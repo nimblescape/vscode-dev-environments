@@ -33,7 +33,7 @@ import { systemClock, type Logger } from '../core/ports';
 import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
 import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
-import { MAX_IMAGE_REPOSITORIES, imagePrefixesOf } from '../core/remoteMonitor/protocol';
+import { MAX_IMAGE_REPOSITORIES, REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
@@ -212,6 +212,8 @@ async function activateExtension(
             target.kind === 'remote'
               ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET)
               : helperDockerSocket(env, platform, target.endpoint),
+          // Plan step 5, PR B: the lock files of the environments, in the volume of the Session Monitor of the engine.
+          stateVolume: REMOTE_MONITOR_VOLUME,
         },
         target,
       ),
@@ -367,6 +369,8 @@ async function activateExtension(
       const target = operationDockerTarget();
       return target === undefined ? undefined : channels.refresh(target, environments);
     },
+    // Plan step 5, PR B: the lock of an environment in the worker of the Docker target of the operation (Stop, Delete).
+    environmentLock: async (environmentId, waitSeconds, signal) => channels.lock(await targets.current(), environmentId, waitSeconds, signal),
     ui,
     logger,
     clock: systemClock,

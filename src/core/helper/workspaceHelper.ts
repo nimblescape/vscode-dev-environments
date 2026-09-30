@@ -35,6 +35,7 @@ import {
 } from './devcontainerCli';
 import {
   HELPER_LAST_USED_INTERVAL_MS,
+  currentHelperImageTag,
   ensureHelperImageUse,
   recordHelperImageUse,
   type BaseDigestLookup,
@@ -518,6 +519,50 @@ export class WorkspaceHelper {
    */
   async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
     return this.image(options, true);
+  }
+
+  /**
+   * PR #74 review round 1 (A-R1-1): the helper image for the worker of the environment lock (Stop, Delete), on the engine
+   * of the operation, local or remote alike. It only builds a missing tag, like the helper runs: no check of the base
+   * image, no rebuild of an existing tag, no cleanup, so nothing long runs before the lock. A cached result whose image
+   * is gone (a prune, or another window moved the tag) is not trusted: the cache is reset and the tag ensured again.
+   * PR #74 review round 2, A-R2-1: it does not join a pending maintaining ensure of an open (a `--pull --no-cache`
+   * rebuild, the cleanup), which the caller could not cancel: when the tag exists, its image is used at once (the worker
+   * is pinned to its ID; a rebuild that moves the tag later cannot remove an image that a container uses). Only a missing
+   * tag, or a tag that cannot be checked, joins it, like before. Throws like ensureImage.
+   */
+  async ensureImagePresent(options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
+    const engine = await this.currentEngine();
+    this.adoptEngine(engine.key);
+    if (this.imagePromise && this.imageReadyAt !== undefined && !(await this.cachedImageCurrent())) this.resetImage();
+    this.adoptEngine(engine.key);
+    if (this.imagePromise && this.imageReadyAt === undefined && this.imageMaintained) {
+      const present = await this.presentTag(options.signal);
+      if (present !== undefined) return present;
+      // The cache may have been replaced during the await (another engine): image() joins a promise of this engine.
+      this.adoptEngine(engine.key);
+    }
+    return this.image({ onOutput: options.onOutput, signal: options.signal }, false);
+  }
+
+  /**
+   * PR #74 review round 2, A-R2-1: the current helper tag with the ID of its image, when the tag exists; `undefined` when
+   * it is missing or cannot be checked (the caller then joins or builds). It leaves the cache untouched and records no
+   * use. An abort of `signal` passes through.
+   */
+  private async presentTag(signal: AbortSignal | undefined): Promise<HelperImageUse | undefined> {
+    if (signal?.aborted) throw abortError();
+    let tag: string | undefined;
+    let id: string | undefined;
+    try {
+      tag = await currentHelperImageTag(this.deps.dockerfilePath);
+      id = await this.deps.docker.imageId(tag);
+    } catch (error) {
+      this.deps.logger.warn(`The workspace helper image${tag !== undefined ? ` ${tag}` : ''} could not be checked: ${errorMessage(error)}`);
+      id = undefined;
+    }
+    if (signal?.aborted) throw abortError();
+    return tag !== undefined && id !== undefined ? { tag, id } : undefined;
   }
 
   /** Whether the engine of the operation (HelperDeps.engine) is the local Docker. */

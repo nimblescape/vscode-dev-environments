@@ -1146,6 +1146,8 @@ describe('open: existing environment', () => {
     await h.service.stop(ENV_ID);
     h.settings.updateImagesOnConnect = false;
     await h.service.open(TARGET, options());
+    // PR #74 review round 1, A-R1-1: changed expectation: the Stop between the opens ensures the helper image before its
+    // lock without the maintenance (ensureImagePresent), so only the opens reach ensureImageUse (before: [true, true, false]).
     expect(seen).toEqual([true, false]);
   });
 

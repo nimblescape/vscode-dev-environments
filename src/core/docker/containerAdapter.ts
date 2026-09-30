@@ -32,6 +32,7 @@ import { dockerProcessEnv, envValue } from './dockerCli';
 import { isSshClosedBeforeLogin, type DockerTarget } from './dockerHost';
 import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { operationDockerTarget } from './dockerTargets';
+import { heldEnvironmentLock } from './environmentLock';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 
 // Plan step 5, PR A: the classification moved to dockerRouting.ts.
@@ -569,12 +570,52 @@ export class ContainerAdapter {
    * directly (logged); any other call throws a CommandError, because its outcome is not known, and is never repeated.
    */
   async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    // Plan step 5, PR B: an operation that holds the lock of an environment (environmentLock.ts).
+    const held = heldEnvironmentLock();
+    if (held !== undefined) return this.runLocked(held, args, options);
     const target = this.router === undefined ? undefined : operationDockerTarget();
     if (target !== undefined && isRoutableDockerCall(args, options)) {
       const routed = await this.runRouted(target, args, options);
       if (routed !== undefined) return routed;
     }
     return this.runDirect(args, options);
+  }
+
+  /**
+   * Plan step 5, PR B: a call while the operation holds the lock of an environment. After the lock was lost, no call runs
+   * (CommandError). A routable call goes only through the worker that holds the lock: when it was not sent, or the worker
+   * was lost or failed while it ran, it throws a CommandError and never runs directly (also a call that only reads), so
+   * a lost lock never lets the operation go on without it. Any other call runs directly, as without the lock.
+   */
+  private async runLocked(held: NonNullable<ReturnType<typeof heldEnvironmentLock>>, args: readonly string[], options: RunOptions): Promise<RunResult> {
+    const command = dockerCommandWords(args).join(' ');
+    const lost = held.lostReason();
+    if (lost !== undefined) {
+      throw new CommandError(commandText(args), null, '', `The lock of the environment on the Docker host was lost (${lost}); docker ${command} was not run.`);
+    }
+    if (!isRoutableDockerCall(args, options)) return this.runDirect(args, options);
+    try {
+      return await held.lock.docker(args, { timeoutMs: options.timeoutMs, signal: options.signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (options.signal?.aborted) throw abortError();
+      this.logger.warn(`docker ${command} through the worker that holds the lock failed (${errorMessage(error)}); it is not run directly.`);
+      // PR #74 review round 1 (A-R1-2): a call that was not sent (no place of its own, or a closed channel) did not run.
+      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
+        throw new CommandError(
+          commandText(args),
+          null,
+          '',
+          `docker ${command} was not sent to the worker that holds the lock of the environment (${errorMessage(error)}); it did not run.`,
+        );
+      }
+      throw new CommandError(
+        commandText(args),
+        null,
+        '',
+        `The connection to the worker that holds the lock of the environment failed; the outcome of docker ${command} is not known.`,
+      );
+    }
   }
 
   /** run through the router; undefined: run it directly. See run. */

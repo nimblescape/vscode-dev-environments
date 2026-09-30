@@ -27,7 +27,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume } from './harness';
 
 const REPOSITORY = 'devenv-test/worker-routing';
 
@@ -116,6 +116,21 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     settings: () => settings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     dockerTarget: () => targets.current(),
+    // Plan step 5, PR B (D1: no unlocked path): the real lock of the worker, as extension.ts. Under it the plain calls go
+    // through the worker that holds the lock (not the router); they are recorded as routed too.
+    environmentLock: async (environmentId, waitSeconds, signal) => {
+      const lock = await channels.lock(await targets.current(), environmentId, waitSeconds, signal);
+      return {
+        environmentId: lock.environmentId,
+        lost: lock.lost,
+        release: () => lock.release(),
+        docker: async (args, options) => {
+          const result = await lock.docker(args, options);
+          routed.push([...args]);
+          return result;
+        },
+      };
+    },
   });
   const environmentId = newEnvironmentId();
   const name = resourceName(REPOSITORY, environmentId);
@@ -153,6 +168,8 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
             script: async () => script,
             helperTag: async () => helperTag,
             socketPath: async () => helperDockerSocket(env, process.platform, target.endpoint),
+            // Plan step 5, PR B: the lock files in a volume of the test, never the one of the Session Monitor.
+            stateVolume: testStateVolume({ run, cli }, 'workerRouting'),
           },
           target,
         ),

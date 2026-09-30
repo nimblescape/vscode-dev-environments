@@ -12,6 +12,7 @@ import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo,
 import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
+import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
@@ -233,7 +234,20 @@ export const PipelineTexts = {
   updatingHelper: 'The workspace helper is being updated. This can take a few minutes.',
   lifecycleCommandFailed: (command: string | undefined) =>
     `The ${command ?? 'lifecycle command'} of the environment failed. The environment is opened anyway.`,
+  /** Plan step 5, PR B, user decision D3: the lock of the environment stayed held elsewhere for ENVIRONMENT_LOCK_WAIT_SECONDS. */
+  environmentLockBusy: (repository: string) =>
+    `${repository} is busy with an operation from another window or computer; try again in a moment.`,
+  /**
+   * Plan step 5, PR B, user decision D1: the worker that holds the lock of the environment could not be made ready (the
+   * helper image could not be built, the worker could not be opened or reaches another Docker engine, or the lock failed
+   * in it). Nothing was changed.
+   */
+  environmentLockUnavailable: (repository: string, cause: string) =>
+    `${repository} was not changed: the Dev Environments worker on the Docker host could not be prepared (${cause}). Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
 } as const;
+
+/** Plan step 5, PR B, user decision D3: how long an operation waits for the lock of an environment that is held elsewhere. */
+export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -278,6 +292,7 @@ export type EnvironmentDocker = Pick<
 export type EnvironmentHelper = Pick<
   WorkspaceHelper,
   | 'ensureImageUse'
+  | 'ensureImagePresent'
   | 'clone'
   | 'readConfigFiles'
   | 'listConfigurations'
@@ -416,6 +431,12 @@ export interface EnvironmentServiceDeps {
    * Undefined, or a result of undefined: no worker with the operation `refresh`; the states are read directly.
    */
   workerRefresh?: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates | undefined>;
+  /**
+   * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
+   * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
+   * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
+   */
+  environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
 }
 
 export interface RepositoryTarget {
@@ -5387,22 +5408,25 @@ export class EnvironmentService {
       // An update, rebuild, or delete in another window replaces or removes the container: no stop in between (concept
       // 7.9 rule 1 applies to the Session Monitor; a Stop from a sidebar that is not up to date must respect it too).
       const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
-      const container = await this.deps.docker.findContainer(env.id, env.containerName);
-      if (!container || container.state !== 'running') {
-        this.logger.info(`The container of ${env.repository} does not run.`);
+      // Plan step 5, PR B: under the lock of the environment on the Docker host (user decisions D1 to D3).
+      await this.withEnvironmentLock(env, undefined, async () => {
+        const container = await this.deps.docker.findContainer(env.id, env.containerName);
+        if (!container || container.state !== 'running') {
+          this.logger.info(`The container of ${env.repository} does not run.`);
+          await this.stopServices(env);
+          return;
+        }
+        const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository));
+        if (summary) {
+          await this.quietly('record the Git state', () =>
+            this.deps.registry.updateEnvironment(env.id, (entry) => {
+              entry.gitSummary = summary;
+            }),
+          );
+        }
+        await this.deps.docker.stopContainer(container.id);
         await this.stopServices(env);
-        return;
-      }
-      const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository));
-      if (summary) {
-        await this.quietly('record the Git state', () =>
-          this.deps.registry.updateEnvironment(env.id, (entry) => {
-            entry.gitSummary = summary;
-          }),
-        );
-      }
-      await this.deps.docker.stopContainer(container.id);
-      await this.stopServices(env);
+      });
     });
   }
 
@@ -5617,30 +5641,34 @@ export class EnvironmentService {
     env = await this.setBusyMark(env, 'delete');
     let removed = false;
     try {
-      // Step 3: container, environment image, unused base images.
-      const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
-      for (const container of containers) {
-        await this.stopServiceBeforeRemoval(container, env);
-        await docker.removeContainer(container.id);
-      }
-      // Review round 9 (D9-3): a dev container of the name without the ID label (for example relabelled by hand) is
-      // stopped first too.
-      const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
-      if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
-      await docker.removeContainer(env.containerName);
-      // Docker Compose: the other containers, the networks, and the built images of the project too.
-      const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)));
-      if (compose) await this.removeComposeProject(env, false);
-      await this.removeEnvironmentImages(env, undefined, env.buildRecord);
-      // Step 4: the workspace volume; additional volumes only when the user confirmed it.
-      await this.removeVolumeWithRetry(env.volumeName);
-      const removedVolumes =
-        options.additionalVolumesToRemove.length > 0 ? await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove) : [];
-      // Step 5: the registry entry and the files that reference the environment. The additional volumes that stay keep
-      // their owner in the registry: the environments of other accounts must not mount them (concept section 9).
-      const keptVolumes = await this.existingVolumes((env.additionalVolumes ?? []).filter((name) => !removedVolumes.includes(name)));
-      await this.deps.registry.remove(env.id, { kept: keptVolumes, removed: removedVolumes });
-      removed = true;
+      // Plan step 5, PR B: the busy mark first, then the lock of the environment on the Docker host (user decisions D1 to
+      // D3); both are released in `finally`.
+      await this.withEnvironmentLock(env, options.signal, async () => {
+        // Step 3: container, environment image, unused base images.
+        const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
+        for (const container of containers) {
+          await this.stopServiceBeforeRemoval(container, env);
+          await docker.removeContainer(container.id);
+        }
+        // Review round 9 (D9-3): a dev container of the name without the ID label (for example relabelled by hand) is
+        // stopped first too.
+        const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
+        if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
+        await docker.removeContainer(env.containerName);
+        // Docker Compose: the other containers, the networks, and the built images of the project too.
+        const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)));
+        if (compose) await this.removeComposeProject(env, false);
+        await this.removeEnvironmentImages(env, undefined, env.buildRecord);
+        // Step 4: the workspace volume; additional volumes only when the user confirmed it.
+        await this.removeVolumeWithRetry(env.volumeName);
+        const removedVolumes =
+          options.additionalVolumesToRemove.length > 0 ? await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove) : [];
+        // Step 5: the registry entry and the files that reference the environment. The additional volumes that stay keep
+        // their owner in the registry: the environments of other accounts must not mount them (concept section 9).
+        const keptVolumes = await this.existingVolumes((env.additionalVolumes ?? []).filter((name) => !removedVolumes.includes(name)));
+        await this.deps.registry.remove(env.id, { kept: keptVolumes, removed: removedVolumes });
+        removed = true;
+      });
       await this.removeEnvironmentFiles(env.id);
       // Unit 7, PR 2: the heartbeat record of this computer on the remote host (best effort).
       const host = dockerHostOf(env);
@@ -6682,6 +6710,49 @@ export class EnvironmentService {
       const next = await this.deps.registry.get(current.id);
       if (!next) throw environmentMissing(current.repository);
       current = next;
+    }
+  }
+
+  /**
+   * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
+   * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
+   * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent), then the worker with the lock
+   * (HelperChannels.lock opens it, also within the wait after a failed open). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
+   * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
+   * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
+   * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in
+   * `finally`. Re-entrant: an operation that holds the lock of `env` runs `fn` at once. The caller took its busy mark
+   * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear.
+   */
+  private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+    if (holdsEnvironmentLock(env.id)) return fn();
+    try {
+      // PR #74 review round 1 (A-R1-1): only a missing tag is built (no rebuild, check, or cleanup before Stop or Delete).
+      await this.deps.helper.ensureImagePresent({ onOutput: (text) => this.logger.output(text), signal });
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);
+      this.logger.warn(`${env.repository}: the helper image for the worker could not be prepared, so nothing is changed: ${cause}`);
+      throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, cause), cause);
+    }
+    let lock: HeldEnvironmentLock;
+    try {
+      lock = await this.deps.environmentLock(env.id, ENVIRONMENT_LOCK_WAIT_SECONDS, signal);
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      if (error instanceof EnvironmentLockError && error.kind === 'busy') {
+        this.logger.info(`${env.repository} is locked on the Docker host by another window or computer: ${error.message}`);
+        throw new UserFacingError('startFailed', PipelineTexts.environmentLockBusy(env.repository), error.message);
+      }
+      this.logger.warn(`${env.repository}: the lock on the Docker host could not be taken, so nothing is changed: ${errorMessage(error)}`);
+      throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
+    }
+    this.logger.info(`${env.repository} is locked on the Docker host.`);
+    try {
+      return await runWithEnvironmentLock(lock, fn);
+    } finally {
+      await lock.release();
+      this.logger.info(`${env.repository} is unlocked on the Docker host.`);
     }
   }
 

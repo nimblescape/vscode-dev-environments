@@ -10,6 +10,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import {
   ENGINE_IDENTITY_ARGS,
   OP_DOCKER,
+  OP_LOCK,
   OP_PROBE,
   OP_REFRESH,
   OP_SWEEP,
@@ -24,6 +25,7 @@ import {
 } from '../core/helperChannel/protocol';
 import { readEnvironmentStates } from '../core/pipeline/refreshStates';
 import { abortError, type Logger, type ProcessRunner } from '../core/ports';
+import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
 /** `docker <args>`: its output goes back as it comes; the value is its exit code. */
@@ -143,4 +145,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_PROBE]: probeOperation,
   [OP_SWEEP]: sweepOperation,
   [OP_REFRESH]: refreshOperation,
+  // Plan step 5, PR B: the environment lock (lock.ts).
+  [OP_LOCK]: lockOperation(),
 };

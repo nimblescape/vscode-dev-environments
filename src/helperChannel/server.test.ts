@@ -140,7 +140,8 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     send({ t: 'ping', n: 7 });
     expect(messages).toEqual([
       // Review round 4 (M1): with the sweep of never-started channel containers.
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'probe', 'refresh', 'sweep'] }, // plan step 5, PR C: `refresh`
+      // Plan step 5, PR B: changed expectation: `lock` too.
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'lock', 'probe', 'refresh', 'sweep'] }, // plan step 5, PR C: `refresh`
       { t: 'pong', n: 7 },
     ]);
   });

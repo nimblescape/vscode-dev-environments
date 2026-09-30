@@ -2788,3 +2788,251 @@ describe('WorkspaceHelper.up with a failed lifecycle command', () => {
     expect(docker.calls.filter((call) => call.args[0] === 'container')).toHaveLength(0);
   });
 });
+
+// PR #74 review round 1, A-R1-1: the helper image before the environment lock (Stop, Delete) only makes sure that the
+// tag exists on the engine of the operation (local or remote alike); it does no maintenance.
+describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', () => {
+  const statePath = () => path.join(dir, 'storage', 'helper.json');
+  const REMOTE: HelperEngine = { key: 'ssh://build-box', socket: '/var/run/docker.sock' };
+
+  function helperOn(engine: HelperEngine, baseDigest?: BaseDigestLookup): WorkspaceHelper {
+    return new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env: {},
+      platform: 'linux',
+      clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
+      statePath: statePath(),
+      engine: async () => engine,
+      baseDigest,
+    });
+  }
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])('on %s, a recorded new base digest rebuilds nothing, checks nothing, and cleans up nothing', async (_name, engine) => {
+    docker.images.add(TAG);
+    const file = helperStatePathFor(statePath(), engine.key);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const old = '2026-09-01T12:00:00.000Z';
+    const record = {
+      baseImage: 'node:22-bookworm-slim',
+      baseDigest: `sha256:${'a'.repeat(64)}`,
+      latestBaseDigest: `sha256:${'b'.repeat(64)}`,
+      builtAt: old,
+      checkedAt: old,
+      lastUsedAt: old,
+      imageId: fakeImageId(TAG),
+      generation: HELPER_GENERATION,
+    };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old }));
+    // A `--pull --no-cache` rebuild would never end here, so a Stop that waited for it would hang.
+    docker.buildHandler = () => new Promise<void>(() => {});
+    const lookup = vi.fn<BaseDigestLookup>(async () => `sha256:${'c'.repeat(64)}`);
+    const helper = helperOn(engine, lookup);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toEqual([]);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(docker.listCalls).toBe(0);
+    expect(docker.removals).toEqual([]);
+  });
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])('on %s, builds a missing tag', async (_name, engine) => {
+    const helper = helperOn(engine);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ tag: TAG });
+  });
+
+  it('builds the tag again when it was deleted after it was cached (by itself or by an open)', async () => {
+    const helper = helperOn(REMOTE);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    docker.images.delete(TAG);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(2);
+    expect(docker.images.has(TAG)).toBe(true);
+
+    await helper.ensureImageUse();
+    docker.images.delete(TAG);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(3);
+    expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} was removed. It is prepared again.`);
+  });
+
+  it('fails like ensureImage when the missing tag cannot be built', async () => {
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'failed to solve: node:22-bookworm-slim: not found');
+    };
+    const helper = helperOn(REMOTE);
+    await expect(helper.ensureImagePresent()).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(docker.images.has(TAG)).toBe(false);
+  });
+
+  // PR #74 review round 2, A-R2-1: a pending maintaining ensure of an open in the same window (a `--pull --no-cache`
+  // rebuild, the cleanup) is not joined when the tag exists: the Stop could not cancel that wait.
+  const NEW_ID = `sha256:${'e'.repeat(64)}`;
+
+  /** A helper.json on `engine` that asks the next maintaining ensure for a `--pull --no-cache` rebuild of TAG. */
+  function recordNewBaseDigest(engine: HelperEngine): void {
+    const file = helperStatePathFor(statePath(), engine.key);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const old = '2026-09-01T12:00:00.000Z';
+    const record = {
+      baseImage: 'node:22-bookworm-slim',
+      baseDigest: `sha256:${'a'.repeat(64)}`,
+      latestBaseDigest: `sha256:${'b'.repeat(64)}`,
+      builtAt: old,
+      checkedAt: old,
+      lastUsedAt: old,
+      imageId: fakeImageId(TAG),
+      generation: HELPER_GENERATION,
+    };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old }));
+  }
+
+  /**
+   * A build that ends only when the returned function is called (with an error, or with success). After a failure, each
+   * later build (the retry without `--pull`) fails at once with the same error.
+   */
+  function heldBuild(): (error?: Error) => void {
+    let finish: ((error?: Error) => void) | undefined;
+    let failure: Error | undefined;
+    docker.buildHandler = () =>
+      failure !== undefined
+        ? Promise.reject(failure)
+        : new Promise<void>((resolve, reject) => {
+            finish = (error) => (error ? reject(error) : resolve());
+          });
+    return (error) => {
+      failure = error;
+      finish?.(error);
+    };
+  }
+
+  /** `promise`, or 'HUNG' when it has not settled after `ms`. */
+  function orHung<T>(promise: Promise<T>, ms = 1000): Promise<T | 'HUNG'> {
+    return Promise.race([promise, new Promise<'HUNG'>((resolve) => setTimeout(() => resolve('HUNG'), ms))]);
+  }
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])(
+    'on %s, uses the existing tag at once while a maintaining rebuild of an open hangs, and leaves that rebuild untouched (PR #74 review round 2, A-R2-1)',
+    async (_name, engine) => {
+      docker.images.add(TAG);
+      recordNewBaseDigest(engine);
+      const finish = heldBuild();
+      const helper = helperOn(engine);
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true, noCache: true });
+
+      // PR #74 review round 2, A-R2-1: resolves at once with the ID of the tag, without waiting for the rebuild.
+      expect(await orHung(helper.ensureImagePresent())).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      // PR #74 review round 2, A-R2-1: the rebuild promise of the open is untouched: a second open joins it.
+      const second = helper.ensureImageUse();
+      docker.ids.set(TAG, NEW_ID);
+      finish();
+      expect(await open).toEqual({ tag: TAG, id: NEW_ID });
+      expect(await second).toEqual({ tag: TAG, id: NEW_ID });
+      expect(docker.builds).toHaveLength(1);
+      // PR #74 review round 2, A-R2-1: afterwards, the cached result of the open is used.
+      expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: NEW_ID });
+      expect(docker.builds).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])(
+    'on %s, joins a pending maintaining ensure when the tag is missing, and resolves when it does (PR #74 review round 2, A-R2-1)',
+    async (_name, engine) => {
+      const finish = heldBuild();
+      const helper = helperOn(engine);
+      const asked: string[] = [];
+      const imageId = docker.imageId.bind(docker);
+      docker.imageId = async (reference) => {
+        asked.push(reference);
+        return imageId(reference);
+      };
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const before = asked.length;
+      const present = helper.ensureImagePresent();
+      // PR #74 review round 2, A-R2-1: the tag is checked first; it is missing, so the pending ensure is joined.
+      await vi.waitFor(() => expect(asked.slice(before)).toEqual([TAG]));
+      expect(await orHung(present, 200)).toBe('HUNG');
+      finish();
+      expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(await present).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])(
+    'on %s, a cancelled Delete stops waiting for the joined maintaining ensure at once, and the build goes on (PR #74 review round 3, B-R3-1)',
+    async (_name, engine) => {
+      const finish = heldBuild();
+      const helper = helperOn(engine);
+      const asked: string[] = [];
+      const imageId = docker.imageId.bind(docker);
+      docker.imageId = async (reference) => {
+        asked.push(reference);
+        return imageId(reference);
+      };
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      const before = asked.length;
+      const controller = new AbortController();
+      const present = helper.ensureImagePresent({ signal: controller.signal });
+      // PR #74 review round 3, B-R3-1: the tag is missing, so the pending ensure is joined; the abort ends that wait.
+      await vi.waitFor(() => expect(asked.slice(before)).toEqual([TAG]));
+      const settled = present.then(
+        () => 'resolved',
+        (error: unknown) => (error instanceof Error ? error.name : 'other'),
+      );
+      controller.abort();
+      expect(await orHung(settled, 200)).toBe('AbortError');
+      finish();
+      expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+      expect(docker.builds).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['the local Docker', { key: '' }],
+    ['a remote engine', REMOTE],
+  ])(
+    'on %s, joins the pending maintaining ensure when the tag cannot be checked, and fails (D1) when that ensure fails, without a fallback (PR #74 review round 2, A-R2-1)',
+    async (_name, engine) => {
+      const finish = heldBuild();
+      const helper = helperOn(engine);
+      const open = helper.ensureImageUse();
+      await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+      // PR #74 review round 2, A-R2-1: a failing imageId is no answer: the pending ensure is joined, not bypassed.
+      docker.imageId = async () => {
+        throw new CommandError('docker image inspect', 1, '', 'Cannot connect to the Docker daemon');
+      };
+      const present = helper.ensureImagePresent();
+      await vi.waitFor(() => expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} could not be checked`));
+      expect(await orHung(present, 200)).toBe('HUNG');
+      finish(new CommandError('docker build', 1, '', 'failed to solve: node:22-bookworm-slim: not found'));
+      await expect(open).rejects.toMatchObject({ code: 'helperFailed' });
+      const builds = docker.builds.length;
+      // PR #74 review round 2, A-R2-1: the D1 refusal: the failure of the joined ensure, no other image, no build of its own.
+      await expect(present).rejects.toMatchObject({ code: 'helperFailed' });
+      expect(docker.builds).toHaveLength(builds);
+      expect(docker.images.has(TAG)).toBe(false);
+    },
+  );
+});
