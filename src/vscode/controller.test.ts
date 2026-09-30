@@ -2053,6 +2053,28 @@ describe('Window roles', () => {
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
+  it('role B (PR #76 review round 6, B-R6-1): a pending-operations folder that cannot be read is reported, runs nothing, and the window is not reopened', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const readdir = fs.promises.readdir;
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((async (dir: fs.PathLike, ...rest: unknown[]) => {
+      if (String(dir) === h.paths.operationsDir) throw Object.assign(new Error('EIO: i/o error, scandir'), { code: 'EIO' });
+      return (readdir as (...args: unknown[]) => Promise<unknown>)(dir, ...rest);
+    }) as typeof fs.promises.readdir);
+    try {
+      await expect(h.controller.runEmptyWindowTasks()).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining('EIO'));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
   it('role B: runs a pending stop and keeps the reopen record; a later start reopens the environment (D-5 a)', async () => {
     await h.registry.add(environment());
     h.connection.isEmptyWindow.mockReturnValue(true);
