@@ -199,6 +199,8 @@ const NO_OWN_CALL = new Set([
   'setRouter',
   'run',
   'runRouted',
+  // Plan step 5, PR B: the calls under the lock of an environment (environmentLock.test.ts).
+  'runLocked',
   'runDirect',
   'runOnce',
   'start',

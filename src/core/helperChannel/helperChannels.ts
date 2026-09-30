@@ -12,14 +12,17 @@ import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
-import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
-import { HelperChannel, HelperChannelError, type ChannelDockerOptions } from './helperChannel';
+import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
+import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
+import { HelperChannel, HelperChannelError, HelperOperationError, type ChannelDockerOptions } from './helperChannel';
 import {
   CHANNEL_ENTRY,
   CHANNEL_IDLE_CLOSE_MS,
   CHANNEL_SCRIPT_PATH,
   ENGINE_IDENTITY_ARGS,
   LABEL_HELPER_CHANNEL,
+  LOCK_BUSY_CODE,
+  LOCK_STATE_DIR,
   OP_PROBE,
   OP_REFRESH,
   OP_SWEEP,
@@ -53,9 +56,10 @@ export const CHANNEL_OPEN_WAIT_MS = 5_000;
  * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
  * the first line of the input (HelperChannel.open), never on the command line.
  */
-export function channelRunArgs(p: { tag: string; socketPath: string; containerName: string; label: string; scriptHash: string }): string[] {
+export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume: string; containerName: string; label: string; scriptHash: string }): string[] {
   // --mount is CSV: a path with a comma or a quote would change the mount.
   if (/[",]/.test(p.socketPath)) throw new HelperChannelError('open', `The Docker socket path ${p.socketPath} cannot be mounted.`);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(p.stateVolume)) throw new HelperChannelError('open', `The volume ${p.stateVolume} cannot be mounted.`);
   return [
     'run',
     '--rm',
@@ -79,6 +83,9 @@ export function channelRunArgs(p: { tag: string; socketPath: string; containerNa
     'no-new-privileges',
     '--mount',
     `type=bind,source=${p.socketPath},target=${HELPER_DOCKER_SOCKET}`,
+    // Plan step 5, PR B: the volume of the Session Monitor, for the lock files of the environments (OP_LOCK).
+    '--mount',
+    `type=volume,source=${p.stateVolume},target=${LOCK_STATE_DIR}`,
     p.tag,
     ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: CHANNEL_ENTRY }),
   ];
@@ -99,6 +106,11 @@ export interface ChannelOpenDeps {
   helperTag(): Promise<string>;
   /** The source of the socket mount on the host of the engine (rootless aware). */
   socketPath(target: DockerTarget): Promise<string>;
+  /**
+   * Plan step 5, PR B: the volume with the lock files of the environments: the volume of the Session Monitor
+   * (REMOTE_MONITOR_VOLUME), the same for every engine, local and remote (the Docker tests: a volume of their own).
+   */
+  stateVolume: string;
 }
 
 /** The name of the engine of `target` in the log. */
@@ -116,7 +128,7 @@ function engineName(target: DockerTarget): string {
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const [script, tag, socketPath] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target)]);
   const containerName = `devenv-channel-${crypto.randomBytes(6).toString('hex')}`;
-  const args = channelRunArgs({ tag, socketPath, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
+  const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
   const process = await runWithDockerTarget(target, async () => deps.start(args));
   if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
   const name = engineName(target);
@@ -164,6 +176,8 @@ interface Entry {
   channel?: HelperChannel;
   opening?: Promise<HelperChannel | undefined>;
   failedAt?: number;
+  /** Plan step 5, PR B: why the last open failed (for the refusal of a lock, user decision D1). */
+  failure?: string;
 }
 
 export interface HelperChannelsOptions {
@@ -264,6 +278,7 @@ export class HelperChannels {
       (error: unknown) => {
         current.opening = undefined;
         current.failedAt = Date.now();
+        current.failure = (error as Error).message;
         this.options.logger.info(
           `${(error as Error).message} Docker calls to ${engineName(target)} go without it; the next attempt in ${Math.round(retryAfter / 60_000)} minutes.`,
         );
@@ -319,6 +334,35 @@ export class HelperChannels {
     const states = parseRefreshValue(value, params);
     if (states === undefined) throw new HelperChannelError('protocol', 'The worker answered the refresh with an invalid value.');
     return states;
+  }
+
+  /**
+   * Plan step 5, PR B: takes the lock of an environment in the worker of `target` and waits at most `waitSeconds` for
+   * it. User decision D1 (an explicit attempt to make the state consistent): the wait after a failed open ends for this
+   * engine, and the open is awaited in full (not CHANNEL_OPEN_WAIT_MS). Throws EnvironmentLockError: `busy` when another
+   * holder kept the lock for the whole wait (user decision D3), `unavailable` when there is no worker (it could not be
+   * opened, it reaches another engine, it does not know the operation) or the lock failed in it, with the cause. An
+   * AbortError when `signal` aborts. Never goes on without the lock.
+   */
+  async lock(target: DockerTarget, environmentId: string, waitSeconds: number, signal?: AbortSignal): Promise<HeldEnvironmentLock> {
+    const entry = this.entries.get(keyOf(target));
+    if (entry !== undefined) entry.failedAt = undefined;
+    const channel = await this.get(target, { signal });
+    if (channel === undefined) {
+      const why = this.disposed
+        ? 'the window is closing'
+        : target.kind !== 'remote' && target.kind !== 'local'
+          ? 'the Docker endpoint is neither local nor SSH'
+          : (this.entries.get(keyOf(target))?.failure ?? 'the worker could not be opened');
+      throw new EnvironmentLockError('unavailable', why);
+    }
+    try {
+      return await channel.lock(environmentId, waitSeconds, signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) throw new EnvironmentLockError('busy', error.message);
+      throw new EnvironmentLockError('unavailable', (error as Error).message);
+    }
   }
 
   /** Closes the channels without an operation for CHANNEL_IDLE_CLOSE_MS. */

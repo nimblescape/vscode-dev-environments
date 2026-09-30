@@ -610,3 +610,63 @@ export function parseRefreshValue(value: unknown, params: RefreshParams): Enviro
   }
   return states;
 }
+
+// ---- Plan step 5, PR B: the environment lock ----
+
+/**
+ * `lock`: the lock of one environment on the Docker host (decision 2026-09-29, "Concurrency"): the worker opens
+ * lockFilePath (in the volume of the Session Monitor, mounted into every worker; O_NOFOLLOW, folder 0700, file 0600),
+ * runs `flock -w <waitSeconds> -E LOCK_BUSY_EXIT <fd>` on the inherited file descriptor, reports the progress
+ * LOCK_HELD_STEP when it holds the lock, and holds it until the operation is cancelled (at most LOCK_HOLD_LIMIT_MS). The
+ * kernel frees the lock when the worker ends, whatever the way. The lock files are never deleted. Parameters LockParams;
+ * the value is `{}`; a lock that stayed held elsewhere fails with the code LOCK_BUSY_CODE. It carries no secret.
+ */
+export const OP_LOCK = 'lock';
+/** The mount point of the volume of the Session Monitor in the worker (as REMOTE_MONITOR_STATE_DIR in the monitor). */
+export const LOCK_STATE_DIR = '/state';
+/** The folder of the lock files in that volume. */
+export const LOCK_FOLDER = 'locks';
+/** The exit code of `flock -E` when the lock stayed held by another holder for the whole wait. */
+export const LOCK_BUSY_EXIT = 75;
+/** The failure code of a lock that another window or computer holds (user decision D3). */
+export const LOCK_BUSY_CODE = 'busy';
+/** The progress step that says that the lock is held. */
+export const LOCK_HELD_STEP = 'locked';
+/** The longest wait for a lock, in seconds. */
+export const MAX_LOCK_WAIT_SECONDS = 60;
+/** The backstop of a held lock: the worker lets go of it after this time (2 hours). */
+export const LOCK_HOLD_LIMIT_MS = 2 * 60 * 60_000;
+/**
+ * The lock operations of one worker at the same time. They do not take one of the MAX_CONCURRENT_OPERATIONS places: a
+ * held lock would keep its place for the whole operation, and the Docker calls of that operation would wait behind it.
+ */
+export const MAX_CONCURRENT_LOCKS = 16;
+
+export interface LockParams {
+  environmentId: string;
+  waitSeconds: number;
+}
+
+/** The strict check of LockParams (both sides): a storage ID (isStorageId) and a whole wait of 1..MAX_LOCK_WAIT_SECONDS s. */
+export function parseLockParams(value: unknown): LockParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'waitSeconds'])) return undefined;
+  const { environmentId, waitSeconds } = value;
+  if (!isStorageId(environmentId)) return undefined;
+  if (typeof waitSeconds !== 'number' || !Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > MAX_LOCK_WAIT_SECONDS) return undefined;
+  return { environmentId, waitSeconds };
+}
+
+/** The folder of the lock files under `stateDir`. */
+export function lockFolder(stateDir: string = LOCK_STATE_DIR): string {
+  return `${stateDir}/${LOCK_FOLDER}`;
+}
+
+/** The lock file of an environment (its ID checked by parseLockParams). */
+export function lockFilePath(environmentId: string, stateDir: string = LOCK_STATE_DIR): string {
+  return `${lockFolder(stateDir)}/${environmentId}.lock`;
+}
+
+/** The arguments of `flock` on the file descriptor `fd` that it inherits from the worker. */
+export function flockArgs(waitSeconds: number, fd: number): string[] {
+  return ['-w', String(waitSeconds), '-E', String(LOCK_BUSY_EXIT), String(fd)];
+}

@@ -30,7 +30,7 @@ import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/works
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { HELPER_DOCKERFILE, Timings, dockerTestContext } from './harness';
+import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -93,6 +93,8 @@ describe('the helper channel with the real Docker engine', () => {
         script: async () => script,
         helperTag: async () => helperTag,
         socketPath: async () => socket,
+        // Plan step 5, PR B: the lock files in a volume of the test, never the one of the Session Monitor.
+        stateVolume: testStateVolume({ run, cli }, 'helperChannel'),
       },
       target,
     );
@@ -175,7 +177,15 @@ describe('the helper channel with the real Docker engine', () => {
     const containerName = `devenv-channel-test-${run.runId}`;
     const stepName = `devenv-test-channel-silent-${run.runId}`;
     const label = newCleanupLabel();
-    const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
+    // Plan step 5, PR B: changed call: the state volume (a volume of the test).
+    const args = channelRunArgs({
+      tag: helperTag,
+      socketPath: socket,
+      stateVolume: testStateVolume({ run, cli }, 'helperChannel'),
+      containerName,
+      label: channelLabelValue(script),
+      scriptHash: bundleHash(script),
+    });
     // Review round 1 (P8): long enough for the step to start and be seen on a slow runner.
     args.splice(args.indexOf(helperTag), 0, ...runLabelArgs, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');
     const process = docker.start(args)!;

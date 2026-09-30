@@ -9,6 +9,7 @@
 // lost and `docker run` is stopped (the script ends by itself on the host, protocol.ts). The secret of an operation and
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
+import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
 import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
@@ -21,15 +22,20 @@ import {
   CHANNEL_SLOT_WAIT_MS,
   LineSplitter,
   MAX_CHANNEL_REQUEST_BYTES,
+  LOCK_HELD_STEP,
+  LOCK_HOLD_LIMIT_MS,
   MAX_CLIENT_LINE,
+  MAX_CONCURRENT_LOCKS,
   MAX_CONCURRENT_OPERATIONS,
   MAX_OPERATION_TIMEOUT_MS,
   MAX_SERVER_LINE,
   OP_DOCKER,
+  OP_LOCK,
   encodeMessage,
   isSecret,
   parseDockerOperationParams,
   parseDockerOperationValue,
+  parseLockParams,
   parseServerMessage,
   type ClientMessage,
   type ServerMessage,
@@ -122,6 +128,8 @@ export interface HelperChannelOptions {
 
 interface Pending {
   op: string;
+  /** Plan step 5, PR B: a lock operation holds no place of MAX_CONCURRENT_OPERATIONS (MAX_CONCURRENT_LOCKS instead). */
+  lock?: boolean;
   /** Review round 4 (M2): the cancel was sent; waiting for the script to confirm it. */
   cancelling?: boolean;
   startedAt: number;
@@ -146,6 +154,8 @@ export class HelperChannel {
   private slots = 0;
   /** Operations that wait for a free place; each gets the place of the operation that ended. */
   private readonly waiting: (() => void)[] = [];
+  /** Plan step 5, PR B: the lock operations that run (MAX_CONCURRENT_LOCKS; they hold no place of the others). */
+  private locks = 0;
   private readonly closeListeners = new Set<(reason: string) => void>();
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private stderrTail = '';
@@ -363,7 +373,8 @@ export class HelperChannel {
     if (pending.onAbort) pending.options.signal?.removeEventListener('abort', pending.onAbort);
     // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
     this.lastUsedAt = Date.now();
-    this.releaseSlot();
+    if (pending.lock) this.locks--;
+    else this.releaseSlot();
     return pending;
   }
 
@@ -409,6 +420,10 @@ export class HelperChannel {
    * channel ended while it ran).
    */
   async operation(op: string, params: unknown, options: OperationOptions = {}): Promise<unknown> {
+    return this.sendOperation(op, params, options, false);
+  }
+
+  private async sendOperation(op: string, params: unknown, options: OperationOptions, lock: boolean): Promise<unknown> {
     if (options.signal?.aborted) throw abortError();
     if (this.state !== 'open') throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
     // Review round 2 (A5): what the script refuses as a whole is not sent: a time limit that is no whole number of
@@ -432,7 +447,12 @@ export class HelperChannel {
     }
     // A free place is taken at once, so the operation is written in the same turn as the call.
     const queuedAt = Date.now();
-    if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
+    const release = () => (lock ? this.locks-- : this.releaseSlot());
+    if (lock) {
+      // Plan step 5, PR B: a lock waits for no place; beyond MAX_CONCURRENT_LOCKS it is not sent.
+      if (this.locks >= MAX_CONCURRENT_LOCKS) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} holds too many locks.`);
+      this.locks++;
+    } else if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
     else {
       const waitMs = Math.min(options.slotWaitMs ?? this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY);
       await this.waitForSlot(options.signal, Math.max(0, waitMs));
@@ -447,19 +467,19 @@ export class HelperChannel {
     }
     // Review round 1 (L1): the signal or the channel may have ended while it waited for its place.
     if (options.signal?.aborted || this.state !== 'open') {
-      this.releaseSlot();
+      release();
       if (options.signal?.aborted) throw abortError();
       throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
     }
     // Review round 1 (L3): the operation counts as pending only once it was written, so a failed write is `closed`
     // (not sent), never `lost`. The answers come later (stream events), never during the write.
     if (!this.write(line)) {
-      this.releaseSlot();
+      release();
       throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
     }
     this.lastUsedAt = Date.now();
     return new Promise<unknown>((resolve, reject) => {
-      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject };
+      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject, lock };
       // The `docker` operation logs its one call itself; an operation of steps gets a line at its start and its end.
       if (op !== OP_DOCKER) this.options.logger.info(`[${this.options.name}] ${op}#${id}: started.`);
       this.pending.set(id, pending);
@@ -485,6 +505,75 @@ export class HelperChannel {
         options.signal.addEventListener('abort', pending.onAbort, { once: true });
       }
     });
+  }
+
+  /**
+   * Plan step 5, PR B: takes the lock of an environment in the worker (the operation `lock`): waits at most `waitSeconds`
+   * for it and resolves when the worker holds it (the progress LOCK_HELD_STEP). Rejects with HelperOperationError (code
+   * LOCK_BUSY_CODE: another holder kept it for the whole wait; another code: it failed), an AbortError (the signal while
+   * it waits), or HelperChannelError (`unsendable`: invalid parameters, a worker without the operation, or too many
+   * locks; `closed`, `lost`). The held lock keeps no place of MAX_CONCURRENT_OPERATIONS. It is never taken over or forced:
+   * only `release`, the end of the worker, or its backstop (LOCK_HOLD_LIMIT_MS) let go of it.
+   */
+  async lock(environmentId: string, waitSeconds: number, signal?: AbortSignal): Promise<HeldEnvironmentLock> {
+    const params = parseLockParams({ environmentId, waitSeconds });
+    if (params === undefined) throw new HelperChannelError('unsendable', 'The lock request is invalid.');
+    if (!this.operations.includes(OP_LOCK)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_LOCK}.`);
+    if (signal?.aborted) throw abortError();
+    const controller = new AbortController();
+    const onCallerAbort = () => controller.abort();
+    signal?.addEventListener('abort', onCallerAbort, { once: true });
+    let held = false;
+    let onHeld!: () => void;
+    const heldNow = new Promise<void>((resolve) => (onHeld = resolve));
+    const done = this.sendOperation(
+      OP_LOCK,
+      params,
+      {
+        signal: controller.signal,
+        // The backstop of the worker comes first; this is for a worker that does not answer.
+        timeoutMs: waitSeconds * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS,
+        onProgress: (step) => {
+          if (step === LOCK_HELD_STEP) {
+            held = true;
+            onHeld();
+          }
+        },
+      },
+      true,
+    );
+    // Settled once the worker let go of the lock (or the channel ended): never rejects.
+    const ended = done.then(
+      () => 'the lock operation ended',
+      (error: unknown) => (error as Error).message,
+    );
+    try {
+      await Promise.race([heldNow, done]);
+    } finally {
+      signal?.removeEventListener('abort', onCallerAbort);
+    }
+    if (!held) {
+      // The worker answered without the lock (an invalid answer): let go of whatever it holds.
+      controller.abort();
+      await ended;
+      throw new HelperChannelError('protocol', `The helper answered the lock of ${environmentId} without holding it.`);
+    }
+    let releasing = false;
+    const lost = new Promise<string>((resolve) => {
+      void ended.then((reason) => {
+        if (!releasing) resolve(reason);
+      });
+    });
+    return {
+      environmentId,
+      lost,
+      docker: (args, options) => this.docker(args, options),
+      release: async () => {
+        releasing = true;
+        controller.abort();
+        await ended;
+      },
+    };
   }
 
   /**

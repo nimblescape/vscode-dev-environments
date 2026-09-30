@@ -13,6 +13,8 @@ import {
   CHANNEL_KILL_GRACE_MS,
   CHANNEL_PROTOCOL_VERSION,
   CHANNEL_SLOT_WAIT_MS,
+  LOCK_BUSY_CODE,
+  LOCK_HELD_STEP,
   MAX_CHANNEL_REQUEST_BYTES,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
@@ -547,5 +549,132 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       fake.answer({ t: 'result', id: lastOp(fake).id, ok: true, value: { exitCode: 'zero' } });
       await expect(result).rejects.toBeInstanceOf(HelperChannelError);
     });
+  });
+});
+
+// Plan step 5, PR B: the lock of an environment through the worker (the operation `lock`).
+describe('HelperChannel.lock (plan step 5, PR B)', () => {
+  const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function openWithLock() {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ ...HELLO, ops: ['docker', 'lock', 'probe'] } as ServerMessage);
+    return { channel: await opening, fake };
+  }
+
+  /** Sends the lock and answers it as held. */
+  async function held() {
+    const opened = await openWithLock();
+    const locking = opened.channel.lock(ID, 10);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(opened.fake);
+    opened.fake.answer({ t: 'progress', id: op.id, step: LOCK_HELD_STEP });
+    const lock = await locking;
+    return { ...opened, op, lock };
+  }
+
+  it('sends the lock with its parameters and no secret, and resolves when the worker holds it', async () => {
+    const { op, lock } = await held();
+    expect(op).toMatchObject({ t: 'op', op: 'lock', params: { environmentId: ID, waitSeconds: 10 } });
+    expect(op.secret).toBeUndefined();
+    expect(lock.environmentId).toBe(ID);
+  });
+
+  it('rejects with the busy code of the worker, and when the worker does not know the operation', async () => {
+    const { channel, fake } = await openWithLock();
+    const locking = channel.lock(ID, 10);
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: false, error: { code: LOCK_BUSY_CODE, message: 'held' }, cancelled: false, timedOut: false });
+    await expect(locking).rejects.toMatchObject({ name: 'HelperOperationError', code: LOCK_BUSY_CODE });
+    const { channel: old } = await openChannel();
+    await expect(old.lock(ID, 10)).rejects.toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
+  });
+
+  it('refuses an invalid id or wait without sending anything', async () => {
+    const { channel, fake } = await openWithLock();
+    const before = fake.messages().length;
+    for (const [id, wait] of [['../x', 10], [ID, 0], [ID, 61], [ID, 2.5]] as const) {
+      await expect(channel.lock(id, wait)).rejects.toMatchObject({ code: 'unsendable' });
+    }
+    expect(fake.messages()).toHaveLength(before);
+  });
+
+  it('release waits until the worker let go of the lock', async () => {
+    const { fake, op, lock } = await held();
+    let released = false;
+    const releasing = lock.release().then(() => (released = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.messages().at(-1)).toEqual({ t: 'cancel', id: op.id });
+    // The worker has not confirmed yet: the lock may still be held.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(released).toBe(false);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+    await releasing;
+    expect(released).toBe(true);
+  });
+
+  it('lost resolves when the worker is lost while the lock is held, and not after a release', async () => {
+    const first = await held();
+    let reason: string | undefined;
+    void first.lock.lost.then((text) => (reason = text));
+    first.fake.exit(137);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reason).toMatch(/lost|ended/);
+
+    const second = await held();
+    let lostAfterRelease = false;
+    void second.lock.lost.then(() => (lostAfterRelease = true));
+    const releasing = second.lock.release();
+    await vi.advanceTimersByTimeAsync(0);
+    second.fake.answer({ t: 'result', id: second.op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+    await releasing;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lostAfterRelease).toBe(false);
+  });
+
+  it('a held lock takes none of the places of the operations', async () => {
+    const { channel, fake } = await openWithLock();
+    const locks = [];
+    for (let index = 0; index < MAX_CONCURRENT_OPERATIONS; index++) {
+      const locking = channel.lock(`env-${index}`, 10);
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ t: 'progress', id: lastOp(fake).id, step: LOCK_HELD_STEP });
+      locks.push(await locking);
+    }
+    // All places of the operations are still free: MAX_CONCURRENT_OPERATIONS Docker calls go out at once.
+    const sentBefore = fake.messages().filter((message) => message.t === 'op').length;
+    for (let index = 0; index < MAX_CONCURRENT_OPERATIONS; index++) void channel.docker(['ps']).catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.messages().filter((message) => message.t === 'op').length - sentBefore).toBe(MAX_CONCURRENT_OPERATIONS);
+    // And with every place taken, a lock still goes out (its own cap).
+    const extra = channel.lock('env-extra', 10);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastOp(fake)).toMatchObject({ op: 'lock', params: { environmentId: 'env-extra' } });
+    fake.answer({ t: 'progress', id: lastOp(fake).id, step: LOCK_HELD_STEP });
+    await extra;
+    channel.close();
+  });
+
+  it('a cancel of the caller while it waits sends the cancel and rejects with an AbortError', async () => {
+    const { channel, fake } = await openWithLock();
+    const controller = new AbortController();
+    const locking = channel.lock(ID, 10, controller.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.messages().at(-1)).toEqual({ t: 'cancel', id: op.id });
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+    await expect(locking).rejects.toMatchObject({ name: 'AbortError' });
   });
 });

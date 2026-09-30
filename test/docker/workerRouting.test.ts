@@ -27,7 +27,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume } from './harness';
 
 const REPOSITORY = 'devenv-test/worker-routing';
 
@@ -153,6 +153,8 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
             script: async () => script,
             helperTag: async () => helperTag,
             socketPath: async () => helperDockerSocket(env, process.platform, target.endpoint),
+            // Plan step 5, PR B: the lock files in a volume of the test, never the one of the Session Monitor.
+            stateVolume: testStateVolume({ run, cli }, 'workerRouting'),
           },
           target,
         ),

@@ -115,7 +115,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     // Review round 4 (M1): with the sweep of never-started channel containers.
     // Plan step 5, PR C: `refresh`.
-    expect(channel.operations).toEqual(['docker', 'probe', 'refresh', 'sweep']);
+    // Plan step 5, PR B: changed expectation: `lock` too.
+    expect(channel.operations).toEqual(['docker', 'lock', 'probe', 'refresh', 'sweep']);
     expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
     const result = await channel.docker(['cat'], { input: 'hello channel' });
     expect(result).toEqual({ exitCode: 0, stdout: 'hello channel', stderr: '', timedOut: false });

@@ -24,7 +24,7 @@ import {
   type ProcessRunner,
   type ProgressReporter,
 } from '../../src/core/ports';
-import { DockerCli, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
+import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
@@ -65,6 +65,17 @@ export function dockerTestContext(name: string): DockerTestContext {
     });
   });
   return { run, env, cli: new DockerCli(run.dockerPath, env), log };
+}
+
+/**
+ * Plan step 5, PR B: a volume of its own for the lock files of the workers of a test file (ChannelOpenDeps.stateVolume),
+ * so that the volume of the Session Monitor of the engine is never created or touched; with the label of the run, so
+ * that removeRunObjects removes it. Created now when it is missing; returns its name.
+ */
+export function testStateVolume(context: Pick<DockerTestContext, 'run' | 'cli'>, name: string): string {
+  const volume = `devenv-test-state-${name}-${context.run.runId}`;
+  if (context.cli.volume(volume) === undefined) context.cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${context.run.runId}`, volume]);
+  return volume;
 }
 
 /** Logger of the core modules. Messages and the output of the tools go to one file per test file. */

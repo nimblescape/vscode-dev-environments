@@ -5,8 +5,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { dockerTargetOf, remoteContextName, LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
-import { silentLogger, type Logger, type StartedProcess } from '../ports';
-import { HelperChannel, HelperChannelError } from './helperChannel';
+import { abortError, silentLogger, type Logger, type StartedProcess } from '../ports';
+import { EnvironmentLockError } from '../docker/environmentLock';
+import { HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
 import {
   CHANNEL_OPEN_WAIT_MS,
   CHANNEL_PROBE_TIMEOUT_MS,
@@ -17,7 +18,7 @@ import {
   openHelperChannel,
 } from './helperChannels';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
-import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
+import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, LOCK_BUSY_CODE, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
 import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
@@ -249,7 +250,8 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
 describe('channelRunArgs and openHelperChannel', () => {
   it('runs the helper image with --rm -i, never a pull, no network, no capability, only the socket, and the loader', () => {
     const hash = bundleHash('SCRIPT');
-    const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
+    // Plan step 5, PR B: changed call: the state volume with the lock files is mounted too.
+    const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', stateVolume: 'devenv-session-monitor', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
     expect(args).toEqual([
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
@@ -257,13 +259,19 @@ describe('channelRunArgs and openHelperChannel', () => {
       // Review round 2 (B3): no log of the channel on the host.
       '--network', 'none', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
+      // Plan step 5, PR B: changed expectation: the volume of the Session Monitor at /state, for the lock files.
+      '--mount', 'type=volume,source=devenv-session-monitor,target=/state',
       // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: 'node', '-e', CHANNEL_LOADER).
       'devenv-helper:abc', 'node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', hash, 'startChannel',
     ]);
     // Neither a restart policy nor -d: the container lives only as long as its connection.
     expect(args).not.toContain('--restart');
     expect(args).not.toContain('-d');
-    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', stateVolume: 'v', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+    // Plan step 5, PR B: a volume name that could change the mount (CSV) or be an option is refused.
+    for (const stateVolume of ['a,b', '-v', 'a"b', '', 'a=b']) {
+      expect(() => channelRunArgs({ tag: 't', socketPath: '/s', stateVolume, containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+    }
   });
 
   it('starts the container with the Docker context of the target and checks the engine with probe', async () => {
@@ -303,6 +311,7 @@ describe('channelRunArgs and openHelperChannel', () => {
         script: async () => 'SCRIPT',
         helperTag: async () => 'devenv-helper:abc',
         socketPath: async () => '/var/run/docker.sock',
+        stateVolume: 'devenv-session-monitor',
       },
       REMOTE,
     );
@@ -358,6 +367,7 @@ describe('channelRunArgs and openHelperChannel', () => {
         script: async () => script,
         helperTag: async () => 'devenv-helper:abc',
         socketPath: async () => '/var/run/docker.sock',
+        stateVolume: 'devenv-session-monitor',
       },
       REMOTE,
     );
@@ -393,7 +403,7 @@ describe('channelRunArgs and openHelperChannel', () => {
     };
     await expect(
       openHelperChannel(
-        { start: () => process, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
+        { start: () => process, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
         REMOTE,
       ),
     ).rejects.toThrow('The helper channel to build-box does not reach Docker: permission denied while trying to connect to the Docker daemon socket');
@@ -403,7 +413,7 @@ describe('channelRunArgs and openHelperChannel', () => {
   it('fails to open without a Docker CLI', async () => {
     await expect(
       openHelperChannel(
-        { start: () => undefined, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
+        { start: () => undefined, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
         REMOTE,
       ),
     ).rejects.toMatchObject({ code: 'open' });
@@ -455,6 +465,7 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
         script: async () => 'S',
         helperTag: async () => 't',
         socketPath: async () => '/run/user/1000/docker.sock',
+        stateVolume: 'devenv-session-monitor',
       },
       target,
     );
@@ -485,6 +496,7 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
               script: async () => 'S',
               helperTag: async () => 't',
               socketPath: async () => '/var/run/docker.sock',
+              stateVolume: 'devenv-session-monitor',
             },
             target,
           ),
@@ -553,5 +565,55 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     const invalid = refreshChannel(['refresh'], async () => wrong);
     await expect(invalid.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'protocol' });
     invalid.channels.dispose();
+  });
+});
+
+// Plan step 5, PR B: HelperChannels.lock (user decisions D1 and D3).
+describe('HelperChannels.lock (plan step 5, PR B)', () => {
+  const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+
+  function lockingChannel(lock: (id: string, wait: number) => Promise<unknown>) {
+    return { ...fakeChannel(), lock: vi.fn(lock) };
+  }
+
+  it('user decision D1: ends the wait after a failed open and opens the worker for the lock', async () => {
+    const held = { environmentId: ID };
+    const channel = lockingChannel(async () => held);
+    const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'The helper channel could not be opened: no image.')).mockResolvedValueOnce(channel);
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    expect(await channels.get(REMOTE)).toBeUndefined();
+    // Within the wait after the failure, an explicit lock opens again.
+    expect(await channels.lock(REMOTE, ID, 10)).toBe(held);
+    expect(open).toHaveBeenCalledTimes(2);
+    expect(channel.lock).toHaveBeenCalledWith(ID, 10, undefined);
+    channels.dispose();
+  });
+
+  it('user decision D1: without a worker it throws unavailable with the cause of the failed open, and never goes on', async () => {
+    const open = vi.fn().mockRejectedValue(new HelperChannelError('open', 'The helper channel to build-box was closed: it reaches another Docker engine.'));
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    const error = await channels.lock(REMOTE, ID, 10).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EnvironmentLockError);
+    expect(error).toMatchObject({ kind: 'unavailable', message: expect.stringContaining('another Docker engine') });
+    const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
+    await expect(channels.lock(unsupported, ID, 10)).rejects.toMatchObject({ kind: 'unavailable' });
+    channels.dispose();
+  });
+
+  it('user decision D3: a busy lock of the worker is busy; any other failure is unavailable; an abort passes', async () => {
+    const busy = lockingChannel(async () => {
+      throw new HelperOperationError(LOCK_BUSY_CODE, 'held', false);
+    });
+    const channels = new HelperChannels({ open: async () => busy as unknown as HelperChannel, logger: silentLogger });
+    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ name: 'EnvironmentLockError', kind: 'busy' });
+    busy.lock.mockImplementationOnce(async () => {
+      throw new HelperChannelError('lost', 'lost');
+    });
+    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ kind: 'unavailable' });
+    busy.lock.mockImplementationOnce(async () => {
+      throw abortError();
+    });
+    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ name: 'AbortError' });
+    channels.dispose();
   });
 });

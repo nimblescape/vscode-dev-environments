@@ -26,6 +26,10 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-09-28 | **Names**: container named by its 8-hex short ID; the Docker context named after the SSH profile or host; image `devenv-<owner>-<repo>-<adjective>-<scientist>:<n>`. No compatibility for old names. |
 | 2026-09-29 | **Versions**: no migration code for files, windows, names or data until release; all container upgrade mechanisms stay and are exercised now (container version label and recreate, monitor label, local monitor protocol version, registry version). |
 | 2026-09-28 | Not planned: a Go agent on the host, Remote Tunnels, credential helpers that read the token through the worker, SSH ControlMaster settings. |
+| 2026-09-30 | **D1: a consistent state before every operation** (a general rule for every operation and every phase). Before any operation runs, the extension checks that the state is consistent and repairs it if not (for example, it builds a missing helper image and opens the worker). If it cannot be repaired, the operation is refused with a clear message that names the cause. The extension never works around an inconsistent state: no fallback to the direct path, no proceeding without the lock, and no treating unreadable state as "nothing there". This replaces the fallback to the direct path of the decision of 2026-09-28. Step 5, PR B applies it to Stop and Delete (the helper image, then the worker with the lock; the open backoff is cleared for this attempt; "Docker is not running" stays its own refusal); PR D applies it to the code that is already merged (section 5). |
+| 2026-09-30 | **D2: the lock in step 5 covers Stop and Delete only.** Start, Rebuild, Select configuration and Clone again take it in step 6, Switch branch in step 7, and the automatic stops in step 8, as each is moved into the worker. Until step 6, a Start from another computer is not locked against a Delete here. |
+| 2026-09-30 | **D3: a lock held by another window or computer** is waited for 10 s (`flock -w 10`); then the operation is refused with "…is busy with an operation from another window or computer; try again in a moment". No retry loop. |
+| 2026-09-30 | **Local and remote work the same.** "There is no reason why the remote and local environments shall work differently. All remote functionality is the same locally. Just targeting a different docker engine, that is switched via the context." The lock, the ensure-or-refuse step and the worker behave the same for the local and a remote Docker; the only difference is the Docker context and the engine that it points to. |
 
 ## 3. Steps
 
@@ -37,7 +41,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | merged (PR #64) |
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
-| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress: PR A routing merged (PR #71), PR C batched refresh merged (PR #72); PR B environment lock waits on decisions (section 4) |
+| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress: PR A routing merged (PR #71), PR C batched refresh merged (PR #72), PR B environment lock in review; PR D follows: it applies the rule D1 of 2026-09-30 to the merged code (section 5) |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again | queued |
 | 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
 | 8 | Worker: Session Monitor | heartbeats, "in use elsewhere", `forget`, automatic stops | queued |
@@ -50,11 +54,7 @@ Also merged outside this table: PR #68, a helper failure during an update fails 
 
 ## 4. Open decisions
 
-| # | Step | Question | Recommendation |
-|---|---|---|---|
-| D1 | 5 (PR B) | The lock needs a worker. When no worker can be opened (no helper image yet, Docker just started, the 5-minute backoff), should Stop and Delete go on without the host lock, or refuse? | Go on without it and log it once per host. The local busy mark still applies, as today. Refusing would block Delete while the helper image is missing. |
-| D2 | 5 (PR B) | Which operations take the lock in step 5? | Stop and Delete only. Start, Rebuild, Select configuration and Clone again take it in step 6, Switch branch in step 7, and the automatic stops in step 8, as each is moved into the worker. Until step 6, a Start from another computer is not locked against a Delete here, as today. |
-| D3 | 5 (PR B) | When another window or computer holds the lock, how long to wait? | Wait 10 s, then refuse with "…is busy with an operation from another window or computer; try again in a moment". No retry loop. |
+None. D1, D2 and D3 were decided on 2026-09-30 (section 2).
 
 Assumption to confirm (no change planned): the "hard deadline" of the 2026-09-28 decision is the worker's existing shutdown deadline (40 s) and exit timer (45 s); there is no absolute lifetime. A held lock operation has a 2-hour limit as a backstop.
 
@@ -64,6 +64,8 @@ Found in review and left on purpose, because the named step replaces the code (u
 
 | Gap | Effect | Replaced by |
 |---|---|---|
-| A session folder that cannot be read (permissions, disk error) reads as "no other window" | The other-window checks can pass when they should refuse | Environment lock (step 5, PR B) and the move of the operations into the worker (steps 5–8) |
+| A session folder that cannot be read (permissions, disk error) reads as "no other window" | The other-window checks can pass when they should refuse | Step 5, PR D (rule D1 of 2026-09-30: unreadable state is never "nothing there") |
+| The routing of PR A takes the direct path when no worker is available | Plain Docker calls of an operation run without the worker | Step 5, PR D (rule D1 of 2026-09-30: ensure the worker, or refuse) |
+| The refresh of PR C reads directly when no worker is available | The refresh runs without the worker | Step 5, PR D (rule D1 of 2026-09-30: ensure the worker, or refuse) |
 | A remote monitor restarted by Docker whose stored-script check is cut off by its exit is kept | The monitor stays in an exit-3 loop until the next open | Step 8 (the Session Monitor's work in the worker) |
 
