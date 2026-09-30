@@ -23,13 +23,14 @@ import {
   GIT_SUMMARY_TIMEOUT_MS,
   MAX_FAILED_TICKS,
   MonitorLoop,
+  defaultMeasureFromTickEnd,
   devContainerFirst,
   environmentLabel,
   type MonitorDocker,
   type MonitorLoopDeps,
   type TickResult,
 } from './monitorLoop';
-import { DOCKER_UNKNOWN_MAX_MS, SLEEP_GRACE_MS, TICK_MS } from './rules';
+import { DOCKER_UNKNOWN_MAX_MS, SLEEP_GAP_MS, SLEEP_GRACE_MS, TICK_MS } from './rules';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -679,6 +680,123 @@ describe('MonitorLoop.tick', () => {
     const results = await runUntil(h, wake + SLEEP_GRACE_MS + 3 * WAITING_MS, owner);
     expect(results.some((result) => result.end)).toBe(false);
     expect(h.docker.calls).toEqual([]);
+  });
+
+  // Plan step 4: the gap between two ticks is measured from the end of the previous tick.
+  describe('a tick that hangs in docker stop (plan step 4)', () => {
+    const HANG_MS = 5 * 60_000;
+    /** The fake run time (`uptime`): a hang advances it with the clock, a sleep does not. */
+    let uptime = 0;
+
+    beforeEach(() => {
+      uptime = 0;
+      h.loop = h.newLoop({ uptime: () => uptime, measureFromTickEnd: true });
+    });
+
+    /** Ticks until A is stopped; its `docker stop` takes HANG_MS. Returns the time at the end of that tick. */
+    async function hangingStop(): Promise<number> {
+      await closedWindowScenario(h);
+      h.docker.stopHook = async () => {
+        h.clock.advance(HANG_MS);
+        // PR #70 review round 1, A-R1-1: a hang runs on the monotonic clock too; without it, the hang counts as sleep.
+        uptime += HANG_MS;
+      };
+      for (;;) {
+        const result = await h.loop.tick();
+        if (result.stopped.length > 0) {
+          expect(result.stopped).toEqual([ID_A]);
+          return h.clock.time;
+        }
+        expect(h.clock.time).toBeLessThan(T0 + 2 * 60_000);
+        h.clock.advance(TICK_MS);
+        uptime += TICK_MS;
+      }
+    }
+
+    it('does not start the sleep grace when the next tick follows after a normal interval', async () => {
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(end);
+      h.docker.stopHook = undefined;
+      h.clock.advance(TICK_MS);
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBeUndefined();
+    });
+
+    it('still starts the sleep grace after a real gap between the end of the tick and the next one', async () => {
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(end);
+      h.docker.stopHook = undefined;
+      h.clock.advance(SLEEP_GAP_MS + 1);
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBe(end + SLEEP_GAP_MS + 1 + SLEEP_GRACE_MS);
+    });
+
+    // PR #70 review round 1, A-R1-1.
+    it('starts the sleep grace after the computer slept during a tick', async () => {
+      await closedWindowScenario(h);
+      h.docker.stopHook = async () => {
+        // A sleep of 10 minutes: the wall clock moves, the monotonic clock does not.
+        h.clock.advance(10 * 60_000);
+      };
+      for (;;) {
+        const result = await h.loop.tick();
+        if (result.stopped.length > 0) break;
+        expect(h.clock.time).toBeLessThan(T0 + 2 * 60_000);
+        h.clock.advance(TICK_MS);
+        uptime += TICK_MS;
+      }
+      h.docker.stopHook = undefined;
+      h.clock.advance(TICK_MS);
+      uptime += TICK_MS;
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBe(h.clock.time + SLEEP_GRACE_MS);
+    });
+
+    // PR #70 review round 1, A-R1-2.
+    it('starts the sleep grace after a sleep when the first tick after it failed', async () => {
+      await closedWindowScenario(h);
+      await h.loop.tick();
+      expect(h.loop.state.lastTickAt).toBe(T0);
+      h.clock.advance(30 * 60_000);
+      h.beforeReadWindows = async () => {
+        h.beforeReadWindows = undefined;
+        throw new Error('EMFILE');
+      };
+      await expect(h.loop.tick()).rejects.toThrow('EMFILE');
+      expect(h.loop.state.lastTickAt).toBe(T0);
+      h.clock.advance(TICK_MS);
+      uptime += TICK_MS;
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBe(h.clock.time + SLEEP_GRACE_MS);
+    });
+
+    // PR #70 review round 2 (B-R2-1): the default is off only on Windows, where performance.now() counts sleep.
+    it('measures from the end of the tick by default except on Windows', () => {
+      expect(defaultMeasureFromTickEnd('win32')).toBe(false);
+      expect(defaultMeasureFromTickEnd('linux')).toBe(true);
+      expect(defaultMeasureFromTickEnd('darwin')).toBe(true);
+      // PR #70 review round 3 (B-R3-1/2): the call without an argument uses the platform of this process.
+      expect(defaultMeasureFromTickEnd()).toBe(process.platform !== 'win32');
+    });
+
+    // PR #70 review round 2 (B-R2-1): a loop without the setting uses the default of this platform.
+    it('uses the platform default when measureFromTickEnd is not given', async () => {
+      h.loop = h.newLoop({ uptime: () => uptime });
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(defaultMeasureFromTickEnd() ? end : end - HANG_MS);
+      h.docker.stopHook = undefined;
+    });
+
+    // PR #70 review round 1: on Windows, performance.now() counts sleep, so the gap is measured from the tick start.
+    it('measures the gap from the start of the previous tick when measureFromTickEnd is false', async () => {
+      h.loop = h.newLoop({ uptime: () => uptime, measureFromTickEnd: false });
+      const end = await hangingStop();
+      expect(h.loop.state.lastTickAt).toBe(end - HANG_MS);
+      h.docker.stopHook = undefined;
+      h.clock.advance(TICK_MS);
+      await h.loop.tick();
+      expect(h.loop.state.sleepGraceUntil).toBe(h.clock.time + SLEEP_GRACE_MS);
+    });
   });
 
   it('removes status files of ended windows after the waiting time, but not a file that was written again', async () => {

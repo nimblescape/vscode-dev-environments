@@ -19,6 +19,7 @@ import {
   SLEEP_GRACE_MS,
   sleepGraceAt,
   STOPPED_RECHECK_MS,
+  tickEnded,
   TICK_MS,
   waitingTimeMs,
   type DecideInput,
@@ -426,6 +427,39 @@ describe('sleep rule', () => {
     for (const [index, state] of states.entries()) {
       expect(computeInUse({ ...input, now, state }).inUse.has('A')).toBe(graces[index]);
     }
+  });
+
+  // Plan step 4: the gap is measured from the end of the previous tick (tickEnded), not from its start.
+  describe('the gap from the end of the previous tick (plan step 4)', () => {
+    const input = { environments: [env('A')], windows: [staleWindow], pendings: [] };
+    const HANG_MS = 5 * 60_000;
+
+    it('a tick that took 5 minutes, followed by a normal interval, does not start the grace', () => {
+      const end = now - TICK_MS;
+      const previous = runningState(end - HANG_MS);
+      const copy = structuredClone(previous);
+      const state = tickEnded(previous, end);
+      expect(state.lastTickAt).toBe(end);
+      expect(previous).toEqual(copy);
+      const result = computeInUse({ ...input, now, state });
+      expect(result.state.sleepGraceUntil).toBeUndefined();
+      expect(result.inUse.has('A')).toBe(false);
+      expect(sleepGraceAt(state, now)).toBe(false);
+    });
+
+    it('a gap of more than SLEEP_GAP_MS between the end of the previous tick and this one still starts the grace', () => {
+      const end = now - SLEEP_GAP_MS - 1;
+      const state = tickEnded(runningState(end - HANG_MS), end);
+      expect(state.lastTickAt).toBe(end);
+      const result = computeInUse({ ...input, now, state });
+      expect(result.state.sleepGraceUntil).toBe(now + SLEEP_GRACE_MS);
+      expect(result.inUse.has('A')).toBe(true);
+      expect(sleepGraceAt(state, now)).toBe(true);
+      // A state before the first decide keeps the grace of the first tick.
+      const first = tickEnded(initialMonitorState(), end);
+      expect(first.lastTickAt).toBeUndefined();
+      expect(computeInUse({ ...input, now, state: first }).state.sleepGraceUntil).toBe(now + SLEEP_GRACE_MS);
+    });
   });
 
   it('gives the same decision with the previous state and with the state of computeInUse', () => {

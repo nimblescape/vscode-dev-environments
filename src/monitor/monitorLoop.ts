@@ -52,6 +52,7 @@ import {
   remoteStopAfterSeconds,
   sleepGraceAt,
   TICK_MS,
+  tickEnded,
   waitingTimeMs,
   type MonitorDecision,
   type MonitorEnvironment,
@@ -152,8 +153,21 @@ export interface MonitorLoopDeps {
    * Its errors are logged; they never fail a tick. Without it: no sweep.
    */
   sweep?: () => Promise<void>;
-  /** The run time for the sweep (a monotonic clock, not the wall clock). Default: performance.now(). */
+  /**
+   * The run time (a monotonic clock, not the wall clock) for the sweep and for the length of a tick (plan step 4).
+   * Default: performance.now(), which does not count computer sleep on macOS and Linux.
+   */
   uptime?: () => number;
+  /**
+   * Plan step 4: the next tick measures its gap from the end of this tick instead of its start. Default: not on
+   * Windows, where performance.now() counts computer sleep, so a sleep during a tick could not be told from a hang.
+   */
+  measureFromTickEnd?: boolean;
+}
+
+/** PR #70 review round 2 (B-R2-1): the default of `measureFromTickEnd`, not on Windows. */
+export function defaultMeasureFromTickEnd(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32';
 }
 
 /** Why the monitor ends. */
@@ -200,6 +214,8 @@ export class MonitorLoop {
   private readonly isAlive: (pid: number) => boolean;
   private readonly tickMs: number;
   private readonly delay: (ms: number, signal: AbortSignal) => Promise<void>;
+  private readonly uptime: () => number;
+  private readonly measureFromTickEnd: boolean;
   private readonly abort = new AbortController();
   private monitorState: MonitorState = initialMonitorState();
   private readonly stopRetries = new Map<string, StopRetry>();
@@ -226,6 +242,8 @@ export class MonitorLoop {
     this.isAlive = deps.isAlive ?? isProcessAlive;
     this.tickMs = deps.tickMs ?? TICK_MS;
     this.delay = deps.delay ?? sleep;
+    this.uptime = deps.uptime ?? (() => performance.now());
+    this.measureFromTickEnd = deps.measureFromTickEnd ?? defaultMeasureFromTickEnd();
   }
 
   /** State of the rules after the last tick. */
@@ -277,12 +295,20 @@ export class MonitorLoop {
     }
     await this.sweepWhenDue();
     const now = this.clock.now();
+    const uptimeAtStart = this.uptime();
     const settings = (await this.deps.sessionFiles.readMonitorSettings()) ?? defaultMonitorSettings();
     const run = async (target: DockerTarget): Promise<TickResult> => {
       this.tickTarget = target;
       try {
         return await this.tickOn(target, now, settings);
       } finally {
+        // Plan step 4: the next tick measures its gap from the end of this one, so a hanging `docker stop` is not taken
+        // for sleep. The end is the start plus the run time of the tick (`uptime`), so a sleep or a forward clock jump
+        // during the tick stays in the gap (PR #70 review round 1, A-R1-1). Only after `decide` ran for this tick: a
+        // tick that failed before leaves the state as it is (A-R1-2).
+        if (this.measureFromTickEnd && this.monitorState.lastTickAt === now) {
+          this.monitorState = tickEnded(this.monitorState, Math.min(this.clock.now(), now + (this.uptime() - uptimeAtStart)));
+        }
         this.tickTarget = LOCAL_DOCKER_TARGET;
         this.tickHeartbeat = undefined;
       }
@@ -298,7 +324,7 @@ export class MonitorLoop {
   private async sweepWhenDue(): Promise<void> {
     const { sweep } = this.deps;
     if (!sweep) return;
-    const uptime = (this.deps.uptime ?? (() => performance.now()))();
+    const uptime = this.uptime();
     if (this.lastSweepAt !== undefined && uptime - this.lastSweepAt < STORAGE_SWEEP_INTERVAL_MS) return;
     this.lastSweepAt = uptime;
     try {
