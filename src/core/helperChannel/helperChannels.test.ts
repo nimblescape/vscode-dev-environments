@@ -643,11 +643,17 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     const checkPresent = vi.fn(async () => {});
     const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
     await expect(channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable', message: 'no image.' });
-    // Within the wait after the failed open, the next refresh opens again.
+    // PR #76 review round 2 (A-R2-1): within the wait after the failed open, the next refresh is refused with the cause
+    // and opens nothing (was: it opened again at once).
+    await expect(channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable', message: 'no image.' });
+    expect(open).toHaveBeenCalledTimes(1);
+    // An operation (a Docker call) opens again at once; the refresh then uses that worker.
+    await channels.docker(LOCAL_DOCKER_TARGET, ['ps']);
     expect(await channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
-    // PR #76 review round 1 (A-R1-1, A-R1-2): checked, never prepared (was: prepared twice).
+    // PR #76 review round 1 (A-R1-1, A-R1-2): checked, never prepared by the refresh (was: prepared twice); the Docker
+    // call prepared once.
     expect(checkPresent).toHaveBeenCalledTimes(2);
-    expect(prepare).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledTimes(2);
     channels.dispose();
     const refused = new HelperChannels({
@@ -663,7 +669,7 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
       message: 'the helper image could not be prepared: Cannot connect to the Docker daemon',
     });
     expect(open).toHaveBeenCalledTimes(2);
-    expect(prepare).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledTimes(1);
     refused.dispose();
   });
 
@@ -690,6 +696,49 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(checkPresent).toHaveBeenCalledTimes(5);
     channels.dispose();
+  });
+
+  // PR #76 review round 2 (B-R2-1): the refresh that is sent once more after its channel closed makes the new worker ready
+  // the way of the refresh too: it checks the helper image, and never prepares (builds) it.
+  it('the refresh sent once more after a closed channel checks the helper image and never prepares it', async () => {
+    const first = Object.assign(fakeChannel(), { operations: ['refresh'], operation: vi.fn() });
+    first.operation.mockImplementationOnce(async () => {
+      first.close();
+      throw new HelperChannelError('closed', 'not sent');
+    });
+    const second = Object.assign(fakeChannel(), { operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) });
+    const open = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+    const prepare = vi.fn(async () => {});
+    const checkPresent = vi.fn(async () => {});
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
+    expect(await channels.refresh(REMOTE, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
+    expect(open).toHaveBeenCalledTimes(2);
+    expect(checkPresent).toHaveBeenCalledTimes(2);
+    expect(prepare).not.toHaveBeenCalled();
+    channels.dispose();
+  });
+
+  // PR #76 review round 2 (A-R2-1): a worker that cannot be opened is opened again by the refresh only after the wait
+  // (CHANNEL_RETRY_AFTER_FAILURE_MS), never by each refresh; the first refresh (no failure yet) opens it.
+  it('a worker that cannot be opened is not opened again by each refresh within the wait after the failure', async () => {
+    const open = vi.fn(async (): Promise<HelperChannel> => {
+      throw new HelperChannelError('open', 'The worker on build-box answered from another Docker engine.');
+    });
+    const checkPresent = vi.fn(async () => {});
+    const channels = new HelperChannels({ open, prepare: vi.fn(async () => {}), checkPresent, logger: silentLogger });
+    for (let i = 0; i < 5; i++) {
+      await expect(channels.refresh(REMOTE, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({
+        code: 'unavailable',
+        message: 'The worker on build-box answered from another Docker engine.',
+      });
+    }
+    expect(open).toHaveBeenCalledTimes(1);
+    channels.dispose();
+    const noWait = new HelperChannels({ open, checkPresent, logger: silentLogger, retryAfterFailureMs: 0 });
+    await expect(noWait.refresh(REMOTE, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable' });
+    await expect(noWait.refresh(REMOTE, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable' });
+    expect(open).toHaveBeenCalledTimes(3);
+    noWait.dispose();
   });
 
   it('rejects when the worker failed or answered with an invalid value', async () => {

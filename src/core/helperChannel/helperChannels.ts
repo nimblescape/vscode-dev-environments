@@ -309,7 +309,8 @@ export class HelperChannels {
   /**
    * Plan step 5, PR D (rule D1 of 2026-09-30): the open channel to the engine of `target`, made ready now if needed: when
    * none is open, first `prepare` (the helper image; `checkPresent` when `passive`, for the refresh), then the open in
-   * full (openInFull). Throws
+   * full (openInFull; when `passive`, the open that keeps the wait after a failed open, PR #76 review round 2, A-R2-1).
+   * Throws
    * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts.
    */
   private async ready(target: DockerTarget, signal: AbortSignal | undefined, passive = false): Promise<HelperChannel> {
@@ -328,6 +329,14 @@ export class HelperChannels {
         this.options.logger.warn(`The helper image for the worker on ${engineName(target)} could not be prepared: ${cause}`);
         throw new HelperChannelError('unavailable', `the helper image could not be prepared: ${cause}`);
       }
+    }
+    if (passive) {
+      // PR #76 review round 2 (A-R2-1): the refresh keeps the wait after a failed open (CHANNEL_RETRY_AFTER_FAILURE_MS):
+      // within it, it is refused at once; only an operation (docker, lock) opens again at once (openInFull).
+      const channel = await this.get(target, { signal });
+      if (channel !== undefined) return channel;
+      this.refuseUnsupported(target);
+      throw new HelperChannelError('unavailable', this.entries.get(keyOf(target))?.failure ?? 'the worker could not be opened');
     }
     return this.openInFull(target, signal);
   }
