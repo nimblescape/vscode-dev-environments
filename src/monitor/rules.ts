@@ -79,7 +79,8 @@ export interface MonitorEnvironment {
 export interface MonitorState {
   /**
    * Time of the previous tick: `decide` sets its start, `tickEnded` its end (plan step 4: a tick that hangs, for example
-   * in a `docker stop`, is not taken for computer sleep).
+   * in a `docker stop`, is not taken for computer sleep). MonitorLoop sets the end to the start plus the run time of the
+   * tick, and not on Windows (PR #70 review round 1).
    */
   lastTickAt?: number;
   /** Until this time, active windows with a live process count as in use, whatever the age of `updatedAt`. */
