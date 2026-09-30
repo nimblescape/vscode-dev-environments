@@ -26,7 +26,10 @@
 // of the operation, never by a name, so no container that the operation did not start can be removed).
 import { createHash, randomBytes } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../names';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
+import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
+import { isStorageId } from '../storage/paths';
+import type { ContainerState } from '../types';
 
 export { LABEL_HELPER_CHANNEL };
 
@@ -503,4 +506,107 @@ export function parseProbeValue(value: unknown): ProbeValue | undefined {
   if (value.serverVersion !== undefined) probe.serverVersion = value.serverVersion as string;
   if (value.engine !== undefined) probe.engine = value.engine as string;
   return probe;
+}
+
+// ---- Plan step 5, PR C: the batched refresh ----
+
+/**
+ * `refresh`: readEnvironmentStates (src/core/pipeline/refreshStates.ts) in the worker: the containers and volumes of the
+ * environments and the branches of their running dev containers, in one operation. It only reads; it carries no
+ * secret. Parameters RefreshParams, value RefreshValue.
+ */
+export const OP_REFRESH = 'refresh';
+/** The most environments of one refresh (more: the refresh runs without the worker). */
+export const MAX_REFRESH_ENVIRONMENTS = 200;
+/** The longest branch name of a RefreshValue. */
+export const MAX_REFRESH_BRANCH_LENGTH = 1_024;
+
+export interface RefreshParams {
+  environments: StateEnvironment[];
+}
+
+export interface RefreshValue {
+  runtime: Array<{ id: string; container: ContainerState; volume: boolean; servicesRunning?: true }>;
+  branches: Array<{ id: string; branch: string }>;
+}
+
+/** A container or volume name that Docker accepts, never an option. */
+const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
+/** The user of `docker exec -u`: no white space, never an option. */
+const EXEC_USER = /^[^\s\0-][^\s\0]{0,255}$/;
+/** repositoryFolder: `/workspaces/<name of the repository>`. */
+const REPOSITORY_FOLDER = new RegExp(`^${WORKSPACES_ROOT}/(?!\\.\\.?$)[^/\\s\\0]{1,255}$`);
+
+function parseStateEnvironment(value: unknown): StateEnvironment | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'containerName', 'volumeName', 'folder', 'branch'], ['user'])) return undefined;
+  const { id, containerName, volumeName, user, folder, branch } = value;
+  if (!isStorageId(id) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
+  if (typeof volumeName !== 'string' || !DOCKER_NAME.test(volumeName)) return undefined;
+  if (typeof folder !== 'string' || !REPOSITORY_FOLDER.test(folder) || typeof branch !== 'boolean') return undefined;
+  if (user !== undefined && (typeof user !== 'string' || !EXEC_USER.test(user))) return undefined;
+  const env: StateEnvironment = { id, containerName, volumeName, folder, branch };
+  if (user !== undefined) env.user = user;
+  return env;
+}
+
+/**
+ * The strict check of RefreshParams (both sides: the extension checks what it sends, so a list beyond the check is read
+ * without the worker): at most MAX_REFRESH_ENVIRONMENTS environments with distinct IDs.
+ */
+export function parseRefreshParams(value: unknown): RefreshParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environments']) || !Array.isArray(value.environments)) return undefined;
+  const list: unknown[] = value.environments;
+  if (list.length > MAX_REFRESH_ENVIRONMENTS) return undefined;
+  const environments: StateEnvironment[] = [];
+  const ids = new Set<string>();
+  for (const item of list) {
+    const env = parseStateEnvironment(item);
+    if (env === undefined || ids.has(env.id)) return undefined;
+    ids.add(env.id);
+    environments.push(env);
+  }
+  return { environments };
+}
+
+/** The value of `refresh` from the states of readEnvironmentStates. */
+export function refreshValue(states: EnvironmentStates): RefreshValue {
+  return {
+    runtime: [...states.runtime].map(([id, state]) => ({
+      id,
+      container: state.container,
+      volume: state.volume,
+      ...(state.servicesRunning === true ? { servicesRunning: true as const } : {}),
+    })),
+    branches: [...states.branches].map(([id, branch]) => ({ id, branch })),
+  };
+}
+
+/**
+ * The strict check of RefreshValue against its parameters (the extension): one state for each environment and no
+ * other, and branches only of the running dev containers whose branch was asked for. Undefined for anything else.
+ */
+export function parseRefreshValue(value: unknown, params: RefreshParams): EnvironmentStates | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['runtime', 'branches'])) return undefined;
+  const { runtime, branches } = value;
+  if (!Array.isArray(runtime) || !Array.isArray(branches)) return undefined;
+  const asked = new Map(params.environments.map((env) => [env.id, env]));
+  const states: EnvironmentStates = { runtime: new Map(), branches: new Map() };
+  for (const item of runtime as unknown[]) {
+    if (!isRecord(item) || !hasOnlyKeys(item, ['id', 'container', 'volume'], ['servicesRunning'])) return undefined;
+    const { id, container, volume, servicesRunning } = item;
+    if (typeof id !== 'string' || !asked.has(id) || states.runtime.has(id)) return undefined;
+    if (container !== 'running' && container !== 'stopped' && container !== 'missing') return undefined;
+    if (typeof volume !== 'boolean' || (servicesRunning !== undefined && servicesRunning !== true)) return undefined;
+    states.runtime.set(id, servicesRunning === true ? { container, volume, servicesRunning: true } : { container, volume });
+  }
+  if (states.runtime.size !== asked.size) return undefined;
+  for (const item of branches as unknown[]) {
+    if (!isRecord(item) || !hasOnlyKeys(item, ['id', 'branch'])) return undefined;
+    const { id, branch } = item;
+    if (typeof id !== 'string' || asked.get(id)?.branch !== true || states.runtime.get(id)?.container !== 'running') return undefined;
+    if (states.branches.has(id) || typeof branch !== 'string' || branch === '' || branch.length > MAX_REFRESH_BRANCH_LENGTH) return undefined;
+    if (branch !== branch.trim() || /[\0\n\r]/.test(branch)) return undefined;
+    states.branches.set(id, branch);
+  }
+  return states;
 }

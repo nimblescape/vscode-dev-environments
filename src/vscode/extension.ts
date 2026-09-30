@@ -361,6 +361,12 @@ async function activateExtension(
     auth,
     // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
     viewer: (token, signal) => discovery.viewer(token, signal),
+    // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker of the Docker target of the operation
+    // (none outside of an operation: the refresh reads directly then).
+    workerRefresh: async (environments) => {
+      const target = operationDockerTarget();
+      return target === undefined ? undefined : channels.refresh(target, environments);
+    },
     ui,
     logger,
     clock: systemClock,
@@ -451,6 +457,7 @@ async function activateExtension(
     settings: getSettings,
     dockerSetupRequired: () => setup.setupRequired,
     dockerHost: () => targets.host(),
+    dockerTargets: targets,
     view,
   });
   setup.initialize();

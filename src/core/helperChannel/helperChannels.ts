@@ -21,11 +21,18 @@ import {
   ENGINE_IDENTITY_ARGS,
   LABEL_HELPER_CHANNEL,
   OP_PROBE,
+  OP_REFRESH,
   OP_SWEEP,
   channelLabelValue,
   engineIdentity,
   parseProbeValue,
+  parseRefreshParams,
+  parseRefreshValue,
 } from './protocol';
+import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
+
+/** Plan step 5, PR C: the time limit of the operation `refresh`. */
+export const CHANNEL_REFRESH_TIMEOUT_MS = 5 * 60_000;
 
 /** After a channel could not be opened, the next attempt for that host waits this long. */
 export const CHANNEL_RETRY_AFTER_FAILURE_MS = 5 * 60_000;
@@ -289,6 +296,29 @@ export class HelperChannels {
       if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;
       throw error;
     }
+  }
+
+  /**
+   * Plan step 5, PR C: readEnvironmentStates in the worker of `target` (the operation `refresh`), with the strict checks of
+   * its parameters and its value (protocol.ts). Undefined when it is not sent: no channel, a channel without `refresh`
+   * (an older script), parameters beyond the check, or the channel closed before; the caller then reads directly.
+   * Rejects when it was sent and failed, or answered with an invalid value; it only reads, so the caller may read again.
+   */
+  async refresh(target: DockerTarget, environments: readonly StateEnvironment[]): Promise<EnvironmentStates | undefined> {
+    const params = parseRefreshParams({ environments });
+    if (params === undefined) return undefined;
+    const channel = await this.get(target, { waitMs: CHANNEL_OPEN_WAIT_MS });
+    if (channel === undefined || !channel.operations.includes(OP_REFRESH)) return undefined;
+    let value: unknown;
+    try {
+      value = await channel.operation(OP_REFRESH, params, { timeoutMs: CHANNEL_REFRESH_TIMEOUT_MS });
+    } catch (error) {
+      if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;
+      throw error;
+    }
+    const states = parseRefreshValue(value, params);
+    if (states === undefined) throw new HelperChannelError('protocol', 'The worker answered the refresh with an invalid value.');
+    return states;
   }
 
   /** Closes the channels without an operation for CHANNEL_IDLE_CLOSE_MS. */

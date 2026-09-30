@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
+import { LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
+import { operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { StateTexts } from '../core/messages';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -25,7 +27,7 @@ import {
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { parseRepositoryGroups } from './repositoryGroups';
 import { buildGroupsPreview, entriesFromSetting } from './repositoryGroupsEditorModel';
-import { TreeTexts, buildTreeModel, repositoryRows, type OwnerGroup, type RepositoryRow } from './treeModel';
+import { TreeTexts, buildTreeModel, repositoryRows, type EnvironmentRuntime, type OwnerGroup, type RepositoryRow } from './treeModel';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -97,7 +99,8 @@ interface Harness {
   /** The Docker setup is required (the view gets an empty model). */
   setupRequired: { value: boolean };
   coordinator: { environmentId: string | null; otherActiveWindows: ReturnType<typeof vi.fn<() => Promise<WindowStatus[]>>> };
-  service: { inspectStates: ReturnType<typeof vi.fn>; currentBranch: ReturnType<typeof vi.fn> };
+  // Plan step 5, PR C: the sidebar reads the states and the branches with one call (refreshStates).
+  service: { refreshStates: ReturnType<typeof vi.fn> };
   docker: { isInstalled: ReturnType<typeof vi.fn>; isRunning: ReturnType<typeof vi.fn> };
   discovery: { loadStored: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; getRepository: ReturnType<typeof vi.fn> };
   auth: {
@@ -115,6 +118,8 @@ interface Harness {
   dockerHost: { value: string };
   /** The registered tree view of the repositories; a test can show it. */
   view: { visible: boolean };
+  /** Plan step 5, PR C: DockerTargets.withOperation (on the local Docker). */
+  dockerTargets: { withOperation: ReturnType<typeof vi.fn> };
 }
 
 function createHarness(): Harness {
@@ -137,8 +142,15 @@ function createHarness(): Harness {
     getModel: () => models[models.length - 1] ?? [],
   };
   const coordinator = { environmentId: null as string | null, otherActiveWindows: vi.fn(async (): Promise<WindowStatus[]> => []) };
-  const service = { inspectStates: vi.fn(async () => undefined), currentBranch: vi.fn(async () => undefined) };
+  // Plan step 5, PR C: one call for the states and the branches (before: inspectStates and currentBranch per container).
+  const service = {
+    refreshStates: vi.fn(async (_branchIds: ReadonlySet<string>): Promise<{ runtime: Map<string, EnvironmentRuntime> | undefined; branches: Map<string, string> }> => ({
+      runtime: undefined,
+      branches: new Map(),
+    })),
+  };
   const docker = { isInstalled: vi.fn(() => true), isRunning: vi.fn(async () => true) };
+  const dockerTargets = { withOperation: vi.fn(async <T>(fn: () => Promise<T>) => runWithDockerTarget(LOCAL_DOCKER_TARGET, fn)) };
   const discovery = {
     loadStored: vi.fn(async () => undefined),
     refresh: vi.fn(async () => data([info('acme/api')])),
@@ -172,6 +184,7 @@ function createHarness(): Harness {
     settings: () => settings,
     dockerSetupRequired: () => setupRequired.value,
     dockerHost: async () => dockerHost.value,
+    dockerTargets,
     view,
     clock,
     isAlive: (pid: number) => pid === process.pid,
@@ -194,6 +207,7 @@ function createHarness(): Harness {
     clock,
     dockerHost,
     view,
+    dockerTargets,
   };
 }
 
@@ -353,7 +367,8 @@ describe('Sidebar', () => {
     await h.sidebar.render();
     expect(rowOf('acme/api').state).toBe('connected');
 
-    h.service.inspectStates.mockResolvedValue(undefined);
+    // Plan step 5, PR C: refreshStates instead of inspectStates.
+    h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map() });
     h.docker.isRunning.mockResolvedValue(false);
     await h.sidebar.refreshStates();
     expect(rowOf('acme/api').state).toBe('stopped');
@@ -363,10 +378,11 @@ describe('Sidebar', () => {
   it('falls back to the states of the registry when Docker runs but its answer could not be read', async () => {
     await h.registry.add(environment(API, 'acme/api'));
     await signedIn();
-    h.service.inspectStates.mockResolvedValueOnce(new Map([[API, { container: 'running', volume: true }]]));
+    // Plan step 5, PR C: refreshStates instead of inspectStates.
+    h.service.refreshStates.mockResolvedValueOnce({ runtime: new Map([[API, { container: 'running', volume: true }]]), branches: new Map() });
     await h.sidebar.refreshStates();
     expect(rowOf('acme/api').state).toBe('running');
-    h.service.inspectStates.mockResolvedValueOnce(undefined);
+    h.service.refreshStates.mockResolvedValueOnce({ runtime: undefined, branches: new Map() });
     await h.sidebar.refreshStates();
     expect(rowOf('acme/api').state).toBe('stopped');
   });
@@ -374,14 +390,34 @@ describe('Sidebar', () => {
   it('reads the branch of running containers when it refreshes the states', async () => {
     await h.registry.add(environment(API, 'acme/api', { gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) } }));
     await signedIn();
-    h.service.inspectStates.mockResolvedValue(new Map([[API, { container: 'running', volume: true }]]));
-    h.service.currentBranch.mockResolvedValue('feature-x');
+    // Plan step 5, PR C: the branch comes with the states from one refreshStates call (before: currentBranch).
+    h.service.refreshStates.mockResolvedValue({ runtime: new Map([[API, { container: 'running', volume: true }]]), branches: new Map([[API, 'feature-x']]) });
     const refreshed = vi.fn();
     h.sidebar.onDidRefreshStates(refreshed);
     await h.sidebar.refreshStates();
+    expect(h.service.refreshStates).toHaveBeenCalledTimes(1);
+    expect(h.service.refreshStates).toHaveBeenCalledWith(new Set([API]));
     expect(rowOf('acme/api').branch).toBe('feature-x');
     expect(h.sidebar.liveBranch(API)).toBe('feature-x');
     expect(refreshed).toHaveBeenCalled();
+  });
+
+  it('plan step 5, PR C: reads the states and branches with one call, within one operation of the Docker target', async () => {
+    await h.registry.add(environment(API, 'acme/api'));
+    await signedIn();
+    const targets: unknown[] = [];
+    h.service.refreshStates.mockClear();
+    h.service.refreshStates.mockImplementation(async () => {
+      targets.push(operationDockerTarget());
+      return { runtime: new Map([[API, { container: 'running', volume: true }]]), branches: new Map([[API, 'feature-y']]) };
+    });
+    h.dockerTargets.withOperation.mockClear();
+    await h.sidebar.refreshStates();
+    expect(h.service.refreshStates).toHaveBeenCalledTimes(1);
+    expect(h.dockerTargets.withOperation).toHaveBeenCalledTimes(1);
+    expect(targets).toEqual([LOCAL_DOCKER_TARGET]);
+    expect(rowOf('acme/api').state).toBe('running');
+    expect(h.sidebar.liveBranch(API)).toBe('feature-y');
   });
 
   it('shows Updating only for busy marks of live windows with a recent status file', async () => {
@@ -456,9 +492,15 @@ describe('Sidebar', () => {
     expect((await h.sidebar.availableEnvironments()).map((entry) => entry.id)).toEqual([API]);
     // No lookup on GitHub for a hidden environment, and no branch read in its container.
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
-    h.service.inspectStates.mockResolvedValue(new Map([[OLD, { container: 'running', volume: true }], [API, { container: 'running', volume: true }]]));
+    // Plan step 5, PR C: the branches are asked for the environments of the account only (before: currentBranch was
+    // called for API alone); the service reads a branch only for the IDs it gets (environmentService.test.ts).
+    h.service.refreshStates.mockClear();
+    h.service.refreshStates.mockResolvedValue({
+      runtime: new Map([[OLD, { container: 'running', volume: true }], [API, { container: 'running', volume: true }]]),
+      branches: new Map(),
+    });
     await h.sidebar.refreshStates();
-    expect(h.service.currentBranch.mock.calls.map((call) => call[0])).toEqual([API]);
+    expect(h.service.refreshStates.mock.calls.map((call) => [...(call[0] as ReadonlySet<string>)])).toEqual([[API]]);
   });
 
   it('offers Start for a listed repository that has an environment of another account, and names it nowhere (D-3)', async () => {

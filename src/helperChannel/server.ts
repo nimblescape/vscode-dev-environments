@@ -83,6 +83,8 @@ export interface ContextDockerOptions {
   cleanup?: string;
   /** Pipe its output to the log of the extension as it comes (the tools of a step; not data that it parses). */
   stream?: boolean;
+  /** Plan step 5, PR C: ends this call alone (SIGTERM, then SIGKILL), for example after its own time limit. */
+  signal?: AbortSignal;
 }
 
 /** What an operation can do. Every Docker call ends when the operation is cancelled. */
@@ -438,7 +440,11 @@ export class ChannelServer {
     }
     // Cancelled while the call started.
     if (run.controller.signal.aborted) this.terminate(child);
+    const endCall = () => this.terminate(child);
+    if (options.signal?.aborted) endCall();
+    else options.signal?.addEventListener('abort', endCall, { once: true });
     const { exitCode, error } = await child.exited;
+    options.signal?.removeEventListener('abort', endCall);
     run.children.delete(child);
     streamed?.stdout.flush();
     streamed?.stderr.flush();

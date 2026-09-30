@@ -100,6 +100,7 @@ import {
   splitRepository,
 } from '../names';
 import { isAvailableTo, ownerOf } from '../ownership';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -410,6 +411,11 @@ export interface EnvironmentServiceDeps {
    * (WorkerConfigurationAnalyzer); a failed analysis refuses the configuration.
    */
   analyzer: ConfigurationAnalyzer;
+  /**
+   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target of the operation (HelperChannels.refresh).
+   * Undefined, or a result of undefined: no worker with the operation `refresh`; the states are read directly.
+   */
+  workerRefresh?: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates | undefined>;
 }
 
 export interface RepositoryTarget {
@@ -454,17 +460,8 @@ export interface OpenResult {
   remoteWorkspaceFolder: string;
 }
 
-export interface EnvironmentRuntimeState {
-  /** Review round 7, P7-2: the state of the dev container only (isDevContainer), not of the other services. */
-  container: ContainerState;
-  volume: boolean;
-  /**
-   * Review round 7, P7-2: `true` when a container of another service of Docker Compose (label
-   * nimblescape.devenv.compose-service) runs; not set otherwise. Stop stays offered while it runs, also when the dev
-   * container is stopped.
-   */
-  servicesRunning?: boolean;
-}
+/** Plan step 5, PR C: moved to ./refreshStates (shared with the worker). */
+export type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment };
 
 /** MAX_REFUSED_ITEMS_LENGTH of ./pipelineRules (hotfix review 3, C3-2; review 4, Q3). */
 export { MAX_REFUSED_ITEMS_LENGTH };
@@ -489,7 +486,6 @@ const DEFAULT_BUSY_WAIT_MS = 10_000;
 const DEFAULT_PENDING_REFRESH_MS = 15_000;
 const IMAGE_INSPECT_TIMEOUT_MS = 60_000;
 const GIT_EXEC_TIMEOUT_MS = 30_000;
-const BRANCH_EXEC_TIMEOUT_MS = 15_000;
 const OWNERSHIP_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_START_TIMEOUT_MS = 60_000;
 /**
@@ -5868,48 +5864,51 @@ export class EnvironmentService {
 
   /**
    * Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. Review
-   * D2: no Docker call at all on an endpoint that is neither local nor SSH; its (empty) map of states.
+   * D2: no Docker call at all on an endpoint that is neither local nor SSH; its (empty) map of states. Plan step 5, PR C:
+   * refreshStates without branches.
    */
   async inspectStates(): Promise<Map<string, EnvironmentRuntimeState> | undefined> {
+    return (await this.refreshStates(new Set())).runtime;
+  }
+
+  /**
+   * Plan step 5, PR C: the states of inspectStates and the branches of the running dev containers of `branchIds` (the
+   * sidebar: the environments of the account), in one worker operation (`refresh`) when a worker with it is open, else
+   * directly (readEnvironmentStates). It only reads, so a failed worker refresh is read once more directly. `runtime` is
+   * `undefined` when Docker does not run or the states could not be read; then there are no branches.
+   */
+  async refreshStates(
+    branchIds: ReadonlySet<string>,
+  ): Promise<{ runtime: Map<string, EnvironmentRuntimeState> | undefined; branches: Map<string, string> }> {
     const { docker } = this.deps;
     try {
       const readable = await this.readableDockerHost();
-      if (readable === undefined) return new Map();
-      if (!(await docker.isRunning())) return undefined;
+      if (readable === undefined) return { runtime: new Map(), branches: new Map() };
+      if (!(await docker.isRunning())) return { runtime: undefined, branches: new Map() };
       // Unit 7: only the environments of the current Docker host; the others are hidden.
-      const dockerHost = readable;
-      const [environments, containers, volumes] = await Promise.all([
-        this.deps.registry.list().then((list) => environmentsOfHost(list, dockerHost)),
-        docker.listEnvironmentContainers(),
-        docker.listEnvironmentVolumes(),
-      ]);
-      // Review round 7, P7-2: the state of the environment is the one of its dev container; a running container of another
-      // service of Docker Compose only sets servicesRunning (before: any running container made it "running").
-      const containerNames = new Map(environments.map((env) => [env.id, env.containerName]));
-      const containerStates = new Map<string, ContainerState>();
-      const servicesRunning = new Set<string>();
-      for (const container of containers) {
-        const id = container.labels[LABEL_ENVIRONMENT_ID];
-        const containerName = id === undefined ? undefined : containerNames.get(id);
-        if (!id || containerName === undefined) continue;
-        if (!isDevContainer(container, containerName)) {
-          if (container.state === 'running') servicesRunning.add(id);
-        } else if (containerStates.get(id) !== 'running') {
-          containerStates.set(id, container.state);
-        }
-      }
-      const volumeNames = new Set(volumes.map((volume) => volume.name));
-      const states = new Map<string, EnvironmentRuntimeState>();
-      for (const env of environments) {
-        // A volume without the labels (created outside of this extension) is found by its name.
-        const volume = volumeNames.has(env.volumeName) || (await docker.volumeExists(env.volumeName));
-        const state: EnvironmentRuntimeState = { container: containerStates.get(env.id) ?? 'missing', volume };
-        if (servicesRunning.has(env.id)) state.servicesRunning = true;
-        states.set(env.id, state);
-      }
-      return states;
+      const environments: StateEnvironment[] = environmentsOfHost(await this.deps.registry.list(), readable).map((env) => ({
+        id: env.id,
+        containerName: env.containerName,
+        volumeName: env.volumeName,
+        ...(env.remoteUser ? { user: env.remoteUser } : {}),
+        folder: repositoryFolder(env.repository),
+        branch: branchIds.has(env.id),
+      }));
+      return (await this.refreshThroughWorker(environments)) ?? (await readEnvironmentStates(docker, environments));
     } catch (error) {
       this.logger.warn(`The state of the environments could not be read: ${errorMessage(error)}`);
+      return { runtime: undefined, branches: new Map() };
+    }
+  }
+
+  /** Plan step 5, PR C: the refresh in the worker; undefined when there is none, or it failed (logged). */
+  private async refreshThroughWorker(environments: readonly StateEnvironment[]): Promise<EnvironmentStates | undefined> {
+    const refresh = this.deps.workerRefresh;
+    if (refresh === undefined) return undefined;
+    try {
+      return await refresh(environments);
+    } catch (error) {
+      this.logger.warn(`The refresh through the worker failed (${errorMessage(error)}); the states are read directly.`);
       return undefined;
     }
   }
@@ -6628,24 +6627,8 @@ export class EnvironmentService {
   }
 
   /** The branch (`null` for a detached HEAD), or `undefined` when Git is missing, fails, or `signal` aborts. */
-  private async branchInContainer(
-    container: string,
-    user: string | undefined,
-    folder: string,
-    signal?: AbortSignal,
-  ): Promise<string | null | undefined> {
-    try {
-      const result = await this.deps.docker.exec(
-        container,
-        ['git', '-c', 'safe.directory=*', '-C', folder, 'branch', '--show-current'],
-        { user, timeoutMs: BRANCH_EXEC_TIMEOUT_MS, signal },
-      );
-      if (result.exitCode !== 0) return undefined;
-      const branch = result.stdout.trim();
-      return branch === '' ? null : branch;
-    } catch {
-      return undefined;
-    }
+  private branchInContainer(container: string, user: string | undefined, folder: string, signal?: AbortSignal): Promise<string | null | undefined> {
+    return readBranch(this.deps.docker, container, user, folder, signal);
   }
 
   // --- Busy marks ----------------------------------------------------------------------------------------------------
