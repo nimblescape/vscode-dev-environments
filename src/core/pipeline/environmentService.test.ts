@@ -2795,6 +2795,19 @@ describe('open: existing environment', () => {
         expect(touched()).toEqual([]);
       });
 
+      it('B-R6-1: the container is stopped, but the pending connection files cannot be read: nothing is changed', async () => {
+        // PR #68 review round 6, B-R6-1.
+        await seedEnvironment(h, { container: 'stopped', containerLabels: outdated });
+        h.sessionFiles.readPendings = async () => {
+          throw new Error('unreadable pendings');
+        };
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('startFailed');
+        expect(error.detail).toContain('but it could not be checked whether another window uses the environment.');
+        expect(h.helper.ups).toEqual([]);
+        expect(touched()).toEqual([]);
+      });
+
       it.each([
         ['runs', 'running'],
         ['is paused', 'paused'],
@@ -2967,6 +2980,50 @@ describe('open: existing environment', () => {
         expect(atQuestion).toEqual([undefined]);
         expect(busyAtUp).toEqual(['update', 'rebuild']);
         expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+        expect((await entry())?.busy).toBeUndefined();
+      });
+
+      it('B-R6-2: the mark of Step 9 cannot be cleared before the recreate question, and the user declines: the mark does not stay', async () => {
+        // PR #68 review round 6, B-R6-2.
+        await seedEnvironment(h, { container: 'running' });
+        const container = h.docker.containersOf(ENV_ID)[0];
+        h.docker.addContainer({
+          environmentId: ENV_ID,
+          name: `${NAME}-db-1`,
+          state: 'running',
+          image: 'postgres:16',
+          labels: { [LABEL_COMPOSE_SERVICE]: 'db', 'com.docker.compose.service': 'db' },
+        });
+        await h.registry.updateEnvironment(ENV_ID, (environment) => {
+          environment.lifecycleIncomplete = container.id;
+        });
+        h.settings.updateImagesOnConnect = false;
+        h.helper.upError = (_image, removeExisting) => (removeExisting ? undefined : damagedUp());
+        // The first write that would clear this window's mark `update` fails (the release before the question).
+        let failed = false;
+        const update = h.registry.updateEnvironment.bind(h.registry);
+        h.registry.updateEnvironment = (async (id: string, mutator: (entry: Environment) => void) => {
+          const current = await h.registry.get(id);
+          if (!failed && current?.busy?.operation === 'update' && current.busy.pid === PID) {
+            const probe = structuredClone(current);
+            mutator(probe);
+            if (probe.busy === undefined) {
+              failed = true;
+              throw new Error('registry locked');
+            }
+          }
+          return update(id, mutator);
+        }) as typeof h.registry.updateEnvironment;
+        const atQuestion: unknown[] = [];
+        h.ui.recreateContainer = async () => {
+          atQuestion.push((await entry())?.busy?.operation);
+          return false;
+        };
+        const error = await rejection(h.service.open(TARGET, options()));
+        expect(error.code).toBe('startFailed');
+        expect(failed).toBe(true);
+        expect(atQuestion).toEqual(['update']);
+        expect(h.helper.calls).not.toContain(`up ${IMAGE_1} --remove-existing-container`);
         expect((await entry())?.busy).toBeUndefined();
       });
 
