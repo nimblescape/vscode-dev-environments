@@ -428,7 +428,9 @@ export interface EnvironmentServiceDeps {
   analyzer: ConfigurationAnalyzer;
   /**
    * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target of the operation (HelperChannels.refresh).
-   * Undefined, or a result of undefined: no worker with the operation `refresh`; the states are read directly.
+   * Undefined, or a result of undefined: outside of an operation (or in the unit tests); the states are read directly.
+   * Plan step 5, PR D (rule D1 of 2026-09-30): within an operation it makes the worker ready first, and rejects when it
+   * cannot (the refresh then fails; it is never read directly).
    */
   workerRefresh?: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates | undefined>;
   /**
@@ -5901,9 +5903,10 @@ export class EnvironmentService {
 
   /**
    * Plan step 5, PR C: the states of inspectStates and the branches of the running dev containers of `branchIds` (the
-   * sidebar: the environments of the account), in one worker operation (`refresh`) when a worker with it is open, else
-   * directly (readEnvironmentStates). It only reads, so a failed worker refresh is read once more directly. `runtime` is
-   * `undefined` when Docker does not run or the states could not be read; then there are no branches.
+   * sidebar: the environments of the account), in one worker operation (`refresh`); outside of an operation directly
+   * (readEnvironmentStates). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
+   * never read directly: the refresh fails (logged, with the cause). `runtime` is `undefined` when Docker does not run or
+   * the states could not be read; then there are no branches.
    */
   async refreshStates(
     branchIds: ReadonlySet<string>,
@@ -5922,22 +5925,11 @@ export class EnvironmentService {
         folder: repositoryFolder(env.repository),
         branch: branchIds.has(env.id),
       }));
-      return (await this.refreshThroughWorker(environments)) ?? (await readEnvironmentStates(docker, environments));
+      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below).
+      return (await this.deps.workerRefresh?.(environments)) ?? (await readEnvironmentStates(docker, environments));
     } catch (error) {
       this.logger.warn(`The state of the environments could not be read: ${errorMessage(error)}`);
       return { runtime: undefined, branches: new Map() };
-    }
-  }
-
-  /** Plan step 5, PR C: the refresh in the worker; undefined when there is none, or it failed (logged). */
-  private async refreshThroughWorker(environments: readonly StateEnvironment[]): Promise<EnvironmentStates | undefined> {
-    const refresh = this.deps.workerRefresh;
-    if (refresh === undefined) return undefined;
-    try {
-      return await refresh(environments);
-    } catch (error) {
-      this.logger.warn(`The refresh through the worker failed (${errorMessage(error)}); the states are read directly.`);
-      return undefined;
     }
   }
 

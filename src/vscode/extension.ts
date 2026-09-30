@@ -19,12 +19,14 @@ import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../c
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
-import { errorMessage } from '../core/errors';
+import { errorMessage, UserFacingError } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
 import { HelperPrebuild } from '../core/helper/helperPrebuild';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperChannels';
+import { HelperChannelError } from '../core/helperChannel/helperChannel';
+import { Messages } from '../core/messages';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
@@ -189,12 +191,18 @@ async function activateExtension(
   });
   // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
   // remote. The plain Docker calls of an operation go through it (ContainerAdapter.run, dockerRouting.ts); everything
-  // else, and every call when it cannot be opened, runs directly. Its socket mount is the one of the workspace helper
-  // on that engine.
+  // else runs directly. Plan step 5, PR D (rule D1 of 2026-09-30): a call that needs it makes it ready first (the helper
+  // image, then the open), and is refused when that fails, never run directly. Its socket mount is the one of the
+  // workspace helper on that engine.
   const channelScriptPath = context.asAbsolutePath(path.join('dist', 'helperChannel.js'));
   let channelScript: Promise<string> | undefined;
   const channels = new HelperChannels({
     logger,
+    // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image on the engine of the operation, as withEnvironmentLock
+    // ensures it before the lock (only a missing tag is built).
+    prepare: async (target, signal) => {
+      await runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal }));
+    },
     open: (target) =>
       openHelperChannel(
         {
@@ -364,10 +372,17 @@ async function activateExtension(
     // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
     viewer: (token, signal) => discovery.viewer(token, signal),
     // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker of the Docker target of the operation
-    // (none outside of an operation: the refresh reads directly then).
+    // (none outside of an operation: the refresh reads directly then). Plan step 5, PR D (rule D1 of 2026-09-30): within
+    // an operation, the worker is made ready first; when it cannot be, the refresh fails (never read directly).
     workerRefresh: async (environments) => {
       const target = operationDockerTarget();
-      return target === undefined ? undefined : channels.refresh(target, environments);
+      if (target === undefined) return undefined;
+      try {
+        return await channels.refresh(target, environments);
+      } catch (error) {
+        if (!(error instanceof HelperChannelError) || error.code !== 'unavailable') throw error;
+        throw new UserFacingError('helperFailed', Messages.workerUnavailable(error.message), error.message);
+      }
     },
     // Plan step 5, PR B: the lock of an environment in the worker of the Docker target of the operation (Stop, Delete).
     environmentLock: async (environmentId, waitSeconds, signal) => channels.lock(await targets.current(), environmentId, waitSeconds, signal),

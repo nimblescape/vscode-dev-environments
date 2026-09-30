@@ -29,6 +29,12 @@ export const ControllerTexts = {
   // (concept 6.2 Stop, 7.14).
   otherWindowClosesConnection: (repository: string) =>
     `${repository} is open in another window. That window closes its connection first.`,
+  /**
+   * Plan step 5, PR D (rule D1 of 2026-09-30): the window status files could not be read, so it is not known whether
+   * another window uses the environment; the operation is refused.
+   */
+  otherWindowsUnknown:
+    'It could not be checked whether another window uses this environment: the window status files could not be read. Nothing was changed; see the Dev Environments output.',
   otherWindowContinues: (repository: string) =>
     `The other window of ${repository} closes its connection. The operation continues in that window.`,
   otherWindowNoAnswer: (repository: string) =>

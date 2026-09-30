@@ -282,6 +282,13 @@ export const Messages = {
     'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
   /**
+   * Plan step 5, PR D (rule D1 of 2026-09-30): a plain Docker call of an operation, or the refresh of the states, needs
+   * the worker on the Docker host, and it could not be made ready (the helper image, the open); the call was refused and
+   * nothing was run directly. As PipelineTexts.environmentLockUnavailable.
+   */
+  workerUnavailable: (cause: string) =>
+    `The Dev Environments worker on the Docker host could not be prepared (${cause}), so nothing was run. Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
+  /**
    * Review round 4 of PR #64 (R4-4), review round 14 (R14-1): the helper image could not be prepared at Step 5 of a
    * Rebuild or of the switch to a newly selected configuration, and the running container, which is current, opened as
    * it is. `change` names what was not applied; with a selected configuration, `previous` names the configuration that

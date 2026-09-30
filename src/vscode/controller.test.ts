@@ -1088,6 +1088,22 @@ describe('Stop', () => {
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
   });
 
+  // Plan step 5, PR D (rule D1 of 2026-09-30): window status files that cannot be read are not "no other window".
+  it('refuses Stop, Rebuild and Delete when the other windows cannot be read, and changes nothing', async () => {
+    await h.registry.add(environment());
+    h.coordinator.otherActiveWindows.mockRejectedValue(Object.assign(new Error("EACCES: permission denied, scandir 'sessions'"), { code: 'EACCES' }));
+    await run('stop', row('acme/api', environment()));
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails);
+    await run('rebuild', row('acme/api', environment()));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
+    expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
+  });
+
   it('asks the other window to close its connection first; the stop continues there (concept 6.2)', async () => {
     await h.registry.add(environment());
     otherWindowConnected();

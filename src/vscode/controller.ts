@@ -2119,22 +2119,27 @@ export class Controller implements vscode.Disposable {
     return this.current?.environment.id === environment.id;
   }
 
-  /** The status of another active window that is connected to the environment, if any. */
+  /** The status of another active window that is connected to the environment, if any (see otherActiveWindowsKnown). */
   private async otherWindowOf(environmentId: string): Promise<WindowStatus | undefined> {
-    try {
-      return (await this.deps.coordinator.otherActiveWindows()).find((window) => window.environmentId === environmentId);
-    } catch (error) {
-      this.logger.warn(`The other windows could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
+    return (await this.otherActiveWindowsKnown()).find((window) => window.environmentId === environmentId);
   }
 
+  /** Whether another active window is connected to the environment (see otherActiveWindowsKnown). */
   private async connectedInOtherWindow(environmentId: string): Promise<boolean> {
+    return (await this.otherActiveWindowsKnown()).some((window) => window.environmentId === environmentId);
+  }
+
+  /**
+   * The other active windows. Plan step 5, PR D (rule D1 of 2026-09-30): when their files cannot be read, it is not known
+   * whether another window uses the environment, so the operation is refused (UserFacingError, otherWindowsUnknown) and
+   * nothing is stopped, removed, or renamed; never "no other window".
+   */
+  private async otherActiveWindowsKnown(): Promise<WindowStatus[]> {
     try {
-      return (await this.deps.coordinator.otherActiveWindows()).some((window) => window.environmentId === environmentId);
+      return await this.deps.coordinator.otherActiveWindows();
     } catch (error) {
-      this.logger.warn(`The other windows could not be read: ${errorMessage(error)}`);
-      return false;
+      this.logger.warn(`The other windows could not be read, so nothing is changed: ${errorMessage(error)}`);
+      throw new UserFacingError('startFailed', ControllerTexts.otherWindowsUnknown, errorMessage(error));
     }
   }
 

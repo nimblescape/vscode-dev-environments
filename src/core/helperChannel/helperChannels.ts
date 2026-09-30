@@ -4,15 +4,18 @@
 
 // The helper channels of a window (user request 2026-09-28, step 1 of the remote speedup): at most one per Docker
 // engine, opened at its first use, closed after CHANNEL_IDLE_CLOSE_MS without an operation, and opened again after it was
-// lost. When it cannot be opened (for example the helper image is not on the host yet), the callers take the way
-// without it, and it is not tried again for CHANNEL_RETRY_AFTER_FAILURE_MS (clearFailures ends that wait). Plan step 5,
-// PR A: for the local Docker too (user decision 2026-09-29), never for an unsupported endpoint. No `vscode`.
+// lost. When it cannot be opened, it is not tried again for CHANNEL_RETRY_AFTER_FAILURE_MS (clearFailures ends that
+// wait). Plan step 5, PR A: for the local Docker too (user decision 2026-09-29), never for an unsupported endpoint. Plan
+// step 5, PR D (rule D1 of 2026-09-30): a call that needs the worker (docker, refresh, lock) first makes it ready (the
+// helper image, then the open in full, also within that wait); when it cannot, the call is refused, never taken the way
+// without it. No `vscode`.
 import * as crypto from 'crypto';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
+import { errorMessage, isUserFacingError } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError, HelperOperationError, type ChannelDockerOptions } from './helperChannel';
 import {
@@ -51,7 +54,7 @@ export const CHANNEL_OPEN_WAIT_MS = 5_000;
 
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
- * pipeline; without it the start fails and the caller takes the way without the channel), the labels, no network, no
+ * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, no network, no
  * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
  * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
  * the first line of the input (HelperChannel.open), never on the command line.
@@ -182,6 +185,13 @@ interface Entry {
 
 export interface HelperChannelsOptions {
   open(target: DockerTarget): Promise<HelperChannel>;
+  /**
+   * Plan step 5, PR D (rule D1 of 2026-09-30): makes the state that a worker of `target` needs consistent before it is
+   * opened for a call (docker, refresh): the helper image, built when its tag is missing (WorkspaceHelper.ensureImagePresent,
+   * as withEnvironmentLock does before the lock). Rejects when it cannot; the call is then refused. An AbortError when
+   * `signal` aborts.
+   */
+  prepare?(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
   logger: Logger;
   idleCloseMs?: number;
   retryAfterFailureMs?: number;
@@ -280,7 +290,8 @@ export class HelperChannels {
         current.failedAt = Date.now();
         current.failure = (error as Error).message;
         this.options.logger.info(
-          `${(error as Error).message} Docker calls to ${engineName(target)} go without it; the next attempt in ${Math.round(retryAfter / 60_000)} minutes.`,
+          // Plan step 5, PR D (rule D1 of 2026-09-30): the calls that need it are refused, never run without it.
+          `${(error as Error).message} The Docker calls of operations on ${engineName(target)} are refused until it is open.`,
         );
         return undefined;
       },
@@ -289,72 +300,114 @@ export class HelperChannels {
   }
 
   /**
-   * One Docker call through the channel to the engine of `target`. Undefined when there is no channel, or the call was
-   * not sent (the channel closed before, or the call is beyond what it carries): the caller takes the way without it. Rejects as HelperChannel.docker otherwise (a lost
-   * channel while the call ran: HelperChannelError('lost'), whose outcome is not known).
+   * Plan step 5, PR D (rule D1 of 2026-09-30): the open channel to the engine of `target`, made ready now if needed: when
+   * none is open, first `prepare` (the helper image), then the open in full (openInFull). Throws
+   * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts.
    */
-  async docker(target: DockerTarget, args: readonly string[], options: ChannelDockerOptions = {}): Promise<RunResult | undefined> {
-    const waitMs = Math.min(CHANNEL_OPEN_WAIT_MS, options.timeoutMs ?? CHANNEL_OPEN_WAIT_MS);
-    const startedAt = Date.now();
-    const channel = await this.get(target, { signal: options.signal, waitMs });
-    if (channel === undefined) return undefined;
-    // Review round 6 (R6-2): the wait for the channel and the wait for a free place share one wait of at most waitMs, and
-    // the time limit counts from this call. So a call ends within its limit (plus the waits of at most 5 s when it
-    // is not sent and the caller takes the way without the channel).
-    const waited = Date.now() - startedAt;
-    const timeoutMs = options.timeoutMs === undefined ? undefined : options.timeoutMs - waited;
-    if (timeoutMs !== undefined && timeoutMs < 1) return undefined;
-    try {
-      return await channel.docker(args, { ...options, timeoutMs, slotWaitMs: Math.max(0, waitMs - waited) });
-    } catch (error) {
-      // Not sent: closed before, or beyond what the channel carries (review round 1, P2).
-      if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;
-      throw error;
+  private async ready(target: DockerTarget, signal: AbortSignal | undefined): Promise<HelperChannel> {
+    if (signal?.aborted) throw abortError();
+    const open = this.entries.get(keyOf(target))?.channel;
+    if (open?.isOpen) return open;
+    this.refuseUnsupported(target);
+    if (this.options.prepare !== undefined) {
+      try {
+        await this.options.prepare(target, signal);
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError();
+        const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);
+        this.options.logger.warn(`The helper image for the worker on ${engineName(target)} could not be prepared: ${cause}`);
+        throw new HelperChannelError('unavailable', `the helper image could not be prepared: ${cause}`);
+      }
+    }
+    return this.openInFull(target, signal);
+  }
+
+  /** Plan step 5, PR D: no worker for the window that closes, or for an endpoint that is neither local nor SSH. */
+  private refuseUnsupported(target: DockerTarget): void {
+    if (this.disposed) throw new HelperChannelError('unavailable', 'the window is closing');
+    if (target.kind !== 'remote' && target.kind !== 'local') throw new HelperChannelError('unavailable', 'the Docker endpoint is neither local nor SSH');
+  }
+
+  /**
+   * Plan step 5, PR B (moved here by PR D, shared by lock, docker and refresh): user decision D1 (an explicit attempt to
+   * make the state consistent): the wait after a failed open ends for this engine, and the open is awaited in full (not
+   * CHANNEL_OPEN_WAIT_MS). Throws HelperChannelError('unavailable') with the cause of the failed open, and an AbortError
+   * when `signal` aborts.
+   */
+  private async openInFull(target: DockerTarget, signal: AbortSignal | undefined): Promise<HelperChannel> {
+    const entry = this.entries.get(keyOf(target));
+    if (entry !== undefined) entry.failedAt = undefined;
+    const channel = await this.get(target, { signal });
+    if (channel !== undefined) return channel;
+    this.refuseUnsupported(target);
+    throw new HelperChannelError('unavailable', this.entries.get(keyOf(target))?.failure ?? 'the worker could not be opened');
+  }
+
+  /**
+   * One Docker call through the channel to the engine of `target`. Plan step 5, PR D (rule D1 of 2026-09-30): never the
+   * way without it. Without an open channel, it is made ready first (ready): HelperChannelError('unavailable') when that
+   * fails. A call that was not sent because the channel closed before is sent once more through a channel made ready
+   * again (it did not run); a call beyond what the channel carries rejects with HelperChannelError('unsendable'). Rejects
+   * as HelperChannel.docker otherwise (a lost channel while the call ran: HelperChannelError('lost'), whose outcome is
+   * not known).
+   */
+  async docker(target: DockerTarget, args: readonly string[], options: ChannelDockerOptions = {}): Promise<RunResult> {
+    for (let attempt = 0; ; attempt++) {
+      const channel = await this.ready(target, options.signal);
+      // Review round 6 (R6-2): the wait for a free place is at most CHANNEL_OPEN_WAIT_MS or the time limit of the call,
+      // and HelperChannel.operation takes it from the time limit that it sends. Plan step 5, PR D: the time that made the
+      // worker ready (a build of the helper image) is not taken from it; the lock awaits that in full too.
+      const slotWaitMs = Math.min(CHANNEL_OPEN_WAIT_MS, options.timeoutMs ?? CHANNEL_OPEN_WAIT_MS);
+      try {
+        return await channel.docker(args, { ...options, slotWaitMs });
+      } catch (error) {
+        if (attempt === 0 && error instanceof HelperChannelError && error.code === 'closed') continue;
+        throw error;
+      }
     }
   }
 
   /**
    * Plan step 5, PR C: readEnvironmentStates in the worker of `target` (the operation `refresh`), with the strict checks of
-   * its parameters and its value (protocol.ts). Undefined when it is not sent: no channel, a channel without `refresh`
-   * (an older script), parameters beyond the check, or the channel closed before; the caller then reads directly.
-   * Rejects when it was sent and failed, or answered with an invalid value; it only reads, so the caller may read again.
+   * its parameters and its value (protocol.ts). Plan step 5, PR D (rule D1 of 2026-09-30): never the way without it. The
+   * worker is made ready first (ready: HelperChannelError('unavailable') when that fails, also for a worker without
+   * `refresh`); parameters beyond the check reject with HelperChannelError('unsendable'); a refresh that was not sent
+   * because the channel closed before is sent once more through a channel made ready again. Rejects when it was sent and
+   * failed, or answered with an invalid value.
    */
-  async refresh(target: DockerTarget, environments: readonly StateEnvironment[]): Promise<EnvironmentStates | undefined> {
+  async refresh(target: DockerTarget, environments: readonly StateEnvironment[], signal?: AbortSignal): Promise<EnvironmentStates> {
     const params = parseRefreshParams({ environments });
-    if (params === undefined) return undefined;
-    const channel = await this.get(target, { waitMs: CHANNEL_OPEN_WAIT_MS });
-    if (channel === undefined || !channel.operations.includes(OP_REFRESH)) return undefined;
-    let value: unknown;
-    try {
-      value = await channel.operation(OP_REFRESH, params, { timeoutMs: CHANNEL_REFRESH_TIMEOUT_MS });
-    } catch (error) {
-      if (error instanceof HelperChannelError && (error.code === 'closed' || error.code === 'unsendable')) return undefined;
-      throw error;
+    if (params === undefined) throw new HelperChannelError('unsendable', 'The environments are beyond what the refresh of the worker carries.');
+    for (let attempt = 0; ; attempt++) {
+      const channel = await this.ready(target, signal);
+      if (!channel.operations.includes(OP_REFRESH)) throw new HelperChannelError('unavailable', 'the worker does not know the refresh');
+      let value: unknown;
+      try {
+        value = await channel.operation(OP_REFRESH, params, { timeoutMs: CHANNEL_REFRESH_TIMEOUT_MS, signal });
+      } catch (error) {
+        if (attempt === 0 && error instanceof HelperChannelError && error.code === 'closed') continue;
+        throw error;
+      }
+      const states = parseRefreshValue(value, params);
+      if (states === undefined) throw new HelperChannelError('protocol', 'The worker answered the refresh with an invalid value.');
+      return states;
     }
-    const states = parseRefreshValue(value, params);
-    if (states === undefined) throw new HelperChannelError('protocol', 'The worker answered the refresh with an invalid value.');
-    return states;
   }
 
   /**
    * Plan step 5, PR B: takes the lock of an environment in the worker of `target` and waits at most `waitSeconds` for
-   * it. User decision D1 (an explicit attempt to make the state consistent): the wait after a failed open ends for this
-   * engine, and the open is awaited in full (not CHANNEL_OPEN_WAIT_MS). Throws EnvironmentLockError: `busy` when another
-   * holder kept the lock for the whole wait (user decision D3), `unavailable` when there is no worker (it could not be
-   * opened, it reaches another engine, it does not know the operation) or the lock failed in it, with the cause. An
-   * AbortError when `signal` aborts. Never goes on without the lock.
+   * it. User decision D1: the worker is opened in full (openInFull; the caller ensured the helper image before). Throws
+   * EnvironmentLockError: `busy` when another holder kept the lock for the whole wait (user decision D3), `unavailable`
+   * when there is no worker (it could not be opened, it reaches another engine, it does not know the operation) or the
+   * lock failed in it, with the cause. An AbortError when `signal` aborts. Never goes on without the lock.
    */
   async lock(target: DockerTarget, environmentId: string, waitSeconds: number, signal?: AbortSignal): Promise<HeldEnvironmentLock> {
-    const entry = this.entries.get(keyOf(target));
-    if (entry !== undefined) entry.failedAt = undefined;
-    const channel = await this.get(target, { signal });
-    if (channel === undefined) {
-      const why = this.disposed
-        ? 'the window is closing'
-        : target.kind !== 'remote' && target.kind !== 'local'
-          ? 'the Docker endpoint is neither local nor SSH'
-          : (this.entries.get(keyOf(target))?.failure ?? 'the worker could not be opened');
-      throw new EnvironmentLockError('unavailable', why);
+    let channel: HelperChannel;
+    try {
+      channel = await this.openInFull(target, signal);
+    } catch (error) {
+      if (error instanceof HelperChannelError) throw new EnvironmentLockError('unavailable', error.message);
+      throw error;
     }
     try {
       return await channel.lock(environmentId, waitSeconds, signal);

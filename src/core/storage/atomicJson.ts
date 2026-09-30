@@ -85,13 +85,20 @@ export function removeFileSync(file: string): void {
   fs.rmSync(file, { force: true });
 }
 
-/** Full paths of the `*.json` files in a folder. Temporary files are not included. A missing folder gives an empty list. */
+/**
+ * Full paths of the `*.json` files in a folder. Temporary files are not included. A missing folder (ENOENT, or ENOTDIR as
+ * listNames of paths.ts) gives an empty list. Plan step 5, PR D (rule D1 of 2026-09-30): any other error (permissions, a
+ * disk error, a link loop) is thrown: a folder that cannot be read is never "nothing there" (the other-window checks
+ * then count it as not known).
+ */
 export async function listJsonFiles(dir: string): Promise<string[]> {
   let names: string[];
   try {
     names = await fs.promises.readdir(dir);
-  } catch {
-    return [];
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+    throw error;
   }
   return names.filter((name) => name.endsWith('.json') && !name.startsWith('.')).map((name) => path.join(dir, name));
 }

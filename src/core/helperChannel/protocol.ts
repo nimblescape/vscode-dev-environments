@@ -64,12 +64,12 @@ export const MAX_CLIENT_LINE = 4 * 1024 * 1024;
 /**
  * Review round 5 (F3): the longest request that the extension sends through the channel, in bytes of UTF-8. The pings
  * wait behind a request in the same stream, so a request must reach the script well within the pong time limit also on
- * a slow link (256 KiB at 30 s: about 70 kbit/s); a longer one is `unsendable` and takes the way without the channel.
+ * a slow link (256 KiB at 30 s: about 70 kbit/s); a longer one is `unsendable` (plan step 5, PR D: refused).
  */
 export const MAX_CHANNEL_REQUEST_BYTES = 256 * 1024;
 /**
  * Review round 5 (F2): the longest wait of an operation for a free place (MAX_CONCURRENT_OPERATIONS are held); after it
- * the operation is `unsendable` and takes the way without the channel.
+ * the operation is `unsendable` (plan step 5, PR D: refused, never run without the channel).
  */
 export const CHANNEL_SLOT_WAIT_MS = 5_000;
 /** At most this many characters in one line from the script. */

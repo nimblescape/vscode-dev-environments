@@ -8,6 +8,7 @@
 // without the socket: Git runs programs that the repository configuration names (for example filter drivers).
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
+import { runPreparingWorker } from '../docker/workerPreparation';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
@@ -532,6 +533,12 @@ export class WorkspaceHelper {
    * tag, or a tag that cannot be checked, joins it, like before. Throws like ensureImage.
    */
   async ensureImagePresent(options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
+    // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its calls
+    // run without the worker (workerPreparation.ts).
+    return runPreparingWorker(() => this.ensureImagePresentNow(options));
+  }
+
+  private async ensureImagePresentNow(options: { onOutput?: (text: string) => void; signal?: AbortSignal }): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     this.adoptEngine(engine.key);
     if (this.imagePromise && this.imageReadyAt !== undefined && !(await this.cachedImageCurrent())) this.resetImage();
@@ -1181,7 +1188,13 @@ export class WorkspaceHelper {
    * a stop, a delete, or a branch switch. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
    * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
-  private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
+  private image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
+    // Plan step 5, PR D (rule D1 of 2026-09-30): the check and the build of the helper image run without the worker, which
+    // is opened from it (workerPreparation.ts); so also the shared promise of the cache never waits for the worker.
+    return runPreparingWorker(() => this.imageNow(options, recheck));
+  }
+
+  private async imageNow(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     // Unit 7: an image of another engine (the Docker context changed) is not reused.
     this.adoptEngine(engine.key);

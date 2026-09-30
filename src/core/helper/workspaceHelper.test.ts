@@ -10,6 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageInfo } from '../docker/containerAdapter';
+import { preparingWorker } from '../docker/workerPreparation';
 import { CommandError, UserFacingError } from '../errors';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
@@ -2847,6 +2848,29 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG });
+  });
+
+  // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its Docker
+  // calls run in the scope of the worker preparation (ContainerAdapter runs them directly; the worker is opened from it).
+  it('checks and builds the helper image in the scope of the worker preparation, also for an open', async () => {
+    const scopes: boolean[] = [];
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async (reference: string) => {
+      scopes.push(preparingWorker());
+      return imageId(reference);
+    };
+    docker.buildHandler = async () => {
+      scopes.push(preparingWorker());
+    };
+    const helper = helperOn(REMOTE);
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+    docker.images.delete(TAG);
+    await helper.ensureImageUse();
+    expect(docker.builds).toHaveLength(2);
+    expect(scopes.length).toBeGreaterThanOrEqual(4);
+    expect(scopes.every((inScope) => inScope)).toBe(true);
+    expect(preparingWorker()).toBe(false);
   });
 
   it('builds the tag again when it was deleted after it was cached (by itself or by an open)', async () => {

@@ -4,13 +4,15 @@
 
 // Plan step 5, PR A: which Docker calls go through the worker, and the routing of ContainerAdapter.run.
 import { describe, expect, it } from 'vitest';
-import { CommandError } from '../errors';
+import { CommandError, UserFacingError } from '../errors';
+import { Messages } from '../messages';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { ContainerAdapter, type DockerRouter } from './containerAdapter';
 import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextName, type DockerTarget } from './dockerHost';
 import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { runWithDockerTarget } from './dockerTargets';
+import { runPreparingWorker } from './workerPreparation';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
 
@@ -158,7 +160,9 @@ describe('isRoutableDockerCall and isReadOnlyDockerCall (plan step 5, PR A)', ()
  * of the adapter fails the test below until it is classified here.
  */
 const CLASSIFICATION: Record<string, { routed: boolean; readOnly: boolean }> = {
-  info: { routed: true, readOnly: true },
+  // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: routed). The only `info` of the adapter is the
+  // check whether Docker runs (daemonStatus), which comes before the worker and runs directly (workerPreparation.ts).
+  info: { routed: false, readOnly: true },
   version: { routed: true, readOnly: true },
   ps: { routed: true, readOnly: true },
   'container inspect': { routed: true, readOnly: true },
@@ -232,10 +236,11 @@ describe('the classification of every Docker call of ContainerAdapter (plan step
     });
     const docker = new ContainerAdapter(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux');
     const routed: string[] = [];
-    docker.setRouter(async (_target, args) => {
+    docker.setRouter(async (_target, args, options) => {
       routed.push(JSON.stringify(args));
-      // Not sent: every call also runs directly, so the runner sees all of them.
-      return undefined;
+      // Plan step 5, PR D (rule D1 of 2026-09-30): changed stand-in (before: undefined, so the call also ran directly; the
+      // router never gives that up now): the worker's Docker CLI is the same fake runner, so the runner sees every call.
+      return runner.run('docker', args, options);
     });
     const exercised: Record<string, (d: ContainerAdapter) => Promise<unknown>> = {
       daemonStatus: (d) => d.daemonStatus(),
@@ -327,12 +332,60 @@ describe('ContainerAdapter.run with a router (plan step 5, PR A)', () => {
     expect(runner.calls).toEqual([]);
   });
 
-  it('runs directly when the router returns undefined', async () => {
-    const { docker, runner } = setup(async () => undefined, () => ok('direct'));
-    const result = await runWithDockerTarget(REMOTE, () => docker.run(['rm', '-f', 'c'], { timeoutMs: 5_000 }));
-    expect(result.stdout).toBe('direct');
-    expect(runner.calls.map((call) => call.args)).toEqual([['rm', '-f', 'c']]);
-    expect(runner.calls[0].options.env?.DOCKER_CONTEXT).toBe(REMOTE.context);
+  // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: the router returned undefined when there was
+  // no worker, and the call ran directly). The router makes the worker ready or refuses; the call never runs directly.
+  it('refuses a call when the worker cannot be made ready (UserFacingError with the cause), and runs nothing directly', async () => {
+    const { docker, runner, lines } = setup(
+      async () => {
+        throw new HelperChannelError('unavailable', 'the helper image could not be prepared: no space left on device');
+      },
+      () => ok('direct'),
+    );
+    const thrown = await runWithDockerTarget(REMOTE, () => docker.run(['rm', '-f', 'c'], { timeoutMs: 5_000 })).catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(UserFacingError);
+    expect(thrown).toMatchObject({
+      code: 'helperFailed',
+      message: Messages.workerUnavailable('the helper image could not be prepared: no space left on device'),
+      detail: 'the helper image could not be prepared: no space left on device',
+    });
+    // A read too, also through the adapter's own methods.
+    await expect(runWithDockerTarget(REMOTE, () => docker.run(['ps']))).rejects.toBeInstanceOf(UserFacingError);
+    await expect(runWithDockerTarget(REMOTE, () => docker.findContainer('e', 'n'))).rejects.toBeInstanceOf(UserFacingError);
+    expect(runner.calls).toEqual([]);
+    expect(lines.some((line) => line.includes('docker rm -f was refused') && line.includes('it is not run directly'))).toBe(true);
+  });
+
+  // Plan step 5, PR D (rule D1 of 2026-09-30): a call that the worker did not send never runs directly either.
+  for (const code of ['unsendable', 'closed'] as const) {
+    it(`a call that was not sent (${code}) throws a CommandError, and runs nothing directly`, async () => {
+      const { docker, runner } = setup(async () => {
+        throw new HelperChannelError(code, 'no free place in time');
+      });
+      for (const args of [['volume', 'ls'], ['stop', 'c']]) {
+        const thrown = await runWithDockerTarget(REMOTE, () => docker.run(args)).catch((e: unknown) => e);
+        expect(thrown).toBeInstanceOf(CommandError);
+        expect((thrown as CommandError).message).toContain(`docker ${args.join(' ')} was not sent to the worker on the Docker host (no free place in time); it did not run.`);
+      }
+      expect(runner.calls).toEqual([]);
+    });
+  }
+
+  // Plan step 5, PR D (rule D1 of 2026-09-30): "Docker is not running" stays its own answer: the check comes before the
+  // worker and runs directly, also with a router that would refuse; so do the calls that prepare the worker.
+  it('checks whether Docker runs directly within an operation, and runs the calls of the worker preparation directly', async () => {
+    let routed = 0;
+    const { docker, runner } = setup(
+      async () => {
+        routed++;
+        throw new HelperChannelError('unavailable', 'no worker');
+      },
+      (args) => (args[0] === 'info' ? { exitCode: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon', timedOut: false } : ok('direct')),
+    );
+    const status = await runWithDockerTarget(REMOTE, () => docker.daemonStatus());
+    expect(status).toEqual({ running: false, detail: 'Cannot connect to the Docker daemon' });
+    expect(await runWithDockerTarget(REMOTE, () => runPreparingWorker(() => docker.run(['image', 'inspect', 'helper'])))).toMatchObject({ stdout: 'direct' });
+    expect(routed).toBe(0);
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['info', 'image']);
   });
 
   it('runs a non-routable call directly, never through the router', async () => {
@@ -355,17 +408,19 @@ describe('ContainerAdapter.run with a router (plan step 5, PR A)', () => {
     ['protocol', new HelperChannelError('protocol', 'invalid answer')],
     ['an operation failure', new HelperOperationError('failed', 'spawn docker ENOENT', false)],
   ] as const) {
-    it(`a read-only call is retried once directly after ${what} (logged)`, async () => {
+    // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: a read-only call ran once more directly).
+    it(`a read-only call throws after ${what} that it failed through the worker, with no direct call (logged)`, async () => {
       const { docker, runner, lines } = setup(
         async () => {
           throw error;
         },
         () => ok('direct'),
       );
-      const result = await runWithDockerTarget(REMOTE, () => docker.run(['volume', 'ls'], { timeoutMs: 5_000 }));
-      expect(result.stdout).toBe('direct');
-      expect(runner.calls.map((call) => call.args)).toEqual([['volume', 'ls']]);
-      expect(lines.some((line) => line.includes('docker volume ls through the worker failed') && line.includes('runs once more directly'))).toBe(true);
+      const thrown = await runWithDockerTarget(REMOTE, () => docker.run(['volume', 'ls'], { timeoutMs: 5_000 })).catch((e: unknown) => e);
+      expect(thrown).toBeInstanceOf(CommandError);
+      expect((thrown as CommandError).message).toContain(`docker volume ls failed through the worker on the Docker host (${error.message}).`);
+      expect(runner.calls).toEqual([]);
+      expect(lines.some((line) => line.includes('docker volume ls through the worker failed') && line.includes('it is not run directly'))).toBe(true);
     });
 
     it(`a mutating call throws after ${what}, with no direct call`, async () => {
