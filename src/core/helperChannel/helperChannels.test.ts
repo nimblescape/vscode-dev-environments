@@ -18,6 +18,9 @@ import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
 import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, encodeMessage, parseClientMessage } from './protocol';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+/** Plan step 5, PR A: the engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
+const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
+const directEngine = async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false });
 
 /** A channel stand-in with the parts that HelperChannels uses. */
 function fakeChannel() {
@@ -61,12 +64,35 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     vi.useRealTimers();
   });
 
-  it('opens no channel for the local Docker', async () => {
-    const open = vi.fn();
+  // Plan step 5, PR A: changed expectation (before: no channel for the local Docker). The worker is used for the local
+  // Docker too (user decision 2026-09-29), never for an unsupported endpoint.
+  it('opens a channel for the local Docker, none for an unsupported endpoint', async () => {
+    const channel = fakeChannel();
+    const open = vi.fn(async () => channel as unknown as HelperChannel);
     const channels = new HelperChannels({ open, logger: silentLogger });
-    expect(await channels.get(LOCAL_DOCKER_TARGET)).toBeUndefined();
-    expect(await channels.docker(LOCAL_DOCKER_TARGET, ['ps'])).toBeUndefined();
-    expect(open).not.toHaveBeenCalled();
+    expect(await channels.get(LOCAL_DOCKER_TARGET)).toBe(channel);
+    expect(await channels.docker(LOCAL_DOCKER_TARGET, ['ps'])).toEqual({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false });
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledWith(LOCAL_DOCKER_TARGET);
+    const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
+    expect(unsupported.kind).toBe('unsupported');
+    expect(await channels.get(unsupported)).toBeUndefined();
+    expect(await channels.docker(unsupported, ['ps'])).toBeUndefined();
+    expect(open).toHaveBeenCalledTimes(1);
+    channels.dispose();
+  });
+
+  // Plan step 5, PR A: the Docker engine began to answer, or the helper image was built.
+  it('clearFailures ends the wait after a failed open', async () => {
+    const channel = fakeChannel();
+    const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'no image.')).mockResolvedValueOnce(channel);
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    expect(await channels.get(REMOTE)).toBeUndefined();
+    expect(await channels.get(REMOTE)).toBeUndefined();
+    expect(open).toHaveBeenCalledTimes(1);
+    channels.clearFailures();
+    expect(await channels.get(REMOTE)).toBe(channel);
+    expect(open).toHaveBeenCalledTimes(2);
     channels.dispose();
   });
 
@@ -250,7 +276,8 @@ describe('channelRunArgs and openHelperChannel', () => {
             queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
           }
           if (message?.t === 'op' && message.op === 'probe') {
-            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0' } })));
+            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine).
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
           }
         }
         return true;
@@ -267,6 +294,8 @@ describe('channelRunArgs and openHelperChannel', () => {
           started = { args, context: operationDockerTarget()?.context };
           return process;
         },
+        // Plan step 5, PR A: the engine identity without the worker.
+        runDirect: async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false }),
         logger: silentLogger,
         script: async () => 'SCRIPT',
         helperTag: async () => 'devenv-helper:abc',
@@ -302,7 +331,8 @@ describe('channelRunArgs and openHelperChannel', () => {
             queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe'] })));
           }
           if (message?.t === 'op' && message.op === 'probe') {
-            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0' } })));
+            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine).
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
           }
         }
         return true;
@@ -319,6 +349,8 @@ describe('channelRunArgs and openHelperChannel', () => {
           args = startArgs;
           return process;
         },
+        // Plan step 5, PR A: the engine identity without the worker.
+        runDirect: async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false }),
         logger: silentLogger,
         script: async () => script,
         helperTag: async () => 'devenv-helper:abc',
@@ -358,7 +390,7 @@ describe('channelRunArgs and openHelperChannel', () => {
     };
     await expect(
       openHelperChannel(
-        { start: () => process, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
+        { start: () => process, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
         REMOTE,
       ),
     ).rejects.toThrow('The helper channel to build-box does not reach Docker: permission denied while trying to connect to the Docker daemon socket');
@@ -368,9 +400,100 @@ describe('channelRunArgs and openHelperChannel', () => {
   it('fails to open without a Docker CLI', async () => {
     await expect(
       openHelperChannel(
-        { start: () => undefined, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
+        { start: () => undefined, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s' },
         REMOTE,
       ),
     ).rejects.toMatchObject({ code: 'open' });
   });
+});
+
+// Plan step 5, PR A: a worker that talks to another engine is refused.
+describe('the engine identity at the open (plan step 5, PR A)', () => {
+  /** A channel process that answers hello and a probe with `engine`; `ended()` after the extension closed it. */
+  function probeProcess(engine: string | undefined) {
+    let stdout: ((text: string) => void) | undefined;
+    let ended = false;
+    const process: StartedProcess = {
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) {
+          const message = parseClientMessage(line);
+          if (message?.t === 'hello') {
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe'] })));
+          }
+          if (message?.t === 'op' && message.op === 'probe') {
+            const value = { serverVersion: '27.1.0', detail: 'Docker 27.1.0', ...(engine === undefined ? {} : { engine }) };
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value })));
+          }
+        }
+        return true;
+      },
+      end: () => (ended = true),
+      kill: () => {},
+      onStdout: (listener) => (stdout = listener),
+      onStderr: () => {},
+      exited: new Promise(() => {}),
+    };
+    return { process, ended: () => ended };
+  }
+
+  it('opens for the local Docker when the engine is the one without the worker, compared in the context of the target', async () => {
+    const worker = probeProcess(ENGINE);
+    const direct: { args: readonly string[]; context: string | undefined }[] = [];
+    const target = dockerTargetOf('unix:///run/user/1000/docker.sock', 'rootless');
+    expect(target.kind).toBe('local');
+    const channel = await openHelperChannel(
+      {
+        start: () => worker.process,
+        runDirect: async (args) => {
+          direct.push({ args, context: operationDockerTarget()?.context });
+          return { exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false };
+        },
+        logger: silentLogger,
+        script: async () => 'S',
+        helperTag: async () => 't',
+        socketPath: async () => '/run/user/1000/docker.sock',
+      },
+      target,
+    );
+    expect(channel.isOpen).toBe(true);
+    expect(direct).toEqual([{ args: ['info', '--format', '{{json .ID}} {{json .DockerRootDir}}'], context: 'rootless' }]);
+    channel.close();
+  });
+
+  for (const [what, engine, directStdout] of [
+    ['another engine', '"other-id" "/var/lib/docker"', ENGINE],
+    ['a worker that names no engine', undefined, ENGINE],
+    ['an engine that cannot be identified without the worker', ENGINE, ''],
+  ] as const) {
+    it(`refuses ${what}: the worker is closed, the open fails, and the next attempt waits`, async () => {
+      vi.useFakeTimers();
+      try {
+        const worker = probeProcess(engine);
+        const { logger, lines } = recordingLogger();
+        const open = vi.fn((target: DockerTarget) =>
+          openHelperChannel(
+            {
+              start: () => worker.process,
+              runDirect: async () => ({ exitCode: directStdout === '' ? 1 : 0, stdout: directStdout, stderr: '', timedOut: false }),
+              logger: silentLogger,
+              script: async () => 'S',
+              helperTag: async () => 't',
+              socketPath: async () => '/var/run/docker.sock',
+            },
+            target,
+          ),
+        );
+        const channels = new HelperChannels({ open, logger });
+        expect(await channels.docker(LOCAL_DOCKER_TARGET, ['ps'])).toBeUndefined();
+        expect(worker.ended()).toBe(true);
+        expect(lines.join('\n')).toContain('The helper channel to the local Docker was closed:');
+        expect(lines.join('\n')).toContain('Docker calls to the local Docker go without it; the next attempt in 5 minutes.');
+        expect(await channels.get(LOCAL_DOCKER_TARGET)).toBeUndefined();
+        expect(open).toHaveBeenCalledTimes(1);
+        channels.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
 });

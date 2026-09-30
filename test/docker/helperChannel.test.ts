@@ -87,6 +87,8 @@ describe('the helper channel with the real Docker engine', () => {
           started = docker.start(all);
           return started;
         },
+        // Plan step 5, PR A: the engine identity of the open is compared with one call without the worker.
+        runDirect: (args, options) => docker.runDirect(args, options),
         logger: log,
         script: async () => script,
         helperTag: async () => helperTag,

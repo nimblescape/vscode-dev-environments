@@ -2,26 +2,28 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The helper channels of a window (user request 2026-09-28, step 1 of the remote speedup): at most one per remote Docker
-// host, opened at its first use, closed after CHANNEL_IDLE_CLOSE_MS without an operation, and opened again after it was
+// The helper channels of a window (user request 2026-09-28, step 1 of the remote speedup): at most one per Docker
+// engine, opened at its first use, closed after CHANNEL_IDLE_CLOSE_MS without an operation, and opened again after it was
 // lost. When it cannot be opened (for example the helper image is not on the host yet), the callers take the way
-// without it, and it is not tried again for CHANNEL_RETRY_AFTER_FAILURE_MS. Only for remote hosts: the local Docker
-// needs no channel. No `vscode`.
+// without it, and it is not tried again for CHANNEL_RETRY_AFTER_FAILURE_MS (clearFailures ends that wait). Plan step 5,
+// PR A: for the local Docker too (user decision 2026-09-29), never for an unsupported endpoint. No `vscode`.
 import * as crypto from 'crypto';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
-import { abortError, type Logger, type RunResult, type StartedProcess } from '../ports';
+import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError, type ChannelDockerOptions } from './helperChannel';
 import {
   CHANNEL_ENTRY,
   CHANNEL_IDLE_CLOSE_MS,
   CHANNEL_SCRIPT_PATH,
+  ENGINE_IDENTITY_ARGS,
   LABEL_HELPER_CHANNEL,
   OP_PROBE,
   OP_SWEEP,
   channelLabelValue,
+  engineIdentity,
   parseProbeValue,
 } from './protocol';
 
@@ -78,6 +80,11 @@ export function channelRunArgs(p: { tag: string; socketPath: string; containerNa
 export interface ChannelOpenDeps {
   /** ContainerAdapter.start: `docker <args>` with the environment of the operation (its Docker context). */
   start(args: readonly string[]): StartedProcess | undefined;
+  /**
+   * Plan step 5, PR A: ContainerAdapter.runDirect: `docker <args>` without the worker, with the environment of the
+   * operation (the engine identity of the open).
+   */
+  runDirect(args: readonly string[], options?: RunOptions): Promise<RunResult>;
   logger: Logger;
   /** The content of dist/helperChannel.js. */
   script(): Promise<string>;
@@ -87,9 +94,17 @@ export interface ChannelOpenDeps {
   socketPath(target: DockerTarget): Promise<string>;
 }
 
+/** The name of the engine of `target` in the log. */
+function engineName(target: DockerTarget): string {
+  return target.kind === 'local' ? 'the local Docker' : target.host;
+}
+
 /**
  * Opens a channel to the engine of `target`: starts the container with the Docker context of `target`, then checks
- * with the operation `probe` that the Docker CLI in it reaches its engine. Throws HelperChannelError('open').
+ * with the operation `probe` that the Docker CLI in it reaches its engine, and (plan step 5, PR A) that it is the engine
+ * of `target`: the engine identity of the probe (ENGINE_IDENTITY_ARGS in the container) must be the one of the same call
+ * without the worker (a socket mount of another engine, for example with DOCKER_HOST set to a TCP endpoint of this
+ * computer, is refused). Throws HelperChannelError('open').
  */
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const [script, tag, socketPath] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target)]);
@@ -97,19 +112,42 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   const args = channelRunArgs({ tag, socketPath, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
   const process = await runWithDockerTarget(target, async () => deps.start(args));
   if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
-  const channel = await HelperChannel.open(process, script, { logger: deps.logger, name: target.host });
+  const name = engineName(target);
+  const channel = await HelperChannel.open(process, script, { logger: deps.logger, name });
+  let engine: string | undefined;
   try {
     const probe = parseProbeValue(await channel.operation(OP_PROBE, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
     if (probe?.serverVersion === undefined) throw new Error(probe?.detail ?? 'an invalid answer');
+    engine = probe.engine;
   } catch (error) {
     channel.close();
-    throw new HelperChannelError('open', `The helper channel to ${target.host} does not reach Docker: ${(error as Error).message}`);
+    throw new HelperChannelError('open', `The helper channel to ${name} does not reach Docker: ${(error as Error).message}`);
+  }
+  // Plan step 5, PR A: the engine identity, compared with one call without the worker.
+  let direct: string | undefined;
+  let directDetail = '';
+  try {
+    const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
+    direct = result.exitCode === 0 ? engineIdentity(result.stdout) : undefined;
+    directDetail = result.stderr.trim().slice(-500);
+  } catch (error) {
+    directDetail = (error as Error).message;
+  }
+  if (engine === undefined || direct === undefined || engine !== direct) {
+    channel.close();
+    const why =
+      engine === undefined
+        ? 'the helper did not name its Docker engine'
+        : direct === undefined
+          ? `the Docker engine could not be identified without it${directDetail ? ` (${directDetail})` : ''}`
+          : `it reaches another Docker engine (${engine}) than the Docker calls without it (${direct})`;
+    throw new HelperChannelError('open', `The helper channel to ${name} was closed: ${why}.`);
   }
   // Review round 4 (M1): channel containers that an earlier open created but never started are removed, in the
   // background (a failure is logged; the channel is open already).
   if (channel.operations.includes(OP_SWEEP)) {
     void channel.operation(OP_SWEEP, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).catch((error: unknown) => {
-      deps.logger.info(`The stopped helper channel containers on ${target.host} could not be removed: ${(error as Error).message}`);
+      deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
     });
   }
   return channel;
@@ -140,7 +178,7 @@ function keyOf(target: DockerTarget): string {
   return JSON.stringify([target.context ?? null, target.endpoint]);
 }
 
-/** The channels of this window, one per remote host. */
+/** The channels of this window, one per Docker engine (local and remote). */
 export class HelperChannels {
   private readonly entries = new Map<string, Entry>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
@@ -152,7 +190,15 @@ export class HelperChannels {
   }
 
   /**
-   * The open channel to the engine of `target`, opened now if needed. Undefined for a target that is not remote, after
+   * Plan step 5, PR A: the next get of every engine opens a channel again at once, also within
+   * CHANNEL_RETRY_AFTER_FAILURE_MS after a failed open (the Docker engine began to answer, or the helper image was built).
+   */
+  clearFailures(): void {
+    for (const entry of this.entries.values()) entry.failedAt = undefined;
+  }
+
+  /**
+   * The open channel to the engine of `target`, opened now if needed. Undefined for an unsupported target, after
    * dispose, when it cannot be opened (logged once per attempt; the next attempt after CHANNEL_RETRY_AFTER_FAILURE_MS),
    * and when it is not open within `wait.waitMs`. Rejects only with an AbortError when `wait.signal` aborts (review
    * round 3, K5), as every call with that signal does.
@@ -180,7 +226,8 @@ export class HelperChannels {
 
   /** The open channel, or the shared opening of one (see get). */
   private async channelFor(target: DockerTarget): Promise<HelperChannel | undefined> {
-    if (this.disposed || target.kind !== 'remote') return undefined;
+    // Plan step 5, PR A: the local Docker too; never an endpoint that is neither local nor SSH.
+    if (this.disposed || (target.kind !== 'remote' && target.kind !== 'local')) return undefined;
     const key = keyOf(target);
     let entry = this.entries.get(key);
     if (entry === undefined) {
@@ -211,7 +258,7 @@ export class HelperChannels {
         current.opening = undefined;
         current.failedAt = Date.now();
         this.options.logger.info(
-          `${(error as Error).message} Docker calls to ${target.host} go without it; the next attempt in ${Math.round(retryAfter / 60_000)} minutes.`,
+          `${(error as Error).message} Docker calls to ${engineName(target)} go without it; the next attempt in ${Math.round(retryAfter / 60_000)} minutes.`,
         );
         return undefined;
       },

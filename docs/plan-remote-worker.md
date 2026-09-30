@@ -15,6 +15,7 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-09-28 | **Operations interface**: the extension sends JSON operations; the worker runs all steps of an operation on that machine and reports progress. |
 | 2026-09-28 | **Progress and output go to the local log** (Dev Environments output), as detailed as the worker logs and records the results. The GitHub token is masked everywhere. |
 | 2026-09-29 | **The worker does everything the extension does on a Docker engine**: Start, build, Rebuild, Select configuration, Stop, Delete, Switch branch, refreshes and the Session Monitor's work. **It works the same for local and remote Docker.** |
+| 2026-09-29 | **The worker is used for the local Docker too**, not only for a remote host: one worker per window and engine, with the same routing, fallback and engine check (plan step 5, PR A). |
 | 2026-09-29 | **One mechanism fills the containers: the pipe.** The container runs a small loader; the extension (or the worker, for its helpers) writes the bundle from the `.vsix` as the first line of stdin; the loader stores it in the container and starts it. Communication goes over stdin/stdout of `docker … -a -i`. |
 | 2026-09-29 | **Steps run inside the worker.** The worker is the trusted boundary. Exception: steps that need an environment's volume are delegated to **one helper container per operation**, which the worker starts locally with that volume. The helper is loaded through the same pipe and runs the operation's **whole batch** (for example clone, configuration reads, build, `up`, lifecycle commands, token write, Git config, ownership fix) — never one container per step. |
 | 2026-09-29 | Inside a helper, Git runs as a user without access to the Docker socket; the token is sent only with the request that needs it and stays in memory. |
@@ -36,7 +37,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | merged (PR #64) |
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | in review |
-| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | queued |
+| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress (PR A: routing) |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again | queued |
 | 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
 | 8 | Worker: Session Monitor | heartbeats, "in use elsewhere", `forget`, automatic stops | queued |

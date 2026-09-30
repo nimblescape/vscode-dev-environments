@@ -436,6 +436,34 @@ export interface ProbeValue {
   /** The server version of the engine, or undefined when `docker version` failed. */
   serverVersion?: string;
   detail: string;
+  /**
+   * Plan step 5, PR A: the identity of the engine behind the socket of the container, the output of ENGINE_IDENTITY_ARGS
+   * (trimmed), or undefined when that call failed. The extension compares it with the same call without the worker.
+   */
+  engine?: string;
+}
+
+/** Plan step 5, PR A: `docker info` with the ID and the root folder of the engine (the engine identity of ProbeValue). */
+export const ENGINE_IDENTITY_ARGS: readonly string[] = ['info', '--format', '{{json .ID}} {{json .DockerRootDir}}'];
+/** The longest engine identity. */
+export const MAX_ENGINE_IDENTITY_LENGTH = 1_024;
+
+/**
+ * An engine identity as ENGINE_IDENTITY_ARGS prints it: two JSON strings on one line, the ID not empty, at most
+ * MAX_ENGINE_IDENTITY_LENGTH characters. Undefined for anything else (also a warning line of the CLI).
+ */
+export function engineIdentity(stdout: string): string | undefined {
+  const text = stdout.trim();
+  if (text.length > MAX_ENGINE_IDENTITY_LENGTH) return undefined;
+  const match = /^("(?:[^"\\\n]|\\.)*") ("(?:[^"\\\n]|\\.)*")$/.exec(text);
+  if (!match) return undefined;
+  try {
+    const id: unknown = JSON.parse(match[1]);
+    const root: unknown = JSON.parse(match[2]);
+    return typeof id === 'string' && id !== '' && typeof root === 'string' ? text : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isDockerArg(value: unknown): value is string {
@@ -467,7 +495,12 @@ export function parseDockerOperationValue(value: unknown): DockerOperationValue 
 
 /** The check of ProbeValue (the extension). */
 export function parseProbeValue(value: unknown): ProbeValue | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['detail'], ['serverVersion']) || typeof value.detail !== 'string') return undefined;
+  if (!isRecord(value) || !hasOnlyKeys(value, ['detail'], ['serverVersion', 'engine']) || typeof value.detail !== 'string') return undefined;
   if (value.serverVersion !== undefined && typeof value.serverVersion !== 'string') return undefined;
-  return value.serverVersion === undefined ? { detail: value.detail } : { serverVersion: value.serverVersion, detail: value.detail };
+  // Plan step 5, PR A: an engine identity is one that engineIdentity accepts, unchanged.
+  if (value.engine !== undefined && (typeof value.engine !== 'string' || engineIdentity(value.engine) !== value.engine)) return undefined;
+  const probe: ProbeValue = { detail: value.detail };
+  if (value.serverVersion !== undefined) probe.serverVersion = value.serverVersion as string;
+  if (value.engine !== undefined) probe.engine = value.engine as string;
+  return probe;
 }

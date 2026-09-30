@@ -3,12 +3,15 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The operations of the helper channel (src/core/helperChannel/protocol.ts). Step 1: `docker` (one Docker call, for
-// the calls that no operation covers yet) and `probe` (whether the Docker CLI of the container reaches its engine). The
+// the calls that no operation covers yet) and `probe` (whether the Docker CLI of the container reaches its engine, and
+// which engine: plan step 5, PR A). The
 // later steps add operations that run whole batches here, next to the engine, and report their progress.
 import {
+  ENGINE_IDENTITY_ARGS,
   OP_DOCKER,
   OP_PROBE,
   OP_SWEEP,
+  engineIdentity,
   parseDockerOperationParams,
   sweepArgs,
   type DockerOperationValue,
@@ -46,10 +49,15 @@ export const probeOperation: OperationHandler = async (params, context) => {
   // The time limit is the one of the request (the extension sets it).
   const result = await context.docker(['version', '--format', '{{.Server.Version}}']);
   const version = result.stdout.trim();
-  const value: ProbeValue =
-    result.exitCode === 0 && version !== ''
-      ? { serverVersion: version, detail: `Docker ${version}` }
-      : { detail: ((result.error ?? result.stderr.trim()) || `exit code ${result.exitCode}`).slice(-2_000) };
+  if (result.exitCode !== 0 || version === '') {
+    const failed: ProbeValue = { detail: ((result.error ?? result.stderr.trim()) || `exit code ${result.exitCode}`).slice(-2_000) };
+    return failed;
+  }
+  const value: ProbeValue = { serverVersion: version, detail: `Docker ${version}` };
+  // Plan step 5, PR A: the identity of the engine behind the socket, which the extension compares with its own call.
+  const identity = await context.docker(ENGINE_IDENTITY_ARGS);
+  const engine = identity.exitCode === 0 ? engineIdentity(identity.stdout) : undefined;
+  if (engine !== undefined) value.engine = engine;
   return value;
 };
 

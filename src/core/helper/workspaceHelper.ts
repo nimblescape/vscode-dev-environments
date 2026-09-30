@@ -102,6 +102,8 @@ export interface HelperDeps {
    * context, for helperDockerSocket. Without it, the local Docker of DOCKER_HOST.
    */
   engine?: () => Promise<HelperEngine>;
+  /** Plan step 5, PR A: called after a build of the helper image succeeded (the worker can be opened again at once). */
+  onImageBuilt?: () => void;
 }
 
 /** See HelperDeps.engine. */
@@ -1169,6 +1171,7 @@ export class WorkspaceHelper {
       // rejection nothing would handle (join rejects at once for an aborted signal) and which could start a build.
       if (options.signal?.aborted) throw abortError();
       const listeners = new Set<(kind: HelperBuildKind) => void>();
+      let built = false;
       const promise: Promise<HelperImageUse> = ensureHelperImageUse(this.deps.docker, this.deps.dockerfilePath, {
         onOutput: options.onOutput ?? this.logOutput,
         signal: options.signal,
@@ -1179,6 +1182,7 @@ export class WorkspaceHelper {
         // Review round 5 of PR #64 (R5-1): the progress reaches every caller that awaits this promise (join), not only
         // the caller that started it.
         onBuild: (kind) => {
+          built = true;
           if (this.imagePromise === promise) this.imageBuilding = kind;
           for (const listener of [...listeners]) listener(kind);
         },
@@ -1193,6 +1197,13 @@ export class WorkspaceHelper {
             this.imageUsedAt = this.imageReadyAt;
             this.imageTag = use.tag;
             this.imageCachedId = use.id;
+          }
+          if (built) {
+            try {
+              this.deps.onImageBuilt?.();
+            } catch (error) {
+              this.deps.logger.warn(`The built helper image could not be reported: ${errorMessage(error)}`);
+            }
           }
           return use;
         },

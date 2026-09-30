@@ -21,9 +21,10 @@ import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
-import { registryBaseDigest } from '../core/helper/helperImage';
+import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
 import { HelperPrebuild } from '../core/helper/helperPrebuild';
-import { DOCKER_SOCKET, WorkspaceHelper } from '../core/helper/workspaceHelper';
+import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../core/helper/workspaceHelper';
+import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperChannels';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { ImageChecker } from '../core/imageCheck/imageCheck';
@@ -124,8 +125,20 @@ async function activateExtension(
   logger.info(dockerPath ? `Docker CLI: ${dockerPath}` : 'The Docker CLI was not found.');
   // Set below; the adapter reports each `docker info` to it (context key devEnvironments.dockerReady).
   let dockerSetup: DockerSetup | undefined;
+  // Plan step 5, PR A: the worker (the helper channels), set below; its failed opens are tried again at once when the
+  // Docker engine begins to answer.
+  let helperChannels: HelperChannels | undefined;
+  let daemonRunning = false;
+  const adapterOptions = dockerAdapterOptions(() => dockerSetup);
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload.
-  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, dockerAdapterOptions(() => dockerSetup));
+  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, {
+    ...adapterOptions,
+    onDaemonStatus: (running) => {
+      if (running && !daemonRunning) helperChannels?.clearFailures();
+      daemonRunning = running;
+      adapterOptions.onDaemonStatus?.(running);
+    },
+  });
   // Unit 7: the Docker host is the current Docker context, read at the start of each operation.
   const targets = new DockerTargets(docker, env, logger, platform);
   const remoteState = new RemoteDockerState(paths.remoteDocker);
@@ -154,10 +167,11 @@ async function activateExtension(
     onCredentialsRejected: ghcrRejectionReporter(auth),
   });
   const imageChecker = new ImageChecker(registryClient, logger);
+  const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
   const helper = new WorkspaceHelper({
     docker,
     logger,
-    dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
+    dockerfilePath: helperDockerfile,
     env,
     // Implementation notes 7: the weekly check of the base image uses the registry client (and the credentials) of the
     // image check, with its own time limit of 5 seconds, in the background of the open.
@@ -169,6 +183,45 @@ async function activateExtension(
       const target = await targets.current();
       if (target.kind !== 'remote') return { key: target.host, endpoint: target.endpoint };
       return { key: target.host, socket: (await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
+    },
+    // Plan step 5, PR A: a worker that could not be opened for want of the helper image is tried again at once.
+    onImageBuilt: () => helperChannels?.clearFailures(),
+  });
+  // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
+  // remote. The plain Docker calls of an operation go through it (ContainerAdapter.run, dockerRouting.ts); everything
+  // else, and every call when it cannot be opened, runs directly. Its socket mount is the one of the workspace helper
+  // on that engine.
+  const channelScriptPath = context.asAbsolutePath(path.join('dist', 'helperChannel.js'));
+  let channelScript: Promise<string> | undefined;
+  const channels = new HelperChannels({
+    logger,
+    open: (target) =>
+      openHelperChannel(
+        {
+          start: (args) => docker.start(args),
+          runDirect: (args, options) => docker.runDirect(args, options),
+          logger,
+          script: () => {
+            channelScript ??= fs.promises.readFile(channelScriptPath, 'utf8');
+            // A failed read is tried again at the next open.
+            channelScript.catch(() => (channelScript = undefined));
+            return channelScript;
+          },
+          helperTag: async () => helperImageTag(await fs.promises.readFile(helperDockerfile, 'utf8')),
+          socketPath: async (target) =>
+            target.kind === 'remote'
+              ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET)
+              : helperDockerSocket(env, platform, target.endpoint),
+        },
+        target,
+      ),
+  });
+  helperChannels = channels;
+  docker.setRouter((target, args, options) => channels.docker(target, args, options));
+  context.subscriptions.push({
+    dispose: () => {
+      docker.setRouter(undefined);
+      channels.dispose();
     },
   });
   // Unit 7, PR 2: the Session Monitor container on a remote Docker host. Its script is dist/remoteMonitor.js, read once.

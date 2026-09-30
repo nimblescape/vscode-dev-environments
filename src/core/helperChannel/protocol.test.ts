@@ -24,6 +24,7 @@ import {
   parseClientMessage,
   parseDockerOperationParams,
   parseDockerOperationValue,
+  engineIdentity,
   parseProbeValue,
   parseServerMessage,
   refusedOperationId,
@@ -179,5 +180,19 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(parseDockerOperationValue({ exitCode: 1.5 })).toBeUndefined();
     expect(parseProbeValue({ serverVersion: '27', detail: 'd' })).toEqual({ serverVersion: '27', detail: 'd' });
     expect(parseProbeValue({ detail: 3 })).toBeUndefined();
+  });
+
+  // Plan step 5, PR A: the engine identity of the probe is checked strictly.
+  it('engineIdentity and the engine of ProbeValue', () => {
+    const engine = '"7b1c:ABCD" "/var/lib/docker"';
+    expect(engineIdentity(`${engine}\n`)).toBe(engine);
+    expect(engineIdentity('"" "/var/lib/docker"')).toBeUndefined();
+    expect(engineIdentity('"id"')).toBeUndefined();
+    expect(engineIdentity('WARNING: x\n"id" "/r"')).toBeUndefined();
+    expect(engineIdentity(`"${'a'.repeat(2_000)}" "/r"`)).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine })).toEqual({ serverVersion: '27', detail: 'd', engine });
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: 3 })).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: ` ${engine}` })).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: '"id" "/r"', other: 1 })).toBeUndefined();
   });
 });
