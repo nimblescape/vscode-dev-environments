@@ -119,6 +119,14 @@ export function helperImageTag(
 }
 
 /**
+ * PR #74 review round 2, A-R2-1: the current helper tag (helperImageTag) of the Dockerfile at `dockerfilePath`, the tag
+ * that ensureHelperImageUse ensures. Throws when the Dockerfile cannot be read.
+ */
+export async function currentHelperImageTag(dockerfilePath: string): Promise<string> {
+  return helperImageTag(await fs.promises.readFile(dockerfilePath, 'utf8'));
+}
+
+/**
  * The helper image that an ensure resolved (ensureHelperImageUse), and the helper image of an open (review round 2 of
  * PR #64, A-N1): the open pipeline resolves it once per open and passes it to every helper run of that open (`image`),
  * so the configuration that the CLI of one helper image read and checked is run with the same CLI, whatever another open
