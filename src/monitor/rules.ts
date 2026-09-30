@@ -15,7 +15,14 @@
 //      (recording the Git summary takes time), record the Git summary, then `docker stop`.
 //      Remove the window status files of `decision.removeWindowFiles`.
 //   5. End the process when `decision.exit` is true.
-import { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../core/busy';
+import {
+  DEFAULT_WAITING_TIME_SECONDS,
+  HEARTBEAT_MAX_AGE_MS,
+  PENDING_MAX_AGE_MS,
+  SLEEP_GAP_MS,
+  isStaleLiveWindowStatus,
+  waitingTimeMs,
+} from '../core/busy';
 import { DEFAULT_REMOTE_STOP_AFTER_SECONDS, clampLimitSeconds } from '../core/remoteMonitor/protocol';
 import type { MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 
@@ -25,8 +32,9 @@ export const TICK_MS = 5000;
 // PENDING_MAX_AGE_MS (the same for a pending connection file) live in src/core/busy.ts since review round 3 of PR #68
 // (A-R3-4), which the environment service shares (otherWindowUsesEnvironment).
 export { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS };
-/** A gap between two ticks larger than this means that the computer slept, or that the clock was changed. */
-export const SLEEP_GAP_MS = 30_000;
+// SLEEP_GAP_MS, DEFAULT_WAITING_TIME_SECONDS, waitingTimeMs and the rule of isStaleLiveWindow live in src/core/busy.ts
+// since review round 5 of PR #68 (risk 2): the destructive checks of the environment service use the same rule.
+export { DEFAULT_WAITING_TIME_SECONDS, SLEEP_GAP_MS, waitingTimeMs };
 /** After such a gap, the age of `updatedAt` is ignored for this time (sleep rule). */
 export const SLEEP_GRACE_MS = 60_000;
 /**
@@ -41,8 +49,6 @@ export const DOCKER_UNKNOWN_MAX_MS = 30_000;
  * `docker start`.
  */
 export const STOPPED_RECHECK_MS = 10 * 60_000;
-/** Default of the setting `devEnvLauncher.waitingTimeSeconds` (concept section 8). */
-export const DEFAULT_WAITING_TIME_SECONDS = 30;
 
 /** A window status file, and whether its process exists. */
 export interface MonitorWindow {
@@ -303,17 +309,6 @@ export function decide(input: DecideInput): MonitorDecision {
   return { state, inUse, stop, removeWindowFiles, exit };
 }
 
-/** The waiting time of the settings in milliseconds. A missing, negative, or invalid value gives the default. */
-export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSeconds'>): number {
-  const seconds: unknown = settings.waitingTimeSeconds;
-  // Assumption (V-4): a window reload takes less than the waiting time, so the default of 30 s prevents a stop
-  // during a reload.
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
-    return DEFAULT_WAITING_TIME_SECONDS * 1000;
-  }
-  return Math.round(seconds * 1000);
-}
-
 /**
  * Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host, in seconds, from the
  * setting remoteStopAfterMinutes (clamped to one minute..one day as the protocol allows; the setting itself is 5..1440 minutes; a missing or invalid value gives 10 minutes).
@@ -369,7 +364,7 @@ function statesNeeded(
  * or a hanging extension host). Never during the sleep grace.
  */
 function isStaleLiveWindow(window: MonitorWindow, now: number, grace: boolean, waitingMs: number): boolean {
-  return window.alive && !grace && !isFresh(window.status.updatedAt, now, HEARTBEAT_MAX_AGE_MS + waitingMs);
+  return isStaleLiveWindowStatus(window.status, window.alive, now, grace, waitingMs);
 }
 
 /** A window keeps the monitor running: its process exists, its state is `active`, and its file is not stale. */

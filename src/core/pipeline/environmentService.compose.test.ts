@@ -3920,6 +3920,46 @@ describe('review round 22 (D22-1): Select configuration… between two configura
     });
   });
 
+  describe('review round 5 of PR #68 (A-R5-3): the guard of a failed switch of the dev service follows what happened, not the build record', () => {
+    /** The first FF-1 test, with the build record of the previous configuration changed by `change` before the switch. */
+    async function failedSwitch(change: (environment: Environment) => void): Promise<void> {
+      await h.service.open(TARGET, options());
+      const app = byService('app')!;
+      await h.registry.updateEnvironment(ENV_ID, change);
+      const log = h.docker.log.length;
+      const ups = h.helper.ups.length;
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_1 ? undefined : new Error('compose up failed'));
+      const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH }));
+      expect(error.code).toBe('startFailed');
+      // Before: the guard read the service from composeRecordOf(record), so it was skipped, and the restore ran `up` with the
+      // new configuration and the previous image next to the renamed previous dev container.
+      expect(h.helper.ups.slice(ups).map((up) => up.image)).not.toContain(IMAGE_1);
+      expect(h.docker.log.slice(log)).not.toContain(`rm ${app.id}`);
+      expect(h.docker.containers.get(app.id)).toMatchObject({ name: `${PROJECT}-app-1`, state: 'stopped' });
+      expect(h.docker.containersOf(ENV_ID).filter((c) => c.labels['com.docker.compose.service'] === 'app')).toEqual([expect.objectContaining({ id: app.id })]);
+      expect((await h.registry.get(ENV_ID))?.configPath).toBe(DEFAULT_CONFIG_PATH);
+    }
+
+    it('an older build record whose part of Docker Compose lacks a field (composeRecordOf rejects it)', async () => {
+      await failedSwitch((environment) => {
+        delete (environment.buildRecord!.compose as Partial<NonNullable<BuildRecord['compose']>>).inputsHash;
+      });
+    });
+
+    it('a build record without the service name in its part of Docker Compose', async () => {
+      await failedSwitch((environment) => {
+        delete (environment.buildRecord!.compose as Partial<NonNullable<BuildRecord['compose']>>).service;
+      });
+    });
+
+    it('no build record', async () => {
+      await failedSwitch((environment) => {
+        delete environment.buildRecord;
+      });
+    });
+  });
+
   describe('review round 2 of PR #68 (A-R2-3): run-user-commands of the new dev service fails with helperFailed after up', () => {
     const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
 
@@ -4958,6 +4998,41 @@ describe('review round 4 of PR #68', () => {
     const after = await h.registry.get(ENV_ID);
     expect(after?.lifecycleIncomplete).toBeUndefined();
     expect(after?.busy).toBeUndefined();
+  });
+
+  /** Review round 5 of PR #68 (A-R5-1): the single container of seedMarkedSingle, stopped (with the service db in `db`). */
+  async function seedStoppedSingle(db: 'running' | 'stopped'): Promise<ContainerInfo> {
+    await seedCompose({ dev: null, db });
+    const single = h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'stopped', image: IMAGE_2 });
+    h.docker.images.add(IMAGE_2);
+    h.settings.updateImagesOnConnect = false;
+    return single;
+  }
+
+  it('A-R5-1 (review round 5 of PR #68): nothing of the environment runs: window B `active` does not keep the stopped single container from being replaced', async () => {
+    withWindowB();
+    const single = await seedStoppedSingle('stopped');
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    // Before (round 4): startFailed "…must be removed, but another window is connected to the environment."
+    expect(h.docker.log).toContain(`rm ${single.id}`);
+    expect(devContainer()?.state).toBe('running');
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  it('A-R5-1 (review round 5 of PR #68): the single container is stopped, but the service db runs: window B counts, nothing is changed', async () => {
+    withWindowB();
+    const single = await seedStoppedSingle('running');
+    const db = dbContainer()!;
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(
+      `To start the environment with its Docker Compose configuration, the container ${NAME}, which Docker Compose did not create, must be removed, but another window is connected to the environment. Nothing was stopped, removed, or renamed. Open or rebuild the environment again when that window is closed.`,
+    );
+    expect(touched()).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containers.get(single.id)).toMatchObject({ state: 'stopped' });
+    expect(h.docker.containers.get(db.id)).toMatchObject({ state: 'running' });
   });
 
   it('A-R4-2: a build record of Docker Compose whose part lacks a field of a later version keeps the environment a Docker Compose environment', async () => {
