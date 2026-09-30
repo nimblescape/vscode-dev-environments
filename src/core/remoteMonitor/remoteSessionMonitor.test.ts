@@ -1322,6 +1322,29 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
     expect(REMOTE_MONITOR_STALE_CREATED_MS).toBe(REMOTE_MONITOR_DOCKER_TIMEOUT_MS + 30_000);
   });
 
+  // PR #69 review round 5, B-R5-6: the wait for the end of a killed client is pinned to a few seconds (its value
+  // survived: the test of the wait derives its times from it).
+  it('B-R5-6: the wait for the end of a killed client is bounded to 1-10 s', () => {
+    expect(REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS).toBeGreaterThanOrEqual(1_000);
+    expect(REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS).toBeLessThanOrEqual(10_000);
+  });
+
+  // PR #69 review round 5, B-R5-6: a failed create whose client never ends fails, with its cleanup, within the Docker
+  // time limit plus 10 s of fake time (not derived from REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS).
+  it('B-R5-6: a failed create whose client never ends fails within the Docker time limit plus 10 s', async () => {
+    vi.useFakeTimers();
+    const docker = new FakeDocker(missingThenCreated, (client) => {
+      client.exitOnKill = false;
+    });
+    let outcome: string | undefined;
+    void monitor(docker)
+      .ensure(TAG, SOCKET)
+      .then((value) => (outcome = value));
+    await vi.advanceTimersByTimeAsync(REMOTE_MONITOR_DOCKER_TIMEOUT_MS + 10_000);
+    expect(outcome).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'rm']);
+  });
+
   it('A-R4-1: a matching created container that another window starts meanwhile is accepted, never removed', async () => {
     vi.useFakeTimers();
     const next = inspects(createdIn(LABEL), createdIn(LABEL), inspected(true, LABEL));
@@ -1479,6 +1502,41 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
     });
   }
 
+  // PR #69 review round 5, B-R5-2: a creation time after the daemon's clock (the clock was set back) is a negative age,
+  // never a large one (Math.abs survived): the young container of a live create is kept.
+  it('B-R5-2: a created container whose creation time is after the clock of the daemon is kept', async () => {
+    vi.useFakeTimers();
+    const docker = new FakeDocker((args) =>
+      args[0] === 'container' ? createdIn(LABEL) : args[0] === 'info' ? systemTime(-(REMOTE_MONITOR_STALE_CREATED_MS + 60_000)) : result(0),
+    );
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(CREATED_WAIT_TOTAL);
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).toEqual([...allCreatedLooks, 'info']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  // PR #69 review round 5, B-R5-3: a cancellation during `docker info` of the age check passes as an AbortError (the
+  // rethrow survived); nothing is removed and nothing runs after it.
+  it('B-R5-3: a cancellation during docker info of the age check passes; nothing removed, nothing after it', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const docker = new FakeDocker((args) => {
+      if (args[0] === 'container') return createdIn(LABEL);
+      if (args[0] === 'info') {
+        controller.abort();
+        return Promise.reject(abortError());
+      }
+      return result(0);
+    });
+    const ensured = monitor(docker).ensure(TAG, SOCKET, controller.signal);
+    const rejected = expect(ensured).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.advanceTimersByTimeAsync(CREATED_WAIT_TOTAL);
+    await rejected;
+    expect(docker.commands()).toEqual([...allCreatedLooks, 'info']);
+    expect(removals(docker)).toEqual([]);
+  });
+
   for (const [what, created] of [
     ['no creation time', undefined],
     ['Docker\'s zero time', '0001-01-01T00:00:00Z'],
@@ -1592,6 +1650,9 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
     ['a line of the container that says "conflict" (exit 125)', 'devenv loader: the entry failed: merge conflict\n', 125],
     ['a line of the container that says "already in use" (exit 125)', 'Error: the port is already in use\n', 125],
     ['the daemon message with exit 1', CONFLICT, 1],
+    // PR #69 review round 5, B-R5-1: the anchor of NAME_CONFLICT (the daemon's message quoted mid-line, or its bare text).
+    ['the daemon message quoted mid-line by the container (exit 125)', 'devenv loader: the entry failed: Error response from daemon: Conflict. The container name "/x" is already in use\n', 125],
+    ['the conflict text without the daemon prefix at a line start (exit 125)', 'Conflict. The container name "/x" is already in use\n', 125],
   ] as const) {
     it(`A-R4-2: ${what} is no conflict: the create's own container is removed by its nonce, nothing inspected`, async () => {
       const docker = new FakeDocker(missingThenCreated, (client) => {
@@ -1639,6 +1700,24 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
     });
   }
 
+  // PR #69 review round 5, B-R5-4: a cancellation during the nonce check after a conflict passes as an AbortError (the
+  // rethrow in listOwn survived): no cleanup, no look at the container, no warning.
+  it('B-R5-4: a cancellation during the nonce check after a conflict passes; nothing removed, no warning', async () => {
+    const controller = new AbortController();
+    const logger = new Log();
+    const docker = new FakeDocker((args, index) => {
+      if (index === 0) return MISSING;
+      if (args[0] === 'ps') {
+        controller.abort();
+        return Promise.reject(abortError());
+      }
+      return inspected(true, LABEL);
+    }, alwaysConflict);
+    await expect(monitor(docker, logger).ensure(TAG, SOCKET, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps']);
+    expect(logger.lines.some((line) => line.startsWith('warn'))).toBe(false);
+  });
+
   it('A-R4-2: the nonce check after a conflict gets the signal and the time limit; the cleanup gets no signal', async () => {
     const controller = new AbortController();
     const docker = new FakeDocker((args, index) => (index === 0 ? MISSING : args[0] === 'ps' ? result(0) : inspected(true, 'other-label')), alwaysConflict);
@@ -1666,6 +1745,20 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
       expect(removals(docker)).toEqual([]);
     });
   }
+
+  // PR #69 review round 5, B-R5-5: the check of the stored script of a restarted container after a conflict gets the
+  // signal of ensure (the signal survived) and a time limit.
+  it('B-R5-5: the stored-script check after a conflict gets the signal and a time limit of ensure', async () => {
+    const controller = new AbortController();
+    const docker = new FakeDocker(
+      (args, index) => (index === 0 ? MISSING : args[0] === 'ps' ? result(0) : args[0] === 'exec' ? SAME : inspected(true, LABEL, 0, 2)),
+      alwaysConflict,
+    );
+    expect(await monitor(docker).ensure(TAG, SOCKET, controller.signal)).toBe('running');
+    const exec = docker.calls.find((call) => call.args[0] === 'exec');
+    expect(exec?.options?.signal).toBe(controller.signal);
+    expect(exec?.options?.timeoutMs).toBeGreaterThan(0);
+  });
 
   it('A-R4-3: a conflict with a matching paused container with RestartCount 2 is accepted without a check', async () => {
     const docker = new FakeDocker((args, index) => (index === 0 ? MISSING : args[0] === 'ps' ? result(0) : inspected('paused', LABEL, 0, 2)), alwaysConflict);
