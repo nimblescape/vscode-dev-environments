@@ -1125,17 +1125,21 @@ describe('RemoteSessionMonitor.ensure (review round 3 of PR #69, A-R3)', () => {
     const ensured = monitor(docker, logger)
       .ensure(TAG, SOCKET)
       .finally(() => (settled = true));
-    const total = REMOTE_MONITOR_CONFLICT_WAITS_MS.reduce((sum, ms) => sum + ms, 0);
-    // A few seconds in all.
-    expect(total).toBeGreaterThanOrEqual(2_000);
-    expect(total).toBeLessThanOrEqual(5_000);
+    // The waits for a `removing` one: a few seconds in all.
+    const conflictTotal = REMOTE_MONITOR_CONFLICT_WAITS_MS.reduce((sum, ms) => sum + ms, 0);
+    expect(conflictTotal).toBeGreaterThanOrEqual(2_000);
+    expect(conflictTotal).toBeLessThanOrEqual(5_000);
+    // PR #69 review round 5, A-R5-1: changed expectation (before: REMOTE_MONITOR_CONFLICT_WAITS_MS, 3.75 s): a `created`
+    // one gets the waits of the first look (REMOTE_MONITOR_CREATED_WAITS_MS, 12.75 s).
+    const total = REMOTE_MONITOR_CREATED_WAITS_MS.reduce((sum, ms) => sum + ms, 0);
     await vi.advanceTimersByTimeAsync(total - 1);
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(await ensured).toBe('failed');
     // PR #69 review round 4, A-R4-2: changed expectation (before: without the two 'ps'): the nonce check after the
     // conflict, and the cleanup by the nonce before the failure (it finds nothing: the conflict made no container).
-    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', ...REMOTE_MONITOR_CONFLICT_WAITS_MS.map(() => 'inspect'), 'inspect', 'ps']);
+    // PR #69 review round 5, A-R5-1: changed expectation (before: a look after each of REMOTE_MONITOR_CONFLICT_WAITS_MS).
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', ...REMOTE_MONITOR_CREATED_WAITS_MS.map(() => 'inspect'), 'inspect', 'ps']);
     expect(removals(docker)).toEqual([]);
     noncePs(docker);
     expect(logger.lines.join('\n')).toMatch(/warn The Session Monitor on the Docker host could not be started: docker run failed: .*already in use/);
@@ -1371,17 +1375,40 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
     expect(docker.commands()).toEqual(['inspect', 'inspect']);
   });
 
-  it('A-R4-1: a created container of another ID after the wait is judged by its own age: young, so kept', async () => {
+  // PR #69 review round 5, A-R5-2: changed test (before: another ID found `created` ended the wait at once and was judged
+  // by its age: ['inspect', 'inspect', 'info'], failed): the waits start once more for the new ID. It starts → running;
+  // still `created` after the second wait → judged by its own age: young, so kept (failed), nothing removed.
+  it('A-R4-1, A-R5-2: a created container of another ID gets the wait once more; it starts → running, nothing removed', async () => {
     vi.useFakeTimers();
     // The old ID was abandoned long ago, but another window just created a new one (its own Created, 1 s before now).
     const now = REMOTE_MONITOR_STALE_CREATED_MS * 10;
     const young = inspected('created', LABEL, 0, 0, OTHER_ID, new Date(CREATED_MS + now - 1_000).toISOString());
-    const next = inspects(createdIn(LABEL), young);
+    const next = inspects(createdIn(LABEL), young, young, inspected(true, LABEL, 0, 0, OTHER_ID));
     const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(now) : result(0)));
     const ensured = monitor(docker).ensure(TAG, SOCKET);
     await vi.advanceTimersByTimeAsync(CREATED_WAIT_TOTAL);
+    expect(await ensured).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'inspect', 'inspect', 'inspect']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R4-1, A-R5-2: a created container of another ID still created after the second wait is judged by its own age: young, so kept', async () => {
+    vi.useFakeTimers();
+    const now = REMOTE_MONITOR_STALE_CREATED_MS * 10;
+    const young = inspected('created', LABEL, 0, 0, OTHER_ID, new Date(CREATED_MS + now - 1_000).toISOString());
+    const next = inspects(createdIn(LABEL), young);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(now) : result(0)));
+    let settled = false;
+    const ensured = monitor(docker)
+      .ensure(TAG, SOCKET)
+      .finally(() => (settled = true));
+    // The first look at the new ID uses the first wait (250 ms) of the first list; then its own full list.
+    const first = REMOTE_MONITOR_CREATED_WAITS_MS[0];
+    await vi.advanceTimersByTimeAsync(first + CREATED_WAIT_TOTAL - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     expect(await ensured).toBe('failed');
-    expect(docker.commands()).toEqual(['inspect', 'inspect', 'info']);
+    expect(docker.commands()).toEqual(['inspect', 'inspect', ...REMOTE_MONITOR_CREATED_WAITS_MS.map(() => 'inspect'), 'info']);
     expect(removals(docker)).toEqual([]);
   });
 
@@ -1823,4 +1850,184 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, B-R4)', () => {
     expect(docker.commands()).not.toContain('rm');
   });
 
+});
+
+// Review round 5 of PR #69: the findings of reviewer A.
+describe('RemoteSessionMonitor.ensure (review round 5 of PR #69, A-R5)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const OTHER_ID = 'beef'.padEnd(64, '2');
+  const THIRD_ID = 'dead'.padEnd(64, '3');
+  const CREATED_AT = '2026-09-30T10:00:00.123456789Z';
+  const CREATED_MS = Date.UTC(2026, 8, 30, 10, 0, 0, 123);
+  const createdIn = (label: string | undefined, id: unknown = MONITOR_ID) => inspected('created', label, 0, 0, id, CREATED_AT);
+  const systemTime = (ageMs: number) => result(0, `${JSON.stringify(new Date(CREATED_MS + ageMs).toISOString())}\n`);
+  const inspects = (...answers: RunResult[]) => {
+    let at = 0;
+    return () => answers[Math.min(at++, answers.length - 1)];
+  };
+  const sum = (waits: readonly number[]) => waits.reduce((total, ms) => total + ms, 0);
+  const removals = (docker: FakeDocker) => docker.calls.filter((call) => call.args[0] === 'rm' || call.args[0] === 'start');
+  const alwaysConflict = (client: FakeClient) => {
+    client.complain(CONFLICT);
+    client.exit(125);
+  };
+  /** The inspects after a conflict: `created` until `untilMs` of fake time have passed, then `after`. */
+  const createdUntil = (untilMs: number, after: RunResult) => {
+    const start = Date.now();
+    let first = true;
+    return () => {
+      if (first) {
+        first = false;
+        return MISSING;
+      }
+      return Date.now() - start < untilMs ? inspected('created', LABEL) : after;
+    };
+  };
+
+  it('A-R5-1: a conflict with a container that is created for about 8 s and then runs with the matching label → running, nothing removed', async () => {
+    vi.useFakeTimers();
+    const logger = new Log();
+    const next = createdUntil(8_000, inspected(true, LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker, logger).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('running');
+    expect(removals(docker)).toEqual([]);
+    expect(docker.commands().filter((command) => command === 'run')).toHaveLength(1);
+    expect(logger.lines.some((line) => line.startsWith('warn'))).toBe(false);
+  });
+
+  it('A-R5-1: a conflict with a container that stays created through all waits → failed after 12.75 s, nothing removed', async () => {
+    vi.useFakeTimers();
+    const next = createdUntil(Number.POSITIVE_INFINITY, MISSING);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    let settled = false;
+    const ensured = monitor(docker)
+      .ensure(TAG, SOCKET)
+      .finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CREATED_WAITS_MS) - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await ensured).toBe('failed');
+    expect(removals(docker)).toEqual([]);
+    expect(docker.commands().filter((command) => command === 'info')).toEqual([]);
+  });
+
+  it('A-R5-1: a container that stays removing still gets the short waits only (3.75 s), nothing removed', async () => {
+    vi.useFakeTimers();
+    const next = inspects(MISSING, inspected('removing', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    let settled = false;
+    const ensured = monitor(docker)
+      .ensure(TAG, SOCKET)
+      .finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CONFLICT_WAITS_MS) - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'run', 'ps', ...REMOTE_MONITOR_CONFLICT_WAITS_MS.map(() => 'inspect'), 'inspect', 'ps']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-1: one counter for both lists: a status that changes between created and removing ends after the longer list at most', async () => {
+    vi.useFakeTimers();
+    // removing, created, removing, created, …: never more looks than the longer list has waits, plus the first.
+    let at = 0;
+    const next = () => (at++ === 0 ? MISSING : at % 2 === 0 ? inspected('removing', LABEL) : inspected('created', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('failed');
+    const looks = docker.commands().filter((command) => command === 'inspect').length - 1;
+    expect(looks).toBeLessThanOrEqual(Math.max(REMOTE_MONITOR_CREATED_WAITS_MS.length, REMOTE_MONITOR_CONFLICT_WAITS_MS.length) + 1);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-1: a created container after a conflict is never judged by its age, even when it is old (inspect only)', async () => {
+    vi.useFakeTimers();
+    const next = inspects(MISSING, createdIn(LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(REMOTE_MONITOR_STALE_CREATED_MS * 10) : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).not.toContain('info');
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-1: a cancellation during a long created wait of the conflict passes at once, nothing removed', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const next = inspects(MISSING, inspected('created', LABEL));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)), alwaysConflict);
+    const ensured = monitor(docker).ensure(TAG, SOCKET, controller.signal);
+    const rejected = expect(ensured).rejects.toMatchObject({ name: 'AbortError' });
+    // Past the old 3.75 s: still waiting.
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CONFLICT_WAITS_MS) + 1_000);
+    const before = docker.commands();
+    controller.abort();
+    await rejected;
+    expect(docker.commands()).toEqual(before);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-2: the restart of the created-wait for another ID happens once only: a third ID ends it (young → kept)', async () => {
+    vi.useFakeTimers();
+    const now = REMOTE_MONITOR_STALE_CREATED_MS * 10;
+    const createdAtNow = new Date(CREATED_MS + now - 1_000).toISOString();
+    const other = inspected('created', LABEL, 0, 0, OTHER_ID, createdAtNow);
+    const third = inspected('created', LABEL, 0, 0, THIRD_ID, createdAtNow);
+    const next = inspects(createdIn(LABEL), other, third);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(now) : result(0)));
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(2 * sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('failed');
+    expect(docker.commands()).toEqual(['inspect', 'inspect', 'inspect', 'info']);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-2: the whole created-wait stays bounded at 2 x 12.75 s even when the ID keeps changing', async () => {
+    vi.useFakeTimers();
+    let at = 0;
+    const ids = [MONITOR_ID, OTHER_ID];
+    // Old enough to be replaced only if the ID had been stable; it alternates, so the wait ends at the second change.
+    const next = () => inspected('created', LABEL, 0, 0, ids[at++ % 2], CREATED_AT);
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(1_000) : result(0)));
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(2 * sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('failed');
+    expect(docker.commands().filter((command) => command === 'inspect').length).toBeLessThanOrEqual(2 * REMOTE_MONITOR_CREATED_WAITS_MS.length + 1);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-2: a cancellation during the second created-wait passes at once, nothing removed', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const next = inspects(createdIn(LABEL), createdIn(LABEL, OTHER_ID));
+    const docker = new FakeDocker((args) => (args[0] === 'container' ? next() : result(0)));
+    const ensured = monitor(docker).ensure(TAG, SOCKET, controller.signal);
+    const rejected = expect(ensured).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.advanceTimersByTimeAsync(sum(REMOTE_MONITOR_CREATED_WAITS_MS) - 1_000);
+    const before = docker.commands();
+    expect(before.length).toBeGreaterThan(2);
+    controller.abort();
+    await rejected;
+    expect(docker.commands()).toEqual(before);
+    expect(docker.calls.every((call) => call.options?.signal === controller.signal)).toBe(true);
+    expect(removals(docker)).toEqual([]);
+  });
+
+  it('A-R5-2: a second ID that is old and stays created after its own wait is removed by that ID, never by the name', async () => {
+    vi.useFakeTimers();
+    const next = inspects(createdIn(LABEL), createdIn(LABEL, OTHER_ID));
+    const docker = new FakeDocker((args) =>
+      args[0] === 'container' ? next() : args[0] === 'info' ? systemTime(REMOTE_MONITOR_STALE_CREATED_MS + 1) : args[0] === 'ps' ? result(0, `${CREATED_ID}\n`) : result(0),
+    );
+    const ensured = monitor(docker).ensure(TAG, SOCKET);
+    await vi.advanceTimersByTimeAsync(2 * sum(REMOTE_MONITOR_CREATED_WAITS_MS));
+    expect(await ensured).toBe('created');
+    expect(docker.calls.filter((call) => call.args[0] === 'rm').map((call) => call.args)).toEqual([['rm', '-f', OTHER_ID]]);
+  });
 });

@@ -142,6 +142,12 @@ export const REMOTE_MONITOR_CONFLICT_WAITS_MS: readonly number[] = [250, 500, 1_
 export const REMOTE_MONITOR_CREATED_WAITS_MS: readonly number[] = [250, 500, 1_000, 1_000, 2_000, 2_000, 2_000, 2_000, 2_000];
 
 /**
+ * Review round 5 of PR #69 (A-R5-1): the most waits of one look after a name conflict (resolveConflict), whatever the
+ * status of the container between them: that of the longer list.
+ */
+const CONFLICT_LOOK_BUDGET = Math.max(REMOTE_MONITOR_CREATED_WAITS_MS.length, REMOTE_MONITOR_CONFLICT_WAITS_MS.length);
+
+/**
  * Review round 4 of PR #69 (A-R4-1): a container that is still `created` after REMOTE_MONITOR_CREATED_WAITS_MS is
  * removed only when it is older than this on the clock of the daemon: every live create either starts its container or
  * gives up (and removes it by its nonce) within REMOTE_MONITOR_DOCKER_TIMEOUT_MS of its start, so an older one was
@@ -203,8 +209,9 @@ export class RemoteSessionMonitor {
    *   before its script was stored exits 3 at once) → `docker rm -f <ID>`, then create; a check that fails → kept (logged);
    * - created (any label): review round 4 of PR #69 (A-R4-1): it may be the create of another window between its create
    *   and its start, so ensure looks again, 12.75 s at most (REMOTE_MONITOR_CREATED_WAITS_MS; a cancellation ends the
-   *   wait), while the same ID stays `created`; any other state it finds (gone, running, another ID, …) goes through this
-   *   table. Still `created` → `docker rm -f <ID>`, then create, only when the daemon created it more than
+   *   wait), while the same ID stays `created`; review round 5 of PR #69 (A-R5-2): when another ID is found still
+   *   `created`, the waits start once more for it (once only, 25.5 s at most in all); any other state it finds (gone,
+   *   running, another ID after that, …) goes through this table. Still `created` → `docker rm -f <ID>`, then create, only when the daemon created it more than
    *   REMOTE_MONITOR_STALE_CREATED_MS ago by the clock of the daemon (`.Created` and `docker info` SystemTime); younger,
    *   or an age that cannot be read → kept, `failed`;
    * - the matching label and restarting, dead, removing, or exited with LOADER_EXIT_CODE (the loader refused its stored
@@ -220,7 +227,8 @@ export class RemoteSessionMonitor {
    * monitor is up when its output has REMOTE_MONITOR_READY_TEXT within REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then the client
    * is ended. Review round 3 of PR #69 (A-R3-1, A-R3-2): on a name conflict (another window creates or removes the
    * container meanwhile) it looks again (resolveConflict): while that container is `created` or `removing` it waits and
-   * looks again, a few seconds at most (REMOTE_MONITOR_CONFLICT_WAITS_MS); a matching one that runs or is paused is
+   * looks again (review round 5 of PR #69, A-R5-1: `created` 12.75 s at most, REMOTE_MONITOR_CREATED_WAITS_MS;
+   * `removing` 3.75 s, REMOTE_MONITOR_CONFLICT_WAITS_MS; one counter for both); a matching one that runs or is paused is
    * accepted; when the name is free, the create is tried once more (once only); anything else (still `created` after the
    * waits, another label, another status) fails. Nothing is removed there: the container is not ours. Review round 4 of
    * PR #69: a conflict is only the daemon's message at a line start with the CLI's exit 125 (A-R4-2), and only when no
@@ -385,13 +393,28 @@ export class RemoteSessionMonitor {
    * Review round 4 of PR #69 (A-R4-1): looks at the container of the name again while it stays `created` with the same
    * ID, with the waits of REMOTE_MONITOR_CREATED_WAITS_MS, and gives the first other state (gone, another status, another
    * ID) or the last look. Only inspects. A cancellation during a wait passes (AbortError).
+   * Review round 5 of PR #69 (A-R5-2): when the name moves to another container that is still `created` (another window
+   * removed an abandoned one and created its own, between its create and its start), the waits start once more for that
+   * ID (once only: 2 × 12.75 s at most, one budget of looks); another ID after that, or one that cannot be read, ends the
+   * wait, and that container is judged by its own age.
    */
   private async waitWhileCreated(first: Inspected & { exists: true }, signal: AbortSignal | undefined): Promise<Inspected> {
+    const waits = REMOTE_MONITOR_CREATED_WAITS_MS;
     let found: Inspected = first;
-    for (const ms of REMOTE_MONITOR_CREATED_WAITS_MS) {
-      await wait(ms, signal);
+    let id = first.id;
+    let restarted = false;
+    let step = 0;
+    for (let looks = 0; looks < 2 * waits.length && step < waits.length; looks += 1) {
+      await wait(waits[step], signal);
+      step += 1;
       found = await this.inspect(signal);
-      if (!found.exists || found.status !== 'created' || found.id !== first.id) return found;
+      if (!found.exists || found.status !== 'created') return found;
+      if (found.id !== id) {
+        if (restarted || found.id === undefined) return found;
+        restarted = true;
+        id = found.id;
+        step = 0;
+      }
     }
     return found;
   }
@@ -426,7 +449,8 @@ export class RemoteSessionMonitor {
   /**
    * Review round 3 of PR #69 (A-R3-1, A-R3-2): what the container of the name is after a name conflict of the create:
    * `running` (the matching label, running or paused), `missing` (the name is free again), or `other` (anything else,
-   * also a container that is still `created` or `removing` after the waits of REMOTE_MONITOR_CONFLICT_WAITS_MS). Only
+   * also a container that is still `created` after the waits of REMOTE_MONITOR_CREATED_WAITS_MS, review round 5 of PR
+   * #69, A-R5-1, or still `removing` after the waits of REMOTE_MONITOR_CONFLICT_WAITS_MS). Only
    * inspects: it never removes anything. A cancellation during a wait passes (AbortError). Review round 4 of PR #69
    * (A-R4-3): a running one that Docker restarted (RestartCount > 0) is accepted only when it holds the stored script of
    * this version (storedScript `same`); otherwise `other` (the next open's first look decides on evidence).
@@ -439,9 +463,12 @@ export class RemoteSessionMonitor {
         if (found.status === 'paused' || found.restartCount === 0) return 'running';
         return (await this.storedScript(script, signal)) === 'same' ? 'running' : 'other';
       }
-      const passing = found.status === 'created' || found.status === 'removing';
-      if (!passing || attempt >= REMOTE_MONITOR_CONFLICT_WAITS_MS.length) return 'other';
-      await wait(REMOTE_MONITOR_CONFLICT_WAITS_MS[attempt], signal);
+      // Review round 5 of PR #69 (A-R5-1): a `created` one gets the waits of the first look (the create-to-start gap
+      // of another window over SSH), a `removing` one the short ones. One counter for both, never reset, so the waits
+      // end after the longer list at most, also when the status changes between them.
+      const waits = found.status === 'created' ? REMOTE_MONITOR_CREATED_WAITS_MS : found.status === 'removing' ? REMOTE_MONITOR_CONFLICT_WAITS_MS : undefined;
+      if (waits === undefined || attempt >= waits.length || attempt >= CONFLICT_LOOK_BUDGET) return 'other';
+      await wait(waits[attempt], signal);
     }
   }
 
