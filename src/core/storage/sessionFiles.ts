@@ -106,6 +106,27 @@ export class SessionFiles {
   }
 
   /**
+   * PR #76 review round 5 (A-R5-1): the pending operations that could be read, and the files that could not. The files
+   * are named per environment and a value counts only for the environment of its file name, so a file that cannot be
+   * read says nothing about the others. A folder that cannot be read throws.
+   */
+  async readOperationsKnown(): Promise<{ operations: PendingOperation[]; unreadable: Array<{ file: string; error: unknown }> }> {
+    const { values, unreadable } = await readAllKnown(this.paths.operationsDir, isPendingOperation, (operation) => operation.environmentId);
+    return { operations: values, unreadable };
+  }
+
+  /**
+   * PR #76 review round 4 (A-R4-1): the pending operation of this environment that no window has claimed yet, if any.
+   * Reads only this environment's file: a file of another environment that cannot be read says nothing about it. A file
+   * that cannot be read throws.
+   */
+  async readOperation(environmentId: string): Promise<PendingOperation | undefined> {
+    const text = await readTextFile(this.paths.operationFile(environmentId));
+    const operation = text === undefined ? undefined : parseJson(text);
+    return isPendingOperation(operation) && operation.environmentId === environmentId ? operation : undefined;
+  }
+
+  /**
    * Atomically claims the pending operation: renames it to `<environment-id>.claimed.<time>.<window-id>`. A rename of one
    * source succeeds only once, also across processes, so only one window wins. Returns the operation if this window won;
    * `undefined` if another window was first or no operation exists. An invalid claimed file is removed.
@@ -196,15 +217,38 @@ export class SessionFiles {
 
 /** Reads all `*.json` files of a folder, in name order. Keeps a value only if it is valid and its key matches the file name. */
 async function readAll<T>(dir: string, isValid: (value: unknown) => value is T, key: (value: T) => string): Promise<T[]> {
+  const { values, unreadable } = await readAllKnown(dir, isValid, key);
+  // PR #76 review round 3 (A-R3-2), rule D1 of 2026-09-30: a file that cannot be read is not known, never missing.
+  if (unreadable.length > 0) throw unreadable[0].error;
+  return values;
+}
+
+/**
+ * As readAll, but a file that cannot be read (not missing, not EISDIR) is returned in `unreadable` instead of throwing.
+ * A folder named *.json is no one's file and is skipped; invalid JSON stays tolerant (atomic writes).
+ */
+async function readAllKnown<T>(
+  dir: string,
+  isValid: (value: unknown) => value is T,
+  key: (value: T) => string,
+): Promise<{ values: T[]; unreadable: Array<{ file: string; error: unknown }> }> {
   const files = (await listJsonFiles(dir)).sort();
   const results: Array<T | undefined> = [];
+  const unreadable: Array<{ file: string; error: unknown }> = [];
   await Promise.all(
     files.map(async (file, index) => {
-      const value = await readJsonTolerant(file);
+      let text: string | undefined;
+      try {
+        text = await readTextFile(file);
+      } catch (error) {
+        if (errorCode(error) !== 'EISDIR') unreadable.push({ file, error });
+        return;
+      }
+      const value = text === undefined ? undefined : parseJson(text);
       if (isValid(value) && `${key(value)}.json` === path.basename(file)) results[index] = value;
     }),
   );
-  return results.filter((value): value is T => value !== undefined);
+  return { values: results.filter((value): value is T => value !== undefined), unreadable };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

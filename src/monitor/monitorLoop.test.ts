@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_OWNER_STATUS_MAX_AGE_MS } from '../core/busy';
 import type { ContainerInfo } from '../core/docker/containerAdapter';
 import { dockerTargetOf, type DockerTarget } from '../core/docker/dockerHost';
@@ -1055,6 +1055,55 @@ describe('MonitorLoop.run', () => {
     expect(await h.loop.run()).toBe('idle');
     expect(h.docker.count('stop')).toBe(1);
     expect(h.logger.lines.some((line) => line.startsWith('error A check failed (1 in a row).'))).toBe(true);
+  });
+
+  // Plan step 5, PR D (rule D1 of 2026-09-30): a folder of window status files that cannot be read is not "no window".
+  it('stops nothing while the folder of the window status files cannot be read, and does not crash', async () => {
+    const env = environment(ID_A, 'acme/api');
+    await h.registry.add(env);
+    await writeSettings(h);
+    // A live window uses the environment; its file cannot be seen while the folder cannot be read.
+    await writeWindow(h, 'w1', ID_A);
+    h.docker.containers = [containerOf(env)];
+    const readdir = fs.promises.readdir;
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((async (dir: fs.PathLike, ...rest: unknown[]) => {
+      if (String(dir) === h.paths.sessionsDir) throw Object.assign(new Error(`EACCES: permission denied, scandir '${String(dir)}'`), { code: 'EACCES' });
+      return (readdir as (...args: unknown[]) => Promise<unknown>)(dir, ...rest);
+    }) as typeof fs.promises.readdir);
+    try {
+      const pauses = { value: 0 };
+      h.loop = h.newLoop({ delay: fakeDelay(h, pauses) });
+      // Every tick fails (logged), far beyond the waiting time; the loop ends as designed after MAX_FAILED_TICKS.
+      expect(await h.loop.run()).toBe('failing');
+      expect(h.clock.time - T0).toBeGreaterThan(WAITING_MS + 60_000);
+      expect(h.docker.count('stop')).toBe(0);
+      expect(h.logger.lines.some((line) => line.startsWith('error A check failed (1 in a row).'))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('stops nothing while one window status file cannot be read (PR #76 review round 3, A-R3-2), and does not crash', async () => {
+    const env = environment(ID_A, 'acme/api');
+    await h.registry.add(env);
+    await writeSettings(h);
+    await writeWindow(h, 'w1', ID_A);
+    h.docker.containers = [containerOf(env)];
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (path.dirname(String(file)) === h.paths.sessionsDir) throw Object.assign(new Error('EIO: i/o error, open'), { code: 'EIO' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      const pauses = { value: 0 };
+      h.loop = h.newLoop({ delay: fakeDelay(h, pauses) });
+      const end = await h.loop.run();
+      expect(end).toBe('failing');
+      expect(h.clock.time - T0).toBeGreaterThan(WAITING_MS + 60_000);
+      expect(h.docker.count('stop')).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('ends after too many failed ticks in a row', async () => {

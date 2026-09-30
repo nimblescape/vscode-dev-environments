@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { isRoutableDockerCall } from '../../src/core/docker/dockerRouting';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
+import { preparingWorker } from '../../src/core/docker/workerPreparation';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
@@ -66,12 +67,16 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_
   }
 }
 
-/** The runner of the adapter: records every Docker call that runs directly (the spy). */
+/**
+ * The runner of the adapter: records every Docker call that runs directly (the spy). Plan step 5, PR D (rule D1 of
+ * 2026-09-30): with whether it ran in the scope of the worker preparation (the check whether Docker runs, the helper
+ * image), whose calls run directly by design.
+ */
 class SpyRunner implements ProcessRunner {
-  readonly calls: { args: string[]; options: RunOptions }[] = [];
+  readonly calls: { args: string[]; options: RunOptions; preparing: boolean }[] = [];
   constructor(private readonly inner: NodeProcessRunner) {}
   run(file: string, args: readonly string[], options?: RunOptions): Promise<RunResult> {
-    this.calls.push({ args: [...args], options: options ?? {} });
+    this.calls.push({ args: [...args], options: options ?? {}, preparing: preparingWorker() });
     return this.inner.run(file, args, options);
   }
   start(file: string, args: readonly string[], options?: StartOptions): StartedProcess {
@@ -240,9 +245,12 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     expect(routed.some((args) => args[0] === 'volume' && args[1] === 'rm')).toBe(true);
 
     // The spy: every call that ran directly is one that is not routable (the adapter adds its environment to each
-    // direct call, so the check leaves `env` out), apart from the engine identity of a reopened worker.
+    // direct call, so the check leaves `env` out), apart from the engine identity of a reopened worker. Plan step 5, PR D
+    // (rule D1 of 2026-09-30): changed expectation: also apart from the calls of the worker preparation (before, the
+    // check whether Docker runs and the check of the helper image went through the open worker; now they come before it).
     const direct = spy.calls
       .filter(({ args }) => !(openCalls.includes(JSON.stringify(args)) && JSON.stringify(args) === JSON.stringify(ENGINE_IDENTITY_ARGS)))
+      .filter(({ preparing }) => !preparing)
       .filter(({ args, options }) => isRoutableDockerCall(args, { ...options, env: undefined }));
     expect(direct.map(({ args }) => args.join(' '))).toEqual([]);
     log.info(`Routed through the worker: ${routed.map((args) => args.slice(0, 2).join(' ')).join(', ')}`);

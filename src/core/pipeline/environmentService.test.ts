@@ -3959,15 +3959,20 @@ describe('refreshStates (plan step 5, PR C)', () => {
     expect(h.docker.execs).toHaveLength(0);
   });
 
-  it('reads directly when the worker gives undefined, or fails (logged); never shows its failure as states', async () => {
+  // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation. Before, a failed worker refresh was read once more
+  // directly. Now only undefined (outside of an operation) reads directly; a failure fails the refresh, with its cause.
+  it('reads directly only when the worker gives undefined (outside of an operation); a failure fails the refresh (logged), never read directly', async () => {
     const workerRefresh = vi.fn(async (): Promise<undefined> => undefined);
     h = recreate({ workerRefresh });
     await seedTwo(h);
     expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual(direct);
-    workerRefresh.mockRejectedValueOnce(new Error('The connection to the Docker host was lost'));
-    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual(direct);
+    workerRefresh.mockRejectedValueOnce(new Error('The Dev Environments worker on the Docker host could not be prepared (no helper image)'));
+    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
     expect(workerRefresh).toHaveBeenCalledTimes(2);
-    expect(h.logger.warnings.join('\n')).toContain('The refresh through the worker failed (The connection to the Docker host was lost)');
+    expect(h.logger.warnings.join('\n')).toContain(
+      'The state of the environments could not be read: The Dev Environments worker on the Docker host could not be prepared (no helper image)',
+    );
+    expect(h.logger.warnings.join('\n')).not.toContain('read directly');
   });
 
   it('does not ask the worker when Docker does not run', async () => {

@@ -42,7 +42,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | merged (PR #64) |
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
-| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress: PR A routing merged (PR #71), PR C batched refresh merged (PR #72), PR B environment lock merged (PR #74); PR D follows: it applies the rule D1 of 2026-09-30 to the merged code (section 5) |
+| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress: PR A routing merged (PR #71), PR C batched refresh merged (PR #72), PR B environment lock merged (PR #74); PR D in review: it applies the rule D1 of 2026-09-30 to the merged code (no direct fallback of the routing and the refresh, unreadable session folders are not known) |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | queued |
 | 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
 | 8 | One Session Monitor on every engine | the monitor container on the local Docker too; the local Node.js monitor removed; heartbeats, "in use elsewhere", `forget` from each window's worker; automatic stops, Close and Keep Running (today it needs a remote host), the window context, the stop when heartbeats end, engine-side cleanup and the optional image updates the same on every engine | queued |
@@ -65,8 +65,5 @@ Found in review and left on purpose, because the named step replaces the code (u
 
 | Gap | Effect | Replaced by |
 |---|---|---|
-| A session folder that cannot be read (permissions, disk error) reads as "no other window" | The other-window checks can pass when they should refuse | Step 5, PR D (rule D1 of 2026-09-30: unreadable state is never "nothing there") |
-| The routing of PR A takes the direct path when no worker is available | Plain Docker calls of an operation run without the worker | Step 5, PR D (rule D1 of 2026-09-30: ensure the worker, or refuse) |
-| The refresh of PR C reads directly when no worker is available | The refresh runs without the worker | Step 5, PR D (rule D1 of 2026-09-30: ensure the worker, or refuse) |
 | A remote monitor restarted by Docker whose stored-script check is cut off by its exit is kept | The monitor stays in an exit-3 loop until the next open | Step 8 (the Session Monitor's work in the worker) |
 

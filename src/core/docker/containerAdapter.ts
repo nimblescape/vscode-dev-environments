@@ -33,6 +33,7 @@ import { isSshClosedBeforeLogin, type DockerTarget } from './dockerHost';
 import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { operationDockerTarget } from './dockerTargets';
 import { heldEnvironmentLock } from './environmentLock';
+import { preparingWorker, runPreparingWorker } from './workerPreparation';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 
 // Plan step 5, PR A: the classification moved to dockerRouting.ts.
@@ -157,15 +158,15 @@ export interface RegistryLogin extends Credentials {
 
 /**
  * Plan step 5, PR A: runs one plain Docker call (isRoutableDockerCall) on the engine of `target` through the worker.
- * Undefined when it was not sent (no worker, or beyond what it carries): the call then runs directly. Rejects like
- * HelperChannels.docker (an AbortError; HelperChannelError `lost` or `protocol`, HelperOperationError: the outcome is
- * not known).
+ * Plan step 5, PR D (rule D1 of 2026-09-30): it makes the worker ready first and never returns without the call:
+ * rejects like HelperChannels.docker (an AbortError; HelperChannelError `unavailable`: the worker could not be made ready;
+ * `unsendable` or `closed`: not sent; `lost` or `protocol`, HelperOperationError: the outcome is not known).
  */
 export type DockerRouter = (
   target: DockerTarget,
   args: readonly string[],
   options: Pick<RunOptions, 'timeoutMs' | 'signal'>,
-) => Promise<RunResult | undefined>;
+) => Promise<RunResult>;
 
 export interface ContainerAdapterOptions {
   /**
@@ -565,19 +566,17 @@ export class ContainerAdapter {
    * without a CLI, or when the CLI cannot be started anymore (removed after it was found).
    *
    * Plan step 5, PR A: within an operation (operationDockerTarget), a routable call (isRoutableDockerCall) goes through
-   * the router when one is set; when the router returns undefined (no worker, or the call was not sent), it runs
-   * directly. A routed call whose worker was lost, answered wrongly, or failed: a call that only reads runs once more
-   * directly (logged); any other call throws a CommandError, because its outcome is not known, and is never repeated.
+   * the router when one is set. Plan step 5, PR D (rule D1 of 2026-09-30): only through it, never directly (see
+   * runRouted); the exception are the calls that make the state for the worker consistent (workerPreparation.ts: the
+   * check whether Docker runs, the helper image), which run directly.
    */
   async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
     // Plan step 5, PR B: an operation that holds the lock of an environment (environmentLock.ts).
     const held = heldEnvironmentLock();
     if (held !== undefined) return this.runLocked(held, args, options);
     const target = this.router === undefined ? undefined : operationDockerTarget();
-    if (target !== undefined && isRoutableDockerCall(args, options)) {
-      const routed = await this.runRouted(target, args, options);
-      if (routed !== undefined) return routed;
-    }
+    // Plan step 5, PR D (rule D1 of 2026-09-30): no direct way after the router.
+    if (target !== undefined && isRoutableDockerCall(args, options) && !preparingWorker()) return this.runRouted(target, args, options);
     return this.runDirect(args, options);
   }
 
@@ -618,22 +617,37 @@ export class ContainerAdapter {
     }
   }
 
-  /** run through the router; undefined: run it directly. See run. */
-  private async runRouted(target: DockerTarget, args: readonly string[], options: RunOptions): Promise<RunResult | undefined> {
+  /**
+   * run through the router. Plan step 5, PR D (rule D1 of 2026-09-30): never directly, whatever happens. The worker could
+   * not be made ready (the helper image, the open): UserFacingError('helperFailed', Messages.workerUnavailable) with the
+   * cause, nothing ran. Not sent (`unsendable`, or `closed` twice): a CommandError, it did not run. The worker was lost,
+   * answered wrongly, or the operation failed in it: a call that only reads throws a CommandError that says it failed
+   * through the worker (it is not run directly); any other call throws a CommandError, because its outcome is not known,
+   * and is never repeated.
+   */
+  private async runRouted(target: DockerTarget, args: readonly string[], options: RunOptions): Promise<RunResult> {
     const router = this.router;
-    if (router === undefined) return undefined;
+    if (router === undefined) return this.runDirect(args, options);
     try {
       return await router(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
     } catch (error) {
       if (isAbortError(error)) throw error;
       if (options.signal?.aborted) throw abortError();
+      const command = dockerCommandWords(args).join(' ');
+      if (error instanceof HelperChannelError && error.code === 'unavailable') {
+        this.logger.warn(`docker ${command} was refused: the worker on the Docker host could not be prepared (${error.message}); it is not run directly.`);
+        throw new UserFacingError('helperFailed', Messages.workerUnavailable(error.message), error.message);
+      }
+      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
+        this.logger.warn(`docker ${command} was not sent to the worker (${errorMessage(error)}); it is not run directly.`);
+        throw new CommandError(commandText(args), null, '', `docker ${command} was not sent to the worker on the Docker host (${errorMessage(error)}); it did not run.`);
+      }
       const unknownOutcome =
         (error instanceof HelperChannelError && (error.code === 'lost' || error.code === 'protocol')) || error instanceof HelperOperationError;
       if (!unknownOutcome) throw error;
-      const command = dockerCommandWords(args).join(' ');
       if (isReadOnlyDockerCall(args)) {
-        this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); it runs once more directly.`);
-        return undefined;
+        this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); it is not run directly.`);
+        throw new CommandError(commandText(args), null, '', `docker ${command} failed through the worker on the Docker host (${errorMessage(error)}).`);
       }
       this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); its outcome is not known, and it is not repeated.`);
       throw new CommandError(
@@ -774,7 +788,9 @@ export class ContainerAdapter {
     if (!this.isInstalled()) return { running: false, detail: 'The Docker CLI was not found.' };
     let result: RunResult;
     try {
-      result = await this.run(['info', '--format', '{{json .ServerVersion}}'], { signal, timeoutMs });
+      // Plan step 5, PR D (rule D1 of 2026-09-30): the check whether Docker runs comes before the worker (which needs it),
+      // so "Docker is not running" stays its own answer: directly, unless the lock of an environment is held.
+      result = await runPreparingWorker(() => this.run(['info', '--format', '{{json .ServerVersion}}'], { signal, timeoutMs }));
     } catch (error) {
       if (isAbortError(error)) throw error;
       return { running: false, detail: errorMessage(error) };

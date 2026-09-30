@@ -56,15 +56,18 @@ export const CHANNEL_CLOSE_KILL_MS = 5_000;
 export const CHANNEL_RESULT_GRACE_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS + 15_000;
 
 /**
- * The channel cannot be used. `closed`: it was closed or lost before the operation was sent (the caller can take the
- * way without the channel). `unsendable` (review round 1, P2, S6): the channel cannot carry this request (a line longer
- * than the script reads, parameters beyond the limits of the operation, a secret that cannot be masked); it was not
- * sent, and the caller can take the way without the channel. `lost`: the connection ended while the operation ran (its
+ * The channel cannot be used. `closed`: it was closed or lost before the operation was sent. `unsendable` (review round
+ * 1, P2, S6): the channel cannot carry this request (a line longer than the script reads, parameters beyond the limits
+ * of the operation, a secret that cannot be masked); it was not sent. Plan step 5, PR D (rule D1 of 2026-09-30): neither
+ * is taken the way without the channel (HelperChannels sends a `closed` one once more through a channel made ready
+ * again; ContainerAdapter refuses the call). `lost`: the connection ended while the operation ran (its
  * outcome is not known). `open`: it could not be opened. `protocol`: the script answered with something invalid.
+ * Plan step 5, PR D (rule D1 of 2026-09-30): `unavailable`: HelperChannels could not make the worker ready (the helper
+ * image could not be prepared, the worker could not be opened); the call was refused and nothing ran.
  */
 export class HelperChannelError extends Error {
   constructor(
-    readonly code: 'closed' | 'unsendable' | 'lost' | 'open' | 'protocol',
+    readonly code: 'closed' | 'unsendable' | 'lost' | 'open' | 'protocol' | 'unavailable',
     message: string,
   ) {
     super(message);
@@ -401,7 +404,7 @@ export class HelperChannel {
 
   /**
    * Waits for the place of an operation that ends (MAX_CONCURRENT_OPERATIONS are held). Review round 5 (F2): at most
-   * `waitMs`; then `unsendable` (not sent), so the caller takes the way without the channel.
+   * `waitMs`; then `unsendable` (not sent; plan step 5, PR D: the call is refused, never run without the channel).
    */
   private waitForSlot(signal: AbortSignal | undefined, waitMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -615,7 +618,7 @@ export class HelperChannel {
     if (options.input !== undefined) params.input = options.input;
     if (options.secretInput !== undefined) params.inputIsSecret = true;
     if (options.cleanup !== undefined) params.cleanup = options.cleanup;
-    // Review round 1 (P2): a call beyond the limits of the operation is not sent; the caller takes the way without it.
+    // Review round 1 (P2): a call beyond the limits of the operation is not sent (plan step 5, PR D: it is refused).
     if (parseDockerOperationParams(params) === undefined) {
       throw new HelperChannelError('unsendable', 'The Docker call is beyond the limits of the helper channel.');
     }

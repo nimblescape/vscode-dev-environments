@@ -1088,6 +1088,41 @@ describe('Stop', () => {
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
   });
 
+  // Plan step 5, PR D (rule D1 of 2026-09-30): window status files that cannot be read are not "no other window".
+  // PR #76 review round 1 (B-R1-2): Start too.
+  it('refuses Start, Stop, Rebuild and Delete when the other windows cannot be read, and changes nothing', async () => {
+    await h.registry.add(environment());
+    h.coordinator.otherActiveWindows.mockRejectedValue(Object.assign(new Error("EACCES: permission denied, scandir 'sessions'"), { code: 'EACCES' }));
+    await run('stop', row('acme/api', environment()));
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails);
+    await run('rebuild', row('acme/api', environment()));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    // PR #76 review round 1 (B-R1-2): an Open never replaces a container under a window that cannot be read.
+    await run('start', row('acme/api', environment()));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
+    expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
+  });
+
+  // PR #76 review round 1 (B-R1-3): Delete reads the other windows again after the confirmation; when they cannot be read
+  // then, nothing is deleted.
+  it('deletes nothing when the other windows cannot be read at the check after the confirmation', async () => {
+    await h.registry.add(environment());
+    h.coordinator.otherActiveWindows
+      .mockResolvedValueOnce([])
+      .mockRejectedValue(Object.assign(new Error("EACCES: permission denied, scandir 'sessions'"), { code: 'EACCES' }));
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(h.coordinator.otherActiveWindows.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
+    expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
+  });
+
   it('asks the other window to close its connection first; the stop continues there (concept 6.2)', async () => {
     await h.registry.add(environment());
     otherWindowConnected();
@@ -1575,6 +1610,53 @@ describe('Rebuild', () => {
     await settle(() => h.sidebar.render.mock.calls.length > 0, 'the render');
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
+
+  // PR #76 review round 4 (A-R4-1): an operation file of another environment that cannot be read does not keep the
+  // hand-off; this environment's own file that cannot be read keeps it and the busy mark (rule D1: its owner is not known).
+  it('cancels the hand-off when an operation file of another environment cannot be read (PR #76 review round 4, A-R4-1)', async () => {
+    const env = await handOffWithUnreadable(() => h.paths.operationFile(OTHER_ENV_ID), async () => {
+      await settle(() => h.logger.info.mock.calls.some((call) => String(call[0]).includes('pending operation is cancelled')), 'the cancel');
+      await settle(() => h.sidebar.render.mock.calls.length > 0, 'the render');
+    });
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(false);
+    expect(fs.existsSync(h.paths.operationFile(OTHER_ENV_ID))).toBe(true);
+    expect((await h.registry.get(env.id))?.busy).toBeUndefined();
+    expect(h.logger.error).not.toHaveBeenCalled();
+  });
+
+  it('keeps the hand-off and its busy mark when its own operation file cannot be read (PR #76 review round 4, A-R4-1)', async () => {
+    const env = await handOffWithUnreadable(() => h.paths.operationFile(ENV_ID), async () => {
+      await settle(() => h.logger.error.mock.calls.some((call) => String(call[0]).includes('check the pending operation')), 'the failed check');
+    });
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(true);
+    expect((await h.registry.get(env.id))?.busy).toMatchObject({ operation: 'rebuild', windowId: WINDOW_ID });
+  });
+
+  async function handOffWithUnreadable(unreadable: () => string, waitFor: () => Promise<void>): Promise<Environment> {
+    h.controller.dispose();
+    fs.rmSync(h.root, { recursive: true, force: true });
+    resetFakeVscode();
+    h = createHarness({ handOffCheckMs: 20 });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    fs.mkdirSync(h.paths.operationsDir, { recursive: true });
+    fs.writeFileSync(h.paths.operationFile(OTHER_ENV_ID), '{}');
+    const denied = unreadable();
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await run('rebuild', row('acme/api', env));
+      h.sidebar.render.mockClear();
+      await waitFor();
+    } finally {
+      spy.mockRestore();
+    }
+    return env;
+  }
 });
 
 describe('Select configuration…', () => {
@@ -1921,6 +2003,75 @@ describe('Window roles', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
     expect(h.statusBar.showNotConnected).toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('role B (PR #76 review round 5, A-R5-1): an unreadable operation file of another environment is reported and does not block this one', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const denied = h.paths.operationFile(OTHER_ENV_ID);
+    fs.writeFileSync(denied, '{}');
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await h.controller.runEmptyWindowTasks();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(false);
+    expect(fs.existsSync(denied)).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining(`${OTHER_ENV_ID}.json: EACCES`));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
+  it('role B (PR #76 review round 5, A-R5-1): an unreadable operation file alone is reported, not dropped, and the window is not reopened', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const denied = h.paths.operationFile(ENV_ID);
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === denied) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await h.controller.runEmptyWindowTasks();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(denied)).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining(`${ENV_ID}.json: EACCES`));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('role B (PR #76 review round 6, B-R6-1): a pending-operations folder that cannot be read is reported, runs nothing, and the window is not reopened', async () => {
+    await h.registry.add(environment());
+    h.connection.isEmptyWindow.mockReturnValue(true);
+    h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
+    await h.sessionFiles.writeOperation({ environmentId: ENV_ID, operation: 'stop', requestedAt: iso(NOW - 5000), requestedBy: 'old-window', reason: 'manual' });
+    const readdir = fs.promises.readdir;
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((async (dir: fs.PathLike, ...rest: unknown[]) => {
+      if (String(dir) === h.paths.operationsDir) throw Object.assign(new Error('EIO: i/o error, scandir'), { code: 'EIO' });
+      return (readdir as (...args: unknown[]) => Promise<unknown>)(dir, ...rest);
+    }) as typeof fs.promises.readdir);
+    try {
+      await expect(h.controller.runEmptyWindowTasks()).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(h.service.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(true);
+    expect(warningMessages()).toContainEqual(expect.stringContaining('EIO'));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 

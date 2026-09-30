@@ -5,6 +5,7 @@
 // Controller (concept 6, 7.9–7.14): the commands of package.json and the flows of the window roles at activation. It
 // connects the UI components (sidebar, status bar, switcher, progress, messages) with the environment service, the
 // Session Coordinator, and the Connection Adapter.
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
@@ -511,7 +512,22 @@ export class Controller implements vscode.Disposable {
     await sessionFiles
       .cleanupStaleClaims()
       .catch((error: unknown) => this.logger.warn(`Old claimed operations could not be removed: ${errorMessage(error)}`));
-    const { runnable, stale } = sortPendingOperations(await sessionFiles.readOperations(), this.clock.now());
+    // PR #76 review round 5 (A-R5-1), rule D1: an operation file that cannot be read is not run and not dropped, and the
+    // user is told; the operations of the other environments still run (the files are per environment).
+    let known: Awaited<ReturnType<typeof sessionFiles.readOperationsKnown>>;
+    try {
+      known = await sessionFiles.readOperationsKnown();
+    } catch (error) {
+      this.logger.warn(`The pending operations could not be read: ${errorMessage(error)}`);
+      this.warn(ControllerTexts.pendingOperationsUnreadable(errorMessage(error)));
+      return;
+    }
+    for (const { file, error } of known.unreadable) {
+      const cause = `${path.basename(file)}: ${errorMessage(error)}`;
+      this.logger.warn(`A pending operation could not be read: ${cause}`);
+      this.warn(ControllerTexts.pendingOperationsUnreadable(cause));
+    }
+    const { runnable, stale } = sortPendingOperations(known.operations, this.clock.now());
     for (const operation of stale) {
       this.logger.info(`The pending ${operation.operation} of ${operation.environmentId} is too old and is dropped.`);
       await this.removeOperationQuietly(operation.environmentId);
@@ -542,7 +558,8 @@ export class Controller implements vscode.Disposable {
       }
       if (claimed) await this.runPendingOperation(claimed);
     }
-    if (runnable.length > 0) return;
+    // Not known whether an operation is pending: the window is not opened again.
+    if (runnable.length > 0 || known.unreadable.length > 0) return;
 
     await this.delay(this.deps.timing?.reopenCheckDelayMs ?? REOPEN_CHECK_DELAY_MS);
     if (this.disposed) return;
@@ -1579,11 +1596,11 @@ export class Controller implements vscode.Disposable {
   /** This extension host still runs long after "Close Remote Connection": the connection was kept. */
   private async cancelHandOffIfUnclaimed(environmentId: string): Promise<void> {
     if (this.disposed) return;
-    const operations = await this.deps.sessionFiles.readOperations();
-    const own = operations.some(
-      (operation) => operation.environmentId === environmentId && operation.requestedBy === this.deps.coordinator.windowId,
-    );
-    if (!own) return;
+    // PR #76 review round 4 (A-R4-1): only this environment's file, so an unreadable file of another environment does
+    // not keep this hand-off. When this file cannot be read, its owner is not known (rule D1): it throws, and the hand-off
+    // and the busy mark are kept (never removed without knowing whose request it is).
+    const operation = await this.deps.sessionFiles.readOperation(environmentId);
+    if (operation?.requestedBy !== this.deps.coordinator.windowId) return;
     this.logger.info('The remote connection was not closed. The pending operation is cancelled.');
     await this.cancelHandOff(environmentId);
     this.background(this.deps.sidebar.render(), 'update the sidebar');
@@ -2119,22 +2136,27 @@ export class Controller implements vscode.Disposable {
     return this.current?.environment.id === environment.id;
   }
 
-  /** The status of another active window that is connected to the environment, if any. */
+  /** The status of another active window that is connected to the environment, if any (see otherActiveWindowsKnown). */
   private async otherWindowOf(environmentId: string): Promise<WindowStatus | undefined> {
-    try {
-      return (await this.deps.coordinator.otherActiveWindows()).find((window) => window.environmentId === environmentId);
-    } catch (error) {
-      this.logger.warn(`The other windows could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
+    return (await this.otherActiveWindowsKnown()).find((window) => window.environmentId === environmentId);
   }
 
+  /** Whether another active window is connected to the environment (see otherActiveWindowsKnown). */
   private async connectedInOtherWindow(environmentId: string): Promise<boolean> {
+    return (await this.otherActiveWindowsKnown()).some((window) => window.environmentId === environmentId);
+  }
+
+  /**
+   * The other active windows. Plan step 5, PR D (rule D1 of 2026-09-30): when their files cannot be read, it is not known
+   * whether another window uses the environment, so the operation is refused (UserFacingError, otherWindowsUnknown) and
+   * nothing is stopped, removed, or renamed; never "no other window".
+   */
+  private async otherActiveWindowsKnown(): Promise<WindowStatus[]> {
     try {
-      return (await this.deps.coordinator.otherActiveWindows()).some((window) => window.environmentId === environmentId);
+      return await this.deps.coordinator.otherActiveWindows();
     } catch (error) {
-      this.logger.warn(`The other windows could not be read: ${errorMessage(error)}`);
-      return false;
+      this.logger.warn(`The other windows could not be read, so nothing is changed: ${errorMessage(error)}`);
+      throw new UserFacingError('startFailed', ControllerTexts.otherWindowsUnknown, errorMessage(error));
     }
   }
 
