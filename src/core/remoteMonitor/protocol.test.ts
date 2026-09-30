@@ -2,13 +2,17 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
+import { PIPE_LOADER } from '../loader/pipeLoader';
 import {
   isImagePrefix,
   DEFAULT_REMOTE_STOP_AFTER_SECONDS,
   MAX_HEARTBEAT_ENVIRONMENTS,
+  REMOTE_MONITOR_ENTRY,
+  REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
   clampLimitSeconds,
   forgetCommand,
@@ -223,6 +227,17 @@ describe('limits and the label', () => {
     expect(remoteMonitorLabelValue('script', 'devenv-helper:1')).toBe(label);
     expect(remoteMonitorLabelValue('script2', 'devenv-helper:1')).not.toBe(label);
     expect(remoteMonitorLabelValue('script', 'devenv-helper:2')).not.toBe(label);
+    // Plan step 3 (pipe loading, user decision 2026-09-29): the loader is part of the label, so every monitor of the way
+    // of loading before is replaced once.
+    const withLoader = createHash('sha256').update('script\ndevenv-helper:1\n', 'utf8').update(PIPE_LOADER, 'utf8').digest('hex');
+    expect(label).toBe(withLoader.slice(0, 12));
+    expect(label).not.toBe(createHash('sha256').update('script\ndevenv-helper:1', 'utf8').digest('hex').slice(0, 12));
+  });
+
+  it('names where the loader stores the script, its entry, and the line of its start', () => {
+    expect(REMOTE_MONITOR_SCRIPT_PATH).toBe('/opt/devenv/monitor.js');
+    expect(REMOTE_MONITOR_ENTRY).toBe('startMonitor');
+    expect(REMOTE_MONITOR_READY_TEXT).toBe('Session Monitor started');
   });
 });
 

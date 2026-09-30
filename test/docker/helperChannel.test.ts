@@ -24,8 +24,8 @@ import {
   channelStepLabel,
   encodeMessage,
   newCleanupLabel,
-  encodeScript,
 } from '../../src/core/helperChannel/protocol';
+import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -125,6 +125,13 @@ describe('the helper channel with the real Docker engine', () => {
     expect(details.HostConfig.RestartPolicy?.Name ?? 'no').toMatch(/^(no|)$/);
     expect(details.Config.Labels?.[LABEL_HELPER_CHANNEL]).toBe(channelLabelValue(script));
     expect((details as unknown as { HostConfig: { NetworkMode: string } }).HostConfig.NetworkMode).toBe('none');
+    // Plan step 3 (pipe loading, user decision 2026-09-29): the command is the pipe loader with the path, the hash and the
+    // entry; the script came over stdin and is nowhere in the configuration of the container.
+    expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', bundleHash(script), 'startChannel']);
+    expect(details.Config.OpenStdin).toBe(true);
+    // Review round 1 of PR #69 (B-R1-8): changed expectation (before: script.slice(0, 200), which JSON.stringify escapes, so
+    // the check could never fail): the piece as it appears in the JSON of the details.
+    expect(JSON.stringify(details)).not.toContain(JSON.stringify(script).slice(1, 201));
 
     const version = await timings.measure('docker version through the channel', () => channel.docker(['version', '--format', '{{.Server.Version}}']));
     expect(version.exitCode).toBe(0);
@@ -166,13 +173,13 @@ describe('the helper channel with the real Docker engine', () => {
     const containerName = `devenv-channel-test-${run.runId}`;
     const stepName = `devenv-test-channel-silent-${run.runId}`;
     const label = newCleanupLabel();
-    const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script) });
+    const args = channelRunArgs({ tag: helperTag, socketPath: socket, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
     // Review round 1 (P8): long enough for the step to start and be seen on a slow runner.
     args.splice(args.indexOf(helperTag), 0, ...runLabelArgs, '-e', 'DEVENV_CHANNEL_SILENCE_MS=10000');
     const process = docker.start(args)!;
     let stdout = '';
     process.onStdout((text) => (stdout += text));
-    process.write(encodeScript(script));
+    process.write(encodeBundle(script));
     process.write(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION }));
     process.write(
       encodeMessage({

@@ -4,9 +4,10 @@
 
 // Entry point of the Session Monitor on a remote Docker host (unit 7, PR 2; implementation notes 16), bundled to
 // dist/remoteMonitor.js. The container devenv-session-monitor (image: the workspace helper, which has Node.js and the
-// Docker CLI; the Docker socket of its engine; the volume devenv-session-monitor at /state) writes it to
-// /opt/devenv/monitor.js at each start and runs `node /opt/devenv/monitor.js run`. The computers run the other
-// subcommands with `docker exec`:
+// Docker CLI; the Docker socket of its engine; the volume devenv-session-monitor at /state) runs the pipe loader (plan step
+// 3, src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
+// /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The computers
+// run the other subcommands with `docker exec node /opt/devenv/monitor.js …`:
 //   run                          the loop: a tick every 15 s (rules.ts)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
@@ -28,6 +29,7 @@ import {
   MAX_IMAGE_LIST_LENGTH,
   parseImageListInput,
   parseImageSettingsInput,
+  REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_STATE_DIR,
   SEQ_ORDER_WINDOW_MS,
   forgetIfUnchangedCommand,
@@ -727,7 +729,8 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       // Review round 2 of PR #63 (R2-10): the removals run /opt/devenv/monitor.js under the lock of /state, so they always
       // act on /state; deps.stateDir only moves the reading (the tests).
       const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing });
-      log(`Session Monitor started (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
+      // Plan step 3 (pipe loading): the extension waits for this line (REMOTE_MONITOR_READY_TEXT) after `docker run`.
+      log(`${REMOTE_MONITOR_READY_TEXT} (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
       // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
       // Only here, at the start of `run`: a leftover younger than STATE_TEMPORARY_MAX_AGE_MS at a start stays until the
       // next start (review round 9 of PR #63, A2).
@@ -770,15 +773,50 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
   }
 }
 
-// Only when this file is the entry module (dist/remoteMonitor.js), not when a test imports it.
-if (typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module) {
-  process.on('SIGTERM', () => process.exit(0));
-  process.on('SIGINT', () => process.exit(0));
-  main(process.argv.slice(2), { env: process.env }).then(
-    (code) => process.exit(code),
+/** What runEntry needs of the process (the tests give their own). */
+export interface EntryDeps {
+  onSignal(signal: 'SIGTERM' | 'SIGINT', listener: () => void): void;
+  exit(code: number): void;
+  err(text: string): void;
+  main(argv: readonly string[]): Promise<number>;
+}
+
+function processEntryDeps(): EntryDeps {
+  return {
+    onSignal: (signal, listener) => process.on(signal, listener),
+    exit: (code) => process.exit(code),
+    err: (text) => process.stderr.write(text),
+    main: (argv) => main(argv, { env: process.env }),
+  };
+}
+
+/**
+ * Runs the subcommand `argv` as the program of this process: SIGTERM and SIGINT end it with 0 (`docker stop`), the exit
+ * code of the subcommand ends it, a failure ends it with 1.
+ */
+export function runEntry(argv: readonly string[], deps: EntryDeps = processEntryDeps()): Promise<void> {
+  deps.onSignal('SIGTERM', () => deps.exit(0));
+  deps.onSignal('SIGINT', () => deps.exit(0));
+  return deps.main(argv).then(
+    (code) => deps.exit(code),
     (error: unknown) => {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-      process.exit(1);
+      deps.err(`${error instanceof Error ? error.message : String(error)}\n`);
+      deps.exit(1);
     },
   );
+}
+
+/**
+ * Plan step 3 (pipe loading): the function that the pipe loader of the container starts (REMOTE_MONITOR_ENTRY), at the
+ * first start and after each restart: the loop (`run`). `_input`: what the loader read after the script (nothing is
+ * expected; the standard input is not read).
+ */
+export function startMonitor(_input = '', deps: EntryDeps = processEntryDeps()): void {
+  void runEntry(['run'], deps);
+}
+
+// Only when this file is the entry module (`docker exec … node /opt/devenv/monitor.js <subcommand>`), not when the loader
+// or a test loads it.
+if (typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module) {
+  void runEntry(process.argv.slice(2));
 }

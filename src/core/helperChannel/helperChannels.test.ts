@@ -14,7 +14,8 @@ import {
   channelRunArgs,
   openHelperChannel,
 } from './helperChannels';
-import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_LOADER, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, encodeMessage, parseClientMessage } from './protocol';
+import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
+import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, encodeMessage, parseClientMessage } from './protocol';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
 
@@ -218,7 +219,8 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
 
 describe('channelRunArgs and openHelperChannel', () => {
   it('runs the helper image with --rm -i, never a pull, no network, no capability, only the socket, and the loader', () => {
-    const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', containerName: 'devenv-channel-1', label: '1-x' });
+    const hash = bundleHash('SCRIPT');
+    const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
     expect(args).toEqual([
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
@@ -226,12 +228,13 @@ describe('channelRunArgs and openHelperChannel', () => {
       // Review round 2 (B3): no log of the channel on the host.
       '--network', 'none', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
-      'devenv-helper:abc', 'node', '-e', CHANNEL_LOADER,
+      // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: 'node', '-e', CHANNEL_LOADER).
+      'devenv-helper:abc', 'node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', hash, 'startChannel',
     ]);
     // Neither a restart policy nor -d: the container lives only as long as its connection.
     expect(args).not.toContain('--restart');
     expect(args).not.toContain('-d');
-    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', containerName: 'n', label: 'l' })).toThrow(HelperChannelError);
+    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
   });
 
   it('starts the container with the Docker context of the target and checks the engine with probe', async () => {
@@ -276,8 +279,58 @@ describe('channelRunArgs and openHelperChannel', () => {
     expect(started?.args[started.args.indexOf('--name') + 1]).toMatch(/^devenv-channel-[0-9a-f]{12}$/);
     expect(channel.isOpen).toBe(true);
     expect(written[0]).toBe(`${JSON.stringify('SCRIPT')}\n`);
+    // Plan step 3 (pipe loading): the loader gets the hash of that script, never the script.
+    expect(started?.args.slice(-4)).toEqual([PIPE_LOADER, '/opt/devenv/channel.js', bundleHash('SCRIPT'), 'startChannel']);
     // Review round 4 (M1): then the sweep of never-started channel containers, in the background.
     expect(written.some((line) => line.includes('"op":"sweep"'))).toBe(true);
+    channel.close();
+  });
+
+  // Plan step 3 (pipe loading, user decision 2026-09-29): the script size limit of the command line is gone.
+  it('a 1 MB script is accepted and never in argv', async () => {
+    const script = `/* ${'a "quoted" \\ line\n'.repeat(60_000)} */`;
+    expect(script.length).toBeGreaterThan(1024 * 1024);
+    let args: readonly string[] = [];
+    let stdout: ((text: string) => void) | undefined;
+    const written: string[] = [];
+    const process: StartedProcess = {
+      write: (text) => {
+        written.push(text);
+        for (const line of text.split('\n').filter((part) => part !== '' && part.length < 10_000)) {
+          const message = parseClientMessage(line);
+          if (message?.t === 'hello') {
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe'] })));
+          }
+          if (message?.t === 'op' && message.op === 'probe') {
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0' } })));
+          }
+        }
+        return true;
+      },
+      end: () => {},
+      kill: () => {},
+      onStdout: (listener) => (stdout = listener),
+      onStderr: () => {},
+      exited: new Promise(() => {}),
+    };
+    const channel = await openHelperChannel(
+      {
+        start: (startArgs) => {
+          args = startArgs;
+          return process;
+        },
+        logger: silentLogger,
+        script: async () => script,
+        helperTag: async () => 'devenv-helper:abc',
+        socketPath: async () => '/var/run/docker.sock',
+      },
+      REMOTE,
+    );
+    expect(channel.isOpen).toBe(true);
+    expect(written[0]).toBe(`${JSON.stringify(script)}\n`);
+    expect(args.join(' ').length).toBeLessThan(5_000);
+    expect(args.some((arg) => arg.includes('quoted'))).toBe(false);
+    expect(args.slice(-2)).toEqual([bundleHash(script), 'startChannel']);
     channel.close();
   });
 

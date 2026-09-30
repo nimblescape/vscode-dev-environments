@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
+import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
 import {
   EXIT_INVALID,
   PS_FORMAT,
@@ -23,6 +23,9 @@ import {
   recordRemover,
   removeRecord,
   removeStaleStateTemporaryFiles,
+  runEntry,
+  startMonitor,
+  type EntryDeps,
   type ExecFile,
   timingFromEnv,
   type DockerResult,
@@ -777,12 +780,61 @@ describe('recordRemover', () => {
       expect(await called).toEqual(forgetIfUnchangedCommand(SOURCE, B, old.at));
       await vi.waitFor(() => expect(out).toContain(`Removed the old record of ${B} (no container of it exists).`));
       expect(out).toContain('Removed 1 leftover temporary file(s) of the volume.');
+      // Plan step 3 (pipe loading): the line that the extension waits for after `docker run`.
+      expect(out).toMatch(new RegExp(`^\\S+ ${REMOTE_MONITOR_READY_TEXT} \\(Node\\.js `, 'm'));
       expect(fs.existsSync(path.join(stateDir, 'images.json.1.1.tmp'))).toBe(false);
       expect(fs.existsSync(path.join(stateDir, 'images.json.1.2.tmp'))).toBe(true);
     } finally {
       // The loop of `run` waits for a fake timer that never fires.
       vi.useRealTimers();
     }
+  });
+});
+
+// Plan step 3 (pipe loading, user decisions 2026-09-29): the pipe loader of the container starts `startMonitor` (the
+// loop); `docker exec … node /opt/devenv/monitor.js <subcommand>` runs the same entry with its arguments.
+describe('startMonitor and runEntry', () => {
+  function entryDeps(result: Promise<number>) {
+    const signals = new Map<string, () => void>();
+    const exits: number[] = [];
+    const errors: string[] = [];
+    const argvs: Array<readonly string[]> = [];
+    const deps: EntryDeps = {
+      onSignal: (signal, listener) => signals.set(signal, listener),
+      exit: (code) => exits.push(code),
+      err: (text) => errors.push(text),
+      main: (argv) => {
+        argvs.push(argv);
+        return result;
+      },
+    };
+    return { deps, signals, exits, errors, argvs };
+  }
+
+  it('is the entry that the loader starts', () => {
+    expect(REMOTE_MONITOR_ENTRY).toBe('startMonitor');
+    expect(typeof startMonitor).toBe('function');
+  });
+
+  it('startMonitor runs `run` whatever the input, with SIGTERM and SIGINT ending it with 0', () => {
+    const { deps, signals, exits, argvs } = entryDeps(new Promise(() => {}));
+    startMonitor('input after the script', deps);
+    expect(argvs).toEqual([['run']]);
+    expect([...signals.keys()].sort()).toEqual(['SIGINT', 'SIGTERM']);
+    signals.get('SIGTERM')!();
+    signals.get('SIGINT')!();
+    expect(exits).toEqual([0, 0]);
+  });
+
+  it('runEntry ends the process with the exit code of the subcommand, or 1 after a failure', async () => {
+    const done = entryDeps(Promise.resolve(2));
+    await runEntry(['heartbeat', 'x'], done.deps);
+    expect(done.argvs).toEqual([['heartbeat', 'x']]);
+    expect(done.exits).toEqual([2]);
+    const failed = entryDeps(Promise.reject(new Error('broken')));
+    await runEntry(['run'], failed.deps);
+    expect(failed.errors).toEqual(['broken\n']);
+    expect(failed.exits).toEqual([1]);
   });
 });
 

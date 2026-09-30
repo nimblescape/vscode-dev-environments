@@ -9,9 +9,10 @@
 // per Docker call. The messages are JSON, one per line, on the standard input and output of `docker run`. Pure
 // functions and constants of both sides; no I/O. No `vscode`.
 //
-// The start: the container runs CHANNEL_LOADER (a short `node -e` program). The first line that the extension writes is
-// the script as a JSON string; the loader writes it to CHANNEL_SCRIPT_PATH, loads it, and hands the rest of the input
-// to it. So the script has no length limit of the command line (Windows: 32767 characters).
+// The start (plan step 3, pipe loading): the container runs the pipe loader (src/core/loader/pipeLoader.ts) with
+// CHANNEL_SCRIPT_PATH, the hash of the script, and CHANNEL_ENTRY. The first line that the extension writes is the script
+// as a JSON string (encodeBundle); the loader checks its hash, stores it at CHANNEL_SCRIPT_PATH, and calls its
+// `startChannel` with the rest of the input. So the script has no length limit of the command line.
 //
 // The container must end by itself when the connection is lost (user request 2026-09-28: nothing on the Docker host
 // can clean up after it). Four independent ways, each enough alone:
@@ -24,6 +25,7 @@
 // containers that they started with their cleanup label are removed (`docker rm -f`, review round 1, S1: by the label
 // of the operation, never by a name, so no container that the operation did not start can be removed).
 import { createHash, randomBytes } from 'crypto';
+import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../names';
 
 export { LABEL_HELPER_CHANNEL };
@@ -32,24 +34,8 @@ export { LABEL_HELPER_CHANNEL };
 export const CHANNEL_PROTOCOL_VERSION = 1;
 /** Where the loader writes the script (the file system of the container). */
 export const CHANNEL_SCRIPT_PATH = '/opt/devenv/channel.js';
-/** The longest script, as its JSON line (review round 1, P6: the loader limits the escaped line, so the extension does too). */
-export const MAX_CHANNEL_SCRIPT_LENGTH = 8 * 1024 * 1024;
-
-/**
- * The program of the container (`node -e`): reads the first line of the standard input (the script as a JSON string),
- * writes it to CHANNEL_SCRIPT_PATH, and calls its `startChannel` with the rest of the input read so far. It exits when
- * the input ends before that line or the line is too long. Only Node.js built-ins.
- */
-export const CHANNEL_LOADER = [
-  `const fs=require('fs'),P=${JSON.stringify(CHANNEL_SCRIPT_PATH)},M=${MAX_CHANNEL_SCRIPT_LENGTH};`,
-  `let b='';const s=process.stdin;s.setEncoding('utf8');`,
-  `const t=setTimeout(()=>process.exit(3),60000);`,
-  `const f=d=>{b+=d;const i=b.indexOf('\\n');if(i<0){if(b.length>M)process.exit(3);return;}`,
-  `s.off('data',f);s.off('end',e);s.pause();clearTimeout(t);`,
-  `fs.mkdirSync(require('path').dirname(P),{recursive:true});fs.writeFileSync(P,JSON.parse(b.slice(0,i)));`,
-  `require(P).startChannel(b.slice(i+1));};`,
-  `const e=()=>process.exit(3);s.on('data',f);s.on('end',e);`,
-].join('');
+/** The function of the script that the loader starts (src/helperChannel/main.ts). */
+export const CHANNEL_ENTRY = 'startChannel';
 
 /** The extension sends a ping this often while a channel is open. */
 export const CHANNEL_PING_INTERVAL_MS = 15_000;
@@ -197,11 +183,6 @@ export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswe
 /** One line of the channel (JSON and a line feed; JSON.stringify escapes every line feed in a string). */
 export function encodeMessage(message: ClientMessage | ServerMessage): string {
   return `${JSON.stringify(message)}\n`;
-}
-
-/** The first line of the extension: the script as a JSON string (CHANNEL_LOADER). */
-export function encodeScript(script: string): string {
-  return `${JSON.stringify(script)}\n`;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -400,9 +381,13 @@ export class LineSplitter {
   }
 }
 
-/** The label value of a channel container: the protocol and 12 hex digits of sha256 of the script. */
+/**
+ * The label value of a channel container: the protocol and 12 hex digits of sha256 of the script and the loader (plan
+ * step 3: a new loader is a new version of the container too).
+ */
 export function channelLabelValue(script: string): string {
-  return `${CHANNEL_PROTOCOL_VERSION}-${createHash('sha256').update(script).digest('hex').slice(0, 12)}`;
+  const hash = createHash('sha256').update(script, 'utf8').update('\n', 'utf8').update(PIPE_LOADER, 'utf8');
+  return `${CHANNEL_PROTOCOL_VERSION}-${hash.digest('hex').slice(0, 12)}`;
 }
 
 // ---- The operations of step 1 ----

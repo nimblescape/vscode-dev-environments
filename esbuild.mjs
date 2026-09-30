@@ -87,8 +87,9 @@ const contexts = await Promise.all([
     entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
     outfile: outfiles[3],
   }),
-  // Unit 7, PR 2: the Session Monitor on a remote Docker host. The container gets it as an argument of `docker run`
-  // (MAX_SCRIPT_LENGTH in src/core/remoteMonitor/protocol.ts), so it is always minified and has no source map.
+  // Unit 7, PR 2: the Session Monitor on a remote Docker host. The extension sends it over SSH as the first input line of
+  // the pipe loader of its container (plan step 3, src/core/loader/pipeLoader.ts), so it is always minified (less data
+  // over SSH) and has no source map.
   esbuild.context({
     ...shared,
     entryPoints: ['src/remoteMonitor/main.ts'],
@@ -96,8 +97,9 @@ const contexts = await Promise.all([
     minify: true,
     sourcemap: false,
   }),
-  // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it as the
-  // first line of the channel (src/core/helperChannel/protocol.ts), so it is always minified and has no source map.
+  // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it over SSH as
+  // the first input line of the pipe loader of the channel container (plan step 3, src/core/loader/pipeLoader.ts), so it
+  // is always minified (less data over SSH) and has no source map.
   esbuild.context({
     ...shared,
     entryPoints: ['src/helperChannel/main.ts'],
