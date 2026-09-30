@@ -45,7 +45,7 @@ import {
   resourceName,
 } from '../names';
 import type { ContainerInfo } from '../docker/containerAdapter';
-import type { BuildRecord, ContainerState, Environment } from '../types';
+import type { BuildRecord, ContainerState, Environment, WindowStatus } from '../types';
 import { PipelineTexts, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
@@ -58,8 +58,11 @@ import {
   FEATURE_DIGEST,
   OTHER_ACCOUNT,
   OTHER_ID,
+  PID,
   REPO,
+  T0,
   TOKEN,
+  WINDOW_ID,
   checked,
   createHarness,
   seedEnvironment,
@@ -4863,5 +4866,127 @@ describe('review round 2 of PR #68: run-user-commands of Docker Compose fails wi
     expect(h.docker.log).not.toContain(`stop ${db.id}`);
     expect(h.logger.infos.join('\n')).toContain('was created or started, but its lifecycle commands did not run. It is stopped');
     expect(h.logger.infos.join('\n')).toContain('The containers of the other services of acme/api are left as they are: it is not known which of them ran before up.');
+  });
+});
+
+describe('review round 4 of PR #68', () => {
+  const gone = () => new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+  const WINDOW_B = 'window-b';
+  const PID_B = 5252;
+  const touched = (): string[] => h.docker.log.filter((line) => line.startsWith('stop') || line.startsWith('rm'));
+
+  /** A harness whose window status files name window B, connected to the environment. */
+  function withWindowB(): void {
+    h.cleanup();
+    const live: WindowStatus[] = [{ windowId: WINDOW_B, pid: PID_B, environmentId: ENV_ID, state: 'active', updatedAt: new Date(T0).toISOString() }];
+    h = createHarness({ newEnvironmentId: () => ENV_ID, windowStatuses: async () => live });
+    useCompose(h);
+    h.alivePids.add(PID_B);
+  }
+
+  /**
+   * A-R4-5: the build record of Docker Compose (the previous configuration stays selected after a failed switch to a
+   * single container), and the new single container of that switch, which was left running for another window and marked
+   * (Environment.lifecycleIncomplete).
+   */
+  async function seedMarkedSingle(): Promise<ContainerInfo> {
+    await seedCompose({ dev: null, db: 'running' });
+    const single = h.docker.addContainer({ environmentId: ENV_ID, name: NAME, state: 'running', image: IMAGE_2 });
+    h.docker.images.add(IMAGE_2);
+    await h.registry.updateEnvironment(ENV_ID, (environment) => {
+      environment.lifecycleIncomplete = single.id;
+    });
+    h.settings.updateImagesOnConnect = false;
+    return single;
+  }
+
+  it('A-R4-5: Step 9 does not remove the marked single container that another window uses; the open ends with startFailed and changes nothing', async () => {
+    withWindowB();
+    const single = await seedMarkedSingle();
+    const db = dbContainer()!;
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.message).toBe(PipelineTexts.startFailed);
+    expect(error.detail).toBe(
+      `To start the environment with its Docker Compose configuration, the container ${NAME}, which Docker Compose did not create, must be removed, but another window is connected to the environment. Nothing was stopped, removed, or renamed. Open or rebuild the environment again when that window is closed.`,
+    );
+    // Before: runComposeUp stopped and removed it (`docker rm -f`), and the files of window B outside the volumes were lost.
+    expect(touched()).toEqual([]);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.docker.containers.get(single.id)).toMatchObject({ state: 'running' });
+    expect(h.docker.containers.get(db.id)).toMatchObject({ state: 'running' });
+    const after = await h.registry.get(ENV_ID);
+    expect(after?.lifecycleIncomplete).toBe(single.id);
+    // The busy mark of the check is gone again.
+    expect(after?.busy).toBeUndefined();
+  });
+
+  it('A-R4-5: the same while another window is opening the environment (its pending connection file)', async () => {
+    const single = await seedMarkedSingle();
+    h.sessionFiles.readPendings = async () => [{ environmentId: ENV_ID, windowId: WINDOW_B, createdAt: new Date(T0).toISOString() }];
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('must be removed, but another window is opening the environment. Nothing was stopped, removed, or renamed.');
+    expect(touched()).toEqual([]);
+    expect(h.docker.containers.get(single.id)).toMatchObject({ state: 'running' });
+  });
+
+  it('A-R4-5: the same when the files of the windows cannot be read', async () => {
+    const single = await seedMarkedSingle();
+    h.sessionFiles.readPendings = async () => {
+      throw new Error('unreadable pendings');
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('must be removed, but it could not be checked whether another window uses the environment.');
+    expect(touched()).toEqual([]);
+    expect(h.docker.containers.get(single.id)).toMatchObject({ state: 'running' });
+  });
+
+  it('A-R4-5: without another window, the single container is replaced with the busy mark set, and the mark goes with the open', async () => {
+    const single = await seedMarkedSingle();
+    let busyAtRemoval: unknown;
+    const remove = h.docker.removeContainer.bind(h.docker);
+    h.docker.removeContainer = async (ref) => {
+      busyAtRemoval = (await h.registry.get(ENV_ID))?.busy;
+      return remove(ref);
+    };
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.log).toContain(`rm ${single.id}`);
+    expect(busyAtRemoval).toMatchObject({ operation: 'update', pid: PID, windowId: WINDOW_ID });
+    expect(devContainer()?.state).toBe('running');
+    const after = await h.registry.get(ENV_ID);
+    expect(after?.lifecycleIncomplete).toBeUndefined();
+    expect(after?.busy).toBeUndefined();
+  });
+
+  it('A-R4-2: a build record of Docker Compose whose part lacks a field of a later version keeps the environment a Docker Compose environment', async () => {
+    await seedCompose({ dev: 'stopped', db: 'stopped' });
+    await h.registry.updateEnvironment(ENV_ID, (environment) => {
+      delete (environment.buildRecord!.compose as Partial<NonNullable<BuildRecord['compose']>>).inputsHash;
+    });
+    h.settings.updateImagesOnConnect = false;
+    // Before: the environment counted as a single container, and every open without a build ended with startFailed "The
+    // configuration no longer uses Docker Compose, which applies with a rebuild".
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(devContainer()?.state).toBe('running');
+  });
+
+  it('A-R4-4: a switch to Docker Compose whose listing before `up` failed says "created or started"', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add(DB_IMAGE);
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    const list = h.docker.listEnvironmentContainers.bind(h.docker);
+    h.docker.listEnvironmentContainers = async () => {
+      if (new Error().stack?.includes('containersBeforeUp')) throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
+      return list();
+    };
+    h.helper.userCommandsError = gone();
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('helperFailed');
+    // Before: "Its dev container was created", which the listing could not tell.
+    expect(error.detail).toContain('The configuration now uses Docker Compose. Its dev container was created or started, but its lifecycle commands could not run.');
   });
 });

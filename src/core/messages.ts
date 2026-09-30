@@ -293,6 +293,12 @@ export const Messages = {
         ? `the selected configuration was not applied${previous !== undefined ? `, and ${previous} stays selected` : ''}`
         : 'it was not rebuilt'
     }. Open it again to try again.`,
+  /**
+   * Review round 4 of PR #68 (B-R4-2): the lifecycle commands of a container could not run (the workspace helper
+   * failed), it still runs, and the registry could not record that (Environment.lifecycleIncomplete).
+   */
+  lifecycleNotRecorded: (repository: string) =>
+    `The container of ${repository} runs without its lifecycle commands, and this could not be recorded. Stop or rebuild the environment before working in it.`,
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
   /**

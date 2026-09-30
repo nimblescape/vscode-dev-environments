@@ -174,6 +174,7 @@ import {
   composeConfigurationChange,
   composeMountVolumes,
   composeRecordOf,
+  hasComposeRecord,
   serviceFoldersOf,
   devMountFolders,
   verifiedIdentityTargets,
@@ -468,6 +469,8 @@ export interface EnvironmentRuntimeState {
 export { MAX_REFUSED_ITEMS_LENGTH };
 
 const BUSY_POLL_MS = 500;
+/** Review round 4 of PR #68 (B-R4-2): the pause before the second write of Environment.lifecycleIncomplete. */
+const LIFECYCLE_MARK_RETRY_MS = 500;
 const DEFAULT_BUSY_WAIT_MS = 10_000;
 // A pending connection file counts for 2 minutes (concept 7.9 rule 1). A helper image build, `up` with long lifecycle
 // commands, or an open prompt can take longer; a refresh well within the waiting time keeps the container in use.
@@ -664,6 +667,18 @@ interface PipelineContext {
    */
   upWithdrawn?: UpWithdrawn;
   /**
+   * Review round 4 of PR #68 (A-R4-1): the value of Environment.lifecycleIncomplete that this run decided with (read at the
+   * start of the pipeline, and again where Step 9 or opensAsItIs decides whether the container opens as it is). finish
+   * clears the mark only when it still has this value, or when it names lifecycleRanFor: a mark that another window set
+   * meanwhile (for a container that this run opened as it is) stays.
+   */
+  lifecycleMarkRead?: string;
+  /**
+   * Review round 4 of PR #68 (A-R4-1): the container whose `up` and run-user-commands this run completed (its lifecycle
+   * commands ran, also when one of them failed on its own: keptAfterLifecycleFailure).
+   */
+  lifecycleRanFor?: string;
+  /**
    * Recreate offer (user request 2026-09-26): the user chose to create the damaged dev container of this Docker Compose
    * environment again (offerRecreation). runComposeUp removes only that container (never a volume, never another
    * service) after the checks, right before `up`.
@@ -703,9 +718,37 @@ export interface UpWithdrawn {
   name: string;
   /**
    * Review round 3 of PR #68 (A-R3-5): with `kept` (and with `inUse` or `useUnknown`, A-R3-4), the mark
-   * Environment.lifecycleIncomplete was recorded.
+   * Environment.lifecycleIncomplete was recorded. Review round 4 (A-R4-4): with `unchanged` (and a container that ran
+   * before `up`), the mark of an earlier open names it still, so the next open runs its lifecycle commands.
    */
   marked?: boolean;
+  /**
+   * Review round 4 of PR #68 (A-R4-3): with `inUse`, how another window uses the environment: `connected` (its window
+   * status file), `opening` (its pending connection file: it opens the environment, and may still wait or build), or
+   * `busy` (its busy mark, A-R4-6: the withdrawal could not take its own). Unset: `connected`.
+   */
+  use?: 'connected' | 'opening' | 'busy';
+  /** Review round 4 of PR #68 (A-R4-4): the container ran before `up` (this `up` neither created nor started it). */
+  ranBefore?: boolean;
+  /**
+   * Review round 4 of PR #68 (B-R4-2): it runs without its lifecycle commands, and the mark Environment.lifecycleIncomplete
+   * could not be written (with `kept`, `inUse`, `useUnknown`): nothing may promise that the next open runs them.
+   */
+  markFailed?: boolean;
+}
+
+/** Review round 4 of PR #68 (B-R4-2): the end of the sentence of withdrawnOutcome when the mark could not be written. */
+const MARK_FAILED = ', and it could not be recorded that its lifecycle commands did not run: stop or rebuild the environment before working in it.';
+
+/**
+ * Review round 3 of PR #68 (A-R3-4): whether another window uses the environment, with a sentence for the log. `known:
+ * false`: it is not known (a file or the registry could not be read or written), and the containers stay. Review round 4
+ * (A-R4-3, A-R4-6): `use`, how the other window uses it (UpWithdrawn.use).
+ */
+interface WindowUse {
+  known: boolean;
+  text: string;
+  use?: 'connected' | 'opening' | 'busy';
 }
 
 /**
@@ -723,16 +766,31 @@ export function withdrawnOutcome(withdrawn: UpWithdrawn, inSwitch = false): stri
       return inSwitch ? 'It could not be removed and was stopped.' : 'It could not be removed and was stopped; the next open starts it and runs its lifecycle commands.';
     case 'kept': {
       const what = withdrawn.created === true ? 'It could be neither removed nor stopped' : 'It could not be stopped';
+      // Review round 4 (B-R4-2): the mark could not be written.
+      if (withdrawn.markFailed === true) return `${what}${MARK_FAILED}`;
       // Review round 3 (A-R3-5): the mark makes the next open run `up` and the lifecycle commands for it.
       return !inSwitch && withdrawn.marked === true ? `${what}; the next open runs its lifecycle commands.` : `${what}.`;
     }
     case 'unchanged':
-      return 'It runs as before this open.';
-    case 'inUse':
-      return 'It was left running: another window is connected to it.';
+      // Review round 4 of PR #68 (A-R4-4): the next open runs its lifecycle commands only when the mark still names it.
+      return !inSwitch && withdrawn.marked === true ? 'It runs; its lifecycle commands run at the next open.' : 'It runs as before this open.';
+    case 'inUse': {
+      // Review round 4 of PR #68 (A-R4-3): a pending connection file means that another window opens the environment (it
+      // may still wait or build), not that it is connected; A-R4-6: a busy mark of another window.
+      const what =
+        withdrawn.use === 'opening'
+          ? 'It was left running: another window is opening the environment'
+          : withdrawn.use === 'busy'
+            ? 'It was left running: another window is working on the environment'
+            : 'It was left running: another window is connected to it';
+      // Review round 4 (B-R4-2): the mark could not be written.
+      return withdrawn.markFailed === true ? `${what}${MARK_FAILED}` : `${what}.`;
+    }
     case 'useUnknown': {
       // Review round 3 of PR #68 (A-R3-4): when it is not known whether another window uses it, it stays.
       const what = 'It was left running: it could not be checked whether another window is connected to it';
+      // Review round 4 (B-R4-2): the mark could not be written.
+      if (withdrawn.markFailed === true) return `${what}${MARK_FAILED}`;
       return !inSwitch && withdrawn.marked === true ? `${what}; the next open runs its lifecycle commands.` : `${what}.`;
     }
   }
@@ -804,6 +862,16 @@ class StepReporter {
   }
 }
 
+/**
+ * Review round 4 of PR #68 (A-R4-5): a step without a busy mark (Step 9) would have to stop, remove, or rename a container,
+ * and another window uses the environment (or that could not be checked): nothing was changed (requireNoOtherWindow).
+ */
+class OtherWindowUsesError extends UserFacingError {
+  constructor(detail: string) {
+    super('startFailed', PipelineTexts.startFailed, detail);
+  }
+}
+
 function cancelledError(): UserFacingError {
   return new UserFacingError('cancelled', PipelineTexts.cancelled);
 }
@@ -833,6 +901,18 @@ function sameContainer(a: string, b: string): boolean {
   if (a === b) return true;
   const full = /^[0-9a-f]{64}$/;
   return full.test(a) !== full.test(b) && sameContainerId(a, b);
+}
+
+/**
+ * Review round 4 of PR #68 (A-R4-1): whether finish clears the mark Environment.lifecycleIncomplete (`mark`, as the
+ * registry holds it under the lock): only when it is the value this run decided with (`read`), or when it names the
+ * container whose `up` and run-user-commands this run completed (`ranFor`). A mark that another window set after this run
+ * read the entry (for example for the container that this run opened as it is) stays.
+ */
+export function lifecycleMarkClears(mark: string | undefined, read: string | undefined, ranFor: string | undefined): boolean {
+  if (mark === undefined) return false;
+  if (read !== undefined && sameContainer(mark, read)) return true;
+  return ranFor !== undefined && sameContainer(mark, ranFor);
 }
 
 /**
@@ -885,7 +965,9 @@ function volumeLabels(environment: Environment): Record<string, string> {
  * Docker Compose that existed before and stay. Review round 2 of PR #68 (A-R2-4): `afterUp`, the sentence of
  * withdrawnOutcome when `up` returned and the lifecycle commands of its (dev) container could not run (helperFailed).
  * Review round 3 of PR #68 (A-R3-2): `removeExisting`, the `up` of the switch ran with --remove-existing-container (there
- * was a dev container); only then does the detail say that the CLI removed (or may have removed) it.
+ * was a dev container); only then does the detail say that the CLI removed (or may have removed) it. Review round 4 of
+ * PR #68 (A-R4-4): `afterUpWhat`, what that `up` did with the (dev) container (createdOrStarted: "created or started"
+ * when the listing before `up` failed), in both directions.
  */
 export function kindSwitchFailure(
   toCompose: boolean,
@@ -895,12 +977,13 @@ export function kindSwitchFailure(
   kept: readonly string[] = [],
   afterUp?: string,
   removeExisting = true,
+  afterUpWhat = 'created',
 ): string {
   const what =
     afterUp !== undefined
       ? toCompose
-        ? `The configuration now uses Docker Compose. Its dev container was created, but its lifecycle commands could not run. ${afterUp}`
-        : `The configuration no longer uses Docker Compose. Its container was created, but its lifecycle commands could not run. ${afterUp}`
+        ? `The configuration now uses Docker Compose. Its dev container was ${afterUpWhat}, but its lifecycle commands could not run. ${afterUp}`
+        : `The configuration no longer uses Docker Compose. Its container was ${afterUpWhat}, but its lifecycle commands could not run. ${afterUp}`
       : toCompose
         ? 'The configuration now uses Docker Compose, and its containers could not all be created and started.'
         : 'The configuration no longer uses Docker Compose, and its container could not be created.';
@@ -1087,6 +1170,13 @@ function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefin
  */
 export class EnvironmentService {
   private readonly queues = new Map<string, Promise<void>>();
+  /**
+   * Review round 4 of PR #68 (B-R4-2): environment ID → the ID of a container that runs without its lifecycle commands
+   * while the registry could not record it (Environment.lifecycleIncomplete). Consulted with the mark, so that no later
+   * open of this window opens it as it is; cleared where the mark is (clearLifecycleMark, and finish after the lifecycle
+   * commands of that container ran).
+   */
+  private readonly unrecordedLifecycle = new Map<string, string>();
   /** Review D2: the endpoints (neither local nor SSH) whose refusal the reads showed already: once each. */
   private readonly refusedEndpoints = new Set<string>();
   /**
@@ -1413,6 +1503,8 @@ export class EnvironmentService {
   private async runPipeline(ctx: PipelineContext): Promise<OpenResult> {
     const { docker } = this.deps;
     this.throwIfCancelled(ctx.signal);
+    // Review round 4 of PR #68 (A-R4-1): the mark as this run read it (Step 9 and opensAsItIs read it again).
+    ctx.lifecycleMarkRead = ctx.env.lifecycleIncomplete;
     const container = await docker.findContainer(ctx.env.id, ctx.env.containerName);
     ctx.composeContainer = container !== undefined && isComposeContainer(container.labels, composeProjectName(ctx.env.id));
     const record = ctx.env.buildRecord;
@@ -1572,7 +1664,8 @@ export class EnvironmentService {
    * a switch whose removal worked.
    */
   private existingCompose(ctx: PipelineContext, record: BuildRecord | undefined): boolean {
-    return record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
+    // Review round 4 of PR #68 (A-R4-2): the key decides the kind (hasComposeRecord), not the validity of its fields.
+    return record !== undefined ? hasComposeRecord(record) : ctx.composeContainer === true;
   }
 
   /**
@@ -2506,7 +2599,8 @@ export class EnvironmentService {
       // Review round 2 (D2-4): the build switched the kind of the environment (Docker Compose or a single container). The
       // previous kind is not started from here: its image is not an image of the new kind, and the configuration is of
       // the new kind. The next build tries again.
-      const previousCompose = record !== undefined ? composeRecordOf(record) !== undefined : ctx.composeContainer === true;
+      // Review round 4 of PR #68 (A-R4-2): as existingCompose.
+      const previousCompose = this.existingCompose(ctx, record);
       // Review round 11 of PR #64 (R11-1): a helperFailed before the switch removed or moved a container (and before `up`
       // ran, R12-2) ends the open without the detail of a switch (helperFailedInUpdate; user decision 2026-09-29: never
       // opened as it is).
@@ -2543,6 +2637,8 @@ export class EnvironmentService {
           withdrawn !== undefined ? withdrawnOutcome(withdrawn, true) : undefined,
           // Review round 3 of PR #68 (A-R3-2): runUp ran with --remove-existing-container only when there was a container.
           container !== undefined,
+          // Review round 4 of PR #68 (A-R4-4): "created or started" when the listing before `up` failed.
+          withdrawn !== undefined ? createdOrStarted(withdrawn) : undefined,
         );
         // Review round 4 of PR #64 (R4-5): the cleanup of the switch above stays (the containers of the other kind are
         // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
@@ -2854,7 +2950,7 @@ export class EnvironmentService {
     // Review round 3 of PR #68 (A-R3-5): a running container whose lifecycle commands did not run (the workspace helper
     // failed, and it could be neither removed nor stopped: Environment.lifecycleIncomplete) is not opened as it is: `up`
     // (without removal) and run-user-commands run for it below.
-    const incomplete = this.lifecycleIncomplete(ctx, container);
+    const incomplete = this.decideOnLifecycleMark(ctx, container);
     if (container?.state === 'running' && incomplete) {
       this.logger.info(`The container ${container.name} runs, but its lifecycle commands did not run. They run now.`);
     }
@@ -2925,10 +3021,17 @@ export class EnvironmentService {
         `The container of ${ctx.env.repository} is created without the configuration, which cannot be read. Its runArgs and published ports apply once it can be read; the container is then created again.`,
       );
     }
+    // Review round 4 of PR #68 (A-R4-5): Step 9 holds no busy mark, so `up --remove-existing-container` of an existing
+    // container needs the busy mark first, and no other window that uses the environment (when in doubt, it stays).
+    if (outdated && container !== undefined) {
+      await this.requireNoOtherWindow(ctx, `To start the environment, the container ${container.name} must be created again`);
+    }
     try {
       const result = await this.runUp(ctx, image, loaded?.config, outdated, container === undefined || outdated, loaded?.compose);
       return { result, created: container === undefined || outdated, container: outdated ? undefined : container };
     } catch (error) {
+      // Review round 4 of PR #68 (A-R4-5): another window uses the environment; nothing was changed.
+      if (error instanceof OtherWindowUsesError) throw error;
       if (this.isCancellation(error, ctx.signal) || isFilesMissing(error) || isHostAccess(error)) throw error;
       // No docker start fallback (user decision 2026-09-29): a workspace helper that failed during `up` fails the open.
       // Review round 2 of PR #68: when `up` returned, the container whose lifecycle commands did not run was stopped (or
@@ -2936,6 +3039,17 @@ export class EnvironmentService {
       if (isHelperFailed(error)) {
         const withdrawn = ctx.upWithdrawn;
         if (withdrawn === undefined) throw error;
+        // Review round 4 of PR #68 (A-R4-4): a container that ran before `up` (for example one of the mark
+        // Environment.lifecycleIncomplete) was neither created nor started by it.
+        if (withdrawn.ranBefore === true) {
+          const text =
+            withdrawn.outcome !== 'unchanged'
+              ? `The container runs, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)}`
+              : withdrawn.marked === true
+                ? 'The container runs; its lifecycle commands could not run and run at the next open.'
+                : 'The container runs as before this open; its lifecycle commands could not run.';
+          throw new UserFacingError('helperFailed', Messages.helperFailed, `${text} ${causeOf(error)}`);
+        }
         const what = container === undefined ? 'The container was created' : outdated ? 'The container was created again' : 'The container was started';
         throw new UserFacingError('helperFailed', Messages.helperFailed, `${what}, but its lifecycle commands could not run. ${withdrawnOutcome(withdrawn)} ${causeOf(error)}`);
       }
@@ -3277,7 +3391,7 @@ export class EnvironmentService {
   private async opensAsItIs(ctx: PipelineContext, container: ContainerInfo | undefined, record: BuildRecord | undefined, configKnown: boolean): Promise<boolean> {
     if (container?.state !== 'running' || !containerIsCurrent(container.labels, configKnown, ctx.hostAccessChecks)) return false;
     // Review round 3 of PR #68 (A-R3-5): its lifecycle commands did not run (Environment.lifecycleIncomplete).
-    if (this.lifecycleIncomplete(ctx, container)) return false;
+    if (this.decideOnLifecycleMark(ctx, container)) return false;
     if (ctx.hostAccessChecks !== 'on' || !this.isComposeEnvironment(ctx.env, record, container)) return true;
     return (await this.unrestrictedServiceContainer(ctx)) === undefined;
   }
@@ -3308,7 +3422,8 @@ export class EnvironmentService {
    * environment.
    */
   private isComposeEnvironment(env: Environment, record: BuildRecord | undefined, container: ContainerInfo | undefined): boolean {
-    if (composeRecordOf(record) !== undefined) return true;
+    // Review round 4 of PR #68 (A-R4-2): the key decides the kind (hasComposeRecord), not the validity of its fields.
+    if (hasComposeRecord(record)) return true;
     return container !== undefined && isComposeContainer(container.labels, composeProjectName(env.id));
   }
 
@@ -3430,6 +3545,8 @@ export class EnvironmentService {
           `Containers of other Docker Compose services of ${env.repository} exist (${services.map((container) => container.name).join(', ')}), and it is not known whether its dev container is a single container: rebuild the environment.`,
         );
       }
+      // Review round 4 of PR #68 (A-R4-5): without a busy mark (Step 9), only with it and no other window.
+      await this.requireNoOtherWindow(ctx, `To start the environment, the containers ${services.map((container) => container.name).join(', ')} of other Docker Compose services must be removed`);
       for (const container of services) {
         this.logger.info(
           `The container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${env.repository} is left over next to its single container. It is removed; its volumes are kept.`,
@@ -3441,6 +3558,8 @@ export class EnvironmentService {
     }
     const leftovers = createsContainer && (ctx.composeContainer === true || composeRecordOf(env.buildRecord) !== undefined || services.length > 0);
     if (leftovers) {
+      // Review round 4 of PR #68 (A-R4-5): without a busy mark (Step 9), only with it and no other window.
+      await this.requireNoOtherWindow(ctx, 'To start the environment, the containers of its other Docker Compose services must be removed');
       this.logger.info(
         `The environment ${env.repository} was a Docker Compose environment. The container is created again for the configuration, and the containers of the other services are removed; the files in the volumes are kept.`,
       );
@@ -3481,6 +3600,8 @@ export class EnvironmentService {
       }
       result = kept;
     }
+    // Review round 4 of PR #68 (A-R4-1): its lifecycle commands ran.
+    ctx.lifecycleRanFor = nonEmptyString(result.containerId) ?? upContainer;
     // A volume named with ${devcontainerId} gets its name only at `up`, so neither the configuration nor the image
     // metadata named it: the container does. Also for an existing container, whose volumes an earlier failed or cancelled
     // `up` may not have recorded.
@@ -3578,6 +3699,18 @@ export class EnvironmentService {
     // of the Git setup leaves the running containers as they are.
     if (ctx.cloned && !ctx.ownershipPrepared) await this.prepareOwnership(ctx, image, userArgs);
     await this.prepareGit(ctx, true);
+    // Review round 22 (D22-1): the dev container of another service of the project (Select configuration… between two
+    // configurations of one compose file with another `service`): it holds the name that the new dev service gets.
+    const previousService = found !== undefined && replaced === undefined ? found.labels[COMPOSE_SERVICE_LABEL] : undefined;
+    const movesPrevious = found !== undefined && previousService !== undefined && previousService !== compose.service;
+    // Review round 4 of PR #68 (A-R4-5): without a busy mark (Step 9, for example for a container of the mark
+    // Environment.lifecycleIncomplete that a failed switch left running for another window), a container is removed or
+    // renamed only with the busy mark set and no other window that uses the environment; else nothing is changed.
+    if (replaced) {
+      await this.requireNoOtherWindow(ctx, `To start the environment with its Docker Compose configuration, the container ${replaced.name}, which Docker Compose did not create, must be removed`);
+    } else if (movesPrevious) {
+      await this.requireNoOtherWindow(ctx, `To start the environment, the dev container ${found.name} of the service ${previousService} must be renamed and stopped`);
+    }
     if (replaced) {
       this.logger.info(
         `The container ${replaced.name} of ${env.repository} was not created by Docker Compose. It is replaced by the containers of the Docker Compose configuration; the files in the volume are kept.`,
@@ -3592,10 +3725,7 @@ export class EnvironmentService {
       // was cancelled, which the user may have used since) are not new, whatever the failed `up` does.
       ctx.composeSwitch = { existing: await this.composeContainerIds(env) };
     }
-    // Review round 22 (D22-1): the dev container of another service of the project (Select configuration… between two
-    // configurations of one compose file with another `service`): it holds the name that the new dev service gets.
-    const previousService = found !== undefined && replaced === undefined ? found.labels[COMPOSE_SERVICE_LABEL] : undefined;
-    if (found !== undefined && previousService !== undefined && previousService !== compose.service) {
+    if (movesPrevious) {
       await this.movePreviousDevContainer(ctx, compose, found, previousService, removeExistingContainer);
     }
     // Recreate offer: the user chose to create the damaged dev container again. After the checks above (a refusal leaves
@@ -3650,6 +3780,8 @@ export class EnvironmentService {
       }
       result = kept;
     }
+    // Review round 4 of PR #68 (A-R4-1): its lifecycle commands ran.
+    ctx.lifecycleRanFor = nonEmptyString(result.containerId) ?? upContainer;
     await this.quietly('record the volumes of the containers', () => this.recordContainerVolumes(ctx, true));
     // L-2: the CLI finds the dev container again only by the project; another project would be a second environment.
     if (result.composeProjectName !== undefined && result.composeProjectName !== compose.project) {
@@ -3702,12 +3834,42 @@ export class EnvironmentService {
    * that could be neither removed nor stopped, or that was left running for another window (and did not run before `up`),
    * is named in Environment.lifecycleIncomplete, so that the next open runs its lifecycle commands. Every failure is logged; a cancellation does not stop the cleanup. The
    * result goes to PipelineContext.upWithdrawn.
+   *
+   * Review round 4 of PR #68 (A-R4-6): without a busy mark of this run (Step 9), a busy mark is set first, before the
+   * files of the windows are read, and held until the withdrawal ends: another window that begins to open the environment
+   * meanwhile waits for it (waitForOtherOperation) instead of opening the container that is about to be stopped or removed.
+   * When it cannot be set (another window holds one, or the mark of this window is there already, which is never
+   * overwritten), the containers stay as they are, as with another window connected (`inUse`); when the registry fails,
+   * as when the files cannot be read (`useUnknown`). Only the mark set here is cleared, in `finally`; nothing waits for
+   * another window while it is held.
    */
   private async withdrawAfterHelperFailed(
     ctx: PipelineContext,
     containerId: string,
     before: ReadonlyMap<string, boolean> | undefined,
     compose: boolean,
+  ): Promise<void> {
+    let own: BusyMark | undefined;
+    let blocked: WindowUse | undefined;
+    if (!ctx.busy) {
+      const taken = await this.takeStepMark(ctx, 'update');
+      if ('mark' in taken) own = taken.mark;
+      else blocked = taken.user;
+    }
+    try {
+      await this.withdrawContainer(ctx, containerId, before, compose, blocked);
+    } finally {
+      if (own !== undefined) await this.releaseStepMark(ctx, own);
+    }
+  }
+
+  /** withdrawAfterHelperFailed, with the busy mark set (or `blocked`: why it could not be set). */
+  private async withdrawContainer(
+    ctx: PipelineContext,
+    containerId: string,
+    before: ReadonlyMap<string, boolean> | undefined,
+    compose: boolean,
+    blocked: WindowUse | undefined,
   ): Promise<void> {
     const env = ctx.env;
     const { docker } = this.deps;
@@ -3727,7 +3889,11 @@ export class EnvironmentService {
     // Review round 3 (A-R3-4): Step 9 holds no busy mark, so another window may have started this container (its `up`)
     // and connected to it meanwhile.
     // When the files cannot be read, it is not known: the containers stay too (when in doubt, nothing is stopped or removed).
-    const user = await this.otherWindowOf(env);
+    // Review round 4 (A-R4-6): read with the busy mark of this run set; without it (`blocked`), nothing is touched either.
+    const user = blocked ?? (await this.otherWindowOf(env));
+    // Review round 4 (A-R4-4): a mark of an earlier open that names this container (it ran before `up`) stays.
+    const mark = ctx.env.lifecycleIncomplete;
+    const markedBefore = ranBefore && mark !== undefined && sameContainer(mark, id);
     if (user !== undefined) {
       const what = created === undefined ? 'created or started' : created ? 'created' : 'started';
       this.logger.info(
@@ -3737,8 +3903,20 @@ export class EnvironmentService {
       );
       // A container that did not run before `up` runs without its lifecycle commands: the mark (A-R3-5) makes the next
       // open run them. One that ran before this open runs as before.
-      const marked = !ranBefore && (await this.markLifecycleIncomplete(ctx, id, name));
-      ctx.upWithdrawn = { outcome: user.known ? 'inUse' : 'useUnknown', id, created, name, ...(marked ? { marked } : {}) };
+      // Review round 4 (B-R4-2): nothing is stopped here, also when the mark cannot be written (another window may use it).
+      const marked = ranBefore ? markedBefore : await this.markLifecycleIncomplete(ctx, id, name);
+      const markFailed = !ranBefore && !marked;
+      if (markFailed) this.lifecycleNotRecorded(ctx, id, name);
+      ctx.upWithdrawn = {
+        outcome: user.known ? 'inUse' : 'useUnknown',
+        id,
+        created,
+        name,
+        ...(marked ? { marked } : {}),
+        ...(markFailed ? { markFailed } : {}),
+        ...(user.known && user.use !== undefined ? { use: user.use } : {}),
+        ...(ranBefore ? { ranBefore } : {}),
+      };
       return;
     }
     const stop = async (): Promise<boolean> => {
@@ -3782,13 +3960,111 @@ export class EnvironmentService {
       this.logger.info(`The containers of the other services of ${env.repository} are left as they are: it is not known which of them ran before up.`);
     }
     // Review round 3 (A-R3-5): the container runs without its lifecycle commands: the mark makes the next open run them.
-    let marked = false;
+    let marked = markedBefore;
+    let markFailed = false;
     if (outcome === 'kept') {
       marked = await this.markLifecycleIncomplete(ctx, id, name);
+      // Review round 4 (B-R4-2): the mark could not be written: the stop of this container (which this `up` created or
+      // started, and which no other window uses) is tried once more; when it still runs, this window remembers it, and the
+      // detail and a warning say that it could not be recorded.
+      if (!marked) {
+        if (await stop()) {
+          outcome = created === true ? 'stoppedAfterRemovalFailed' : 'stopped';
+        } else {
+          markFailed = true;
+          this.lifecycleNotRecorded(ctx, id, name);
+        }
+      }
     } else if (outcome === 'removed') {
       await this.clearLifecycleMark(ctx, id);
     }
-    ctx.upWithdrawn = { outcome, id, created, name, ...(marked ? { marked } : {}) };
+    ctx.upWithdrawn = { outcome, id, created, name, ...(marked ? { marked } : {}), ...(markFailed ? { markFailed } : {}), ...(ranBefore ? { ranBefore } : {}) };
+  }
+
+  /**
+   * Review round 4 of PR #68 (A-R4-5, A-R4-6): sets a busy mark for a step of a run that holds none (Step 9), unless the
+   * entry has a mark already that is not an ended one: a live mark of another window, and any mark of this window or
+   * process (an outer mark is never overwritten). Never waits. Returns the mark that was set, or else how the environment
+   * is used (`busy`; `known: false` when the registry could not be written, logged).
+   */
+  private async takeStepMark(ctx: PipelineContext, operation: BusyOperation): Promise<{ mark: BusyMark } | { user: WindowUse }> {
+    const mark = this.busyMark(operation);
+    const state: { conflict?: BusyMark } = {};
+    try {
+      // Read before the lock: the mutator does no I/O.
+      const blocks = await this.markBlocker();
+      const updated = await this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
+        if (entry.busy && (blocks(entry.busy) || this.isOwnMark(entry.busy) || entry.busy.pid === this.deps.owner.pid)) {
+          state.conflict = entry.busy;
+          return;
+        }
+        entry.busy = mark;
+      });
+      if (!updated) {
+        this.logger.warn(`The registry entry of ${ctx.env.repository} is missing; no busy mark was set.`);
+        return { user: { known: false, text: `It is not known whether another window uses ${ctx.env.repository}.` } };
+      }
+      ctx.env = updated;
+      if (state.conflict) {
+        const other = state.conflict;
+        return { user: { known: true, use: 'busy', text: `The window ${other.windowId} (process ${other.pid}) holds the busy mark ${other.operation} since ${other.since}.` } };
+      }
+      this.logger.info(`${ctx.env.repository} is marked as busy (${operation}).`);
+      return { mark };
+    } catch (error) {
+      this.logger.warn(`The busy mark of ${ctx.env.repository} could not be set: ${errorMessage(error)}.`);
+      return { user: { known: false, text: `It is not known whether another window uses ${ctx.env.repository}.` } };
+    }
+  }
+
+  /**
+   * Review round 4 of PR #68 (A-R4-5): before a step of a run without a busy mark (Step 9) stops, removes, or renames a
+   * container (`change` says which and why): the busy mark is set (takeStepMark, never over another mark), and then the
+   * files of the windows are read. When another window uses the environment, when its busy mark is there, or when that
+   * cannot be checked, nothing is changed and the open ends with startFailed (OtherWindowUsesError); the mark
+   * Environment.lifecycleIncomplete stays. Otherwise the mark is held for the rest of this run (PipelineContext.busy:
+   * releaseBusy in `finally`, or finish, clears it), so that no other window opens the environment meanwhile. With a busy
+   * mark of this run already, nothing is checked.
+   */
+  private async requireNoOtherWindow(ctx: PipelineContext, change: string): Promise<void> {
+    if (ctx.busy) return;
+    const taken = await this.takeStepMark(ctx, 'update');
+    let user: WindowUse | undefined;
+    if ('mark' in taken) {
+      ctx.busy = true;
+      user = await this.otherWindowOf(ctx.env);
+    } else {
+      user = taken.user;
+    }
+    if (user === undefined) return;
+    this.logger.warn(`${change}. ${user.text} Nothing is changed, and the open ends.`);
+    const who = !user.known
+      ? 'it could not be checked whether another window uses the environment'
+      : user.use === 'opening'
+        ? 'another window is opening the environment'
+        : user.use === 'busy'
+          ? 'another window is working on the environment'
+          : 'another window is connected to the environment';
+    throw new OtherWindowUsesError(`${change}, but ${who}. Nothing was stopped, removed, or renamed. Open or rebuild the environment again when that window is closed.`);
+  }
+
+  /** Review round 4 of PR #68 (A-R4-6): clears the busy mark `mark` that takeStepMark set, and no other. Never throws. */
+  private async releaseStepMark(ctx: PipelineContext, mark: BusyMark): Promise<void> {
+    await this.quietly('clear the busy mark', async () => {
+      const updated = await this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
+        const current = entry.busy;
+        if (
+          current !== undefined &&
+          current.operation === mark.operation &&
+          current.since === mark.since &&
+          current.pid === mark.pid &&
+          current.windowId === mark.windowId
+        ) {
+          delete entry.busy;
+        }
+      });
+      if (updated) ctx.env = updated;
+    });
   }
 
   /**
@@ -3796,15 +4072,33 @@ export class EnvironmentService {
    * lifecycle commands, so the next open runs them). Whether that worked; a failure is logged.
    */
   private async markLifecycleIncomplete(ctx: PipelineContext, id: string, name: string): Promise<boolean> {
-    this.logger.warn(`The container ${name} runs without its lifecycle commands. The next open runs them.`);
-    let marked = false;
-    await this.quietly('record the container whose lifecycle commands did not run', async () => {
-      await this.updateEntry(ctx, (entry) => {
-        entry.lifecycleIncomplete = id;
-      });
-      marked = true;
-    });
-    return marked;
+    // Review round 4 of PR #68 (B-R4-2): written twice at most, with a short pause; "the next open runs them" only once it
+    // is written.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.updateEntry(ctx, (entry) => {
+          entry.lifecycleIncomplete = id;
+        });
+        this.logger.warn(`The container ${name} runs without its lifecycle commands. The next open runs them.`);
+        return true;
+      } catch (error) {
+        this.logger.warn(`Could not record the container whose lifecycle commands did not run: ${errorMessage(error)}`);
+        if (attempt >= 2) return false;
+      }
+      await this.sleepFn(LIFECYCLE_MARK_RETRY_MS).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Review round 4 of PR #68 (B-R4-2): the container `id` runs without its lifecycle commands, and the registry could not
+   * record it: this window remembers it (unrecordedLifecycle), and the log and a warning say so.
+   */
+  private lifecycleNotRecorded(ctx: PipelineContext, id: string, name: string): void {
+    this.unrecordedLifecycle.set(ctx.env.id, id);
+    this.logger.error(
+      `The container ${name} of ${ctx.env.repository} runs without its lifecycle commands, and this could not be recorded. Stop or rebuild the environment before working in it.`,
+    );
+    this.deps.ui.warn(Messages.lifecycleNotRecorded(ctx.env.repository));
   }
 
   /**
@@ -3813,7 +4107,7 @@ export class EnvironmentService {
    * `known: false`: a file could not be read (logged), so it is not known, and the caller keeps the containers as when
    * another window uses them (when in doubt, nothing is stopped or removed).
    */
-  private async otherWindowOf(env: Environment): Promise<{ known: boolean; text: string } | undefined> {
+  private async otherWindowOf(env: Environment): Promise<WindowUse | undefined> {
     let unreadable = false;
     let windowStatuses: readonly WindowStatus[] | undefined;
     if (this.deps.windowStatuses) {
@@ -3833,7 +4127,10 @@ export class EnvironmentService {
     }
     const other = otherWindowUsesEnvironment(env.id, this.deps.owner.windowId, { now: this.deps.clock.now(), isAlive: this.isAlive, windowStatuses, pendings });
     if (other !== undefined) {
-      return { known: true, text: 'window' in other ? `The window ${other.window.windowId} is connected to it.` : `The window ${other.pending.windowId} is connecting to it.` };
+      // Review round 4 (A-R4-3): a pending connection file: that window opens the environment (it may still wait or build).
+      return 'window' in other
+        ? { known: true, use: 'connected', text: `The window ${other.window.windowId} is connected to it.` }
+        : { known: true, use: 'opening', text: `The window ${other.pending.windowId} is opening the environment.` };
     }
     return unreadable ? { known: false, text: `It is not known whether another window is connected to ${env.repository}.` } : undefined;
   }
@@ -3843,12 +4140,29 @@ export class EnvironmentService {
    * did not run, so it is not opened as it is.
    */
   private lifecycleIncomplete(ctx: PipelineContext, container: ContainerInfo | undefined): boolean {
-    const mark = ctx.env.lifecycleIncomplete;
-    return mark !== undefined && container !== undefined && sameContainer(mark, container.id);
+    if (container === undefined) return false;
+    // Review round 4 of PR #68 (B-R4-2): also a container that this window remembers because the mark could not be written.
+    return [ctx.env.lifecycleIncomplete, this.unrecordedLifecycle.get(ctx.env.id)].some((mark) => mark !== undefined && sameContainer(mark, container.id));
+  }
+
+  /**
+   * Review round 4 of PR #68 (A-R4-1): lifecycleIncomplete for a decision whether `container` opens as it is; the value
+   * that the decision used is kept (PipelineContext.lifecycleMarkRead), so that finish clears only that one.
+   */
+  private decideOnLifecycleMark(ctx: PipelineContext, container: ContainerInfo | undefined): boolean {
+    // The value that an earlier decision of this run read (the start of the pipeline, or Step 5) counts too, so that Step 5
+    // and Step 9 decide with the same snapshot at least; a newer mark in the entry counts as well (when in doubt, `up`).
+    const earlier = ctx.lifecycleMarkRead;
+    ctx.lifecycleMarkRead = ctx.env.lifecycleIncomplete;
+    if (container !== undefined && earlier !== undefined && sameContainer(earlier, container.id)) return true;
+    return this.lifecycleIncomplete(ctx, container);
   }
 
   /** Review round 3 of PR #68 (A-R3-5): clears Environment.lifecycleIncomplete when it names `containerId` (the container is gone). */
   private async clearLifecycleMark(ctx: PipelineContext, containerId: string): Promise<void> {
+    // Review round 4 of PR #68 (B-R4-2): also the mark that this window remembers.
+    const unrecorded = this.unrecordedLifecycle.get(ctx.env.id);
+    if (unrecorded !== undefined && sameContainer(unrecorded, containerId)) this.unrecordedLifecycle.delete(ctx.env.id);
     const mark = ctx.env.lifecycleIncomplete;
     if (mark === undefined || !sameContainer(mark, containerId)) return;
     await this.quietly('clear the mark of the container whose lifecycle commands did not run', () =>
@@ -4688,8 +5002,10 @@ export class EnvironmentService {
       // Unit 7, PR 2: Close and Keep Running holds only until a window connects again.
       delete entry.keepRunningOnce;
       // Review round 3 of PR #68 (A-R3-5): the container that opens ran its lifecycle commands now (or runs as it ran
-      // before, and a mark of another container names one that this open replaced or that is gone).
-      delete entry.lifecycleIncomplete;
+      // before, and a mark of another container names one that this open replaced or that is gone). Review round 4
+      // (A-R4-1): only the mark that this run decided with, or one that names the container whose lifecycle commands this
+      // run ran; a mark that another window set meanwhile (Step 9 holds no busy mark) stays.
+      if (lifecycleMarkClears(entry.lifecycleIncomplete, ctx.lifecycleMarkRead, ctx.lifecycleRanFor)) delete entry.lifecycleIncomplete;
       if (remoteUser) entry.remoteUser = remoteUser;
       entry.remoteWorkspaceFolder = remoteWorkspaceFolder;
       if (gitSummary) entry.gitSummary = gitSummary;
@@ -4698,6 +5014,10 @@ export class EnvironmentService {
       if (entry.busy && (this.isOwnMark(entry.busy) || !blocks(entry.busy))) delete entry.busy;
     });
     ctx.busy = false;
+    // Review round 4 of PR #68 (B-R4-2): the mark that this window remembers goes once the lifecycle commands of its
+    // container ran.
+    const unrecorded = this.unrecordedLifecycle.get(env.id);
+    if (unrecorded !== undefined && ctx.lifecycleRanFor !== undefined && sameContainer(unrecorded, ctx.lifecycleRanFor)) this.unrecordedLifecycle.delete(env.id);
     this.logger.info(`${env.repository} is ready in the container ${containerName}.`);
     return { environment: ctx.env, containerName, remoteWorkspaceFolder };
   }

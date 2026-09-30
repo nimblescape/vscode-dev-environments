@@ -13,6 +13,7 @@ import {
   composeMountVolumes,
   composeConfigurationChange,
   composeRecordOf,
+  hasComposeRecord,
   configHash,
   containerIsCurrent,
   digestReference,
@@ -515,6 +516,18 @@ describe('Docker Compose rules (unit 6)', () => {
     ['no object', 'app', undefined],
   ])('composeRecordOf: %s', (_name, compose, expected) => {
     expect(composeRecordOf({ ...record, compose } as never)).toEqual(expected);
+  });
+
+  it('hasComposeRecord: the key `compose` with an object decides the kind, also for a part that composeRecordOf rejects (PR #68 review round 4, A-R4-2)', () => {
+    expect(hasComposeRecord(undefined)).toBe(false);
+    expect(hasComposeRecord(record as never)).toBe(false);
+    expect(hasComposeRecord({ ...record, compose: valid } as never)).toBe(true);
+    // A part of an earlier version, without the hash of the files: not valid, but still Docker Compose.
+    const older = { service: 'app', images: [], serviceImages: [], version: '2.40.3' };
+    expect(composeRecordOf({ ...record, compose: older } as never)).toBeUndefined();
+    expect(hasComposeRecord({ ...record, compose: older } as never)).toBe(true);
+    expect(hasComposeRecord({ ...record, compose: 'app' } as never)).toBe(false);
+    expect(hasComposeRecord({ ...record, compose: ['app'] } as never)).toBe(false);
   });
 
   it('composeRecordOf keeps the service images, the Compose version, and the hash of the files (review round 1, D5, P-4)', () => {
