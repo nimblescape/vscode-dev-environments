@@ -775,6 +775,8 @@ describe('MonitorLoop.tick', () => {
       expect(defaultMeasureFromTickEnd('win32')).toBe(false);
       expect(defaultMeasureFromTickEnd('linux')).toBe(true);
       expect(defaultMeasureFromTickEnd('darwin')).toBe(true);
+      // PR #70 review round 3 (B-R3-1/2): the call without an argument uses the platform of this process.
+      expect(defaultMeasureFromTickEnd()).toBe(process.platform !== 'win32');
     });
 
     // PR #70 review round 2 (B-R2-1): a loop without the setting uses the default of this platform.
