@@ -282,18 +282,23 @@ export const Messages = {
     'These volumes may hold data of the services of the environment, for example of a database. Tick the ones to remove; the others are kept. Escape cancels the deletion.',
   helperFailed: 'The workspace helper could not be prepared.',
   /**
-   * Review round 4 of PR #64 (R4-4): the helper image of an open was gone in the middle of an update, a rebuild, or the
-   * switch to a newly selected configuration, and the running container opened as it is. `change` names what was not
-   * applied; with a selected configuration, `previous` names the configuration that stays selected.
+   * Review round 4 of PR #64 (R4-4), review round 14 (R14-1): the helper image could not be prepared at Step 5 of a
+   * Rebuild or of the switch to a newly selected configuration, and the running container, which is current, opened as
+   * it is. `change` names what was not applied; with a selected configuration, `previous` names the configuration that
+   * stays selected. (A helperFailed in Step 8 ends the open instead, user decision 2026-09-29.)
    */
-  helperFailedOpenedAsItIs: (change: 'update' | 'rebuild' | 'configuration', previous?: string) =>
+  helperFailedOpenedAsItIs: (change: 'rebuild' | 'configuration', previous?: string) =>
     `The workspace helper could not be prepared. The running environment is opened as it is: ${
       change === 'configuration'
         ? `the selected configuration was not applied${previous !== undefined ? `, and ${previous} stays selected` : ''}`
-        : change === 'rebuild'
-          ? 'it was not rebuilt'
-          : 'the update was not applied'
+        : 'it was not rebuilt'
     }. Open it again to try again.`,
+  /**
+   * Review round 4 of PR #68 (B-R4-2): the lifecycle commands of a container could not run (the workspace helper
+   * failed), it still runs, and the registry could not record that (Environment.lifecycleIncomplete).
+   */
+  lifecycleNotRecorded: (repository: string) =>
+    `The container of ${repository} runs without its lifecycle commands, and this could not be recorded. Stop or rebuild the environment before working in it.`,
   cloneFailed: 'The repository could not be downloaded.',
   noEnvironment: (repository: string) => `${repository} has no environment.`,
   /**

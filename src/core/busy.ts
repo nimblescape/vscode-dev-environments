@@ -4,7 +4,34 @@
 
 // Liveness of busy marks (concept 7.9 rule 1: "The registry marks the environment as busy"). One rule for the windows
 // (sidebar, environment service) and the Session Monitor, so that they never disagree about a mark.
-import type { BusyMark, WindowStatus } from './types';
+import type { BusyMark, MonitorSettings, PendingConnection, WindowStatus } from './types';
+
+/**
+ * A window status file whose `updatedAt` is older than this does not make its environment in use (concept 7.9 rule 1).
+ * The Session Monitor (src/monitor/rules.ts) and otherWindowUsesEnvironment share it.
+ */
+export const HEARTBEAT_MAX_AGE_MS = 60_000;
+/** A pending connection file older than this does not make its environment in use (concept 7.9 rule 1). */
+export const PENDING_MAX_AGE_MS = 120_000;
+/**
+ * A gap between two ticks of the Session Monitor larger than this means that the computer slept, or that the clock was
+ * changed. Review round 5 of PR #68 (risk 2): here since then (src/monitor/rules.ts re-exports it), because the
+ * environment service reads the same gap from the status file of its own window (sleepGraceOfWindow).
+ */
+export const SLEEP_GAP_MS = 30_000;
+/** Default of the setting `devEnvLauncher.waitingTimeSeconds` (concept section 8). */
+export const DEFAULT_WAITING_TIME_SECONDS = 30;
+
+/** The waiting time of the settings in milliseconds. A missing, negative, or invalid value gives the default. */
+export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSeconds'>): number {
+  const seconds: unknown = settings.waitingTimeSeconds;
+  // Assumption (V-4): a window reload takes less than the waiting time, so the default of 30 s prevents a stop
+  // during a reload.
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
+    return DEFAULT_WAITING_TIME_SECONDS * 1000;
+  }
+  return Math.round(seconds * 1000);
+}
 
 /**
  * A busy mark older than this does not protect its environment, even when a process with the owner's ID exists: the ID
@@ -69,4 +96,103 @@ export function isBlockingBusyMark(
 ): boolean {
   if (mark.pid === owner.pid) return false;
   return isBusyMarkLive(mark, input);
+}
+
+export interface OtherWindowInput {
+  /** Milliseconds since the epoch. */
+  now: number;
+  /** `process.kill(pid, 0)` does not fail with ESRCH (see `isProcessAlive`). */
+  isAlive: (pid: number) => boolean;
+  /** All window status files; `undefined` when they could not be read. */
+  windowStatuses?: readonly WindowStatus[];
+  /** All pending connection files; `undefined` when they could not be read. */
+  pendings?: readonly PendingConnection[];
+}
+
+/** The ISO time is valid and at most `maxAgeMs` away from `now` (also a time far in the future is not fresh). */
+function isFreshTime(time: string, now: number, maxAgeMs: number): boolean {
+  const at = Date.parse(time);
+  return Number.isFinite(at) && Math.abs(now - at) <= maxAgeMs;
+}
+
+/**
+ * Review round 3 of PR #68 (A-R3-4): what shows that a window other than `ownWindowId` uses the environment
+ * `environmentId`, as the Session Monitor's rule 1 counts it (computeInUse, without the sleep grace) and as
+ * SessionCoordinator.otherActiveWindows filters: a status file of another window that names the environment, in the state
+ * `active`, whose process exists, updated at most HEARTBEAT_MAX_AGE_MS ago; or a pending connection file of another window
+ * for it, at most PENDING_MAX_AGE_MS old. `undefined`: none (also for files that could not be read).
+ */
+export function otherWindowUsesEnvironment(
+  environmentId: string,
+  ownWindowId: string,
+  input: OtherWindowInput,
+): { window: WindowStatus } | { pending: PendingConnection } | undefined {
+  const window = (input.windowStatuses ?? []).find(
+    (status) =>
+      status.windowId !== ownWindowId &&
+      status.environmentId === environmentId &&
+      status.state === 'active' &&
+      isFreshTime(status.updatedAt, input.now, HEARTBEAT_MAX_AGE_MS) &&
+      input.isAlive(status.pid),
+  );
+  if (window !== undefined) return { window };
+  const pending = (input.pendings ?? []).find(
+    (entry) => entry.windowId !== ownWindowId && entry.environmentId === environmentId && isFreshTime(entry.createdAt, input.now, PENDING_MAX_AGE_MS),
+  );
+  return pending !== undefined ? { pending } : undefined;
+}
+
+/**
+ * The Session Monitor's rule for the status file of a window whose process exists (src/monitor/rules.ts,
+ * isStaleLiveWindow): it is stale (a reused process ID, or a hanging extension host) when it was not updated for
+ * HEARTBEAT_MAX_AGE_MS plus the waiting time; never during the sleep grace (`grace`). Review round 5 of PR #68 (risk 2):
+ * shared with the destructive checks of the environment service (otherWindowMayUseEnvironment).
+ */
+export function isStaleLiveWindowStatus(
+  status: Pick<WindowStatus, 'updatedAt'>,
+  alive: boolean,
+  now: number,
+  grace: boolean,
+  waitingMs: number,
+): boolean {
+  return alive && !grace && !isFreshTime(status.updatedAt, now, HEARTBEAT_MAX_AGE_MS + waitingMs);
+}
+
+/**
+ * Review round 5 of PR #68 (risk 2): the sleep grace as a window sees it without the state of the Session Monitor. The
+ * status file of the own window (`ownWindowId`, process `ownPid`) is written every 15 seconds; when it was not updated for
+ * SLEEP_GAP_MS, the timers of this window did not run (the computer slept, or the clock was changed), so the files of the
+ * other windows may be old for the same reason. False when the own file is missing.
+ */
+export function sleepGraceOfWindow(
+  windowStatuses: readonly WindowStatus[] | undefined,
+  own: { windowId: string; pid: number },
+  now: number,
+): boolean {
+  const status = (windowStatuses ?? []).find((entry) => entry.windowId === own.windowId && entry.pid === own.pid);
+  return status !== undefined && !isFreshTime(status.updatedAt, now, SLEEP_GAP_MS);
+}
+
+/**
+ * Review round 5 of PR #68 (risk 2): a status file of a window other than `ownWindowId` that names the environment, in
+ * the state `active`, whose process exists, and that is no longer fresh (HEARTBEAT_MAX_AGE_MS, so
+ * otherWindowUsesEnvironment does not count it), but not stale by the Session Monitor's rule either
+ * (isStaleLiveWindowStatus, with its waiting time and sleep grace): that window may only have missed its updates (for
+ * example after computer sleep). The destructive checks of the environment service count it as "not known", and only
+ * while a container of the environment runs. `undefined`: none.
+ */
+export function otherWindowMayUseEnvironment(
+  environmentId: string,
+  ownWindowId: string,
+  input: OtherWindowInput & { waitingMs: number; grace: boolean },
+): WindowStatus | undefined {
+  return (input.windowStatuses ?? []).find(
+    (status) =>
+      status.windowId !== ownWindowId &&
+      status.environmentId === environmentId &&
+      status.state === 'active' &&
+      input.isAlive(status.pid) &&
+      !isFreshTime(status.updatedAt, input.now, HEARTBEAT_MAX_AGE_MS) &&
+      !isStaleLiveWindowStatus(status, true, input.now, input.grace, input.waitingMs),
+  );
 }

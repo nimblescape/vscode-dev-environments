@@ -546,6 +546,26 @@ export function isComposeRecreateLeftoverName(name: string): boolean {
   return /^[0-9a-f]{12}_/.test(name);
 }
 
+/**
+ * Review round 4 of PR #68 (A-R4-2): whether the build record is one of a Docker Compose environment, for its kind only:
+ * the key `compose` holds an object. A part that composeRecordOf rejects (for example one that lacks a field added in a
+ * later version) still makes the environment a Docker Compose environment; its fields are read with composeRecordOf.
+ */
+export function hasComposeRecord(record: BuildRecord | undefined): boolean {
+  return record !== undefined && isRecord(record.compose);
+}
+
+/**
+ * Review round 5 of PR #68 (A-R5-3): the dev service of the build record of Docker Compose, read by its key
+ * (BuildRecord.compose.service), also from a part that composeRecordOf rejects (for example an older record without
+ * `inputsHash`). `undefined`: no such key, or no service name.
+ */
+export function recordedComposeService(record: BuildRecord | undefined): string | undefined {
+  const value: unknown = record?.compose;
+  if (!isRecord(value)) return undefined;
+  return typeof value.service === 'string' && value.service !== '' ? value.service : undefined;
+}
+
 /** BuildRecord.compose, when it is valid: the build record of a Docker Compose configuration. */
 export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRecord | undefined {
   const value: unknown = record?.compose;

@@ -185,6 +185,36 @@ describe('recreate offer: a stopped container that cannot be started or used', (
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
+  it('review round 2 of PR #68: run-user-commands of the recreated container fails with helperFailed: it is removed, and the next open creates it with its lifecycle commands', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    failFirstUp(PASSWD_DAMAGED);
+    h.ui.recreateAnswer = true;
+    h.helper.userCommandsError = new UserFacingError('helperFailed', Messages.helperFailed, `No such image: sha256:${'4'.repeat(64)}`);
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('helperFailed');
+    expect(error.message).toBe(Messages.helperFailed);
+    expect(error.detail).toBe(
+      `The damaged container was created again, but its lifecycle commands could not run. It was removed; the next open creates it again. No such image: sha256:${'4'.repeat(64)}`,
+    );
+    expect(ups()).toEqual([`up ${IMAGE_1}`, `up ${IMAGE_1} --remove-existing-container`]);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([]);
+    expectVolumesKept();
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+
+    h.helper.userCommandsError = undefined;
+    h.helper.upError = () => undefined;
+    h.settings.updateImagesOnConnect = false;
+    const runs = h.helper.userCommandRuns.length;
+    h.helper.calls.length = 0;
+    await h.service.open(TARGET, options());
+    expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expect(h.helper.userCommandRuns.length).toBe(runs + 1);
+    expect(h.docker.containersOf(ENV_ID)).toEqual([expect.objectContaining({ state: 'running' })]);
+  });
+
   it('a Cancel of the operation during the question: cancelled, nothing is removed', async () => {
     h = createHarness();
     await seedEnvironment(h);
