@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from './pipeLoader';
+import { LOADER_BUNDLE_TIMEOUT_MS, LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from './pipeLoader';
 
 interface Ended {
   code: number | null;
@@ -112,7 +112,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     expect(leftovers(file)).toEqual([]);
   });
 
-  it('exits 3 when the input ends before the first line', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('exits 3 when the input ends before the first line', { timeout: 30_000 }, async () => {
     // Review round 1 of PR #69 (A-R1-1): changed expectation (before: one path for all cases): a new path per case, as
     // the marker of the first start makes a second start on the same path exit at once (its own test below).
     for (const input of ['', JSON.stringify(START_BUNDLE)]) {
@@ -124,7 +125,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     }
   });
 
-  it('exits 3 for a first line that is no JSON string', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('exits 3 for a first line that is no JSON string', { timeout: 30_000 }, async () => {
     // Review round 1 of PR #69 (A-R1-1): changed expectation (before: one path for all cases): a new path per case (the
     // marker of the first start).
     for (const line of ['{"start":1}', '42', 'null', 'not json', '"unterminated']) {
@@ -156,7 +158,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     expect(fs.existsSync(other)).toBe(false);
   });
 
-  it('exits 3 when the bundle has no such function or cannot be loaded', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('exits 3 when the bundle has no such function or cannot be loaded', { timeout: 30_000 }, async () => {
     const noEntry = 'exports.other = () => {};';
     const ended = await load(newPath(), bundleHash(noEntry), 'start', encodeBundle(noEntry));
     expect(ended.code).toBe(LOADER_EXIT_CODE);
@@ -169,7 +172,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     expect(failed.stderr).toMatch(/^devenv loader: the bundle cannot be loaded: .+\n$/);
   });
 
-  it('exits 3 for invalid arguments before it reads anything', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('exits 3 for invalid arguments before it reads anything', { timeout: 30_000 }, async () => {
     const hash = bundleHash(START_BUNDLE);
     for (const [file, sha, entry] of [
       [newPath(), 'abc', 'start'],
@@ -199,7 +203,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     expect(fs.existsSync(`${file}.started`)).toBe(true);
   });
 
-  it('review round 1 of PR #69 (A-R1-1): a second start without a stored bundle exits 3 at once, also with its input open', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('review round 1 of PR #69 (A-R1-1): a second start without a stored bundle exits 3 at once, also with its input open', { timeout: 45_000 }, async () => {
     const file = newPath();
     const hash = bundleHash(START_BUNDLE);
     // The first start: its input ended before the bundle (the attached client was cut off).
@@ -212,7 +217,9 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     const ended = await again.ended;
     again.end();
     expect(ended).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: started before without its bundle\n' });
-    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    // PR #69 review round 6, A-R6-3: changed expectation (before: below 4 s, which a loaded machine can exceed): still far
+    // below the wait for a bundle, so it proves that the loader does not wait for this input.
+    expect(Date.now() - startedAt).toBeLessThan(LOADER_BUNDLE_TIMEOUT_MS / 2);
     expect(fs.existsSync(file)).toBe(false);
     // The same with a stored file of another hash (changed in the container): never read from an input again.
     fs.writeFileSync(file, 'exports.start = () => process.stdout.write("changed");');
@@ -254,7 +261,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     expect(ended).toEqual({ code: LOADER_EXIT_CODE, stdout: '', stderr: 'devenv loader: the entry failed: boom\n' });
   });
 
-  it('B-R2-3: an entry that throws something that is no Error (undefined, null) still exits 3 with one line', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('B-R2-3: an entry that throws something that is no Error (undefined, null) still exits 3 with one line', { timeout: 30_000 }, async () => {
     for (const thrown of ['undefined', 'null']) {
       const throwing = `exports.start = () => { throw ${thrown}; }; // ${'x'.repeat(5_000)}`;
       const ended = await load(newPath(), bundleHash(throwing), 'start', encodeBundle(throwing));
@@ -262,7 +270,8 @@ describe('the pipe loader in a Node.js process (plan step 3)', () => {
     }
   });
 
-  it('review round 2 of PR #69 (A-R2-3): the source excerpt of an asynchronous uncaught error of a multi-line bundle is not in readableStderr', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('review round 2 of PR #69 (A-R2-3): the source excerpt of an asynchronous uncaught error of a multi-line bundle is not in readableStderr', { timeout: 30_000 }, async () => {
     for (const [thrown, shown] of [
       ['new TypeError("not a secret: " + 7)', 'TypeError: not a secret: 7'],
       ['42', '42'],

@@ -109,7 +109,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('opens, answers the probe and a Docker call with input, and ends when it is closed', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('opens, answers the probe and a Docker call with input, and ends when it is closed', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     // Review round 4 (M1): with the sweep of never-started channel containers.
@@ -152,7 +153,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     process.end();
   });
 
-  it('the loader exits when the input ends before the script', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('the loader exits when the input ends before the script', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     process.end();
     await waitUntil(ended, 'the end of the loader');
@@ -160,7 +162,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
   });
 
   // Plan step 3 (pipe loading, user decision 2026-09-29): the loader checks the script against the hash of its command.
-  it('the loader exits when the script does not match its hash, and starts nothing', async () => {
+  // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
+  it('the loader exits when the script does not match its hash, and starts nothing', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     let stderr = '';
     process.onStderr((text) => (stderr += text));
