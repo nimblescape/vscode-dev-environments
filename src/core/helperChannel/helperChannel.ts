@@ -10,6 +10,7 @@
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
+import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
@@ -20,14 +21,12 @@ import {
   CHANNEL_SLOT_WAIT_MS,
   LineSplitter,
   MAX_CHANNEL_REQUEST_BYTES,
-  MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
   MAX_OPERATION_TIMEOUT_MS,
   MAX_SERVER_LINE,
   OP_DOCKER,
   encodeMessage,
-  encodeScript,
   isSecret,
   parseDockerOperationParams,
   parseDockerOperationValue,
@@ -36,6 +35,8 @@ import {
   type ServerMessage,
 } from './protocol';
 
+/** The characters of the end of the stderr of `docker run` that are kept for the log (readableStderr). */
+const STDERR_TAIL_LENGTH = 4_000;
 /** Time for the start of the container and the answer to `hello` (an SSH connection, the container, Node.js). */
 export const CHANNEL_OPEN_TIMEOUT_MS = 120_000;
 /** After `close`, `docker run` gets this long to end by itself before it is stopped. */
@@ -162,7 +163,8 @@ export class HelperChannel {
   ) {}
 
   /**
-   * Starts the channel on `process` (`docker run -i … node -e CHANNEL_LOADER`): writes the script, sends `hello`, and
+   * Starts the channel on `process` (`docker run -i … node -e PIPE_LOADER …`, channelRunArgs): writes the script as the
+   * first line (encodeBundle; the loader checks it against the hash of its command line), sends `hello`, and
    * waits for its answer. Throws HelperChannelError('open') and stops the process when that fails.
    */
   static async open(process: StartedProcess, script: string, options: HelperChannelOptions): Promise<HelperChannel> {
@@ -201,15 +203,19 @@ export class HelperChannel {
     const splitter = new LineSplitter(MAX_SERVER_LINE, (line) => this.onLine(line), () => this.lose('a line of the helper is too long'));
     this.process.onStdout((text) => splitter.push(text));
     this.process.onStderr((text) => {
-      this.stderrTail = (this.stderrTail + text).slice(-4_000);
+      this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_LENGTH);
     });
     void this.process.exited.then(({ exitCode, error }) => {
-      const detail = error ? error.message : this.stderrTail.trim() || `exit code ${exitCode}`;
+      // Review round 1 of PR #69 (A-R1-3): only the short lines of the tail reach the log (Node.js prints the source line
+      // of an uncaught error, and the script is one long line). Review round 2 of PR #69 (A-R2-3): the
+      // script has short lines too, so readableStderr also drops the source excerpt by its shape.
+      const detail = error ? error.message : readableStderr(this.stderrTail, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
       this.lose(`the helper ended (${detail})`);
     });
-    // Review round 1 (P6): the loader limits the escaped line, so the same is checked here.
-    const scriptLine = encodeScript(script);
-    if (scriptLine.length - 1 > MAX_CHANNEL_SCRIPT_LENGTH) {
+    // Review round 1 (P6): the loader limits the escaped line, so the same is checked here (plan step 3: the memory guard
+    // of the pipe loader, MAX_BUNDLE_LINE_LENGTH).
+    const scriptLine = encodeBundle(script);
+    if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
       this.lose('the script is too long');
       throw new HelperChannelError('open', `The script of the helper channel is too long (${scriptLine.length - 1} characters as JSON).`);
     }

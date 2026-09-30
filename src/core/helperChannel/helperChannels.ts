@@ -10,12 +10,14 @@
 import * as crypto from 'crypto';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
+import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
 import { abortError, type Logger, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError, type ChannelDockerOptions } from './helperChannel';
 import {
+  CHANNEL_ENTRY,
   CHANNEL_IDLE_CLOSE_MS,
-  CHANNEL_LOADER,
+  CHANNEL_SCRIPT_PATH,
   LABEL_HELPER_CHANNEL,
   OP_PROBE,
   OP_SWEEP,
@@ -38,9 +40,11 @@ export const CHANNEL_OPEN_WAIT_MS = 5_000;
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
  * pipeline; without it the start fails and the caller takes the way without the channel), the labels, no network, no
- * capability, no new privileges, only the Docker socket of the engine. The command is the loader of protocol.ts.
+ * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
+ * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
+ * the first line of the input (HelperChannel.open), never on the command line.
  */
-export function channelRunArgs(p: { tag: string; socketPath: string; containerName: string; label: string }): string[] {
+export function channelRunArgs(p: { tag: string; socketPath: string; containerName: string; label: string; scriptHash: string }): string[] {
   // --mount is CSV: a path with a comma or a quote would change the mount.
   if (/[",]/.test(p.socketPath)) throw new HelperChannelError('open', `The Docker socket path ${p.socketPath} cannot be mounted.`);
   return [
@@ -67,9 +71,7 @@ export function channelRunArgs(p: { tag: string; socketPath: string; containerNa
     '--mount',
     `type=bind,source=${p.socketPath},target=${HELPER_DOCKER_SOCKET}`,
     p.tag,
-    'node',
-    '-e',
-    CHANNEL_LOADER,
+    ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: CHANNEL_ENTRY }),
   ];
 }
 
@@ -92,7 +94,7 @@ export interface ChannelOpenDeps {
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const [script, tag, socketPath] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target)]);
   const containerName = `devenv-channel-${crypto.randomBytes(6).toString('hex')}`;
-  const args = channelRunArgs({ tag, socketPath, containerName, label: channelLabelValue(script) });
+  const args = channelRunArgs({ tag, socketPath, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
   const process = await runWithDockerTarget(target, async () => deps.start(args));
   if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
   const channel = await HelperChannel.open(process, script, { logger: deps.logger, name: target.host });

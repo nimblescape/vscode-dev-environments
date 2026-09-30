@@ -80,6 +80,9 @@ describe('EXTENSION_LABEL_KEYS', () => {
       'helper-channel',
       'helper-run',
       'host-access',
+      // Review round 1 of PR #69 (A-R1-2): changed expectation (before: without it): the nonce label of each create of the
+      // remote Session Monitor, by which a failed create removes only its own container.
+      'monitor-create',
       'owner-id',
       'repository',
       'service-data',

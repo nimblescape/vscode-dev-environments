@@ -142,8 +142,10 @@ export interface ContainerDetails {
   Id: string;
   /** With a leading `/`. */
   Name: string;
-  State: { Status: string; Running: boolean };
-  Config: { Image: string; Hostname?: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean };
+  State: { Status: string; Running: boolean; ExitCode?: number; Restarting?: boolean };
+  /** How often the restart policy restarted it since its last start by a client (review round 1 of PR #69, A-R1-1). */
+  RestartCount?: number;
+  Config: { Image: string; Hostname?: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean; Cmd?: string[] | null };
   HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null; Privileged?: boolean; RestartPolicy?: { Name?: string; MaximumRetryCount?: number }; Tmpfs?: Record<string, string> | null };
   Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
 }

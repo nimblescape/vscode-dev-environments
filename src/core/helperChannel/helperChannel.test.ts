@@ -4,6 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES } from '../helper/analysisLimits';
+import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { OutputTooLargeError } from '../process';
 import type { Logger, StartedProcess } from '../ports';
 import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
@@ -13,7 +14,6 @@ import {
   CHANNEL_PROTOCOL_VERSION,
   CHANNEL_SLOT_WAIT_MS,
   MAX_CHANNEL_REQUEST_BYTES,
-  MAX_CHANNEL_SCRIPT_LENGTH,
   MAX_CLIENT_LINE,
   MAX_CONCURRENT_OPERATIONS,
   MAX_DOCKER_ARGS,
@@ -127,6 +127,50 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await check;
     expect(silent.state.killed).toBe(true);
+  });
+
+  it('review round 1 of PR #69 (A-R1-3): a long line of stderr (the source line of an uncaught error) is not in the reason, the loader line is', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    crashed.stderr(`${'y'.repeat(4_000)}\n`);
+    crashed.stderr('devenv loader: x\n');
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toBe('The helper channel to build-box could not be opened: the helper ended (devenv loader: x)');
+    expect(JSON.stringify(lines)).not.toContain('yyyyyyyyyy');
+  });
+
+  it('B-R2-1: at the cap of the stderr tail its first line (the cut end of a longer one) is not in the reason, even when it is short', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    const rest = `${'short line\n'.repeat(300)}devenv loader: x\n`;
+    const cut = 4_000 - rest.length - 1;
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThanOrEqual(1_000);
+    crashed.stderr(`${'z'.repeat(10_000)}\n${rest}`);
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toContain('short line\ndevenv loader: x)');
+    expect(failure?.message).not.toContain('z');
+    expect(JSON.stringify(lines)).not.toContain('zzz');
+  });
+
+  it('review round 1 of PR #69 (B-R1-5): a script whose line is exactly MAX_BUNDLE_LINE_LENGTH is written', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'a'.repeat(MAX_BUNDLE_LINE_LENGTH - 2), { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.lines[0]).toHaveLength(MAX_BUNDLE_LINE_LENGTH);
+    fake.answer(HELLO);
+    expect((await opening).isOpen).toBe(true);
   });
 
   it('closes a channel whose script speaks another protocol', async () => {
@@ -403,7 +447,9 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const fake = fakeProcess();
       const { logger } = recordingLogger();
       // Each line feed doubles in JSON: short enough as text, too long as its line.
-      const script = '\n'.repeat(MAX_CHANNEL_SCRIPT_LENGTH / 2 + 1);
+      // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: MAX_CHANNEL_SCRIPT_LENGTH of the
+      // channel; now MAX_BUNDLE_LINE_LENGTH of the pipe loader, the same 8 MiB).
+      const script = '\n'.repeat(MAX_BUNDLE_LINE_LENGTH / 2 + 1);
       await expect(HelperChannel.open(fake.process, script, { logger, name: 'build-box' })).rejects.toThrow(/too long/);
       expect(fake.lines).toHaveLength(0);
     });

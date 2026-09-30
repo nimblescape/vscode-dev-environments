@@ -34,7 +34,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 |---|---|---|---|
 | 1 | Cleanup of old monitor data | old records, leftover files, capped monitor log | merged (PR #63) |
 | 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | merged (PR #64) |
-| 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | next |
+| 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | in review |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | queued |
 | 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | queued |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again | queued |

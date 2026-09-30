@@ -4,7 +4,7 @@
 
 // Names and labels (implementation notes 5).
 import * as crypto from 'crypto';
-import { LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
+import { LABEL_MONITOR_CREATE, LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
 
 /**
  * Labels of the helper channel (src/core/helperChannel/protocol.ts re-exports them). Here, not there, so that the script
@@ -155,6 +155,7 @@ export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
   LABEL_HELPER_RUN,
   LABEL_BUILD_ID,
   LABEL_SESSION_MONITOR,
+  LABEL_MONITOR_CREATE,
   LABEL_HELPER_CHANNEL,
   LABEL_CHANNEL_STEP,
 ]);
