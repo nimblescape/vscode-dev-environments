@@ -36,8 +36,8 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 1 | Cleanup of old monitor data | old records, leftover files, capped monitor log | merged (PR #63) |
 | 2 | No `docker start` fallback | pinned helper image per open, build label; the previous-helper fallback is removed again | merged (PR #64) |
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
-| 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | in review |
-| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress (PR A: routing, merged (PR #71); PR C: batched refresh, in review) |
+| 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
+| 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | in progress: PR A routing merged (PR #71), PR C batched refresh merged (PR #72); PR B environment lock waits on decisions (section 4) |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again | queued |
 | 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
 | 8 | Worker: Session Monitor | heartbeats, "in use elsewhere", `forget`, automatic stops | queued |
@@ -45,3 +45,25 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 10 | Naming 2 | readable image names with the reworked image checks | queued |
 
 After steps 5–8: live checks on a real remote host (refresh time, first and later Start, heartbeats after sleep, Cancel during a Start), because CI has no SSH host.
+
+Also merged outside this table: PR #68, a helper failure during an update fails the open (decision of 2026-09-29).
+
+## 4. Open decisions
+
+| # | Step | Question | Recommendation |
+|---|---|---|---|
+| D1 | 5 (PR B) | The lock needs a worker. When no worker can be opened (no helper image yet, Docker just started, the 5-minute backoff), should Stop and Delete go on without the host lock, or refuse? | Go on without it and log it once per host. The local busy mark still applies, as today. Refusing would block Delete while the helper image is missing. |
+| D2 | 5 (PR B) | Which operations take the lock in step 5? | Stop and Delete only. Start, Rebuild, Select configuration and Clone again take it in step 6, Switch branch in step 7, and the automatic stops in step 8, as each is moved into the worker. Until step 6, a Start from another computer is not locked against a Delete here, as today. |
+| D3 | 5 (PR B) | When another window or computer holds the lock, how long to wait? | Wait 10 s, then refuse with "…is busy with an operation from another window or computer; try again in a moment". No retry loop. |
+
+Assumption to confirm (no change planned): the "hard deadline" of the 2026-09-28 decision is the worker's existing shutdown deadline (40 s) and exit timer (45 s); there is no absolute lifetime. A held lock operation has a 2-hour limit as a backstop.
+
+## 5. Known gaps left to later steps
+
+Found in review and left on purpose, because the named step replaces the code (user rule: do not fix what a later phase replaces).
+
+| Gap | Effect | Replaced by |
+|---|---|---|
+| A session folder that cannot be read (permissions, disk error) reads as "no other window" | The other-window checks can pass when they should refuse | Environment lock (step 5, PR B) and the move of the operations into the worker (steps 5–8) |
+| A remote monitor restarted by Docker whose stored-script check is cut off by its exit is kept | The monitor stays in an exit-3 loop until the next open | Step 8 (the Session Monitor's work in the worker) |
+
