@@ -2865,6 +2865,11 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     const helper = helperOn(REMOTE);
     expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(docker.builds).toHaveLength(1);
+    // PR #76 review round 1 (B-R1-1): with a warm cache, the check of the cached image runs in the scope too (else it
+    // would go through the router, which prepares the image again, without end).
+    const warm = scopes.length;
+    expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(scopes.length).toBeGreaterThan(warm);
     docker.images.delete(TAG);
     await helper.ensureImageUse();
     expect(docker.builds).toHaveLength(2);

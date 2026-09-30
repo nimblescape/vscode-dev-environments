@@ -1089,7 +1089,8 @@ describe('Stop', () => {
   });
 
   // Plan step 5, PR D (rule D1 of 2026-09-30): window status files that cannot be read are not "no other window".
-  it('refuses Stop, Rebuild and Delete when the other windows cannot be read, and changes nothing', async () => {
+  // PR #76 review round 1 (B-R1-2): Start too.
+  it('refuses Start, Stop, Rebuild and Delete when the other windows cannot be read, and changes nothing', async () => {
     await h.registry.add(environment());
     h.coordinator.otherActiveWindows.mockRejectedValue(Object.assign(new Error("EACCES: permission denied, scandir 'sessions'"), { code: 'EACCES' }));
     await run('stop', row('acme/api', environment()));
@@ -1097,8 +1098,26 @@ describe('Stop', () => {
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails);
     await run('rebuild', row('acme/api', environment()));
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    // PR #76 review round 1 (B-R1-2): an Open never replaces a container under a window that cannot be read.
+    await run('start', row('acme/api', environment()));
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
     await run('delete', row('acme/api', environment()));
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
+    expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
+  });
+
+  // PR #76 review round 1 (B-R1-3): Delete reads the other windows again after the confirmation; when they cannot be read
+  // then, nothing is deleted.
+  it('deletes nothing when the other windows cannot be read at the check after the confirmation', async () => {
+    await h.registry.add(environment());
+    h.coordinator.otherActiveWindows
+      .mockResolvedValueOnce([])
+      .mockRejectedValue(Object.assign(new Error("EACCES: permission denied, scandir 'sessions'"), { code: 'EACCES' }));
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
+    await run('delete', row('acme/api', environment()));
+    expect(h.coordinator.otherActiveWindows.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(h.service.delete).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
