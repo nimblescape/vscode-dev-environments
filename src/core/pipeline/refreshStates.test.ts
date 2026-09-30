@@ -8,7 +8,7 @@ import { ContainerAdapter, type ContainerInfo } from '../docker/containerAdapter
 import { isReadOnlyDockerCall, isRoutableDockerCall } from '../docker/dockerRouting';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import { silentLogger, type RunResult } from '../ports';
-import { BRANCH_READ_CONCURRENCY, readEnvironmentStates, type StateDocker, type StateEnvironment } from './refreshStates';
+import { BRANCH_EXEC_TIMEOUT_MS, BRANCH_READ_CONCURRENCY, readEnvironmentStates, type StateDocker, type StateEnvironment } from './refreshStates';
 import { ENV_OPS, EXPECTED_STATES, FixtureRunner, REFRESH_ENVIRONMENTS } from './refreshStates.testkit';
 
 function adapter(runner: FixtureRunner): ContainerAdapter {
@@ -38,7 +38,38 @@ describe('readEnvironmentStates (plan step 5, PR C)', () => {
     const execs = runner.calls.filter((call) => call.args[0] === 'exec').map((call) => call.args[call.args.indexOf('git') - 1]);
     expect(execs.sort()).toEqual(['devenv-api', 'devenv-detached', 'devenv-git-fails']);
     expect(execs).not.toContain(REFRESH_ENVIRONMENTS.find((env) => env.id === ENV_OPS)?.containerName);
+    // PR #72 review round 1 (B-R1-1): every branch read has a time limit, so a stuck exec cannot hang the refresh.
+    const execCalls = runner.calls.filter((call) => call.args[0] === 'exec');
+    expect(execCalls.length).toBe(3);
+    for (const call of execCalls) expect(call.options.timeoutMs).toBe(BRANCH_EXEC_TIMEOUT_MS);
   });
+
+  // PR #72 review round 1 (B-R1-2): a leftover stopped dev container never hides the running one.
+  for (const order of ['running first', 'stopped first'] as const) {
+    it(`shows an environment with a running and a stopped dev container as running (${order})`, async () => {
+      const dev = (name: string, running: boolean): ContainerInfo => ({
+        id: name,
+        name,
+        state: running ? 'running' : 'stopped',
+        rawState: running ? 'running' : 'exited',
+        labels: { [LABEL_ENVIRONMENT_ID]: 'env-dup' },
+        image: 'img',
+        volumes: [],
+        volumeSubpaths: [],
+        mountTargets: [],
+      });
+      const pair = [dev('devenv-dup', true), dev('devenv-dup-old', false)];
+      const docker: StateDocker = {
+        listEnvironmentContainers: async () => (order === 'running first' ? pair : [...pair].reverse()),
+        listEnvironmentVolumes: async () => [{ name: 'v-dup', labels: {} }],
+        volumeExists: async () => true,
+        exec: async () => ({ exitCode: 0, stdout: 'main\n', stderr: '', timedOut: false }),
+      };
+      const env: StateEnvironment = { id: 'env-dup', containerName: 'devenv-dup', volumeName: 'v-dup', folder: '/workspaces/r', branch: false };
+      const states = await readEnvironmentStates(docker, [env]);
+      expect(states.runtime.get('env-dup')?.container).toBe('running');
+    });
+  }
 
   it('fails when the containers cannot be listed', async () => {
     const docker: StateDocker = {
