@@ -5,6 +5,8 @@
 import { createHash } from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { PIPE_LOADER, encodeBundle } from '../loader/pipeLoader';
+import type { StateEnvironment } from '../pipeline/refreshStates';
+import { ENV_API, ENV_WEB, EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 import {
   CHANNEL_ENTRY,
   CHANNEL_SCRIPT_PATH,
@@ -16,6 +18,11 @@ import {
   LineSplitter,
   MAX_CLIENT_LINE,
   MAX_SECRET_LENGTH,
+  MAX_REFRESH_BRANCH_LENGTH,
+  MAX_REFRESH_ENVIRONMENTS,
+  parseRefreshParams,
+  parseRefreshValue,
+  refreshValue,
   channelLabelValue,
   channelStepLabel,
   isCleanupLabel,
@@ -194,5 +201,88 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: 3 })).toBeUndefined();
     expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: ` ${engine}` })).toBeUndefined();
     expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: '"id" "/r"', other: 1 })).toBeUndefined();
+  });
+});
+
+describe('the refresh operation (plan step 5, PR C)', () => {
+  const env: StateEnvironment = { id: ENV_API, containerName: 'devenv-api', volumeName: 'devenv-api-vol', folder: '/workspaces/api', branch: true };
+
+  it('accepts at most MAX_REFRESH_ENVIRONMENTS environments of the strict shape', () => {
+    expect(parseRefreshParams({ environments: REFRESH_ENVIRONMENTS })).toEqual({ environments: REFRESH_ENVIRONMENTS });
+    expect(parseRefreshParams({ environments: [] })).toEqual({ environments: [] });
+    const many = (count: number) => Array.from({ length: count }, (_, index) => ({ ...env, id: `env-${index}` }));
+    expect(parseRefreshParams({ environments: many(MAX_REFRESH_ENVIRONMENTS) })?.environments).toHaveLength(MAX_REFRESH_ENVIRONMENTS);
+    expect(parseRefreshParams({ environments: many(MAX_REFRESH_ENVIRONMENTS + 1) })).toBeUndefined();
+    expect(parseRefreshParams({ environments: [{ ...env, user: 'node' }] })?.environments[0].user).toBe('node');
+    expect(parseRefreshParams({ environments: [{ ...env, user: '1000:1000' }] })).toBeDefined();
+  });
+
+  it('refuses anything else', () => {
+    for (const value of [
+      undefined,
+      null,
+      [],
+      {},
+      { environments: {} },
+      { environments: [env], other: 1 },
+      { environments: [env, env] },
+      { environments: [{ ...env, extra: true }] },
+      { environments: [{ ...env, id: '../x' }] },
+      { environments: [{ ...env, id: '' }] },
+      { environments: [{ ...env, containerName: '-e' }] },
+      { environments: [{ ...env, containerName: 'a b' }] },
+      { environments: [{ ...env, volumeName: '--mount' }] },
+      { environments: [{ ...env, volumeName: 3 }] },
+      { environments: [{ ...env, user: '' }] },
+      { environments: [{ ...env, user: '-u' }] },
+      { environments: [{ ...env, user: 'a b' }] },
+      { environments: [{ ...env, folder: '/etc' }] },
+      { environments: [{ ...env, folder: '/workspaces/..' }] },
+      { environments: [{ ...env, folder: '/workspaces/a/b' }] },
+      { environments: [{ ...env, folder: 'workspaces/api' }] },
+      { environments: [{ ...env, branch: 'yes' }] },
+      { environments: [{ id: env.id, containerName: env.containerName, volumeName: env.volumeName, folder: env.folder }] },
+    ]) {
+      expect(parseRefreshParams(value)).toBeUndefined();
+    }
+  });
+
+  it('checks the value against its parameters', () => {
+    const params = parseRefreshParams({ environments: REFRESH_ENVIRONMENTS })!;
+    const value = refreshValue(EXPECTED_STATES);
+    expect(parseRefreshValue(JSON.parse(JSON.stringify(value)), params)).toEqual(EXPECTED_STATES);
+    const running = { id: ENV_API, container: 'running', volume: true };
+    const one = parseRefreshParams({ environments: [env] })!;
+    expect(parseRefreshValue({ runtime: [running], branches: [{ id: ENV_API, branch: 'main' }] }, one)).toEqual({
+      runtime: new Map([[ENV_API, { container: 'running', volume: true }]]),
+      branches: new Map([[ENV_API, 'main']]),
+    });
+    for (const bad of [
+      undefined,
+      { runtime: [running] },
+      { runtime: [running], branches: [], other: 1 },
+      // Missing, duplicate, or unknown environments.
+      { runtime: [], branches: [] },
+      { runtime: [running, running], branches: [] },
+      { runtime: [{ ...running, id: ENV_WEB }], branches: [] },
+      // Invalid states.
+      { runtime: [{ ...running, container: 'paused' }], branches: [] },
+      { runtime: [{ ...running, volume: 'yes' }], branches: [] },
+      { runtime: [{ ...running, servicesRunning: false }], branches: [] },
+      { runtime: [{ ...running, extra: 1 }], branches: [] },
+      // Branches of another environment, of a container that does not run, or invalid names.
+      { runtime: [running], branches: [{ id: ENV_WEB, branch: 'main' }] },
+      { runtime: [{ ...running, container: 'stopped' }], branches: [{ id: ENV_API, branch: 'main' }] },
+      { runtime: [running], branches: [{ id: ENV_API, branch: 'main' }, { id: ENV_API, branch: 'main' }] },
+      { runtime: [running], branches: [{ id: ENV_API, branch: '' }] },
+      { runtime: [running], branches: [{ id: ENV_API, branch: ' main' }] },
+      { runtime: [running], branches: [{ id: ENV_API, branch: 'a\nb' }] },
+      { runtime: [running], branches: [{ id: ENV_API, branch: 'b'.repeat(MAX_REFRESH_BRANCH_LENGTH + 1) }] },
+    ]) {
+      expect(parseRefreshValue(bad, one)).toBeUndefined();
+    }
+    // No branch of an environment whose branch was not asked for.
+    const notAsked = parseRefreshParams({ environments: [{ ...env, branch: false }] })!;
+    expect(parseRefreshValue({ runtime: [running], branches: [{ id: ENV_API, branch: 'main' }] }, notAsked)).toBeUndefined();
   });
 });

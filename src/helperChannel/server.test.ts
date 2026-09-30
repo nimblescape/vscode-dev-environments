@@ -12,9 +12,15 @@ import {
   MAX_SERVER_LINE,
   OUTPUT_CHUNK_CHARACTERS,
   encodeMessage,
+  parseRefreshParams,
+  parseRefreshValue,
   type ClientMessage,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
+import { ContainerAdapter } from '../core/docker/containerAdapter';
+import { readEnvironmentStates } from '../core/pipeline/refreshStates';
+import { EXPECTED_STATES, FixtureRunner, REFRESH_ENVIRONMENTS, refreshFixture } from '../core/pipeline/refreshStates.testkit';
+import { silentLogger } from '../core/ports';
 import { OPERATIONS } from './operations';
 import {
   CLEANUP_SECOND_PASS_MS,
@@ -42,7 +48,7 @@ interface FakeChild extends ServerChild {
 
 /** A Docker CLI that records its calls; each call ends when the test says so, or on SIGKILL (and SIGTERM if `endsOnTerm`). */
 /** The answer of the fake to a call that ends by itself (for example the `docker ps` and `docker rm` of a cleanup). */
-type FakeAnswer = { stdout?: string; exitCode: number };
+type FakeAnswer = { stdout?: string; exitCode: number; /** Plan step 5, PR C. */ stderr?: string };
 
 /** The answers of the cleanup: `docker ps` names `ids` (one per line), `docker rm` ends with 0. */
 function cleanupAnswers(ids: string[]) {
@@ -75,6 +81,7 @@ function fakeDocker(options: { endsOnTerm?: boolean; respond?: (args: readonly s
         if (answer !== undefined) {
           queueMicrotask(() => {
             if (answer.stdout) onStdout(answer.stdout);
+            if (answer.stderr) onStderr(answer.stderr);
             child.exit(answer.exitCode);
           });
         }
@@ -133,7 +140,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     send({ t: 'ping', n: 7 });
     expect(messages).toEqual([
       // Review round 4 (M1): with the sweep of never-started channel containers.
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'probe', 'sweep'] },
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['docker', 'probe', 'refresh', 'sweep'] }, // plan step 5, PR C: `refresh`
       { t: 'pong', n: 7 },
     ]);
   });
@@ -640,5 +647,79 @@ describe('the helpers of the server', () => {
 
   it('commandLine quotes arguments with spaces or quotes', () => {
     expect(commandLine(['ps', '--format', '{{json .}}', '', 'a"b'])).toBe('docker ps --format "{{json .}}" "" "a\\"b"');
+  });
+});
+
+describe('the refresh operation over the fake Docker CLI (plan step 5, PR C)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function refresh(params: unknown, secret?: string) {
+    const docker = fakeDocker({ respond: (args) => refreshFixture(args) });
+    const ctx = setup({ docker });
+    ctx.send(secret === undefined ? { t: 'op', id: 1, op: 'refresh', params } : { t: 'op', id: 1, op: 'refresh', params, secret });
+    for (let round = 0; round < 200 && ctx.resultOf(1) === undefined; round++) await vi.advanceTimersByTimeAsync(0);
+    return { result: ctx.resultOf(1), docker, messages: ctx.messages };
+  }
+
+  it('gives the same states and branches as the refresh without the worker', async () => {
+    const params = parseRefreshParams({ environments: REFRESH_ENVIRONMENTS });
+    expect(params).toBeDefined();
+    const { result, docker } = await refresh(params);
+    expect(result).toMatchObject({ t: 'result', id: 1, ok: true });
+    const viaWorker = parseRefreshValue((result as { value: unknown }).value, params!);
+    const direct = await readEnvironmentStates(new ContainerAdapter(new FixtureRunner(), '/usr/bin/docker', {}, silentLogger, 'linux'), REFRESH_ENVIRONMENTS);
+    expect(viaWorker).toEqual(direct);
+    expect(viaWorker).toEqual(EXPECTED_STATES);
+    // It only reads: no call with an input, no exec -i, no variable.
+    expect(docker.children.length).toBeGreaterThan(0);
+    for (const child of docker.children) {
+      expect(child.input).toBeUndefined();
+      expect(['ps', 'container', 'volume', 'exec']).toContain(child.args[0]);
+      expect(child.args).not.toContain('-i');
+      expect(child.args).not.toContain('-e');
+    }
+  });
+
+  it('ends one call when its own signal aborts (the time limit of a call of the refresh)', async () => {
+    const docker = fakeDocker({ endsOnTerm: true });
+    const ctx = setup({
+      docker,
+      operations: {
+        one: async (_params, context) => {
+          const controller = new AbortController();
+          const call = context.docker(['ps'], { signal: controller.signal });
+          controller.abort();
+          return (await call).exitCode;
+        },
+      },
+    });
+    ctx.send({ t: 'op', id: 1, op: 'one', params: null });
+    for (let round = 0; round < 50 && ctx.resultOf(1) === undefined; round++) await vi.advanceTimersByTimeAsync(0);
+    expect(docker.children[0].signals).toEqual(['SIGTERM']);
+    expect(ctx.resultOf(1)).toMatchObject({ ok: true, value: null });
+  });
+
+  it('refuses invalid parameters and a secret, and calls no Docker', async () => {
+    const env = REFRESH_ENVIRONMENTS[0];
+    for (const params of [
+      null,
+      {},
+      { environments: [{ ...env, extra: 1 }] },
+      { environments: [env, env] },
+      { environments: [{ ...env, containerName: '-e' }] },
+    ]) {
+      const { result, docker } = await refresh(params);
+      expect(result).toMatchObject({ ok: false, error: { code: 'invalid' } });
+      expect(docker.children).toHaveLength(0);
+    }
+    const { result, docker, messages } = await refresh({ environments: [env] }, 'ghp_secret_value');
+    expect(result).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect(docker.children).toHaveLength(0);
+    expect(JSON.stringify(messages)).not.toContain('ghp_secret_value');
   });
 });

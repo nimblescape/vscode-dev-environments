@@ -9,6 +9,7 @@
 // sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { DockerTargets } from '../core/docker/dockerTargets';
 import { DISCOVERY_CONCURRENCY, type DiscoveryService, type PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -38,8 +39,6 @@ export const LOADED_CONTEXT_KEY = 'devEnvironments.loaded';
  * because the list could not be loaded, not because no repository has a configuration.
  */
 export const LOAD_FAILED_CONTEXT_KEY = 'devEnvironments.loadFailed';
-/** Branches of running containers are read with at most this many `docker exec` calls at a time. */
-const BRANCH_READ_CONCURRENCY = 4;
 
 /** Duration of one render with repository groups after which the view names the setting (warnIfGroupingIsSlow). */
 export const SLOW_GROUPING_MS = 200;
@@ -65,6 +64,11 @@ export interface SidebarDeps {
    * only its environments. Default: the local Docker.
    */
   dockerHost?: () => Promise<string>;
+  /**
+   * Plan step 5, PR C: the refresh of the states runs as one operation on the Docker target that is current at its start.
+   * Default: no operation (each call reads the current context).
+   */
+  dockerTargets?: Pick<DockerTargets, 'withOperation'>;
   /**
    * The tree view of the repositories, once createTreeView registered it. The refresh shows its progress in the view
    * only while the view is visible (viewProgressLocation). Default: no view, the progress shows in the status bar.
@@ -452,26 +456,20 @@ export class Sidebar implements vscode.Disposable {
 
   private async refreshStatesNow(): Promise<void> {
     if (this.disposed) return;
-    const { service, docker, registry } = this.deps;
-    let runtime: ReadonlyMap<string, EnvironmentRuntime> | undefined = await service.inspectStates();
+    const { service, docker, registry, dockerTargets } = this.deps;
+    // Plan step 5, PR C: the states and the branches of the running dev containers of the account in one call (one
+    // operation of the worker when one is open), on one Docker target (DockerTargets.withOperation).
+    const read = async () => service.refreshStates(new Set((await this.availableEnvironments()).map((environment) => environment.id)));
+    const states = await (dockerTargets ? dockerTargets.withOperation(read) : read());
+    let runtime: ReadonlyMap<string, EnvironmentRuntime> | undefined = states.runtime;
     if (!runtime) {
-      // inspectStates gives `undefined` both when Docker does not run and when Docker failed. Only the first means
+      // refreshStates gives `undefined` both when Docker does not run and when Docker failed. Only the first means
       // "nothing runs" (a connection that was lost must not keep showing Connected).
       const running = docker.isInstalled() && (await docker.isRunning());
       if (!running) runtime = dockerStoppedRuntime(await registry.list());
     }
     this.runtime = runtime;
-
-    const available = new Set((await this.availableEnvironments()).map((environment) => environment.id));
-    const runningIds = runtime
-      ? [...runtime].filter(([id, state]) => state.container === 'running' && available.has(id)).map(([id]) => id)
-      : [];
-    const branches = new Map<string, string>();
-    await mapLimit(runningIds, BRANCH_READ_CONCURRENCY, async (id) => {
-      const branch = await service.currentBranch(id).catch(() => undefined);
-      if (branch) branches.set(id, branch);
-    });
-    this.liveBranches = branches;
+    this.liveBranches = states.branches;
     await this.render();
     if (!this.disposed) this.statesEmitter.fire();
   }

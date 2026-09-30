@@ -3916,6 +3916,68 @@ describe('inspectStates and currentBranch', () => {
   });
 });
 
+describe('refreshStates (plan step 5, PR C)', () => {
+  const direct = {
+    runtime: new Map([
+      [ENV_ID, { container: 'running', volume: true }],
+      [OTHER_ID, { container: 'missing', volume: false }],
+    ]),
+    branches: new Map([[ENV_ID, 'feature-q']]),
+  };
+
+  async function seedTwo(harness: Harness): Promise<void> {
+    await seedEnvironment(harness, { container: 'running' });
+    await seedEnvironment(harness, { id: OTHER_ID, repository: 'acme/web', container: null, volume: false });
+    harness.docker.execHandler = () => ({ stdout: 'feature-q\n' });
+  }
+
+  it('reads directly without a worker: the states, and the branches of the running environments that were asked for', async () => {
+    await seedTwo(h);
+    expect(await h.service.refreshStates(new Set([ENV_ID, OTHER_ID]))).toEqual(direct);
+    expect(h.docker.execs).toHaveLength(1);
+    expect(h.docker.execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
+    // No branch read for an environment whose branch was not asked for.
+    expect(await h.service.refreshStates(new Set())).toEqual({ ...direct, branches: new Map() });
+    expect(h.docker.execs).toHaveLength(1);
+  });
+
+  it('takes the states of the worker, with the environments of the current host', async () => {
+    const fromWorker = { runtime: new Map([[ENV_ID, { container: 'stopped' as const, volume: true }]]), branches: new Map<string, string>() };
+    const workerRefresh = vi.fn(async () => fromWorker);
+    h = recreate({ workerRefresh });
+    await seedTwo(h);
+    expect(await h.service.refreshStates(new Set([ENV_ID]))).toBe(fromWorker);
+    expect(workerRefresh).toHaveBeenCalledTimes(1);
+    expect(workerRefresh.mock.calls[0]).toEqual([
+      [
+        { id: ENV_ID, containerName: NAME, volumeName: NAME, user: 'vscode', folder: '/workspaces/api', branch: true },
+        { id: OTHER_ID, containerName: resourceName('acme/web', OTHER_ID), volumeName: resourceName('acme/web', OTHER_ID), user: 'vscode', folder: '/workspaces/web', branch: false },
+      ],
+    ]);
+    expect(h.docker.execs).toHaveLength(0);
+  });
+
+  it('reads directly when the worker gives undefined, or fails (logged); never shows its failure as states', async () => {
+    const workerRefresh = vi.fn(async (): Promise<undefined> => undefined);
+    h = recreate({ workerRefresh });
+    await seedTwo(h);
+    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual(direct);
+    workerRefresh.mockRejectedValueOnce(new Error('The connection to the Docker host was lost'));
+    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual(direct);
+    expect(workerRefresh).toHaveBeenCalledTimes(2);
+    expect(h.logger.warnings.join('\n')).toContain('The refresh through the worker failed (The connection to the Docker host was lost)');
+  });
+
+  it('does not ask the worker when Docker does not run', async () => {
+    const workerRefresh = vi.fn(async (): Promise<undefined> => undefined);
+    h = recreate({ workerRefresh });
+    await seedTwo(h);
+    h.docker.running = false;
+    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
+    expect(workerRefresh).not.toHaveBeenCalled();
+  });
+});
+
 describe('reconcileFromVolumes', () => {
   it('adds an entry for each labeled volume that the registry lacks', async () => {
     await seedEnvironment(h);

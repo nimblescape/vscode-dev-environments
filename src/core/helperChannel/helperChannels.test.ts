@@ -10,13 +10,15 @@ import { HelperChannel, HelperChannelError } from './helperChannel';
 import {
   CHANNEL_OPEN_WAIT_MS,
   CHANNEL_PROBE_TIMEOUT_MS,
+  CHANNEL_REFRESH_TIMEOUT_MS,
   CHANNEL_RETRY_AFTER_FAILURE_MS,
   HelperChannels,
   channelRunArgs,
   openHelperChannel,
 } from './helperChannels';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
-import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, encodeMessage, parseClientMessage } from './protocol';
+import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
+import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
 /** Plan step 5, PR A: the engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
@@ -500,4 +502,56 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
       }
     });
   }
+});
+
+describe('HelperChannels.refresh (plan step 5, PR C)', () => {
+  function refreshChannel(ops: string[], answer: () => Promise<unknown>) {
+    const channel = { ...fakeChannel(), operations: ops, operation: vi.fn(answer) };
+    const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
+    return { channel, channels };
+  }
+
+  it('reads the states in one operation, without a secret, and checks its value', async () => {
+    const { channel, channels } = refreshChannel(['docker', 'probe', 'refresh'], async () => refreshValue(EXPECTED_STATES));
+    expect(await channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
+    expect(channel.operation).toHaveBeenCalledTimes(1);
+    expect(channel.operation).toHaveBeenCalledWith('refresh', { environments: REFRESH_ENVIRONMENTS }, { timeoutMs: CHANNEL_REFRESH_TIMEOUT_MS });
+    channels.dispose();
+  });
+
+  it('is undefined without a worker with `refresh`, for parameters beyond the check, or when it was not sent', async () => {
+    const older = refreshChannel(['docker', 'probe', 'sweep'], async () => refreshValue(EXPECTED_STATES));
+    expect(await older.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toBeUndefined();
+    expect(older.channel.operation).not.toHaveBeenCalled();
+    const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
+    expect(await older.channels.refresh(unsupported, REFRESH_ENVIRONMENTS)).toBeUndefined();
+    older.channels.dispose();
+
+    const current = refreshChannel(['refresh'], async () => refreshValue(EXPECTED_STATES));
+    const many = Array.from({ length: MAX_REFRESH_ENVIRONMENTS + 1 }, (_, index) => ({ ...REFRESH_ENVIRONMENTS[0], id: `env-${index}` }));
+    expect(await current.channels.refresh(LOCAL_DOCKER_TARGET, many)).toBeUndefined();
+    expect(await current.channels.refresh(LOCAL_DOCKER_TARGET, [{ ...REFRESH_ENVIRONMENTS[0], containerName: '-x' }])).toBeUndefined();
+    expect(current.channel.operation).not.toHaveBeenCalled();
+    current.channels.dispose();
+
+    for (const code of ['closed', 'unsendable'] as const) {
+      const notSent = refreshChannel(['refresh'], async () => {
+        throw new HelperChannelError(code, 'not sent');
+      });
+      expect(await notSent.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toBeUndefined();
+      notSent.channels.dispose();
+    }
+  });
+
+  it('rejects when the worker failed or answered with an invalid value', async () => {
+    const lost = refreshChannel(['refresh'], async () => {
+      throw new HelperChannelError('lost', 'lost');
+    });
+    await expect(lost.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'lost' });
+    lost.channels.dispose();
+    const wrong = { ...refreshValue(EXPECTED_STATES), branches: [{ id: REFRESH_ENVIRONMENTS[3].id, branch: 'main' }] };
+    const invalid = refreshChannel(['refresh'], async () => wrong);
+    await expect(invalid.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'protocol' });
+    invalid.channels.dispose();
+  });
 });

@@ -4,20 +4,27 @@
 
 // The operations of the helper channel (src/core/helperChannel/protocol.ts). Step 1: `docker` (one Docker call, for
 // the calls that no operation covers yet) and `probe` (whether the Docker CLI of the container reaches its engine, and
-// which engine: plan step 5, PR A). The
+// which engine: plan step 5, PR A), `refresh` (the states and branches of the environments: plan step 5, PR C). The
 // later steps add operations that run whole batches here, next to the engine, and report their progress.
+import { ContainerAdapter } from '../core/docker/containerAdapter';
 import {
   ENGINE_IDENTITY_ARGS,
   OP_DOCKER,
   OP_PROBE,
+  OP_REFRESH,
   OP_SWEEP,
   engineIdentity,
   parseDockerOperationParams,
+  parseRefreshParams,
+  refreshValue,
   sweepArgs,
   type DockerOperationValue,
   type ProbeValue,
+  type RefreshValue,
 } from '../core/helperChannel/protocol';
-import { OperationError, type OperationHandler } from './server';
+import { readEnvironmentStates } from '../core/pipeline/refreshStates';
+import { abortError, type Logger, type ProcessRunner } from '../core/ports';
+import { OperationError, type OperationContext, type OperationHandler } from './server';
 
 /** `docker <args>`: its output goes back as it comes; the value is its exit code. */
 export const dockerOperation: OperationHandler = async (params, context) => {
@@ -72,8 +79,68 @@ export const sweepOperation: OperationHandler = async (params, context) => {
   return { output: result.stdout.trim().slice(-2_000) };
 };
 
+/**
+ * Plan step 5, PR C: a ProcessRunner over the Docker CLI of the worker (OperationContext.docker), for a ContainerAdapter
+ * in the worker. The program name is ignored (always `docker`); so are `env` and `cwd`: the worker never sets a
+ * variable. It refuses an input (the refresh only reads, and never carries a secret). `timeoutMs` and `signal` end the
+ * call alone; it resolves then with `timedOut`, or rejects with an AbortError, as NodeProcessRunner does.
+ */
+export function contextRunner(context: OperationContext): ProcessRunner {
+  return {
+    run: async (_file, args, options = {}) => {
+      if (options.input !== undefined) throw new Error('The worker runs no Docker call with an input here.');
+      if (options.signal?.aborted || context.signal.aborted) throw abortError();
+      const controller = new AbortController();
+      let timedOut = false;
+      const timer =
+        options.timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+            }, options.timeoutMs);
+      const onAbort = () => controller.abort();
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        const result = await context.docker(args, { signal: controller.signal });
+        if (options.signal?.aborted || context.signal.aborted) throw abortError();
+        if (result.error !== undefined && !timedOut) throw new Error(result.error);
+        return { exitCode: timedOut ? null : result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut };
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+      }
+    },
+  };
+}
+
+/** Plan step 5, PR C: the log of the extension as the Logger of a ContainerAdapter in the worker. */
+function contextLogger(context: OperationContext): Logger {
+  return {
+    info: (message) => context.log(message),
+    warn: (message) => context.log(message, 'warn'),
+    error: (message) => context.log(message, 'warn'),
+    output: () => {},
+  };
+}
+
+/**
+ * Plan step 5, PR C: `refresh`: readEnvironmentStates with a ContainerAdapter over the Docker CLI of the worker, the
+ * same code as the refresh without the worker. It only reads; it takes no secret.
+ */
+export const refreshOperation: OperationHandler = async (params, context) => {
+  const checked = parseRefreshParams(params);
+  if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');
+  if (context.secret !== undefined) throw new OperationError('invalid', 'The refresh operation takes no secret.');
+  context.progress('refresh');
+  const docker = new ContainerAdapter(contextRunner(context), 'docker', {}, contextLogger(context), 'linux');
+  const value: RefreshValue = refreshValue(await readEnvironmentStates(docker, checked.environments));
+  return value;
+};
+
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
   [OP_PROBE]: probeOperation,
   [OP_SWEEP]: sweepOperation,
+  [OP_REFRESH]: refreshOperation,
 };
