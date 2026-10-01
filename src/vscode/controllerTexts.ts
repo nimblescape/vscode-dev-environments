@@ -11,7 +11,6 @@ export const ControllerTexts = {
   deleting: (repository: string) => `Deleting the environment of ${repository}…`,
   rebuilding: (repository: string) => `Rebuilding ${repository}…`,
   checkingChanges: (repository: string) => `Checking ${repository} for changes…`,
-  switchingBranch: (repository: string, branch: string) => `Switching ${repository} to the branch ${branch}…`,
   readingConfigurations: (repository: string) => `Reading the configurations of ${repository}…`,
   waitingForOtherWindow: (repository: string) => `Waiting until another window has finished changing ${repository}…`,
   // Messages.
@@ -60,7 +59,6 @@ export const ControllerTexts = {
     `The container of ${repository} was made while the host access checks were off. They are on now, so it cannot be used. This window closes its connection. Start ${repository} again to make a new container with the checks.`,
   noEnvironments: 'There is no environment yet. Start a repository to create one.',
   noRepositories: 'No repository is available. Sign in with GitHub, or refresh the list.',
-  branchesUnavailable: 'The branches could not be loaded. Type the name of a branch.',
   // Buttons.
   stop: 'Stop',
   // Quick Picks.
@@ -70,14 +68,9 @@ export const ControllerTexts = {
   selectEnvironmentToStopWhenClosed: 'Select an environment to stop when closed',
   selectEnvironmentToDelete: 'Select an environment to delete',
   selectEnvironmentToRebuild: 'Select an environment to rebuild',
-  selectRepositoryForBranch: 'Select a repository to switch its branch',
   selectRepositoryForConfiguration: 'Select a repository to select its configuration',
   selectRepositoryForGitHub: 'Select a repository to show on GitHub',
-  switchBranchTitle: 'Switch Branch',
-  branchPlaceholder: (repository: string) => `Select or type a branch of ${repository}`,
   selectConfigurationTitle: 'Select Configuration',
   configurationPlaceholder: (repository: string) => `Select a configuration of ${repository}`,
   current: 'current',
-  defaultBranch: 'default branch',
-  typedBranch: 'other branch',
 } as const;

@@ -682,7 +682,7 @@ describe('existing Docker Compose environment', () => {
     await seedCompose();
     useCompose(h, output((m) => (m.services.db.environment = { POSTGRES_PASSWORD: 'dev' })));
     h.ui.configurationChangedAnswer = 'rebuildNow';
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
@@ -694,7 +694,7 @@ describe('existing Docker Compose environment', () => {
     await seedCompose({ record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.39.0', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } } });
     // The same files, printed by the newer plugin with a key more.
     useCompose(h, { ...output((m) => (m.services.db.stop_signal = 'SIGTERM')), version: '2.40.3' });
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.prompts).toEqual([]);
     expect(h.helper.builds).toEqual([]);
@@ -706,20 +706,13 @@ describe('existing Docker Compose environment', () => {
   it('asks when the files changed, and when the same Compose version prints another model (review round 1, P-4)', async () => {
     const record = { compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.40.3', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } };
     await seedCompose({ record });
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged queries are gone;
+    // the open asks for the changed model.
     useCompose(h, { ...output(), version: '2.41.0', inputsHash: 'inputs-2' });
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
     useCompose(h, output((m) => (m.services.db.stop_signal = 'SIGTERM')));
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
     h.ui.configurationChangedAnswer = 'later';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
-  });
-
-  it('counts an unchanged model as unchanged, and a model that cannot be read as changed', async () => {
-    await seedCompose();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
-    h.helper.composeOutput = { error: 'yaml: invalid' };
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
   });
 
   it('refuses to start the containers when the configuration cannot be read (D-15)', async () => {
@@ -1073,7 +1066,7 @@ describe('existing Docker Compose environment', () => {
   });
 
   it('ends the open with helperFailed, without the detail of a switch, and keeps the running single container when the folders of the bind mounts cannot be written with helperFailed before the switch to Docker Compose removed it (review round 11 of PR #64, R11-1)', async () => {
-    // Reproduced: the switch branch of the failed `up` ended the open with helperFailed and the detail "removed the
+    // Reproduced: the switch code path of the failed `up` ended the open with helperFailed and the detail "removed the
     // container …", although nothing was removed.
     const SOURCE = `${FOLDER}/data/postgres`;
     const out = output((m) => {
@@ -2322,13 +2315,11 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     });
   }
 
-  it('reports a switch from Docker Compose to a single container in configurationChanged, with the question of the pipeline (D5-3)', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
+  it('reports a switch from Docker Compose to a single container with the question of the pipeline (D5-3)', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await withoutRecord();
     useSingle();
-    // Review round 20 of PR #64 (R20-2): changed expectation, the connected window gets its own question, as Later there
-    // only keeps the window connected (before: Messages.configurationKindChanged(true, …), the question of the pipeline).
-    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
     // The pipeline asks its own question, which says what Later does in an open.
     // Changed expectation (no docker start fallback, user decision 2026-09-29): Later then fails to start (no
     // Docker Compose configuration, no `up`); before, docker start started the containers.
@@ -2337,35 +2328,12 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     expect(h.ui.kindQuestions).toEqual([Messages.configurationKindChanged(true, DEFAULT_CONFIG_PATH)]);
   });
 
-  it('asks the connected window about a switch from Docker Compose without promising a start on Later (review round 20 of PR #64, R20-2)', async () => {
-    await seedCompose({ dev: 'running', db: 'stopped' });
-    await withoutRecord();
-    useSingle();
-    const changed = await h.service.configurationChanged(ENV_ID, options());
-    expect(changed).toEqual({ question: Messages.configurationKindChangedConnected(DEFAULT_CONFIG_PATH) });
-    const question = typeof changed === 'object' ? changed.question : '';
-    // Review round 24 of PR #64 (B-R24-1): also in the connected window, Later keeps Docker Compose without a rebuild.
-    expect(question).toContain('Later keeps Docker Compose without a rebuild');
-    expect(question).toContain('this window stays connected, and nothing is started or removed');
-    expect(question).not.toContain('are started');
-    expect(question).not.toContain('opens as it is');
-    // Review round 22 of PR #64 (A-R22-2): the checks that nothing started are gone (configurationChanged only reads); that
-    // Later starts nothing in the connected window is checked in controller.test (Switch branch…, D5-3: no openEnvironment
-    // and no open).
-  });
-
-  it('reports a switch from a single container to Docker Compose in configurationChanged (D5-3)', async () => {
-    await seedEnvironment(h, { container: 'stopped' });
-    await withoutRecord();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question: Messages.configurationKindChanged(false, DEFAULT_CONFIG_PATH) });
-  });
-
   it('reports a switch when the dev container of Docker Compose is gone, with the question for it (D5-3, P5-4)', async () => {
     await seedCompose({ dev: null, db: 'stopped' });
     await withoutRecord();
     useSingle();
     const question = Messages.configurationKindChangedDevContainerMissing(DEFAULT_CONFIG_PATH);
-    expect(await h.service.configurationChanged(ENV_ID, options())).toEqual({ question });
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     expect(question).toContain('Later starts nothing');
     expect(question).toContain('choose Rebuild');
     expect(question).toContain('Select configuration…');
@@ -2374,24 +2342,6 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(h.ui.kindQuestions).toEqual([question]);
     expect(error.detail).toBe(Messages.composeDevContainerMissing(DEFAULT_CONFIG_PATH));
-  });
-
-  it('reports a change without a switch as true, as before (D5-3)', async () => {
-    // Containers of Docker Compose and a Docker Compose configuration.
-    await seedCompose({ dev: 'stopped', db: 'stopped' });
-    await withoutRecord();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-    // No containers: nothing to switch.
-    for (const container of h.docker.containersOf(ENV_ID)) await h.docker.removeContainer(container.id);
-    useSingle();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-  });
-
-  it('reports a single container with a single-container configuration as changed (D5-3)', async () => {
-    await seedEnvironment(h, { container: 'stopped' });
-    await withoutRecord();
-    useSingle();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
   });
 });
 
@@ -2655,22 +2605,19 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     expect(h.docker.runs.filter((run) => run.all.includes('--entrypoint'))).toEqual([]);
   });
 
-  it('leaves them out when a rebuild creates the containers again, and Switch branch… gets them from the build record', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('leaves them out when a rebuild creates the containers again', async () => {
     withDataFolder();
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
     // Review round 10, D10-3: without the read-only INIT_SQL (before: [FOLDER, 'vscode', SOURCE, INIT_SQL] and
     // [[SOURCE, INIT_SQL]]). Review round 11, G5: the ready arguments of find (before: [FOLDER, 'vscode', SOURCE]).
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SOURCE])]]);
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders).toEqual([[SOURCE]]);
   });
 
-  it('records the paths at an up without a build; an entry without them leaves out nothing before', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('records the paths at an up without a build', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
-    // An entry without serviceFolders: Switch branch… leaves out nothing.
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders).toEqual([[]]);
     // The next start with up records the paths of the model. Review round 10, D10-3: with a data folder of db that
     // exists (the read-only init.sql of the default model is no longer recorded); D10-1: in the entry (before:
     // buildRecord.compose.serviceFolders [INIT_SQL]).
@@ -2682,8 +2629,6 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     h.ui.configurationChangedAnswer = 'later';
     await h.service.openEnvironment(ENV_ID, options());
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
-    await h.service.switchBranch(ENV_ID, 'main', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([SOURCE]);
   });
 });
 
@@ -2700,7 +2645,8 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     useCompose(h, out);
   }
 
-  it('keeps the folder of the old model at an up --no-recreate (Rebuild later), for Switch branch… and Delete', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('keeps the folder of the old model at an up --no-recreate (Rebuild later), for Delete', async () => {
     // The entry names OLD; the db container was created with it and is not created again.
     await seedCompose({ dev: 'stopped', db: 'stopped', extra: { serviceFolders: [OLD] } });
     withNewFolder();
@@ -2708,12 +2654,9 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.ups.map((up) => up.removeExistingContainer)).toEqual([false]);
     const entry = await h.registry.get(ENV_ID);
-    // Before: [NEW] (in the build record), and the next Switch branch… gave the live data in OLD to the dev user.
+    // Before: [NEW] (in the build record).
     // Review round 11, G3: the paths of the model first, then the recorded ones (before: [OLD, NEW]).
     expect(entry?.serviceFolders).toEqual([NEW, OLD]);
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    // Review round 11, G3: in the order of the record (before: [OLD, NEW]).
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW, OLD]);
     // The question of Delete names both. Review round 11, G3: in the order of the record (before: ['./data/pg', './pgdata']).
     expect(repositoryServiceDataFolders(entry!)).toEqual(['./pgdata', './data/pg']);
     // Another start with the same model changes nothing.
@@ -2723,7 +2666,8 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW, OLD]);
   });
 
-  it('records the folders before a first up that fails, so that Switch branch… leaves them out', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('records the folders before a first up that fails', async () => {
     // An entry without a build record (restored after a lost registry, or a first open that was cut off).
     await seedEnvironment(h, { container: null, record: null });
     h.docker.images.add(DB_IMAGE);
@@ -2735,10 +2679,8 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     };
     await expect(h.service.openEnvironment(ENV_ID, options())).rejects.toBeInstanceOf(UserFacingError);
     expect((await h.registry.get(ENV_ID))?.buildRecord).toBeUndefined();
-    // Before: nothing was recorded without a build record, and Switch branch… gave the data of db to the dev user.
+    // Before: nothing was recorded without a build record.
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW]);
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([NEW]);
   });
 
   it('replaces the list when no container of another service exists before up (review round 11, G3: and the old folder is gone)', async () => {
@@ -3206,13 +3148,13 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA, PGDATA]);
     expect(h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT)).toEqual([]);
-    // Switch branch… and Delete too.
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([DATA, PGDATA]);
+    // Delete too.
+    // 2026-10-01: the Switch branch command was dropped (user decision).
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg', './pgdata']);
   });
 
-  it('Switch branch… of a restored entry leaves alone the folder that the running db mounts (G4)', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision). The question of Delete stays.
+  it('the question of Delete of a restored entry names the folder that the running db mounts (G4)', async () => {
     // An entry without a record (restored from its volumes), and a db container that mounts ./data/pg, as Docker
     // inspects it (HostConfig.Mounts with VolumeOptions.Subpath).
     await seedEnvironment(h, {
@@ -3236,9 +3178,6 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
       ],
     });
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toBeUndefined();
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    // Before: [] (the documented limit): the restore of the owner gave the live data of Postgres to the dev user.
-    expect(h.helper.switchServiceFolders.at(-1)).toEqual([DATA]);
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg']);
   });
 
@@ -3260,7 +3199,8 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
       volumeSubpaths: [{ volume: NAME, subpath: 'api/data/pg', readOnly: false }],
     });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
-    // Before: no list: Switch branch… and the ownership fixes left nothing out until the next `up`.
+    // Before: no list: the ownership fixes left nothing out until the next `up`.
+    // 2026-10-01: the Switch branch command was dropped (user decision).
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
   });
 
@@ -3278,8 +3218,7 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     expect(entry?.serviceFoldersOverflow).toBe(true);
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', '-path', FOLDER, '-o', '-path', `${FOLDER}/*`]]);
     expect(h.logger.warnings.some((line) => line.includes(`More than ${MAX_SERVICE_FOLDERS} paths of ${REPO}`))).toBe(true);
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.switchServiceFolders.at(-1)).toBe('repository');
+    // 2026-10-01: the Switch branch command was dropped (user decision).
     // The existence check of the recorded paths goes in calls of a bounded command line.
     const checks = h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT);
     expect(checks.length).toBeGreaterThan(1);
@@ -3774,13 +3713,6 @@ describe('review round 19 of unit 6 (D19-1): `${localEnv:COMPOSE_PROJECT_NAME}` 
       expect(h.helper.readConfigurations.every((read) => (read.env as Record<string, string> | undefined)?.COMPOSE_PROJECT_NAME === PROJECT)).toBe(true);
     });
   }
-
-  it('reads the configuration for the question about a rebuild with the project name too', async () => {
-    await seedCompose();
-    h.helper.readConfigurations.length = 0;
-    await h.service.configurationChanged(ENV_ID, options());
-    expect(h.helper.readConfigurations).toEqual([{ configPath: DEFAULT_CONFIG_PATH, merged: false, env: { COMPOSE_PROJECT_NAME: PROJECT } }]);
-  });
 });
 
 describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev service', () => {

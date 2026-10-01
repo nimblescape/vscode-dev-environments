@@ -77,8 +77,7 @@ describe('an environment of another Docker host is never acted on', () => {
     ['stop', () => h.service.stop(ENV_ID)],
     ['delete', () => h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] })],
     ['safetyCheck', () => h.service.safetyCheck(ENV_ID, { progress: h.progress })],
-    ['switchBranch', () => h.service.switchBranch(ENV_ID, 'main', { progress: h.progress })],
-    ['configurationChanged', () => h.service.configurationChanged(ENV_ID, { progress: h.progress })],
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its rows switchBranch and configurationChanged are gone.
     ['listConfigurations', () => h.service.listConfigurations(ENV_ID, { progress: h.progress })],
   ])('%s is refused with both hosts named, before Docker is asked', async (_name, operation) => {
     const changes = h.docker.log.length;
@@ -182,8 +181,7 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
     ['stop (local environment)', () => u.service.stop(OTHER_ID)],
     ['delete', () => u.service.delete(ENV_ID, { progress: u.progress, additionalVolumesToRemove: [] })],
     ['safetyCheck', () => u.service.safetyCheck(ENV_ID, { progress: u.progress })],
-    ['switchBranch', () => u.service.switchBranch(ENV_ID, 'main', { progress: u.progress })],
-    ['configurationChanged', () => u.service.configurationChanged(ENV_ID, { progress: u.progress })],
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its rows switchBranch and configurationChanged are gone.
     ['listConfigurations', () => u.service.listConfigurations(ENV_ID, { progress: u.progress })],
   ])('%s is refused with dockerEndpointUnsupported, before any Docker call', async (_name, operation) => {
     const error = await rejection(operation());

@@ -20,7 +20,7 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks,
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
-import { PipelineTexts, type ConfigurationKindChange, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
+import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
 import { containerIsCurrent, isUnrestrictedContainer, repositoryServiceDataFolders } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
@@ -53,7 +53,6 @@ import type { DockerSetup } from './dockerSetup';
 import { showError as presentError } from './errors';
 import type { OutputChannelLogger } from './logger';
 import { selectOwners } from './ownerSelector';
-import type { VsCodePipelineUi } from './pipelineUi';
 import { hideProgressNotification, runWithProgress, type BusyChange } from './progress';
 import type { RemoteDockerCommands } from './remoteDockerCommands';
 import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
@@ -65,7 +64,6 @@ import type { EnvironmentStatusBar } from './statusBar';
 import { pickRepository, showSwitcher } from './switcher';
 import { CoalescingTask, OperationGate } from './tasks';
 import {
-  branchChoices,
   configurationChoices,
   parseCommandArgument,
   repositoryKey,
@@ -119,7 +117,6 @@ export interface ControllerDeps {
   service: EnvironmentService;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
-  ui: VsCodePipelineUi;
   connection: ConnectionAdapter;
   coordinator: SessionCoordinator;
   sidebar: Sidebar;
@@ -200,8 +197,6 @@ interface StartOptions {
    * Window and Start in Current Window name it. Default: `default`.
    */
   window?: WindowRequest;
-  /** First open only: the branch to clone (Switch branch… without environment). */
-  branch?: string;
   /** First open only: the configuration (Select configuration… without environment). */
   configPath?: string;
 }
@@ -235,10 +230,6 @@ type HandOffRequest = Pick<PendingOperation, 'operation' | 'reason' | 'configPat
 
 /** What a command without argument asks for: `open` is a repository that the command opens (Start). */
 type PickKind = 'open' | 'repository' | 'environment' | 'gitHub';
-
-interface BranchItem extends vscode.QuickPickItem {
-  branch: string;
-}
 
 export class Controller implements vscode.Disposable {
   private readonly gate = new OperationGate();
@@ -296,7 +287,6 @@ export class Controller implements vscode.Disposable {
       startInCurrentWindow: (argument) => this.start(parseCommandArgument(argument), 'currentWindow'),
       stop: (argument) => this.stop(parseCommandArgument(argument)),
       delete: (argument) => this.delete(parseCommandArgument(argument)),
-      switchBranch: (argument) => this.switchBranch(parseCommandArgument(argument)),
       selectConfiguration: (argument) => this.selectConfiguration(parseCommandArgument(argument)),
       rebuild: (argument) => this.rebuild(parseCommandArgument(argument)),
       showOnGitHub: (argument) => this.showOnGitHub(parseCommandArgument(argument)),
@@ -939,42 +929,6 @@ export class Controller implements vscode.Disposable {
     await this.rebuildEnvironment(target, environment, { reason: 'configurationSelected', configPath });
   }
 
-  /** Switch branch… (concept 6.2, 7.5). */
-  async switchBranch(argument: CommandArgument): Promise<void> {
-    const target = await this.resolveTarget(argument, 'repository', ControllerTexts.selectRepositoryForBranch);
-    if (!target) return;
-    const token = await this.deps.auth.getToken({ interactive: true });
-    if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    const environment = target.environment;
-    const current = environment
-      ? (this.deps.sidebar.liveBranch(environment.id) ?? environment.gitSummary?.branch ?? undefined)
-      : undefined;
-    const branch = await this.pickBranch(this.displayName(target), token, current, target.info?.defaultBranch ?? undefined);
-    if (!branch) return;
-    await this.switchToBranch(target, branch);
-  }
-
-  /**
-   * Switch branch… after the pick. Try again of a first open that failed runs this step again with the same branch, for
-   * the environment of the repository that the account signed in now has then (its own, or none), as the command does.
-   */
-  private async switchToBranch(target: Target, branch: string): Promise<void> {
-    const environment = target.environment;
-    if (!environment) {
-      // Concept 6.2: without an environment, the first Start creates it on the selected branch.
-      await this.startTarget(target, { branch, window: 'currentWindow' }, async () =>
-        this.switchToBranch(await this.refreshedTarget(target, 'token'), branch),
-      );
-      return;
-    }
-    const current = this.deps.sidebar.liveBranch(environment.id) ?? environment.gitSummary?.branch ?? undefined;
-    if (branch === current && this.isConnectedHere(environment)) {
-      this.logger.info(`${this.displayName(target)} is on the branch ${branch} already.`);
-      return;
-    }
-    await this.switchEnvironmentBranch(target, environment, branch);
-  }
-
   /** Show on GitHub. */
   async showOnGitHub(argument: CommandArgument): Promise<void> {
     const target = await this.resolveTarget(argument, 'gitHub', ControllerTexts.selectRepositoryForGitHub);
@@ -1227,7 +1181,6 @@ export class Controller implements vscode.Disposable {
                 result = await service.open(repositoryTarget(repository, target.info, trusted), {
                   progress,
                   signal,
-                  branch: options.branch,
                   configPath: options.configPath,
                 });
               }
@@ -1409,53 +1362,6 @@ export class Controller implements vscode.Disposable {
         }),
       { retry: () => this.rebuildEnvironment(target, environment, request) },
     );
-  }
-
-  /** Switch branch… in an existing environment (concept 6.2, 7.5). */
-  private async switchEnvironmentBranch(target: Target, environment: Environment, branch: string): Promise<void> {
-    const repository = this.displayName(target);
-    const connectedHere = this.isConnectedHere(environment);
-    let configurationChanged: boolean | ConfigurationKindChange = false;
-    const switched = await this.operation(
-      repository,
-      'Switch branch',
-      async () => {
-        configurationChanged = await runWithProgress({
-          title: ControllerTexts.switchingBranch(repository, branch),
-          repository,
-          cancellable: true,
-          task: async (progress, signal) => {
-            await this.deps.service.switchBranch(environment.id, branch, { progress, signal });
-            return connectedHere ? this.deps.service.configurationChanged(environment.id, { progress, signal }) : false;
-          },
-        });
-      },
-      { retry: () => this.switchEnvironmentBranch(target, environment, branch) },
-    );
-    if (!switched) return;
-    if (connectedHere) {
-      if (this.current) {
-        this.current.branch = branch;
-        this.updateStatusBar();
-      }
-      // Concept 7.12: a changed configuration offers Rebuild now; Later keeps the window connected. Review round 5 (D5-3):
-      // a switch between Docker Compose and a single container asks as the pipeline asks (configurationKindChanged).
-      const changed = configurationChanged as boolean | ConfigurationKindChange;
-      const answer =
-        typeof changed === 'object'
-          ? await this.deps.ui.configurationKindChanged(repository, changed.question)
-          : changed
-            ? await this.deps.ui.configurationChanged(repository)
-            : 'later';
-      if (answer === 'rebuildNow') {
-        await this.handOff(target, environment, { operation: 'rebuild', reason: 'configChanged' }, 'rebuild');
-      }
-      return;
-    }
-    // Concept 6.2: Switch branch… connects the current window; the pipeline applies the rule for a changed configuration.
-    // It connects the environment whose branch it switched, also when the target was a repository: after an account
-    // change during the switch, the pipeline refuses that environment (otherAccount) instead of opening another one.
-    await this.startTarget(await this.refreshedTarget({ ...target, environment, named: true }), { window: 'currentWindow' });
   }
 
   /**
@@ -2226,8 +2132,7 @@ export class Controller implements vscode.Disposable {
 
   private async resolveTargetOfAnyAccount(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const { registry, sidebar } = this.deps;
-    // Show on GitHub needs neither an environment nor a sign-in; Start, Switch branch…, and Select configuration… need a
-    // working token.
+    // Show on GitHub needs neither an environment nor a sign-in; Start and Select configuration… need a working token.
     const signIn = pick === 'gitHub' ? false : pick === 'open' || pick === 'repository' ? 'token' : true;
     switch (argument.kind) {
       case 'row': {
@@ -2276,7 +2181,7 @@ export class Controller implements vscode.Disposable {
    * 7.5, D-3). The environments of other accounts are not looked at: they neither block nor name anything, and the first
    * Start of an account creates its own. The account decides the environment, so with `signIn` a sign-in is asked for
    * when nobody is signed in; without it, the target has no environment then. With `'token'` (a command that needs a
-   * working token: Start, Switch branch…, Select configuration…) the account comes from a session with a working token,
+   * working token: Start, Select configuration…) the account comes from a session with a working token,
    * so that the new sign-in while GitHub rejects the token happens before the environment is chosen: an account change
    * at that sign-in then chooses the environment of the new account.
    */
@@ -2334,71 +2239,6 @@ export class Controller implements vscode.Disposable {
     }));
     const picked = await vscode.window.showQuickPick(items, { placeHolder: placeholder, matchOnDescription: true });
     return picked ? environments.find((environment) => environment.id === picked.environmentId) : undefined;
-  }
-
-  /**
-   * Quick Pick of the branches (concept 6.2): the branches of GitHub load while the list is open; the current branch is
-   * marked; a name that is not listed can be typed.
-   */
-  private pickBranch(
-    repository: string,
-    token: string,
-    current: string | undefined,
-    defaultBranch: string | undefined,
-  ): Promise<string | undefined> {
-    return new Promise<string | undefined>((resolve) => {
-      const quickPick = vscode.window.createQuickPick<BranchItem>();
-      let branches: string[] = [];
-      let settled = false;
-      const finish = (branch: string | undefined): void => {
-        if (settled) return;
-        settled = true;
-        resolve(branch);
-        quickPick.hide();
-      };
-      const update = (): void => {
-        if (settled) return;
-        quickPick.items = branchChoices(branches, { current, defaultBranch, typed: quickPick.value }).map((choice) => ({
-          label: choice.branch,
-          description: choice.description,
-          branch: choice.branch,
-        }));
-      };
-      const subscriptions: vscode.Disposable[] = [
-        quickPick.onDidChangeValue(update),
-        quickPick.onDidAccept(() => {
-          const item = quickPick.selectedItems[0] ?? quickPick.activeItems[0];
-          if (item) finish(item.branch);
-        }),
-        quickPick.onDidHide(() => {
-          finish(undefined);
-          for (const subscription of subscriptions) subscription.dispose();
-          quickPick.dispose();
-        }),
-      ];
-      quickPick.title = ControllerTexts.switchBranchTitle;
-      quickPick.placeholder = ControllerTexts.branchPlaceholder(repository);
-      quickPick.matchOnDescription = true;
-      quickPick.busy = true;
-      update();
-      quickPick.show();
-      this.deps.discovery
-        .listBranches(repository, token)
-        .then(
-          (list) => {
-            branches = list;
-            update();
-          },
-          (error: unknown) => {
-            this.logger.warn(`The branches of ${repository} could not be loaded: ${errorMessage(error)}`);
-            if (!settled) quickPick.placeholder = ControllerTexts.branchesUnavailable;
-          },
-        )
-        .finally(() => {
-          if (!settled) quickPick.busy = false;
-        })
-        .catch((error: unknown) => this.logger.error('The branch list could not be shown.', error));
-    });
   }
 
   // -------------------------------------------------------------------------------------------------------------------

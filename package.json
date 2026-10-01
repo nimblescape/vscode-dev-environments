@@ -180,11 +180,6 @@
         "icon": "$(trash)"
       },
       {
-        "command": "devEnvironments.switchBranch",
-        "title": "Switch Branch…",
-        "category": "Dev Environments"
-      },
-      {
         "command": "devEnvironments.selectConfiguration",
         "title": "Select Configuration…",
         "category": "Dev Environments"
@@ -488,11 +483,6 @@
           "group": "1_actions@6"
         },
         {
-          "command": "devEnvironments.switchBranch",
-          "when": "view == devEnvironments.repositories && viewItem =~ /^repository/",
-          "group": "2_more@1"
-        },
-        {
           "command": "devEnvironments.selectConfiguration",
           "when": "view == devEnvironments.repositories && viewItem =~ /multiConfig/",
           "group": "2_more@2"
@@ -543,10 +533,6 @@
           "command": "devEnvironments.closeAndKeepRunning",
           "when": "viewItem =~ /;canCloseAndKeepRunning(;|$)/",
           "group": "1_more@6"
-        },
-        {
-          "command": "devEnvironments.switchBranch",
-          "group": "1_more@1"
         },
         {
           "command": "devEnvironments.selectConfiguration",

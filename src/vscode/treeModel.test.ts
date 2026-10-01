@@ -239,7 +239,8 @@ describe('row actions and contextValue', () => {
   });
 
   it('offers Delete while the environment is updating, except while it is being deleted (concept 7.15)', () => {
-    for (const operation of ['create', 'update', 'rebuild', 'switchBranch'] as const) {
+    // 2026-10-01: the Switch branch command was dropped (user decision).
+    for (const operation of ['create', 'update', 'rebuild'] as const) {
       expect(contextValue(rowActions('updating', info, operation))).toBe('repository;canDelete;onGitHub');
     }
     expect(contextValue(rowActions('updating', info, 'delete'))).toBe('repository;onGitHub');
@@ -304,12 +305,10 @@ describe('row actions and contextValue', () => {
             expect(matches(when, value), `${command} for ${state ?? 'no environment'}: ${value}`).toBe(actions[flag]);
           }
         }
-        // The ⋯ submenu and Switch branch… appear on every repository row.
+        // The ⋯ submenu appears on every repository row.
+        // 2026-10-01: the Switch branch command was dropped (user decision).
         const submenu = menus['view/item/context'].find((item) => item.submenu === 'devEnvironments.more');
         expect(matches(submenu?.when ?? '', value)).toBe(true);
-        for (const when of whenOf('view/item/context', 'devEnvironments.switchBranch')) {
-          expect(matches(when, value)).toBe(true);
-        }
       }
     }
   });

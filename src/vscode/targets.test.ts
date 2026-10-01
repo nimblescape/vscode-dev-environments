@@ -7,11 +7,9 @@ import type { DiscoveryData, Environment, RepositoryInfo } from '../core/types';
 import { ControllerTexts } from './controllerTexts';
 import { dockerStoppedRuntime, environmentIdsOf, liveBusyEnvironmentIds } from './sidebarData';
 import {
-  branchChoices,
   configurationChoices,
   findRepositoryInfo,
   gitHubUrl,
-  isPlausibleBranchName,
   ownerTrust,
   parseCommandArgument,
   pickerRepositories,
@@ -209,36 +207,6 @@ describe('configurationChoices', () => {
       },
     ]);
   });
-});
-
-describe('branchChoices', () => {
-  it('marks the current and the default branch', () => {
-    expect(branchChoices(['main', 'dev', 'dev', ''], { current: 'dev', defaultBranch: 'main' })).toEqual([
-      { branch: 'main', description: ControllerTexts.defaultBranch },
-      { branch: 'dev', description: ControllerTexts.current },
-    ]);
-  });
-
-  it('adds the current branch when GitHub does not list it', () => {
-    expect(branchChoices(['main'], { current: 'local-only' }).map((choice) => choice.branch)).toEqual(['local-only', 'main']);
-  });
-
-  it('puts a typed name that is not listed first, if it can be a branch name', () => {
-    expect(branchChoices(['main'], { typed: ' feature/x ' })[0]).toEqual({ branch: 'feature/x', description: ControllerTexts.typedBranch });
-    expect(branchChoices(['main'], { typed: 'main' }).map((choice) => choice.branch)).toEqual(['main']);
-    expect(branchChoices(['main'], { typed: '-rf' }).map((choice) => choice.branch)).toEqual(['main']);
-  });
-
-  it.each(['main', 'feature/x', 'release-1.2', 'fix_ü'])('accepts the branch name %s', (name) => {
-    expect(isPlausibleBranchName(name)).toBe(true);
-  });
-
-  it.each(['', '-b', '--orphan', 'a b', 'a..b', 'a~1', 'a^', 'a:b', 'a?', 'a*', 'a[', 'a\\b', 'x.lock', 'a/', '/a', 'a.', 'a//b', 'a@{1}', '@', 'tab\tname'])(
-    'rejects the branch name %j',
-    (name) => {
-      expect(isPlausibleBranchName(name)).toBe(false);
-    },
-  );
 });
 
 describe('sidebar data', () => {

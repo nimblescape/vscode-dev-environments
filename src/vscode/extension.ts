@@ -502,7 +502,6 @@ async function activateExtension(
     service,
     discovery,
     auth,
-    ui,
     connection,
     coordinator: sessionCoordinator,
     sidebar,
