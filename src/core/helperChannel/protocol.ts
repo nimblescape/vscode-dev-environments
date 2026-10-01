@@ -634,8 +634,12 @@ export const LOCK_BUSY_CODE = 'busy';
 export const LOCK_HELD_STEP = 'locked';
 /** The longest wait for a lock, in seconds. */
 export const MAX_LOCK_WAIT_SECONDS = 60;
-/** The backstop of a held lock: the worker lets go of it after this time (2 hours). */
-export const LOCK_HOLD_LIMIT_MS = 2 * 60 * 60_000;
+/**
+ * The backstop of a held lock: the worker lets go of it after this time (6 hours). Plan step 6, PR A: before 2 hours,
+ * which a first open (a long build, `up`, the lifecycle commands, and a question to the user that stays open, all under
+ * the lock) could exceed; now the same as the longest life of a busy mark (BUSY_MARK_MAX_AGE_MS in src/core/busy.ts).
+ */
+export const LOCK_HOLD_LIMIT_MS = 6 * 60 * 60_000;
 /**
  * The lock operations of one worker at the same time. They do not take one of the MAX_CONCURRENT_OPERATIONS places: a
  * held lock would keep its place for the whole operation, and the Docker calls of that operation would wait behind it.

@@ -31,6 +31,10 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-09-30 | **D3: a lock held by another window or computer** is waited for 10 s (`flock -w 10`); then the operation is refused with "…is busy with an operation from another window or computer; try again in a moment". No retry loop. |
 | 2026-09-30 | **Local and remote work the same.** "There is no reason why the remote and local environments shall work differently. All remote functionality is the same locally. Just targeting a different docker engine, that is switched via the context." The lock, the ensure-or-refuse step and the worker behave the same for the local and a remote Docker; the only difference is the Docker context and the engine that it points to. |
 | 2026-09-30 | **One Session Monitor on every engine.** "There is no local node process, it is the same monitor process as in the remote." The local Docker gets the same `devenv-session-monitor` container with the same rules as a remote engine. The detached Node.js Session Monitor on the user's computer (`src/monitor`, started by `sessionCoordinator.ts`) is removed, with its lock files and protocol version. Heartbeats, the "in use elsewhere" check and `forget` are operations of each window's own worker (`docker exec` on the monitor container); when a window's heartbeats stop, the monitor container stops its environments, after VS Code quits too. Image updates stay optional and off by default ("nightly pulling of images can be configured anyway"); the setting applies to every engine and loses "remote" from its name. This replaces the local Session Monitor of the decision of 2026-09-28. |
+| 2026-10-01 | **Q1: orchestration of the Start batch (step 6).** The extension keeps the orchestration and the questions to the user; the worker runs the steps. The steps that need an environment's volume go to **one helper container per operation**, which the worker starts on the same host with that volume. Why: a running container cannot get a volume mounted later, and the worker starts once per window and engine, before any environment is chosen, and serves all of them, so it cannot see the volume of the environment being opened. Rejected: a worker per environment; mounting Docker's volume store into the worker (it breaks on Docker Desktop, rootless Docker and custom data roots, needs root, and exposes every volume on the host); mounting all volumes when the worker starts. The helper also keeps an untrusted clone and the Compose parsing to that one volume, away from the worker's socket, the locks and the monitor state. |
+| 2026-10-01 | **Q2: isolation inside the one helper.** Git runs as an unprivileged user, without the Docker socket and without the token. Compose remote includes are turned off where supported. The read steps lose `--network none`; this is accepted. |
+| 2026-10-01 | **Q3: the lock and questions to the user.** The environment lock stays held while a question to the user is open; other windows and computers are refused after 10 s (D3). |
+| 2026-10-01 | **Q4: the token write into the dev container**, as recommended: through the worker's `docker exec -i`, with the secret on standard input. (The user agreed to "all three", which covered Q1–Q3; Q4 is taken as recommended.) |
 
 ## 3. Steps
 
@@ -43,7 +47,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
 | 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | merged (PRs #71, #72, #74, #76) |
-| 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | in progress: PR D (prebuild on every engine) in review; PRs A–C wait on user decisions |
+| 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | in progress: PR D merged (#77); PR A in review |
 | 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
 | 8 | One Session Monitor on every engine | the monitor container on the local Docker too; the local Node.js monitor removed; heartbeats, "in use elsewhere", `forget` from each window's worker; automatic stops, Close and Keep Running (today it needs a remote host), the window context, the stop when heartbeats end, engine-side cleanup and the optional image updates the same on every engine | queued |
 | 9 | Naming 1 | container short ID; Docker context named after the SSH host | queued |
@@ -55,9 +59,9 @@ Also merged outside this table: PR #68, a helper failure during an update fails 
 
 ## 4. Open decisions
 
-None. D1, D2 and D3 were decided on 2026-09-30 (section 2).
+None. D1, D2 and D3 were decided on 2026-09-30, Q1 to Q4 of step 6 on 2026-10-01 (section 2).
 
-Assumption to confirm (no change planned): the "hard deadline" of the 2026-09-28 decision is the worker's existing shutdown deadline (40 s) and exit timer (45 s); there is no absolute lifetime. A held lock operation has a 2-hour limit as a backstop.
+Assumption to confirm (no change planned): the "hard deadline" of the 2026-09-28 decision is the worker's existing shutdown deadline (40 s) and exit timer (45 s); there is no absolute lifetime. A held lock operation has a 6-hour limit as a backstop (2 hours before plan step 6, PR A: an open under the lock, with a long first build, `up`, the lifecycle commands and a question to the user that stays open, could exceed it; 6 hours is the life of a busy mark).
 
 ## 5. Known gaps left to later steps
 

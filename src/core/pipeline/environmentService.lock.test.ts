@@ -4,15 +4,23 @@
 
 // Plan step 5, PR B: Stop and Delete under the lock of the environment on the Docker host (EnvironmentService
 // withEnvironmentLock). User decision D1: the helper image is ensured (built when missing) and the worker opened before;
-// when that fails, the operation is refused and nothing is stopped or removed. User decision D2: Stop and Delete only.
+// when that fails, the operation is refused and nothing is stopped or removed. User decision D2: Stop and Delete in step 5.
 // User decision D3: a lock held elsewhere is refused after the wait, with its message. The busy mark comes first, then
 // the lock; both are released in `finally`.
+//
+// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the same lock. An open
+// of an existing environment takes it after the start of Docker and the wait for another window's operation, around
+// everything through the pipeline; a first open after its registry entry, before the volume. A refusal leaves no busy
+// mark and nothing changed (a first open removes its new registry entry again). Re-entrant: the Delete of Clone again
+// takes no second lock; the redirects of a first open to an existing environment take one lock of that environment.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, UserFacingError } from '../errors';
 import { Messages } from '../messages';
-import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts } from './environmentService';
-import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { LABEL_ENVIRONMENT_ID } from '../names';
+import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './environmentService';
+import { ACCOUNT, ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
 let h: Harness;
 /** What happened, in order: `ensureImage`, `build`, `lock <id> <wait>`, `busy=<operation>` at the lock, `docker …`, `release`. */
@@ -20,6 +28,10 @@ let events: string[];
 /** How the next lock ends: held, or an error. */
 let lockOutcome: Error | undefined;
 let releases: number;
+/** Plan step 6, PR A: the IDs of the locks asked for, in order. */
+let lockedIds: string[];
+/** Plan step 6, PR A: when set, each sleep of the service (the wait for another window's busy mark) is the event `busy wait` and runs this. */
+let onSleep: (() => Promise<void>) | undefined;
 
 function heldLock(environmentId: string): HeldEnvironmentLock {
   return {
@@ -39,8 +51,16 @@ beforeEach(() => {
   events = [];
   lockOutcome = undefined;
   releases = 0;
+  lockedIds = [];
+  onSleep = undefined;
   h = createHarness({
+    sleep: async () => {
+      if (onSleep === undefined) return;
+      events.push('busy wait');
+      await onSleep();
+    },
     environmentLock: async (environmentId, waitSeconds) => {
+      lockedIds.push(environmentId);
       events.push(`lock ${environmentId} ${waitSeconds}`);
       const busy = (await h.registry.get(environmentId))?.busy;
       events.push(`busy=${busy?.operation ?? 'none'}`);
@@ -258,3 +278,305 @@ describe('no unlocked path (plan step 5, PR B, D1: no unlocked path)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the environment lock.
+
+const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
+
+function openOptions<T extends object = object>(extra?: T): { progress: typeof h.progress } & T {
+  return { progress: h.progress, ...(extra ?? ({} as T)) };
+}
+
+/** The environment ID of a workspace volume (by its label; the seeded environment for a volume that is gone). */
+function idOfVolume(name: string): string {
+  return h.docker.volumes.get(name)?.[LABEL_ENVIRONMENT_ID] ?? lockedIds.at(-1) ?? ENV_ID;
+}
+
+/** ` (locked)` while the running operation holds the lock of the environment of `volumeName`. */
+function lockedSuffix(volumeName: string): string {
+  return holdsEnvironmentLock(idOfVolume(volumeName)) ? ' (locked)' : '';
+}
+
+/** The events without the container steps of Delete (`docker stop`, `docker rm`) and the maintaining ensure of the open. */
+function openEvents(): string[] {
+  return events.filter((event) => !event.startsWith('docker stop') && !event.startsWith('docker rm') && event !== 'ensureImageUse (maintaining)');
+}
+
+/** The read of a first open before its registry entry (unusedEnvironmentId: the volume name is free); nothing is created. */
+const FREE_NAME_CHECK = 'docker volume exists';
+
+describe('Start, Rebuild, Select configuration and Clone again under the environment lock (plan step 6, PR A)', () => {
+  beforeEach(() => {
+    // The Docker and helper steps of the open, each with whether it ran under the lock of its environment.
+    const volumeExists = h.docker.volumeExists.bind(h.docker);
+    h.docker.volumeExists = async (name) => {
+      events.push(`docker volume exists${lockedSuffix(name)}`);
+      return volumeExists(name);
+    };
+    const createVolume = h.docker.createVolume.bind(h.docker);
+    h.docker.createVolume = async (name, labels) => {
+      events.push(`docker volume create${holdsEnvironmentLock(labels[LABEL_ENVIRONMENT_ID]) ? ' (locked)' : ''}`);
+      return createVolume(name, labels);
+    };
+    const removeVolume = h.docker.removeVolume.bind(h.docker);
+    h.docker.removeVolume = async (name) => {
+      events.push(`docker volume rm${lockedSuffix(name)}`);
+      return removeVolume(name);
+    };
+    const clone = h.helper.clone.bind(h.helper);
+    h.helper.clone = async (p) => {
+      events.push(`clone${lockedSuffix(p.volumeName)}`);
+      return clone(p);
+    };
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      events.push(`build${lockedSuffix(p.volumeName)}`);
+      return build(p);
+    };
+    const up = h.helper.up.bind(h.helper);
+    h.helper.up = async (p) => {
+      events.push(`up${lockedSuffix(p.volumeName)}`);
+      return up(p);
+    };
+  });
+
+  it('Start: the lock after the start of Docker and the wait for another window, before the volume check and the pipeline', async () => {
+    // Another live window holds a busy mark; it ends during the first wait.
+    await seedEnvironment(h, { extra: { busy: { operation: 'rebuild', since: new Date(h.clock.now()).toISOString(), pid: 7777, windowId: 'window-2' } } });
+    h.alivePids.add(7777);
+    onSleep = async () => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        delete entry.busy;
+      });
+    };
+    await h.service.open(TARGET, openOptions());
+    expect(h.dockerStarts).toBe(1);
+    expect(openEvents().slice(0, 5)).toEqual(['busy wait', 'ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker volume exists (locked)']);
+    expect(openEvents()).toContain('up (locked)');
+    expect(openEvents()).not.toContain('up');
+    expect(openEvents().at(-1)).toBe('release');
+    expect(lockedIds).toEqual([ENV_ID]);
+    expect(releases).toBe(1);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  it('Rebuild: builds and starts under the lock', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.openEnvironment(ENV_ID, openOptions({ forceRebuild: true }));
+    expect(lockedIds).toEqual([ENV_ID]);
+    expect(openEvents()).toEqual(expect.arrayContaining(['build (locked)', 'up (locked)']));
+    expect(openEvents().filter((event) => event === 'build' || event === 'up')).toEqual([]);
+    expect(openEvents().at(-1)).toBe('release');
+    expect(releases).toBe(1);
+  });
+
+  it('Select configuration: applies the selected configuration under the lock', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.openEnvironment(ENV_ID, openOptions({ configPath: DEFAULT_CONFIG_PATH }));
+    expect(lockedIds).toEqual([ENV_ID]);
+    expect(openEvents()).toEqual(expect.arrayContaining(['build (locked)', 'up (locked)']));
+    expect(openEvents().filter((event) => event === 'build' || event === 'up')).toEqual([]);
+    expect(openEvents().at(-1)).toBe('release');
+    expect(releases).toBe(1);
+  });
+
+  it('Clone again: the question, the new volume and the clone under the lock', async () => {
+    await seedEnvironment(h, { volume: false, container: null });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    await h.service.open(TARGET, openOptions());
+    expect(lockedIds).toEqual([ENV_ID]);
+    expect(openEvents().slice(0, 6)).toEqual([
+      'ensureImage',
+      `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
+      'busy=none',
+      'docker volume exists (locked)',
+      'docker volume create (locked)',
+      'clone (locked)',
+    ]);
+    expect(openEvents()).toContain('up (locked)');
+    expect(openEvents().at(-1)).toBe('release');
+    expect(h.ui.prompts).toEqual([`filesMissing ${REPO}`]);
+  });
+
+  it('re-entrant: the Delete of "files missing" runs under the held lock and takes no second one', async () => {
+    await seedEnvironment(h, { volume: false, container: 'stopped' });
+    h.ui.filesMissingAnswer = 'deleteEnvironment';
+    const error = await rejection(h.service.open(TARGET, openOptions()));
+    expect(error.code).toBe('cancelled');
+    expect(lockedIds).toEqual([ENV_ID]);
+    expect(events.filter((event) => event === 'ensureImage')).toHaveLength(1);
+    expect(events).toContain('docker rm (locked)');
+    expect(events).toContain('docker volume rm (locked)');
+    expect(events.at(-1)).toBe('release');
+    expect(releases).toBe(1);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+  });
+
+  it('the resumed clone of an interrupted first open runs under the lock', async () => {
+    const staleCreate = { operation: 'create' as const, since: '2026-09-24T15:00:00.000Z', pid: 999, windowId: 'window-old' };
+    await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
+    await h.service.open(TARGET, openOptions());
+    expect(openEvents().slice(0, 5)).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create', 'docker volume exists (locked)', 'clone (locked)']);
+    expect(openEvents()).toContain('up (locked)');
+    expect(openEvents().at(-1)).toBe('release');
+  });
+
+  it.each([
+    ['D3: busy', () => new EnvironmentLockError('busy', 'The lock stayed held by another holder for 10 s.'), PipelineTexts.environmentLockBusy(REPO)],
+    ['D1: no worker', () => new EnvironmentLockError('unavailable', 'no worker'), PipelineTexts.environmentLockUnavailable(REPO, 'no worker')],
+  ] as const)('a refused lock (%s) of Start changes nothing and leaves no busy mark or pending file', async (_name, refusal, message) => {
+    await seedEnvironment(h, { container: 'stopped' });
+    lockOutcome = refusal();
+    const error = await rejection(h.service.open(TARGET, openOptions()));
+    expect(error.message).toBe(message);
+    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none']);
+    expect(h.docker.log).toEqual([]);
+    expect(h.helper.calls).toEqual(['ensureImagePresent']);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  it('a refused lock of Rebuild and of Select configuration builds nothing', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    lockOutcome = new EnvironmentLockError('busy', 'held');
+    expect((await rejection(h.service.openEnvironment(ENV_ID, openOptions({ forceRebuild: true })))).message).toBe(PipelineTexts.environmentLockBusy(REPO));
+    expect((await rejection(h.service.openEnvironment(ENV_ID, openOptions({ configPath: DEFAULT_CONFIG_PATH })))).message).toBe(PipelineTexts.environmentLockBusy(REPO));
+    expect(h.helper.calls).toEqual(['ensureImagePresent', 'ensureImagePresent']);
+    expect(h.docker.log).toEqual([]);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  it('a refused lock of Clone again asks nothing, creates no volume, and keeps a stale create mark as it was', async () => {
+    const staleCreate = { operation: 'create' as const, since: '2026-09-24T15:00:00.000Z', pid: 999, windowId: 'window-old' };
+    await seedEnvironment(h, { volume: false, container: null, extra: { busy: staleCreate } });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    lockOutcome = new EnvironmentLockError('busy', 'held');
+    await rejection(h.service.open(TARGET, openOptions()));
+    expect(h.ui.prompts).toEqual([]);
+    expect(h.helper.clones).toEqual([]);
+    expect(h.docker.volumes.size).toBe(0);
+    expect((await h.registry.get(ENV_ID))?.busy).toEqual(staleCreate);
+  });
+
+  it('D1: a missing helper image that cannot be built refuses Start before the lock; nothing is started', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'pull access denied for node');
+    const error = await rejection(h.service.open(TARGET, openOptions()));
+    expect(error.message).toBe(PipelineTexts.environmentLockUnavailable(REPO, `${Messages.helperFailed} pull access denied for node`));
+    expect(events).toEqual(['ensureImage']);
+    expect(h.docker.log).toEqual([]);
+    expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  describe('first open', () => {
+    it('takes the lock after the registry entry (with its create mark), before the volume, and clones and starts under it', async () => {
+      await h.service.open(TARGET, openOptions());
+      const [id] = lockedIds;
+      expect(lockedIds).toEqual([id]);
+      expect((await h.registry.list()).map((entry) => entry.id)).toEqual([id]);
+      expect(openEvents().slice(0, 6)).toEqual([
+        FREE_NAME_CHECK,
+        'ensureImage',
+        `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
+        'busy=create',
+        'docker volume create (locked)',
+        'clone (locked)',
+      ]);
+      expect(openEvents()).toContain('up (locked)');
+      expect(openEvents().at(-1)).toBe('release');
+      expect((await h.registry.get(id))?.busy).toBeUndefined();
+    });
+
+    it.each([
+      ['D3: busy', () => new EnvironmentLockError('busy', 'held'), PipelineTexts.environmentLockBusy(REPO)],
+      ['D1: no worker', () => new EnvironmentLockError('unavailable', 'no worker'), PipelineTexts.environmentLockUnavailable(REPO, 'no worker')],
+    ] as const)('a refused lock (%s) removes the new registry entry and creates nothing on Docker', async (_name, refusal, message) => {
+      lockOutcome = refusal();
+      const error = await rejection(h.service.open(TARGET, openOptions()));
+      expect(error.message).toBe(message);
+      expect(events).toEqual([FREE_NAME_CHECK, 'ensureImage', `lock ${lockedIds[0]} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create']);
+      expect(await h.registry.list()).toEqual([]);
+      expect(h.docker.log).toEqual([]);
+      expect(h.docker.volumes.size).toBe(0);
+      expect(h.helper.calls).toEqual(['ensureImagePresent']);
+      expect(await h.sessionFiles.readPendings()).toEqual([]);
+    });
+
+    it('a lock wait that is cancelled removes the new registry entry too', async () => {
+      const controller = new AbortController();
+      h = recreateWithLock(async () => {
+        controller.abort();
+        throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+      });
+      const error = await rejection(h.service.open(TARGET, openOptions({ signal: controller.signal })));
+      expect(error.code).toBe('cancelled');
+      expect(await h.registry.list()).toEqual([]);
+      expect(h.docker.log).toEqual([]);
+    });
+
+    it('D1: a helper image that cannot be built refuses the first open; the new registry entry is removed again', async () => {
+      h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'no space left on device');
+      const error = await rejection(h.service.open(TARGET, openOptions()));
+      expect(error.message).toBe(PipelineTexts.environmentLockUnavailable(REPO, `${Messages.helperFailed} no space left on device`));
+      expect(events).toEqual([FREE_NAME_CHECK, 'ensureImage']);
+      expect(await h.registry.list()).toEqual([]);
+      expect(h.docker.volumes.size).toBe(0);
+    });
+
+    it('a failed clone is removed again under the lock, before the release', async () => {
+      h.helper.cloneError = new CommandError('git clone', 128, '', 'Repository not found');
+      await rejection(h.service.open(TARGET, openOptions()));
+      const [id] = lockedIds;
+      expect(openEvents()).toEqual([
+        FREE_NAME_CHECK,
+        'ensureImage',
+        `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
+        'busy=create',
+        'docker volume create (locked)',
+        'clone (locked)',
+        'docker volume rm (locked)',
+        'release',
+      ]);
+      expect(await h.registry.list()).toEqual([]);
+      expect(h.docker.volumes.size).toBe(0);
+    });
+
+    it('redirect: a first open that restores the environment from its volume opens it with one lock of its ID', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      // The registry lost the entry; the labelled volume stays.
+      await h.registry.remove(ENV_ID);
+      await h.service.open(TARGET, openOptions());
+      expect(lockedIds).toEqual([ENV_ID]);
+      expect(releases).toBe(1);
+      expect(openEvents()).toContain('up (locked)');
+      expect((await h.registry.get(ENV_ID))?.owner.id).toBe(ACCOUNT.id);
+    });
+
+    it('redirect: a first open whose entry another window created meanwhile opens that one with one lock of its ID', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      // The lookup of `open` misses the entry (it is created "meanwhile"), so `add` of the first open conflicts.
+      const find = h.registry.findForAccount.bind(h.registry);
+      let lookups = 0;
+      h.registry.findForAccount = async (...args: Parameters<typeof find>) => (++lookups === 1 ? undefined : find(...args));
+      const add = h.registry.add.bind(h.registry);
+      h.registry.add = async (environment) => {
+        if (environment.id !== ENV_ID) throw new Error('One environment per repository and account.');
+        return add(environment);
+      };
+      await h.service.open(TARGET, openOptions());
+      expect(lockedIds).toEqual([ENV_ID]);
+      expect(releases).toBe(1);
+      expect(openEvents()).toContain('up (locked)');
+      expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
+    });
+  });
+});
+
+/** A harness of this file whose lock is `take` (for a lock that does something else than hold or refuse). */
+function recreateWithLock(take: () => Promise<HeldEnvironmentLock>): Harness {
+  h.cleanup();
+  return createHarness({ environmentLock: take });
+}

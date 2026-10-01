@@ -1383,18 +1383,41 @@ export class EnvironmentService {
       identity,
       hostAccessChecks: this.hostAccessChecksFor(environment.repository),
     };
+    // Plan step 6, PR A (user decision D2): the first open runs under the lock of the environment on the Docker host,
+    // from before the volume is created through the pipeline and the removal after a failure. A refused lock (D1, D3)
+    // has created nothing on Docker: only the new registry entry is removed again (no busy mark, no partial state). When
+    // the lock is lost during the removal, its Docker calls fail and the volume stays (the entry too, so the next open
+    // finds it); nothing is removed without the lock.
+    let locked = false;
     try {
-      steps.step('downloadingRepository');
-      await this.deps.docker.createVolume(name, volumeLabels(environment));
-      await this.prepareHelper(ctx);
-      await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
-      return await this.runPipeline(ctx);
+      return await this.withEnvironmentLock(environment, signal, async () => {
+        locked = true;
+        try {
+          steps.step('downloadingRepository');
+          await this.deps.docker.createVolume(name, volumeLabels(environment));
+          await this.prepareHelper(ctx);
+          await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
+          return await this.runPipeline(ctx);
+        } catch (error) {
+          await this.removeFailedFirstOpen(ctx.env, ctx.compose === true);
+          throw error;
+        }
+      });
     } catch (error) {
-      await this.removeFailedFirstOpen(ctx.env, ctx.compose === true);
+      if (!locked) await this.removeRefusedFirstOpen(environment);
       throw error;
     } finally {
       await this.releaseBusy(ctx);
     }
+  }
+
+  /**
+   * Plan step 6, PR A: the lock of a first open was refused (or its wait cancelled) before anything was created on
+   * Docker. Only the registry entry of `env` (with its busy mark) is removed; no Docker call runs, as none may run
+   * without the lock.
+   */
+  private async removeRefusedFirstOpen(env: Environment): Promise<void> {
+    await this.quietly('remove the registry entry', () => this.deps.registry.remove(env.id, { kept: [] }));
   }
 
   /**
@@ -1423,38 +1446,47 @@ export class EnvironmentService {
     try {
       await this.startDocker(steps, signal);
       const env = await this.waitForOtherOperation(owned, signal);
-      let forced = options.forceRebuild === true;
-      let configPath = env.configPath;
-      if (options.configPath !== undefined) {
-        forced = true;
-        if (options.configPath !== env.configPath) {
-          this.logger.info(`Configuration of ${env.repository}: ${env.configPath} → ${options.configPath}.`);
-          configPath = options.configPath;
+      // Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again run under the lock of
+      // the environment on the Docker host, from here through `finish` (in runPipeline): the check of the volume, Clone
+      // again (recoverMissingFiles, with its Delete, which holds the lock already: re-entrant), the resumed clone, and the
+      // pipeline. D1: without the helper image or the worker the open is refused before anything is changed; D3: a lock
+      // held elsewhere is refused after 10 s. The lock stays held while a question to the user is open (user decision Q3
+      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state.
+      const result = await this.withEnvironmentLock(env, signal, async () => {
+        let forced = options.forceRebuild === true;
+        let configPath = env.configPath;
+        if (options.configPath !== undefined) {
+          forced = true;
+          if (options.configPath !== env.configPath) {
+            this.logger.info(`Configuration of ${env.repository}: ${env.configPath} → ${options.configPath}.`);
+            configPath = options.configPath;
+          }
         }
-      }
-      ctx = {
-        env,
-        configPath,
-        firstOpen: false,
-        forced,
-        steps,
-        signal,
-        announceConfigFallback: options.configPath !== undefined || env.buildRecord !== undefined,
-        cloned: false,
-        ownershipPrepared: false,
-        busy: false,
-        helperUnavailable: false,
-        session,
-        gitPrepared: false,
-        identity,
-        hostAccessChecks: this.hostAccessChecksFor(env.repository),
-      };
-      if (!(await this.deps.docker.volumeExists(env.volumeName))) {
-        await this.recoverMissingFiles(ctx, defaultBranch, options.progress);
-      } else if (env.busy?.operation === 'create') {
-        await this.resumeInterruptedClone(ctx, defaultBranch);
-      }
-      const result = await this.runPipeline(ctx);
+        const opened: PipelineContext = {
+          env,
+          configPath,
+          firstOpen: false,
+          forced,
+          steps,
+          signal,
+          announceConfigFallback: options.configPath !== undefined || env.buildRecord !== undefined,
+          cloned: false,
+          ownershipPrepared: false,
+          busy: false,
+          helperUnavailable: false,
+          session,
+          gitPrepared: false,
+          identity,
+          hostAccessChecks: this.hostAccessChecksFor(env.repository),
+        };
+        ctx = opened;
+        if (!(await this.deps.docker.volumeExists(env.volumeName))) {
+          await this.recoverMissingFiles(opened, defaultBranch, options.progress);
+        } else if (env.busy?.operation === 'create') {
+          await this.resumeInterruptedClone(opened, defaultBranch);
+        }
+        return this.runPipeline(opened);
+      });
       succeeded = true;
       return result;
     } finally {
@@ -6714,7 +6746,8 @@ export class EnvironmentService {
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
    * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in
    * `finally`. Re-entrant: an operation that holds the lock of `env` runs `fn` at once. The caller took its busy mark
-   * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear.
+   * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear. Plan step 6, PR A: also
+   * the opens (openExisting: Start, Rebuild, Select configuration, Clone again; openFirst), see there.
    */
   private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();

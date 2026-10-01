@@ -554,6 +554,12 @@ export class FakeHelper implements EnvironmentHelper {
   merged: Record<string, unknown> | undefined = {};
   remoteUser = 'vscode';
   ensureImageError: Maybe<Error>;
+  /**
+   * Plan step 6, PR A: the tag of the helper image exists, so ensureImagePresent (the D1 step before the lock, which
+   * only builds a missing tag) succeeds while `ensureImageError` fails the maintaining ensureImageUse of the open (for
+   * example a failed rebuild of the tag). Default false: `ensureImageError` fails both.
+   */
+  tagPresent = false;
   /** Review round 3 of PR #64 (P2): the ID of the image of the current tag `devenv-helper:test`, which the open pins. */
   currentHelperImageId = `sha256:${'4'.repeat(64)}`;
   cloneError: Maybe<Error>;
@@ -696,7 +702,7 @@ export class FakeHelper implements EnvironmentHelper {
    */
   async ensureImagePresent(_options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
     this.calls.push('ensureImagePresent');
-    if (this.ensureImageError) throw this.ensureImageError;
+    if (this.ensureImageError && !this.tagPresent) throw this.ensureImageError;
     return { tag: 'devenv-helper:test', id: this.currentHelperImageId };
   }
 
