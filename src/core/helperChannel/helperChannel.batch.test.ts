@@ -271,7 +271,7 @@ describe('the places and the limits of a batch on the client (review round 1 of 
     channel.close();
   });
 
-  it('review round 2 of PR #80, B-R2-1: with a caller signal, stdout beyond the cap still cancels the step, and a late success rejects with OutputTooLargeError (O9)', async () => {
+  it('review round 2 of PR #80, B-R2-1: with a caller signal, stdout beyond the cap still cancels the step and the step rejects with OutputTooLargeError (O9)', async () => {
     const { channel, worker, session: s } = await session({ maxCapturedOutputBytes: 1_000 });
     const caller = new AbortController();
     const running = s.step('listConfigs', { repository: 'o/r' }, { signal: caller.signal });
@@ -283,7 +283,8 @@ describe('the places and the limits of a batch on the client (review round 1 of 
     // The cap aborts the operation also when the caller passed its own signal (AbortSignal.any).
     expect(worker.lines.map((line) => parseClientMessage(line))).toContainEqual({ t: 'cancel', id: op.id });
     expect(caller.signal.aborted).toBe(false);
-    // The step ended before the cancel took effect: its success must not hand back an empty stdout.
+    // A result after the cancel still rejects (review round 3 of PR #80, A-R3-1: the cancel decides here; the success
+    // path's own check is held by the test of an overflow found only at the flush).
     worker.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
     const error = await running.catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(OutputTooLargeError);
