@@ -507,6 +507,93 @@ describe('open: first open', () => {
     expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created'))).toBe(true);
   });
 
+  // Review round 2 of PR #82 (B-R2-1, B-R2-3): the removal of the container of the fix before up, with a `ps` and an
+  // `rm` that take time and refuse an aborted signal, as the real round trips to the worker under the lock do.
+  describe('the removal of the container of the fix before up (review round 2 of PR #82)', () => {
+    function deferred(): { promise: Promise<void>; resolve: () => void } {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => (resolve = r));
+      return { promise, resolve };
+    }
+
+    /** One turn of the event loop (no timer). */
+    const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+    /**
+     * The `run` of the fix fails (a cancel when `controller` is given, else `runError`) and leaves its container, which
+     * holds the volume; the `ps` of its cleanup label waits on `listGate` and fails with `listError` when given; `ps`
+     * and `rm` reject with an AbortError when their signal is aborted.
+     */
+    function fakeFix(p: { controller?: AbortController; listGate?: Promise<void>; listed?: () => void; listError?: Error }): { label: () => string | undefined } {
+      const runChecked = h.docker.runChecked.bind(h.docker);
+      const removeContainer = h.docker.removeContainer.bind(h.docker);
+      let label: string | undefined;
+      h.docker.runChecked = async (args: readonly string[], options?: { signal?: AbortSignal }): Promise<string> => {
+        if (args[0] === 'run') {
+          await runChecked(args);
+          label = args.find((arg) => arg.startsWith(`${LABEL_CHANNEL_STEP}=`));
+          h.docker.volumesInUse.add(args.find((arg) => arg.startsWith('type=volume,source='))!.split(',')[1].slice('source='.length));
+          if (p.controller === undefined) throw new CommandError('docker run', 1, '', 'sh: find: not found');
+          p.controller.abort();
+          throw abortError();
+        }
+        if (args[0] === 'ps' && label !== undefined && args.includes(`label=${label}`)) {
+          p.listed?.();
+          if (options?.signal?.aborted) throw abortError();
+          await p.listGate;
+          if (options?.signal?.aborted) throw abortError();
+          h.docker.log.push(args.join(' '));
+          if (p.listError !== undefined) throw p.listError;
+          return 'ownership-container\n';
+        }
+        return runChecked(args);
+      };
+      h.docker.removeContainer = async (nameOrId: string, options?: { signal?: AbortSignal }): Promise<void> => {
+        if (options?.signal?.aborted) throw abortError();
+        if (nameOrId === 'ownership-container') h.docker.volumesInUse.clear();
+        return removeContainer(nameOrId);
+      };
+      return { label: () => label };
+    }
+
+    it('review round 2 of PR #82, B-R2-1: a cancel removes the volume only after the removal of the container settled, and the removal runs without the aborted signal', async () => {
+      const controller = new AbortController();
+      const listing = deferred();
+      const gate = deferred();
+      const fix = fakeFix({ controller, listGate: gate.promise, listed: listing.resolve });
+      const run = rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+      await listing.promise;
+      await turn();
+      expect(h.docker.log.some((line) => line.startsWith('volume rm '))).toBe(false);
+      gate.resolve();
+      const error = await run;
+      expect(error.code).toBe('cancelled');
+      const removed = h.docker.log.indexOf('rm ownership-container');
+      const volumeRemoved = h.docker.log.findIndex((line) => line.startsWith('volume rm '));
+      expect(h.docker.log.indexOf(`ps -aq --no-trunc --filter label=${fix.label()}`)).toBeGreaterThanOrEqual(0);
+      expect(removed).toBeGreaterThanOrEqual(0);
+      expect(volumeRemoved).toBeGreaterThan(removed);
+      expect(await h.registry.list()).toEqual([]);
+      expect(h.docker.volumes.size).toBe(0);
+    });
+
+    it('review round 2 of PR #82, B-R2-3: a failed removal after a cancel is logged; the open is still cancelled', async () => {
+      const controller = new AbortController();
+      fakeFix({ controller, listError: new CommandError('docker ps', 1, '', 'the worker was lost') });
+      const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+      expect(error.code).toBe('cancelled');
+      expect(h.logger.warnings.some((w) => w.includes('Could not remove the container of the ownership fix'))).toBe(true);
+    });
+
+    it('review round 2 of PR #82, B-R2-3: a failed removal after a failed fix is logged; the open continues', async () => {
+      fakeFix({ listError: new CommandError('docker ps', 1, '', 'the worker was lost') });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+      expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created'))).toBe(true);
+      expect(h.logger.warnings.some((w) => w.includes('Could not remove the container of the ownership fix'))).toBe(true);
+    });
+  });
+
   it('uses the environment that another window of the account created in the meantime (one per repository and account)', async () => {
     const registry = h.registry;
     const original = registry.add.bind(registry);

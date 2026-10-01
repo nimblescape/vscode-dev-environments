@@ -600,6 +600,23 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     }
   });
 
+  it('review round 2 of PR #82, B-R2-2: an up with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {
+    const files = { [COMPOSE_MODEL_PATH]: '{"services":{}}' };
+    const call = (h: WorkspaceHelper): Promise<unknown> =>
+      h.up({ volumeName: VOLUME, repository: 'acme/app', override: { name: 'o' }, environmentId: ENVIRONMENT_ID, removeExistingContainer: false, files, env: { COMPOSE_PROJECT_NAME: 'p' }, token: TOKEN, image: IMAGE });
+    const single = setup();
+    await call(single.helper).catch(() => undefined);
+    const [run] = single.docker.runs;
+    const at = run.args.indexOf(IMAGE.id!);
+    const { helper, lock } = setup();
+    await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
+    expect(lock.steps.map((step) => step.kind)).toEqual(['up']);
+    expect(lock.steps[0].params).toEqual(expect.objectContaining({ files }));
+    const command = batchStepCommand('up', lock.steps[0].params);
+    expect(command.command).toEqual(run.args.slice(at + 1));
+    expect(command.input).toBe(run.options.input);
+  });
+
   it('review round 1 of PR #82, B-R1-6: a step that comes after the end of the scope is refused and opens nothing', async () => {
     const { helper, lock } = setup();
     lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
