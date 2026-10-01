@@ -433,7 +433,13 @@ describe('the override folder is cleared before a read step runs (review round 3
           chownSync: (() => {}) as never,
           readdirSync: (() => []) as never,
           rmSync: ((name: string, rmOptions: fs.RmOptions) => {
-            if (name === OVERRIDE_FOLDER) events.push('rm override folder');
+            // Review round 4 of PR #82 (A-R4-1): only the stand-in of OVERRIDE_FOLDER is ever removed for real; any other
+            // path is recorded, never a path of the machine that runs the tests.
+            if (name !== OVERRIDE_FOLDER) {
+              events.push(`rm ${name}`);
+              return;
+            }
+            events.push('rm override folder');
             fs.rmSync(real(name), rmOptions);
           }) as never,
         },
