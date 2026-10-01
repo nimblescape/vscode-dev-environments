@@ -229,7 +229,9 @@ describe('first open of a Docker Compose configuration', () => {
   it('reads the model, checks it, builds the dev service image, and starts both services', async () => {
     const result = await h.service.open(TARGET, options());
 
+    // Plan step 6, PR A: changed expectation, the open first ensures the helper image of the worker for its lock (D1).
     expect(h.helper.calls.filter((call) => !call.startsWith('readConfigFiles') && call !== 'ensureImage')).toEqual([
+      'ensureImagePresent',
       'clone main',
       `readConfiguration ${DEFAULT_CONFIG_PATH}`,
       `composeModel ${PROJECT}`,
@@ -766,6 +768,10 @@ describe('existing Docker Compose environment', () => {
   it('opens a running dev container that is current as it is without the workspace helper (review round 1 of PR #64, L2)', async () => {
     await seedCompose({ dev: 'running', db: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.warnings).toEqual([Messages.helperFailed]);
     // Changed expectation (review round 2 of PR #64, B2): the log line names the helper, not the configuration.
@@ -835,6 +841,10 @@ describe('existing Docker Compose environment', () => {
       dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED },
     });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const result = await h.service.openEnvironment(ENV_ID, options());
     expect(result.containerName).toBe(devContainer()?.name);
     expect(h.helper.ups).toEqual([]);
@@ -856,7 +866,16 @@ describe('existing Docker Compose environment', () => {
   });
 
   it.each([
-    ['helperFailed', () => (h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed)), () => h.helper.calls.includes('ensureImage')],
+    [
+      'helperFailed',
+      () => {
+        h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+        // Plan step 6, PR A: changed input, the tag of the helper image exists (the lock's D1 step builds only a missing
+        // tag); the maintaining ensure of the open fails as before.
+        h.helper.tagPresent = true;
+      },
+      () => h.helper.calls.includes('ensureImage'),
+    ],
     [
       'a configuration error',
       () => (h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError')),
@@ -887,6 +906,10 @@ describe('existing Docker Compose environment', () => {
   it('keeps helperFailed when the containers cannot be listed at Step 5 (review round 2 of PR #64, A-N4)', async () => {
     await seedCompose({ dev: 'running', db: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     h.docker.listEnvironmentContainers = async () => {
       throw new CommandError('docker ps', 1, '', 'Cannot connect to the Docker daemon');
     };
@@ -912,6 +935,10 @@ describe('existing Docker Compose environment', () => {
   it('fails with helperFailed at once, without a warning, for a running dev container that is outdated (review round 1 of PR #64, L2)', async () => {
     await seedCompose({ dev: 'running', devLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('helperFailed');
     expect(h.ui.warnings).toEqual([]);
@@ -924,6 +951,10 @@ describe('existing Docker Compose environment', () => {
     // off: the environment is created again (startContainer), which needs the helper.
     await seedCompose({ dev: 'running', db: 'running', dbLabels: { [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('helperFailed');
     expect(h.ui.warnings).toEqual([]);
@@ -936,6 +967,10 @@ describe('existing Docker Compose environment', () => {
     // the helper, so it fails with helperFailed (never a start without the helper).
     await seedCompose({ dev: 'running', db: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const list = h.docker.listEnvironmentContainers.bind(h.docker);
     let calls = 0;
     h.docker.listEnvironmentContainers = async () => {
@@ -961,6 +996,10 @@ describe('existing Docker Compose environment', () => {
   it('fails with helperFailed and starts nothing when the workspace helper is not available', async () => {
     await seedCompose();
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start started all
     // containers; now the open fails with helperFailed.
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));

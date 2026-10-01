@@ -499,6 +499,16 @@ const LIFECYCLE_MARK_RETRY_MS = 500;
  */
 const NOT_RUNNING_STATES: ReadonlySet<string> = new Set(['exited', 'created']);
 
+/**
+ * PR #78 review round 2 (A-R2-1): a mark that isBusyMarkLive counts as ended (older than BUSY_MARK_MAX_AGE_MS; the epoch,
+ * so a clock correction cannot make it live again), with its operation kept: the create mark of an unfinished clone of
+ * this window then blocks nothing (the sidebar of every window, other windows' Start and Delete), like the mark of an
+ * ended window, and the next open of any window still completes the clone.
+ */
+function endedMark(mark: BusyMark): BusyMark {
+  return { ...mark, since: new Date(0).toISOString() };
+}
+
 /** Review round 4 of PR #68 (A-R4-6): the busy marks are the same mark (all four fields). */
 function sameBusyMark(a: BusyMark, b: BusyMark): boolean {
   return a.operation === b.operation && a.since === b.since && a.pid === b.pid && a.windowId === b.windowId;
@@ -1383,18 +1393,52 @@ export class EnvironmentService {
       identity,
       hostAccessChecks: this.hostAccessChecksFor(environment.repository),
     };
+    // Plan step 6, PR A (user decision D2): the first open runs under the lock of the environment on the Docker host,
+    // from before the volume is created through the pipeline and the removal after a failure. A refused lock (D1, D3)
+    // has created nothing on Docker: only the new registry entry is removed again (no busy mark, no partial state). When
+    // the lock is lost during the removal, its Docker calls fail and the volume stays; PR #78 review round 1 (A-R1-1):
+    // the entry then stays too, with its create mark, so the next open completes the clone or Delete removes it
+    // (removeFailedFirstOpen keeps the entry whenever the volume cannot be removed); nothing is removed without the lock.
+    let locked = false;
     try {
-      steps.step('downloadingRepository');
-      await this.deps.docker.createVolume(name, volumeLabels(environment));
-      await this.prepareHelper(ctx);
-      await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
-      return await this.runPipeline(ctx);
+      return await this.withEnvironmentLock(environment, signal, async () => {
+        locked = true;
+        try {
+          steps.step('downloadingRepository');
+          await this.deps.docker.createVolume(name, volumeLabels(environment));
+          await this.prepareHelper(ctx);
+          await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
+          return await this.runPipeline(ctx);
+        } catch (error) {
+          // PR #78 review round 1 (A-R1-1): the volume could not be removed (for example the lock was lost): the entry keeps its create mark, so the
+          // next open completes the clone (resumeInterruptedClone) or Delete removes it.
+          if (!(await this.removeFailedFirstOpen(ctx.env, ctx.compose === true))) {
+            ctx.busy = false;
+            // PR #78 review round 2 (A-R2-1): kept as ended, so it blocks nothing while this window lives.
+            await this.quietly('keep the create mark as ended', () =>
+              this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
+                if (entry.busy && this.isOwnMark(entry.busy)) entry.busy = endedMark(entry.busy);
+              }),
+            );
+          }
+          throw error;
+        }
+      });
     } catch (error) {
-      await this.removeFailedFirstOpen(ctx.env, ctx.compose === true);
+      if (!locked) await this.removeRefusedFirstOpen(environment);
       throw error;
     } finally {
       await this.releaseBusy(ctx);
     }
+  }
+
+  /**
+   * Plan step 6, PR A: the lock of a first open was refused (or its wait cancelled) before anything was created on
+   * Docker. Only the registry entry of `env` (with its busy mark) is removed; no Docker call runs, as none may run
+   * without the lock.
+   */
+  private async removeRefusedFirstOpen(env: Environment): Promise<void> {
+    await this.quietly('remove the registry entry', () => this.deps.registry.remove(env.id, { kept: [] }));
   }
 
   /**
@@ -1423,38 +1467,47 @@ export class EnvironmentService {
     try {
       await this.startDocker(steps, signal);
       const env = await this.waitForOtherOperation(owned, signal);
-      let forced = options.forceRebuild === true;
-      let configPath = env.configPath;
-      if (options.configPath !== undefined) {
-        forced = true;
-        if (options.configPath !== env.configPath) {
-          this.logger.info(`Configuration of ${env.repository}: ${env.configPath} → ${options.configPath}.`);
-          configPath = options.configPath;
+      // Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again run under the lock of
+      // the environment on the Docker host, from here through `finish` (in runPipeline): the check of the volume, Clone
+      // again (recoverMissingFiles, with its Delete, which holds the lock already: re-entrant), the resumed clone, and the
+      // pipeline. D1: without the helper image or the worker the open is refused before anything is changed; D3: a lock
+      // held elsewhere is refused after 10 s. The lock stays held while a question to the user is open (user decision Q3
+      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state.
+      const result = await this.withEnvironmentLock(env, signal, async () => {
+        let forced = options.forceRebuild === true;
+        let configPath = env.configPath;
+        if (options.configPath !== undefined) {
+          forced = true;
+          if (options.configPath !== env.configPath) {
+            this.logger.info(`Configuration of ${env.repository}: ${env.configPath} → ${options.configPath}.`);
+            configPath = options.configPath;
+          }
         }
-      }
-      ctx = {
-        env,
-        configPath,
-        firstOpen: false,
-        forced,
-        steps,
-        signal,
-        announceConfigFallback: options.configPath !== undefined || env.buildRecord !== undefined,
-        cloned: false,
-        ownershipPrepared: false,
-        busy: false,
-        helperUnavailable: false,
-        session,
-        gitPrepared: false,
-        identity,
-        hostAccessChecks: this.hostAccessChecksFor(env.repository),
-      };
-      if (!(await this.deps.docker.volumeExists(env.volumeName))) {
-        await this.recoverMissingFiles(ctx, defaultBranch, options.progress);
-      } else if (env.busy?.operation === 'create') {
-        await this.resumeInterruptedClone(ctx, defaultBranch);
-      }
-      const result = await this.runPipeline(ctx);
+        const opened: PipelineContext = {
+          env,
+          configPath,
+          firstOpen: false,
+          forced,
+          steps,
+          signal,
+          announceConfigFallback: options.configPath !== undefined || env.buildRecord !== undefined,
+          cloned: false,
+          ownershipPrepared: false,
+          busy: false,
+          helperUnavailable: false,
+          session,
+          gitPrepared: false,
+          identity,
+          hostAccessChecks: this.hostAccessChecksFor(env.repository),
+        };
+        ctx = opened;
+        if (!(await this.deps.docker.volumeExists(env.volumeName))) {
+          await this.recoverMissingFiles(opened, defaultBranch, options.progress);
+        } else if (env.busy?.operation === 'create') {
+          await this.resumeInterruptedClone(opened, defaultBranch);
+        }
+        return this.runPipeline(opened);
+      });
       succeeded = true;
       return result;
     } finally {
@@ -1545,12 +1598,14 @@ export class EnvironmentService {
     } catch (error) {
       // The mark of the ended window comes back, so the next open completes the clone again. A mark of this window
       // would count as live: the environment would show as busy without Start and Delete, and other windows could
-      // not use it, as long as this window lives.
+      // not use it, as long as this window lives; so it comes back as ended (PR #78 review round 2, A-R2-1).
       ctx.busy = false;
       await this.quietly('restore the busy mark', () =>
         this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
           if (!entry.busy || !this.isOwnMark(entry.busy)) return;
-          if (interrupted && !this.isOwnMark(interrupted)) entry.busy = interrupted;
+          // PR #78 review round 1 (A-R1-1): the create mark of a failed first open of this window (kept because its
+          // volume could not be removed) comes back too, so a resume that fails again does not lose the clone.
+          if (interrupted) entry.busy = this.isOwnMark(interrupted) ? endedMark(interrupted) : interrupted;
           else delete entry.busy;
         }),
       );
@@ -6602,7 +6657,7 @@ export class EnvironmentService {
   }
 
   /** A failed first open leaves nothing behind, so the next Start begins cleanly. `compose`: a Docker Compose configuration. */
-  private async removeFailedFirstOpen(env: Environment, compose = false): Promise<void> {
+  private async removeFailedFirstOpen(env: Environment, compose = false): Promise<boolean> {
     const { docker } = this.deps;
     this.logger.info(`Removing what the failed first open of ${env.repository} created.`);
     await this.quietly('remove the container', async () => {
@@ -6616,7 +6671,13 @@ export class EnvironmentService {
       if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)))) await this.removeComposeProject(env, true);
     });
     await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
-    await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
+    try {
+      await this.removeVolumeWithRetry(env.volumeName);
+    } catch (error) {
+      this.logger.warn(`Could not remove the volume ${env.volumeName}: ${errorMessage(error)}. The environment is kept; open it again to complete the clone, or delete it.`);
+      await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));
+      return false;
+    }
     // The additional volumes that the failed open recorded stay (a known limit), with their account: the environments of
     // other accounts must not mount them (concept section 9), as after a Delete that kept them.
     await this.quietly('remove the registry entry', async () => {
@@ -6624,6 +6685,7 @@ export class EnvironmentService {
       await this.deps.registry.remove(env.id, { kept: await this.existingVolumes(current.additionalVolumes ?? []) });
     });
     await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));
+    return true;
   }
 
   /** The Git summary from the running container, or `undefined` when Git is missing, fails, or `signal` aborts. */
@@ -6714,7 +6776,8 @@ export class EnvironmentService {
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
    * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in
    * `finally`. Re-entrant: an operation that holds the lock of `env` runs `fn` at once. The caller took its busy mark
-   * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear.
+   * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear. Plan step 6, PR A: also
+   * the opens (openExisting: Start, Rebuild, Select configuration, Clone again; openFirst), see there.
    */
   private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();

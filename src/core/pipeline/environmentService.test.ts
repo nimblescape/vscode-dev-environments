@@ -924,7 +924,9 @@ describe('open: existing environment', () => {
       expect(error.code).toBe('cancelled');
       expect(h.ui.prompts).toEqual([`filesMissing ${REPO}`]);
       expect(h.docker.volumes.size).toBe(0);
-      expect(h.helper.calls).toEqual([]);
+      // Plan step 6, PR A: changed expectation, the question is asked under the lock, so the helper image of the worker
+      // was ensured before it (D1); no helper run.
+      expect(h.helper.calls).toEqual(['ensureImagePresent']);
       expect(await pendingIds()).toEqual([]);
     });
 
@@ -1378,6 +1380,10 @@ describe('open: existing environment', () => {
   it('fails with helperFailed and starts nothing when the helper cannot be prepared for a stopped container', async () => {
     await seedEnvironment(h);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     // Changed expectation (no docker start fallback, user decision 2026-09-29): before, the container was
     // started with docker start after a warning; now the open fails with helperFailed, without the warning.
     const error = await rejection(h.service.open(TARGET, options()));
@@ -1396,6 +1402,10 @@ describe('open: existing environment', () => {
   it('opens a running container that was created without the configuration without the workspace helper', async () => {
     await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'nimblescape.devenv.container-config': 'unknown' } });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const result = await h.service.open(TARGET, options());
     expect(result.containerName).toBe(NAME);
     expect(h.ui.warnings).toEqual([Messages.helperFailed]);
@@ -1407,6 +1417,10 @@ describe('open: existing environment', () => {
     // still opens without the helper (as before).
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const result = await h.service.open(TARGET, options());
     expect(result.containerName).toBe(NAME);
     expect(h.ui.warnings).toEqual([Messages.helperFailed]);
@@ -1419,6 +1433,10 @@ describe('open: existing environment', () => {
     // text; the outdated container would be created again, which needs the helper.
     await seedEnvironment(h, { container: 'running', containerLabels: { [LABEL_CONTAINER_VERSION]: '0' } });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('helperFailed');
     expect(error.message).toBe(Messages.helperFailed);
@@ -1431,6 +1449,10 @@ describe('open: existing environment', () => {
   it('logs that a running current container is opened as it is when the helper is not available (review round 1 of PR #64, L2)', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     await h.service.open(TARGET, options());
     // Changed expectation (review round 2 of PR #64, B2): the log line names the helper, not the configuration.
     expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
@@ -1491,6 +1513,10 @@ describe('open: existing environment', () => {
   it('fails with helperFailed when neither the helper nor a container is available', async () => {
     await seedEnvironment(h, { container: null });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('helperFailed');
     expect(h.helper.calls.filter((c) => c === 'ensureImage')).toHaveLength(1);
@@ -1499,6 +1525,10 @@ describe('open: existing environment', () => {
   it('unit 15: writes no token into a container when the helper cannot be prepared', async () => {
     await seedEnvironment(h);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     // Changed expectation (no docker start fallback, user decision 2026-09-29): before, docker start
     // started the container without the helper and the token was written into its memory; now nothing starts, so no
     // token is written.
@@ -1740,6 +1770,10 @@ describe('open: existing environment', () => {
       h.helper.files[python] = { configText: '{ "image": "python:3.12" }' };
       h.helper.config = { image: 'python:3.12' };
       h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'apt-get failed');
+      // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+      // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+      // before anything is changed (environmentService.lock.test.ts).
+      h.helper.tagPresent = true;
       const result = await h.service.openEnvironment(ENV_ID, options({ configPath: python }));
       expect(result.containerName).toBe(NAME);
       expect((await entry())?.configPath).toBe(env.configPath);
@@ -4544,6 +4578,10 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
   it('never starts an old container with docker start when the workspace helper is not available', async () => {
     await seedEnvironment(h, { container: 'stopped', containerLabels: {} });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
     const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
     expect(error.code).toBe('helperFailed');
     expect(h.docker.log.filter((line) => line.startsWith('start'))).toEqual([]);

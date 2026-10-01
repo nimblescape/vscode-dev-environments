@@ -452,6 +452,10 @@ describe('recreate offer: a running container that the remote user cannot use', 
     const old = h.docker.containersOf(ENV_ID)[0];
     failCheck(old.id, PASSWD_DAMAGED);
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'offline');
+    // Plan step 6, PR A: changed input, the tag of the helper image exists (the open takes the lock, whose D1 step
+    // builds only a missing tag); the maintaining ensure of the open fails as before. A missing tag refuses the open
+    // before anything is changed (environmentService.lock.test.ts).
+    h.helper.tagPresent = true;
 
     await h.service.open(TARGET, options()).catch(() => undefined);
 

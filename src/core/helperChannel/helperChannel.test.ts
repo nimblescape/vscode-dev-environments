@@ -7,6 +7,7 @@ import { MAX_CAPTURED_OUTPUT_BYTES } from '../helper/analysisLimits';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { OutputTooLargeError } from '../process';
 import type { Logger, StartedProcess } from '../ports';
+import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
@@ -23,6 +24,8 @@ import {
   MAX_CONCURRENT_OPERATIONS,
   MAX_DOCKER_ARGS,
   MAX_DOCKER_INPUT_LENGTH,
+  MAX_LOCK_WAIT_SECONDS,
+  MAX_OPERATION_TIMEOUT_MS,
   encodeMessage,
   parseClientMessage,
   type ClientMessage,
@@ -686,6 +689,15 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
   it('B-R1-3: sends the time limit of the wait plus the hold limit plus the grace', async () => {
     const { op } = await held();
     expect(op.timeoutMs).toBe(10 * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS);
+  });
+
+  // Plan step 6, PR A: Start, Rebuild, Select configuration and Clone again hold the lock through the build, `up`, the
+  // lifecycle commands and the questions to the user, so the backstop is as long as the life of a busy mark (6 h), and
+  // the time limit of the longest wait still fits into the limit of one operation.
+  it('plan step 6, PR A: the backstop covers the life of a busy mark and fits into the limit of one operation', () => {
+    expect(LOCK_HOLD_LIMIT_MS).toBe(6 * 60 * 60_000);
+    expect(LOCK_HOLD_LIMIT_MS).toBeGreaterThanOrEqual(BUSY_MARK_MAX_AGE_MS);
+    expect(MAX_LOCK_WAIT_SECONDS * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS).toBeLessThanOrEqual(MAX_OPERATION_TIMEOUT_MS);
   });
 
   // PR #74 review round 1, B-R1-5: a worker that ends the lock operation without `locked` never gives a held lock.

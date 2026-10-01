@@ -6,7 +6,9 @@
 // real Docker engine of the runner, with a state volume of the test. Checked: a second lock is busy while the first is
 // held; after a hard kill of the first worker, the kernel freed the lock and the second takes it; two Deletes of the
 // same environment at the same time give exactly one winner, and the other removes nothing (user decision D3); no
-// worker container is left over.
+// worker container is left over. Plan step 6, PR A: a Start and a Delete of the same environment at the same time, with
+// the service's own wait (10 s): exactly one wins, the other is refused as busy after the wait and changes nothing; a
+// Delete while the question of a Start is open is refused as busy (the Start holds the lock during the question).
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -18,7 +20,7 @@ import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/
 import { LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
-import { EnvironmentService, PipelineTexts } from '../../src/core/pipeline/environmentService';
+import { ENVIRONMENT_LOCK_WAIT_SECONDS, EnvironmentService, PipelineTexts } from '../../src/core/pipeline/environmentService';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -118,8 +120,16 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
     return channels;
   }
 
-  /** The service of one window or computer: its own registry, its own workers. */
-  function windowService(name: string, channels: HelperChannels): { service: EnvironmentService; registry: EnvironmentRegistry } {
+  /**
+   * The service of one window or computer: its own registry, its own workers. Plan step 6, PR A: `ui` (default FakeUi)
+   * and `waitSeconds` (default the short wait of the test; the service's own wait when `service`).
+   */
+  function windowService(
+    name: string,
+    channels: HelperChannels,
+    options: { ui?: FakeUi; waitSeconds?: number | 'service' } = {},
+  ): { service: EnvironmentService; registry: EnvironmentRegistry; sessionFiles: SessionFiles } {
+    const waitSeconds = options.waitSeconds ?? TEST_WAIT_SECONDS;
     const paths = new StoragePaths(path.join(run.runDir, `worker-lock-${name}`));
     paths.ensureDirectoriesSync();
     const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
@@ -133,7 +143,7 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
       sessionFiles,
       imageChecker: new ImageChecker(registryClient(registryTransport, runner, env, log), log),
       auth: fakeAuth,
-      ui: new FakeUi(),
+      ui: options.ui ?? new FakeUi(),
       logger: log,
       clock: systemClock,
       platform: process.platform,
@@ -142,10 +152,11 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
       settings: () => settings,
       windowStatuses: () => sessionFiles.readWindowStatuses(),
       dockerTarget: () => targets.current(),
-      // As extension.ts, with the short wait of the test.
-      environmentLock: async (environmentId, _waitSeconds, signal) => channels.lock(await targets.current(), environmentId, TEST_WAIT_SECONDS, signal),
+      // As extension.ts, with the short wait of the test (or the wait that the service asks for).
+      environmentLock: async (environmentId, serviceWait, signal) =>
+        channels.lock(await targets.current(), environmentId, waitSeconds === 'service' ? serviceWait : waitSeconds, signal),
     });
-    return { service, registry };
+    return { service, registry, sessionFiles };
   }
 
   beforeAll(async () => {
@@ -242,5 +253,166 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
     const kept = await loser.registry.get(environmentId);
     expect(kept?.id).toBe(environmentId);
     expect(kept?.busy).toBeUndefined();
+  });
+
+  // Plan step 6, PR A (user decision D2): Start takes the lock too. The Start finds the volume missing and asks; the
+  // answer "Delete environment" deletes it under the lock that the Start holds (re-entrant, no second lock on the same
+  // worker, which would wait for itself). The Delete of the other window stops and removes the same container. Either
+  // holds the lock for the stop time of the container (15 s, longer than the wait), so the other one is refused as busy
+  // after the 10 s wait (D3) and changes nothing.
+  it('a Start and a Delete of the same environment at the same time: exactly one winner, the other is refused as busy after 10 s', async () => {
+    const target = await targets.current();
+    expect(target.kind).toBe('local');
+    const channelsA = windowChannels();
+    const channelsB = windowChannels();
+    expect(await channelsA.get(target)).toBeDefined();
+    expect(await channelsB.get(target)).toBeDefined();
+    class DeletingUi extends FakeUi {
+      override async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
+        await super.filesMissing(repository);
+        return 'deleteEnvironment';
+      }
+    }
+    const starter = windowService('start', channelsA, { ui: new DeletingUi(), waitSeconds: 'service' });
+    const deleter = windowService('delete', channelsB, { waitSeconds: 'service' });
+    const environmentId = newEnvironmentId();
+    const name = resourceName(REPOSITORY, environmentId);
+    // No workspace volume: the Start asks what to do (concept 7.12) and gets "Delete environment".
+    cli.ok([
+      'run', '-d', '--stop-timeout', '15', '--name', name,
+      '--label', `${LABEL_ENVIRONMENT_ID}=${environmentId}`, '--label', `${TEST_RUN_LABEL}=${run.runId}`,
+      TEST_BASE_IMAGE, 'sleep', '3600',
+    ]);
+    const now = isoTime(systemClock);
+    const entry = {
+      id: environmentId,
+      repository: REPOSITORY,
+      configPath: '.devcontainer/devcontainer.json',
+      volumeName: name,
+      containerName: name,
+      createdAt: now,
+      lastUsedAt: now,
+      owner: TEST_ACCOUNT,
+      dockerHost: '',
+    };
+    await starter.registry.add({ ...entry });
+    await deleter.registry.add({ ...entry });
+
+    const startedAt = Date.now();
+    const settledAfter: number[] = [];
+    const outcomes = await Promise.allSettled(
+      [
+        (): Promise<unknown> => starter.service.openEnvironment(environmentId, { progress: new RecordingProgress() }),
+        (): Promise<unknown> => deleter.service.delete(environmentId, { progress: new RecordingProgress(), additionalVolumesToRemove: [] }),
+      ].map((operation, index) =>
+        targets.withOperation(operation).finally(() => {
+          settledAfter[index] = Date.now() - startedAt;
+        }),
+      ),
+    );
+    const busy = PipelineTexts.environmentLockBusy(REPOSITORY);
+    const refused = outcomes.map((outcome) => outcome.status === 'rejected' && (outcome.reason as Error).message === busy);
+    // Exactly one is refused as busy: the Start (the Delete won) or the Delete (the Start won and deleted).
+    expect(refused.filter(Boolean)).toHaveLength(1);
+    const loserIndex = refused.indexOf(true);
+    const winnerIndex = 1 - loserIndex;
+    if (winnerIndex === 0) {
+      // The Start won: its question was answered with "Delete environment", which ends the open as cancelled.
+      expect(outcomes[0].status).toBe('rejected');
+      expect(((outcomes[0] as PromiseRejectedResult).reason as Error).message).toBe('The operation was cancelled.');
+    } else {
+      expect(outcomes[1].status).toBe('fulfilled');
+    }
+    // The loser waited for the lock (D3: 10 s) before it was refused.
+    expect(settledAfter[loserIndex]).toBeGreaterThanOrEqual(ENVIRONMENT_LOCK_WAIT_SECONDS * 1000 - 500);
+    // The winner removed the container and its entry; the loser's entry stays, without a busy mark or pending file.
+    expect(cli.container(name)).toBeUndefined();
+    const [winner, loser] = winnerIndex === 0 ? [starter, deleter] : [deleter, starter];
+    expect(await winner.registry.get(environmentId)).toBeUndefined();
+    const kept = await loser.registry.get(environmentId);
+    expect(kept?.id).toBe(environmentId);
+    expect(kept?.busy).toBeUndefined();
+    expect((await loser.sessionFiles.readPendings()).map((pending) => pending.environmentId)).toEqual([]);
+  });
+
+  // Plan step 6, PR A (user decisions D2 and Q3 of 2026-10-01): the Start holds the lock while its question to the user
+  // is open. A Delete of another window that comes during the question is refused as busy after the wait (D3) and
+  // removes nothing; then the answer "Delete environment" deletes it under the Start's lock. Without the lock of the
+  // Start, the Delete would win at once.
+  it('a Delete while the question of a Start is open is refused as busy after 10 s; the Start goes on under its lock', async () => {
+    const target = await targets.current();
+    expect(target.kind).toBe('local');
+    const channelsA = windowChannels();
+    const channelsB = windowChannels();
+    expect(await channelsA.get(target)).toBeDefined();
+    expect(await channelsB.get(target)).toBeDefined();
+    let asked!: () => void;
+    const questionOpen = new Promise<void>((resolve) => (asked = resolve));
+    let deleteEnded!: () => void;
+    const deleteSettled = new Promise<void>((resolve) => (deleteEnded = resolve));
+    class WaitingUi extends FakeUi {
+      override async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
+        await super.filesMissing(repository);
+        asked();
+        // The answer comes after the Delete of the other window has ended (refused, or done without the Start's lock).
+        await deleteSettled;
+        return 'deleteEnvironment';
+      }
+    }
+    const starter = windowService('start-question', channelsA, { ui: new WaitingUi(), waitSeconds: 'service' });
+    const deleter = windowService('delete-question', channelsB, { waitSeconds: 'service' });
+    const environmentId = newEnvironmentId();
+    const name = resourceName(REPOSITORY, environmentId);
+    cli.ok([
+      'run', '-d', '--stop-timeout', '1', '--name', name,
+      '--label', `${LABEL_ENVIRONMENT_ID}=${environmentId}`, '--label', `${TEST_RUN_LABEL}=${run.runId}`,
+      TEST_BASE_IMAGE, 'sleep', '3600',
+    ]);
+    const now = isoTime(systemClock);
+    const entry = {
+      id: environmentId,
+      repository: REPOSITORY,
+      configPath: '.devcontainer/devcontainer.json',
+      volumeName: name,
+      containerName: name,
+      createdAt: now,
+      lastUsedAt: now,
+      owner: TEST_ACCOUNT,
+      dockerHost: '',
+    };
+    await starter.registry.add({ ...entry });
+    await deleter.registry.add({ ...entry });
+
+    const start = targets.withOperation(() => starter.service.openEnvironment(environmentId, { progress: new RecordingProgress() })).then(
+      () => undefined,
+      (error: unknown) => error as Error,
+    );
+    // A Start that ends before its question fails the test at once (instead of at the time limit of the test).
+    await Promise.race([
+      questionOpen,
+      start.then((error) => {
+        throw new Error(`The Start ended before its question: ${error?.message ?? 'it succeeded'}`);
+      }),
+    ]);
+    const deleteStartedAt = Date.now();
+    const deleting = targets
+      .withOperation(() => deleter.service.delete(environmentId, { progress: new RecordingProgress(), additionalVolumesToRemove: [] }))
+      .then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      );
+    void deleting.finally(() => deleteEnded());
+    const deleteError = await deleting;
+    const deleteTook = Date.now() - deleteStartedAt;
+    expect(deleteError?.message).toBe(PipelineTexts.environmentLockBusy(REPOSITORY));
+    expect(deleteTook).toBeGreaterThanOrEqual(ENVIRONMENT_LOCK_WAIT_SECONDS * 1000 - 500);
+    // The refused Delete removed nothing and left no busy mark.
+    expect(cli.container(name)).toBeDefined();
+    expect((await deleter.registry.get(environmentId))?.busy).toBeUndefined();
+    // The Start's answer "Delete environment" deletes it under the Start's lock, and the open ends as cancelled.
+    expect((await start)?.message).toBe('The operation was cancelled.');
+    expect(cli.container(name)).toBeUndefined();
+    expect(await starter.registry.get(environmentId)).toBeUndefined();
+    expect((await deleter.registry.get(environmentId))?.id).toBe(environmentId);
   });
 });
