@@ -202,11 +202,15 @@ export class RemoteSessionMonitor {
    *   killed before it wrote its marker does it wait up to 60 s for an input, as `running`, and this check catches it);
    *   review round 2 of PR #69 (A-R2-1, A-R2-2): only definite evidence of another or no stored script (storedScript
    *   `other`) → `docker rm -f`, then create; a check that fails keeps it (logged), and a paused one is kept without a
-   *   check (Docker refuses `docker exec` in a paused container);
+   *   check (Docker refuses `docker exec` in a paused container); known gap of plan step 8 (fixed): a check that fails
+   *   is followed by checkAgain (an inspect by the same ID: restarting, exited with LOADER_EXIT_CODE or a grown
+   *   RestartCount → replaced; still running → one more check), so a check cut off by the exit of the loader no longer
+   *   keeps a monitor in an exit-3 loop;
    * - the matching label and exited with an exit code other than LOADER_EXIT_CODE → `docker start <ID>` (the loader
    *   resumes from the stored script); review round 4 of PR #69 (A-R4-4): then the stored script is checked as for a
    *   restarted one: `same` → started; definite evidence of another or no stored script (`other`: a first run killed
-   *   before its script was stored exits 3 at once) → `docker rm -f <ID>`, then create; a check that fails → kept (logged);
+   *   before its script was stored exits 3 at once) → `docker rm -f <ID>`, then create; a check that fails → checkAgain
+   *   as for a restarted one, then kept (logged) without evidence;
    * - created (any label): review round 4 of PR #69 (A-R4-1): it may be the create of another window between its create
    *   and its start, so ensure looks again, 12.75 s at most (REMOTE_MONITOR_CREATED_WAITS_MS; a cancellation ends the
    *   wait), while the same ID stays `created`; review round 5 of PR #69 (A-R5-2): when another ID is found still
@@ -348,8 +352,10 @@ export class RemoteSessionMonitor {
       // (a normal open, or the create of another window that is still loading) needs no extra call. Review round 2 of
       // PR #69 (A-R2-1): a paused one is kept without a check (Docker refuses `docker exec` in it).
       if (current.restartCount === 0 || current.status === 'paused') return 'running';
-      // Review round 2 of PR #69 (A-R2-2): only definite evidence replaces it; a check that fails keeps it.
-      const stored = await this.storedScript(script, signal);
+      // Review round 2 of PR #69 (A-R2-2): only definite evidence replaces it; a check that fails keeps it. Known gap of
+      // plan step 8 (fixed): a check cut off by the exit of the loader is followed by checkAgain.
+      let stored = await this.storedScript(script, signal);
+      if (stored === 'unknown') stored = await this.checkAgain(current, script, signal);
       if (stored === 'same') return 'running';
       if (stored === 'unknown') {
         logger.info(`The Session Monitor on the Docker host was restarted and its stored script could not be checked; it is kept (${this.containerName}).`);
@@ -364,7 +370,10 @@ export class RemoteSessionMonitor {
       // a first run killed before its script was stored exits 3 again at once. Only definite evidence replaces it.
       const id = this.idOf(current);
       await this.docker(['start', id], signal);
-      const stored = await this.storedScript(script, signal);
+      let stored = await this.storedScript(script, signal);
+      // Review round 1 of PR #83 (B-R1-1): `docker start` resets RestartCount to 0, so the count before the start is no
+      // base for a restart by the policy after it.
+      if (stored === 'unknown') stored = await this.checkAgain({ ...current, restartCount: 0 }, script, signal);
       if (stored === 'same') {
         logger.info(`The Session Monitor on the Docker host was started again (${this.containerName}).`);
         return 'started';
@@ -380,6 +389,31 @@ export class RemoteSessionMonitor {
     const how = current.status === 'exited' ? `exited with ${current.exitCode}` : current.status;
     logger.info(`The Session Monitor on the Docker host does not run (${how}); it is replaced (${this.containerName}).`);
     return 'replace';
+  }
+
+  /**
+   * Known gap of plan step 8 (fixed): after a stored-script check of the container `current` that gave `unknown` (the
+   * `docker exec` may be cut off when the loader exits 3 at once, between two restarts by the policy), the container
+   * of the name is inspected again. The same ID found `restarting`, exited with LOADER_EXIT_CODE, or with a RestartCount
+   * above that of `current` is definite evidence that it exits at once without its script → `other` (replaced by its ID).
+   * The same ID still `running` with the same RestartCount → the stored script is checked once more (its answer counts;
+   * `unknown` again keeps it). An inspect that fails, a missing container, another ID or an ID that cannot be read, or
+   * any other state → `unknown` (no evidence: kept). Only inspects and execs; a cancellation passes (AbortError).
+   */
+  private async checkAgain(current: Inspected & { exists: true }, script: string, signal: AbortSignal | undefined): Promise<StoredScript> {
+    let again: Inspected;
+    try {
+      again = await this.inspect(signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return 'unknown';
+    }
+    if (!again.exists || current.id === undefined || again.id !== current.id) return 'unknown';
+    if (again.status === 'restarting' || (again.status === 'exited' && again.exitCode === LOADER_EXIT_CODE) || again.restartCount > current.restartCount) {
+      return 'other';
+    }
+    if (again.status !== 'running') return 'unknown';
+    return this.storedScript(script, signal);
   }
 
   /**

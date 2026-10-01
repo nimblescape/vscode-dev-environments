@@ -190,6 +190,9 @@ describe('RemoteSessionMonitor.ensure', () => {
       expect.anything(),
       ['start', MONITOR_ID],
       ['exec', 'devenv-session-monitor', 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH],
+      // Known gap of plan step 8 (fixed): changed expectation (before: nothing after the check): the check that fails is
+      // followed by an inspect by the same ID (exited with 0 again: no evidence, kept).
+      expect.arrayContaining(['container', 'inspect', 'devenv-session-monitor']),
     ]);
   });
 
@@ -438,9 +441,12 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
     // Stopped by `docker stop`, a daemon restart without the policy, or an error of the script: the stored script resumes.
     // PR #69 review round 4, A-R4-4: changed expectation (before: ['inspect', 'start']): then the stored script is checked
     // (here an answer without a hash: no evidence, kept).
-    ['exited', 0, 'started', ['inspect', 'start', 'exec']],
-    ['exited', 137, 'started', ['inspect', 'start', 'exec']],
-    ['exited', 1, 'started', ['inspect', 'start', 'exec']],
+    // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'start', 'exec']): a check that fails
+    // is followed by an inspect by the same ID (here exited again with an exit code other than 3 and the same
+    // RestartCount: no evidence, kept).
+    ['exited', 0, 'started', ['inspect', 'start', 'exec', 'inspect']],
+    ['exited', 137, 'started', ['inspect', 'start', 'exec', 'inspect']],
+    ['exited', 1, 'started', ['inspect', 'start', 'exec', 'inspect']],
     // The loader refused (exit 3), or the container never ran as it should: replaced.
     ['exited', 3, 'created', ['inspect', 'rm', 'run']],
     // PR #69 review round 4, A-R4-1: changed expectation (before: ['created', 0, 'created', ['inspect', 'rm', 'run']]):
@@ -650,7 +656,9 @@ describe('RemoteSessionMonitor.ensure (review round 1 of PR #69)', () => {
       const logger = new Log();
       const docker = answering('running', answer);
       expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('running');
-      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'exec']): a check that fails is
+      // followed by an inspect by the same ID and, still running with the same RestartCount, by one more check.
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
       expect(docker.calls[1].args).toEqual(SHA256SUM);
       expect(logger.lines).toEqual([
         'info The Session Monitor on the Docker host was restarted and its stored script could not be checked; it is kept (devenv-session-monitor).',
@@ -1228,7 +1236,9 @@ describe('RemoteSessionMonitor.ensure (review round 3 of PR #69, B-R3)', () => {
     it(`B-R3-1: a failed check with ${what} keeps the monitor`, async () => {
       const docker = restartedWith(result(255, '', stderr));
       expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
-      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'exec']): a check that fails is
+      // followed by an inspect by the same ID and, still running with the same RestartCount, by one more check.
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
     });
   }
 
@@ -1243,7 +1253,9 @@ describe('RemoteSessionMonitor.ensure (review round 3 of PR #69, B-R3)', () => {
     it(`B-R3-2: an answer with ${what} keeps the monitor`, async () => {
       const docker = restartedWith(result(0, stdout));
       expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
-      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'exec']): a check that fails is
+      // followed by an inspect by the same ID and, still running with the same RestartCount, by one more check.
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
       expect(docker.calls[1].args).toEqual(SHA);
     });
   }
@@ -1802,7 +1814,10 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, A-R4)', () => {
       const logger = new Log();
       const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(false, LABEL, 0) : args[0] === 'exec' ? answer : result(0)));
       expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('started');
-      expect(docker.commands()).toEqual(['inspect', 'start', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'start', 'exec']): a check that
+      // fails is followed by an inspect by the same ID (here exited again with an exit code other than 3 and the same
+      // RestartCount: no evidence, kept).
+      expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect']);
       expect(logger.lines).toEqual([
         'info The Session Monitor on the Docker host was started again and its stored script could not be checked; it is kept (devenv-session-monitor).',
       ]);
@@ -1903,7 +1918,9 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, B-R4)', () => {
     it(`B-R4-2: a failed check with ${what} keeps the monitor`, async () => {
       const docker = restartedWith(result(1, '', stderr));
       expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
-      expect(docker.commands()).toEqual(['inspect', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'exec']): a check that fails is
+      // followed by an inspect by the same ID and, still running with the same RestartCount, by one more check.
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
     });
 
     // Verifier note (PR #69 review round 4, A-R4-4): the start path decides on the same check, so the same cases keep a
@@ -1911,7 +1928,10 @@ describe('RemoteSessionMonitor.ensure (review round 4 of PR #69, B-R4)', () => {
     it(`B-R4-2, A-R4-4: a started container whose check fails with ${what} is kept, nothing removed`, async () => {
       const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(false, LABEL, 137) : args[0] === 'exec' ? result(1, '', stderr) : result(0)));
       expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('started');
-      expect(docker.commands()).toEqual(['inspect', 'start', 'exec']);
+      // Known gap of plan step 8 (fixed): changed expectation (before: ['inspect', 'start', 'exec']): a check that
+      // fails is followed by an inspect by the same ID (here exited again with an exit code other than 3 and the same
+      // RestartCount: no evidence, kept).
+      expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect']);
       expect(docker.calls[1].args).toEqual(['start', MONITOR_ID]);
     });
   }
@@ -2155,5 +2175,191 @@ describe('RemoteSessionMonitor.ensure (review round 5 of PR #69, A-R5)', () => {
     await vi.advanceTimersByTimeAsync(2 * sum(REMOTE_MONITOR_CREATED_WAITS_MS));
     expect(await ensured).toBe('created');
     expect(docker.calls.filter((call) => call.args[0] === 'rm').map((call) => call.args)).toEqual([['rm', '-f', OTHER_ID]]);
+  });
+});
+
+// Known gap of plan step 8 (fixed): a restarted monitor whose stored-script check is cut off by the exit 3 of its
+// loader (between two restarts by the policy) was kept, in an exit-3 loop until the next open. A check that gives
+// `unknown` is now followed by an inspect by the same ID: restarting, exited with 3, or a grown RestartCount is definite
+// evidence (replaced by its ID); still running with the same RestartCount → one more check; anything else → kept.
+describe('RemoteSessionMonitor.ensure: remote monitor restart check (known gap of plan step 8)', () => {
+  const NAME = 'remote monitor restart check (known gap of plan step 8)';
+  const SHA = ['exec', 'devenv-session-monitor', 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH];
+  const SAME = result(0, `${bundleHash(SCRIPT)}  ${REMOTE_MONITOR_SCRIPT_PATH}\n`);
+  /** A check cut off by the exit of the loader: the CLI loses the exec without an answer that counts as evidence. */
+  const CUT_OFF = result(1, '', 'Error response from daemon: cannot attach: exec session ended unexpectedly\n');
+  const OTHER_ID = 'beef'.padEnd(64, '2');
+  const KEPT_LOG = 'info The Session Monitor on the Docker host was restarted and its stored script could not be checked; it is kept (devenv-session-monitor).';
+  const REPLACED_LOG = 'info The Session Monitor on the Docker host was restarted without its script; it is replaced (devenv-session-monitor).';
+  /** The answers of inspect and of the checks in order (the last one repeats); any other call succeeds. */
+  const sequenced = (inspects: ReadonlyArray<RunResult | Error>, checks: readonly RunResult[]) => {
+    let inspectIndex = 0;
+    let checkIndex = 0;
+    return new FakeDocker((args) => {
+      if (args[0] === 'container') {
+        const answer = inspects[Math.min(inspectIndex++, inspects.length - 1)];
+        return answer instanceof Error ? Promise.reject(answer) : answer;
+      }
+      if (args[0] === 'exec') return checks[Math.min(checkIndex++, checks.length - 1)];
+      return result(0);
+    });
+  };
+  const RESTARTED = inspected(true, LABEL, 3, 1);
+
+  for (const [what, again] of [
+    ['found restarting', inspected('restarting', LABEL, 3, 1)],
+    ['exited with 3', inspected(false, LABEL, 3, 1)],
+    ['running with a grown RestartCount', inspected(true, LABEL, 3, 2)],
+  ] as const) {
+    it(`${NAME}: unknown, then ${what} → replaced by its ID`, async () => {
+      const logger = new Log();
+      const docker = sequenced([RESTARTED, again, MISSING], [CUT_OFF]);
+      expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('created');
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'rm', 'run']);
+      expect(docker.calls[1].args).toEqual(SHA);
+      expect(docker.calls[2].args.at(-1)).toBe('devenv-session-monitor');
+      expect(docker.calls[3].args).toEqual(['rm', '-f', MONITOR_ID]);
+      expect(logger.lines).toContain(REPLACED_LOG);
+      expect(logger.lines).not.toContain(KEPT_LOG);
+    });
+  }
+
+  it(`${NAME}: unknown, still running with the same RestartCount, the second check same → kept`, async () => {
+    const logger = new Log();
+    const docker = sequenced([RESTARTED, RESTARTED], [CUT_OFF, SAME]);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
+    expect(docker.calls[3].args).toEqual(SHA);
+    expect(logger.lines).toEqual([]);
+  });
+
+  it(`${NAME}: unknown, still running with the same RestartCount, the second check other → replaced by its ID`, async () => {
+    const logger = new Log();
+    const docker = sequenced([RESTARTED, RESTARTED, MISSING], [CUT_OFF, NO_SCRIPT]);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('created');
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec', 'rm', 'run']);
+    expect(docker.calls[4].args).toEqual(['rm', '-f', MONITOR_ID]);
+    expect(logger.lines).toContain(REPLACED_LOG);
+  });
+
+  it(`${NAME}: unknown twice → kept, logged`, async () => {
+    const logger = new Log();
+    const docker = sequenced([RESTARTED, RESTARTED], [CUT_OFF, CUT_OFF]);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect', 'exec']);
+    expect(logger.lines).toEqual([KEPT_LOG]);
+  });
+
+  for (const [what, again] of [
+    ['a failed second inspect', result(1, '', 'error during connect: read: connection reset by peer\n')],
+    ['a second inspect without an answer in time', { exitCode: null, stdout: '', stderr: '', timedOut: true } as unknown as RunResult],
+    ['a second inspect that throws', new Error('spawn docker ENOENT')],
+    ['a container that is gone at the second inspect', MISSING],
+  ] as const) {
+    it(`${NAME}: unknown, then ${what} → kept, nothing removed`, async () => {
+      const logger = new Log();
+      const docker = sequenced([RESTARTED, again], [CUT_OFF]);
+      expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect']);
+      expect(logger.lines).toEqual([KEPT_LOG]);
+    });
+  }
+
+  for (const [what, again] of [
+    ['restarting', inspected('restarting', LABEL, 3, 1, OTHER_ID)],
+    ['exited with 3', inspected(false, LABEL, 3, 1, OTHER_ID)],
+    ['running with a grown RestartCount', inspected(true, LABEL, 3, 5, OTHER_ID)],
+    ['running', inspected(true, LABEL, 0, 1, OTHER_ID)],
+  ] as const) {
+    it(`${NAME}: unknown, then an ID that changed (${what}) → kept, nothing removed`, async () => {
+      const logger = new Log();
+      const docker = sequenced([RESTARTED, again], [CUT_OFF, SAME]);
+      expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('running');
+      expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect']);
+      expect(docker.calls.some((call) => call.args[0] === 'rm')).toBe(false);
+      expect(logger.lines).toEqual([KEPT_LOG]);
+    });
+  }
+
+  it(`${NAME}: unknown, then an ID that cannot be read → kept, nothing removed`, async () => {
+    const docker = sequenced([RESTARTED, inspected('restarting', LABEL, 3, 2, 'not-an-id')], [CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect']);
+  });
+
+  it(`${NAME}: unknown, then paused → kept without another check`, async () => {
+    const docker = sequenced([RESTARTED, inspected('paused', LABEL, 3, 1)], [CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect']);
+  });
+
+  it(`${NAME}: a cancellation during the second inspect passes, nothing removed`, async () => {
+    const docker = sequenced([RESTARTED, abortError()], [CUT_OFF]);
+    await expect(monitor(docker).ensure(TAG, SOCKET, new AbortController().signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(docker.commands()).toEqual(['inspect', 'exec', 'inspect']);
+  });
+
+  it(`${NAME}: the second inspect and check get the signal of ensure`, async () => {
+    const controller = new AbortController();
+    const docker = sequenced([RESTARTED, RESTARTED], [CUT_OFF, SAME]);
+    expect(await monitor(docker).ensure(TAG, SOCKET, controller.signal)).toBe('running');
+    expect(docker.calls[2].options?.signal).toBe(controller.signal);
+    expect(docker.calls[3].options?.signal).toBe(controller.signal);
+  });
+
+  // The start path (an exited container of this version) shares the check.
+  const STOPPED = inspected(false, LABEL, 137, 0);
+  for (const [what, again] of [
+    ['found restarting', inspected('restarting', LABEL, 3, 1)],
+    ['exited with 3', inspected(false, LABEL, 3, 0)],
+    ['running with a grown RestartCount', inspected(true, LABEL, 0, 1)],
+  ] as const) {
+    it(`${NAME}: started, unknown, then ${what} → replaced by its ID`, async () => {
+      const logger = new Log();
+      const docker = sequenced([STOPPED, again, MISSING], [CUT_OFF]);
+      expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('created');
+      expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect', 'rm', 'run']);
+      expect(docker.calls[1].args).toEqual(['start', MONITOR_ID]);
+      expect(docker.calls[4].args).toEqual(['rm', '-f', MONITOR_ID]);
+      expect(logger.lines).toContain('info The Session Monitor on the Docker host was started again without its script; it is replaced (devenv-session-monitor).');
+    });
+  }
+
+  it(`${NAME}: started after earlier restarts (docker start resets RestartCount), unknown, then running with RestartCount 1 → replaced (review round 1 of PR #83, B-R1-1)`, async () => {
+    const docker = sequenced([inspected(false, LABEL, 137, 4), inspected(true, LABEL, 0, 1), MISSING], [CUT_OFF, CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('created');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect', 'rm', 'run']);
+    expect(docker.calls[4].args).toEqual(['rm', '-f', MONITOR_ID]);
+  });
+
+  it(`${NAME}: started, unknown, still running, the second check same → started`, async () => {
+    const logger = new Log();
+    const docker = sequenced([STOPPED, inspected(true, LABEL, 0, 0)], [CUT_OFF, SAME]);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('started');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect', 'exec']);
+    expect(logger.lines).toEqual(['info The Session Monitor on the Docker host was started again (devenv-session-monitor).']);
+  });
+
+  it(`${NAME}: started, unknown twice → kept (started, logged)`, async () => {
+    const logger = new Log();
+    const docker = sequenced([STOPPED, inspected(true, LABEL, 0, 0)], [CUT_OFF, CUT_OFF]);
+    expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('started');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect', 'exec']);
+    expect(logger.lines).toEqual([
+      'info The Session Monitor on the Docker host was started again and its stored script could not be checked; it is kept (devenv-session-monitor).',
+    ]);
+  });
+
+  it(`${NAME}: started, unknown, then a failed second inspect → kept (started), nothing removed`, async () => {
+    const docker = sequenced([STOPPED, result(1, '', 'error during connect: EOF\n')], [CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('started');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect']);
+  });
+
+  it(`${NAME}: started, unknown, then an ID that changed (restarting) → kept (started), nothing removed`, async () => {
+    const docker = sequenced([STOPPED, inspected('restarting', LABEL, 3, 4, OTHER_ID)], [CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('started');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect']);
+    expect(docker.calls.some((call) => call.args[0] === 'rm')).toBe(false);
   });
 });

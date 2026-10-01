@@ -70,5 +70,5 @@ Found in review and left on purpose, because the named step replaces the code (u
 
 | Gap | Effect | Replaced by |
 |---|---|---|
-| A remote monitor restarted by Docker whose stored-script check is cut off by its exit is kept | The monitor stays in an exit-3 loop until the next open | Step 8 (the Session Monitor's work in the worker) |
+| ~~A remote monitor restarted by Docker whose stored-script check is cut off by its exit is kept~~ | Fixed on branch `fix/remote-monitor-restart-check` (before step 8, as it made CI red): a check that gives `unknown` is followed by an inspect by the same ID; `restarting`, exited with 3, or a grown RestartCount replaces it by its ID; still running with the same RestartCount gets one more check; no evidence keeps it | — |
 
