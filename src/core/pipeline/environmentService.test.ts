@@ -3258,6 +3258,19 @@ describe('open: existing environment', () => {
       expect(before!.args).toContain(`${pg}/*`);
     });
 
+    it('fixes only the files of root before up of a resumed clone of a single container when the recorded paths overflowed (review round 1 of PR #81, B-R1-1)', async () => {
+      // Review round 1 of PR #81 (B-R1-1): the overflow branch had no test of its own; the deleted Switch branch test only
+      // covered its copy in switchServiceFolders.
+      const repo = `/workspaces/${REPO.split('/')[1]}`;
+      const pg = `${repo}/pgdata`;
+      await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate, serviceFolders: [pg], serviceFoldersOverflow: true } });
+      await h.service.open(TARGET, options());
+      const before = h.docker.runs.find((run) => run.args[0] === '-c');
+      expect(before).toBeDefined();
+      expect(before!.args.slice(-5)).toEqual(['-path', repo, '-o', '-path', `${repo}/*`]);
+      expect(before!.args).not.toContain(pg);
+    });
+
     it('restores the mark of the ended window when the resumed clone is cancelled', async () => {
       await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
       const controller = new AbortController();

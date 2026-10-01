@@ -1053,7 +1053,7 @@ Status: phases 1 and 2 are implemented, including Docker Compose configurations 
 | ID | Decision | Result | Reason |
 |---|---|---|---|
 | D-2 | Workspace storage | Named Docker volume per environment | Requirement FR-12: a rebuild mounts the same volume again. Faster file access on macOS and Windows. The disadvantage is described in RK-5. |
-| D-3 | Number of environments per repository | One environment per repository and GitHub account. It uses the default branch first and switches to other branches on demand. | Several environments per repository and account are not required for now. Each account has its own environment, so one account does not use the environment of another (see [7.5](#75-environment-model-and-workspace-volume)). Cost: each account has its own clone on the disk. Limit: a named volume whose name depends only on the repository serves the environment of one account only (see section 5). |
+| D-3 | Number of environments per repository | One environment per repository and GitHub account. It is cloned on the default branch; other branches are switched with Git in the dev container (the Switch branch command was dropped on 2026-10-01). | Several environments per repository and account are not required for now. Each account has its own environment, so one account does not use the environment of another (see [7.5](#75-environment-model-and-workspace-volume)). Cost: each account has its own clone on the disk. Limit: a named volume whose name depends only on the repository serves the environment of one account only (see section 5). |
 | D-4 | Action when no window uses an environment | `docker stop` | A stopped container uses no memory. `docker pause` would keep the processes and their memory. |
 
 ## 14. Alternatives considered
