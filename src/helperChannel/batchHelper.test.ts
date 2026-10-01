@@ -10,7 +10,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import {
   BATCH_GIT_HOME,
@@ -369,5 +369,38 @@ describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
     expect(await operations.composeHash({ model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
     expect(quiet).toEqual([kill, rootWalk]);
     expect(quiet).not.toContain(volumeWalk);
+  });
+});
+
+describe('the override folder before a read step (review round 1 of PR #82, B-R1-5)', () => {
+  it('review round 1 of PR #82, B-R1-5: a read step starts without the files that earlier root steps left below OVERRIDE_FOLDER (a folder with files)', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-override-'));
+    const override = path.join(temp, 'override');
+    try {
+      // What `up` or `build` of a Compose configuration leaves there: our configuration and a folder of files.
+      fs.mkdirSync(path.join(override, 'compose'), { recursive: true });
+      fs.writeFileSync(path.join(override, 'devcontainer.json'), '{}');
+      fs.writeFileSync(path.join(override, 'compose', 'model.json'), '{}');
+      const real = (name: string) => (name === OVERRIDE_FOLDER ? override : name);
+      const operations = batchHelperOperations({
+        spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
+        runQuiet: async () => {},
+        fs: {
+          lstatSync: ((name: string) => ({ isDirectory: () => true, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+          chmodSync: (() => {}) as never,
+          chownSync: (() => {}) as never,
+          readdirSync: (() => []) as never,
+          // The real rmSync on the real folder: without `recursive`, a folder is refused (EISDIR or ERR_FS_EISDIR).
+          rmSync: ((name: string, rmOptions: fs.RmOptions) => fs.rmSync(real(name), rmOptions)) as never,
+        },
+        env: {},
+      });
+      expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+      expect(fs.existsSync(override)).toBe(false);
+      // Also when there is nothing to remove.
+      expect(await operations.composeHash({ model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
   });
 });

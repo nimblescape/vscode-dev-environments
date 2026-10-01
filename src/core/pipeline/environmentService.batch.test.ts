@@ -9,14 +9,18 @@
 // listing of configurations) there is no scope. The token write into the dev container uses the secret input of the
 // call (Q4: through the worker that holds the lock). The FakeHelper does not route itself; each of its volume steps
 // runs one step of the scope here, as WorkspaceHelper does.
+import { createHash } from 'crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { currentBatchScope } from '../helper/batchScope';
-import { abortError, type RunResult } from '../ports';
+import { abortError, isAbortError, silentLogger, type RunResult } from '../ports';
+import { batchStepCommand, type BatchStepKind } from '../helper/batchSteps';
+import { composeProjectName } from '../names';
+import { WorkspaceHelper, type HelperDocker, type HelperImageUse } from '../helper/workspaceHelper';
 import type { RepositoryTarget } from './environmentService';
-import { ENV_ID, REPO, TOKEN, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { BASE_IMAGE, DIGEST_NEW, ENV_ID, REPO, TOKEN, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 import { resourceName } from '../names';
 
@@ -45,6 +49,17 @@ let events: string[];
 let scopes: string[];
 /** Runs before each step of a session (for a cancel during a step). */
 let onStep: ((name: string) => void) | undefined;
+/** Review round 1 of PR #82 (B-R1-2): runs when a close starts; the close settles after `closeGate`. */
+let onClose: (() => void) | undefined;
+let closeGate: Promise<void> | undefined;
+/** Review round 1 of PR #82 (B-R1-4): each step of a session, with its kind and parameters. */
+let recorded: Array<{ kind: BatchStepKind; params: unknown }>;
+/**
+ * Review round 1 of PR #82 (B-R1-4): when set, each volume step of the FakeHelper runs as the real WorkspaceHelper runs
+ * it in the scope (with the parameters that the service passes), instead of one `listConfigs` step.
+ */
+let realHelper: WorkspaceHelper | undefined;
+const PINNED: HelperImageUse = { tag: 'devenv-helper:test', id: `sha256:${'4'.repeat(64)}` };
 
 function batchLock(environmentId: string): HeldEnvironmentLock {
   let sessions = 0;
@@ -60,13 +75,16 @@ function batchLock(environmentId: string): HeldEnvironmentLock {
       const handle: HelperBatchSession = {
         session,
         lost: new Promise(() => {}),
-        step: async (kind, _params, options: BatchStepOptions = {}): Promise<RunResult> => {
+        step: async (kind, params, options: BatchStepOptions = {}): Promise<RunResult> => {
+          recorded.push({ kind, params });
           onStep?.(kind);
           if (options.signal?.aborted) throw abortError();
           events.push(`step ${kind} ${session}`);
           return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
         },
         close: async () => {
+          onClose?.();
+          await closeGate;
           events.push(`close ${session}`);
         },
       };
@@ -82,7 +100,12 @@ beforeEach(() => {
   events = [];
   scopes = [];
   onStep = undefined;
+  onClose = undefined;
+  closeGate = undefined;
+  recorded = [];
+  realHelper = undefined;
   h = createHarness({
+    newEnvironmentId: () => ENV_ID,
     environmentLock: async (environmentId) => {
       events.push('lock');
       return batchLock(environmentId);
@@ -95,7 +118,15 @@ beforeEach(() => {
       const scope = currentBatchScope();
       scopes.push(`${name} ${scope?.volume ?? 'none'}`);
       // As WorkspaceHelper.runInBatch: the step goes to the session of the scope (opened at the first step).
-      if (scope !== undefined) {
+      if (scope !== undefined && realHelper !== undefined) {
+        const real = realHelper as unknown as Record<string, (p: unknown) => Promise<unknown>>;
+        // Its result is not used (the FakeHelper answers); a refusal or a cancel goes on as in WorkspaceHelper.
+        // The fake containers have IDs of their own; Docker's are hexadecimal.
+        const ids = 'containerId' in p ? { containerId: createHash('sha256').update(String(p.containerId)).digest('hex') } : {};
+        await real[name]({ ...p, ...ids, image: PINNED }).catch((error: unknown) => {
+          if (error instanceof UserFacingError || isAbortError(error)) throw error;
+        });
+      } else if (scope !== undefined) {
         await scope.step({ volume: p.volumeName, kind: 'listConfigs', params: {}, options: { signal: p.signal } }, async () => ({ image: `sha256:${'4'.repeat(64)}`, socket: '/var/run/docker.sock' }));
       }
       return original(p);
@@ -187,4 +218,112 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
       expect(write.command.some((arg) => arg.includes(TOKEN))).toBe(false);
     }
   });
+
+  // Review round 1 of PR #82: the tests of reviewer B (mutation testing).
+
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+
+  /** One turn of the event loop (no timer). */
+  const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+  it('review round 1 of PR #82, B-R1-2: the lock is released only after the close of the session settled', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    const closing = deferred();
+    const gate = deferred();
+    onClose = closing.resolve;
+    closeGate = gate.promise;
+    const run = h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    await closing.promise;
+    await turn();
+    expect(events).not.toContain('release');
+    gate.resolve();
+    await run;
+    expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
+  });
+
+  it('review round 1 of PR #82, B-R1-2: a failed first open removes the volume only after the close of the session settled', async () => {
+    h.helper.cloneError = new Error('Repository not found');
+    const closing = deferred();
+    const gate = deferred();
+    onClose = closing.resolve;
+    closeGate = gate.promise;
+    const run = h.service.open(TARGET, { progress: h.progress }).catch(() => undefined);
+    await closing.promise;
+    await turn();
+    expect(events).not.toContain('docker volume rm');
+    gate.resolve();
+    await run;
+    const [open] = frame().filter((event) => event.startsWith('open'));
+    expect(frame()).toEqual(['lock', open, 'close s1', 'docker volume rm', 'release']);
+  });
+
+  /** A HelperDocker for the real WorkspaceHelper: in the scope it runs nothing. */
+  const noDocker: HelperDocker = {
+    run: async () => {
+      throw new Error('A docker run in the scope.');
+    },
+    imageExists: async () => true,
+    imageId: async () => PINNED.id,
+    buildImage: async () => PINNED.id,
+    listImagesByLabel: async () => [],
+    removeImage: async () => true,
+  };
+
+  const COMPOSE_CONFIG = `{
+  "name": "API",
+  "dockerComposeFile": ["compose.yml"],
+  "service": "app",
+  "workspaceFolder": "/workspaces/\${localWorkspaceFolderBasename}"
+}`;
+
+  const opens: Array<[string, () => Promise<unknown>, BatchStepKind[]]> = [
+    ['single container (first open)', () => h.service.open(TARGET, { progress: h.progress }), ['clone', 'readConfiguration', 'build', 'up', 'gitFiles', 'runUserCommands']],
+    [
+      'Docker Compose (first open)',
+      () => {
+        h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: COMPOSE_CONFIG } };
+        h.helper.composeOutput = {
+          version: '2.40.3',
+          dollarEscaped: true,
+          model: { name: composeProjectName(ENV_ID), services: { app: { image: BASE_IMAGE, command: ['sleep', 'infinity'] } } },
+          dockerfiles: {},
+          realPaths: {},
+          inputsHash: 'inputs-1',
+        };
+        h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW });
+        return h.service.open(TARGET, { progress: h.progress });
+      },
+      ['clone', 'readConfiguration', 'composeModel', 'build', 'up'],
+    ],
+    [
+      'Rebuild',
+      async () => {
+        await seedEnvironment(h, { container: 'running' });
+        return h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+      },
+      ['readConfiguration', 'build', 'up', 'runUserCommands'],
+    ],
+    [
+      'Clone again',
+      async () => {
+        await seedEnvironment(h, { volume: false, container: null });
+        h.ui.filesMissingAnswer = 'cloneAgain';
+        return h.service.open(TARGET, { progress: h.progress });
+      },
+      ['clone', 'readConfiguration', 'up', 'runUserCommands'],
+    ],
+  ];
+  for (const [name, open, kinds] of opens) {
+    it(`review round 1 of PR #82, B-R1-4: every step of a whole open is one the batch helper accepts (batchStepCommand): ${name}`, async () => {
+      realHelper = new WorkspaceHelper({ docker: noDocker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux' });
+      await open();
+      expect(frame().filter((event) => event.startsWith('open '))).toHaveLength(1);
+      expect(recorded.map((step) => step.kind)).toEqual(expect.arrayContaining(kinds));
+      for (const step of recorded) expect(() => batchStepCommand(step.kind, step.params), step.kind).not.toThrow();
+    });
+  }
 });

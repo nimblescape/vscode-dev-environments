@@ -152,6 +152,13 @@ export class BatchScope {
       if (isAbortError(error) || step.options.signal?.aborted) throw error;
       throw this.refuse(`The batch helper on the volume ${this.volume} could not be ${reopen ? 'opened again' : 'opened'}: ${errorMessage(error)}`);
     }
+    // Review round 1 of PR #82 (B-R1-1): the lock may be lost while the session opens; its loss found no session to close
+    // then, so the new one is closed here and the step is refused (never a step without the lock).
+    if (this.lockLost !== undefined || !this.active) {
+      await session.close();
+      if (!this.active) throw this.refuse(`The step ${step.kind} came after the end of the operation`);
+      throw this.refuse(`The lock of the environment was lost (${this.lockLost}) while the batch helper opened, so the step ${step.kind} is not run`);
+    }
     this.session = session;
     void session.lost.then((reason) => {
       if (this.session === session) this.sessionLost = reason;

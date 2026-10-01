@@ -15,9 +15,10 @@ import { UserFacingError } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
-import type { BatchStepKind } from './batchSteps';
+import { batchStepCommand, type BatchStepKind } from './batchSteps';
+import { COMPOSE_MODEL_PATH } from './compose';
 import { currentBatchScope, runWithBatchScope } from './batchScope';
-import { WorkspaceHelper, type HelperDocker, type HelperImageUse } from './workspaceHelper';
+import { WorkspaceHelper, type HelperDeps, type HelperDocker, type HelperImageUse } from './workspaceHelper';
 
 const TOKEN = 'gho_0123456789abcdefSECRET';
 const VOLUME = 'devenv-acme-app-3f2a9c1e';
@@ -44,10 +45,15 @@ class FakeSession implements HelperBatchSession {
   }
   async step(kind: BatchStepKind, params: unknown, options: BatchStepOptions = {}): Promise<RunResult> {
     this.world.steps.push({ session: this.session, kind, params, options });
+    // Review round 1 of PR #82 (B-R1-1): as HelperChannel, a closed session runs no step.
+    if (this.closed > 0) throw new HelperChannelError('closed', 'The batch helper is closed.');
     return this.world.stepResult(kind, this);
   }
   async close(): Promise<void> {
     this.closed++;
+    // Review round 1 of PR #82 (B-R1-2): a real close is a round trip to the worker; `closeGate` holds it.
+    this.world.onClose?.(this);
+    await this.world.closeGate;
     this.world.events.push(`close ${this.session}`);
   }
 }
@@ -55,9 +61,16 @@ class FakeSession implements HelperBatchSession {
 /** A held lock whose `batch` opens FakeSessions (or fails with `openError`). */
 class FakeLock implements HeldEnvironmentLock {
   readonly environmentId = ENVIRONMENT_ID;
-  readonly lost = new Promise<string>(() => {});
+  /** Review round 1 of PR #82 (B-R1-1): `lose` resolves `lost`, as the lock does when it was lost. */
+  lose!: (reason: string) => void;
+  readonly lost = new Promise<string>((resolve) => (this.lose = resolve));
   readonly sessions: FakeSession[] = [];
   readonly opens: Array<{ volume: string; image: string; socket: string }> = [];
+  /** Review round 1 of PR #82 (B-R1-3): the signal of each open. */
+  readonly openSignals: Array<AbortSignal | undefined> = [];
+  /** Review round 1 of PR #82 (B-R1-2): runs when a close starts; the close settles after `closeGate`. */
+  onClose: ((session: FakeSession) => void) | undefined;
+  closeGate: Promise<void> | undefined;
   readonly steps: StepCall[] = [];
   readonly events: string[] = [];
   openError: Error | undefined;
@@ -66,8 +79,9 @@ class FakeLock implements HeldEnvironmentLock {
     throw new Error('not used');
   }
   async release(): Promise<void> {}
-  batch = async (p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> => {
+  batch = async (p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession> => {
     this.opens.push(p);
+    this.openSignals.push(signal);
     if (this.openError) throw this.openError;
     const session = new FakeSession(`s${this.sessions.length + 1}`, this);
     this.sessions.push(session);
@@ -100,9 +114,9 @@ class RecordingDocker implements HelperDocker {
   }
 }
 
-function setup() {
+function setup(engine?: HelperDeps['engine']) {
   const docker = new RecordingDocker();
-  const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux' });
+  const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux', ...(engine ? { engine } : {}) });
   const lock = new FakeLock();
   return { docker, helper, lock };
 }
@@ -391,5 +405,223 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     });
     expect(most).toBe(1);
     expect(lock.opens).toHaveLength(1);
+  });
+
+  // Review round 1 of PR #82: the tests of reviewer B (mutation testing).
+
+  /** A promise and its resolve (no timers). */
+  function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+
+  /** One turn of the event loop: every pending microtask has run (no timer). */
+  const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+  it('review round 1 of PR #82, B-R1-1: after the lock was lost between two steps, no later step runs, also while the session still answers', async () => {
+    const { docker, helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
+      lock.lose('its hold limit was reached');
+      // After the handler of the scope (registered first).
+      await lock.lost;
+      const error = await refusal(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe('The lock of the environment was lost (its hold limit was reached), so the step listConfigs is not run');
+      await expect(helper.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: 'a.json', image: IMAGE })).rejects.toBe(error);
+    });
+    expect(lock.steps).toHaveLength(1);
+    expect(lock.opens).toHaveLength(1);
+    expect(lock.sessions[0].closed).toBeGreaterThan(0);
+    expect(docker.runs).toEqual([]);
+  });
+
+  it('review round 1 of PR #82, B-R1-1: a lock lost while the session opens closes the new session and runs no step', async () => {
+    const { docker, helper, lock } = setup();
+    const open = lock.batch;
+    lock.batch = async (p, signal) => {
+      const session = await open(p, signal);
+      // The lock ends before the open answers: its loss finds no session of the scope to close.
+      lock.lose('the worker was lost');
+      await lock.lost;
+      await turn();
+      return session;
+    };
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      const error = await refusal(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
+      expect(error.code).toBe('helperFailed');
+      expect(error.detail).toBe('The lock of the environment was lost (the worker was lost) while the batch helper opened, so the step listConfigs is not run');
+    });
+    expect(lock.steps).toEqual([]);
+    expect(lock.sessions[0].closed).toBeGreaterThan(0);
+    expect(docker.runs).toEqual([]);
+  });
+
+  it('review round 1 of PR #82, B-R1-2: runWithBatchScope settles only after the close of the session settled', async () => {
+    const { helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    const closing = deferred();
+    const gate = deferred();
+    lock.onClose = () => closing.resolve();
+    lock.closeGate = gate.promise;
+    let settled = false;
+    const run = runWithBatchScope(lock, VOLUME, silentLogger, () => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })).finally(() => {
+      settled = true;
+    });
+    await closing.promise;
+    await turn();
+    expect(settled).toBe(false);
+    expect(lock.events).toEqual(['open s1']);
+    gate.resolve();
+    await run;
+    expect(lock.events).toEqual(['open s1', 'close s1']);
+  });
+
+  it('review round 1 of PR #82, B-R1-2: closeSession resolves only after the close settled, so the volume is removed after it', async () => {
+    const { helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    const closing = deferred();
+    const gate = deferred();
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
+      lock.onClose = () => closing.resolve();
+      lock.closeGate = gate.promise;
+      const closed = currentBatchScope()!
+        .closeSession()
+        .then(() => lock.events.push('volume rm'));
+      await closing.promise;
+      await turn();
+      expect(lock.events).toEqual(['open s1']);
+      gate.resolve();
+      await closed;
+    });
+    expect(lock.events).toEqual(['open s1', 'close s1', 'volume rm']);
+  });
+
+  it('review round 1 of PR #82, B-R1-3: the cancel of the caller reaches the open and every step of the session', async () => {
+    const { helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    const controller = new AbortController();
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE, signal: controller.signal });
+      await helper.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:1', image: IMAGE, signal: controller.signal }).catch(() => undefined);
+    });
+    expect(lock.openSignals).toEqual([controller.signal]);
+    expect(lock.steps.map((step) => step.options.signal)).toEqual([controller.signal, controller.signal]);
+  });
+
+  it('review round 1 of PR #82, B-R1-3: a step with an aborted signal is cancelled before anything opens or runs; the scope goes on', async () => {
+    const { docker, helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    const controller = new AbortController();
+    controller.abort();
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      await expect(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE, signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+      expect(lock.opens).toEqual([]);
+      expect(lock.steps).toEqual([]);
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
+    });
+    expect(lock.steps).toHaveLength(1);
+    expect(docker.runs).toEqual([]);
+  });
+
+  it('review round 1 of PR #82, B-R1-3: a step or an open that fails with any error after the cancel is the cancel, never a refusal of the scope', async () => {
+    for (const where of ['step', 'open'] as const) {
+      const { helper, lock } = setup();
+      const controller = new AbortController();
+      const plain = new HelperChannelError('lost', 'The batch helper ended.');
+      lock.stepResult = async () => {
+        if (controller.signal.aborted) return { exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false };
+        controller.abort();
+        throw plain;
+      };
+      if (where === 'open') {
+        const open = lock.batch;
+        lock.batch = async (p, signal) => {
+          if (controller.signal.aborted) return open(p, signal);
+          controller.abort();
+          lock.opens.push(p);
+          throw plain;
+        };
+      }
+      await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+        const failed = helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE, signal: controller.signal });
+        await expect(failed, where).rejects.toBe(plain);
+        // The scope did not refuse: the next step (of the next operation's caller) runs.
+        await expect(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), where).resolves.toEqual(['a']);
+      });
+      expect(lock.steps.map((step) => step.kind), where).toEqual(where === 'step' ? ['listConfigs', 'listConfigs'] : ['listConfigs']);
+    }
+  });
+
+  it('review round 1 of PR #82, B-R1-4: every step of the scope makes in the helper the command, variables and input of its per-step run (batchStepCommand)', async () => {
+    const E = ENVIRONMENT_ID;
+    const env = { COMPOSE_PROJECT_NAME: 'p' };
+    const override = { name: 'o' };
+    const calls: Array<[BatchStepKind, (helper: WorkspaceHelper) => Promise<unknown>]> = [
+      ['clone', (h) => h.clone({ volumeName: VOLUME, repository: 'acme/app', branch: 'dev', token: TOKEN, image: IMAGE })],
+      ['readFiles', (h) => h.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/a/devcontainer.json', dockerfile: 'Dockerfile.dev', image: IMAGE })],
+      ['listConfigs', (h) => h.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })],
+      ['readConfiguration', (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: E, merged: true, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:7', env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:7', override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
+      ['composeModel', (h) => h.composeModel({ volumeName: VOLUME, repository: 'acme/app', files: ['/workspaces/app/compose.yml'], project: 'p', image: IMAGE })],
+      ['composeHash', (h) => h.composeServiceHashes({ volumeName: VOLUME, repository: 'acme/app', model: '{"a":1}', project: 'p', image: IMAGE })],
+      ['createFolders', (h) => h.createRepositoryFolders({ volumeName: VOLUME, repository: 'acme/app', folders: ['/workspaces/app/data'], image: IMAGE })],
+      ['up', (h) => h.up({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, removeExistingContainer: true, env, token: TOKEN, image: IMAGE })],
+      ['runUserCommands', (h) => h.runUserCommands({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, containerId: 'abcdef012345', env, token: TOKEN, image: IMAGE })],
+      ['gitFiles', (h) => h.prepareGit({ volumeName: VOLUME, repository: 'acme/app', identity: { name: 'Octo', email: 'octo@example.com' }, image: IMAGE })],
+      ['ownershipFix', (h) => h.fixConfigOwnership({ volumeName: VOLUME, folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 5000, image: IMAGE })],
+    ];
+    for (const [kind, call] of calls) {
+      // The per-step run (outside a scope): its command after the image, its `-e` variables, its standard input.
+      const single = setup();
+      await call(single.helper).catch(() => undefined);
+      const [run] = single.docker.runs;
+      const at = run.args.indexOf(IMAGE.id!);
+      const runEnv: Record<string, string> = {};
+      for (let i = 0; i < at; i++) {
+        if (run.args[i] !== '-e') continue;
+        const [name, ...value] = run.args[i + 1].split('=');
+        runEnv[name] = value.join('=');
+      }
+      // The same call as a step of the scope.
+      const { helper, lock } = setup();
+      await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
+      // (readConfiguration reads once more when its first output has no configuration.)
+      expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
+      const command = batchStepCommand(kind, lock.steps[0].params);
+      expect(command.command, kind).toEqual(run.args.slice(at + 1));
+      expect(command.env, kind).toEqual(runEnv);
+      // The clone takes the token as its secret, not as the input of the per-step run.
+      if (kind !== 'clone') expect(command.input, kind).toBe(run.options.input);
+    }
+  });
+
+  it('review round 1 of PR #82, B-R1-6: a step that comes after the end of the scope is refused and opens nothing', async () => {
+    const { helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    const later = deferred();
+    let late!: Promise<unknown>;
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
+      // A continuation that keeps the context of the scope beyond its end (not awaited by the operation).
+      late = later.promise.then(() => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
+    });
+    later.resolve();
+    const error = await refusal(late);
+    expect(error.code).toBe('helperFailed');
+    expect(error.detail).toBe('The step listConfigs came after the end of the operation');
+    expect(lock.opens).toHaveLength(1);
+    expect(lock.events).toEqual(['open s1', 'close s1']);
+  });
+
+  it('review round 1 of PR #82, B-R1-7: the session opens with the socket of the engine of the operation', async () => {
+    const { helper, lock } = setup(async () => ({ key: 'build-box', socket: '/run/user/1000/docker.sock' }));
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    await runWithBatchScope(lock, VOLUME, silentLogger, () => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
+    expect(lock.opens).toEqual([{ volume: VOLUME, image: IMAGE.id, socket: '/run/user/1000/docker.sock' }]);
   });
 });
