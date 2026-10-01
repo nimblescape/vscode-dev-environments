@@ -1185,10 +1185,36 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  it('plan step 7: the safety check of a volume without the repository folder runs as nobody in one batch helper and gives the recorded state', async () => {
+    const repository = 'devenv-test/empty';
+    const id = newEnvironmentId();
+    const name = resourceName(repository, id);
+    const recorded = { branch: 'old', uncommittedFiles: 3, unpushedCommits: 2, stashes: 1, recordedAt: '2026-09-20T10:00:00.000Z' };
+    try {
+      await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+      const now = isoTime(systemClock);
+      await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
+      // The folder is missing: the step runs as nobody, its `cd` fails, and the check gives the recorded state (as before).
+      expect(await online.safetyCheck(id, { progress: new RecordingProgress() })).toEqual(recorded);
+      expect(locks.batches.get(id) ?? []).toHaveLength(1);
+      expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_RUN}=true`, '--filter', `volume=${name}`])).toEqual([]);
+    } finally {
+      await registry.remove(id);
+      cli.run(['volume', 'rm', name]);
+    }
+  });
+
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {
     const progress = new RecordingProgress();
+    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
     const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
+    // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the Git summary ran in exactly one batch
+    // helper under the lock, as the owner of the repository (the remote user after the ownership fix), and no helper is
+    // left. Its counts are those of before (the untracked file, the one commit without a remote).
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
+    expect((await registry.get(environmentId))?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    expect(helperContainers()).toEqual([]);
 
     await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));
     expect(containersOfEnvironment()).toEqual([]);

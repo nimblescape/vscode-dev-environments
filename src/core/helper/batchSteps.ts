@@ -7,7 +7,7 @@
 // inputs of its builder; the helper checks them strictly here and builds the command itself with the builders of the
 // per-step runs (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts), as WorkspaceHelper does. It never runs a
 // command line that it was sent. Pure functions. No `vscode`.
-import { configOwnershipFixCommand } from '../git/gitSummary';
+import { configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { isStorageId } from '../storage/paths';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -41,6 +41,7 @@ export const BATCH_STEP_KINDS = [
   'runUserCommands',
   'gitFiles',
   'ownershipFix',
+  'gitSummary',
 ] as const;
 export type BatchStepKind = (typeof BATCH_STEP_KINDS)[number];
 
@@ -71,7 +72,8 @@ export interface BatchStepCommand {
    * replaces option A, the Git user): the repository folder whose owner (uid:gid, read with lstat at step time) runs the
    * step, as root when root owns it. The Docker Compose read steps (composeModel, composeHash): Compose follows `env_file`
    * and `include` of the repository, so it reads as that user, with CONFIG_FOLDER root's and 0700 during the step. By the
-   * agreed extension of the same day, readFiles, listConfigs and createFolders too. The steps that need the Docker
+   * agreed extension of the same day, readFiles, listConfigs and createFolders too; plan step 7 (user decision of
+   * 2026-10-01, "step 7 proposal accepted"): gitSummary, Delete's check, too. The steps that need the Docker
    * socket (readConfiguration, build, up, runUserCommands) and gitFiles and ownershipFix stay root; the clone stays Git's.
    */
   owner?: string;
@@ -316,6 +318,16 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const p = fields(kind, params, ['folder', 'uid', 'gid']);
       if (p.folder !== CONFIG_FOLDER) fail(kind);
       return { command: checked(kind, () => configOwnershipFixCommand(CONFIG_FOLDER, text(kind, p.uid, 16), text(kind, p.gid, 16))), env: {}, git: false };
+    }
+    case 'gitSummary': {
+      // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): Delete's Git summary (GIT_SUMMARY_SCRIPT,
+      // built as WorkspaceHelper.gitSummary builds it) runs as the owner of the repository, like the other read steps: so
+      // Git meets no "dubious ownership", and a program that the repository configuration names (a filter driver) runs as
+      // that user, without the socket and with CONFIG_FOLDER closed. A folder that is missing (or a link) runs as nobody,
+      // so its `cd` fails and the check reports it as before. No secret.
+      const p = fields(kind, params, ['repository']);
+      const { folder } = folderOf(kind, p.repository);
+      return { command: gitSummaryCommand(folder), env: {}, git: false, owner: folder };
     }
     default:
       throw new BatchStepError(`The batch helper does not know the step ${String(kind).slice(0, 64)}.`);

@@ -5628,7 +5628,8 @@ export class EnvironmentService {
   }
 
   /**
-   * Safety check before Delete (concept 7.14 step 1), through the workspace helper on the volume. Starts Docker if needed.
+   * Safety check before Delete (concept 7.14 step 1), through the workspace helper on the volume (plan step 7: a step of
+   * the batch helper under the lock of the environment, released before this returns). Starts Docker if needed.
    * `undefined` when the volume is missing. When Git cannot read the repository, the last recorded state (or
    * `undefined`), so that known changes are still named (FR-09) and a broken clone can still be deleted.
    * A new result is recorded in the registry.
@@ -5644,7 +5645,15 @@ export class EnvironmentService {
       if (!(await this.deps.docker.volumeExists(env.volumeName))) return undefined;
       let summary: GitSummary;
       try {
-        summary = await this.deps.helper.gitSummary({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
+        // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the Git summary runs as a step of the
+        // batch helper of the volume under the lock of the environment (D1: refused when either cannot be had; D3: busy
+        // after 10 s). The lock is released before the user's confirmation; Delete takes it again (deleteLocked).
+        summary = await this.withEnvironmentLock(
+          env,
+          options.signal,
+          () => this.deps.helper.gitSummary({ volumeName: env.volumeName, repository: env.repository, signal: options.signal }),
+          { batchVolume: env.volumeName },
+        );
       } catch (error) {
         if (this.isCancellation(error, options.signal) || isUserFacingError(error)) throw error;
         this.logger.warn(`The Git state of ${env.repository} could not be read: ${errorDetail(error)}`);

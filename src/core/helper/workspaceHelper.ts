@@ -1118,6 +1118,8 @@ export class WorkspaceHelper {
   async gitSummary(p: { volumeName: string; repository: string; signal?: AbortSignal }): Promise<GitSummary> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, gitSummaryCommand(folder), {
+      // Plan step 7 (user decision of 2026-10-01): a step of the batch helper, as the owner of the repository.
+      batch: { kind: 'gitSummary', params: { repository: p.repository } },
       docker: false,
       network: false,
       signal: p.signal,

@@ -9,9 +9,13 @@
 // is replaced once under the same lock, a failed reopen refuses; a step that fails because its session was lost fails
 // the operation and is never repeated; the session is closed on success, failure and cancel; outside the scope the
 // per-step run is unchanged.
-import { describe, expect, it } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { describe, expect, it, onTestFinished } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError, isBatchHelperUnavailable } from '../errors';
+import { CommandError, UserFacingError, isBatchHelperUnavailable } from '../errors';
+import { gitSummaryCommand } from '../git/gitSummary';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
@@ -121,6 +125,15 @@ function setup(engine?: HelperDeps['engine']) {
   return { docker, helper, lock };
 }
 
+/** Plan step 7: setup with a Dockerfile, for a step without a pinned image (the image of the window, WorkspaceHelper.image). */
+function setupWithImage() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-batch-scope-'));
+  fs.writeFileSync(path.join(dir, 'Dockerfile'), 'FROM node:22-bookworm-slim\n');
+  const docker = new RecordingDocker();
+  const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux' });
+  return { docker, helper, lock: new FakeLock(), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
 async function refusal(promise: Promise<unknown>): Promise<UserFacingError> {
   try {
     await promise;
@@ -228,7 +241,8 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const cases: Array<[string, (helper: WorkspaceHelper) => Promise<unknown>, (lock: FakeLock) => HeldEnvironmentLock, string]> = [
       ['no batch', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), (lock) => ({ ...lock, environmentId: lock.environmentId, lost: lock.lost, docker: lock.docker, release: lock.release, batch: undefined }), 'has no batch helper'],
       ['run', (helper) => helper.run(VOLUME, ['sh', '-c', 'true']), (lock) => lock, 'has no step in the batch helper'],
-      ['gitSummary', (helper) => helper.gitSummary({ volumeName: VOLUME, repository: 'acme/app' }), (lock) => lock, 'has no step in the batch helper'],
+      // Plan step 7 (user decision of 2026-10-01): changed expectation, gitSummary is a step of the batch helper now
+      // (its routing is checked with the other kinds), so it is no longer refused here.
       ['volume', (helper) => helper.listConfigurations({ volumeName: 'other', repository: 'acme/app', image: IMAGE }), (lock) => lock, 'is for the volume other'],
       ['no image ID', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: { tag: IMAGE.tag } }), (lock) => lock, 'the ID of the helper image'],
     ];
@@ -603,6 +617,34 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       // The clone takes the token as its secret, not as the input of the per-step run.
       if (kind !== 'clone') expect(command.input, kind).toBe(run.options.input);
     }
+  });
+
+  it('plan step 7: the Git summary of Delete is the step gitSummary, with the image of the window (no pinned image), and parses its output', async () => {
+    const { docker, helper, lock, cleanup } = setupWithImage();
+    onTestFinished(cleanup);
+    lock.stepResult = async () => ({ exitCode: 0, stdout: 'main\n2\n1\n0\n', stderr: '', timedOut: false });
+    const summary = await runWithBatchScope(lock, VOLUME, silentLogger, () => helper.gitSummary({ volumeName: VOLUME, repository: 'acme/app' }));
+    expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0 });
+    expect(lock.steps.map((step) => [step.kind, step.params])).toEqual([['gitSummary', { repository: 'acme/app' }]]);
+    expect(lock.steps[0].options.secret).toBeUndefined();
+    expect(batchStepCommand('gitSummary', lock.steps[0].params)).toEqual({ command: gitSummaryCommand('/workspaces/app'), env: {}, git: false, owner: '/workspaces/app' });
+    // The image of the window (WorkspaceHelper.image), by its ID.
+    expect(lock.opens).toEqual([{ volume: VOLUME, image: IMAGE.id, socket: '/var/run/docker.sock' }]);
+    expect(docker.runs.filter((run) => run.args[0] === 'run')).toEqual([]);
+  });
+
+  it('plan step 7: a Git summary that fails in the helper is a CommandError (Delete then shows the recorded state), not a refusal', async () => {
+    const { helper, lock, cleanup } = setupWithImage();
+    onTestFinished(cleanup);
+    lock.stepResult = async () => ({ exitCode: 2, stdout: '', stderr: "sh: cd: can't cd to /workspaces/app", timedOut: false });
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      const error = await helper.gitSummary({ volumeName: VOLUME, repository: 'acme/app' }).then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(error).toBeInstanceOf(CommandError);
+      expect(isBatchHelperUnavailable(error)).toBe(false);
+    });
   });
 
   it('review round 2 of PR #82, B-R2-2: an up with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {
