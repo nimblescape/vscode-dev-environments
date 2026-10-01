@@ -23,6 +23,7 @@ import {
   OVERRIDE_CONFIG_PATH,
   OVERRIDE_FOLDER,
   READ_FILES_SCRIPT,
+  SECRETS_FOLDER,
   TOKEN_FILE,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
@@ -41,6 +42,7 @@ import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } f
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { composeAccessReport, type ComposeAccessInput } from '../policy';
+import { WORKSPACES_ROOT } from '../names';
 
 function hasProgram(name: string, args: string[]): boolean {
   return !spawnSync(name, args, { stdio: 'ignore' }).error;
@@ -761,6 +763,126 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     const { repo, env } = setup();
     const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, PATH: path.join(tempDir(), 'empty') });
     expect(output).toMatchObject({ error: expect.stringContaining('ENOENT') });
+  });
+});
+
+describe('CLONE_SCRIPT with fake tools', () => {
+  // The script needs Linux (a tmpfs in /proc/mounts) and /workspaces. Fake tools on PATH stand in for awk, mktemp and
+  // Git, and record what the script does. SECRETS_FOLDER and WORKSPACES_ROOT are replaced by temporary folders.
+  function runClone(opts: { cloneExit: number; existing?: 'repo' | 'file' }): {
+    status: number | null;
+    stdout: string;
+    stderr: string;
+    ws: string;
+    log: string;
+    tokenLeft: boolean;
+    temp: string[];
+  } {
+    const dir = tempDir();
+    const bin = path.join(dir, 'bin');
+    const secrets = path.join(dir, 'secrets');
+    const ws = path.join(dir, 'workspaces');
+    const log = path.join(dir, 'log');
+    fs.mkdirSync(secrets);
+    fs.mkdirSync(ws);
+    if (opts.existing === 'repo') fs.mkdirSync(path.join(ws, 'api', '.git'), { recursive: true });
+    if (opts.existing === 'file') write(path.join(ws, 'api', 'notes.txt'), 'keep me');
+    const tool = (name: string, body: string) => {
+      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(bin, name), 0o755);
+    };
+    tool('awk', 'exit 0');
+    tool(
+      'mktemp',
+      ['for last; do :; done', 't=$(printf %s "$last" | sed "s/XXXXXX$/abc123/")', 'mkdir "$t"', 'echo "$t"'].join('\n'),
+    );
+    tool(
+      'git',
+      [
+        // printf, not echo: dash's echo would expand the backslash sequences of the credential helper.
+        `printf 'git-args %s prompt=%s\\n' "$*" "$GIT_TERMINAL_PROMPT" >> '${log}'`,
+        'while [ "$1" = -c ]; do shift 2; done',
+        `if [ -s '${path.join(secrets, 'github-token')}' ]; then token=present; else token=absent; fi`,
+        `echo "git $1 token=$token" >> '${log}'`,
+        'for last; do :; done',
+        'mkdir -p "$last/.git"',
+        `[ ${opts.cloneExit} -eq 0 ] || { echo 'fatal: repository not found' >&2; exit ${opts.cloneExit}; }`,
+      ].join('\n'),
+    );
+    // mv records whether the token file is still there when the clone is moved into place, then does the real move.
+    tool(
+      'mv',
+      [
+        `if [ -e '${path.join(secrets, 'github-token')}' ]; then token=present; else token=absent; fi`,
+        `echo "mv token=$token" >> '${log}'`,
+        `PATH='${process.env.PATH ?? ''}' exec mv "$@"`,
+      ].join('\n'),
+    );
+    const script = CLONE_SCRIPT.split(SECRETS_FOLDER).join(secrets).split(WORKSPACES_ROOT).join(ws);
+    const result = spawnSync('sh', ['-c', script, 'sh', 'acme/api', 'api', 'main'], {
+      encoding: 'utf8',
+      input: 'gho_secret',
+      env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      ws,
+      log: fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '',
+      tokenLeft: fs.existsSync(path.join(secrets, 'github-token')),
+      temp: fs.readdirSync(ws).filter((name) => name.startsWith('.devenv-clone.')),
+    };
+  }
+
+  it('clones with the token, then removes the token file (review round 2 of PR #81, B-R2-1)', () => {
+    const result = runClone({ cloneExit: 0 });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.log).toMatch(/git clone token=present\nmv token=absent\n/);
+    expect(result.tokenLeft).toBe(false);
+    expect(fs.existsSync(path.join(result.ws, 'api', '.git'))).toBe(true);
+  });
+
+  it('removes the temporary folder after a clone and after a failed clone (review round 2 of PR #81, B-R2-1)', () => {
+    const ok = runClone({ cloneExit: 0 });
+    expect(ok.status).toBe(0);
+    expect(ok.temp).toEqual([]);
+    const failed = runClone({ cloneExit: 128 });
+    expect(failed.status).toBe(128);
+    expect(failed.stderr).toContain('fatal: repository not found');
+    expect(failed.temp).toEqual([]);
+    expect(failed.tokenLeft).toBe(false);
+    expect(fs.existsSync(path.join(failed.ws, 'api'))).toBe(false);
+  });
+
+  it('ends with exit 0 without Git when the repository is already in the volume (review round 2 of PR #81, B-R2-1)', () => {
+    const result = runClone({ cloneExit: 0, existing: 'repo' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('already in the volume');
+    expect(result.log).toBe('');
+  });
+
+  it('refuses and keeps a folder that exists and is not a Git repository (review round 2 of PR #81, B-R2-1)', () => {
+    const result = runClone({ cloneExit: 0, existing: 'file' });
+    expect(result.status).toBe(4);
+    expect(result.log).toBe('');
+    expect(fs.readFileSync(path.join(result.ws, 'api', 'notes.txt'), 'utf8')).toBe('keep me');
+  });
+
+  it('runs Git without hooks, only over https and without a prompt (review round 2 of PR #81, B-R2-2)', () => {
+    const result = runClone({ cloneExit: 0 });
+    expect(result.status).toBe(0);
+    const args = result.log.split('\n').find((line) => line.startsWith('git-args')) ?? '';
+    for (const option of [
+      '-c core.hooksPath=/dev/null',
+      '-c core.fsmonitor=false',
+      '-c protocol.allow=never',
+      '-c protocol.https.allow=always',
+    ]) {
+      expect(args).toContain(option);
+    }
+    expect(args).toMatch(/ prompt=0$/);
   });
 });
 
