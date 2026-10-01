@@ -1084,11 +1084,12 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     return repo;
   }
 
-  function runAsOwner(repo: string, complete = false): { status: number | null; stdout: string; stderr: string } {
+  function runAsOwner(repo: string, complete = false, binFolder?: string): { status: number | null; stdout: string; stderr: string } {
     const [file, ...args] = gitSummaryCommand(repo, complete);
+    const searchPath = process.env.PATH ?? '/usr/bin:/bin';
     const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
+      env: { PATH: binFolder === undefined ? searchPath : `${binFolder}:${searchPath}`, HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   }
@@ -1160,7 +1161,8 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
 
   const silentCases: Array<{ name: string; setup: (repo: string) => void; lost: Record<string, unknown>; unreadable: string }> = [
     { name: 'a root 0600 refs/stash', setup: (repo) => toRoot(repo, '.git/refs/stash', 0o600), lost: { stashes: 0 }, unreadable: '.git/refs/stash' },
-    { name: 'a root 0700 .git/logs', setup: (repo) => toRoot(repo, '.git/logs', 0o700, true), lost: { stashes: 0 }, unreadable: '.git/logs' },
+    // Review round 4 of PR #84, A-R4-2: without its reflog, refs/stash still counts as 1 stash (of 2).
+    { name: 'a root 0700 .git/logs', setup: (repo) => toRoot(repo, '.git/logs', 0o700, true), lost: { stashes: 1 }, unreadable: '.git/logs' },
     { name: 'a root 0711 refs/heads (searchable, not listable)', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o711), lost: { unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
     { name: 'a root 0700 refs/heads', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o700), lost: { branch: null, unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
   ];
@@ -1310,7 +1312,8 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
   });
 
   for (const unborn of [false, true]) {
-    it(`review round 3 of PR #84, A-R3-2: a commit that only a tag reaches is counted as unpushed (${unborn ? 'unborn HEAD' : 'HEAD with commits'})`, () => {
+    // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
+    it(`review round 4 of PR #84, A-R4-1: a commit that only a tag reaches is not counted as unpushed (${unborn ? 'unborn HEAD' : 'HEAD with commits'})`, () => {
       const repo = remoteTrackingRepo({ missing: false });
       if (repo === undefined) return;
       rootGit(repo, 'checkout', '-q', '--detach');
@@ -1325,10 +1328,91 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
       const result = runAsOwner(repo, true);
       expect(result.status).toBe(0);
       expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-      // main has 1 commit that origin/main lacks; the tag adds 1 more.
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0, unpushedCommits: 2, stashes: 0 });
+      // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
+      // main has 1 commit that origin/main lacks; the commit that only the tag reaches is not counted.
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
     });
   }
+
+  it('review round 4 of PR #84, A-R4-1: a fresh clone of an upstream whose tag sits on a deleted branch reports 0 unpushed commits', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const upstream = repo;
+    rootGit(upstream, 'checkout', '-q', '-b', 'release');
+    fs.writeFileSync(path.join(upstream, 'r.txt'), 'r\n');
+    rootGit(upstream, 'add', 'r.txt');
+    rootGit(upstream, 'commit', '-q', '-m', 'release');
+    rootGit(upstream, 'tag', 'v1');
+    rootGit(upstream, 'checkout', '-q', 'main');
+    rootGit(upstream, 'branch', '-q', '-D', 'release');
+    // The upstream belongs to root, so that root's clone reads it (safe.directory does not reach upload-pack).
+    spawnSync('chown', ['-R', '0:0', upstream]);
+    const clone = path.join(path.dirname(upstream), 'clone');
+    rootGit(path.dirname(upstream), 'clone', '-q', upstream, clone);
+    // The clone has the tag (and so the commit of the deleted branch), but no remote branch contains it.
+    expect(rootGit(clone, 'tag', '--list').trim()).toBe('v1');
+    giveToOwner(clone);
+    for (const complete of [false, true]) {
+      const result = runAsOwner(clone, complete);
+      expect(result.status).toBe(0);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 });
+    }
+  });
+
+  it('review round 4 of PR #84, A-R4-2: a stash whose reflog was expired still counts as 1 stash, in both modes; after `git stash clear` 0', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    rootGit(repo, 'reflog', 'expire', '--expire=now', '--all');
+    giveToOwner(repo);
+    // Git's own listing shows no stash any more, while refs/stash still names one.
+    expect(rootGit(repo, 'stash', 'list')).toBe('');
+    expect(rootGit(repo, 'rev-parse', '-q', '--verify', 'refs/stash').trim()).not.toBe('');
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 1 });
+    }
+    rootGit(repo, 'stash', 'clear');
+    giveToOwner(repo);
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
+    }
+  });
+
+  it('review round 3 of PR #84, B-R3-1: a stash whose object is deleted makes `git stash list` fail: the script exits non-zero (Delete reads unknown)', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    const id = rootGit(repo, 'rev-parse', 'refs/stash').trim();
+    const object = path.join(repo, '.git', 'objects', id.slice(0, 2), id.slice(2));
+    expect(fs.existsSync(object)).toBe(true);
+    fs.rmSync(object);
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).not.toBe(0);
+      expect(result.status).not.toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
+      expect(result.stdout).toBe('');
+    }
+  });
+
+  it('review round 3 of PR #84, B-R3-2: a readability walk that fails without printing a path prints the incomplete marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    const bin = path.join(path.dirname(repo), 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'find'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    fs.chmodSync(bin, 0o755);
+    const result = runAsOwner(repo, true, bin);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} not every file and folder of the repository could be read\n`);
+    expect(gitSummaryProblem(result.stdout, '')).toBe('not every file and folder of the repository could be read');
+    // The same repository without the stub: complete, no problem.
+    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBeUndefined();
+  });
 
   it('review round 3 of PR #84, A-R3-3: an empty refs/stash whose reflog still has entries prints the incomplete marker', () => {
     const repo = stashRepo();

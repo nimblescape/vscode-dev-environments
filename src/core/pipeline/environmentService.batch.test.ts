@@ -278,6 +278,38 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
     expect(h.helper.calls).not.toContain('listConfigurations');
   });
 
+  // Review round 3 of PR #84, B-R3-3: as Delete's check (B-R1-1), a cancel of the picker's listing passes its signal to
+  // the step: the listing rejects as cancelled, the session is closed, and the lock is released.
+  for (const when of ['lock wait', 'listConfigs step'] as const) {
+    it(`review round 3 of PR #84, B-R3-3: a cancel during the ${when} of the picker's listing rejects as cancelled; the lock is released`, async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const controller = new AbortController();
+      if (when === 'lock wait') onLockWait = () => controller.abort();
+      else onStep = () => controller.abort();
+      // The step runs as the real WorkspaceHelper sends it (kind listConfigs), with the image of the window.
+      const dockerfile = path.join(h.root, 'Dockerfile');
+      fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
+      realHelper = new WorkspaceHelper({ docker: noDockerInScope, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
+      const error = await h.service.listConfigurations(ENV_ID, { progress: h.progress, signal: controller.signal }).then(
+        (paths) => ({ paths }),
+        (reason: unknown) => reason,
+      );
+      expect(error).toBeInstanceOf(UserFacingError);
+      expect((error as UserFacingError).code).toBe('cancelled');
+      if (when === 'lock wait') {
+        // The lock was never granted: nothing to release, no session, no step.
+        expect(frame()).toEqual(['lock']);
+        expect(recorded).toEqual([]);
+      } else {
+        // The step saw the aborted signal; the session is closed and the lock released, in that order.
+        expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
+        expect(recorded.map((step) => step.kind)).toEqual(['listConfigs']);
+        expect(events.filter((event) => event.startsWith('step '))).toEqual([]);
+      }
+      expect(h.helper.calls).not.toContain('listConfigurations');
+    });
+  }
+
   it('Q4: the token goes into the dev container as the secret input of the exec, never in its command', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });

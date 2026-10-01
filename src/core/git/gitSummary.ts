@@ -40,7 +40,7 @@ export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
 
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
- * commits on HEAD, on any local branch, or on any tag that no remote-tracking branch contains, and the number of stashes. `$1` is the
+ * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
  * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
  * keeps them, and Delete removes them.
  *
@@ -67,8 +67,10 @@ export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
  * counts are line counts, and paths pass through as bytes.
  *
  * Review round 3 of PR #84 (decision D1: what the check cannot vouch for is never reported clean): the unpushed
- * commits are those of HEAD, of every local branch, and of every tag that no remote-tracking branch contains (A-R3-2);
- * commits that only the reflog still reaches (for example of a deleted branch) are not counted, by decision. With `$2`
+ * commits are those of HEAD and of every local branch that no remote-tracking branch contains; commits that only the
+ * reflog or a tag still reaches (for example of a deleted branch) are not counted, by decision (review round 4 of PR
+ * #84, A-R4-1: a clone fetches every tag of the upstream, and a tag on a commit that no remote branch contains made an
+ * untouched clone show unpushed commits for good). With `$2`
  * GIT_SUMMARY_COMPLETE, after the walk, GIT_SUMMARY_INCOMPLETE_MARKER is printed for submodules (a `.gitmodules`, or a
  * non-empty `modules` folder in the Git folder: their commits, stashes and changes are not counted; A-R3-1), for other
  * worktrees (a non-empty `worktrees` folder: their changes and detached commits are not counted; A-R3-2), and for a
@@ -77,6 +79,10 @@ export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
  * example the data folder of a database), at most GIT_SUMMARY_MAX_PRUNED_FOLDERS; `.git` is always walked in full. A
  * name that Git quotes (a control character, `"` or `\`) or with a character that `-path` reads as a pattern is not
  * left out (it is walked). The names pass to find as positional parameters (`-path ./<name>`), never as shell text.
+ *
+ * Review round 4 of PR #84, A-R4-2: a stash that `refs/stash` still names while its reflog is empty (`git reflog expire
+ * --expire=now --all`, a packed `refs/stash` without a reflog, or a reftable repository) is listed by no `git stash
+ * list`; in every mode it counts as 1 stash then (whatever the ref backend).
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
 export LC_ALL=C LANG=C
@@ -105,11 +111,14 @@ branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short
 status=$(g status --porcelain --untracked-files=normal)
 incomplete=''
 if g rev-parse -q --verify HEAD >/dev/null 2>&1; then
-  unpushed=$(g rev-list --count HEAD --branches --tags --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count HEAD --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 else
-  unpushed=$(g rev-list --count --branches --tags --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 fi
 stashes=$(g stash list)
+if [ -z "$stashes" ] && g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
+  stashes='(stash without reflog)'
+fi
 if [ "\${2:-}" = '${GIT_SUMMARY_COMPLETE}' ] && [ -z "$incomplete" ]; then
   set --
   ignored=$(g -c core.quotePath=false ls-files -o -i --exclude-standard --directory 2>/dev/null) || ignored=''
