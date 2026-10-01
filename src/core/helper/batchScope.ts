@@ -12,8 +12,9 @@
 //   first open or Clone again, so `batch` never meets a missing volume), and closes when the scope ends (`finally`),
 //   before the lock is released; also before the volume is removed (closeSession).
 // - User decision D1 of 2026-09-30: a step without a batch kind, a step for another volume, a lock without `batch`, or a
-//   session that cannot be opened refuse the operation (UserFacingError helperFailed with the cause). Nothing ever falls
-//   back to the per-step `docker run`.
+//   session that cannot be opened refuse the operation (BatchHelperUnavailableError, code helperFailed, with the cause).
+//   Nothing ever falls back to the per-step `docker run`. User decision of 2026-10-01 (D1): the refusal is never taken
+//   for the helperFailed of the rule of 2026-09-29, so a running, current container is not opened as it is.
 // - The helper ends itself after 15 minutes without a step (PR B), while the lock stays held during a question to the
 //   user (Q3). A session that ended between two steps (lost, closed, or idle) is replaced once by a new one under the
 //   same held lock before the next step; when that open fails, the operation is refused. A step is never repeated or
@@ -23,7 +24,7 @@
 // No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError, errorMessage } from '../errors';
+import { BatchHelperUnavailableError, UserFacingError, errorMessage } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, isAbortError, type Logger, type RunResult } from '../ports';
@@ -89,7 +90,8 @@ export class BatchScope {
   /** Refuses the operation (D1) for a step that cannot run in the batch helper; the scope refuses every later step too. */
   refuse(cause: string): UserFacingError {
     this.logger.warn(`${cause}; the operation is refused, and nothing is run without the batch helper.`);
-    this.refused ??= new UserFacingError('helperFailed', Messages.batchHelperUnavailable(cause), cause);
+    // User decision of 2026-10-01 (D1): a refusal of its own (code helperFailed, marked), never opened as it is.
+    this.refused ??= new BatchHelperUnavailableError(Messages.batchHelperUnavailable(cause), cause);
     return this.refused;
   }
 

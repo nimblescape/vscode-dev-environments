@@ -11,7 +11,7 @@
 // per-step run is unchanged.
 import { describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError } from '../errors';
+import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
@@ -212,6 +212,10 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       const error = await refusal(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
       expect(error.code).toBe('helperFailed');
       expect(error.message).toBe(Messages.batchHelperUnavailable(`The batch helper on the volume ${VOLUME} could not be opened: too many batch helpers`));
+      // User decision of 2026-10-01 (D1): the refusal is marked, so the open never takes it for the helperFailed of a
+      // helper image (the rule of 2026-09-29) and opens a running container as it is.
+      expect(isBatchHelperUnavailable(error)).toBe(true);
+      expect(isBatchHelperUnavailable(new UserFacingError('helperFailed', Messages.helperFailed))).toBe(false);
       lock.openError = undefined;
       // The scope refused: a caller that catches the error cannot go on with another step.
       await expect(helper.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: 'a.json', image: IMAGE })).rejects.toBe(error);

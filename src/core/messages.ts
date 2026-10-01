@@ -284,7 +284,8 @@ export const Messages = {
   /**
    * Plan step 6, PR C (rule D1 of 2026-09-30): a helper step of an open needs the batch helper of the operation (one per
    * operation, through the worker that holds the lock), and it could not be used; the open was refused, and nothing was
-   * run without it.
+   * run without it. User decision of 2026-10-01 (D1): also a running, current container is not opened as it is then
+   * (BatchHelperUnavailableError, src/core/errors.ts).
    */
   batchHelperUnavailable: (cause: string) =>
     `The workspace helper of this operation could not be used (${cause}), so the operation was stopped and nothing was run without it. Check that Docker runs (see the Dev Environments output), then try again.`,

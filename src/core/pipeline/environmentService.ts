@@ -13,7 +13,7 @@ import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
+import { UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
@@ -1622,6 +1622,11 @@ export class EnvironmentService {
       // that is outdated would be created again, which needs the helper, too. Review round 2 of PR #64 (A-N4): whether
       // it opens as it is (a Docker listing) is asked only when the answer is needed, and a failure of the listing counts
       // as `false`, so the error of the configuration is never lost.
+      // User decision of 2026-10-01 (D1): "refuse the operation, a helper that cannot be opened is an inconsistent state,
+      // we already defined that." The refusal of the batch scope (the session cannot be opened, a lost lock, a step
+      // without a batch kind) is rethrown before the rule of 2026-09-29: Start, Rebuild and Select configuration are
+      // refused, and a running, current container is not opened as it is.
+      if (isBatchHelperUnavailable(error)) throw error;
       if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record, false)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
@@ -4980,6 +4985,9 @@ export class EnvironmentService {
         ctx.helperUnavailable = true;
         throw error;
       }
+      // User decision of 2026-10-01 (D1): the refusal of the batch scope is no warning about the Git configuration; it
+      // refuses the operation, also for a running container that would open as it is.
+      if (isBatchHelperUnavailable(error)) throw error;
       this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
       this.deps.ui.warn(Messages.gitSetupFailed);
     }

@@ -12,7 +12,8 @@
 import { createHash } from 'crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError } from '../errors';
+import { UserFacingError, isBatchHelperUnavailable } from '../errors';
+import { Messages } from '../messages';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { currentBatchScope } from '../helper/batchScope';
 import { abortError, isAbortError, silentLogger, type RunResult } from '../ports';
@@ -59,6 +60,8 @@ let recorded: Array<{ kind: BatchStepKind; params: unknown }>;
  * it in the scope (with the parameters that the service passes), instead of one `listConfigs` step.
  */
 let realHelper: WorkspaceHelper | undefined;
+/** User decision of 2026-10-01 (D1): when set, the batch helper of the lock cannot be opened (`batch` rejects with it). */
+let batchError: Error | undefined;
 const PINNED: HelperImageUse = { tag: 'devenv-helper:test', id: `sha256:${'4'.repeat(64)}` };
 
 function batchLock(environmentId: string): HeldEnvironmentLock {
@@ -70,6 +73,10 @@ function batchLock(environmentId: string): HeldEnvironmentLock {
       throw new Error('The fake Docker of the service runs no call through the worker.');
     },
     batch: async (p) => {
+      if (batchError !== undefined) {
+        events.push(`open refused ${p.volume}`);
+        throw batchError;
+      }
       const session = `s${++sessions}`;
       events.push(`open ${session} ${p.volume}`);
       const handle: HelperBatchSession = {
@@ -104,6 +111,7 @@ beforeEach(() => {
   closeGate = undefined;
   recorded = [];
   realHelper = undefined;
+  batchError = undefined;
   h = createHarness({
     newEnvironmentId: () => ENV_ID,
     environmentLock: async (environmentId) => {
@@ -326,4 +334,82 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
       for (const step of recorded) expect(() => batchStepCommand(step.kind, step.params), step.kind).not.toThrow();
     });
   }
+});
+
+/**
+ * User decision of 2026-10-01 (D1): "refuse the operation, a helper that cannot be opened is an inconsistent state, we
+ * already defined that." A refusal of the batch scope refuses Start, Rebuild and Select configuration, also for a running
+ * container that is current: it is not opened as it is (the rule of 2026-09-29 applies only to a helper image that
+ * cannot be prepared, which stays as it was).
+ */
+describe('a batch helper that cannot be opened refuses the open (user decision of 2026-10-01, D1)', () => {
+  const PYTHON = '.devcontainer/python/devcontainer.json';
+  const cases: Array<[string, () => { forceRebuild?: boolean; configPath?: string }]> = [
+    ['Start', () => ({})],
+    ['Rebuild', () => ({ forceRebuild: true })],
+    [
+      'Select configuration',
+      () => {
+        h.helper.files[PYTHON] = { configText: '{ "image": "python:3.12" }' };
+        h.helper.config = { image: 'python:3.12' };
+        return { configPath: PYTHON };
+      },
+    ],
+  ];
+
+  for (const [name, options] of cases) {
+    it(`${name}: a refused batch session refuses the open of a running, current container, which is not opened as it is`, async () => {
+      const env = await seedEnvironment(h, { container: 'running' });
+      const before = h.docker.containersOf(ENV_ID).map((container) => `${container.id} ${container.state}`);
+      batchError = new Error('the helper container did not start');
+      const extra = options();
+      const opened = await h.service.openEnvironment(ENV_ID, { progress: h.progress, ...extra }).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      );
+      // Refused: no result, so the window does not connect to the container.
+      expect('result' in opened ? opened.result : undefined).toBeUndefined();
+      const error = (opened as { error: unknown }).error;
+      expect(isBatchHelperUnavailable(error)).toBe(true);
+      expect((error as UserFacingError).code).toBe('helperFailed');
+      expect((error as UserFacingError).message).toBe(
+        Messages.batchHelperUnavailable(`The batch helper on the volume ${VOLUME} could not be opened: the helper container did not start`),
+      );
+      // Not the open as it is of the rule of 2026-09-29: no warning, no log line about it, nothing created or changed.
+      expect(h.ui.warnings).toEqual([]);
+      expect(h.logger.errors.filter((line) => line.includes('opened as it is'))).toEqual([]);
+      expect(h.helper.ups).toEqual([]);
+      expect(h.docker.containersOf(ENV_ID).map((container) => `${container.id} ${container.state}`)).toEqual(before);
+      if (extra.configPath !== undefined) expect((await h.registry.get(ENV_ID))?.configPath).toBe(env.configPath);
+      expect(frame()).toEqual(['lock', `open refused ${VOLUME}`, 'release']);
+    });
+  }
+
+  it('a step that fails in its session after the configuration was read refuses the open too (no Git warning, not opened as it is)', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    // The session is lost at the Git setup of the running container (Step 9): the step fails in its session.
+    onStep = () => {
+      if (scopes.at(-1)?.startsWith('prepareGit ')) throw new Error('the session was lost');
+    };
+    const error = await h.service.openEnvironment(ENV_ID, { progress: h.progress }).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(isBatchHelperUnavailable(error)).toBe(true);
+    expect(h.ui.warnings).toEqual([]);
+    expect(scopes.map((scope) => scope.split(' ')[0])).toContain('prepareGit');
+    expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
+  });
+
+  it('the rule of 2026-09-29 stays for a helper image that cannot be prepared: a running, current container opens as it is', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
+    // The tag of the helper image exists (the lock's D1 step builds only a missing tag); the maintaining ensure fails.
+    h.helper.tagPresent = true;
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(result.containerName).toBe(h.docker.containersOf(ENV_ID)[0].name);
+    expect(h.ui.warnings).toEqual([Messages.helperFailed]);
+    expect(h.logger.errors).toEqual([`The workspace helper is not available for ${REPO}. The running environment is opened as it is. ${Messages.helperFailed}`]);
+    expect(h.helper.ups).toEqual([]);
+  });
 });
