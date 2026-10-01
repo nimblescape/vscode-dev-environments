@@ -11,6 +11,8 @@
 // are restored after the Git step; Docker Compose refuses remote includes in the helper; the helper container is gone
 // after a close (cancel), after a kill of the worker, and after its silence when the worker hangs. The clone uses a
 // derived image whose `git` only waits (so the Git step is deterministic and needs no network).
+// Plan step 6, PR C (option A, provisional): a Compose model step, which runs as the unprivileged user, cannot read a file
+// in CONFIG_FOLDER.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -122,6 +124,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       `mkdir -p ${FOLDER}/.devcontainer /workspaces/.devenv+ && echo '{}' > ${FOLDER}/.devcontainer/devcontainer.json && ` +
         `printf 'services:\\n  a:\\n    image: alpine\\ninclude:\\n  - https://github.com/docker/compose.git#main\\n' > ${FOLDER}/git.yml && ` +
         `printf 'include:\\n  - oci://localhost:1/devenv/none:latest\\nservices:\\n  a:\\n    image: alpine\\n' > ${FOLDER}/oci.yml && ` +
+        // Plan step 6, PR C (option A): a compose file whose env_file is a file of CONFIG_FOLDER.
+        `printf 'services:\\n  a:\\n    image: alpine\\n    env_file: ../.devenv+/gitconfig\\n' > ${FOLDER}/token.yml && ` +
         `echo '[user]' > /workspaces/.devenv+/gitconfig && chown -R 1000:1000 ${FOLDER} /workspaces/.devenv+ && chmod 0755 /workspaces/.devenv+`,
     ]);
   });
@@ -222,6 +226,22 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout.trim().split('\n').pop()!)).toMatchObject({ error: expect.stringContaining(disabled) });
     }
+    await session.close();
+    await lock.release();
+  });
+
+  // Plan step 6, PR C (option A, provisional): the Compose model step runs as the unprivileged user, so Compose, which
+  // follows `env_file`, cannot read a file in CONFIG_FOLDER (0700 during the step); the folder gets its mode back.
+  it('a Compose model step cannot read a file in CONFIG_FOLDER (option A)', async () => {
+    const channels = windowChannels();
+    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    const container = helpersOf(session.session)[0];
+    const result = await session.step('composeModel', { repository: REPOSITORY, files: [`${FOLDER}/token.yml`], project: 'devenv-batch-test' });
+    const output = `${result.stdout}\n${result.stderr}`;
+    expect(output).toMatch(/permission denied/i);
+    expect(output).not.toContain('[user]');
+    expect(execIn(container, '0:0', 'stat -c %a /workspaces/.devenv+').out).toBe('755');
+    expect(execIn(container, '0:0', 'cat /workspaces/.devenv+/gitconfig').out).toBe('[user]');
     await session.close();
     await lock.release();
   });

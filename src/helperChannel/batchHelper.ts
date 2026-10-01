@@ -20,7 +20,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { CHANNEL_KILL_GRACE_MS } from '../core/helperChannel/protocol';
 import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -115,11 +115,17 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
       deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
       restores.push(() => deps.fs.chmodSync(CONFIG_FOLDER, config.mode & 0o7777));
     }
-    const root = deps.fs.lstatSync(WORKSPACES_ROOT);
-    deps.fs.chmodSync(WORKSPACES_ROOT, 0o1777);
-    // Review round 1 of PR #80 (A-R1-1): never sticky or writable for others afterwards, also when a cut-off step left
-    // it so (its 1777 would otherwise be taken for the mode to restore, for good).
-    restores.push(() => deps.fs.chmodSync(WORKSPACES_ROOT, root.mode & 0o7777 & ~0o1022));
+    // Plan step 6, PR C (option A): a read step (the Compose reads) gets no write access to /workspaces. It starts without
+    // the files that root steps before it left below OVERRIDE_FOLDER (as in a container of its own; the Compose hash
+    // writes its model there, and could not write over a folder of root).
+    if (step.readOnly === true) deps.fs.rmSync(OVERRIDE_FOLDER, { recursive: true, force: true });
+    else {
+      const root = deps.fs.lstatSync(WORKSPACES_ROOT);
+      deps.fs.chmodSync(WORKSPACES_ROOT, 0o1777);
+      // Review round 1 of PR #80 (A-R1-1): never sticky or writable for others afterwards, also when a cut-off step left
+      // it so (its 1777 would otherwise be taken for the mode to restore, for good).
+      restores.push(() => deps.fs.chmodSync(WORKSPACES_ROOT, root.mode & 0o7777 & ~0o1022));
+    }
     if (step.secret === 'stdin') {
       deps.fs.chownSync(SECRETS_FOLDER, BATCH_GIT_UID, BATCH_GIT_UID);
       // Review round 2 of PR #80 (A-R2-3): its mode too, which the Git user could change while it owned the folder.

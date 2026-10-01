@@ -53,16 +53,20 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
     });
     expect(batchStepCommand('listConfigs', { repository: REPO })).toEqual({ command: listConfigsCommand(FOLDER), env: {}, git: false });
+    // Plan step 6, PR C (option A): changed expectation (before: `git: false`, as root): the Compose read steps run as the
+    // unprivileged user, read-only, so that Compose cannot read CONFIG_FOLDER.
     expect(batchStepCommand('composeModel', { repository: REPO, files: [`${FOLDER}/compose.yml`], project: 'p1' })).toEqual({
       command: composeModelCommand(FOLDER, [`${FOLDER}/compose.yml`]),
       env: { COMPOSE_PROJECT_NAME: 'p1' },
-      git: false,
+      git: true,
+      readOnly: true,
     });
     expect(batchStepCommand('composeHash', { model: '{}', project: 'p1' })).toEqual({
       command: composeHashCommand(COMPOSE_MODEL_PATH, 'p1'),
       input: '{}',
       env: { COMPOSE_PROJECT_NAME: 'p1' },
-      git: false,
+      git: true,
+      readOnly: true,
     });
     expect(batchStepCommand('createFolders', { repository: REPO, folders: [`${FOLDER}/data`] })).toEqual({ command: createFoldersCommand(FOLDER, [`${FOLDER}/data`]), env: {}, git: false });
   });

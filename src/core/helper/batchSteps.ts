@@ -67,6 +67,13 @@ export interface BatchStepCommand {
   /** Q2: Git runs as the unprivileged user of the helper (BATCH_GIT_UID), without the socket and CONFIG_FOLDER. */
   git: boolean;
   /**
+   * Plan step 6, PR C (option A, provisional): a read step that runs as that user too (`git` true), but writes nothing
+   * in the volume, so /workspaces is not opened for it. The Docker Compose read steps (composeModel, composeHash; the
+   * per-step runs got an empty tmpfs over CONFIG_FOLDER, `hideConfigFolder`): Compose follows `env_file` and `include` of
+   * the repository, and CONFIG_FOLDER (0700 during the step) is closed to that user.
+   */
+  readOnly?: boolean;
+  /**
    * The secret of the request (the GitHub token): `stdin`: required, the standard input of the step (TOKEN_PRELUDE writes
    * it to the tmpfs and removes it); `mask`: optional, only masked in the output; undefined: refused.
    */
@@ -238,14 +245,18 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const { folder } = folderOf(kind, p.repository);
       const files = pathsBelow(kind, p.files, folder);
       if (files.length === 0) fail(kind);
-      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: false };
+      // Plan step 6, PR C (option A): as the unprivileged user, so that Compose cannot read CONFIG_FOLDER (the token).
+      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: true, readOnly: true };
     }
     case 'composeHash': {
       const p = fields(kind, params, ['model', 'project']);
       const name = project(kind, p.project);
-      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: false };
+      // Plan step 6, PR C (option A): as the unprivileged user (it writes the model below OVERRIDE_FOLDER in /tmp only).
+      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: true, readOnly: true };
     }
     case 'createFolders': {
+      // Plan step 6, PR C (option A): stays root. It creates folders in the repository, whose folders belong to root or
+      // the user of the dev container; CREATE_FOLDERS_SCRIPT is our script (no Compose), and follows no link out.
       const p = fields(kind, params, ['repository', 'folders']);
       const { folder } = folderOf(kind, p.repository);
       return { command: createFoldersCommand(folder, pathsBelow(kind, p.folders, folder)), env: {}, git: false };

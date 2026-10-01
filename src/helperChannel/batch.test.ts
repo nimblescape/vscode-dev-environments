@@ -23,7 +23,7 @@ import {
   batchVolumeArgs,
 } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
 import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage } from '../core/helperChannel/protocol';
 import { bundleHash } from '../core/loader/pipeLoader';
@@ -410,6 +410,32 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     await session.step('listConfigs', { repository: 'octo/hello' });
     expect(t.steps[1].command[0]).toBe('node');
     expect(t.steps[1].input).toBeUndefined();
+  });
+
+  // Plan step 6, PR C (option A, provisional): the Compose read steps run as the unprivileged user, read-only: CONFIG_FOLDER
+  // is closed to them, /workspaces is not opened, they get no secret, and they start without the files of root below
+  // OVERRIDE_FOLDER; the same cleanup follows.
+  it('runs the Compose read steps as the unprivileged user without write access to /workspaces (option A)', async () => {
+    const { t, session } = await started();
+    for (const [kind, params] of [
+      ['composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }],
+      ['composeHash', { model: '{}', project: 'p' }],
+    ] as const) {
+      t.fsCalls.length = 0;
+      t.quiet.length = 0;
+      const index = t.steps.length;
+      const result = await session.step(kind, params);
+      expect(result.exitCode, kind).toBe(0);
+      const step = t.steps[index];
+      expect(step.command, kind).toEqual(['setpriv', ...gitPrivilegeArgs(), ...batchStepCommand(kind, params).command]);
+      expect(step.env.HOME, kind).toBe('/nonexistent');
+      expect(step.env.COMPOSE_PROJECT_NAME, kind).toBe('p');
+      expect(t.fsCalls, kind).toEqual([`chmod ${CONFIG_FOLDER} 700`, `rm ${OVERRIDE_FOLDER}`, `chmod ${CONFIG_FOLDER} 750`]);
+      expect(t.quiet, kind).toContainEqual(['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']);
+    }
+    // createFolders stays root (it writes folders of the repository).
+    await session.step('createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] });
+    expect(t.steps.at(-1)!.command[0]).toBe('node');
   });
 
   it('never leaves /workspaces sticky or writable for others, also after a Git step whose cleanup was cut off', async () => {
