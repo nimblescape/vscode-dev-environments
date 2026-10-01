@@ -10,6 +10,20 @@
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
+import type { BatchStepKind } from '../helper/batchSteps';
+import {
+  BATCH_CHUNK_CHARACTERS,
+  BATCH_HOLD_LIMIT_MS,
+  BATCH_READY_STEP,
+  MAX_BATCH_INPUT_CHARACTERS,
+  MAX_CONCURRENT_BATCHES,
+  OP_BATCH,
+  OP_BATCH_CHUNK,
+  OP_BATCH_STEP,
+  parseBatchParams,
+  parseBatchStepParams,
+  parseBatchStepValue,
+} from './batch';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
 import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
@@ -32,8 +46,10 @@ import {
   MAX_SERVER_LINE,
   OP_DOCKER,
   OP_LOCK,
+  StreamRedactor,
   encodeMessage,
   isSecret,
+  newCleanupLabel,
   parseDockerOperationParams,
   parseDockerOperationValue,
   parseLockParams,
@@ -126,6 +142,28 @@ export interface ChannelDockerOptions
   secretInput?: string;
 }
 
+/** Plan step 6, PR B: the options of one step of a batch helper (HelperBatchSession.step). */
+export interface BatchStepOptions {
+  /** The GitHub token, for a step that needs it (the clone) or whose output may hold it (masked). */
+  secret?: string;
+  signal?: AbortSignal;
+  /** Ends the step alone (its process group in the helper); the result has `timedOut`, and the session stays. */
+  timeoutMs?: number;
+  onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
+}
+
+/** Plan step 6, PR B: a batch helper of an operation in the worker (HelperChannel.batch). */
+export interface HelperBatchSession {
+  /** The session ID (also the label of its helper container). */
+  readonly session: string;
+  /** Resolves with the reason when the helper ended without `close`. Never rejects. */
+  readonly lost: Promise<string>;
+  /** One step (the fixed kinds of batchSteps.ts with the inputs of their builders), one at a time. */
+  step(kind: BatchStepKind, params: unknown, options?: BatchStepOptions): Promise<RunResult>;
+  /** Ends the helper (its container is removed) and resolves when the worker confirmed it, or was lost. Never rejects. */
+  close(): Promise<void>;
+}
+
 export interface HelperChannelOptions {
   logger: Logger;
   /** Named in the log lines, for example the Docker host. */
@@ -133,15 +171,23 @@ export interface HelperChannelOptions {
   openTimeoutMs?: number;
   /** Only for the tests. */
   pingIntervalMs?: number;
+  /** Only for the tests; plan step 6, PR B: also the worker's client of a batch helper (see src/helperChannel/batch.ts). */
   pongTimeoutMs?: number;
   closeKillMs?: number;
   slotWaitMs?: number;
+  /**
+   * Plan step 6, PR B: the longest request in bytes (default MAX_CHANNEL_REQUEST_BYTES, for a slow link). The worker's
+   * client of a batch helper, a local pipe, allows the longer inputs of a step (MAX_BATCH_INPUT_CHARACTERS).
+   */
+  maxRequestBytes?: number;
 }
 
 interface Pending {
   op: string;
   /** Plan step 5, PR B: a lock operation holds no place of MAX_CONCURRENT_OPERATIONS (MAX_CONCURRENT_LOCKS instead). */
   lock?: boolean;
+  /** Plan step 6, PR B: neither does a batch helper (MAX_CONCURRENT_BATCHES). */
+  batch?: boolean;
   /** PR #74 review round 1 (A-R1-2): a call under a held lock holds a place of MAX_CONCURRENT_LOCKED_OPERATIONS. */
   reserved?: boolean;
   /** Review round 4 (M2): the cancel was sent; waiting for the script to confirm it. */
@@ -172,6 +218,8 @@ export class HelperChannel {
   private locks = 0;
   /** PR #74 review round 1 (A-R1-2): the calls under held locks that run (MAX_CONCURRENT_LOCKED_OPERATIONS). */
   private lockedOperations = 0;
+  /** Plan step 6, PR B: the batch helpers that are held (MAX_CONCURRENT_BATCHES). */
+  private batches = 0;
   private readonly closeListeners = new Set<(reason: string) => void>();
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private stderrTail = '';
@@ -390,6 +438,7 @@ export class HelperChannel {
     // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
     this.lastUsedAt = Date.now();
     if (pending.lock) this.locks--;
+    else if (pending.batch) this.batches--;
     else if (pending.reserved) this.lockedOperations--;
     else this.releaseSlot();
     return pending;
@@ -437,10 +486,11 @@ export class HelperChannel {
    * channel ended while it ran).
    */
   async operation(op: string, params: unknown, options: OperationOptions = {}): Promise<unknown> {
-    return this.sendOperation(op, params, options, false);
+    return this.sendOperation(op, params, options, undefined);
   }
 
-  private async sendOperation(op: string, params: unknown, options: OperationOptions, lock: boolean): Promise<unknown> {
+  /** `held` (plan step 5, PR B; plan step 6, PR B): a long-lived operation of its own class (see hold). */
+  private async sendOperation(op: string, params: unknown, options: OperationOptions, held: 'lock' | 'batch' | undefined): Promise<unknown> {
     if (options.signal?.aborted) throw abortError();
     if (this.state !== 'open') throw new HelperChannelError('closed', `The helper channel to ${this.options.name} is closed.`);
     // Review round 2 (A5): what the script refuses as a whole is not sent: a time limit that is no whole number of
@@ -459,14 +509,20 @@ export class HelperChannel {
     // Review round 1 (P2): a longer line would end the whole channel in the script (and every operation on it). Review
     // round 5 (F3): the limit of what the channel carries is lower (MAX_CHANNEL_REQUEST_BYTES), so the pings behind a
     // request are not late on a slow link.
-    if (line.length - 1 > MAX_CLIENT_LINE || Buffer.byteLength(line, 'utf8') - 1 > MAX_CHANNEL_REQUEST_BYTES) {
+    if (line.length - 1 > MAX_CLIENT_LINE || Buffer.byteLength(line, 'utf8') - 1 > (this.options.maxRequestBytes ?? MAX_CHANNEL_REQUEST_BYTES)) {
       throw new HelperChannelError('unsendable', `The request ${op} is too long for the helper channel (${line.length} characters).`);
     }
     // A free place is taken at once, so the operation is written in the same turn as the call.
     const queuedAt = Date.now();
-    const reserved = !lock && options.reserved === true;
-    const release = () => (lock ? this.locks-- : reserved ? this.lockedOperations-- : this.releaseSlot());
-    if (lock) {
+    const lock = held === 'lock';
+    const batch = held === 'batch';
+    const reserved = held === undefined && options.reserved === true;
+    const release = () => (lock ? this.locks-- : batch ? this.batches-- : reserved ? this.lockedOperations-- : this.releaseSlot());
+    if (batch) {
+      // Plan step 6, PR B: a batch helper waits for no place either; beyond MAX_CONCURRENT_BATCHES it is not sent.
+      if (this.batches >= MAX_CONCURRENT_BATCHES) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} holds too many batch helpers.`);
+      this.batches++;
+    } else if (lock) {
       // Plan step 5, PR B: a lock waits for no place; beyond MAX_CONCURRENT_LOCKS it is not sent.
       if (this.locks >= MAX_CONCURRENT_LOCKS) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} holds too many locks.`);
       this.locks++;
@@ -503,7 +559,7 @@ export class HelperChannel {
     }
     this.lastUsedAt = Date.now();
     return new Promise<unknown>((resolve, reject) => {
-      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject, lock, reserved };
+      const pending: Pending = { op, startedAt: Date.now(), options, resolve, reject, lock, batch, reserved };
       // The `docker` operation logs its one call itself; an operation of steps gets a line at its start and its end.
       if (op !== OP_DOCKER) this.options.logger.info(`[${this.options.name}] ${op}#${id}: started.`);
       this.pending.set(id, pending);
@@ -543,6 +599,35 @@ export class HelperChannel {
     const params = parseLockParams({ environmentId, waitSeconds });
     if (params === undefined) throw new HelperChannelError('unsendable', 'The lock request is invalid.');
     if (!this.operations.includes(OP_LOCK)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_LOCK}.`);
+    // The backstop of the worker comes first; this is for a worker that does not answer.
+    const held = await this.hold(OP_LOCK, params, 'lock', LOCK_HELD_STEP, waitSeconds * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS, signal, `the lock of ${environmentId}`);
+    return {
+      environmentId,
+      lost: held.lost,
+      // PR #74 review round 1 (A-R1-2): the calls under the lock have their own places (MAX_CONCURRENT_LOCKED_OPERATIONS).
+      docker: (args, options) => this.docker(args, { ...options, reserved: true }),
+      // Plan step 6, PR B: a batch helper of the operation that holds the lock, through the same worker.
+      batch: (batch, batchSignal) => this.batch(batch, batchSignal),
+      release: held.release,
+    };
+  }
+
+  /**
+   * Plan step 5, PR B (lock; moved here by plan step 6, PR B, for `batch` too): sends a long-lived operation of its own
+   * class (`lock` or `batch`: none of the MAX_CONCURRENT_OPERATIONS places) and resolves once it reports `heldStep`.
+   * Rejects as the operation; HelperChannelError('protocol') when it ended without that step. `lost` resolves with the
+   * reason when it ends without `release`; `release` cancels it and resolves when the worker confirmed it, or the
+   * channel ended. Never rejects.
+   */
+  private async hold(
+    op: string,
+    params: unknown,
+    kind: 'lock' | 'batch',
+    heldStep: string,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+    what: string,
+  ): Promise<{ lost: Promise<string>; release: () => Promise<void> }> {
     if (signal?.aborted) throw abortError();
     const controller = new AbortController();
     const onCallerAbort = () => controller.abort();
@@ -551,24 +636,23 @@ export class HelperChannel {
     let onHeld!: () => void;
     const heldNow = new Promise<void>((resolve) => (onHeld = resolve));
     const done = this.sendOperation(
-      OP_LOCK,
+      op,
       params,
       {
         signal: controller.signal,
-        // The backstop of the worker comes first; this is for a worker that does not answer.
-        timeoutMs: waitSeconds * 1000 + LOCK_HOLD_LIMIT_MS + CHANNEL_RESULT_GRACE_MS,
+        timeoutMs,
         onProgress: (step) => {
-          if (step === LOCK_HELD_STEP) {
+          if (step === heldStep) {
             held = true;
             onHeld();
           }
         },
       },
-      true,
+      kind,
     );
-    // Settled once the worker let go of the lock (or the channel ended): never rejects.
+    // Settled once the worker let go of it (or the channel ended): never rejects.
     const ended = done.then(
-      () => 'the lock operation ended',
+      () => `the ${op} operation ended`,
       (error: unknown) => (error as Error).message,
     );
     try {
@@ -577,10 +661,10 @@ export class HelperChannel {
       signal?.removeEventListener('abort', onCallerAbort);
     }
     if (!held) {
-      // The worker answered without the lock (an invalid answer): let go of whatever it holds.
+      // The worker answered without holding it (an invalid answer): let go of whatever it holds.
       controller.abort();
       await ended;
-      throw new HelperChannelError('protocol', `The helper answered the lock of ${environmentId} without holding it.`);
+      throw new HelperChannelError('protocol', `The helper answered ${what} without holding it.`);
     }
     let releasing = false;
     const lost = new Promise<string>((resolve) => {
@@ -589,16 +673,108 @@ export class HelperChannel {
       });
     });
     return {
-      environmentId,
       lost,
-      // PR #74 review round 1 (A-R1-2): the calls under the lock have their own places (MAX_CONCURRENT_LOCKED_OPERATIONS).
-      docker: (args, options) => this.docker(args, { ...options, reserved: true }),
       release: async () => {
         releasing = true;
         controller.abort();
         await ended;
       },
     };
+  }
+
+  /**
+   * Plan step 6, PR B: starts a batch helper of an operation in the worker (the operation `batch`) with the volume
+   * `volume`, the pinned helper image `image` (its ID) and the socket source `socket`, and resolves once it answered
+   * (BATCH_READY_STEP). Rejects with HelperOperationError (code BATCH_MISSING_VOLUME_CODE: the volume does not exist and
+   * was not created; another code: it failed), an AbortError, or HelperChannelError (`unsendable`: invalid parameters, a
+   * worker without the operation, or too many batch helpers; `closed`, `lost`). A batch helper takes none of the
+   * MAX_CONCURRENT_OPERATIONS places (its own cap, MAX_CONCURRENT_BATCHES); its steps and input pieces are `reserved`.
+   */
+  async batch(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession> {
+    const session = newCleanupLabel();
+    const params = parseBatchParams({ session, volume: p.volume, image: p.image, socket: p.socket });
+    if (params === undefined) throw new HelperChannelError('unsendable', 'The batch request is invalid.');
+    if (!this.operations.includes(OP_BATCH)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_BATCH}.`);
+    const timeoutMs = BATCH_HOLD_LIMIT_MS + CHANNEL_OPEN_TIMEOUT_MS + CHANNEL_RESULT_GRACE_MS;
+    const held = await this.hold(OP_BATCH, params, 'batch', BATCH_READY_STEP, timeoutMs, signal, `the batch on ${p.volume}`);
+    return { session, lost: held.lost, step: (kind, stepParams, options) => this.batchStep(session, kind, stepParams, options), close: held.release };
+  }
+
+  /**
+   * Plan step 6, PR B: one step in the batch helper `session` (the operation `batchStep`), with the result of
+   * ProcessRunner.run (the standard output, at most MAX_CAPTURED_OUTPUT_BYTES; the end of the standard error output;
+   * `timedOut` after `timeoutMs`, which ends the step alone and keeps the session). The parameters are the inputs of the
+   * step (batchStepCommand); when their request would be longer than the channel carries, they go first in pieces
+   * (`batchChunk`), at most MAX_BATCH_INPUT_CHARACTERS. The secret travels only in the `secret` field and is masked here
+   * too. Rejects as `operation`; HelperChannelError('unsendable') for parameters beyond the checks.
+   */
+  private async batchStep(session: string, kind: BatchStepKind, params: unknown, options: BatchStepOptions = {}): Promise<RunResult> {
+    if (options.signal?.aborted) throw abortError();
+    const value = params === undefined ? null : params;
+    const text = JSON.stringify(value);
+    const request: Record<string, unknown> = { session, kind, params: value };
+    if (options.timeoutMs !== undefined) request.timeoutMs = options.timeoutMs;
+    if (typeof text !== 'string' || parseBatchStepParams(request) === undefined) throw new HelperChannelError('unsendable', 'The batch step is invalid.');
+    // The request with its secret (at most 6 bytes per character as JSON) must fit in MAX_CHANNEL_REQUEST_BYTES.
+    if (Buffer.byteLength(text, 'utf8') + 6 * ((options.secret?.length ?? 0) + 1_024) > MAX_CHANNEL_REQUEST_BYTES) {
+      if (text.length > MAX_BATCH_INPUT_CHARACTERS) throw new HelperChannelError('unsendable', `The input of the step ${kind} is too large for the helper channel.`);
+      const input = newCleanupLabel();
+      for (let start = 0; start < text.length; start += BATCH_CHUNK_CHARACTERS) {
+        await this.operation(OP_BATCH_CHUNK, { session, input, data: text.slice(start, start + BATCH_CHUNK_CHARACTERS) }, { signal: options.signal, reserved: true });
+      }
+      delete request.params;
+      request.input = input;
+    }
+    let stdout = '';
+    let stdoutBytes = 0;
+    let stderr = '';
+    let tooLarge = false;
+    const tooLargeAbort = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
+    // The output of the step, masked here too (the worker and the helper mask it before), also across pieces.
+    const streams = {
+      stdout: new StreamRedactor(options.secret, (piece) => {
+        if (tooLarge) return;
+        stdoutBytes += Buffer.byteLength(piece, 'utf8');
+        if (stdoutBytes > MAX_CAPTURED_OUTPUT_BYTES) {
+          tooLarge = true;
+          stdout = '';
+          tooLargeAbort.abort();
+          return;
+        }
+        stdout += piece;
+        options.onOutput?.('stdout', piece);
+      }),
+      stderr: new StreamRedactor(options.secret, (piece) => {
+        stderr += piece;
+        if (stderr.length > 2 * MAX_CAPTURED_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CAPTURED_STDERR_CHARACTERS);
+        options.onOutput?.('stderr', piece);
+      }),
+    };
+    const flush = () => {
+      streams.stdout.flush();
+      streams.stderr.flush();
+      if (stderr.length > MAX_CAPTURED_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CAPTURED_STDERR_CHARACTERS);
+    };
+    try {
+      const result = await this.operation(OP_BATCH_STEP, request, {
+        secret: options.secret,
+        // The helper ends the step at its time limit; the worker and this side wait longer for its result.
+        timeoutMs: options.timeoutMs === undefined ? undefined : Math.min(options.timeoutMs + 2 * CHANNEL_RESULT_GRACE_MS, MAX_OPERATION_TIMEOUT_MS),
+        reserved: true,
+        signal,
+        onOutput: (stream, piece) => streams[stream].push(piece),
+      });
+      flush();
+      const checked = parseBatchStepValue(result);
+      if (checked === undefined) throw new HelperChannelError('protocol', 'The helper answered the batch step with an invalid value.');
+      return { exitCode: checked.exitCode, stdout, stderr, timedOut: false };
+    } catch (error) {
+      flush();
+      if (tooLarge) throw new OutputTooLargeError(kind, MAX_CAPTURED_OUTPUT_BYTES);
+      if (error instanceof HelperOperationError && (error.timedOut || error.code === 'timeout')) return { exitCode: null, stdout, stderr, timedOut: true };
+      throw error;
+    }
   }
 
   /**

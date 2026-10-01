@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Plan step 6, PR B: the batch helper in one process: the extension's HelperChannel, the worker's ChannelServer with
+// `batch`, `batchStep` and `batchChunk`, and, as the `docker run` of the helper, a second ChannelServer with the step
+// table of the helper (fake step processes and file system). Checked: one helper per session after the volume check
+// (a missing volume is refused and nothing is started); the relay of a step (its command from the builders, its
+// variables on the process only, its output masked); the token only as the `secret` and the standard input of the clone,
+// which runs as the Git user with the cleanup after it; unknown kinds refused; chunked input; the time limit and the
+// cancel of a step end that step alone; one step at a time; close and the end of the helper.
+import { afterEach, describe, expect, it } from 'vitest';
+import { BATCH_GIT_UID, BATCH_READY_STEP, MAX_BATCH_INPUT_CHARACTERS, OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP, batchRunArgs, batchVolumeArgs } from '../core/helperChannel/batch';
+import { batchStepCommand } from '../core/helper/batchSteps';
+import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession } from '../core/helperChannel/helperChannel';
+import { channelStepLabel, parseClientMessage } from '../core/helperChannel/protocol';
+import { bundleHash } from '../core/loader/pipeLoader';
+import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
+import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
+import { BATCH_MISSING_VOLUME_CODE, batchChunkOperation, batchOperation, batchStepOperation, type BatchDeps } from './batch';
+import { batchHelperOperations, gitPrivilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
+import { ChannelServer, type ServerChild, type SpawnDocker } from './server';
+
+const TOKEN = 'ghp_secret_token_of_the_test';
+const VOLUME = 'devenv-vol-1';
+const IMAGE = `sha256:${'a'.repeat(64)}`;
+const SOCKET = '/var/run/docker.sock';
+const HELPER_SCRIPT = 'the script of the worker and its helper';
+const UP = { repository: 'octo/hello', override: { name: 'x' }, environmentId: 'env-1', removeExistingContainer: false, env: { COMPOSE_PROJECT_NAME: 'p' } };
+
+interface FakeStep {
+  command: string[];
+  env: NodeJS.ProcessEnv;
+  input: string | undefined;
+  signals: string[];
+  out(text: string): void;
+  err(text: string): void;
+  exit(code: number | null): void;
+}
+
+/** Writes everything after the first line (the bundle, which the pipe loader reads) to `next`; records the bundle. */
+function afterLoader(next: (text: string) => void, onBundle: (line: string) => void): (text: string) => void {
+  let buffer: string | undefined = '';
+  return (text) => {
+    if (buffer === undefined) return next(text);
+    buffer += text;
+    const end = buffer.indexOf('\n');
+    if (end < 0) return;
+    onBundle(buffer.slice(0, end));
+    const rest = buffer.slice(end + 1);
+    buffer = undefined;
+    if (rest !== '') next(rest);
+  };
+}
+
+function setup(options: { autoExit?: boolean } = {}) {
+  const calls: string[][] = [];
+  const steps: FakeStep[] = [];
+  const quiet: string[][] = [];
+  const fsCalls: string[] = [];
+  const logLines: string[] = [];
+  const clientLines: string[] = [];
+  const bundles: string[] = [];
+  const servers: ChannelServer[] = [];
+  let helperExit: ((code: number | null) => void) | undefined;
+  const helperDeps: BatchHelperDeps = {
+    spawnStep: (command, env, input, onStdout, onStderr) => {
+      let resolve!: (value: { exitCode: number | null }) => void;
+      const exited = new Promise<{ exitCode: number | null }>((r) => (resolve = r));
+      const step: FakeStep = { command: [...command], env, input, signals: [], out: onStdout, err: onStderr, exit: (exitCode) => resolve({ exitCode }) };
+      steps.push(step);
+      if (options.autoExit !== false && input !== 'hang') setTimeout(() => step.exit(0), 5);
+      const process: StepProcess = {
+        exited,
+        killGroup: (signal) => {
+          step.signals.push(signal);
+          if (signal === 'SIGTERM') step.exit(null);
+        },
+      };
+      return process;
+    },
+    runQuiet: async (command) => {
+      quiet.push([...command]);
+    },
+    fs: {
+      lstatSync: ((path: string) => ({ isDirectory: () => true, mode: path === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+      chmodSync: ((path: string, mode: number) => fsCalls.push(`chmod ${path} ${mode.toString(8)}`)) as never,
+      chownSync: ((path: string, uid: number, gid: number) => fsCalls.push(`chown ${path} ${uid}:${gid}`)) as never,
+      readdirSync: (() => ['github-token']) as never,
+      rmSync: ((path: string) => fsCalls.push(`rm ${path}`)) as never,
+    },
+    env: { PATH: '/usr/bin', HOME: '/root', DOCKER_HOST: 'tcp://elsewhere:2375', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'true' },
+  };
+  const helperChild = (onStdout: (text: string) => void): ServerChild => {
+    let resolveExit!: (value: { exitCode: number | null }) => void;
+    const exited = new Promise<{ exitCode: number | null }>((resolve) => (resolveExit = resolve));
+    const helper = new ChannelServer({
+      write: (text) => {
+        onStdout(text);
+        return true;
+      },
+      spawnDocker: () => {
+        throw new Error('The helper runs no Docker call of its own.');
+      },
+      operations: batchHelperOperations(helperDeps),
+      exit: (code) => resolveExit({ exitCode: code }),
+      killGraceMs: 50,
+    });
+    servers.push(helper);
+    helper.start();
+    helperExit = (code) => {
+      helper.shutdown();
+      resolveExit({ exitCode: code });
+    };
+    const feed = afterLoader((text) => helper.input(text), (line) => bundles.push(line));
+    return {
+      write: (text) => {
+        feed(text);
+        return true;
+      },
+      end: (input) => {
+        if (input !== undefined) feed(input);
+        helper.inputEnded();
+      },
+      kill: () => helper.shutdown(),
+      exited,
+    };
+  };
+  const spawnDocker: SpawnDocker = (args, onStdout) => {
+    calls.push([...args]);
+    if (args[0] === 'run') return helperChild(onStdout);
+    let stdout = '';
+    let exitCode = 0;
+    if (args[0] === 'volume') {
+      if (args[args.length - 1] === VOLUME) stdout = `${VOLUME}\n`;
+      // An answer without the name of the volume counts as missing too.
+      else if (args[args.length - 1] !== 'devenv-unnamed') exitCode = 1;
+    }
+    if (args[0] === 'ps') stdout = '0123456789abcdef0123456789abcdef\n';
+    return {
+      end: () => {},
+      kill: () => {},
+      exited: new Promise((resolve) =>
+        setTimeout(() => {
+          if (stdout !== '') onStdout(stdout);
+          resolve({ exitCode });
+        }, 1),
+      ),
+    };
+  };
+  const deps: BatchDeps = { sessions: new Map(), readScript: () => HELPER_SCRIPT };
+  let toClient: (text: string) => void = () => {};
+  const worker = new ChannelServer({
+    write: (text) => {
+      toClient(text);
+      return true;
+    },
+    spawnDocker,
+    operations: { [OP_BATCH]: batchOperation(deps), [OP_BATCH_STEP]: batchStepOperation(deps), [OP_BATCH_CHUNK]: batchChunkOperation(deps) },
+    exit: () => {},
+    killGraceMs: 50,
+  });
+  servers.push(worker);
+  worker.start();
+  const toWorker = afterLoader((text) => worker.input(text), () => {});
+  const process: StartedProcess = {
+    write: (text) => {
+      clientLines.push(...text.split('\n').filter((line) => line !== ''));
+      // As through a pipe: later, never within the write.
+      setImmediate(() => toWorker(text));
+      return true;
+    },
+    end: () => worker.inputEnded(),
+    kill: () => worker.shutdown(),
+    onStdout: (listener) => (toClient = listener),
+    onStderr: () => {},
+    exited: new Promise(() => {}),
+  };
+  const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
+  const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
+  return { calls, steps, quiet, fsCalls, logLines, clientLines, bundles, servers, deps, open, helperExit: (code: number | null) => helperExit?.(code) };
+}
+
+async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+describe('the batch helper of the worker (plan step 6, PR B)', () => {
+  let cleanup: Array<() => void> = [];
+  afterEach(() => {
+    for (const fn of cleanup) fn();
+    cleanup = [];
+  });
+
+  async function started(options: { autoExit?: boolean } = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
+    const t = setup(options);
+    const channel = await t.open();
+    cleanup.push(() => {
+      channel.close();
+      for (const server of t.servers) server.shutdown();
+    });
+    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
+    return { t, channel, session };
+  }
+
+  it('checks the volume, then starts exactly one helper with the pinned image, the session label and no variable', async () => {
+    const { t, session } = await started();
+    expect(t.calls[0]).toEqual(batchVolumeArgs(VOLUME));
+    const runs = t.calls.filter((call) => call[0] === 'run');
+    expect(runs).toEqual([batchRunArgs({ session: session.session, volume: VOLUME, image: IMAGE, socket: SOCKET, scriptHash: bundleHash(HELPER_SCRIPT) })]);
+    expect(runs[0]).toContain(channelStepLabel(session.session));
+    const options = runs[0].slice(0, runs[0].indexOf(IMAGE));
+    expect(options).not.toContain('-e');
+    expect(options).not.toContain('--env');
+    expect(options.some((arg) => arg.startsWith('--env'))).toBe(false);
+    // The helper got the script of the worker as its first line (the pipe loader).
+    expect(t.bundles).toEqual([JSON.stringify(HELPER_SCRIPT)]);
+    await session.step('listConfigs', { repository: 'octo/hello' });
+    await session.step('listConfigs', { repository: 'octo/hello' });
+    expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
+  });
+
+  it('refuses a missing volume and starts nothing (the volume is never created)', async () => {
+    const t = setup();
+    const channel = await t.open();
+    cleanup.push(() => {
+      channel.close();
+      for (const server of t.servers) server.shutdown();
+    });
+    const failure = await channel.batch({ volume: 'devenv-missing', image: IMAGE, socket: SOCKET }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(HelperOperationError);
+    expect((failure as HelperOperationError).code).toBe(BATCH_MISSING_VOLUME_CODE);
+    expect(t.calls).toEqual([batchVolumeArgs('devenv-missing')]);
+    expect(t.deps.sessions.size).toBe(0);
+    await expect(channel.batch({ volume: 'devenv-unnamed', image: IMAGE, socket: SOCKET })).rejects.toMatchObject({ code: BATCH_MISSING_VOLUME_CODE });
+    expect(t.calls.filter((call) => call[0] === 'run')).toEqual([]);
+  });
+
+  it('relays a step: its command from the builders, its variables on the process only, its output masked everywhere', async () => {
+    const { t, session } = await started({ autoExit: false });
+    const seen: string[] = [];
+    const running = session.step('up', UP, { secret: TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    await waitUntil(() => t.steps.length === 1, 'the step');
+    const step = t.steps[0];
+    const built = batchStepCommand('up', UP);
+    expect(step.command).toEqual(built.command);
+    expect(step.input).toBe(built.input);
+    expect(step.env).toMatchObject({ PATH: '/usr/bin', COMPOSE_PROJECT_NAME: 'p', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' });
+    expect(step.env.DOCKER_HOST).toBeUndefined();
+    // The token split over two pieces of output.
+    step.out(`log in with ${TOKEN.slice(0, 10)}`);
+    step.out(`${TOKEN.slice(10)} done\n`);
+    step.err(`warning ${TOKEN}\n`);
+    step.exit(0);
+    const result = await running;
+    expect(result).toEqual({ exitCode: 0, stdout: 'log in with *** done\n', stderr: 'warning ***\n', timedOut: false });
+    expect(seen.join('')).not.toContain(TOKEN);
+    expect(t.logLines.join('\n')).not.toContain(TOKEN);
+    // The token travels only in the `secret` field of the request.
+    const request = t.clientLines.map((line) => parseClientMessage(line)).find((message) => message?.t === 'op' && message.op === OP_BATCH_STEP);
+    expect(request).toMatchObject({ secret: TOKEN });
+    expect(JSON.stringify((request as { params: unknown }).params)).not.toContain(TOKEN);
+  });
+
+  it('runs the clone as the Git user with the token only on its standard input, and cleans up after it', async () => {
+    const { t, session } = await started();
+    const result = await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+    expect(result.exitCode).toBe(0);
+    const step = t.steps[0];
+    expect(step.command).toEqual(['setpriv', ...gitPrivilegeArgs(), ...batchStepCommand('clone', { repository: 'octo/hello' }).command]);
+    expect(step.input).toBe(TOKEN);
+    expect(step.command.join(' ')).not.toContain(TOKEN);
+    expect(Object.values(step.env).join(' ')).not.toContain(TOKEN);
+    expect(step.env.HOME).toBe('/nonexistent');
+    const uid = String(BATCH_GIT_UID);
+    expect(t.fsCalls).toEqual([
+      `chmod ${CONFIG_FOLDER} 700`,
+      `chmod ${WORKSPACES_ROOT} 1777`,
+      `chown ${SECRETS_FOLDER} ${uid}:${uid}`,
+      `chown ${SECRETS_FOLDER} 0:0`,
+      `chmod ${WORKSPACES_ROOT} 755`,
+      `chmod ${CONFIG_FOLDER} 750`,
+      `rm ${SECRETS_FOLDER}/github-token`,
+    ]);
+    expect(t.quiet).toEqual([
+      ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
+    ]);
+    // A root step runs without setpriv and without the token.
+    await session.step('listConfigs', { repository: 'octo/hello' });
+    expect(t.steps[1].command[0]).toBe('node');
+    expect(t.steps[1].input).toBeUndefined();
+  });
+
+  it('refuses unknown kinds, a secret for a step without one, and a clone without one', async () => {
+    const { t, channel, session } = await started();
+    await expect(session.step('docker' as never, { args: ['ps'] })).rejects.toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
+    // Sent directly, the worker refuses the kind before the helper sees it.
+    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'docker', params: { args: ['ps'] } }, { reserved: true })).rejects.toMatchObject({ code: 'invalid' });
+    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'listConfigs', params: { repository: 'octo/hello', command: ['id'] } }, { reserved: true })).rejects.toMatchObject({
+      code: 'invalid',
+    });
+    await expect(session.step('listConfigs', { repository: 'octo/hello' }, { secret: TOKEN })).rejects.toMatchObject({ code: 'invalid' });
+    await expect(session.step('clone', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'invalid' });
+    expect(t.steps).toHaveLength(0);
+  });
+
+  it('sends an input longer than one request in pieces before the step, and refuses one beyond the limit', async () => {
+    const { t, session } = await started();
+    const big = { ...UP, override: { text: 'ä'.repeat(300_000) } };
+    await session.step('up', big);
+    const ops = t.clientLines.map((line) => parseClientMessage(line)).filter((message) => message?.t === 'op').map((message) => (message as { op: string }).op);
+    expect(ops.filter((op) => op === OP_BATCH_CHUNK).length).toBeGreaterThan(5);
+    expect(ops.indexOf(OP_BATCH_STEP)).toBeGreaterThan(ops.lastIndexOf(OP_BATCH_CHUNK));
+    expect(t.steps[0].input).toBe(batchStepCommand('up', big).input);
+    expect(t.deps.sessions.get(session.session)?.inputSize).toBe(0);
+    await expect(session.step('up', { ...UP, override: { text: 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS) } })).rejects.toMatchObject({ code: 'unsendable' });
+    expect(t.steps).toHaveLength(1);
+  });
+
+  it('ends a step at its time limit alone (its group), and the session goes on', async () => {
+    const { t, session } = await started();
+    const result = await session.step('composeHash', { model: 'hang', project: 'p' }, { timeoutMs: 100 });
+    expect(result).toMatchObject({ exitCode: null, timedOut: true });
+    expect(t.steps[0].signals[0]).toBe('SIGTERM');
+    expect(await session.step('listConfigs', { repository: 'octo/hello' })).toMatchObject({ exitCode: 0, timedOut: false });
+  });
+
+  it('forwards the cancel of a step to the helper, and the session goes on', async () => {
+    const { t, session } = await started({ autoExit: false });
+    const controller = new AbortController();
+    const running = session.step('listConfigs', { repository: 'octo/hello' }, { signal: controller.signal });
+    await waitUntil(() => t.steps.length === 1, 'the step');
+    controller.abort();
+    const error = await running.catch((caught: unknown) => caught);
+    expect(isAbortError(error)).toBe(true);
+    expect(t.steps[0].signals).toContain('SIGTERM');
+    const next = session.step('listConfigs', { repository: 'octo/hello' });
+    await waitUntil(() => t.steps.length === 2, 'the next step');
+    t.steps[1].exit(3);
+    expect(await next).toMatchObject({ exitCode: 3 });
+  });
+
+  it('runs one step at a time', async () => {
+    const { t, session } = await started({ autoExit: false });
+    const first = session.step('listConfigs', { repository: 'octo/hello' });
+    await waitUntil(() => t.steps.length === 1, 'the step');
+    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'busy' });
+    t.steps[0].exit(0);
+    await first;
+  });
+
+  it('the helper itself also runs one step at a time', async () => {
+    // The table of the helper alone, without the worker in front of it.
+    const steps: Array<() => void> = [];
+    const operations = batchHelperOperations({
+      spawnStep: () => {
+        let done!: (value: { exitCode: number | null }) => void;
+        steps.push(() => done({ exitCode: 0 }));
+        return { exited: new Promise((resolve) => (done = resolve)), killGroup: () => {} };
+      },
+      runQuiet: async () => {},
+      fs: {} as never,
+      env: {},
+    });
+    const context = {
+      signal: new AbortController().signal,
+      secret: undefined,
+      progress: () => {},
+      log: () => {},
+      output: () => {},
+      docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    };
+    const first = operations.listConfigs({ repository: 'octo/hello' }, context);
+    await expect(operations.readFiles({ repository: 'octo/hello', configPath: 'a.json' }, context)).rejects.toMatchObject({ code: 'busy' });
+    steps[0]();
+    expect(await first).toEqual({ exitCode: 0 });
+  });
+
+  it('the worker refuses a second step of a session while one runs, before the helper sees it', async () => {
+    const { t, channel, session } = await started({ autoExit: false });
+    const first = session.step('listConfigs', { repository: 'octo/hello' });
+    await waitUntil(() => t.steps.length === 1, 'the step');
+    const helperOps = () => t.logLines.filter((line) => line.includes('[batch ') && line.includes(': started.')).length;
+    const before = helperOps();
+    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'listConfigs', params: { repository: 'octo/hello' } }, { reserved: true })).rejects.toMatchObject({ code: 'busy' });
+    expect(helperOps()).toBe(before);
+    t.steps[0].exit(0);
+    await first;
+  });
+
+  it('close ends the helper and removes its container by the session label', async () => {
+    const { t, session } = await started();
+    await session.close();
+    await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal');
+    expect(t.calls).toContainEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(session.session)}`]);
+    expect(t.deps.sessions.size).toBe(0);
+    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toBeInstanceOf(HelperOperationError);
+  });
+
+  it('reports the end of the helper as lost, and removes what is left by the label', async () => {
+    const { t, session } = await started();
+    t.helperExit(1);
+    expect(await session.lost).toMatch(/batch helper ended/);
+    await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal');
+    expect(t.deps.sessions.size).toBe(0);
+  });
+
+  it('reports the ready step and refuses a batch with invalid parameters before sending it', async () => {
+    const t = setup();
+    const channel = await t.open();
+    cleanup.push(() => {
+      channel.close();
+      for (const server of t.servers) server.shutdown();
+    });
+    for (const p of [
+      { volume: '-v', image: IMAGE, socket: SOCKET },
+      { volume: VOLUME, image: 'devenv-helper:latest', socket: SOCKET },
+      { volume: VOLUME, image: IMAGE, socket: '/a,readonly=false' },
+      { volume: VOLUME, image: IMAGE, socket: 'relative.sock' },
+    ]) {
+      await expect(channel.batch(p)).rejects.toBeInstanceOf(HelperChannelError);
+    }
+    expect(t.calls).toEqual([]);
+    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
+    expect(t.logLines.some((line) => line.includes(`batch#`) && line.includes(BATCH_READY_STEP))).toBe(true);
+    await session.close();
+  });
+});

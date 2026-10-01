@@ -40,6 +40,15 @@ RUN set -eux; \
     devcontainer --version; \
     git config --system --add safe.directory '*'
 
+# Plan step 6, PR B (decision Q2 of 2026-10-01): the batch helper runs Git as this unprivileged user (BATCH_GIT_UID in
+# src/core/helperChannel/batch.ts; no home, no login), and mounts the Docker socket in a folder that only root can
+# enter (BATCH_SOCKET_FOLDER), so that Git and the programs that a repository names never reach it.
+RUN set -eux; \
+    groupadd --system --gid 52741 devenv-git; \
+    useradd --system --uid 52741 --gid 52741 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin devenv-git; \
+    install -d -m 0700 -o root -g root /run/devenv-docker; \
+    setpriv --version
+
 LABEL nimblescape.devenv.helper=true
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["sh"]

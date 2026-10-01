@@ -108,8 +108,8 @@ export const LOCK_DEPS: LockDeps = {
   startFlock: startFlockProcess,
 };
 
-/** Resolves when `signal` aborts or after `ms`, whichever comes first. */
-function abortedOrAfter(signal: AbortSignal, ms: number): Promise<void> {
+/** Resolves when `signal` aborts or after `ms`, whichever comes first. Plan step 6, PR B: also the hold of `batch`. */
+export function abortedOrAfter(signal: AbortSignal, ms: number): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) {
       resolve();

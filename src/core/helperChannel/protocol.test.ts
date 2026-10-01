@@ -153,12 +153,14 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   });
 
   it('channelLabelValue names the protocol, the script and the loader', () => {
-    expect(channelLabelValue('a')).toMatch(/^1-[0-9a-f]{12}$/);
+    // Plan step 6, PR B: changed expectation (protocol version 2, before 1).
+    expect(channelLabelValue('a')).toMatch(/^2-[0-9a-f]{12}$/);
     expect(channelLabelValue('a')).not.toBe(channelLabelValue('b'));
     // Plan step 3 (pipe loading, user decision 2026-09-29): the loader is part of the label (a new loader, a new version).
     const hash = createHash('sha256').update('a', 'utf8').update('\n', 'utf8').update(PIPE_LOADER, 'utf8').digest('hex');
-    expect(channelLabelValue('a')).toBe(`1-${hash.slice(0, 12)}`);
-    expect(channelLabelValue('a')).not.toBe(`1-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
+    // Plan step 6, PR B: changed expectations (protocol version 2, before 1).
+    expect(channelLabelValue('a')).toBe(`2-${hash.slice(0, 12)}`);
+    expect(channelLabelValue('a')).not.toBe(`2-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
   });
 
   it('checks the parameters and values of docker and probe', () => {

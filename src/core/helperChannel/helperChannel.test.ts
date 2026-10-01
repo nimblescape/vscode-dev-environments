@@ -186,7 +186,8 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     const { logger } = recordingLogger();
     const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
     fake.answer({ ...HELLO, protocol: CHANNEL_PROTOCOL_VERSION + 1 } as ServerMessage);
-    await expect(opening).rejects.toThrow(/speaks version 2/);
+    // Plan step 6, PR B: changed expectation (the protocol is version 2 now, so another one is 3).
+    await expect(opening).rejects.toThrow(/speaks version 3, not 2/);
     expect(fake.state.ended).toBe(true);
   });
 
