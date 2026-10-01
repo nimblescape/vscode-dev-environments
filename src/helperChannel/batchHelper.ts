@@ -122,7 +122,11 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
     restores.push(() => deps.fs.chmodSync(WORKSPACES_ROOT, root.mode & 0o7777 & ~0o1022));
     if (step.secret === 'stdin') {
       deps.fs.chownSync(SECRETS_FOLDER, BATCH_GIT_UID, BATCH_GIT_UID);
-      restores.push(() => deps.fs.chownSync(SECRETS_FOLDER, 0, 0));
+      // Review round 2 of PR #80 (A-R2-3): its mode too, which the Git user could change while it owned the folder.
+      restores.push(() => {
+        deps.fs.chownSync(SECRETS_FOLDER, 0, 0);
+        deps.fs.chmodSync(SECRETS_FOLDER, 0o700);
+      });
     }
     return await run();
   } finally {

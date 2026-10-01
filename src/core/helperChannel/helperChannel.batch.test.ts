@@ -271,6 +271,41 @@ describe('the places and the limits of a batch on the client (review round 1 of 
     channel.close();
   });
 
+  it('review round 2 of PR #80, B-R2-1: with a caller signal, stdout beyond the cap still cancels the step, and a late success rejects with OutputTooLargeError (O9)', async () => {
+    const { channel, worker, session: s } = await session({ maxCapturedOutputBytes: 1_000 });
+    const caller = new AbortController();
+    const running = s.step('listConfigs', { repository: 'o/r' }, { signal: caller.signal });
+    await tick();
+    const op = worker.ops().at(-1)!;
+    worker.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'x'.repeat(600) });
+    worker.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'x'.repeat(600) });
+    await tick();
+    // The cap aborts the operation also when the caller passed its own signal (AbortSignal.any).
+    expect(worker.lines.map((line) => parseClientMessage(line))).toContainEqual({ t: 'cancel', id: op.id });
+    expect(caller.signal.aborted).toBe(false);
+    // The step ended before the cancel took effect: its success must not hand back an empty stdout.
+    worker.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
+    const error = await running.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OutputTooLargeError);
+    channel.close();
+  });
+
+  it('review round 2 of PR #80, B-R2-1: an overflow that only the flush after a success finds (a held-back tail that could start the secret) rejects with OutputTooLargeError', async () => {
+    const { channel, worker, session: s } = await session({ maxCapturedOutputBytes: 1_000 });
+    const running = s.step('listConfigs', { repository: 'o/r' }, { secret: TOKEN });
+    await tick();
+    const op = worker.ops().at(-1)!;
+    // 999 characters pass; the masker holds back 'ghp_cl' (it could start the token), so no cancel goes out yet.
+    worker.answer({ t: 'out', id: op.id, stream: 'stdout', data: 'x'.repeat(999) + TOKEN.slice(0, 6) });
+    await tick();
+    expect(worker.lines.map((line) => parseClientMessage(line))).not.toContainEqual({ t: 'cancel', id: op.id });
+    worker.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
+    // Before: { exitCode: 0, stdout: '' } (the output was lost without a word).
+    const error = await running.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OutputTooLargeError);
+    channel.close();
+  });
+
   it('review round 1 of PR #80, B-R1-7: the stderr of a step keeps its end, at most MAX_CAPTURED_STDERR_CHARACTERS (HC21b)', async () => {
     const { channel, worker, session: s } = await session();
     const running = s.step('listConfigs', { repository: 'o/r' });

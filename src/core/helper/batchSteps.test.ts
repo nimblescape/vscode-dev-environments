@@ -180,6 +180,18 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
     for (const name of ['HOME', 'COMPOSE_PROJECT_NAME', 'GITHUB_USER', 'BROWSERS', 'MY_VSCODE']) expect(isPassableEnvName(name), name).toBe(true);
   });
 
+  it('review round 2 of PR #80, B-R2-3: refuses a sibling folder that shares the prefix of the repository folder (S39)', () => {
+    // A sibling of the repository folder `/workspaces/hello` whose name starts with `hello`: it is not below the folder.
+    // (`hello2/a` alone would also fail on its empty part under S39; the name after the prefix needs two characters.)
+    const siblings = ['/workspaces/hello-other/a', '/workspaces/hello22/a', '/workspaces/hellox/compose.yml', '/workspaces/hello2/a'];
+    for (const entry of siblings) {
+      expect(() => batchStepCommand('createFolders', { repository: REPO, folders: [entry] }), entry).toThrow(BatchStepError);
+      expect(() => batchStepCommand('composeModel', { repository: REPO, files: [entry], project: 'p' }), entry).toThrow(BatchStepError);
+    }
+    // The folder itself followed by `/` still passes.
+    expect(() => batchStepCommand('createFolders', { repository: REPO, folders: [`${FOLDER}/a`] })).not.toThrow();
+  });
+
   it('switches the remote includes of Docker Compose off', () => {
     expect(COMPOSE_REMOTE_OFF).toEqual({ COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' });
   });

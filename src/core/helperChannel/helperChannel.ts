@@ -796,6 +796,9 @@ export class HelperChannel {
         onOutput: (stream, piece) => streams[stream].push(piece),
       });
       flush();
+      // Review round 2 of PR #80, B-R2-1: stdout beyond the cap never ends as a success with an empty stdout, also when
+      // the result came before the cancel took effect.
+      if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
       const checked = parseBatchStepValue(result);
       if (checked === undefined) throw new HelperChannelError('protocol', 'The helper answered the batch step with an invalid value.');
       return { exitCode: checked.exitCode, stdout, stderr: stderr.text, timedOut: false };

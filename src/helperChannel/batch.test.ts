@@ -77,6 +77,11 @@ interface SetupOptions {
   helper?: 'channel' | 'silent' | 'wrongProtocol';
   /** Review round 1 of PR #80 (B-R1-14): the output of `docker ps`. */
   psOutput?: string;
+  /**
+   * Review round 2 of PR #80, B-R2-2: what `lstat` of CONFIG_FOLDER finds: a folder (default), a symbolic link (planted by
+   * the Git user while /workspaces was 1777), or nothing (it throws ENOENT).
+   */
+  configFolder?: 'folder' | 'symlink' | 'missing';
 }
 
 function setup(options: SetupOptions = {}) {
@@ -115,7 +120,12 @@ function setup(options: SetupOptions = {}) {
       order.push(command.join(' '));
     },
     fs: {
-      lstatSync: ((path: string) => ({ isDirectory: () => true, mode: path === WORKSPACES_ROOT ? (options.workspacesMode ?? 0o40755) : 0o40750 })) as never,
+      lstatSync: ((path: string) => {
+        // Review round 2 of PR #80, B-R2-2: CONFIG_FOLDER may be a symbolic link or missing.
+        if (path === CONFIG_FOLDER && options.configFolder === 'missing') throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+        if (path === CONFIG_FOLDER && options.configFolder === 'symlink') return { isDirectory: () => false, isSymbolicLink: () => true, mode: 0o120777 };
+        return { isDirectory: () => true, mode: path === WORKSPACES_ROOT ? (options.workspacesMode ?? 0o40755) : 0o40750 };
+      }) as never,
       chmodSync: ((path: string, mode: number) => {
         fsCalls.push(`chmod ${path} ${mode.toString(8)}`);
         order.push(`chmod ${path} ${mode.toString(8)}`);
@@ -356,6 +366,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       `chmod ${WORKSPACES_ROOT} 1777`,
       `chown ${SECRETS_FOLDER} ${uid}:${uid}`,
       `chown ${SECRETS_FOLDER} 0:0`,
+      // Review round 2 of PR #80 (A-R2-3): the secrets tmpfs gets its mode back as well.
+      `chmod ${SECRETS_FOLDER} 700`,
       `chmod ${WORKSPACES_ROOT} 755`,
       `chmod ${CONFIG_FOLDER} 750`,
       `rm ${SECRETS_FOLDER}/github-token`,
@@ -373,7 +385,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     ]);
     // Review round 1 of PR #80 (A-R1-1): the modes are restored right after the kill, before the slow walks.
     const kill = t.order.findIndex((entry) => entry.includes('kill -9 -1'));
-    expect(t.order.slice(kill + 1, kill + 3)).toEqual([`chmod ${WORKSPACES_ROOT} 755`, `chmod ${CONFIG_FOLDER} 750`]);
+    // Review round 2 of PR #80 (A-R2-3): the mode of the secrets tmpfs is restored first (the restores run in reverse).
+    expect(t.order.slice(kill + 1, kill + 4)).toEqual([`chmod ${SECRETS_FOLDER} 700`, `chmod ${WORKSPACES_ROOT} 755`, `chmod ${CONFIG_FOLDER} 750`]);
     // A root step runs without setpriv and without the token.
     await session.step('listConfigs', { repository: 'octo/hello' });
     expect(t.steps[1].command[0]).toBe('node');
@@ -388,6 +401,26 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(t.fsCalls).toContain(`chmod ${WORKSPACES_ROOT} 1777`);
     expect(t.fsCalls.filter((call) => call.startsWith(`chmod ${WORKSPACES_ROOT} `)).at(-1)).toBe(`chmod ${WORKSPACES_ROOT} 755`);
   });
+
+  for (const configFolder of ['symlink', 'missing'] as const) {
+    it(`review round 2 of PR #80, B-R2-2: a Git step never chmods CONFIG_FOLDER when it is a ${configFolder === 'symlink' ? 'symbolic link' : 'missing path'} (R23, R24)`, async () => {
+      // A link planted as /workspaces/.devenv+ would otherwise give its target 0700 and then the link's own mode (0777).
+      const { t, session } = await started({ configFolder });
+      const result = await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+      expect(result.exitCode).toBe(0);
+      expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual([]);
+      const uid = String(BATCH_GIT_UID);
+      expect(t.fsCalls).toEqual([
+        `chmod ${WORKSPACES_ROOT} 1777`,
+        `chown ${SECRETS_FOLDER} ${uid}:${uid}`,
+        `chown ${SECRETS_FOLDER} 0:0`,
+        // Review round 2 of PR #80 (A-R2-3): the secrets tmpfs gets its mode back as well.
+        `chmod ${SECRETS_FOLDER} 700`,
+        `chmod ${WORKSPACES_ROOT} 755`,
+        `rm ${SECRETS_FOLDER}/github-token`,
+      ]);
+    });
+  }
 
   it('refuses unknown kinds, a secret for a step without one, and a clone without one', async () => {
     const { t, channel, session } = await started();
@@ -543,6 +576,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
 
   it('review round 1 of PR #80, B-R1-9: the worker refuses a batch beyond its cap as busy and starts nothing (W3, W4, C32)', async () => {
     expect(MAX_CONCURRENT_BATCHES).toBe(8);
+    // Review round 2 of PR #80, B-R2-4 (C47): the input cap of a step bounds the worker's memory per session (8 sessions).
+    expect(MAX_BATCH_INPUT_CHARACTERS).toBe(3 * 1024 * 1024);
     const t = setup();
     const channel = await channelOf(t);
     // The batches of other windows on this worker.
