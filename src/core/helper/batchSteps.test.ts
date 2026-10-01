@@ -66,6 +66,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       env: { COMPOSE_PROJECT_NAME: 'p1' },
       git: false,
       owner: FOLDER,
+      // Review round 1 of PR #84, A-R1-1: added expectation: only the Compose steps close CONFIG_FOLDER for the step.
+      closeConfigFolder: true,
     });
     expect(batchStepCommand('composeHash', { repository: REPO, model: '{}', project: 'p1' })).toEqual({
       command: composeHashCommand(COMPOSE_MODEL_PATH, 'p1'),
@@ -73,6 +75,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       env: { COMPOSE_PROJECT_NAME: 'p1' },
       git: false,
       owner: FOLDER,
+      // Review round 1 of PR #84, A-R1-1: added expectation: only the Compose steps close CONFIG_FOLDER for the step.
+      closeConfigFolder: true,
     });
     // User decision of 2026-10-01: Compose reads as the repository owner, so composeHash without its repository, or
     // with one outside /workspaces, is refused.

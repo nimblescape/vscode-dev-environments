@@ -72,12 +72,22 @@ export interface BatchStepCommand {
    * User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."; it
    * replaces option A, the Git user): the repository folder whose owner (uid:gid, read with lstat at step time) runs the
    * step, as root when root owns it. The Docker Compose read steps (composeModel, composeHash): Compose follows `env_file`
-   * and `include` of the repository, so it reads as that user, with CONFIG_FOLDER root's and 0700 during the step. By the
+   * and `include` of the repository, so it reads as that user, with CONFIG_FOLDER root's and 0700 during the step
+   * (closeConfigFolder). By the
    * agreed extension of the same day, readFiles, listConfigs and createFolders too; plan step 7 (user decision of
    * 2026-10-01, "step 7 proposal accepted"): gitSummary, Delete's check, too. The steps that need the Docker
    * socket (readConfiguration, build, up, runUserCommands) and gitFiles and ownershipFix stay root; the clone stays Git's.
    */
   owner?: string;
+  /**
+   * Review round 1 of PR #84, A-R1-1: for an `owner` step, CONFIG_FOLDER is root's and 0700 during the step. Only the
+   * steps that follow references in repository files (Docker Compose: `env_file`, `include`): composeModel and
+   * composeHash. The other owner steps (readFiles, listConfigs, createFolders, gitSummary) leave its owner and mode as
+   * they are, so that Git in a running dev container keeps reading its configuration there during the step (the
+   * command-line `include.path` of credentials.gitconfig fails with EACCES otherwise); they still repair the root:root
+   * 0700 that a killed step left.
+   */
+  closeConfigFolder?: boolean;
   /**
    * The secret of the request (the GitHub token): `stdin`: required, the standard input of the step (TOKEN_PRELUDE writes
    * it to the tmpfs and removes it); `mask`: optional, only masked in the output; undefined: refused.
@@ -255,7 +265,7 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const files = pathsBelow(kind, p.files, folder);
       if (files.length === 0) fail(kind);
       // User decision of 2026-10-01: Compose reads as the repository owner (CONFIG_FOLDER closed during the step).
-      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: false, owner: folder };
+      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: false, owner: folder, closeConfigFolder: true };
     }
     case 'composeHash': {
       // User decision of 2026-10-01: Compose reads as the repository owner, so the step names its repository. It writes
@@ -263,7 +273,7 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const p = fields(kind, params, ['repository', 'model', 'project']);
       const { folder } = folderOf(kind, p.repository);
       const name = project(kind, p.project);
-      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: false, owner: folder };
+      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: false, owner: folder, closeConfigFolder: true };
     }
     case 'createFolders': {
       // User decision of 2026-10-01 (agreed extension of "Compose reads as the repository owner"): as the owner of the

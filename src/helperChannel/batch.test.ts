@@ -448,6 +448,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       ['readFiles', { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }],
       ['listConfigs', { repository: 'octo/hello' }],
       ['createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] }],
+      // Review round 1 of PR #84, A-R1-1: gitSummary (plan step 7) is an owner step as well.
+      ['gitSummary', { repository: 'octo/hello' }],
     ] as const) {
       t.fsCalls.length = 0;
       t.quiet.length = 0;
@@ -463,15 +465,17 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       expect(step.input, kind).toBe(batchStepCommand(kind, params).input);
       // User decision of 2026-10-01: Compose reads as the repository owner (CONFIG_FOLDER is also made root's for the
       // step, since it belongs to the owner; OVERRIDE_FOLDER is made new for the owner and removed after the step).
+      // Review round 1 of PR #84, A-R1-1: changed expectation (before: every owner step closed CONFIG_FOLDER): only the
+      // Compose steps close it; readFiles, listConfigs, createFolders and gitSummary leave its owner and mode unchanged.
+      const compose = kind === 'composeModel' || kind === 'composeHash';
+      expect(batchStepCommand(kind, params).closeConfigFolder === true, kind).toBe(compose);
       expect(t.fsCalls, kind).toEqual([
-        `chmod ${CONFIG_FOLDER} 700`,
-        `chown ${CONFIG_FOLDER} 0:0`,
+        ...(compose ? [`chmod ${CONFIG_FOLDER} 700`, `chown ${CONFIG_FOLDER} 0:0`] : []),
         `rm ${OVERRIDE_FOLDER}`,
         `mkdir ${OVERRIDE_FOLDER} 700`,
         `chown ${OVERRIDE_FOLDER} 1000:1000`,
         `rm ${OVERRIDE_FOLDER}`,
-        `chown ${CONFIG_FOLDER} 1000:1000`,
-        `chmod ${CONFIG_FOLDER} 750`,
+        ...(compose ? [`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 750`] : []),
       ]);
       // User decision of 2026-10-01: Compose reads as the repository owner. After its step only the kill of its
       // processes; never a walk of the volume, a removal of its files, or the repair of a cut-off Git step.
@@ -518,13 +522,48 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   }
 
   // Review round 5 of PR #82 (A-R5-2): a CONFIG_FOLDER that a killed owner step left root:root 0700 goes back to the owner.
+  // Review round 1 of PR #84, A-R1-1: changed expectation (before: listConfigs closed CONFIG_FOLDER and gave it back
+  // after the step): a step that does not close it repairs it at once, before the step, and touches it no more.
   it('gives a cut-off CONFIG_FOLDER back to the repository owner with 0755 after an owner step (A-R5-2)', async () => {
     const { t, session } = await started({ configFolder: 'cutOff' });
     expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
-    expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 755`]);
+    expect(t.fsCalls).toEqual([
+      `chown ${CONFIG_FOLDER} 1000:1000`,
+      `chmod ${CONFIG_FOLDER} 755`,
+      `rm ${OVERRIDE_FOLDER}`,
+      `mkdir ${OVERRIDE_FOLDER} 700`,
+      `chown ${OVERRIDE_FOLDER} 1000:1000`,
+      `rm ${OVERRIDE_FOLDER}`,
+    ]);
   });
 
+  // Review round 1 of PR #84, A-R1-1: the repair of a cut-off CONFIG_FOLDER applies to every owner step; a Compose step
+  // closes it for the step and gives it back to the owner with 0755 afterwards, the others repair it before the step.
+  for (const [kind, params] of [
+    ['composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }],
+    ['composeHash', { repository: 'octo/hello', model: '{}', project: 'p' }],
+    ['readFiles', { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }],
+    ['listConfigs', { repository: 'octo/hello' }],
+    ['createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] }],
+    ['gitSummary', { repository: 'octo/hello' }],
+  ] as const) {
+    it(`review round 1 of PR #84, A-R1-1: ${kind} repairs a cut-off CONFIG_FOLDER (back to the owner with 0755)`, async () => {
+      const { t, session } = await started({ configFolder: 'cutOff' });
+      expect((await session.step(kind, params)).exitCode).toBe(0);
+      const repair = [`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 755`];
+      if (kind === 'composeModel' || kind === 'composeHash') {
+        expect(t.fsCalls.slice(0, 2)).toEqual([`chmod ${CONFIG_FOLDER} 700`, `chown ${CONFIG_FOLDER} 0:0`]);
+        expect(t.fsCalls.slice(-2)).toEqual(repair);
+      } else {
+        expect(t.fsCalls.slice(0, 2)).toEqual(repair);
+        expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual(repair);
+      }
+    });
+  }
+
   // Review round 5 of PR #82 (A-R5-3): the restore of CONFIG_FOLDER runs also when the removal of OVERRIDE_FOLDER throws.
+  // Review round 1 of PR #84, A-R1-1: changed step (before: listConfigs, which no longer closes CONFIG_FOLDER): a
+  // Compose step, which still closes and restores it.
   it('restores CONFIG_FOLDER also when the removal of OVERRIDE_FOLDER fails after an owner step (A-R5-3)', async () => {
     const { t, session } = await started();
     const { helperDeps } = t;
@@ -535,7 +574,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       if (removals === 2) throw new Error('EBUSY');
       return (rmSync as (p: string, o: unknown) => void)(path, options);
     }) as never;
-    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'failed' });
+    await expect(session.step('composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' })).rejects.toMatchObject({ code: 'failed' });
     expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 750`]);
   });
 
@@ -546,8 +585,15 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     [1001, 0],
     [0, 1000],
   ] as const) {
-    for (const configFolder of ['folder', 'cutOff'] as const) {
-      it(`review round 5 of PR #82, B-R5-1: an owner step of a repository of ${repoUid}:${repoGid} (CONFIG_FOLDER ${configFolder}) keeps uid and gid apart`, async () => {
+    // Review round 1 of PR #84, A-R1-1: for readFiles (CONFIG_FOLDER left open, a cut-off one repaired before the step)
+    // and composeModel (CONFIG_FOLDER closed for the step); before, readFiles alone, which closed it.
+    for (const [configFolder, kind] of [
+      ['folder', 'readFiles'],
+      ['cutOff', 'readFiles'],
+      ['folder', 'composeModel'],
+      ['cutOff', 'composeModel'],
+    ] as const) {
+      it(`review round 5 of PR #82, B-R5-1: an owner step (${kind}) of a repository of ${repoUid}:${repoGid} (CONFIG_FOLDER ${configFolder}) keeps uid and gid apart`, async () => {
         const { t, session } = await started();
         const { helperDeps } = t;
         const lstatSync = helperDeps.fs.lstatSync as (path: string) => unknown;
@@ -559,26 +605,33 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
             return lstatSync(path);
           },
         });
-        const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
-        expect((await session.step('readFiles', params)).exitCode).toBe(0);
+        const params =
+          kind === 'readFiles'
+            ? { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }
+            : { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' };
+        expect((await session.step(kind, params)).exitCode).toBe(0);
         const restored = configFolder === 'cutOff' ? [`chown ${CONFIG_FOLDER} ${repoUid}:${repoGid}`, `chmod ${CONFIG_FOLDER} 755`] : [`chown ${CONFIG_FOLDER} 1001:1002`, `chmod ${CONFIG_FOLDER} 750`];
+        // Review round 1 of PR #84, A-R1-1: readFiles leaves CONFIG_FOLDER open (a cut-off one is repaired before the
+        // step); composeModel closes it for the step and restores it after.
+        const close = kind === 'composeModel';
+        const before = close ? [`chmod ${CONFIG_FOLDER} 700`, `chown ${CONFIG_FOLDER} 0:0`] : configFolder === 'cutOff' ? restored : [];
+        const after = close ? restored : [];
         if (repoUid === 0) {
           // Root (by the uid): no setpriv, no `kill -9 -1`, no chown of OVERRIDE_FOLDER.
-          expect(t.steps[0].command).toEqual(batchStepCommand('readFiles', params).command);
+          expect(t.steps[0].command).toEqual(batchStepCommand(kind, params).command);
           expect(t.quiet).toEqual([]);
-          expect(t.fsCalls).toEqual([`chmod ${CONFIG_FOLDER} 700`, `chown ${CONFIG_FOLDER} 0:0`, `rm ${OVERRIDE_FOLDER}`, `mkdir ${OVERRIDE_FOLDER} 700`, `rm ${OVERRIDE_FOLDER}`, ...restored]);
+          expect(t.fsCalls).toEqual([...before, `rm ${OVERRIDE_FOLDER}`, `mkdir ${OVERRIDE_FOLDER} 700`, `rm ${OVERRIDE_FOLDER}`, ...after]);
         } else {
           const privilege = ['--reuid', '1001', '--regid', '0', '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
-          expect(t.steps[0].command).toEqual(['setpriv', ...privilege, ...batchStepCommand('readFiles', params).command]);
+          expect(t.steps[0].command).toEqual(['setpriv', ...privilege, ...batchStepCommand(kind, params).command]);
           expect(t.quiet).toEqual([['setpriv', ...privilege, 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']]);
           expect(t.fsCalls).toEqual([
-            `chmod ${CONFIG_FOLDER} 700`,
-            `chown ${CONFIG_FOLDER} 0:0`,
+            ...before,
             `rm ${OVERRIDE_FOLDER}`,
             `mkdir ${OVERRIDE_FOLDER} 700`,
             `chown ${OVERRIDE_FOLDER} 1001:0`,
             `rm ${OVERRIDE_FOLDER}`,
-            ...restored,
+            ...after,
           ]);
         }
       });
@@ -588,14 +641,22 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   // Review round 6 of PR #82 (B-R6-1): a cut-off CONFIG_FOLDER goes back to an owner only when the repository folder is
   // real. With a link or a missing folder the step runs as nobody, and CONFIG_FOLDER keeps root:root 0700 (never the
   // owner of the link, never nobody).
+  // Review round 1 of PR #84, A-R1-1: for composeModel (closes CONFIG_FOLDER for the step, then restores root:root 0700)
+  // and readFiles (changed expectation: before, it closed and restored it too; now it does not touch it at all).
   for (const repository of ['symlink', 'missing'] as const) {
-    it(`review round 6 of PR #82, B-R6-1: a cut-off CONFIG_FOLDER stays root:root 0700 when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'}`, async () => {
-      const { t, session } = await started({ repository, configFolder: 'cutOff' });
-      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
-      expect((await session.step('readFiles', params)).exitCode).toBe(0);
-      expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand('readFiles', params).command]);
-      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 0:0`, `chmod ${CONFIG_FOLDER} 700`]);
-    });
+    for (const kind of ['readFiles', 'composeModel'] as const) {
+      it(`review round 6 of PR #82, B-R6-1: a cut-off CONFIG_FOLDER stays root:root 0700 after ${kind} when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'}`, async () => {
+        const { t, session } = await started({ repository, configFolder: 'cutOff' });
+        const params =
+          kind === 'readFiles'
+            ? { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }
+            : { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' };
+        expect((await session.step(kind, params)).exitCode).toBe(0);
+        expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand(kind, params).command]);
+        if (kind === 'composeModel') expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 0:0`, `chmod ${CONFIG_FOLDER} 700`]);
+        else expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual([]);
+      });
+    }
   }
 
   // Review round 6 of PR #82 (B-R6-3): only root:root 0700 counts as cut off. Each of uid, gid and mode alone keeps
@@ -605,7 +666,10 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     [0, 1002, 0o700],
     [0, 0, 0o755],
   ] as const) {
-    it(`review round 6 of PR #82, B-R6-3: a CONFIG_FOLDER of ${configUid}:${configGid} ${configMode.toString(8)} is restored as it was found`, async () => {
+    // Review round 1 of PR #84, A-R1-1: for composeModel (closes and restores) and readFiles (changed expectation: before,
+    // it closed and restored CONFIG_FOLDER too; now a folder that is not cut off is not touched at all).
+    for (const kind of ['readFiles', 'composeModel'] as const) {
+    it(`review round 6 of PR #82, B-R6-3: a CONFIG_FOLDER of ${configUid}:${configGid} ${configMode.toString(8)} is restored as it was found (${kind})`, async () => {
       const { t, session } = await started();
       const { helperDeps } = t;
       const lstatSync = helperDeps.fs.lstatSync as (path: string) => unknown;
@@ -617,10 +681,15 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
           return lstatSync(path);
         },
       });
-      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
-      expect((await session.step('readFiles', params)).exitCode).toBe(0);
-      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} ${configUid}:${configGid}`, `chmod ${CONFIG_FOLDER} ${configMode.toString(8)}`]);
+      const params =
+        kind === 'readFiles'
+          ? { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }
+          : { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' };
+      expect((await session.step(kind, params)).exitCode).toBe(0);
+      if (kind === 'composeModel') expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} ${configUid}:${configGid}`, `chmod ${CONFIG_FOLDER} ${configMode.toString(8)}`]);
+      else expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual([]);
     });
+    }
   }
 
   // Review round 5 of PR #82 (B-R5-2): an owner step never chmods or chowns CONFIG_FOLDER when it is a symbolic link
@@ -655,7 +724,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       t.order.push(`chown ${path} ${uid}:${gid}`);
       return (chownSync as (p: string, u: number, g: number) => void)(path, uid, gid);
     }) as never;
-    expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
+    // Review round 1 of PR #84, A-R1-1: changed step (before: listConfigs, which no longer closes CONFIG_FOLDER): a
+    // Compose step, which still closes and restores it.
+    expect((await session.step('composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' })).exitCode).toBe(0);
     const kill = ['setpriv', ...privilegeArgs(1000, 1000), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ');
     const start = t.order.indexOf(`chown ${OVERRIDE_FOLDER} 1000:1000`);
     expect(start).toBeGreaterThanOrEqual(0);
