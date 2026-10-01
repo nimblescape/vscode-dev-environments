@@ -61,6 +61,9 @@ import {
 // Plan step 6, PR B: the checks of the inputs and the commands of the Dev Container CLI runs are shared with the batch
 // helper (stepInputs.ts), so that both build every command from the same builders.
 import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
+// Plan step 6, PR C: within an open, the volume steps run in the batch helper of the operation.
+import { currentBatchScope, type BatchScope } from './batchScope';
+import type { BatchStepKind } from './batchSteps';
 
 export { isPassableEnvName };
 
@@ -355,6 +358,12 @@ interface StreamOptions {
   network?: boolean;
   /** See HelperRunSpec.hideConfigFolder. */
   hideConfigFolder?: boolean;
+  /**
+   * Plan step 6, PR C: the step of the batch helper that this run is, with the inputs of its builder (batchSteps.ts) and
+   * the secret (the token: the standard input of the clone, or only masked). Within the batch scope of an open
+   * (batchScope.ts) the run goes only there; a run without it is refused (D1).
+   */
+  batch?: { kind: BatchStepKind; params: Record<string, unknown>; secret?: string };
   /** The helper image of the open (see HelperImageUse); without it, the image of this instance (WorkspaceHelper.image). */
   image?: HelperImageUse;
   signal?: AbortSignal;
@@ -364,6 +373,9 @@ interface StreamOptions {
 
 /** Files of the extension for a run of the Dev Container CLI (stepInputs.ts). */
 export type { HelperFiles };
+
+/** Plan step 6, PR C: the step kinds of the batch helper that take the variables of the request (`env`). */
+const BATCH_ENV_KINDS: ReadonlySet<BatchStepKind> = new Set<BatchStepKind>(['readConfiguration', 'build', 'up', 'runUserCommands']);
 
 /** Time limit of the model run of a Docker Compose configuration (composeModel). */
 export const COMPOSE_MODEL_TIMEOUT_MS = 60_000;
@@ -571,6 +583,8 @@ export class WorkspaceHelper {
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, cloneCommand(p.repository, name, p.branch || undefined), {
+      // Plan step 6, PR C: in the batch helper the token travels only in the `secret` field.
+      batch: { kind: 'clone', params: { repository: p.repository, ...(p.branch ? { branch: p.branch } : {}) }, secret: p.token },
       image: p.image,
       input: p.token,
       secrets: true,
@@ -601,6 +615,7 @@ export class WorkspaceHelper {
   }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } | undefined> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
+      batch: { kind: 'readFiles', params: { repository: p.repository, configPath: p.configPath, ...(p.dockerfile !== undefined ? { dockerfile: p.dockerfile } : {}) } },
       image: p.image,
       docker: false,
       network: false,
@@ -625,6 +640,7 @@ export class WorkspaceHelper {
   async listConfigurations(p: { volumeName: string; repository: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<string[]> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, listConfigsCommand(folder), {
+      batch: { kind: 'listConfigs', params: { repository: p.repository } },
       image: p.image,
       docker: false,
       network: false,
@@ -709,6 +725,17 @@ export class WorkspaceHelper {
       overrideConfigPath: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined,
     });
     const result = await this.runStreams(p.volumeName, withFiles ? writeAndRunCommand({}, args) : ['devcontainer', ...args], {
+      batch: {
+        kind: 'readConfiguration',
+        params: {
+          repository: p.repository,
+          configPath: p.configPath,
+          environmentId: p.environmentId,
+          merged,
+          ...(p.override !== undefined ? { override: p.override } : {}),
+          ...(p.files !== undefined ? { files: p.files } : {}),
+        },
+      },
       input: withFiles ? writeAndRunInput(p.files, p.override) : undefined,
       env: p.env,
       image: p.image,
@@ -762,6 +789,7 @@ export class WorkspaceHelper {
     if (p.override === undefined && p.files === undefined) {
       const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
       return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
+        batch: { kind: 'build', params: { repository: p.repository, configPath: p.configPath, imageName: p.imageName } },
         env: p.env,
         image: p.image,
         onOutput: p.onOutput,
@@ -772,6 +800,16 @@ export class WorkspaceHelper {
     const args = buildArgs({ workspaceFolder: folder, configPath: config, imageName: p.imageName });
     const command = writeAndRunCommand({ repositoryConfig: configFile, config: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined }, args);
     return this.runDevcontainer('devcontainer build', p.volumeName, command, {
+      batch: {
+        kind: 'build',
+        params: {
+          repository: p.repository,
+          configPath: p.configPath,
+          imageName: p.imageName,
+          ...(p.override !== undefined ? { override: p.override } : {}),
+          ...(p.files !== undefined ? { files: p.files } : {}),
+        },
+      },
       input: writeAndRunInput(p.files, p.override),
       env: p.env,
       image: p.image,
@@ -803,6 +841,7 @@ export class WorkspaceHelper {
     }
     this.deps.logger.info(`Reading the Docker Compose configuration of ${p.repository} (${p.files.join(', ')}).`);
     const result = await this.runStreams(p.volumeName, composeModelCommand(folder, p.files), {
+      batch: { kind: 'composeModel', params: { repository: p.repository, files: [...p.files], project: p.project } },
       image: p.image,
       env: { COMPOSE_PROJECT_NAME: p.project },
       docker: false,
@@ -833,6 +872,7 @@ export class WorkspaceHelper {
   }): Promise<Map<string, string>> {
     this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
     const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
+      batch: { kind: 'composeHash', params: { model: p.model, project: p.project } },
       image: p.image,
       input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },
@@ -869,6 +909,7 @@ export class WorkspaceHelper {
     if (p.folders.length === 0) return;
     this.deps.logger.info(`Creating the folders ${p.folders.join(', ')} of ${p.repository} for the bind mounts of Docker Compose.`);
     const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
+      batch: { kind: 'createFolders', params: { repository: p.repository, folders: [...p.folders] } },
       image: p.image,
       docker: false,
       network: false,
@@ -916,6 +957,16 @@ export class WorkspaceHelper {
     );
     try {
       return await this.runDevcontainer('devcontainer up', p.volumeName, overrideCommand(args, p.files), {
+        batch: {
+          kind: 'up',
+          params: {
+            repository: p.repository,
+            override: p.override,
+            environmentId: p.environmentId,
+            removeExistingContainer: p.removeExistingContainer,
+            ...(p.files !== undefined ? { files: p.files } : {}),
+          },
+        },
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
@@ -963,6 +1014,16 @@ export class WorkspaceHelper {
     this.deps.logger.info(`Running the lifecycle commands of ${p.repository} in the container ${p.containerId.slice(0, 12)}.`);
     try {
       const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, overrideCommand(args, p.files), {
+        batch: {
+          kind: 'runUserCommands',
+          params: {
+            repository: p.repository,
+            override: p.override,
+            environmentId: p.environmentId,
+            containerId: p.containerId,
+            ...(p.files !== undefined ? { files: p.files } : {}),
+          },
+        },
         input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
@@ -1011,6 +1072,7 @@ export class WorkspaceHelper {
     const output = p.onOutput ?? this.logOutput;
     this.deps.logger.info(`Writing the Git configuration of ${p.repository} into the volume ${p.volumeName}.`);
     const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+      batch: { kind: 'gitFiles', params: { repository: p.repository, identity: { name: p.identity.name, email: p.identity.email } } },
       image: p.image,
       docker: false,
       network: false,
@@ -1040,6 +1102,7 @@ export class WorkspaceHelper {
     signal?: AbortSignal;
   }): Promise<RunResult> {
     return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
+      batch: { kind: 'ownershipFix', params: { folder: p.folder, uid: p.uid, gid: p.gid } },
       image: p.image,
       docker: false,
       network: false,
@@ -1304,6 +1367,8 @@ export class WorkspaceHelper {
     volumeName: string,
     helperCommand: string[],
     options: {
+      /** Plan step 6, PR C: the step of the batch helper (StreamOptions.batch); `secret` is added here. */
+      batch: NonNullable<StreamOptions['batch']>;
       input?: string;
       env?: Record<string, string>;
       secret?: string;
@@ -1320,6 +1385,8 @@ export class WorkspaceHelper {
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, helperCommand, {
+        // Plan step 6, PR C: `up` and run-user-commands take the token only to mask their output in the helper.
+        batch: { ...options.batch, ...(secret !== undefined ? { secret } : {}) },
         input: options.input,
         env: options.env,
         image: options.image,
@@ -1343,6 +1410,9 @@ export class WorkspaceHelper {
   }
 
   private async runStreams(volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
+    // Plan step 6, PR C: within an open, only through the batch helper of the operation (never a `docker run` of its own).
+    const scope = currentBatchScope();
+    if (scope !== undefined) return this.runInBatch(scope, volumeName, command, options);
     const env = this.helperEnv(options.env ?? {}, options.secrets === true);
     // Review round 2 of PR #64 (A-N1): a run of an open uses the helper image of that open, never the image that this
     // instance resolved for another open meanwhile.
@@ -1377,6 +1447,47 @@ export class WorkspaceHelper {
       this.resetImage();
       use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
       result = await this.runContainer(use.tag, volumeName, command, env, options);
+    }
+    return result;
+  }
+
+  /**
+   * Plan step 6, PR C: a run as a step of the batch helper of the open (batchScope.ts), with the result of the per-step
+   * run: the exit code, the output, and for the time limit an Error that is not an AbortError. User decision D1: a run
+   * that is no step of the batch helper is refused, never run as a `docker run` of its own. The variables pass the same
+   * checks as for `-e` (helperEnv) and go on the process of the step in the helper. The session opens with the pinned
+   * helper image of the open (its ID) and the socket of the engine.
+   */
+  private async runInBatch(scope: BatchScope, volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
+    const batch = options.batch;
+    if (batch === undefined) throw scope.refuse(`The helper run ${describeCommand(command)} has no step in the batch helper`);
+    const params: Record<string, unknown> = { ...batch.params };
+    // The kinds with variables of the request; the Compose read steps set COMPOSE_PROJECT_NAME from their `project`.
+    const env = BATCH_ENV_KINDS.has(batch.kind) ? this.helperEnv(options.env ?? {}, false) : {};
+    const names = Object.keys(env);
+    if (names.length > 0) params.env = env;
+    this.deps.logger.info(`Batch helper step ${batch.kind}` + (names.length > 0 ? ` (variables: ${names.join(', ')})` : '') + '.');
+    const result = await scope.step(
+      {
+        volume: volumeName,
+        kind: batch.kind,
+        params,
+        options: {
+          secret: batch.secret,
+          signal: options.signal,
+          timeoutMs: options.timeoutMs,
+          onOutput: (stream, text) => (stream === 'stdout' ? options.onStdout : options.onStderr)?.(text),
+        },
+      },
+      async () => {
+        const use = options.image ?? (await this.image({ onOutput: options.onStderr, signal: options.signal }, false));
+        if (use.id === undefined) throw new Error(`the ID of the helper image ${use.tag} is not known`);
+        return { image: use.id, socket: this.socketPathFor(await this.currentEngine()) };
+      },
+    );
+    if (result.timedOut) {
+      const seconds = Math.round((options.timeoutMs ?? 0) / 1000);
+      throw new Error(`The step ${batch.kind} of the batch helper did not end within ${seconds} seconds.`);
     }
     return result;
   }

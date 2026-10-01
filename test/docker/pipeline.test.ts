@@ -15,9 +15,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { helperImageTag, registryBaseDigest } from '../../src/core/helper/helperImage';
 import { readHelperState } from '../../src/core/helper/helperState';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import type { HttpTransport } from '../../src/core/http';
 import { extractBaseImages } from '../../src/core/imageCheck/dockerfile';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
@@ -48,13 +49,13 @@ import {
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
-import { FakeEnvironmentLock } from '../../src/core/pipeline/environmentService.testkit';
 import { isoTime, systemClock, type GitHubAuth } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
+import { workerLocks } from './workerLocks';
 import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
@@ -134,6 +135,10 @@ describe('open pipeline on a seeded environment', () => {
   const timings = new Timings();
   const onlineClient = registryClient(registryTransport, runner, env, log);
   const digestChecker = new ImageChecker(onlineClient, log);
+  // Plan step 6, PR C: the real locks of the workers (the opens run their helper steps in the batch helper of the worker
+  // that holds the lock; there is no other path, D1).
+  const targets = new DockerTargets(docker, env, log);
+  const locks = workerLocks({ run, cli, log }, docker, targets, 'pipeline', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
 
   /**
    * The workspace helper of a new window whose weekly check of the base image of the helper is due, with a state file
@@ -187,9 +192,10 @@ describe('open pipeline on a seeded environment', () => {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
     return new EnvironmentService({
       analyzer: inProcessAnalyzer,
-      // Plan step 5, PR B (D1: no unlocked path): the lock is required; this file is not about it, so a lock that is always
-      // granted, whose plain Docker calls run directly as before.
-      environmentLock: new FakeEnvironmentLock((args, options) => docker.runDirect(args, options)).take,
+      // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
+      // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs
+      // the helper steps of the opens.
+      environmentLock: locks.take,
       docker,
       runner,
       helper: workspaceHelper,
@@ -352,10 +358,13 @@ describe('open pipeline on a seeded environment', () => {
     log.info(`Seeded environment ${environmentId}: volume ${volumeName}.`);
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     timings.print(`Timings of the pipeline scenarios (${TEST_BASE_IMAGE}):`);
+    // Plan step 6, PR C: no worker and no batch helper is left over.
+    const leftovers = await locks.dispose();
     restoreBaseImageTag();
     removeRunObjects(cli, run.runId);
+    expect(leftovers).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.volume(volumeName)).toBeUndefined();
     expect(runImages()).toEqual([]);
@@ -385,6 +394,7 @@ describe('open pipeline on a seeded environment', () => {
     const progress = new RecordingProgress();
     const events = ui.events.length;
     const checked = checks.length;
+    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
     const result = await timings.measure(
       'first open: pull, build :1, up',
       () => online.openEnvironment(environmentId, { progress }),
@@ -427,6 +437,9 @@ describe('open pipeline on a seeded environment', () => {
     expect(filesOfOtherUsers()).toBe('');
     expect(execIn(REMOTE_USER, `touch ${FOLDER}/.git/write-test && rm ${FOLDER}/.git/write-test && echo ok`)).toBe('ok');
     expect(helperContainers()).toEqual([]);
+    // Plan step 6, PR C: the whole open (the reads, the build, `up`, the lifecycle commands, the Git files, the ownership
+    // fix) ran in exactly one batch helper container, which is gone now.
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
     expect(ui.since(events)).toEqual([]);
     // Lifecycle token (user decision 2026-09-27): postCreateCommand and postStartCommand ran once each, with the token.
     expect(execIn(REMOTE_USER, `cat ${POST_CREATE_LOG}`)).toBe('present');

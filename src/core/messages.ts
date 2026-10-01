@@ -281,6 +281,13 @@ export const Messages = {
   /** PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar found no helper image; it never builds one. */
   helperImageNotPresent:
     'The workspace helper image is not on this Docker engine (or could not be checked); the next Start, Stop or Delete builds it.',
+  /**
+   * Plan step 6, PR C (rule D1 of 2026-09-30): a helper step of an open needs the batch helper of the operation (one per
+   * operation, through the worker that holds the lock), and it could not be used; the open was refused, and nothing was
+   * run without it.
+   */
+  batchHelperUnavailable: (cause: string) =>
+    `The workspace helper of this operation could not be used (${cause}), so the operation was stopped and nothing was run without it. Check that Docker runs (see the Dev Environments output), then try again.`,
   workerUnavailable: (cause: string) =>
     `The Dev Environments worker on the Docker host could not be prepared (${cause}), so nothing was run. Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
   /**

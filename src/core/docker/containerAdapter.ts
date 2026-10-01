@@ -963,19 +963,51 @@ export class ContainerAdapter {
 
   /**
    * `docker exec` in a running container. Resolves also for a non-zero exit code. Standard input is attached (`-i`) only
-   * when `input` is given.
+   * when `input` or `secretInput` is given.
+   *
+   * Plan step 6, PR C (Q4 of 2026-10-01): `secretInput` is a standard input that is a secret (the GitHub token written
+   * into the dev container). It goes only through the worker that holds the lock of the environment (`docker exec -i` in
+   * the worker, the token as the secret of the operation, masked in what comes back): never as a direct `docker exec`,
+   * never in an argument or a variable. Without a held lock, or after the lock was lost, the call is refused
+   * (CommandError) and nothing runs (rule D1).
    */
   exec(
     container: string,
     command: readonly string[],
-    options: { user?: string; workdir?: string; input?: string; signal?: AbortSignal; timeoutMs?: number } = {},
+    options: { user?: string; workdir?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<RunResult> {
+    if (options.input !== undefined && options.secretInput !== undefined) throw new Error('A docker exec has either an input or a secret input.');
     const args = ['exec'];
-    if (options.input !== undefined) args.push('-i');
+    if (options.input !== undefined || options.secretInput !== undefined) args.push('-i');
     if (options.user) args.push('-u', options.user);
     if (options.workdir) args.push('-w', options.workdir);
     args.push(container, ...command);
+    if (options.secretInput !== undefined) return this.runWithSecretInput(args, options.secretInput, { signal: options.signal, timeoutMs: options.timeoutMs });
     return this.run(args, { input: options.input, signal: options.signal, timeoutMs: options.timeoutMs });
+  }
+
+  /** Plan step 6, PR C: see `exec` (`secretInput`). */
+  private async runWithSecretInput(args: readonly string[], secretInput: string, options: Pick<RunOptions, 'signal' | 'timeoutMs'>): Promise<RunResult> {
+    const command = dockerCommandWords(args).join(' ');
+    const held = heldEnvironmentLock();
+    if (held === undefined) {
+      throw new CommandError(commandText(args), null, '', `docker ${command} with a secret input runs only through the worker that holds the lock of the environment; it was not run.`);
+    }
+    const lost = held.lostReason();
+    if (lost !== undefined) {
+      throw new CommandError(commandText(args), null, '', `The lock of the environment on the Docker host was lost (${lost}); docker ${command} was not run.`);
+    }
+    try {
+      return await held.lock.docker(args, { timeoutMs: options.timeoutMs, signal: options.signal, secretInput });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (options.signal?.aborted) throw abortError();
+      this.logger.warn(`docker ${command} with a secret input through the worker that holds the lock failed (${errorMessage(error)}); it is not run directly.`);
+      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
+        throw new CommandError(commandText(args), null, '', `docker ${command} was not sent to the worker that holds the lock of the environment (${errorMessage(error)}); it did not run.`);
+      }
+      throw new CommandError(commandText(args), null, '', `The connection to the worker that holds the lock of the environment failed; the outcome of docker ${command} is not known.`);
+    }
   }
 
   /** True if the volume exists. Throws CommandError if Docker fails for another reason. */

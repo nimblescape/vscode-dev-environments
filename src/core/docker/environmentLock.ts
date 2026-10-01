@@ -20,11 +20,16 @@ export interface HeldEnvironmentLock {
    * operation ended by itself (its backstop). Never rejects.
    */
   readonly lost: Promise<string>;
-  /** One plain Docker call through the worker that holds the lock. Rejects when it was not sent or its outcome is not known. */
-  docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>): Promise<RunResult>;
   /**
-   * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (HelperChannel.batch). Not used
-   * by the pipeline yet (plan step 6, PR C).
+   * One plain Docker call through the worker that holds the lock. Rejects when it was not sent or its outcome is not known.
+   * Plan step 6, PR C (Q4 of 2026-10-01): `secretInput` is the standard input of the call when it is a secret (the token
+   * written into the dev container, `docker exec -i`): it travels as the secret of the operation, never in its parameters,
+   * and is masked in everything that comes back.
+   */
+  docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'> & { secretInput?: string }): Promise<RunResult>;
+  /**
+   * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (HelperChannel.batch). Plan step
+   * 6, PR C: the open pipeline runs its volume steps in it (src/core/helper/batchScope.ts).
    */
   batch?(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
   /** Lets go of the lock and resolves when the worker confirmed it, or the worker was lost (the kernel frees it). Never rejects. */

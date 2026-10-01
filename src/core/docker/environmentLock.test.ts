@@ -180,3 +180,60 @@ describe('the scope of a held environment lock (plan step 5, PR B)', () => {
     expect(runner.calls).toEqual([['ps']]);
   });
 });
+
+// Plan step 6, PR C (Q4 of 2026-10-01): the token write into the dev container (`docker exec -i` with a secret input) goes
+// only through the worker that holds the lock, with the secret as the secret input of the call; never directly.
+describe('docker exec with a secret input (plan step 6, PR C)', () => {
+  const SECRET = 'gho_0123456789abcdefSECRET';
+
+  it('goes through the worker that holds the lock, with the secret only as its secret input', async () => {
+    const { docker, runner, routed } = adapter();
+    const options: unknown[] = [];
+    const { lock, calls } = fakeLock();
+    const held: HeldEnvironmentLock = {
+      ...lock,
+      docker: async (args, callOptions) => {
+        options.push(callOptions);
+        return lock.docker(args, callOptions);
+      },
+    };
+    const result = await runWithEnvironmentLock(held, () => docker.exec('c1', ['sh', '-c', 'cat > /run/token', 'sh', 'dev'], { user: 'root', secretInput: SECRET, timeoutMs: 1000 }));
+    expect(result.stdout).toBe('worker');
+    expect(calls).toEqual([['exec', '-i', '-u', 'root', 'c1', 'sh', '-c', 'cat > /run/token', 'sh', 'dev']]);
+    expect(options).toEqual([{ secretInput: SECRET, timeoutMs: 1000, signal: undefined }]);
+    expect(JSON.stringify(calls)).not.toContain(SECRET);
+    expect(runner.calls).toEqual([]);
+    expect(routed).toEqual([]);
+  });
+
+  it('is refused without a held lock, and after the lock was lost; nothing runs directly', async () => {
+    const { docker, runner, routed } = adapter();
+    await expect(docker.exec('c1', ['sh'], { user: 'root', secretInput: SECRET })).rejects.toBeInstanceOf(CommandError);
+    const { lock, calls, lose } = fakeLock();
+    lose('the worker was lost');
+    await Promise.resolve();
+    await runWithEnvironmentLock(lock, async () => {
+      await Promise.resolve();
+      await expect(docker.exec('c1', ['sh'], { user: 'root', secretInput: SECRET })).rejects.toThrow('The lock of the environment on the Docker host was lost (the worker was lost)');
+    });
+    expect(calls).toEqual([]);
+    expect(runner.calls).toEqual([]);
+    expect(routed).toEqual([]);
+  });
+
+  it('a failure in the worker is never repeated directly', async () => {
+    const { docker, runner } = adapter();
+    const { lock } = fakeLock('env-1', async () => {
+      throw new HelperChannelError('lost', 'gone');
+    });
+    await runWithEnvironmentLock(lock, async () => {
+      const error = await docker.exec('c1', ['sh'], { user: 'root', secretInput: SECRET }).then(
+        () => undefined,
+        (reason: unknown) => reason as CommandError,
+      );
+      expect(error).toBeInstanceOf(CommandError);
+      expect(error?.message).not.toContain(SECRET);
+    });
+    expect(runner.calls).toEqual([]);
+  });
+});

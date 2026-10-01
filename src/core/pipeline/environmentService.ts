@@ -60,6 +60,7 @@ import {
 } from '../helper/configurationAnalysis';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
+import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
@@ -1366,6 +1367,8 @@ export class EnvironmentService {
     // (removeFailedFirstOpen keeps the entry whenever the volume cannot be removed); nothing is removed without the lock.
     let locked = false;
     try {
+      // Plan step 6, PR C: with the batch scope of the volume `name` (one batch helper for the steps of the open; it opens
+      // at the first volume step, after createVolume, and closes before the lock is released).
       return await this.withEnvironmentLock(environment, signal, async () => {
         locked = true;
         try {
@@ -1388,7 +1391,7 @@ export class EnvironmentService {
           }
           throw error;
         }
-      });
+      }, { batchVolume: name });
     } catch (error) {
       if (!locked) await this.removeRefusedFirstOpen(environment);
       throw error;
@@ -1437,7 +1440,10 @@ export class EnvironmentService {
       // again (recoverMissingFiles, with its Delete, which holds the lock already: re-entrant), the resumed clone, and the
       // pipeline. D1: without the helper image or the worker the open is refused before anything is changed; D3: a lock
       // held elsewhere is refused after 10 s. The lock stays held while a question to the user is open (user decision Q3
-      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state.
+      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state. Plan step 6, PR C: with the
+      // batch scope of the volume (batchScope.ts): every helper step of the open runs in one batch helper of the
+      // operation, opened at the first volume step (after Clone again created a missing volume) and closed before the
+      // release.
       const result = await this.withEnvironmentLock(env, signal, async () => {
         let forced = options.forceRebuild === true;
         let configPath = env.configPath;
@@ -1472,7 +1478,7 @@ export class EnvironmentService {
           await this.resumeInterruptedClone(opened, defaultBranch);
         }
         return this.runPipeline(opened);
-      });
+      }, { batchVolume: env.volumeName });
       succeeded = true;
       return result;
     } finally {
@@ -6371,6 +6377,9 @@ export class EnvironmentService {
   }
 
   private async removeVolumeWithRetry(name: string): Promise<void> {
+    // Plan step 6, PR C: the batch helper of the open mounts the volume; it ends first (a later step would open a new one).
+    const scope = currentBatchScope();
+    if (scope !== undefined && scope.volume === name) await scope.closeSession();
     for (let attempt = 1; ; attempt++) {
       try {
         await this.deps.docker.removeVolume(name);
@@ -6551,7 +6560,14 @@ export class EnvironmentService {
    * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear. Plan step 6, PR A: also
    * the opens (openExisting: Start, Rebuild, Select configuration, Clone again; openFirst), see there.
    */
-  private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  private async withEnvironmentLock<T>(
+    env: Environment,
+    signal: AbortSignal | undefined,
+    fn: () => Promise<T>,
+    // Plan step 6, PR C: `batchVolume` (the opens): `fn` runs in the batch scope of that volume (batchScope.ts) under the
+    // lock; its session is closed before the lock is released.
+    options: { batchVolume?: string } = {},
+  ): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();
     try {
       // PR #74 review round 1 (A-R1-1): only a missing tag is built (no rebuild, check, or cleanup before Stop or Delete).
@@ -6575,8 +6591,9 @@ export class EnvironmentService {
       throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
     }
     this.logger.info(`${env.repository} is locked on the Docker host.`);
+    const batchVolume = options.batchVolume;
     try {
-      return await runWithEnvironmentLock(lock, fn);
+      return await runWithEnvironmentLock(lock, batchVolume === undefined ? fn : () => runWithBatchScope(lock, batchVolume, this.logger, fn));
     } finally {
       await lock.release();
       this.logger.info(`${env.repository} is unlocked on the Docker host.`);

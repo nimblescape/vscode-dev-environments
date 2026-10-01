@@ -205,6 +205,9 @@ const NO_OWN_CALL = new Set([
   'runRouted',
   // Plan step 5, PR B: the calls under the lock of an environment (environmentLock.test.ts).
   'runLocked',
+  // Plan step 6, PR C: a secret input of `exec`, only through the worker that holds the lock, never a direct call
+  // (environmentLock.test.ts).
+  'runWithSecretInput',
   'runDirect',
   'runOnce',
   'start',
