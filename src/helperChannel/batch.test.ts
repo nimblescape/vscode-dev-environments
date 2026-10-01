@@ -54,11 +54,13 @@ function afterLoader(next: (text: string) => void, onBundle: (line: string) => v
   };
 }
 
-function setup(options: { autoExit?: boolean } = {}) {
+function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
   const calls: string[][] = [];
   const steps: FakeStep[] = [];
   const quiet: string[][] = [];
   const fsCalls: string[] = [];
+  // The quiet commands and the file system calls in one order (review round 1 of PR #80, A-R1-1).
+  const order: string[] = [];
   const logLines: string[] = [];
   const clientLines: string[] = [];
   const bundles: string[] = [];
@@ -82,10 +84,14 @@ function setup(options: { autoExit?: boolean } = {}) {
     },
     runQuiet: async (command) => {
       quiet.push([...command]);
+      order.push(command.join(' '));
     },
     fs: {
-      lstatSync: ((path: string) => ({ isDirectory: () => true, mode: path === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
-      chmodSync: ((path: string, mode: number) => fsCalls.push(`chmod ${path} ${mode.toString(8)}`)) as never,
+      lstatSync: ((path: string) => ({ isDirectory: () => true, mode: path === WORKSPACES_ROOT ? (options.workspacesMode ?? 0o40755) : 0o40750 })) as never,
+      chmodSync: ((path: string, mode: number) => {
+        fsCalls.push(`chmod ${path} ${mode.toString(8)}`);
+        order.push(`chmod ${path} ${mode.toString(8)}`);
+      }) as never,
       chownSync: ((path: string, uid: number, gid: number) => fsCalls.push(`chown ${path} ${uid}:${gid}`)) as never,
       readdirSync: (() => ['github-token']) as never,
       rmSync: ((path: string) => fsCalls.push(`rm ${path}`)) as never,
@@ -179,7 +185,7 @@ function setup(options: { autoExit?: boolean } = {}) {
   };
   const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
   const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
-  return { calls, steps, quiet, fsCalls, logLines, clientLines, bundles, servers, deps, open, helperExit: (code: number | null) => helperExit?.(code) };
+  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, open, helperExit: (code: number | null) => helperExit?.(code) };
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -197,7 +203,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     cleanup = [];
   });
 
-  async function started(options: { autoExit?: boolean } = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
+  async function started(options: { autoExit?: boolean; workspacesMode?: number } = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
     const t = setup(options);
     const channel = await t.open();
     cleanup.push(() => {
@@ -287,15 +293,33 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       `chmod ${CONFIG_FOLDER} 750`,
       `rm ${SECRETS_FOLDER}/github-token`,
     ]);
+    // Review round 1 of PR #80 (A-R1-1, A-R1-2): before the step, as root, the repair of a Git step whose cleanup was
+    // cut off (its files get root; temporary clone folders older than 60 minutes go); after it, the temporary clone
+    // folders of the Git user go too.
     expect(t.quiet).toEqual([
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'],
       ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
+      ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-user', uid, '-exec', 'rm', '-rf', '{}', '+'],
       ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
       ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
     ]);
+    // Review round 1 of PR #80 (A-R1-1): the modes are restored right after the kill, before the slow walks.
+    const kill = t.order.findIndex((entry) => entry.includes('kill -9 -1'));
+    expect(t.order.slice(kill + 1, kill + 3)).toEqual([`chmod ${WORKSPACES_ROOT} 755`, `chmod ${CONFIG_FOLDER} 750`]);
     // A root step runs without setpriv and without the token.
     await session.step('listConfigs', { repository: 'octo/hello' });
     expect(t.steps[1].command[0]).toBe('node');
     expect(t.steps[1].input).toBeUndefined();
+  });
+
+  it('never leaves /workspaces sticky or writable for others, also after a Git step whose cleanup was cut off', async () => {
+    // Review round 1 of PR #80 (A-R1-1): a kill of the whole helper left /workspaces at 1777; the next Git step must not
+    // take that for the mode to restore.
+    const { t, session } = await started({ workspacesMode: 0o41777 });
+    await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+    expect(t.fsCalls).toContain(`chmod ${WORKSPACES_ROOT} 1777`);
+    expect(t.fsCalls.filter((call) => call.startsWith(`chmod ${WORKSPACES_ROOT} `)).at(-1)).toBe(`chmod ${WORKSPACES_ROOT} 755`);
   });
 
   it('refuses unknown kinds, a secret for a step without one, and a clone without one', async () => {

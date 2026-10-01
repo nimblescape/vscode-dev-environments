@@ -87,11 +87,26 @@ function clearSecrets(deps: BatchHelperDeps): void {
   for (const name of deps.fs.readdirSync(SECRETS_FOLDER)) deps.fs.rmSync(`${SECRETS_FOLDER}/${name}`, { recursive: true, force: true });
 }
 
+/** The temporary folders of the clone in /workspaces (CLONE_SCRIPT's `mktemp -d`). */
+const CLONE_WORK_NAME = '.devenv-clone.*';
+
+/**
+ * Review round 1 of PR #80 (A-R1-1, A-R1-2): what a Git step left when its cleanup was cut off (the whole helper killed
+ * on a cancel of the batch, `docker rm -f`) is repaired before the next Git step, as root: the files of the Git user in
+ * the volume get root, and the temporary folders of killed clones go after 60 minutes (as the clone of the per-step
+ * helper removed them, which ran as root; the Git user cannot remove a folder of root in the sticky /workspaces).
+ */
+async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<void> {
+  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+']);
+}
+
 /** Runs `run` with the folders of the Git user opened for the step, and cleans up after it (see the module comment). */
 async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: () => Promise<T>): Promise<T> {
   const restores: Array<() => void> = [];
   const uid = String(BATCH_GIT_UID);
   try {
+    await repairCutOffGitStep(deps, uid);
     const config = lstatOrUndefined(deps, CONFIG_FOLDER);
     if (config?.isDirectory()) {
       deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
@@ -99,20 +114,33 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
     }
     const root = deps.fs.lstatSync(WORKSPACES_ROOT);
     deps.fs.chmodSync(WORKSPACES_ROOT, 0o1777);
-    restores.push(() => deps.fs.chmodSync(WORKSPACES_ROOT, root.mode & 0o7777));
+    // Review round 1 of PR #80 (A-R1-1): never sticky or writable for others afterwards, also when a cut-off step left
+    // it so (its 1777 would otherwise be taken for the mode to restore, for good).
+    restores.push(() => deps.fs.chmodSync(WORKSPACES_ROOT, root.mode & 0o7777 & ~0o1022));
     if (step.secret === 'stdin') {
       deps.fs.chownSync(SECRETS_FOLDER, BATCH_GIT_UID, BATCH_GIT_UID);
       restores.push(() => deps.fs.chownSync(SECRETS_FOLDER, 0, 0));
     }
     return await run();
   } finally {
-    // Nothing of the Git user outlives its step: its processes, then its files outside the volume; in the volume its files
-    // get root, as the clone of the per-step helper (which ran as root) left them.
+    // Nothing of the Git user outlives its step: its processes; then the modes are restored at once (review round 1 of
+    // PR #80, A-R1-1: before the slow walks, which a kill of the whole helper may cut off); then the temporary folders
+    // of its clone (A-R1-2: a clone whose own cleanup was cut off by its kill), and its files outside the volume; in the
+    // volume its files get root, as the clone of the per-step helper (which ran as root) left them.
     await deps.runQuiet(['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']);
-    await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
-    await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
-    for (const restore of restores.reverse()) restore();
+    try {
+      for (const restore of restores.reverse()) restore();
+    } finally {
+      await removeGitUserLeftovers(deps, uid);
+    }
   }
+}
+
+/** The files of the Git user after its step (its processes are gone): see the comment in asGitUser. */
+async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string): Promise<void> {
+  await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
+  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
 function lstatOrUndefined(deps: BatchHelperDeps, path: string): fs.Stats | undefined {
