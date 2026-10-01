@@ -5766,7 +5766,15 @@ export class EnvironmentService {
       await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       await this.requireVolume(env);
-      return await this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
+      // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the listing of the picker runs as the step
+      // listConfigs of the batch helper of the volume (as the owner of the repository) under the lock of the environment,
+      // released before the picker is shown (D1: refused when either cannot be had; D3: busy after 10 s).
+      return await this.withEnvironmentLock(
+        env,
+        options.signal,
+        () => this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal }),
+        { batchVolume: env.volumeName },
+      );
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }

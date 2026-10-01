@@ -1185,6 +1185,13 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  it('plan step 7: the listing of the configuration picker runs in exactly one batch helper under the lock and leaves none', async () => {
+    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
+    expect(await online.listConfigurations(environmentId, { progress: new RecordingProgress() })).toEqual([CONFIG_PATH]);
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    expect(helperContainers()).toEqual([]);
+  });
+
   it('plan step 7: the safety check of a volume without the repository folder runs as nobody in one batch helper and gives the recorded state', async () => {
     const repository = 'devenv-test/empty';
     const id = newEnvironmentId();
