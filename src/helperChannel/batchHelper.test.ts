@@ -272,6 +272,14 @@ describeUnix('the real processes of the helper (review round 1 of PR #80, B-R1-1
     }
   });
 
+  it('review round 3 of PR #80, B-R3-2: a step that exits without reading a large input (EPIPE) resolves with its exit code, and the helper does not crash', async () => {
+    // Far more than a pipe buffer: the write is still pending when the step exits, so its standard input gets EPIPE.
+    const step = spawnStepProcess(['sh', '-c', 'exit 3'], { PATH: process.env.PATH }, 'x'.repeat(4 * 1024 * 1024), () => {}, () => {});
+    expect(await within(step.exited, 10_000)).toEqual({ exitCode: 3 });
+    // An unhandled 'error' event of the input would surface as an uncaught exception (vitest fails the run) by now.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+
   it('review round 1 of PR #80, B-R1-1: runQuietProcess resolves for a command that does not exist', async () => {
     expect(await within(runQuietProcess(['/nonexistent/devenv-no-such-command', '-x']), 10_000)).toBeUndefined();
   });

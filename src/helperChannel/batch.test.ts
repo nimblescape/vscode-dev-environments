@@ -82,6 +82,13 @@ interface SetupOptions {
    * the Git user while /workspaces was 1777), or nothing (it throws ENOENT).
    */
   configFolder?: 'folder' | 'symlink' | 'missing';
+  /**
+   * Review round 3 of PR #80, B-R3-1: the helper (a ChannelServer) reads its input only once this settles, so its hello
+   * comes late; and it ignores SIGTERM (as Node.js as PID 1 of its container) and ends only by SIGKILL or its input.
+   */
+  lateHello?: Promise<void>;
+  /** Review round 3 of PR #80, B-R3-1: the kill grace time of the worker's ChannelServer (default 50 ms). */
+  workerKillGraceMs?: number;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -158,18 +165,30 @@ function setup(options: SetupOptions = {}) {
       resolveExit({ exitCode: code });
     };
     const feed = afterLoader((text) => helper.input(text), (line) => bundles.push(line));
+    // Review round 3 of PR #80, B-R3-1: what arrives before options.lateHello settles waits for it, in its order.
+    let late = options.lateHello !== undefined;
+    const waiting: Array<() => void> = [];
+    void options.lateHello?.then(() => {
+      late = false;
+      for (const next of waiting.splice(0)) next();
+    });
+    const inOrder = (next: () => void) => (late ? waiting.push(next) : next());
     return {
       write: (text) => {
-        feed(text);
+        inOrder(() => feed(text));
         return true;
       },
-      end: (input) => {
-        if (input !== undefined) feed(input);
-        helperEvents.push({ event: 'inputEnded', at: Date.now() });
-        helper.inputEnded();
-      },
-      kill: () => {
-        helperEvents.push({ event: 'kill', at: Date.now() });
+      end: (input) =>
+        inOrder(() => {
+          if (input !== undefined) feed(input);
+          helperEvents.push({ event: 'inputEnded', at: Date.now() });
+          helper.inputEnded();
+        }),
+      kill: (signal) => {
+        if (options.lateHello !== undefined) {
+          helperEvents.push({ event: `kill ${signal}`, at: Date.now() });
+          if (signal !== 'SIGKILL') return;
+        } else helperEvents.push({ event: 'kill', at: Date.now() });
         helper.shutdown();
       },
       exited,
@@ -242,7 +261,7 @@ function setup(options: SetupOptions = {}) {
     spawnDocker,
     operations: { [OP_BATCH]: recordedBatch, [OP_BATCH_STEP]: batchStepOperation(deps), [OP_BATCH_CHUNK]: batchChunkOperation(deps) },
     exit: () => {},
-    killGraceMs: 50,
+    killGraceMs: options.workerKillGraceMs ?? 50,
   });
   servers.push(worker);
   worker.start();
@@ -679,4 +698,25 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     for (const call of listed) expect(call).toEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(session.session)}`]);
     expect(t.calls.filter((call) => call[0] === 'rm')).toEqual([['rm', '-f', id]]);
   });
+
+  it('review round 3 of PR #80, B-R3-1: a cancel during the open of the helper ends the batch once the open is done, not at its hold limit', async () => {
+    let answer!: () => void;
+    const lateHello = new Promise<void>((resolve) => (answer = resolve));
+    // Long times: only the cancel can end this batch within the bounds below.
+    const t = setup({ lateHello, workerKillGraceMs: 60_000, deps: { holdLimitMs: 60_000, openTimeoutMs: 60_000 } });
+    const channel = await channelOf(t);
+    const controller = new AbortController();
+    const starting = channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }, controller.signal).catch((error: unknown) => error);
+    await waitUntil(() => t.calls.some((call) => call[0] === 'run'), 'the docker run of the helper');
+    controller.abort();
+    // The worker took the cancel: its SIGTERM to the docker run, which the helper ignores.
+    await waitUntil(() => t.helperEvents.some((entry) => entry.event === 'kill SIGTERM'), 'the SIGTERM of the cancel');
+    // The helper answers its hello now: the open succeeds with the signal of the operation already aborted.
+    answer();
+    await waitUntil(() => t.helperEvents.some((entry) => entry.event === 'inputEnded'), 'the end of the helper input', 10_000);
+    await waitUntil(() => t.deps.sessions.size === 0, 'the end of the session', 10_000);
+    expect(t.helperEvents.map((entry) => entry.event)).not.toContain('kill SIGKILL');
+    // The worker confirms the cancel once its operation ended.
+    expect(isAbortError(await starting)).toBe(true);
+  }, 30_000);
 });

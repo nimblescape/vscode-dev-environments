@@ -162,6 +162,37 @@ describe('HelperChannel.batch (plan step 6, PR B)', () => {
     expect((await starting).session).toBe((op.params as { session: string }).session);
     channel.close();
   });
+  it('review round 3 of PR #80, B-R3-3: HeldEnvironmentLock.batch passes the signal of its caller, and a cancel while it starts reaches the worker', async () => {
+    const { channel, worker } = await opened();
+    const locking = channel.lock('env-1', 5);
+    await tick();
+    worker.answer({ t: 'progress', id: worker.ops().at(-1)!.id, step: LOCK_HELD_STEP });
+    const lock = await locking;
+    const controller = new AbortController();
+    const starting = lock.batch!(BATCH, controller.signal).catch((error: unknown) => error);
+    await tick();
+    const op = worker.ops().at(-1)!;
+    expect(op.op).toBe(OP_BATCH);
+    // Before the worker reports the batch ready.
+    controller.abort();
+    await tick();
+    // A batch that ignored the signal would send no cancel.
+    expect(worker.lines.map((line) => parseClientMessage(line))).toContainEqual({ t: 'cancel', id: op.id });
+    worker.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    expect(await starting).toMatchObject({ name: 'AbortError' });
+    channel.close();
+  });
+
+  for (const what of ['batch', 'lock'] as const) {
+    it(`review round 3 of PR #80, B-R3-4: ${what} with a signal that is already aborted rejects as AbortError and sends nothing`, async () => {
+      const { channel, worker } = await opened();
+      const outcome = (what === 'batch' ? channel.batch(BATCH, AbortSignal.abort()) : channel.lock('env-1', 5, AbortSignal.abort())).catch((error: unknown) => error);
+      await tick();
+      expect(worker.ops()).toEqual([]);
+      expect(await outcome).toMatchObject({ name: 'AbortError' });
+      channel.close();
+    });
+  }
 });
 
 /** Review round 1 of PR #80: starts a batch on an open channel (the fake worker reports it ready). */
