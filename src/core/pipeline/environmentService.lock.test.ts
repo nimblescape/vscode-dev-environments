@@ -19,7 +19,8 @@ import { CommandError, UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './environmentService';
-import { ACCOUNT, ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { ACCOUNT, ENV_ID, PID, REPO, T0, WINDOW_ID, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { isBusyMarkLive } from '../busy';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
 let h: Harness;
@@ -636,5 +637,41 @@ describe('a failed first open whose volume cannot be removed (PR #78 review roun
     await h.service.delete(entry!.id, { progress: h.progress, additionalVolumesToRemove: [] });
     expect(await h.registry.list()).toEqual([]);
     expect(h.docker.volumes.size).toBe(0);
+  });
+
+  // PR #78 review round 2 (A-R2-1): the kept create mark of this window counts as ended, so it blocks nothing while this
+  // window lives (the sidebar of every window, other windows' Start and Delete); any window's next open completes the clone.
+  const statuses = (now: number) =>
+    [
+      { windowId: WINDOW_ID, pid: PID, updatedAt: new Date(now).toISOString(), environmentId: null, state: 'idle' },
+      { windowId: 'window-2', pid: 777, updatedAt: new Date(now).toISOString(), environmentId: null, state: 'idle' },
+    ] as never[];
+
+  it.each([
+    ['after the failed first open', false],
+    ['after a resume that fails again in the same window', true],
+  ])('%s, the kept create mark is not live; another window resumes the clone (PR #78 review round 2, A-R2-1)', async (_name, resumeFailsFirst) => {
+    const { h, heal } = failing();
+    await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    if (resumeFailsFirst) await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    const [entry] = await h.registry.list();
+    expect(entry?.busy?.operation).toBe('create');
+    const now = T0 + 60_000;
+    expect(isBusyMarkLive(entry!.busy!, { now, isAlive: (pid) => pid === PID || pid === 777, windowStatuses: statuses(now) })).toBe(false);
+    const other = createHarness({
+      registry: h.registry,
+      sessionFiles: h.sessionFiles,
+      docker: h.docker,
+      helper: h.helper,
+      owner: { windowId: 'window-2', pid: 777 },
+      isProcessAlive: (pid) => pid === PID || pid === 777,
+      windowStatuses: async () => statuses(Date.now()),
+      sleep: async () => {},
+    });
+    heal();
+    const before = h.helper.calls.length;
+    await other.service.openEnvironment(entry!.id, { progress: h.progress });
+    expect(h.helper.calls.slice(before)).toContain('clone');
+    expect((await h.registry.get(entry!.id))?.busy).toBeUndefined();
   });
 });

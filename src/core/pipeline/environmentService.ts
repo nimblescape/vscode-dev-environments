@@ -499,6 +499,16 @@ const LIFECYCLE_MARK_RETRY_MS = 500;
  */
 const NOT_RUNNING_STATES: ReadonlySet<string> = new Set(['exited', 'created']);
 
+/**
+ * PR #78 review round 2 (A-R2-1): a mark that isBusyMarkLive counts as ended (older than BUSY_MARK_MAX_AGE_MS; the epoch,
+ * so a clock correction cannot make it live again), with its operation kept: the create mark of an unfinished clone of
+ * this window then blocks nothing (the sidebar of every window, other windows' Start and Delete), like the mark of an
+ * ended window, and the next open of any window still completes the clone.
+ */
+function endedMark(mark: BusyMark): BusyMark {
+  return { ...mark, since: new Date(0).toISOString() };
+}
+
 /** Review round 4 of PR #68 (A-R4-6): the busy marks are the same mark (all four fields). */
 function sameBusyMark(a: BusyMark, b: BusyMark): boolean {
   return a.operation === b.operation && a.since === b.since && a.pid === b.pid && a.windowId === b.windowId;
@@ -1402,7 +1412,15 @@ export class EnvironmentService {
         } catch (error) {
           // PR #78 review round 1 (A-R1-1): the volume could not be removed (for example the lock was lost): the entry keeps its create mark, so the
           // next open completes the clone (resumeInterruptedClone) or Delete removes it.
-          if (!(await this.removeFailedFirstOpen(ctx.env, ctx.compose === true))) ctx.busy = false;
+          if (!(await this.removeFailedFirstOpen(ctx.env, ctx.compose === true))) {
+            ctx.busy = false;
+            // PR #78 review round 2 (A-R2-1): kept as ended, so it blocks nothing while this window lives.
+            await this.quietly('keep the create mark as ended', () =>
+              this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
+                if (entry.busy && this.isOwnMark(entry.busy)) entry.busy = endedMark(entry.busy);
+              }),
+            );
+          }
           throw error;
         }
       });
@@ -1580,14 +1598,14 @@ export class EnvironmentService {
     } catch (error) {
       // The mark of the ended window comes back, so the next open completes the clone again. A mark of this window
       // would count as live: the environment would show as busy without Start and Delete, and other windows could
-      // not use it, as long as this window lives.
+      // not use it, as long as this window lives; so it comes back as ended (PR #78 review round 2, A-R2-1).
       ctx.busy = false;
       await this.quietly('restore the busy mark', () =>
         this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
           if (!entry.busy || !this.isOwnMark(entry.busy)) return;
           // PR #78 review round 1 (A-R1-1): the create mark of a failed first open of this window (kept because its
           // volume could not be removed) comes back too, so a resume that fails again does not lose the clone.
-          if (interrupted) entry.busy = interrupted;
+          if (interrupted) entry.busy = this.isOwnMark(interrupted) ? endedMark(interrupted) : interrupted;
           else delete entry.busy;
         }),
       );
