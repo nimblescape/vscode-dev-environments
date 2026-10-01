@@ -371,7 +371,9 @@ export class RemoteSessionMonitor {
       const id = this.idOf(current);
       await this.docker(['start', id], signal);
       let stored = await this.storedScript(script, signal);
-      if (stored === 'unknown') stored = await this.checkAgain(current, script, signal);
+      // Review round 1 of PR #83 (B-R1-1): `docker start` resets RestartCount to 0, so the count before the start is no
+      // base for a restart by the policy after it.
+      if (stored === 'unknown') stored = await this.checkAgain({ ...current, restartCount: 0 }, script, signal);
       if (stored === 'same') {
         logger.info(`The Session Monitor on the Docker host was started again (${this.containerName}).`);
         return 'started';

@@ -2325,6 +2325,13 @@ describe('RemoteSessionMonitor.ensure: remote monitor restart check (known gap o
     });
   }
 
+  it(`${NAME}: started after earlier restarts (docker start resets RestartCount), unknown, then running with RestartCount 1 → replaced (review round 1 of PR #83, B-R1-1)`, async () => {
+    const docker = sequenced([inspected(false, LABEL, 137, 4), inspected(true, LABEL, 0, 1), MISSING], [CUT_OFF, CUT_OFF]);
+    expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('created');
+    expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect', 'rm', 'run']);
+    expect(docker.calls[4].args).toEqual(['rm', '-f', MONITOR_ID]);
+  });
+
   it(`${NAME}: started, unknown, still running, the second check same → started`, async () => {
     const logger = new Log();
     const docker = sequenced([STOPPED, inspected(true, LABEL, 0, 0)], [CUT_OFF, SAME]);
