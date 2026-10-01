@@ -206,6 +206,23 @@ describe('docker exec with a secret input (plan step 6, PR C)', () => {
     expect(routed).toEqual([]);
   });
 
+  it('review round 3 of PR #82, B-R3-4: the signal of the call reaches the worker that holds the lock, so a cancel stops the write of the secret', async () => {
+    const { docker } = adapter();
+    const options: Array<{ signal?: AbortSignal }> = [];
+    const { lock } = fakeLock();
+    const controller = new AbortController();
+    const held: HeldEnvironmentLock = {
+      ...lock,
+      docker: async (args, callOptions) => {
+        options.push(callOptions ?? {});
+        return lock.docker(args, callOptions);
+      },
+    };
+    await runWithEnvironmentLock(held, () => docker.exec('c1', ['sh', '-c', 'cat > /run/token'], { user: 'root', secretInput: SECRET, signal: controller.signal }));
+    expect(options).toHaveLength(1);
+    expect(options[0].signal).toBe(controller.signal);
+  });
+
   it('is refused without a held lock, and after the lock was lost; nothing runs directly', async () => {
     const { docker, runner, routed } = adapter();
     await expect(docker.exec('c1', ['sh'], { user: 'root', secretInput: SECRET })).rejects.toBeInstanceOf(CommandError);

@@ -404,3 +404,49 @@ describe('the override folder before a read step (review round 1 of PR #82, B-R1
     }
   });
 });
+
+describe('the override folder is cleared before a read step runs (review round 3 of PR #82, B-R3-2)', () => {
+  it('review round 3 of PR #82, B-R3-2: the files that a root step left below OVERRIDE_FOLDER are gone when the read step starts, not only after it', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-override-'));
+    const override = path.join(temp, 'override');
+    try {
+      // What readConfiguration with Compose files leaves there as root: the model that composeHash writes to as well.
+      fs.mkdirSync(path.join(override, 'compose'), { recursive: true });
+      fs.writeFileSync(path.join(override, 'compose', 'model.json'), '{"root":true}');
+      const real = (name: string) => (name === OVERRIDE_FOLDER ? override : name);
+      const events: string[] = [];
+      const started: { resolve: () => void; promise: Promise<void> } = (() => {
+        let resolve!: () => void;
+        return { promise: new Promise<void>((r) => (resolve = r)), resolve };
+      })();
+      let exit!: (value: { exitCode: number | null }) => void;
+      const operations = batchHelperOperations({
+        spawnStep: () => {
+          events.push(`spawn (override folder ${fs.existsSync(override) ? 'present' : 'gone'})`);
+          started.resolve();
+          return { exited: new Promise((resolve) => (exit = resolve)), killGroup: () => {} };
+        },
+        runQuiet: async () => {},
+        fs: {
+          lstatSync: ((name: string) => ({ isDirectory: () => true, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+          chmodSync: (() => {}) as never,
+          chownSync: (() => {}) as never,
+          readdirSync: (() => []) as never,
+          rmSync: ((name: string, rmOptions: fs.RmOptions) => {
+            if (name === OVERRIDE_FOLDER) events.push('rm override folder');
+            fs.rmSync(real(name), rmOptions);
+          }) as never,
+        },
+        env: {},
+      });
+      const running = operations.composeHash({ model: '{}', project: 'p' }, context());
+      await started.promise;
+      expect(events).toEqual(['rm override folder', 'spawn (override folder gone)']);
+      exit({ exitCode: 0 });
+      expect(await running).toEqual({ exitCode: 0 });
+      expect(events).toEqual(['rm override folder', 'spawn (override folder gone)']);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+});

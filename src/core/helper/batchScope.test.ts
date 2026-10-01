@@ -617,6 +617,47 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(command.input).toBe(run.options.input);
   });
 
+  /** The command and input of the per-step run of `call`, and the step params and helper command of the same call in a scope. */
+  async function perStepAndBatch(kind: BatchStepKind, call: (helper: WorkspaceHelper) => Promise<unknown>) {
+    const single = setup();
+    await call(single.helper).catch(() => undefined);
+    const [run] = single.docker.runs;
+    const at = run.args.indexOf(IMAGE.id!);
+    const { helper, lock } = setup();
+    await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
+    expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
+    return { run: { command: run.args.slice(at + 1), input: run.options.input }, params: lock.steps[0].params, command: batchStepCommand(kind, lock.steps[0].params) };
+  }
+
+  it('review round 3 of PR #82, B-R3-1: a runUserCommands with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {
+    const files = { [COMPOSE_MODEL_PATH]: '{"services":{}}' };
+    const { run, params, command } = await perStepAndBatch('runUserCommands', (h) =>
+      h.runUserCommands({ volumeName: VOLUME, repository: 'acme/app', override: { name: 'o' }, environmentId: ENVIRONMENT_ID, containerId: 'abcdef012345', files, env: { COMPOSE_PROJECT_NAME: 'p' }, token: TOKEN, image: IMAGE }),
+    );
+    expect(params).toEqual(expect.objectContaining({ files }));
+    expect(command.command).toEqual(run.command);
+    expect(command.input).toBe(run.input);
+  });
+
+  it('review round 3 of PR #82, B-R3-3: build and readConfiguration with a configuration that is not the default one make in the helper the command of their per-step run', async () => {
+    const configPath = '.devcontainer/b/devcontainer.json';
+    const override = { name: 'o' };
+    const files = { [COMPOSE_MODEL_PATH]: '{}' };
+    const env = { COMPOSE_PROJECT_NAME: 'p' };
+    const calls: Array<[BatchStepKind, (helper: WorkspaceHelper) => Promise<unknown>]> = [
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: 'devenv-3f2a9c1e:7', env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: 'devenv-3f2a9c1e:7', override, files, env, image: IMAGE })],
+      ['readConfiguration', (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath, environmentId: ENVIRONMENT_ID, merged: true, override, files, env, image: IMAGE })],
+    ];
+    for (const [kind, call] of calls) {
+      const { run, params, command } = await perStepAndBatch(kind, call);
+      expect(params, kind).toEqual(expect.objectContaining({ configPath }));
+      expect(run.command.join(' '), kind).toContain('b/devcontainer.json');
+      expect(command.command, kind).toEqual(run.command);
+      expect(command.input, kind).toBe(run.input);
+    }
+  });
+
   it('review round 1 of PR #82, B-R1-6: a step that comes after the end of the scope is refused and opens nothing', async () => {
     const { helper, lock } = setup();
     lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
