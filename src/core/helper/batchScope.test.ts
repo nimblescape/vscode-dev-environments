@@ -190,7 +190,8 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     // The variables pass the checks of `-e` (DOCKER_HOST never), and only to the kinds that take them.
     expect(byKind.readConfiguration.params).toEqual({ repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: ENVIRONMENT_ID, merged: false, env: { COMPOSE_PROJECT_NAME: 'p' } });
     expect(byKind.composeModel.params).toEqual({ repository: 'acme/app', files: [`${folder}/compose.yml`], project: 'p' });
-    expect(byKind.composeHash.params).toEqual({ model: '{}', project: 'p' });
+    // User decision of 2026-10-01: Compose reads as the repository owner, so composeHash names its repository.
+    expect(byKind.composeHash.params).toEqual({ repository: 'acme/app', model: '{}', project: 'p' });
     expect(byKind.ownershipFix).toMatchObject({ params: { folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' }, options: { timeoutMs: 5000 } });
     // Closed at the end of the scope.
     expect(lock.events).toEqual(['open s1', 'close s1']);

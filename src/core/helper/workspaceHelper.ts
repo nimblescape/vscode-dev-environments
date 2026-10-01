@@ -872,7 +872,7 @@ export class WorkspaceHelper {
   }): Promise<Map<string, string>> {
     this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
     const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
-      batch: { kind: 'composeHash', params: { model: p.model, project: p.project } },
+      batch: { kind: 'composeHash', params: { repository: p.repository, model: p.model, project: p.project } },
       image: p.image,
       input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },

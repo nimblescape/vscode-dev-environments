@@ -67,12 +67,14 @@ export interface BatchStepCommand {
   /** Q2: Git runs as the unprivileged user of the helper (BATCH_GIT_UID), without the socket and CONFIG_FOLDER. */
   git: boolean;
   /**
-   * Plan step 6, PR C (option A, provisional): a read step that runs as that user too (`git` true), but writes nothing
-   * in the volume, so /workspaces is not opened for it. The Docker Compose read steps (composeModel, composeHash; the
-   * per-step runs got an empty tmpfs over CONFIG_FOLDER, `hideConfigFolder`): Compose follows `env_file` and `include` of
-   * the repository, and CONFIG_FOLDER (0700 during the step) is closed to that user.
+   * User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."; it
+   * replaces option A, the Git user): the repository folder whose owner (uid:gid, read with lstat at step time) runs the
+   * step, as root when root owns it. The Docker Compose read steps (composeModel, composeHash): Compose follows `env_file`
+   * and `include` of the repository, so it reads as that user, with CONFIG_FOLDER root's and 0700 during the step. By the
+   * agreed extension of the same day, readFiles, listConfigs and createFolders too. The steps that need the Docker
+   * socket (readConfiguration, build, up, runUserCommands) and gitFiles and ownershipFix stay root; the clone stays Git's.
    */
-  readOnly?: boolean;
+  owner?: string;
   /**
    * The secret of the request (the GitHub token): `stdin`: required, the standard input of the step (TOKEN_PRELUDE writes
    * it to the tmpfs and removes it); `mask`: optional, only masked in the output; undefined: refused.
@@ -192,11 +194,15 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const p = fields(kind, params, ['repository', 'configPath'], ['dockerfile']);
       const { folder } = folderOf(kind, p.repository);
       const configPath = checked(kind, () => checkConfigPath(text(kind, p.configPath)));
-      return { command: readFilesCommand(folder, configPath, optionalText(kind, p.dockerfile)), env: {}, git: false };
+      // User decision of 2026-10-01 (agreed extension of "Compose reads as the repository owner"): as the owner of the
+      // repository. READ_FILES_SCRIPT reads below the repository folder only, as before.
+      return { command: readFilesCommand(folder, configPath, optionalText(kind, p.dockerfile)), env: {}, git: false, owner: folder };
     }
     case 'listConfigs': {
       const p = fields(kind, params, ['repository']);
-      return { command: listConfigsCommand(folderOf(kind, p.repository).folder), env: {}, git: false };
+      const { folder } = folderOf(kind, p.repository);
+      // User decision of 2026-10-01 (agreed extension): as the owner of the repository.
+      return { command: listConfigsCommand(folder), env: {}, git: false, owner: folder };
     }
     case 'readConfiguration': {
       const p = fields(kind, params, ['repository', 'configPath', 'environmentId', 'merged'], ['override', 'files', 'env']);
@@ -245,21 +251,25 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const { folder } = folderOf(kind, p.repository);
       const files = pathsBelow(kind, p.files, folder);
       if (files.length === 0) fail(kind);
-      // Plan step 6, PR C (option A): as the unprivileged user, so that Compose cannot read CONFIG_FOLDER (the token).
-      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: true, readOnly: true };
+      // User decision of 2026-10-01: Compose reads as the repository owner (CONFIG_FOLDER closed during the step).
+      return { command: composeModelCommand(folder, files), env: { COMPOSE_PROJECT_NAME: project(kind, p.project) }, git: false, owner: folder };
     }
     case 'composeHash': {
-      const p = fields(kind, params, ['model', 'project']);
+      // User decision of 2026-10-01: Compose reads as the repository owner, so the step names its repository. It writes
+      // the model below OVERRIDE_FOLDER only (in /tmp; the helper makes that folder the owner's for the step).
+      const p = fields(kind, params, ['repository', 'model', 'project']);
+      const { folder } = folderOf(kind, p.repository);
       const name = project(kind, p.project);
-      // Plan step 6, PR C (option A): as the unprivileged user (it writes the model below OVERRIDE_FOLDER in /tmp only).
-      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: true, readOnly: true };
+      return { command: composeHashCommand(COMPOSE_MODEL_PATH, name), input: text(kind, p.model, 4 * 1024 * 1024), env: { COMPOSE_PROJECT_NAME: name }, git: false, owner: folder };
     }
     case 'createFolders': {
-      // Plan step 6, PR C (option A): stays root. It creates folders in the repository, whose folders belong to root or
-      // the user of the dev container; CREATE_FOLDERS_SCRIPT is our script (no Compose), and follows no link out.
+      // User decision of 2026-10-01 (agreed extension of "Compose reads as the repository owner"): as the owner of the
+      // repository, so the folders it creates are the owner's. It never needs root: pathsBelow and CREATE_FOLDERS_SCRIPT
+      // refuse every folder outside the repository (and a link out of it); a folder of the repository that the owner
+      // cannot write (one of root) is refused by the script (`Cannot create`, exit 2), never created as root.
       const p = fields(kind, params, ['repository', 'folders']);
       const { folder } = folderOf(kind, p.repository);
-      return { command: createFoldersCommand(folder, pathsBelow(kind, p.folders, folder)), env: {}, git: false };
+      return { command: createFoldersCommand(folder, pathsBelow(kind, p.folders, folder)), env: {}, git: false, owner: folder };
     }
     case 'up': {
       const p = fields(kind, params, ['repository', 'override', 'environmentId', 'removeExistingContainer'], ['files', 'env']);

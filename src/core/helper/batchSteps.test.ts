@@ -47,28 +47,63 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
   });
 
   it('builds the read steps with their builders, as root, without a secret', () => {
+    // User decision of 2026-10-01 (agreed extension of "Compose reads as the repository owner"): readFiles, listConfigs
+    // and createFolders run as the owner of the repository folder too (was: root, no `owner`).
     expect(batchStepCommand('readFiles', { repository: REPO, configPath: '.devcontainer/devcontainer.json', dockerfile: 'Dockerfile' })).toEqual({
       command: readFilesCommand(FOLDER, '.devcontainer/devcontainer.json', 'Dockerfile'),
       env: {},
       git: false,
+      owner: FOLDER,
     });
-    expect(batchStepCommand('listConfigs', { repository: REPO })).toEqual({ command: listConfigsCommand(FOLDER), env: {}, git: false });
-    // Plan step 6, PR C (option A): changed expectation (before: `git: false`, as root): the Compose read steps run as the
-    // unprivileged user, read-only, so that Compose cannot read CONFIG_FOLDER.
+    expect(batchStepCommand('listConfigs', { repository: REPO })).toEqual({ command: listConfigsCommand(FOLDER), env: {}, git: false, owner: FOLDER });
+    // User decision of 2026-10-01: Compose reads as the repository owner. Changed expectation (option A had `git: true,
+    // readOnly: true`, the unprivileged Git user): the Compose read steps run as the owner of the repository folder
+    // (`owner`), which the helper reads at step time; composeHash names its repository for that.
     expect(batchStepCommand('composeModel', { repository: REPO, files: [`${FOLDER}/compose.yml`], project: 'p1' })).toEqual({
       command: composeModelCommand(FOLDER, [`${FOLDER}/compose.yml`]),
       env: { COMPOSE_PROJECT_NAME: 'p1' },
-      git: true,
-      readOnly: true,
+      git: false,
+      owner: FOLDER,
     });
-    expect(batchStepCommand('composeHash', { model: '{}', project: 'p1' })).toEqual({
+    expect(batchStepCommand('composeHash', { repository: REPO, model: '{}', project: 'p1' })).toEqual({
       command: composeHashCommand(COMPOSE_MODEL_PATH, 'p1'),
       input: '{}',
       env: { COMPOSE_PROJECT_NAME: 'p1' },
-      git: true,
-      readOnly: true,
+      git: false,
+      owner: FOLDER,
     });
-    expect(batchStepCommand('createFolders', { repository: REPO, folders: [`${FOLDER}/data`] })).toEqual({ command: createFoldersCommand(FOLDER, [`${FOLDER}/data`]), env: {}, git: false });
+    // User decision of 2026-10-01: Compose reads as the repository owner, so composeHash without its repository, or
+    // with one outside /workspaces, is refused.
+    expect(() => batchStepCommand('composeHash', { model: '{}', project: 'p1' })).toThrow(BatchStepError);
+    expect(() => batchStepCommand('composeHash', { repository: '../x', model: '{}', project: 'p1' })).toThrow(BatchStepError);
+    // User decision of 2026-10-01 (agreed extension): createFolders as the owner too (was: root, no `owner`).
+    expect(batchStepCommand('createFolders', { repository: REPO, folders: [`${FOLDER}/data`] })).toEqual({
+      command: createFoldersCommand(FOLDER, [`${FOLDER}/data`]),
+      env: {},
+      git: false,
+      owner: FOLDER,
+    });
+    // User decision of 2026-10-01 (agreed extension): only the steps without the Docker socket run as the owner; the
+    // clone stays Git's, and the steps that need the socket, gitFiles and ownershipFix stay root.
+    const owners = BATCH_STEP_KINDS.filter((kind) => {
+      const samples: Record<string, unknown> = {
+        clone: { repository: REPO },
+        readFiles: { repository: REPO, configPath: '.devcontainer/devcontainer.json' },
+        listConfigs: { repository: REPO },
+        readConfiguration: { repository: REPO, configPath: '.devcontainer/devcontainer.json', environmentId: ID, merged: false },
+        build: { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x' },
+        composeModel: { repository: REPO, files: [`${FOLDER}/compose.yml`], project: 'p' },
+        composeHash: { repository: REPO, model: '{}', project: 'p' },
+        createFolders: { repository: REPO, folders: [`${FOLDER}/data`] },
+        up: { repository: REPO, override: {}, environmentId: ID, removeExistingContainer: false },
+        runUserCommands: { repository: REPO, override: {}, environmentId: ID, containerId: 'a'.repeat(64) },
+        gitFiles: { repository: REPO, identity: { name: 'n', email: 'e' } },
+        ownershipFix: { folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' },
+      };
+      return batchStepCommand(kind, samples[kind]).owner !== undefined;
+    });
+    expect(owners).toEqual(['readFiles', 'listConfigs', 'composeModel', 'composeHash', 'createFolders']);
+    expect(batchStepCommand('clone', { repository: REPO }).git).toBe(true);
   });
 
   it('builds the runs of the Dev Container CLI with their builders and inputs', () => {

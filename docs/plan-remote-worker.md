@@ -36,6 +36,7 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-10-01 | **Q3: the lock and questions to the user.** The environment lock stays held while a question to the user is open; other windows and computers are refused after 10 s (D3). |
 | 2026-10-01 | **Q4: the token write into the dev container**, as recommended: through the worker's `docker exec -i`, with the secret on standard input. (The user agreed to "all three", which covered Q1–Q3; Q4 is taken as recommended.) |
 | 2026-10-01 | **Switch branch is dropped.** The user: "We drop the Switch Branch command, it is not needed anymore." The command and the code that only it used are removed; step 7 keeps only Delete's check. |
+| 2026-10-01 | **Compose reads as the repository owner.** The user: "we shall run as the repo owner user. that is what a real user would do as well." The Docker Compose read steps of the batch helper (composeModel, composeHash) run as the user that owns the repository folder (as root when root owns it), not as the Git user (option A is replaced). Extended the same day, which the user agreed to ("agreed"), to readFiles, listConfigs and createFolders. The clone stays with the Git user; the steps that need the Docker socket, gitFiles and ownershipFix stay root. |
 
 ## 3. Steps
 
