@@ -38,6 +38,9 @@ export const BATCH_GIT_HOME = '/nonexistent';
 /** After a step ended, its pipes are closed after this time when a process outside its group still holds them. */
 const PIPE_CLOSE_MS = 2_000;
 
+/** The user and group nobody: a step for a repository folder that is not a real folder (asRepositoryOwner). */
+const NOBODY_ID = 65534;
+
 /** The arguments of `setpriv` before the command of a step that runs as `uid`:`gid` (no groups, capabilities, new privileges). */
 export function privilegeArgs(uid: number, gid: number): string[] {
   return ['--reuid', String(uid), '--regid', String(gid), '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
@@ -197,10 +200,10 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
   const folder = step.owner!;
   // At step time, the folder that the step reads: a real folder (no link), whose owner the step runs as.
   const repository = lstatOrUndefined(deps, folder);
-  if (repository === undefined || repository.isSymbolicLink() || !repository.isDirectory()) {
-    throw new OperationError('failed', `The repository folder ${folder} is not a folder.`);
-  }
-  const { uid, gid } = repository;
+  // Review round 5 of PR #82 (A-R5-1): a missing folder, a link or no folder runs the step as nobody (never as root), so
+  // that its script reports it as before (readFiles: no configuration; listConfigs: none).
+  const real = repository !== undefined && !repository.isSymbolicLink() && repository.isDirectory();
+  const { uid, gid } = real ? repository : { uid: NOBODY_ID, gid: NOBODY_ID };
   const privilege = uid === 0 ? undefined : privilegeArgs(uid, gid);
   const restores: Array<() => void> = [];
   try {
@@ -209,9 +212,13 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
     // protects nothing (accepted, docs/implementation-notes.md §17).
     const config = lstatOrUndefined(deps, CONFIG_FOLDER);
     if (config?.isDirectory()) {
+      // Review round 5 of PR #82 (A-R5-2): root:root 0700 is only what a killed step left (GIT_FILES_SCRIPT leaves 0755):
+      // it goes back to the owner of a real repository folder, with 0755.
+      const cutOff = config.uid === 0 && config.gid === 0 && (config.mode & 0o7777) === 0o700 && real;
+      const back = cutOff ? { uid: repository.uid, gid: repository.gid, mode: 0o755 } : { uid: config.uid, gid: config.gid, mode: config.mode & 0o7777 };
       restores.push(() => {
-        deps.fs.chownSync(CONFIG_FOLDER, config.uid, config.gid);
-        deps.fs.chmodSync(CONFIG_FOLDER, config.mode & 0o7777);
+        deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
+        deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
       });
       deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
       deps.fs.chownSync(CONFIG_FOLDER, 0, 0);
@@ -228,7 +235,16 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
     // No process of the owner outlives its step (never for root: that would end the helper; its group ends with the
     // step); then the modes are restored. The files of the owner elsewhere are its own (no walk, no removal).
     if (privilege !== undefined) await deps.runQuiet(killAllCommand(privilege));
-    for (const restore of restores.reverse()) restore();
+    // Review round 5 of PR #82 (A-R5-3): each restore runs, also when one before it throws; the first error is rethrown.
+    let failure: { error: unknown } | undefined;
+    for (const restore of restores.reverse()) {
+      try {
+        restore();
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+    if (failure !== undefined) throw failure.error;
   }
 }
 

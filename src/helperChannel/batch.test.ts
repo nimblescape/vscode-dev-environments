@@ -81,7 +81,7 @@ interface SetupOptions {
    * Review round 2 of PR #80, B-R2-2: what `lstat` of CONFIG_FOLDER finds: a folder (default), a symbolic link (planted by
    * the Git user while /workspaces was 1777), or nothing (it throws ENOENT).
    */
-  configFolder?: 'folder' | 'symlink' | 'missing';
+  configFolder?: 'folder' | 'symlink' | 'missing' | 'cutOff';
   /**
    * Review round 3 of PR #80, B-R3-1: the helper (a ChannelServer) reads its input only once this settles, so its hello
    * comes late; and it ignores SIGTERM (as Node.js as PID 1 of its container) and ends only by SIGKILL or its input.
@@ -135,6 +135,7 @@ function setup(options: SetupOptions = {}) {
       lstatSync: ((path: string) => {
         // Review round 2 of PR #80, B-R2-2: CONFIG_FOLDER may be a symbolic link or missing.
         if (path === CONFIG_FOLDER && options.configFolder === 'missing') throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+        if (path === CONFIG_FOLDER && options.configFolder === 'cutOff') return { isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40700, uid: 0, gid: 0 };
         if (path === CONFIG_FOLDER && options.configFolder === 'symlink') return { isDirectory: () => false, isSymbolicLink: () => true, mode: 0o120777, uid: 1000, gid: 1000 };
         // User decision of 2026-10-01: Compose reads as the repository owner (the owner of /workspaces/hello).
         if (path === `${WORKSPACES_ROOT}/hello`) {
@@ -296,7 +297,7 @@ function setup(options: SetupOptions = {}) {
   };
   const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
   const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
-  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperExit: (code: number | null) => helperExit?.(code) };
+  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperDeps, helperExit: (code: number | null) => helperExit?.(code) };
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -503,18 +504,40 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   });
 
   for (const repository of ['symlink', 'missing'] as const) {
-    // User decision of 2026-10-01: Compose reads as the repository owner; the owner is that of a real folder only.
-    it(`refuses a step as the owner when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'} (user decision of 2026-10-01)`, async () => {
+    // Review round 5 of PR #82 (A-R5-1): a repository folder that is not a real folder runs the step as nobody (never as
+    // root), so that its script reports it as before (no configuration); the session is not refused.
+    it(`runs a step as nobody when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'} (A-R5-1)`, async () => {
       const { t, session } = await started({ repository });
-      await expect(session.step('composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' })).rejects.toMatchObject({ code: 'failed' });
-      expect(t.steps).toHaveLength(0);
-      expect(t.fsCalls).toEqual([]);
-      expect(t.quiet).toEqual([]);
-      // The session goes on (a root step: listConfigs runs as the owner too, so it is refused here the same way).
-      await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'failed' });
-      expect((await session.step('gitFiles', { repository: 'octo/hello', identity: { name: 'n', email: 'e' } })).exitCode).toBe(0);
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand('readFiles', params).command]);
+      expect(t.fsCalls).toContain(`chown ${OVERRIDE_FOLDER} 65534:65534`);
+      expect(t.quiet).toEqual([['setpriv', ...privilegeArgs(65534, 65534), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']]);
+      expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
     });
   }
+
+  // Review round 5 of PR #82 (A-R5-2): a CONFIG_FOLDER that a killed owner step left root:root 0700 goes back to the owner.
+  it('gives a cut-off CONFIG_FOLDER back to the repository owner with 0755 after an owner step (A-R5-2)', async () => {
+    const { t, session } = await started({ configFolder: 'cutOff' });
+    expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
+    expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 755`]);
+  });
+
+  // Review round 5 of PR #82 (A-R5-3): the restore of CONFIG_FOLDER runs also when the removal of OVERRIDE_FOLDER throws.
+  it('restores CONFIG_FOLDER also when the removal of OVERRIDE_FOLDER fails after an owner step (A-R5-3)', async () => {
+    const { t, session } = await started();
+    const { helperDeps } = t;
+    let removals = 0;
+    const rmSync = helperDeps.fs.rmSync;
+    helperDeps.fs.rmSync = ((path: string, options: unknown) => {
+      removals += 1;
+      if (removals === 2) throw new Error('EBUSY');
+      return (rmSync as (p: string, o: unknown) => void)(path, options);
+    }) as never;
+    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'failed' });
+    expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 750`]);
+  });
 
   // Review round 1 of PR #82, A-R1-2: a Git step is cut off only when the whole helper is killed, so the repair runs once
   // per helper process; a writing Git step still walks the volume after it, every time.

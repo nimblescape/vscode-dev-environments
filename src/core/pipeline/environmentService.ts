@@ -13,7 +13,7 @@ import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
+import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
@@ -2739,7 +2739,7 @@ export class EnvironmentService {
         // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
         if (helperFailed) {
           this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its configuration could not be completed.`, error);
-          throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+          throw helperFailedError(error, detail);
         }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, detail);
       }
@@ -2772,9 +2772,8 @@ export class EnvironmentService {
           const change = `The dev service changed from ${previousService} to ${loaded.compose.service}.`;
           const previous = await this.previousDevContainerAfterFailedSwitch(ctx, previousService);
           const withdrawn = ctx.upWithdrawn;
-          throw new UserFacingError(
-            'helperFailed',
-            Messages.helperFailed,
+          throw helperFailedError(
+            error,
             withdrawn !== undefined
               ? // Review round 5 of PR #68 (A-R5-2): afterUpClause, "runs already" for a container that ran before `up`.
                 `${change} ${afterUpClause(`The dev container of the service ${loaded.compose.service}`, withdrawn)} ${withdrawnOutcome(withdrawn, true)} ${previous} The previous configuration stays selected. ${causeOf(error)}`
@@ -2929,7 +2928,10 @@ export class EnvironmentService {
     this.throwIfCancelled(ctx.signal);
     this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The build or start of its environment could not be completed; the open ends.`, error);
     // Review round 1 of PR #68 (A-R1-1): with `detail`, the error says what happened to the container.
-    if (detail !== undefined) throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+    // Review round 5 of PR #82 (A-R5-4): the refusal of the batch scope keeps its message (batchHelperUnavailable).
+    if (detail !== undefined) {
+      throw helperFailedError(error, detail);
+    }
     throw error;
   }
 
@@ -5381,6 +5383,8 @@ export class EnvironmentService {
       }
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
+      // Review round 5 of PR #82 (A-R5-4): the refusal of the batch scope (D1) refuses the operation, also after `up`.
+      if (isBatchHelperUnavailable(error)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed: ${errorMessage(error)}`);
     }
   }
@@ -6729,4 +6733,12 @@ export class EnvironmentService {
       this.logger.warn(`Could not ${what}: ${errorMessage(error)}`);
     }
   }
+}
+
+/**
+ * Review round 5 of PR #82 (A-R5-4): a helperFailed of Step 8 with `detail`; the refusal of the batch scope keeps its
+ * message (Messages.batchHelperUnavailable) and its kind (isBatchHelperUnavailable).
+ */
+function helperFailedError(error: unknown, detail: string): UserFacingError {
+  return isBatchHelperUnavailable(error) ? new BatchHelperUnavailableError(error.message, detail) : new UserFacingError('helperFailed', Messages.helperFailed, detail);
 }

@@ -401,6 +401,37 @@ describe('a batch helper that cannot be opened refuses the open (user decision o
     expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
   });
 
+  // Review round 5 of PR #82 (A-R5-4): also after Step 8, the refusal of the scope at fixConfigOwnership is no warning.
+  it('a step that fails in its session at fixConfigOwnership refuses the open (A-R5-4)', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.config = { ...h.helper.config, remoteUser: 'vscode' };
+    onStep = () => {
+      if (scopes.at(-1)?.startsWith('fixConfigOwnership ')) throw new Error('the lock was lost');
+    };
+    const error = await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true }).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(scopes.map((scope) => scope.split(' ')[0])).toContain('fixConfigOwnership');
+    expect(isBatchHelperUnavailable(error)).toBe(true);
+  });
+
+  // Review round 5 of PR #82 (A-R5-4): helperFailedInUpdate with a detail keeps the message of the refusal.
+  it('a refusal of the scope after `up` keeps its message (A-R5-4)', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    onStep = () => {
+      if (scopes.at(-1)?.startsWith('runUserCommands ')) throw new Error('the lock was lost');
+    };
+    const error = await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true }).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(scopes.map((scope) => scope.split(' ')[0])).toContain('runUserCommands');
+    expect(isBatchHelperUnavailable(error)).toBe(true);
+    expect((error as UserFacingError).message).not.toBe(Messages.helperFailed);
+    expect((error as UserFacingError).detail).toBeTruthy();
+  });
+
   it('the rule of 2026-09-29 stays for a helper image that cannot be prepared: a running, current container opens as it is', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed);
