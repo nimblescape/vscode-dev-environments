@@ -1163,8 +1163,10 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
       let settled = false;
       const pre = prebuild(helper).start(REMOTE_TARGET);
       void pre.then(() => { settled = true; });
-      // Not vi.waitFor: under fake timers it would advance the clock itself.
-      for (let i = 0; i < 500 && docker.builds.length === 0; i++) await new Promise((r) => setImmediate(r));
+      // Not vi.waitFor: under fake timers it would advance the clock itself. Wait by the real clock (only setTimeout is
+      // fake), not by a fixed number of turns: a loaded CI runner needed more than 500 (PR #78 CI, 2026-10-01).
+      const deadline = Date.now() + 10_000;
+      while (docker.builds.length === 0 && Date.now() < deadline) await new Promise((r) => setImmediate(r));
       expect(docker.builds).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(HELPER_PREBUILD_TIMEOUT_MS - 1);
       expect(settled).toBe(false);
