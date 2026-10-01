@@ -1021,6 +1021,39 @@ describe('the problems of the Git summary (review round 1 of PR #84, A-R1-2)', (
   });
 });
 
+describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs Git in the C locale', () => {
+  it('hardening (LC_ALL): the script exports LC_ALL=C and LANG=C at its start, before any other command', () => {
+    const lines = GIT_SUMMARY_SCRIPT.split('\n');
+    expect(lines[0]).toBe('set -eu');
+    expect(lines[1]).toBe('export LC_ALL=C LANG=C');
+    // Set in the script itself, never as an argument or through `-e`: the command is the script and its parameters.
+    expect(gitSummaryCommand('/workspaces/api', true)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
+  });
+
+  it('hardening (LC_ALL): every Git call of the script sees LC_ALL=C and LANG=C, whatever locale the caller has', () => {
+    const root = tempDir();
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    const log = path.join(root, 'log');
+    // A stub of git that records its locale variables, and exits 0 without output.
+    fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s %s\\n' "\${LC_ALL-unset}" "\${LANG-unset}" >> '${log}'\n`, { mode: 0o755 });
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(repo);
+    for (const complete of [false, true]) {
+      fs.rmSync(log, { force: true });
+      const [file, ...args] = gitSummaryCommand(repo, complete);
+      const result = spawnSync(file, args, {
+        encoding: 'utf8',
+        env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
+      });
+      expect(result.status).toBe(0);
+      const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+      expect(calls.length).toBeGreaterThanOrEqual(4);
+      for (const call of calls) expect(call).toBe('C C');
+    }
+  });
+});
+
 /** Whether every folder above `folder` can be passed by other users (for a run as another uid). */
 function passableForOthers(folder: string): boolean {
   for (let dir = path.dirname(folder); ; dir = path.dirname(dir)) {
@@ -1180,6 +1213,60 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     const result = runAsOwner(repo, true);
     expect(result.status).toBe(0);
     expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+  });
+
+  /**
+   * Review round 2 of PR #84, B-R2-1: a repository of the owner with 2 commits on main, and `origin/main` at the first;
+   * `missing`: the loose object of that first commit is deleted (the remote-tracking ref points at a missing commit),
+   * `unborn`: HEAD is then an unborn branch (the other branch of the count in the script).
+   */
+  function remoteTrackingRepo(options: { missing: boolean; unborn?: boolean }): string | undefined {
+    const repo = ownerRepo();
+    if (repo === undefined) return undefined;
+    const sgit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', ...args);
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    sgit(repo, 'add', 'b.txt');
+    sgit(repo, 'commit', '-q', '-m', 'second');
+    sgit(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD~1');
+    if (options.missing) {
+      const id = sgit(repo, 'rev-parse', 'HEAD~1').trim();
+      const object = path.join(repo, '.git', 'objects', id.slice(0, 2), id.slice(2));
+      expect(fs.existsSync(object)).toBe(true);
+      fs.rmSync(object);
+    }
+    if (options.unborn) sgit(repo, 'checkout', '-q', '--orphan', 'fresh');
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  const PERMISSION_PHRASE = /Permission denied|could not open directory|unable to access|cannot open/i;
+
+  for (const unborn of [false, true]) {
+    it(`review round 2 of PR #84, B-R2-1: a remote-tracking ref at a deleted commit object (${unborn ? 'unborn HEAD' : 'HEAD with commits'}): exit code 0, no permission phrase, and only the incomplete marker tells`, () => {
+      const repo = remoteTrackingRepo({ missing: true, unborn });
+      if (repo === undefined) return;
+      for (const complete of [false, true]) {
+        const result = runAsOwner(repo, complete);
+        expect(result.status).toBe(0);
+        expect(result.stderr).not.toMatch(PERMISSION_PHRASE);
+        expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\n`);
+        expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the unpushed commits could not be counted');
+        expect(gitSummaryProblem(result.stdout, '')).toBe('the unpushed commits could not be counted');
+      }
+    });
+  }
+
+  it('review round 2 of PR #84, B-R2-1: a healthy repository with a remote-tracking ref prints no incomplete marker and has no problem', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+      expect(result.stderr).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+    }
   });
 
   it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {

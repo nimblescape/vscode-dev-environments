@@ -17,7 +17,8 @@ import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, GitStateUnreadableError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
-import { GIT_SUMMARY_COMPLETE, GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
+import { GIT_SUMMARY_COMPLETE, GIT_SUMMARY_INCOMPLETE_MARKER, GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
+import { MAX_CAPTURED_STDERR_CHARACTERS } from './analysisLimits';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
@@ -2036,6 +2037,48 @@ describe('WorkspaceHelper file and Git queries', () => {
       name: 'GitStateUnreadableError',
       problem: 'the unpushed commits could not be counted',
     });
+  });
+
+  // Review round 2 of PR #84, B-R2-1: the output of the real GIT_SUMMARY_SCRIPT for a remote-tracking ref at a deleted
+  // commit object (gitSummary.test.ts reproduces it): exit code 0, no permission phrase on stderr, only the marker.
+  for (const forward of [true, false]) {
+    it(`review round 2 of PR #84, B-R2-1: the incomplete marker alone, with exit code 0 and no permission phrase on stderr, makes the state unknown (${forward ? 'streamed' : 'captured only'})`, async () => {
+      docker.forwardOutput = forward;
+      const stderr = 'fatal: bad object origin/main\n';
+      expect(stderr).not.toMatch(/Permission denied|could not open directory|unable to access|cannot open/i);
+      docker.handler = () => ({ exitCode: 0, stdout: `${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\nmain\n0\n0\n0\n`, stderr });
+      await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({
+        name: 'GitStateUnreadableError',
+        problem: 'the unpushed commits could not be counted',
+      });
+    });
+  }
+
+  it('review round 2 of PR #84, B-R2-2: a permission warning streamed across chunks, then more than 1 MiB of other stderr (not in the captured end), makes the state unknown', async () => {
+    // The fake forwards nothing itself: the handler streams the chunks, and the result keeps only the captured end.
+    docker.forwardOutput = false;
+    const filler = "warning: in the working copy of 'src/file.txt', LF will be replaced by CRLF the next time Git touches it\n";
+    const fillerChunk = filler.repeat(Math.ceil(64 * 1024 / filler.length));
+    const fillerChunks = Math.ceil((MAX_CAPTURED_STDERR_CHARACTERS + 1) / fillerChunk.length) + 1;
+    let streamed = '';
+    docker.handler = (_args, options) => {
+      const send = (text: string) => {
+        streamed += text;
+        options.onStderr?.(text);
+      };
+      send("warning: could not open directory 'data/': Perm");
+      send('ission denied\n');
+      for (let i = 0; i < fillerChunks; i++) send(fillerChunk);
+      return { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: streamed.slice(-MAX_CAPTURED_STDERR_CHARACTERS) };
+    };
+    const error = await createHelper()
+      .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
+      .then(() => undefined, (reason: unknown) => reason);
+    // The warning is only in the stream: more than MAX_CAPTURED_STDERR_CHARACTERS of other stderr followed it.
+    expect(streamed.length - streamed.indexOf('Permission denied')).toBeGreaterThan(MAX_CAPTURED_STDERR_CHARACTERS);
+    expect(streamed.slice(-MAX_CAPTURED_STDERR_CHARACTERS)).not.toContain('Permission denied');
+    expect(error).toBeInstanceOf(GitStateUnreadableError);
+    expect((error as GitStateUnreadableError).problem).toBe("warning: could not open directory 'data/': Permission denied");
   });
 
   it('review round 1 of PR #84, A-R1-2: gitSummary keeps CommandError for exit code 128 (a root 0600 .git/index)', async () => {

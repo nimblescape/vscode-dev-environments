@@ -53,8 +53,14 @@ export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
  * working tree and `.git`, as its user: a file or folder that it cannot read (a folder it cannot list or enter: the
  * folder, or the entries below it), or a walk that fails, prints GIT_SUMMARY_INCOMPLETE_MARKER. Links are not tested
  * (`access` follows them; Git does not). One file system (`-xdev`), as Git's own walk of the working tree.
+ *
+ * Hardening (LC_ALL), review round 2 of PR #84: the script runs Git (and find, tr, wc) in the C locale (`LC_ALL=C`,
+ * `LANG=C`, set in the script itself, never with `docker exec -e`), so that Git's messages on stderr are never
+ * translated and the patterns of gitSummaryProblem always match. Nothing else in the script depends on the locale: the
+ * counts are line counts, and paths pass through as bytes.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
+export LC_ALL=C LANG=C
 if [ ! -d "$1" ]; then
   echo "The repository folder $1 is missing." >&2
   exit ${GIT_SUMMARY_NO_FOLDER_EXIT}
