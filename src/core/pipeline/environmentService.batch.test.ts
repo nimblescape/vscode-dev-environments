@@ -83,6 +83,11 @@ let batchError: Error | undefined;
 let lockError: Error | undefined;
 /** Plan step 7: the wait of each lock asked for, in seconds. */
 let lockWaits: number[];
+/**
+ * Review round 1 of PR #84, B-R1-1: runs during the wait for the lock (for a cancel then); a wait whose signal is aborted
+ * ends with an AbortError, as the wait of the real lock does.
+ */
+let onLockWait: (() => void) | undefined;
 const PINNED: HelperImageUse = { tag: 'devenv-helper:test', id: `sha256:${'4'.repeat(64)}` };
 
 function batchLock(environmentId: string): HeldEnvironmentLock {
@@ -135,11 +140,17 @@ beforeEach(() => {
   batchError = undefined;
   lockError = undefined;
   lockWaits = [];
+  onLockWait = undefined;
   h = createHarness({
     newEnvironmentId: () => ENV_ID,
-    environmentLock: async (environmentId, waitSeconds) => {
+    environmentLock: async (environmentId, waitSeconds, signal) => {
       events.push('lock');
       lockWaits.push(waitSeconds);
+      if (onLockWait !== undefined) {
+        onLockWait();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal?.aborted) throw abortError();
+      }
       if (lockError !== undefined) throw lockError;
       return batchLock(environmentId);
     },
@@ -578,6 +589,40 @@ describe("Delete's check in the batch helper (plan step 7)", () => {
     expect(h.helper.calls).not.toContain('gitSummary');
     expect((await h.registry.get(ENV_ID))?.gitSummary).toEqual(before);
   });
+
+  // Review round 1 of PR #84, B-R1-1: a cancelled check is refused as cancelled. It never falls back to the recorded
+  // summary, and never becomes an unknown Git state (A-R1-2); the registry keeps its entry, and no lock stays held.
+  for (const when of ['lock wait', 'gitSummary step'] as const) {
+    it(`review round 1 of PR #84, B-R1-1: a cancel during the ${when} rejects as cancelled, never with the recorded summary; the lock is released`, async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      const before = await h.registry.get(ENV_ID);
+      expect(before?.gitSummary).toBeDefined();
+      const controller = new AbortController();
+      if (when === 'lock wait') onLockWait = () => controller.abort();
+      else onStep = () => controller.abort();
+      // The step runs as the real WorkspaceHelper sends it (kind gitSummary), with the image of the window.
+      const dockerfile = path.join(h.root, 'Dockerfile');
+      fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
+      realHelper = new WorkspaceHelper({ docker: noDocker, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
+      const error = await h.service.safetyCheck(ENV_ID, { progress: h.progress, signal: controller.signal }).then(
+        (summary) => ({ summary }),
+        (reason: unknown) => reason,
+      );
+      expect(error).toBeInstanceOf(UserFacingError);
+      expect((error as UserFacingError).code).toBe('cancelled');
+      expect(await h.registry.get(ENV_ID)).toEqual(before);
+      if (when === 'lock wait') {
+        // The lock was never granted: nothing to release, no session, no step.
+        expect(frame()).toEqual(['lock']);
+        expect(recorded).toEqual([]);
+      } else {
+        // The session is closed and the lock released, in that order.
+        expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
+        expect(recorded.map((step) => step.kind)).toEqual(['gitSummary']);
+      }
+      expect(h.helper.calls).not.toContain('gitSummary');
+    });
+  }
 
   it('a missing volume needs no lock: the check returns undefined', async () => {
     await seedEnvironment(h, { volume: false, container: null });
