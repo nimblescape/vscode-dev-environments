@@ -1269,6 +1269,120 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     }
   });
 
+  /** Review round 3 of PR #84: Git as root on a repository of the owner (safe.directory), then the owner gets it back. */
+  const rootGit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', '-c', 'protocol.file.allow=always', ...args);
+  const giveToOwner = (folder: string) => spawnSync('chown', ['-R', '1000:1000', folder]);
+
+  it('review round 3 of PR #84, A-R3-1: a repository with a submodule prints the incomplete marker (its commits and stashes are not counted)', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    const sub = path.join(path.dirname(repo), 'sub');
+    git(path.dirname(repo), 'init', '-q', '-b', 'main', sub);
+    fs.writeFileSync(path.join(sub, 's.txt'), 's\n');
+    git(sub, 'add', 's.txt');
+    git(sub, 'commit', '-q', '-m', 'sub');
+    rootGit(repo, 'submodule', '-q', 'add', sub, 'sub');
+    rootGit(repo, 'commit', '-q', '-m', 'add sub');
+    giveToOwner(repo);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('submodules are not checked');
+    // The submodule's Git folder in .git/modules alone (no `.gitmodules` any more) is enough too.
+    fs.rmSync(path.join(repo, '.gitmodules'));
+    const withoutFile = runAsOwner(repo, true);
+    expect(withoutFile.status).toBe(0);
+    expect(gitSummaryProblem(withoutFile.stdout, '')).toBe('submodules are not checked');
+  });
+
+  it('review round 3 of PR #84, A-R3-2: a linked worktree prints the incomplete marker (its changes and detached commits are not counted)', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    const linked = path.join(path.dirname(repo), 'linked');
+    rootGit(repo, 'worktree', 'add', '-q', '--detach', linked);
+    fs.writeFileSync(path.join(linked, 'u.txt'), 'u\n');
+    giveToOwner(repo);
+    giveToOwner(linked);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} other worktrees are not checked\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('other worktrees are not checked');
+  });
+
+  for (const unborn of [false, true]) {
+    it(`review round 3 of PR #84, A-R3-2: a commit that only a tag reaches is counted as unpushed (${unborn ? 'unborn HEAD' : 'HEAD with commits'})`, () => {
+      const repo = remoteTrackingRepo({ missing: false });
+      if (repo === undefined) return;
+      rootGit(repo, 'checkout', '-q', '--detach');
+      fs.writeFileSync(path.join(repo, 't.txt'), 't\n');
+      rootGit(repo, 'add', 't.txt');
+      rootGit(repo, 'commit', '-q', '-m', 'tagged');
+      rootGit(repo, 'tag', 'v1');
+      rootGit(repo, 'checkout', '-q', unborn ? '--orphan' : 'main', ...(unborn ? ['fresh'] : []));
+      if (unborn) rootGit(repo, 'rm', '-q', '-r', '--cached', '.');
+      if (unborn) for (const file of ['a.txt', 'b.txt', 't.txt']) fs.rmSync(path.join(repo, file), { force: true });
+      giveToOwner(repo);
+      const result = runAsOwner(repo, true);
+      expect(result.status).toBe(0);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+      // main has 1 commit that origin/main lacks; the tag adds 1 more.
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0, unpushedCommits: 2, stashes: 0 });
+    });
+  }
+
+  it('review round 3 of PR #84, A-R3-3: an empty refs/stash whose reflog still has entries prints the incomplete marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.git', 'refs', 'stash'), '');
+    spawnSync('chown', ['1000:1000', path.join(repo, '.git', 'refs', 'stash')]);
+    const plain = runAsOwner(repo);
+    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the stash could not be read\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the stash could not be read');
+  });
+
+  it('review round 3 of PR #84, A-R3-5: a folder that Git ignores and the owner cannot read (a database folder) is not walked: no marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'data/\nmy data/\n-x/\n');
+    rootGit(repo, 'add', '.gitignore');
+    rootGit(repo, 'commit', '-q', '-m', 'ignore');
+    for (const folder of ['data/pg', 'my data/pg', '-x']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'data', 'pg', 'f'), 'x');
+    giveToOwner(repo);
+    toRoot(repo, 'data', 0o700, true);
+    spawnSync('chown', ['-R', '999:999', path.join(repo, 'data')]);
+    toRoot(repo, 'my data', 0o700, true);
+    toRoot(repo, '-x', 0o700, true);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 2, stashes: 2 });
+  });
+
+  it('review round 3 of PR #84, A-R3-5: with ignored folders left out, an unreadable folder that Git does not ignore still prints the marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'data/\n');
+    rootGit(repo, 'add', '.gitignore');
+    rootGit(repo, 'commit', '-q', '-m', 'ignore');
+    fs.mkdirSync(path.join(repo, 'data'));
+    fs.mkdirSync(path.join(repo, 'datax'));
+    giveToOwner(repo);
+    toRoot(repo, 'data', 0o700);
+    toRoot(repo, 'datax', 0o700);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(gitSummaryProblem(result.stdout, '')).toBe('datax cannot be read');
+    // An unreadable entry in .git is still found, whatever the working tree ignores.
+    fs.rmdirSync(path.join(repo, 'datax'));
+    toRoot(repo, '.git/refs/stash', 0o600);
+    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBe('.git/refs/stash cannot be read');
+  });
+
   it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {
     const repo = ownerRepo();
     if (repo === undefined) return;

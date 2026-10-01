@@ -32,8 +32,15 @@ export const GIT_SUMMARY_COMPLETE = 'complete';
 export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
 
 /**
+ * Review round 3 of PR #84, A-R3-5: the most folders that Git ignores which the readability walk of Delete's check
+ * leaves out (GIT_SUMMARY_SCRIPT); the folders beyond it are walked (a folder that cannot be read then still makes the
+ * state unknown: never less safe, only less quiet).
+ */
+export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
+
+/**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
- * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
+ * commits on HEAD, on any local branch, or on any tag that no remote-tracking branch contains, and the number of stashes. `$1` is the
  * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
  * keeps them, and Delete removes them.
  *
@@ -58,6 +65,18 @@ export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
  * `LANG=C`, set in the script itself, never with `docker exec -e`), so that Git's messages on stderr are never
  * translated and the patterns of gitSummaryProblem always match. Nothing else in the script depends on the locale: the
  * counts are line counts, and paths pass through as bytes.
+ *
+ * Review round 3 of PR #84 (decision D1: what the check cannot vouch for is never reported clean): the unpushed
+ * commits are those of HEAD, of every local branch, and of every tag that no remote-tracking branch contains (A-R3-2);
+ * commits that only the reflog still reaches (for example of a deleted branch) are not counted, by decision. With `$2`
+ * GIT_SUMMARY_COMPLETE, after the walk, GIT_SUMMARY_INCOMPLETE_MARKER is printed for submodules (a `.gitmodules`, or a
+ * non-empty `modules` folder in the Git folder: their commits, stashes and changes are not counted; A-R3-1), for other
+ * worktrees (a non-empty `worktrees` folder: their changes and detached commits are not counted; A-R3-2), and for a
+ * stash that exists (`refs/stash`, or a non-empty reflog of it) but that Git cannot resolve (A-R3-3). A-R3-5: the walk
+ * leaves out the working-tree folders that Git ignores (`git ls-files -o -i --exclude-standard --directory`, for
+ * example the data folder of a database), at most GIT_SUMMARY_MAX_PRUNED_FOLDERS; `.git` is always walked in full. A
+ * name that Git quotes (a control character, `"` or `\`) or with a character that `-path` reads as a pattern is not
+ * left out (it is walked). The names pass to find as positional parameters (`-path ./<name>`), never as shell text.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
 export LC_ALL=C LANG=C
@@ -86,16 +105,49 @@ branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short
 status=$(g status --porcelain --untracked-files=normal)
 incomplete=''
 if g rev-parse -q --verify HEAD >/dev/null 2>&1; then
-  unpushed=$(g rev-list --count HEAD --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count HEAD --branches --tags --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 else
-  unpushed=$(g rev-list --count --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count --branches --tags --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 fi
 stashes=$(g stash list)
 if [ "\${2:-}" = '${GIT_SUMMARY_COMPLETE}' ] && [ -z "$incomplete" ]; then
-  if ! unreadable=$(find . -xdev ! -type l ! -readable -print -quit); then
+  set --
+  ignored=$(g -c core.quotePath=false ls-files -o -i --exclude-standard --directory 2>/dev/null) || ignored=''
+  pruned=0
+  set -f
+  IFS='
+'
+  for entry in $ignored; do
+    case $entry in
+      '"'* | *[[\\\\*?]*) ;;
+      ?*/)
+        if [ "$pruned" -lt ${GIT_SUMMARY_MAX_PRUNED_FOLDERS} ]; then
+          if [ "$pruned" -gt 0 ]; then set -- "$@" -o; fi
+          set -- "$@" -path "./\${entry%/}"
+          pruned=$((pruned + 1))
+        fi
+        ;;
+    esac
+  done
+  unset IFS
+  set +f
+  if [ "$#" -gt 0 ]; then set -- '(' "$@" ')' -prune -o; fi
+  if ! unreadable=$(find . -xdev "$@" ! -type l ! -readable -print -quit); then
     incomplete='not every file and folder of the repository could be read'
   elif [ -n "$unreadable" ]; then
     incomplete="$(printf '%s' "\${unreadable#./}" | tr '\\n' ' ') cannot be read"
+  fi
+  if [ -z "$incomplete" ]; then
+    gitdir=$(g rev-parse --git-common-dir)
+    if [ -z "$gitdir" ]; then
+      incomplete='the Git folder could not be found'
+    elif [ -e .gitmodules ] || [ -L .gitmodules ] || [ -n "$(ls -A -- "$gitdir/modules" 2>/dev/null)" ]; then
+      incomplete='submodules are not checked'
+    elif [ -n "$(ls -A -- "$gitdir/worktrees" 2>/dev/null)" ]; then
+      incomplete='other worktrees are not checked'
+    elif { [ -e "$gitdir/refs/stash" ] || [ -s "$gitdir/logs/refs/stash" ]; } && ! g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
+      incomplete='the stash could not be read'
+    fi
   fi
 fi
 if [ -n "$incomplete" ]; then

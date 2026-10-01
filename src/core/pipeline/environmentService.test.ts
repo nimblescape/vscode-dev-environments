@@ -4048,6 +4048,14 @@ describe('safetyCheck', () => {
     expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: 'Unexpected output of the Git summary: ""' });
   });
 
+  it('review round 3 of PR #84, A-R3-4: the time limit of the check (an Error of the batch helper, no AbortError) gives an unknown state with "Delete anyway", not a cancel', async () => {
+    const env = await seedEnvironment(h);
+    const message = 'The step gitSummary of the batch helper did not end within 300 seconds.';
+    h.helper.gitSummaryResult = new Error(message);
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: message, recorded: env.gitSummary });
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
   it('starts Docker when needed', async () => {
     await seedEnvironment(h);
     h.dockerStopped = true;

@@ -19,7 +19,7 @@ import { CommandError, GitStateUnreadableError, UserFacingError, isUserFacingErr
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { GIT_SUMMARY_COMPLETE, GIT_SUMMARY_INCOMPLETE_MARKER, GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { MAX_CAPTURED_STDERR_CHARACTERS } from './analysisLimits';
-import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { abortError, isAbortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
@@ -45,6 +45,7 @@ import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
   COMPOSE_MODEL_TIMEOUT_MS,
   DOCKER_SOCKET,
+  GIT_SUMMARY_TIMEOUT_MS,
   HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
@@ -2079,6 +2080,38 @@ describe('WorkspaceHelper file and Git queries', () => {
     expect(streamed.slice(-MAX_CAPTURED_STDERR_CHARACTERS)).not.toContain('Permission denied');
     expect(error).toBeInstanceOf(GitStateUnreadableError);
     expect((error as GitStateUnreadableError).problem).toBe("warning: could not open directory 'data/': Permission denied");
+  });
+
+  it('review round 3 of PR #84, A-R3-4: gitSummary ends at GIT_SUMMARY_TIMEOUT_MS with an Error that is no AbortError (an unknown state, never a cancel)', async () => {
+    expect(GIT_SUMMARY_TIMEOUT_MS).toBe(5 * 60_000);
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => (started = resolve));
+    docker.handler = (args, options) => {
+      if (args[0] !== 'run') return {};
+      started();
+      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(abortError())));
+    };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const caught = createHelper()
+        .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
+        .then(() => undefined, (reason: unknown) => reason);
+      await running;
+      await vi.advanceTimersByTimeAsync(GIT_SUMMARY_TIMEOUT_MS - 1);
+      let settled = false;
+      void caught.then(() => (settled = true));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await caught;
+      expect(error).toBeInstanceOf(Error);
+      expect(isAbortError(error)).toBe(false);
+      expect(isUserFacingError(error)).toBe(false);
+      expect((error as Error).message).toMatch(/did not end within 300 seconds/);
+      expect(bridge.kinds).toEqual(['gitSummary']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('review round 1 of PR #84, A-R1-2: gitSummary keeps CommandError for exit code 128 (a root 0600 .git/index)', async () => {
