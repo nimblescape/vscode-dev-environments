@@ -522,9 +522,17 @@ describe('open: first open', () => {
     /**
      * The `run` of the fix fails (a cancel when `controller` is given, else `runError`) and leaves its container, which
      * holds the volume; the `ps` of its cleanup label waits on `listGate` and fails with `listError` when given; `ps`
-     * and `rm` reject with an AbortError when their signal is aborted.
+     * and `rm` reject with an AbortError when their signal is aborted. Review round 4 of PR #82 (B-R4-1): the `rm` of the
+     * container calls `removing` and settles only after `removeGate`.
      */
-    function fakeFix(p: { controller?: AbortController; listGate?: Promise<void>; listed?: () => void; listError?: Error }): { label: () => string | undefined } {
+    function fakeFix(p: {
+      controller?: AbortController;
+      listGate?: Promise<void>;
+      listed?: () => void;
+      listError?: Error;
+      removing?: () => void;
+      removeGate?: Promise<void>;
+    }): { label: () => string | undefined } {
       const runChecked = h.docker.runChecked.bind(h.docker);
       const removeContainer = h.docker.removeContainer.bind(h.docker);
       let label: string | undefined;
@@ -550,11 +558,43 @@ describe('open: first open', () => {
       };
       h.docker.removeContainer = async (nameOrId: string, options?: { signal?: AbortSignal }): Promise<void> => {
         if (options?.signal?.aborted) throw abortError();
-        if (nameOrId === 'ownership-container') h.docker.volumesInUse.clear();
+        if (nameOrId === 'ownership-container') {
+          p.removing?.();
+          await p.removeGate;
+          h.docker.volumesInUse.clear();
+        }
         return removeContainer(nameOrId);
       };
       return { label: () => label };
     }
+
+    // Review round 4 of PR #82, B-R4-1: the removal of the ownership container is awaited before the volume goes (the
+    // `await` of removeContainer in removeOwnershipContainers); without it, the volume removal would start while the
+    // container that holds the volume is still being removed.
+    it('review round 4 of PR #82, B-R4-1: a cancel removes the volume only after the removal of the ownership container resolved', async () => {
+      const controller = new AbortController();
+      const removing = deferred();
+      const removal = deferred();
+      fakeFix({ controller, removing: removing.resolve, removeGate: removal.promise });
+      let containerRemoved = false;
+      const volumeRemovals: string[] = [];
+      const removeVolume = h.docker.removeVolume.bind(h.docker);
+      h.docker.removeVolume = async (name: string): Promise<void> => {
+        volumeRemovals.push(containerRemoved ? 'after the container' : 'while the container is removed');
+        return removeVolume(name);
+      };
+      const run = rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+      await removing.promise;
+      for (let i = 0; i < 5; i += 1) await turn();
+      expect(volumeRemovals).toEqual([]);
+      containerRemoved = true;
+      removal.resolve();
+      const error = await run;
+      expect(error.code).toBe('cancelled');
+      expect(volumeRemovals.length).toBeGreaterThan(0);
+      expect(volumeRemovals.every((when) => when === 'after the container')).toBe(true);
+      expect(h.docker.volumes.size).toBe(0);
+    });
 
     it('review round 2 of PR #82, B-R2-1: a cancel removes the volume only after the removal of the container settled, and the removal runs without the aborted signal', async () => {
       const controller = new AbortController();
