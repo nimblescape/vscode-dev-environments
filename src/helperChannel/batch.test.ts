@@ -431,11 +431,60 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       expect(step.env.HOME, kind).toBe('/nonexistent');
       expect(step.env.COMPOSE_PROJECT_NAME, kind).toBe('p');
       expect(t.fsCalls, kind).toEqual([`chmod ${CONFIG_FOLDER} 700`, `rm ${OVERRIDE_FOLDER}`, `chmod ${CONFIG_FOLDER} 750`]);
-      expect(t.quiet, kind).toContainEqual(['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']);
+      // Review round 1 of PR #82, A-R1-2: the exact cleanup of a read step. The repair of a cut-off Git step runs only
+      // before the first Git step of the helper (composeModel here), and after a read step there is no walk of the
+      // volume: only the kill of the Git user's processes and the removal of its files outside the volume.
+      const uid = String(BATCH_GIT_UID);
+      expect(t.quiet, kind).toEqual([
+        ...(kind === 'composeModel'
+          ? [
+              ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+              ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'],
+            ]
+          : []),
+        ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
+        ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
+      ]);
     }
     // createFolders stays root (it writes folders of the repository).
     await session.step('createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] });
     expect(t.steps.at(-1)!.command[0]).toBe('node');
+  });
+
+  // Review round 1 of PR #82, A-R1-2: a Git step is cut off only when the whole helper is killed, so the repair runs once
+  // per helper process; a writing Git step still walks the volume after it, every time.
+  it('repairs a cut-off Git step only before the first Git step of the helper, and walks the volume after every writing Git step', async () => {
+    const { t, session } = await started();
+    const uid = String(BATCH_GIT_UID);
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    const oldClones = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'];
+    const afterWritingStep = [
+      ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
+      ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-user', uid, '-exec', 'rm', '-rf', '{}', '+'],
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
+    ];
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect(t.quiet).toEqual([repair, oldClones, ...afterWritingStep]);
+    t.quiet.length = 0;
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect(t.quiet).toEqual(afterWritingStep);
+    // A step that timed out is not cut off: its cleanup ran, and the next Git step does not repair either.
+    t.quiet.length = 0;
+    expect(await session.step('composeHash', { model: 'hang', project: 'p' }, { timeoutMs: 100 })).toMatchObject({ timedOut: true });
+    expect(t.quiet).not.toContainEqual(repair);
+    expect(t.quiet).not.toContainEqual(oldClones);
+  });
+
+  it('repairs a cut-off Git step again in a new helper process', async () => {
+    const uid = String(BATCH_GIT_UID);
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    for (let round = 0; round < 2; round += 1) {
+      // Review round 1 of PR #82, A-R1-2: the flag lives in the helper process, so each new helper repairs once.
+      const { t, session } = await started();
+      await session.step('composeHash', { model: '{}', project: 'p' });
+      expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(repair)), `helper ${round}`).toHaveLength(1);
+    }
   });
 
   it('never leaves /workspaces sticky or writable for others, also after a Git step whose cleanup was cut off', async () => {

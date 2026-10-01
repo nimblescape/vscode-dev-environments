@@ -318,3 +318,56 @@ describeUnix('the real processes of the helper (review round 1 of PR #80, B-R1-1
     30_000,
   );
 });
+
+describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
+  const TOKEN = 'ghp_secret_token_of_the_test';
+  const uid = String(BATCH_GIT_UID);
+  const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'].join(' ');
+  const volumeWalk = repair;
+  const rootWalk = ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'].join(' ');
+  const kill = ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ');
+
+  function helper(): { quiet: string[]; operations: ReturnType<typeof batchHelperOperations> } {
+    const quiet: string[] = [];
+    const operations = batchHelperOperations({
+      spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
+      runQuiet: async (command) => {
+        quiet.push(command.join(' '));
+      },
+      fs: {
+        lstatSync: ((name: string) => ({ isDirectory: () => true, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+        chmodSync: (() => {}) as never,
+        chownSync: (() => {}) as never,
+        readdirSync: (() => []) as never,
+        rmSync: (() => {}) as never,
+      },
+      env: {},
+    });
+    return { quiet, operations };
+  }
+
+  it('review round 1 of PR #82, A-R1-2: the repair of a cut-off Git step runs once per helper process', async () => {
+    const first = helper();
+    expect(await first.operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+    expect(await first.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(await first.operations.composeHash({ model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+    // The first walk of the volume is the repair before composeModel; the second is the chown walk after the clone.
+    expect(first.quiet.filter((call) => call === repair)).toHaveLength(2);
+    expect(first.quiet.indexOf(repair)).toBeLessThan(first.quiet.indexOf(kill));
+    // A new helper process repairs again, once.
+    const second = helper();
+    expect(await second.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(await second.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    // Per clone: one chown walk after it; plus the one repair before the first.
+    expect(second.quiet.filter((call) => call === repair)).toHaveLength(3);
+  });
+
+  it('review round 1 of PR #82, A-R1-2: after a read step, no walk of the volume, but the kill and the removal outside it', async () => {
+    const { quiet, operations } = helper();
+    await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context());
+    quiet.length = 0;
+    expect(await operations.composeHash({ model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+    expect(quiet).toEqual([kill, rootWalk]);
+    expect(quiet).not.toContain(volumeWalk);
+  });
+});

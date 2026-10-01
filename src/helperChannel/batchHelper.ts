@@ -104,12 +104,26 @@ async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
+/**
+ * Review round 1 of PR #82 (A-R1-2): the state of one helper process. A Git step is cut off only when the whole helper
+ * was killed (its `finally` runs to its end otherwise, also after a cancel or the time limit of the step), and the next
+ * helper is a new process: so repairCutOffGitStep runs once per process, before its first Git step, and never again.
+ */
+interface GitUserState {
+  repaired: boolean;
+}
+
 /** Runs `run` with the folders of the Git user opened for the step, and cleans up after it (see the module comment). */
-async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: () => Promise<T>): Promise<T> {
+async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: BatchStepCommand, run: () => Promise<T>): Promise<T> {
   const restores: Array<() => void> = [];
   const uid = String(BATCH_GIT_UID);
   try {
-    await repairCutOffGitStep(deps, uid);
+    // Review round 1 of PR #82 (A-R1-2): once per helper process (see GitUserState), also before a read step, so that
+    // no step of the Git user finds files of its own in the volume that a killed helper left.
+    if (!state.repaired) {
+      await repairCutOffGitStep(deps, uid);
+      state.repaired = true;
+    }
     const config = lstatOrUndefined(deps, CONFIG_FOLDER);
     if (config?.isDirectory()) {
       deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
@@ -144,15 +158,29 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
     try {
       for (const restore of restores.reverse()) restore();
     } finally {
-      await removeGitUserLeftovers(deps, uid);
+      await removeGitUserLeftovers(deps, uid, step.readOnly === true);
     }
   }
 }
 
-/** The files of the Git user after its step (its processes are gone): see the comment in asGitUser. */
-async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string): Promise<void> {
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+/**
+ * The files of the Git user after its step (its processes are gone): see the comment in asGitUser.
+ *
+ * Review round 1 of PR #82 (A-R1-2): after a read step (`readOnly`), no walk of the volume. Such a step runs with
+ * /workspaces at its own mode (not 1777), with CONFIG_FOLDER closed and without the secrets tmpfs. In the volume it owns
+ * nothing but what earlier read steps of this helper left in such folders (repairCutOffGitStep before the first Git step
+ * of the helper, and the chown walk after every writing Git step). So in the volume it can write only into folders that
+ * are writable for others (a world-writable folder that a command of the repository made), never into a file or folder
+ * of root: what it leaves there is no more
+ * trusted than anything else in such a folder, it cannot give itself any access (its processes are killed below), and it
+ * gets root at the next writing Git step or before the first Git step of the next helper. Outside the volume (/tmp, the
+ * root file system, /dev/shm) everything of it is still removed after every step.
+ */
+async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string, readOnly: boolean): Promise<void> {
+  if (!readOnly) {
+    await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
+    await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  }
   await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
@@ -195,6 +223,7 @@ async function runStep(deps: BatchHelperDeps, step: BatchStepCommand, input: str
 /** The operations of the batch helper: one per step kind, one step at a time. */
 export function batchHelperOperations(deps: BatchHelperDeps): Record<string, OperationHandler> {
   let running = false;
+  const gitUser: GitUserState = { repaired: false };
   const handler: (kind: string) => OperationHandler = (kind) => async (params, context) => {
     let step: BatchStepCommand;
     try {
@@ -210,7 +239,7 @@ export function batchHelperOperations(deps: BatchHelperDeps): Record<string, Ope
     try {
       context.progress(kind);
       const input = step.secret === 'stdin' ? context.secret : step.input;
-      const exitCode = step.git ? await asGitUser(deps, step, () => runStep(deps, step, input, context)) : await runStep(deps, step, input, context);
+      const exitCode = step.git ? await asGitUser(deps, gitUser, step, () => runStep(deps, step, input, context)) : await runStep(deps, step, input, context);
       return { exitCode };
     } finally {
       // Review round 1 of PR #80 (B-R1-4): the slot is free again also when the secrets cannot be cleared (that step

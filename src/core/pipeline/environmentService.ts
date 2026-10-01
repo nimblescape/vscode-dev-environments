@@ -61,6 +61,7 @@ import {
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
+import { channelStepLabel, newCleanupLabel } from '../helperChannel/protocol';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
@@ -5205,6 +5206,7 @@ export class EnvironmentService {
     const { docker } = this.deps;
     const env = ctx.env;
     const folder = repositoryFolder(env.repository);
+    let cleanup: string | undefined;
     try {
       const user = await this.imageUser(ctx, image, runArgs);
       if (user === undefined) {
@@ -5223,16 +5225,23 @@ export class EnvironmentService {
         ctx.serviceFolders = facts.overflow ? 'repository' : facts.folders;
       }
       const [shell, ...args] = ownershipFixCommand(folder, user, ctx.resumedClone === true ? ctx.serviceFolders : undefined);
+      // Review round 1 of PR #82 (A-R1-1): a cleanup label of its own (channelStepLabel with a new value), by which a
+      // cancel or a failure removes the container before anything removes the volume, and `--init`, so that a SIGTERM
+      // ends `sh` (as PID 1 it would ignore it) and the container does not keep the volume.
+      cleanup = newCleanupLabel();
       await docker.runChecked(
         [
           'run',
           '--rm',
+          '--init',
           '--pull',
           'never',
           '--network',
           'none',
           '--label',
           `${LABEL_HELPER_RUN}=true`,
+          '--label',
+          channelStepLabel(cleanup),
           '--user',
           'root',
           '--entrypoint',
@@ -5245,9 +5254,26 @@ export class EnvironmentService {
         { timeoutMs: OWNERSHIP_TIMEOUT_MS, signal: ctx.signal },
       );
     } catch (error) {
+      // Review round 1 of PR #82 (A-R1-1): the container of the run goes first (also after a cancel, before the error
+      // reaches removeFailedFirstOpen and its volume removal).
+      if (cleanup !== undefined) await this.removeOwnershipContainers(cleanup);
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed before the container was created: ${errorDetail(error)}`);
     }
+  }
+
+  /**
+   * Review round 1 of PR #82 (A-R1-1): `docker rm -f` of the containers of a prepareOwnership run, by its cleanup label
+   * (`docker ps -aq --no-trunc --filter label=…`). Without the signal of the operation, which may be aborted: under the
+   * lock, both calls go through the worker that holds it. Best effort: a failure is logged.
+   */
+  private async removeOwnershipContainers(cleanup: string): Promise<void> {
+    await this.quietly('remove the container of the ownership fix', async () => {
+      const listed = await this.deps.docker.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(cleanup)}`], {
+        timeoutMs: IMAGE_INSPECT_TIMEOUT_MS,
+      });
+      for (const id of listed.split('\n').map((line) => line.trim()).filter((line) => line !== '')) await this.deps.docker.removeContainer(id);
+    });
   }
 
   /**

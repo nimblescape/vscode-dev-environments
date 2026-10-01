@@ -320,6 +320,61 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(lock.events).toEqual(['open s1', 'close s1', 'volume rm', 'open s2', 'close s2']);
   });
 
+  // Review round 1 of PR #82 (A-R1-5): the lock lost while a step runs closes the session, which ends that step; the step
+  // fails the operation, and no later step runs.
+  it('closes the session when the lock is lost, so the running step ends and the scope refuses', async () => {
+    const { docker, helper, lock } = setup();
+    let loseLock!: (reason: string) => void;
+    Object.assign(lock, { lost: new Promise<string>((resolve) => (loseLock = resolve)) });
+    let closedDuringStep = false;
+    lock.stepResult = async (_kind, session) => {
+      loseLock('its hold limit was reached');
+      for (let i = 0; i < 100 && session.closed === 0; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+      closedDuringStep = session.closed > 0;
+      throw new HelperChannelError('lost', 'The batch helper was closed.');
+    };
+    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      const error = await refusal(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
+      expect(error.code).toBe('helperFailed');
+      await expect(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })).rejects.toBe(error);
+    });
+    expect(closedDuringStep).toBe(true);
+    expect(lock.opens).toHaveLength(1);
+    expect(lock.steps).toHaveLength(1);
+    expect(docker.runs).toEqual([]);
+  });
+
+  // Review round 1 of PR #82 (A-R1-6): a step queued while end() closes the session is refused; it never opens a new
+  // session that nothing would close.
+  it('refuses a step that is queued while the scope ends, and opens no new session', async () => {
+    const { helper, lock } = setup();
+    lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
+    let scope!: NonNullable<ReturnType<typeof currentBatchScope>>;
+    let closeStarted!: () => void;
+    const closing = new Promise<void>((resolve) => (closeStarted = resolve));
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => (openGate = resolve));
+    const run = runWithBatchScope(lock, VOLUME, silentLogger, async () => {
+      scope = currentBatchScope()!;
+      await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
+      const session = lock.sessions[0];
+      const close = session.close.bind(session);
+      session.close = async () => {
+        closeStarted();
+        await gate;
+        return close();
+      };
+    });
+    await closing;
+    const late = scope.step({ volume: VOLUME, kind: 'listConfigs', params: { repository: 'acme/app' }, options: {} }, async () => ({ image: IMAGE.id!, socket: '/var/run/docker.sock' }));
+    openGate();
+    await run;
+    const error = await refusal(late);
+    expect(error.code).toBe('helperFailed');
+    expect(lock.opens).toHaveLength(1);
+    expect(lock.events).toEqual(['open s1', 'close s1']);
+  });
+
   it('runs the steps of the scope one at a time', async () => {
     const { helper, lock } = setup();
     let running = 0;

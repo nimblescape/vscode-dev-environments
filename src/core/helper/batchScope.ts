@@ -64,6 +64,10 @@ export class BatchScope {
   ) {
     void lock.lost.then((reason) => {
       this.lockLost = reason;
+      // Review round 1 of PR #82 (A-R1-5): the session is a separate operation of the worker, so a step that runs keeps
+      // running without the lock unless the session ends: its close ends that step, whose rejection then refuses the
+      // scope (runStep). Never rejects (HelperBatchSession.close); the later closeSession of the scope waits for it.
+      void this.session?.close();
     });
   }
 
@@ -158,8 +162,10 @@ export class BatchScope {
 
   /** Ends the scope: closes its session. */
   async end(): Promise<void> {
-    await this.closeSession();
+    // Review round 1 of PR #82 (A-R1-6): inactive before the close, so that a step queued while the session closes is
+    // refused and never opens a new session that nothing would close.
     this.active = false;
+    await this.closeSession();
   }
 }
 

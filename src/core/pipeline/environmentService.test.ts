@@ -29,6 +29,7 @@ import { Messages } from '../messages';
 import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
+  LABEL_CHANNEL_STEP,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
@@ -395,6 +396,9 @@ describe('open: first open', () => {
     expect(run.all).toEqual(
       expect.arrayContaining(['--rm', '--user', 'root', '--network', 'none', '--entrypoint', 'sh', `type=volume,source=${env.volumeName},target=/workspaces`]),
     );
+    // Review round 1 of PR #82 (A-R1-1): `--init` and a cleanup label of its own (channelStepLabel, a new value per run).
+    expect(run.all).toContain('--init');
+    expect(run.all.filter((arg) => new RegExp(`^${LABEL_CHANNEL_STEP}=[0-9a-f]{24}$`).test(arg))).toHaveLength(1);
     expect(run.args[0]).toBe('-c');
     expect(run.args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     // The fix after up stays, for files that up itself creates as root.
@@ -454,6 +458,45 @@ describe('open: first open', () => {
       expect(env.remoteUser).toBeUndefined();
       expect(h.docker.execs.some((e) => e.command.includes('${localEnv:TERM:vscode}'))).toBe(false);
     });
+  });
+
+  // Review round 1 of PR #82 (A-R1-1): a cancel during the fix before up removes its container by its cleanup label
+  // before the failed first open removes the volume, so the volume is not kept in use and nothing is left behind.
+  it('removes the container of the fix before up by its cleanup label when the open is cancelled during it', async () => {
+    const controller = new AbortController();
+    const runChecked = h.docker.runChecked.bind(h.docker);
+    const removeContainer = h.docker.removeContainer.bind(h.docker);
+    let label: string | undefined;
+    h.docker.runChecked = async (args: readonly string[]): Promise<string> => {
+      if (args[0] === 'run') {
+        await runChecked(args);
+        label = args.find((arg) => arg.startsWith(`${LABEL_CHANNEL_STEP}=`));
+        // The CLI was killed, but the container (PID 1 sh) still holds the volume.
+        h.docker.volumesInUse.add(args.find((arg) => arg.startsWith('type=volume,source='))!.split(',')[1].slice('source='.length));
+        controller.abort();
+        throw abortError();
+      }
+      if (args[0] === 'ps' && label !== undefined && args.includes(`label=${label}`)) {
+        h.docker.log.push(args.join(' '));
+        return 'ownership-container\n';
+      }
+      return runChecked(args);
+    };
+    h.docker.removeContainer = async (nameOrId: string): Promise<void> => {
+      if (nameOrId === 'ownership-container') h.docker.volumesInUse.clear();
+      return removeContainer(nameOrId);
+    };
+    const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+    expect(error.code).toBe('cancelled');
+    expect(label).toBeDefined();
+    const listed = h.docker.log.indexOf(`ps -aq --no-trunc --filter label=${label}`);
+    const removed = h.docker.log.indexOf('rm ownership-container');
+    const volumeRemoved = h.docker.log.findIndex((line) => line.startsWith('volume rm '));
+    expect(listed).toBeGreaterThanOrEqual(0);
+    expect(removed).toBeGreaterThan(listed);
+    expect(volumeRemoved).toBeGreaterThan(removed);
+    expect(await h.registry.list()).toEqual([]);
+    expect(h.docker.volumes.size).toBe(0);
   });
 
   it('continues when the files cannot be given to the remote user before up', async () => {
