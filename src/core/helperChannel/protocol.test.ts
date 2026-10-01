@@ -301,3 +301,54 @@ describe('StreamRedactor (review round 1 of PR #80, B-R1-8)', () => {
     expect(forwarded.join('')).toBe('building');
   });
 });
+
+describe('StreamRedactor at every split (review round 4 of PR #80, B-R4-1)', () => {
+  /** Pushes the pieces and returns what was forwarded, joined, after flush. */
+  function stream(secret: string, pieces: string[]): string {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor(secret, (text) => forwarded.push(text));
+    for (const piece of pieces) redactor.push(piece);
+    redactor.flush();
+    return forwarded.join('');
+  }
+
+  const cases: Array<{ secret: string; text: string; expected: string }> = [
+    { secret: 'ghp_abcd', text: 'x ghp_abcd y', expected: 'x *** y' },
+    // Self-overlapping: the secret is 'ab' four times; the text holds it once, plus a longer run and a partial one.
+    { secret: 'abababab', text: 'z abababab q ababababab ababab z', expected: 'z *** q ***ab ababab z' },
+    { secret: 'aabcd', text: 'xaabcd aaabcd', expected: 'x*** a***' },
+  ];
+
+  it('review round 4 of PR #80, B-R4-1: never forwards the secret when the text is split at any position, and keeps the rest of the text', () => {
+    for (const { secret, text, expected } of cases) {
+      expect(stream(secret, [text]), secret).toBe(expected);
+      for (let k = 0; k <= text.length; k++) {
+        const joined = stream(secret, [text.slice(0, k), text.slice(k)]);
+        expect(joined, `${secret} split at ${k}`).not.toContain(secret);
+        expect(joined, `${secret} split at ${k}`).toBe(expected);
+        for (let m = k; m <= text.length; m++) {
+          expect(stream(secret, [text.slice(0, k), text.slice(k, m), text.slice(m)]), `${secret} split at ${k} and ${m}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it('review round 4 of PR #80, B-R4-1: never forwards the secret when the text comes one character per push', () => {
+    for (const { secret, text, expected } of cases) {
+      const joined = stream(secret, [...text]);
+      expect(joined, secret).not.toContain(secret);
+      expect(joined, secret).toBe(expected);
+    }
+  });
+
+  it('review round 4 of PR #80, B-R4-1: holds back the longest tail that starts the secret, not the shortest', () => {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor('abababab', (text) => forwarded.push(text));
+    redactor.push('x ababab');
+    // All of 'ababab' could start the secret, so only 'x ' is forwarded.
+    expect(forwarded.join('')).toBe('x ');
+    redactor.push('ab y');
+    redactor.flush();
+    expect(forwarded.join('')).toBe('x *** y');
+  });
+});

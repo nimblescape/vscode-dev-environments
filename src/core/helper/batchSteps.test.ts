@@ -173,6 +173,34 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
     }
   });
 
+  it('review round 4 of PR #80, B-R4-2: every kind that takes env refuses the same variables (readConfiguration, build, up, runUserCommands)', () => {
+    const withEnv: Array<[string, Record<string, unknown>]> = [
+      ['readConfiguration', { repository: REPO, configPath: 'a.json', environmentId: ID, merged: true }],
+      ['build', { repository: REPO, configPath: 'a.json', imageName: 'x' }],
+      ['up', { repository: REPO, override: {}, environmentId: ID, removeExistingContainer: false }],
+      ['runUserCommands', { repository: REPO, override: {}, environmentId: ID, containerId: 'abcdef012345' }],
+    ];
+    const refused = ['NODE_OPTIONS', 'LD_PRELOAD', 'DOCKER_HOST', 'SSH_AUTH_SOCK', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_x', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS_x', 'PATH'];
+    for (const [kind, params] of withEnv) {
+      // The allowed name passes, so a refusal below comes from the name alone.
+      expect(batchStepCommand(kind, { ...params, env: { COMPOSE_PROJECT_NAME: 'p' } }).env, kind).toEqual({ COMPOSE_PROJECT_NAME: 'p' });
+      for (const name of refused) {
+        expect(() => batchStepCommand(kind, { ...params, env: { COMPOSE_PROJECT_NAME: 'p', [name]: 'v' } }), `${kind} ${name}`).toThrow(BatchStepError);
+      }
+    }
+  });
+
+  it('review round 4 of PR #80, B-R4-3: readConfiguration and build refuse a configuration path outside the repository', () => {
+    const bad = ['../x.json', '../../etc/shadow', '/etc/passwd', 'a/../../x.json'];
+    for (const configPath of bad) {
+      expect(() => batchStepCommand('readConfiguration', { repository: REPO, configPath, environmentId: ID, merged: true }), `readConfiguration ${configPath}`).toThrow(BatchStepError);
+      expect(() => batchStepCommand('build', { repository: REPO, configPath, imageName: 'x' }), `build ${configPath}`).toThrow(BatchStepError);
+    }
+    // The same request with a path inside the repository is accepted.
+    expect(() => batchStepCommand('readConfiguration', { repository: REPO, configPath: 'a.json', environmentId: ID, merged: true })).not.toThrow();
+    expect(() => batchStepCommand('build', { repository: REPO, configPath: 'a.json', imageName: 'x' })).not.toThrow();
+  });
+
   it('isPassableEnvName also refuses the variables of VS Code and the Dev Containers extension, SSH_AUTH_SOCK and BROWSER', () => {
     for (const name of ['REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS_SOCKETS', 'remote_containers', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_GIT_IPC_HANDLE', 'SSH_AUTH_SOCK', 'ssh_auth_sock', 'BROWSER', 'DOCKER_HOST']) {
       expect(isPassableEnvName(name), name).toBe(false);
