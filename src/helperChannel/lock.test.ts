@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, lockFilePath, lockFolder } from '../core/helperChannel/protocol';
-import { FLOCK_FD, LOCK_DEPS, lockOperation, openLockFile, type FlockProcess, type LockDeps } from './lock';
+import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, type FlockProcess, type LockDeps } from './lock';
 import { OperationError, type OperationContext } from './server';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -330,5 +330,15 @@ describe.skipIf(process.platform !== 'linux')('the lock operation with real proc
     fs.symlinkSync(elsewhere, lockFolder(stateDir));
     await expect(lockOperation(deps())({ environmentId: ID, waitSeconds: 1 }, harness().context)).rejects.toMatchObject({ code: 'failed' });
     expect(fs.readdirSync(elsewhere)).toEqual([]);
+  });
+});
+
+describe('abortedOrAfter (review round 3 of PR #80, B-R3-1)', () => {
+  it('review round 3 of PR #80, B-R3-1: resolves at once for a signal that is already aborted, not after its time', async () => {
+    const outcome = await Promise.race([
+      abortedOrAfter(AbortSignal.abort(), 60_000).then(() => 'resolved'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 2_000)),
+    ]);
+    expect(outcome).toBe('resolved');
   });
 });

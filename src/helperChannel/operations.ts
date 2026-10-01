@@ -25,6 +25,8 @@ import {
 } from '../core/helperChannel/protocol';
 import { readEnvironmentStates } from '../core/pipeline/refreshStates';
 import { abortError, type Logger, type ProcessRunner } from '../core/ports';
+import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/batch';
+import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation } from './batch';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
@@ -140,6 +142,9 @@ export const refreshOperation: OperationHandler = async (params, context) => {
   return value;
 };
 
+/** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
+const BATCH = batchDeps();
+
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
   [OP_PROBE]: probeOperation,
@@ -147,4 +152,8 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_REFRESH]: refreshOperation,
   // Plan step 5, PR B: the environment lock (lock.ts).
   [OP_LOCK]: lockOperation(),
+  // Plan step 6, PR B: the batch helper of an operation (batch.ts).
+  [OP_BATCH]: batchOperation(BATCH),
+  [OP_BATCH_STEP]: batchStepOperation(BATCH),
+  [OP_BATCH_CHUNK]: batchChunkOperation(BATCH),
 };

@@ -26,11 +26,17 @@ import {
   type OperationRequest,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
+import { StreamRedactor, redact } from '../core/helperChannel/protocol';
+
+// Plan step 6, PR B: moved to protocol.ts (the extension masks the output of a batch step too).
+export { StreamRedactor, redact };
 
 /** A started Docker call of the script. */
 export interface ServerChild {
   /** Writes the input (if any) and closes the standard input. */
   end(input?: string): void;
+  /** Plan step 6, PR B: writes to the standard input and keeps it open (ContextDockerOptions.onInput). False when closed. */
+  write?(text: string): boolean;
   kill(signal: 'SIGTERM' | 'SIGKILL'): void;
   /** Review round 2 (A2): stops and resumes the reading of its output (the pipe fills, so the call waits). */
   pause?(): void;
@@ -85,6 +91,11 @@ export interface ContextDockerOptions {
   stream?: boolean;
   /** Plan step 5, PR C: ends this call alone (SIGTERM, then SIGKILL), for example after its own time limit. */
   signal?: AbortSignal;
+  /**
+   * Plan step 6, PR B: the standard input stays open (instead of `input`): `onInput` gets its writer once the call
+   * started (the batch helper, which the worker talks to through it). Never logged.
+   */
+  onInput?(input: { write(text: string): boolean; end(): void }): void;
 }
 
 /** What an operation can do. Every Docker call ends when the operation is cancelled. */
@@ -434,7 +445,11 @@ export class ChannelServer {
     run.children.add(child);
     if (this.outputPaused) child.pause?.();
     try {
-      child.end(options.input);
+      // Plan step 6, PR B: an input that stays open goes to its caller.
+      if (options.onInput !== undefined && child.write !== undefined) {
+        const write = child.write.bind(child);
+        options.onInput({ write, end: () => child.end() });
+      } else child.end(options.input);
     } catch {
       // The process ended before it read its input; its exit is reported below.
     }
@@ -574,11 +589,6 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** The secret (at least 4 characters) replaced by `***`. */
-export function redact(text: string, secret: string | undefined): string {
-  return secret !== undefined && secret.length >= 4 ? text.split(secret).join('***') : text;
-}
-
 /** A command for the log: `docker` and its arguments, an argument with a space or a quote as JSON. */
 export function commandLine(args: readonly string[]): string {
   return ['docker', ...args.map((arg) => (arg === '' || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(' ');
@@ -594,43 +604,4 @@ function lastLine(text: string): string {
   const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '');
   const last = lines[lines.length - 1] ?? '';
   return last.length > 500 ? `${last.slice(0, 500)}…` : last;
-}
-
-/**
- * Passes a stream on with the secret masked, also when a chunk splits it: the last characters (shorter than the secret)
- * wait for the next chunk; flush passes them on.
- */
-export class StreamRedactor {
-  private buffer = '';
-
-  constructor(
-    private readonly secret: string | undefined,
-    private readonly forward: (text: string) => void,
-  ) {}
-
-  push(text: string): void {
-    if (text === '') return;
-    if (this.secret === undefined || this.secret.length < 4) {
-      this.forward(text);
-      return;
-    }
-    const masked = redact(this.buffer + text, this.secret);
-    const keep = this.secret.length - 1;
-    // Keep a tail that could be the start of the secret.
-    let cut = masked.length;
-    for (let length = Math.min(keep, masked.length); length > 0; length--) {
-      if (this.secret.startsWith(masked.slice(masked.length - length))) {
-        cut = masked.length - length;
-        break;
-      }
-    }
-    this.buffer = masked.slice(cut);
-    if (cut > 0) this.forward(masked.slice(0, cut));
-  }
-
-  flush(): void {
-    const rest = this.buffer;
-    this.buffer = '';
-    if (rest !== '') this.forward(rest);
-  }
 }

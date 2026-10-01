@@ -9,6 +9,7 @@
 // fails, whatever its kind. The scope is re-entrant: an operation that holds the lock of an environment does not take it
 // again. No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
+import type { HelperBatchSession } from '../helperChannel/helperChannel';
 import type { RunOptions, RunResult } from '../ports';
 
 /** A held lock of an environment (HelperChannel.lock). */
@@ -21,6 +22,11 @@ export interface HeldEnvironmentLock {
   readonly lost: Promise<string>;
   /** One plain Docker call through the worker that holds the lock. Rejects when it was not sent or its outcome is not known. */
   docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>): Promise<RunResult>;
+  /**
+   * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (HelperChannel.batch). Not used
+   * by the pipeline yet (plan step 6, PR C).
+   */
+  batch?(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
   /** Lets go of the lock and resolves when the worker confirmed it, or the worker was lost (the kernel frees it). Never rejects. */
   release(): Promise<void>;
 }

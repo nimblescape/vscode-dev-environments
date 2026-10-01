@@ -35,6 +35,7 @@ import {
   parseProbeValue,
   parseServerMessage,
   refusedOperationId,
+  StreamRedactor,
 } from './protocol';
 
 describe('the protocol of the helper channel (user request 2026-09-28)', () => {
@@ -153,12 +154,14 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   });
 
   it('channelLabelValue names the protocol, the script and the loader', () => {
-    expect(channelLabelValue('a')).toMatch(/^1-[0-9a-f]{12}$/);
+    // Plan step 6, PR B: changed expectation (protocol version 2, before 1).
+    expect(channelLabelValue('a')).toMatch(/^2-[0-9a-f]{12}$/);
     expect(channelLabelValue('a')).not.toBe(channelLabelValue('b'));
     // Plan step 3 (pipe loading, user decision 2026-09-29): the loader is part of the label (a new loader, a new version).
     const hash = createHash('sha256').update('a', 'utf8').update('\n', 'utf8').update(PIPE_LOADER, 'utf8').digest('hex');
-    expect(channelLabelValue('a')).toBe(`1-${hash.slice(0, 12)}`);
-    expect(channelLabelValue('a')).not.toBe(`1-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
+    // Plan step 6, PR B: changed expectations (protocol version 2, before 1).
+    expect(channelLabelValue('a')).toBe(`2-${hash.slice(0, 12)}`);
+    expect(channelLabelValue('a')).not.toBe(`2-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
   });
 
   it('checks the parameters and values of docker and probe', () => {
@@ -284,5 +287,68 @@ describe('the refresh operation (plan step 5, PR C)', () => {
     // No branch of an environment whose branch was not asked for.
     const notAsked = parseRefreshParams({ environments: [{ ...env, branch: false }] })!;
     expect(parseRefreshValue({ runtime: [running], branches: [{ id: ENV_API, branch: 'main' }] }, notAsked)).toBeUndefined();
+  });
+});
+
+describe('StreamRedactor (review round 1 of PR #80, B-R1-8)', () => {
+  it('review round 1 of PR #80, B-R1-8: flush forwards the held-back tail that could have been the start of the secret (P3)', () => {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor('ghp_abcd', (text) => forwarded.push(text));
+    redactor.push('building');
+    // The `g` may start the secret, so it waits for the next piece.
+    expect(forwarded.join('')).toBe('buildin');
+    redactor.flush();
+    expect(forwarded.join('')).toBe('building');
+  });
+});
+
+describe('StreamRedactor at every split (review round 4 of PR #80, B-R4-1)', () => {
+  /** Pushes the pieces and returns what was forwarded, joined, after flush. */
+  function stream(secret: string, pieces: string[]): string {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor(secret, (text) => forwarded.push(text));
+    for (const piece of pieces) redactor.push(piece);
+    redactor.flush();
+    return forwarded.join('');
+  }
+
+  const cases: Array<{ secret: string; text: string; expected: string }> = [
+    { secret: 'ghp_abcd', text: 'x ghp_abcd y', expected: 'x *** y' },
+    // Self-overlapping: the secret is 'ab' four times; the text holds it once, plus a longer run and a partial one.
+    { secret: 'abababab', text: 'z abababab q ababababab ababab z', expected: 'z *** q ***ab ababab z' },
+    { secret: 'aabcd', text: 'xaabcd aaabcd', expected: 'x*** a***' },
+  ];
+
+  it('review round 4 of PR #80, B-R4-1: never forwards the secret when the text is split at any position, and keeps the rest of the text', () => {
+    for (const { secret, text, expected } of cases) {
+      expect(stream(secret, [text]), secret).toBe(expected);
+      for (let k = 0; k <= text.length; k++) {
+        const joined = stream(secret, [text.slice(0, k), text.slice(k)]);
+        expect(joined, `${secret} split at ${k}`).not.toContain(secret);
+        expect(joined, `${secret} split at ${k}`).toBe(expected);
+        for (let m = k; m <= text.length; m++) {
+          expect(stream(secret, [text.slice(0, k), text.slice(k, m), text.slice(m)]), `${secret} split at ${k} and ${m}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it('review round 4 of PR #80, B-R4-1: never forwards the secret when the text comes one character per push', () => {
+    for (const { secret, text, expected } of cases) {
+      const joined = stream(secret, [...text]);
+      expect(joined, secret).not.toContain(secret);
+      expect(joined, secret).toBe(expected);
+    }
+  });
+
+  it('review round 4 of PR #80, B-R4-1: holds back the longest tail that starts the secret, not the shortest', () => {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor('abababab', (text) => forwarded.push(text));
+    redactor.push('x ababab');
+    // All of 'ababab' could start the secret, so only 'x ' is forwarded.
+    expect(forwarded.join('')).toBe('x ');
+    redactor.push('ab y');
+    redactor.flush();
+    expect(forwarded.join('')).toBe('x *** y');
   });
 });

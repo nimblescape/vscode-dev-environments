@@ -7,12 +7,14 @@
 // stores it at CHANNEL_SCRIPT_PATH, and calls startChannel (CHANNEL_ENTRY) with the input that it read after the script;
 // the rest of the standard input comes as text (the loader set its encoding and paused it). Only Node.js built-ins and small modules of src/core.
 import { spawn } from 'child_process';
+import * as fs from 'fs';
 import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
 
 /** Review round 2 (A2): the output of the calls pauses while more than this many characters wait to be written. */
 export const CHANNEL_OUTPUT_HIGH_WATER = 1024 * 1024;
+import { batchHelperOperations, prepareBatchHelper, runQuietProcess, spawnStepProcess } from './batchHelper';
 import { OPERATIONS } from './operations';
-import { ChannelServer, type ServerChild } from './server';
+import { ChannelServer, type OperationHandler, type ServerChild } from './server';
 
 /** SpawnDocker with child_process.spawn: the Docker CLI of the image, its socket; no shell. */
 export function spawnDockerProcess(args: readonly string[], onStdout: (text: string) => void, onStderr: (text: string) => void): ServerChild {
@@ -42,6 +44,12 @@ export function spawnDockerProcess(args: readonly string[], onStdout: (text: str
   });
   return {
     end: (input) => (input === undefined ? child.stdin.end() : child.stdin.end(input)),
+    // Plan step 6, PR B: the input of the batch helper stays open (Node.js buffers what the pipe cannot take yet).
+    write: (text) => {
+      if (child.stdin.destroyed || !child.stdin.writable) return false;
+      child.stdin.write(text);
+      return true;
+    },
     // Review round 2 (A2): with the reading paused, the pipe fills and the Docker CLI waits.
     pause: () => {
       child.stdout.pause();
@@ -87,6 +95,19 @@ export function fatalHandler(server: Pick<ChannelServer, 'shutdown'>, exit: (cod
 
 /** Runs the channel on the standard input and output of this process. `initial`: input that the loader read already. */
 export function startChannel(initial: string): void {
+  serve(initial, OPERATIONS);
+}
+
+/**
+ * Plan step 6, PR B: the entry of the batch helper (BATCH_ENTRY), in the same script as the worker: the same server and
+ * the same ways to end, with the step kinds as its operations (batchHelper.ts).
+ */
+export function startBatchHelper(initial: string): void {
+  const unsafe = prepareBatchHelper();
+  serve(initial, batchHelperOperations({ spawnStep: spawnStepProcess, runQuiet: runQuietProcess, fs, env: process.env, unsafe }));
+}
+
+function serve(initial: string, operations: Readonly<Record<string, OperationHandler>>): void {
   const server = new ChannelServer({
     write: (text) => {
       if (process.stdout.destroyed || !process.stdout.writable) return false;
@@ -94,7 +115,7 @@ export function startChannel(initial: string): void {
       return true;
     },
     spawnDocker: spawnDockerProcess,
-    operations: OPERATIONS,
+    operations,
     // Review round 2 (A2): `process.stdout.write` to a pipe does not wait; the answers that wait are bounded here.
     congested: () => process.stdout.writableLength > CHANNEL_OUTPUT_HIGH_WATER,
     onDrain: (listener) => process.stdout.once('drain', listener),

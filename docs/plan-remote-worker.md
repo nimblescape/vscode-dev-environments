@@ -48,7 +48,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 3 | Pipe loading | one loader for the worker, its helpers and the monitor; the script size limit goes away | merged (PR #69) |
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
 | 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | merged (PRs #71, #72, #74, #76) |
-| 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | in progress: PR D merged (#77); PR A in review |
+| 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | in progress: PR D (#77) and PR A (#78) merged; PR B in review |
 | 7 | Worker: Delete's check | Delete's Git summary in one helper, with the working-copy checks | queued |
 | 8 | One Session Monitor on every engine | the monitor container on the local Docker too; the local Node.js monitor removed; heartbeats, "in use elsewhere", `forget` from each window's worker; automatic stops, Close and Keep Running (today it needs a remote host), the window context, the stop when heartbeats end, engine-side cleanup and the optional image updates the same on every engine | queued |
 | 9 | Naming 1 | container short ID; Docker context named after the SSH host | queued |

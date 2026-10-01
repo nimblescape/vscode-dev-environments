@@ -33,8 +33,11 @@ import type { ContainerState } from '../types';
 
 export { LABEL_HELPER_CHANNEL };
 
-/** The version of the messages. The extension closes a channel whose script answers with another one. */
-export const CHANNEL_PROTOCOL_VERSION = 1;
+/**
+ * The version of the messages. The extension closes a channel whose script answers with another one. Plan step 6, PR B:
+ * 2 (the batch helper: `batch`, `batchStep`, `batchChunk`); no migration (decision 2026-09-29, "Versions").
+ */
+export const CHANNEL_PROTOCOL_VERSION = 2;
 /** Where the loader writes the script (the file system of the container). */
 export const CHANNEL_SCRIPT_PATH = '/opt/devenv/channel.js';
 /** The function of the script that the loader starts (src/helperChannel/main.ts). */
@@ -182,6 +185,51 @@ export interface CancelledAnswer {
 }
 
 export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswer | OutputAnswer | ResultAnswer | CancelledAnswer;
+
+// Plan step 6, PR B: moved here from src/helperChannel/server.ts (the extension masks the output of a batch step too).
+/** The secret (at least 4 characters) replaced by `***`. */
+export function redact(text: string, secret: string | undefined): string {
+  return secret !== undefined && secret.length >= 4 ? text.split(secret).join('***') : text;
+}
+
+/**
+ * Passes a stream on with the secret masked, also when a chunk splits it: the last characters (shorter than the secret)
+ * wait for the next chunk; flush passes them on.
+ */
+export class StreamRedactor {
+  private buffer = '';
+
+  constructor(
+    private readonly secret: string | undefined,
+    private readonly forward: (text: string) => void,
+  ) {}
+
+  push(text: string): void {
+    if (text === '') return;
+    if (this.secret === undefined || this.secret.length < 4) {
+      this.forward(text);
+      return;
+    }
+    const masked = redact(this.buffer + text, this.secret);
+    const keep = this.secret.length - 1;
+    // Keep a tail that could be the start of the secret.
+    let cut = masked.length;
+    for (let length = Math.min(keep, masked.length); length > 0; length--) {
+      if (this.secret.startsWith(masked.slice(masked.length - length))) {
+        cut = masked.length - length;
+        break;
+      }
+    }
+    this.buffer = masked.slice(cut);
+    if (cut > 0) this.forward(masked.slice(0, cut));
+  }
+
+  flush(): void {
+    const rest = this.buffer;
+    this.buffer = '';
+    if (rest !== '') this.forward(rest);
+  }
+}
 
 /** One line of the channel (JSON and a line feed; JSON.stringify escapes every line feed in a string). */
 export function encodeMessage(message: ClientMessage | ServerMessage): string {
