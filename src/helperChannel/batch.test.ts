@@ -585,6 +585,44 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     }
   }
 
+  // Review round 6 of PR #82 (B-R6-1): a cut-off CONFIG_FOLDER goes back to an owner only when the repository folder is
+  // real. With a link or a missing folder the step runs as nobody, and CONFIG_FOLDER keeps root:root 0700 (never the
+  // owner of the link, never nobody).
+  for (const repository of ['symlink', 'missing'] as const) {
+    it(`review round 6 of PR #82, B-R6-1: a cut-off CONFIG_FOLDER stays root:root 0700 when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'}`, async () => {
+      const { t, session } = await started({ repository, configFolder: 'cutOff' });
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand('readFiles', params).command]);
+      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 0:0`, `chmod ${CONFIG_FOLDER} 700`]);
+    });
+  }
+
+  // Review round 6 of PR #82 (B-R6-3): only root:root 0700 counts as cut off. Each of uid, gid and mode alone keeps
+  // CONFIG_FOLDER as it was found (a repository of 1001:0, so that a wrong repair would show as 1001:0 755).
+  for (const [configUid, configGid, configMode] of [
+    [1001, 0, 0o700],
+    [0, 1002, 0o700],
+    [0, 0, 0o755],
+  ] as const) {
+    it(`review round 6 of PR #82, B-R6-3: a CONFIG_FOLDER of ${configUid}:${configGid} ${configMode.toString(8)} is restored as it was found`, async () => {
+      const { t, session } = await started();
+      const { helperDeps } = t;
+      const lstatSync = helperDeps.fs.lstatSync as (path: string) => unknown;
+      const folder = (uid: number, gid: number, mode: number) => ({ isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40000 | mode, uid, gid });
+      Object.assign(helperDeps.fs, {
+        lstatSync: (path: string) => {
+          if (path === `${WORKSPACES_ROOT}/hello`) return folder(1001, 0, 0o755);
+          if (path === CONFIG_FOLDER) return folder(configUid, configGid, configMode);
+          return lstatSync(path);
+        },
+      });
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} ${configUid}:${configGid}`, `chmod ${CONFIG_FOLDER} ${configMode.toString(8)}`]);
+    });
+  }
+
   // Review round 5 of PR #82 (B-R5-2): an owner step never chmods or chowns CONFIG_FOLDER when it is a symbolic link
   // (chmod and chown follow it, and the restore would give its target to the owner) or missing.
   for (const configFolder of ['symlink', 'missing'] as const) {

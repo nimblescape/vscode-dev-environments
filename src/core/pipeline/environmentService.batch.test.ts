@@ -416,6 +416,18 @@ describe('a batch helper that cannot be opened refuses the open (user decision o
     expect(isBatchHelperUnavailable(error)).toBe(true);
   });
 
+  // Review round 6 of PR #82 (B-R6-2): only the refusal of the scope is rethrown at fixConfigOwnership. Any other failure
+  // of the fix, also a user-facing helperFailed, is logged and the open goes on (implementation notes 7).
+  it('review round 6 of PR #82, B-R6-2: a helperFailed of fixConfigOwnership that is no refusal is logged and the open goes on', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.helper.config = { ...h.helper.config, remoteUser: 'vscode' };
+    h.helper.configOwnershipResult = new UserFacingError('helperFailed', Messages.helperFailed);
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress, forceRebuild: true });
+    expect(result.containerName).toBe(h.docker.containersOf(ENV_ID)[0].name);
+    expect(scopes.map((scope) => scope.split(' ')[0])).toContain('fixConfigOwnership');
+    expect(h.logger.warnings.some((line) => line.includes('could not be changed') && line.includes(Messages.helperFailed))).toBe(true);
+  });
+
   // Review round 5 of PR #82 (A-R5-4): helperFailedInUpdate with a detail keeps the message of the refusal.
   it('a refusal of the scope after `up` keeps its message (A-R5-4)', async () => {
     await seedEnvironment(h, { container: 'running' });
