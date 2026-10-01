@@ -35,6 +35,7 @@ import {
   parseProbeValue,
   parseServerMessage,
   refusedOperationId,
+  StreamRedactor,
 } from './protocol';
 
 describe('the protocol of the helper channel (user request 2026-09-28)', () => {
@@ -286,5 +287,17 @@ describe('the refresh operation (plan step 5, PR C)', () => {
     // No branch of an environment whose branch was not asked for.
     const notAsked = parseRefreshParams({ environments: [{ ...env, branch: false }] })!;
     expect(parseRefreshValue({ runtime: [running], branches: [{ id: ENV_API, branch: 'main' }] }, notAsked)).toBeUndefined();
+  });
+});
+
+describe('StreamRedactor (review round 1 of PR #80, B-R1-8)', () => {
+  it('review round 1 of PR #80, B-R1-8: flush forwards the held-back tail that could have been the start of the secret (P3)', () => {
+    const forwarded: string[] = [];
+    const redactor = new StreamRedactor('ghp_abcd', (text) => forwarded.push(text));
+    redactor.push('building');
+    // The `g` may start the secret, so it waits for the next piece.
+    expect(forwarded.join('')).toBe('buildin');
+    redactor.flush();
+    expect(forwarded.join('')).toBe('building');
   });
 });

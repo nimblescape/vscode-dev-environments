@@ -9,18 +9,29 @@
 // variables on the process only, its output masked); the token only as the `secret` and the standard input of the clone,
 // which runs as the Git user with the cleanup after it; unknown kinds refused; chunked input; the time limit and the
 // cancel of a step end that step alone; one step at a time; close and the end of the helper.
-import { afterEach, describe, expect, it } from 'vitest';
-import { BATCH_GIT_UID, BATCH_READY_STEP, MAX_BATCH_INPUT_CHARACTERS, OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP, batchRunArgs, batchVolumeArgs } from '../core/helperChannel/batch';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  BATCH_GIT_UID,
+  BATCH_HOLD_LIMIT_MS,
+  BATCH_READY_STEP,
+  MAX_BATCH_INPUT_CHARACTERS,
+  MAX_CONCURRENT_BATCHES,
+  OP_BATCH,
+  OP_BATCH_CHUNK,
+  OP_BATCH_STEP,
+  batchRunArgs,
+  batchVolumeArgs,
+} from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { SECRETS_FOLDER } from '../core/helper/scripts';
-import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession } from '../core/helperChannel/helperChannel';
-import { channelStepLabel, parseClientMessage } from '../core/helperChannel/protocol';
+import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
+import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage } from '../core/helperChannel/protocol';
 import { bundleHash } from '../core/loader/pipeLoader';
 import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
 import { BATCH_MISSING_VOLUME_CODE, batchChunkOperation, batchOperation, batchStepOperation, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
-import { ChannelServer, type ServerChild, type SpawnDocker } from './server';
+import { ChannelServer, type ContextDockerOptions, type ServerChild, type SpawnDocker } from './server';
 
 const TOKEN = 'ghp_secret_token_of_the_test';
 const VOLUME = 'devenv-vol-1';
@@ -54,7 +65,21 @@ function afterLoader(next: (text: string) => void, onBundle: (line: string) => v
   };
 }
 
-function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
+interface SetupOptions {
+  autoExit?: boolean;
+  workspacesMode?: number;
+  /** Review round 1 of PR #80 (B-R1-12): the deps of the worker's batch operation (holdLimitMs, openTimeoutMs). */
+  deps?: Partial<BatchDeps>;
+  /**
+   * Review round 1 of PR #80 (B-R1-12): the `docker run` of the helper: a ChannelServer (default); one that never
+   * answers and ends only by a kill (`silent`); one that answers `hello` with another protocol version.
+   */
+  helper?: 'channel' | 'silent' | 'wrongProtocol';
+  /** Review round 1 of PR #80 (B-R1-14): the output of `docker ps`. */
+  psOutput?: string;
+}
+
+function setup(options: SetupOptions = {}) {
   const calls: string[][] = [];
   const steps: FakeStep[] = [];
   const quiet: string[][] = [];
@@ -65,6 +90,9 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
   const clientLines: string[] = [];
   const bundles: string[] = [];
   const servers: ChannelServer[] = [];
+  // Review round 1 of PR #80 (B-R1-11, B-R1-12): what the helper child saw, and the options of the worker's Docker calls.
+  const helperEvents: Array<{ event: string; at: number }> = [];
+  const dockerOptions: Array<{ args: readonly string[]; options: ContextDockerOptions | undefined }> = [];
   let helperExit: ((code: number | null) => void) | undefined;
   const helperDeps: BatchHelperDeps = {
     spawnStep: (command, env, input, onStdout, onStderr) => {
@@ -127,15 +155,44 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
       },
       end: (input) => {
         if (input !== undefined) feed(input);
+        helperEvents.push({ event: 'inputEnded', at: Date.now() });
         helper.inputEnded();
       },
-      kill: () => helper.shutdown(),
+      kill: () => {
+        helperEvents.push({ event: 'kill', at: Date.now() });
+        helper.shutdown();
+      },
+      exited,
+    };
+  };
+  // Review round 1 of PR #80 (B-R1-12): a helper that ignores the end of its input and ends only by a kill.
+  const stubbornChild = (onStdout: (text: string) => void): ServerChild => {
+    let resolveExit!: (value: { exitCode: number | null }) => void;
+    const exited = new Promise<{ exitCode: number | null }>((resolve) => (resolveExit = resolve));
+    const feed = afterLoader(
+      (text) => {
+        if (options.helper !== 'wrongProtocol' || !text.includes('"hello"')) return;
+        helperEvents.push({ event: 'hello', at: Date.now() });
+        onStdout(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION + 1, node: 'v24', ops: [] }));
+      },
+      (line) => bundles.push(line),
+    );
+    return {
+      write: (text) => {
+        feed(text);
+        return true;
+      },
+      end: () => helperEvents.push({ event: 'inputEnded', at: Date.now() }),
+      kill: (signal) => {
+        helperEvents.push({ event: `kill ${signal}`, at: Date.now() });
+        resolveExit({ exitCode: null });
+      },
       exited,
     };
   };
   const spawnDocker: SpawnDocker = (args, onStdout) => {
     calls.push([...args]);
-    if (args[0] === 'run') return helperChild(onStdout);
+    if (args[0] === 'run') return options.helper === 'silent' || options.helper === 'wrongProtocol' ? stubbornChild(onStdout) : helperChild(onStdout);
     let stdout = '';
     let exitCode = 0;
     if (args[0] === 'volume') {
@@ -143,7 +200,7 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
       // An answer without the name of the volume counts as missing too.
       else if (args[args.length - 1] !== 'devenv-unnamed') exitCode = 1;
     }
-    if (args[0] === 'ps') stdout = '0123456789abcdef0123456789abcdef\n';
+    if (args[0] === 'ps') stdout = options.psOutput ?? '0123456789abcdef0123456789abcdef\n';
     return {
       end: () => {},
       kill: () => {},
@@ -155,7 +212,17 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
       ),
     };
   };
-  const deps: BatchDeps = { sessions: new Map(), readScript: () => HELPER_SCRIPT };
+  const deps: BatchDeps = { sessions: new Map(), readScript: () => HELPER_SCRIPT, ...options.deps };
+  // Review round 1 of PR #80 (B-R1-11): the options of each Docker call of the batch operation.
+  const batch = batchOperation(deps);
+  const recordedBatch: typeof batch = (params, context) =>
+    batch(params, {
+      ...context,
+      docker: (args, dockerOptionsOfCall) => {
+        dockerOptions.push({ args, options: dockerOptionsOfCall });
+        return context.docker(args, dockerOptionsOfCall);
+      },
+    });
   let toClient: (text: string) => void = () => {};
   const worker = new ChannelServer({
     write: (text) => {
@@ -163,7 +230,7 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
       return true;
     },
     spawnDocker,
-    operations: { [OP_BATCH]: batchOperation(deps), [OP_BATCH_STEP]: batchStepOperation(deps), [OP_BATCH_CHUNK]: batchChunkOperation(deps) },
+    operations: { [OP_BATCH]: recordedBatch, [OP_BATCH_STEP]: batchStepOperation(deps), [OP_BATCH_CHUNK]: batchChunkOperation(deps) },
     exit: () => {},
     killGraceMs: 50,
   });
@@ -185,7 +252,7 @@ function setup(options: { autoExit?: boolean; workspacesMode?: number } = {}) {
   };
   const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
   const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
-  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, open, helperExit: (code: number | null) => helperExit?.(code) };
+  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperExit: (code: number | null) => helperExit?.(code) };
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -203,7 +270,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     cleanup = [];
   });
 
-  async function started(options: { autoExit?: boolean; workspacesMode?: number } = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
+  async function started(options: SetupOptions = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
     const t = setup(options);
     const channel = await t.open();
     cleanup.push(() => {
@@ -344,6 +411,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(ops.indexOf(OP_BATCH_STEP)).toBeGreaterThan(ops.lastIndexOf(OP_BATCH_CHUNK));
     expect(t.steps[0].input).toBe(batchStepCommand('up', big).input);
     expect(t.deps.sessions.get(session.session)?.inputSize).toBe(0);
+    // Review round 1 of PR #80 (B-R1-15): the consumed input is gone from the map too, not only from the count (W24).
+    expect(t.deps.sessions.get(session.session)?.inputs.size).toBe(0);
     await expect(session.step('up', { ...UP, override: { text: 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS) } })).rejects.toMatchObject({ code: 'unsendable' });
     expect(t.steps).toHaveLength(1);
   });
@@ -455,5 +524,124 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
     expect(t.logLines.some((line) => line.includes(`batch#`) && line.includes(BATCH_READY_STEP))).toBe(true);
     await session.close();
+  });
+
+  /** Review round 1 of PR #80: settles with `promise`, or with 'pending' after `ms` (a hang fails the test, quickly). */
+  function within<T>(promise: Promise<T>, ms: number): Promise<T | 'pending'> {
+    return Promise.race([promise, new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), ms))]);
+  }
+
+  /** Review round 1 of PR #80: an open channel to the worker of `t`, closed after the test. */
+  async function channelOf(t: ReturnType<typeof setup>): Promise<HelperChannel> {
+    const channel = await t.open();
+    cleanup.push(() => {
+      channel.close();
+      for (const server of t.servers) server.shutdown();
+    });
+    return channel;
+  }
+
+  it('review round 1 of PR #80, B-R1-9: the worker refuses a batch beyond its cap as busy and starts nothing (W3, W4, C32)', async () => {
+    expect(MAX_CONCURRENT_BATCHES).toBe(8);
+    const t = setup();
+    const channel = await channelOf(t);
+    // The batches of other windows on this worker.
+    for (let i = 0; i < MAX_CONCURRENT_BATCHES; i++) t.deps.sessions.set(`other-${i}`, { inputs: new Map(), inputSize: 0 });
+    await expect(channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET })).rejects.toMatchObject({ code: 'busy' });
+    expect(t.calls).toEqual([]);
+    expect(t.deps.sessions.size).toBe(MAX_CONCURRENT_BATCHES);
+    // One below the cap, it starts.
+    t.deps.sessions.delete('other-0');
+    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
+    expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
+    await session.close();
+  });
+
+  it('review round 1 of PR #80, B-R1-10: a second batch with the same session is refused as invalid, and the first goes on (W2)', async () => {
+    const { t, channel, session } = await started();
+    const controller = new AbortController();
+    const second = channel.operation(OP_BATCH, { session: session.session, volume: VOLUME, image: IMAGE, socket: SOCKET }, { signal: controller.signal }).catch((error: unknown) => error);
+    const outcome = await within(second, 5_000);
+    controller.abort();
+    expect(outcome).toBeInstanceOf(HelperOperationError);
+    expect((outcome as HelperOperationError).code).toBe('invalid');
+    expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
+    expect(await session.step('listConfigs', { repository: 'octo/hello' })).toMatchObject({ exitCode: 0 });
+  });
+
+  it('review round 1 of PR #80, B-R1-11: the channel traffic of the helper is not kept as the stdout of its docker run (W10)', async () => {
+    const { t } = await started();
+    const runs = t.dockerOptions.filter((call) => call.args[0] === 'run');
+    expect(runs).toHaveLength(1);
+    expect(runs[0].options?.discardStdout).toBe(true);
+  });
+
+  it('review round 1 of PR #80, B-R1-12: at its hold limit the batch fails as timeout, the helper input ends, its container goes (W11, W13)', async () => {
+    const { t, session } = await started({ deps: { holdLimitMs: 300 } });
+    const reason = await within(session.lost, 10_000);
+    expect(reason).toMatch(/longest time/);
+    await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal', 10_000);
+    expect(t.helperEvents.map((entry) => entry.event)).toContain('inputEnded');
+    expect(t.calls).toContainEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(session.session)}`]);
+    expect(t.calls).toContainEqual(['rm', '-f', '0123456789abcdef0123456789abcdef']);
+    expect(t.deps.sessions.size).toBe(0);
+  });
+
+  it('review round 1 of PR #80, B-R1-12: a helper that never answers fails the open at its time limit and is killed (W11)', async () => {
+    const t = setup({ helper: 'silent', deps: { openTimeoutMs: 300 } });
+    const channel = await channelOf(t);
+    const outcome = await within(
+      channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }).catch((error: unknown) => error),
+      10_000,
+    );
+    expect(outcome).toBeInstanceOf(HelperOperationError);
+    expect((outcome as HelperOperationError).code).toBe('failed');
+    expect(t.helperEvents.map((entry) => entry.event)).toContain('kill SIGTERM');
+    expect(t.deps.sessions.size).toBe(0);
+  });
+
+  it(
+    'review round 1 of PR #80, B-R1-12: a helper whose open failed is killed at once, not only after the close of its input (W14)',
+    async () => {
+      const t = setup({ helper: 'wrongProtocol' });
+      const channel = await channelOf(t);
+      const outcome = await within(
+        channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }).catch((error: unknown) => error),
+        15_000,
+      );
+      expect(outcome).toBeInstanceOf(HelperOperationError);
+      expect((outcome as HelperOperationError).code).toBe('failed');
+      const hello = t.helperEvents.find((entry) => entry.event === 'hello');
+      const kill = t.helperEvents.find((entry) => entry.event === 'kill SIGTERM');
+      expect(hello).toBeDefined();
+      expect(kill).toBeDefined();
+      // The close of the channel alone kills it only after CHANNEL_CLOSE_KILL_MS (5 s): a generous margin below that.
+      expect(kill!.at - hello!.at).toBeLessThan(4_000);
+    },
+    30_000,
+  );
+
+  it('review round 1 of PR #80, B-R1-13: the worker opens the helper channel with the long pong time limit (W20)', async () => {
+    const open = vi.spyOn(HelperChannel, 'open');
+    try {
+      await started();
+      const options = open.mock.calls.map((call) => call[2] as HelperChannelOptions).filter((o) => o.name.startsWith('batch '));
+      expect(options).toHaveLength(1);
+      expect(options[0].pongTimeoutMs).toBe(BATCH_HOLD_LIMIT_MS);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it('review round 1 of PR #80, B-R1-14: a lost helper is looked up with ps -aq by its label, and only container IDs are removed (W18, W19)', async () => {
+    const id = 'fedcba9876543210fedcba9876543210';
+    const { t, session } = await started({ psOutput: `WARNING: something\n${id}\n\n` });
+    t.helperExit(1);
+    expect(await session.lost).toMatch(/batch helper ended/);
+    await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal');
+    const listed = t.calls.filter((call) => call[0] === 'ps');
+    expect(listed.length).toBeGreaterThan(0);
+    for (const call of listed) expect(call).toEqual(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(session.session)}`]);
+    expect(t.calls.filter((call) => call[0] === 'rm')).toEqual([['rm', '-f', id]]);
   });
 });

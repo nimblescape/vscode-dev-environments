@@ -5,12 +5,25 @@
 // Plan step 6, PR B: the parts of the batch helper around its steps: the checks before the first step, the variables and
 // the log line of a step, the refusal of an unsafe helper, and a step process that ends with its whole group.
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { SECRETS_FOLDER } from '../core/helper/scripts';
-import { HELPER_DOCKER_SOCKET } from '../core/names';
-import { BATCH_GIT_HOME, batchHelperOperations, describeStep, gitPrivilegeArgs, prepareBatchHelper, spawnStepProcess, stepEnvironment } from './batchHelper';
+import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
+import {
+  BATCH_GIT_HOME,
+  batchHelperOperations,
+  describeStep,
+  gitPrivilegeArgs,
+  prepareBatchHelper,
+  runQuietProcess,
+  spawnStepProcess,
+  stepEnvironment,
+  type BatchHelperDeps,
+  type StepProcess,
+} from './batchHelper';
 import { OperationError, type OperationContext } from './server';
 
 function fakeFiles(options: { link?: string; mode?: number; folder?: boolean } = {}) {
@@ -34,11 +47,11 @@ function fakeFiles(options: { link?: string; mode?: number; folder?: boolean } =
   };
 }
 
-function context(secret?: string): OperationContext & { logs: string[] } {
+function context(secret?: string, signal: AbortSignal = new AbortController().signal): OperationContext & { logs: string[] } {
   const logs: string[] = [];
   return {
     logs,
-    signal: new AbortController().signal,
+    signal,
     secret,
     progress: () => {},
     log: (text) => logs.push(text),
@@ -138,4 +151,162 @@ describeUnix('spawnStepProcess (plan step 6, PR B)', () => {
     while (running() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 20));
     expect(running()).toBe(false);
   });
+});
+
+/** Settles with `promise`, or with 'pending' after `ms` (a step that never ends must fail the test, not hang it). */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | 'pending'> {
+  return Promise.race([promise, new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), ms))]);
+}
+
+/** A fake step that records its signals; `endOn` names the signal that ends it (null: none), `exitCode` ends it at once. */
+function recordingSpawn(options: { endOn: 'SIGTERM' | 'SIGKILL' | null; exitCode?: number }) {
+  const signals: string[] = [];
+  const spawnStep: BatchHelperDeps['spawnStep'] = () => {
+    let done!: (value: { exitCode: number | null }) => void;
+    const exited = new Promise<{ exitCode: number | null }>((resolve) => (done = resolve));
+    if (options.exitCode !== undefined) setTimeout(() => done({ exitCode: options.exitCode! }), 1);
+    const step: StepProcess = {
+      exited,
+      killGroup: (signal) => {
+        signals.push(signal);
+        if (signal === options.endOn) done({ exitCode: null });
+      },
+    };
+    return step;
+  };
+  return { signals, spawnStep };
+}
+
+describe('the end of a step process group (review round 1 of PR #80, B-R1-2)', () => {
+  it('review round 1 of PR #80, B-R1-2: a step that ignores SIGTERM gets SIGKILL after the grace time (H28)', async () => {
+    const { signals, spawnStep } = recordingSpawn({ endOn: 'SIGKILL' });
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {}, killGraceMs: 30 });
+    const controller = new AbortController();
+    const running = operations.listConfigs({ repository: 'octo/hello' }, context(undefined, controller.signal));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    expect(await within(running, 5_000)).toEqual({ exitCode: null });
+    expect(signals.slice(0, 2)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('review round 1 of PR #80, B-R1-2: a signal that was aborted before the spawn ends the step at once (H29)', async () => {
+    const { signals, spawnStep } = recordingSpawn({ endOn: 'SIGTERM' });
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {}, killGraceMs: 60_000 });
+    const controller = new AbortController();
+    controller.abort();
+    expect(await within(operations.listConfigs({ repository: 'octo/hello' }, context(undefined, controller.signal)), 5_000)).toEqual({ exitCode: null });
+    expect(signals[0]).toBe('SIGTERM');
+  });
+
+  it('review round 1 of PR #80, B-R1-2: after a normal exit, what is left in the group gets SIGKILL (H27)', async () => {
+    const { signals, spawnStep } = recordingSpawn({ endOn: null, exitCode: 0 });
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {} });
+    expect(await operations.listConfigs({ repository: 'octo/hello' }, context())).toEqual({ exitCode: 0 });
+    expect(signals).toEqual(['SIGKILL']);
+  });
+});
+
+describe('the secrets tmpfs after a step with a secret (review round 1 of PR #80, B-R1-4)', () => {
+  const TOKEN = 'ghp_secret_token_of_the_test';
+
+  /** The file system calls of a Git step; the secrets tmpfs is `secrets` (a real folder) or the fake `readdirSync`. */
+  function gitFiles(options: { secrets?: string; readdir?: () => string[] }): BatchHelperDeps['fs'] {
+    const real = (name: string) => (options.secrets === undefined ? name : name.replace(SECRETS_FOLDER, options.secrets));
+    return {
+      lstatSync: ((name: string) => ({ isDirectory: () => true, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+      chmodSync: (() => {}) as never,
+      chownSync: (() => {}) as never,
+      readdirSync: ((name: string) => (options.readdir ? options.readdir() : fs.readdirSync(real(name)))) as never,
+      rmSync: ((name: string, rmOptions: fs.RmOptions) => fs.rmSync(real(name), rmOptions)) as never,
+    };
+  }
+
+  it('review round 1 of PR #80, B-R1-4: the next step still runs after the secrets could not be listed', async () => {
+    let fail = true;
+    const operations = batchHelperOperations({
+      spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
+      runQuiet: async () => {},
+      fs: gitFiles({
+        readdir: () => {
+          if (fail) {
+            fail = false;
+            throw new Error('EIO: the tmpfs cannot be read');
+          }
+          return [];
+        },
+      }),
+      env: {},
+    });
+    await expect(operations.clone({ repository: 'octo/hello' }, context(TOKEN))).rejects.toThrow(/EIO/);
+    // Not `busy`: the slot was freed although the secrets could not be cleared.
+    expect(await operations.listConfigs({ repository: 'octo/hello' }, context())).toEqual({ exitCode: 0 });
+    expect(await operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+  });
+
+  it('review round 1 of PR #80, B-R1-4: a folder in the secrets tmpfs is removed with what it holds (H52)', async () => {
+    const secrets = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-secrets-'));
+    try {
+      fs.writeFileSync(path.join(secrets, 'github-token'), TOKEN);
+      fs.mkdirSync(path.join(secrets, 'copy', 'deeper'), { recursive: true });
+      fs.writeFileSync(path.join(secrets, 'copy', 'deeper', 'token'), TOKEN);
+      const operations = batchHelperOperations({ spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep, runQuiet: async () => {}, fs: gitFiles({ secrets }), env: {} });
+      expect(await operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+      expect(fs.readdirSync(secrets)).toEqual([]);
+      expect(await operations.listConfigs({ repository: 'octo/hello' }, context())).toEqual({ exitCode: 0 });
+    } finally {
+      fs.rmSync(secrets, { recursive: true, force: true });
+    }
+  });
+});
+
+describeUnix('the real processes of the helper (review round 1 of PR #80, B-R1-1, B-R1-3)', () => {
+  it('review round 1 of PR #80, B-R1-1: runQuietProcess passes each argument as it is, with no shell (H59)', async () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-quiet-'));
+    try {
+      const file = path.join(folder, 'out');
+      const argument = 'a b; echo injected > "$0" | x';
+      await runQuietProcess([process.execPath, '-e', 'require("fs").writeFileSync(process.argv[1], process.argv[2])', file, argument]);
+      expect(fs.readFileSync(file, 'utf8')).toBe(argument);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  it('review round 1 of PR #80, B-R1-1: runQuietProcess resolves for a command that does not exist', async () => {
+    expect(await within(runQuietProcess(['/nonexistent/devenv-no-such-command', '-x']), 10_000)).toBeUndefined();
+  });
+
+  it(
+    'review round 1 of PR #80, B-R1-3: a process outside the group that holds the pipes does not hold the step (H56)',
+    async () => {
+      const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-escape-'));
+      const pidFile = path.join(folder, 'pid');
+      let escaped: number | undefined;
+      try {
+        // The background `sleep` leaves the group of the step (setsid) and keeps its stdout and stderr open.
+        const step = spawnStepProcess(['sh', '-c', 'setsid sleep 30 & echo $! > "$0"; exit 0', pidFile], { PATH: process.env.PATH }, undefined, () => {}, () => {});
+        const started = Date.now();
+        const result = await within(step.exited, 10_000);
+        try {
+          escaped = Number(fs.readFileSync(pidFile, 'utf8').trim()) || undefined;
+        } catch {
+          // No PID written.
+        }
+        expect(result).toEqual({ exitCode: 0 });
+        expect(Date.now() - started).toBeLessThan(10_000);
+      } finally {
+        if (escaped !== undefined) {
+          for (const target of [-escaped, escaped]) {
+            try {
+              process.kill(target, 'SIGKILL');
+            } catch {
+              // Gone already.
+            }
+          }
+        }
+        fs.rmSync(folder, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 });

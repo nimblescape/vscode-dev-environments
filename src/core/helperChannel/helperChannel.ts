@@ -180,6 +180,37 @@ export interface HelperChannelOptions {
    * client of a batch helper, a local pipe, allows the longer inputs of a step (MAX_BATCH_INPUT_CHARACTERS).
    */
   maxRequestBytes?: number;
+  /**
+   * Only for the tests (review round 1 of PR #80, B-R1-7): the cap of the standard output of a batch step (default
+   * MAX_CAPTURED_OUTPUT_BYTES), so that a test need not stream 64 MB.
+   */
+  maxCapturedOutputBytes?: number;
+}
+
+/**
+ * Review round 1 of PR #80 (B-R1-7): the end of an output stream, at most `max` characters. It holds at most twice
+ * that while it grows (it is cut only then: linear time, however small the pieces are).
+ */
+export class OutputTail {
+  private kept = '';
+
+  constructor(private readonly max: number) {}
+
+  push(piece: string): void {
+    this.kept += piece;
+    if (this.kept.length > 2 * this.max) this.kept = this.kept.slice(-this.max);
+  }
+
+  /** The characters held now (at most twice the cap). */
+  get held(): number {
+    return this.kept.length;
+  }
+
+  /** The last `max` characters. */
+  get text(): string {
+    if (this.kept.length > this.max) this.kept = this.kept.slice(-this.max);
+    return this.kept;
+  }
 }
 
 interface Pending {
@@ -727,7 +758,8 @@ export class HelperChannel {
     }
     let stdout = '';
     let stdoutBytes = 0;
-    let stderr = '';
+    const maxStdoutBytes = this.options.maxCapturedOutputBytes ?? MAX_CAPTURED_OUTPUT_BYTES;
+    const stderr = new OutputTail(MAX_CAPTURED_STDERR_CHARACTERS);
     let tooLarge = false;
     const tooLargeAbort = new AbortController();
     const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
@@ -736,7 +768,7 @@ export class HelperChannel {
       stdout: new StreamRedactor(options.secret, (piece) => {
         if (tooLarge) return;
         stdoutBytes += Buffer.byteLength(piece, 'utf8');
-        if (stdoutBytes > MAX_CAPTURED_OUTPUT_BYTES) {
+        if (stdoutBytes > maxStdoutBytes) {
           tooLarge = true;
           stdout = '';
           tooLargeAbort.abort();
@@ -746,15 +778,13 @@ export class HelperChannel {
         options.onOutput?.('stdout', piece);
       }),
       stderr: new StreamRedactor(options.secret, (piece) => {
-        stderr += piece;
-        if (stderr.length > 2 * MAX_CAPTURED_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CAPTURED_STDERR_CHARACTERS);
+        stderr.push(piece);
         options.onOutput?.('stderr', piece);
       }),
     };
     const flush = () => {
       streams.stdout.flush();
       streams.stderr.flush();
-      if (stderr.length > MAX_CAPTURED_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CAPTURED_STDERR_CHARACTERS);
     };
     try {
       const result = await this.operation(OP_BATCH_STEP, request, {
@@ -768,11 +798,11 @@ export class HelperChannel {
       flush();
       const checked = parseBatchStepValue(result);
       if (checked === undefined) throw new HelperChannelError('protocol', 'The helper answered the batch step with an invalid value.');
-      return { exitCode: checked.exitCode, stdout, stderr, timedOut: false };
+      return { exitCode: checked.exitCode, stdout, stderr: stderr.text, timedOut: false };
     } catch (error) {
       flush();
-      if (tooLarge) throw new OutputTooLargeError(kind, MAX_CAPTURED_OUTPUT_BYTES);
-      if (error instanceof HelperOperationError && (error.timedOut || error.code === 'timeout')) return { exitCode: null, stdout, stderr, timedOut: true };
+      if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
+      if (error instanceof HelperOperationError && (error.timedOut || error.code === 'timeout')) return { exitCode: null, stdout, stderr: stderr.text, timedOut: true };
       throw error;
     }
   }

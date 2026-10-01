@@ -82,7 +82,10 @@ export function stepEnvironment(base: NodeJS.ProcessEnv, step: BatchStepCommand)
   return env;
 }
 
-/** Removes everything in the secrets tmpfs (as root; the token file of a step that was killed too). */
+/**
+ * Removes everything in the secrets tmpfs (as root; the token file of a step that was killed too), folders with what
+ * they hold as well (review round 1 of PR #80, B-R1-4: the Git user owns the tmpfs during its step and may make one).
+ */
 function clearSecrets(deps: BatchHelperDeps): void {
   for (const name of deps.fs.readdirSync(SECRETS_FOLDER)) deps.fs.rmSync(`${SECRETS_FOLDER}/${name}`, { recursive: true, force: true });
 }
@@ -200,8 +203,13 @@ export function batchHelperOperations(deps: BatchHelperDeps): Record<string, Ope
       const exitCode = step.git ? await asGitUser(deps, step, () => runStep(deps, step, input, context)) : await runStep(deps, step, input, context);
       return { exitCode };
     } finally {
-      if (step.secret === 'stdin') clearSecrets(deps);
-      running = false;
+      // Review round 1 of PR #80 (B-R1-4): the slot is free again also when the secrets cannot be cleared (that step
+      // fails with the error; the next one runs, and clears them again if it has a secret).
+      try {
+        if (step.secret === 'stdin') clearSecrets(deps);
+      } finally {
+        running = false;
+      }
     }
   };
   return Object.fromEntries(BATCH_STEP_KINDS.map((kind) => [kind, handler(kind)]));
