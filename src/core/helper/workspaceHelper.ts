@@ -2,29 +2,24 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Workspace helper (implementation notes 7, concept 7.6): a short-lived container with Git and the Dev Container CLI.
-// It mounts the workspace volume at /workspaces. The runs of the Dev Container CLI also get the Docker socket, so the
-// CLI builds and starts dev containers with the Docker engine of the computer. Git and the scripts that read files run
-// without the socket: Git runs programs that the repository configuration names (for example filter drivers).
+// Workspace helper (implementation notes 7, concept 7.6): the image with Git and the Dev Container CLI, and the steps
+// that run in it on the workspace volume (at /workspaces). Plan step 7 (user decision of 2026-10-01): every step runs in
+// the batch helper of an operation (batchScope.ts, batchSteps.ts, src/helperChannel/batchHelper.ts), never as a container
+// of its own; a step outside the batch scope of an operation is an internal error. In the batch helper the runs of the
+// Dev Container CLI get the Docker socket, so the CLI builds and starts dev containers with the Docker engine; the clone
+// runs as an unprivileged Git user and the read steps as the owner of the repository, without the socket: Git runs
+// programs that the repository configuration names (for example filter drivers).
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { runPreparingWorker } from '../docker/workerPreparation';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput } from '../git/gitSummary';
 import { Messages } from '../messages';
-import {
-  CONFIG_FOLDER,
-  HELPER_CACHE_VOLUME,
-  HELPER_DOCKER_SOCKET,
-  LABEL_HELPER_RUN,
-  WORKSPACES_ROOT,
-  environmentIdLabel,
-} from '../names';
+import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { abortError, isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
 import type { DevcontainerConfig, DevcontainerResult, GitSummary } from '../types';
 import {
   DevcontainerCommandError,
-  HELPER_CACHE_FOLDER,
   buildArgs,
   isLifecycleCommandFailure,
   parseDevcontainerResult,
@@ -46,7 +41,6 @@ import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
 import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import {
   OVERRIDE_CONFIG_PATH,
-  SECRETS_FOLDER,
   buildCommand,
   cloneCommand,
   composeHashCommand,
@@ -61,7 +55,7 @@ import {
 // Plan step 6, PR B: the checks of the inputs and the commands of the Dev Container CLI runs are shared with the batch
 // helper (stepInputs.ts), so that both build every command from the same builders.
 import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
-// Plan step 6, PR C: within an open, the volume steps run in the batch helper of the operation.
+// Plan step 6, PR C, plan step 7: the volume steps run only in the batch helper of an operation.
 import { currentBatchScope, type BatchScope } from './batchScope';
 import type { BatchStepKind } from './batchSteps';
 
@@ -177,79 +171,6 @@ export function helperDockerSocket(env: NodeJS.ProcessEnv, platform: NodeJS.Plat
   return socketPath;
 }
 
-function mountOption(fields: Record<string, string>): string {
-  // --mount is CSV: quote a field that contains a comma or a quote.
-  return Object.entries(fields)
-    .map(([key, value]) => {
-      const field = `${key}=${value}`;
-      return /[",]/.test(field) ? `"${field.replace(/"/g, '""')}"` : field;
-    })
-    .join(',');
-}
-
-export interface HelperRunSpec {
-  /**
-   * The image reference: the image ID of the helper image of an open (review round 3 of PR #64, P2), or the helper tag
-   * for a run outside an open.
-   */
-  tag: string;
-  volumeName: string;
-  socketPath: string;
-  containerName: string;
-  /** Passed with `-e NAME=value`. */
-  env: Record<string, string>;
-  /** Adds the tmpfs mount for the token. */
-  secrets: boolean;
-  /**
-   * Mounts the Docker socket and the cache volume (default `true`). Only the runs of the Dev Container CLI need them;
-   * a Git run gets neither, because Git runs programs that the repository configuration names.
-   */
-  docker?: boolean;
-  /** `false`: `--network none`, for runs that need no network (default `true`). */
-  network?: boolean;
-  /**
-   * An empty tmpfs over the configuration folder of the volume (CONFIG_FOLDER, with the GitHub token), for runs that
-   * read files of the repository with a tool that follows its references (the model run of Docker Compose).
-   */
-  hideConfigFolder?: boolean;
-  command: readonly string[];
-}
-
-/**
- * `docker run` arguments of one helper run: `--rm -i`, never a pull (the image exists only locally), the label
- * nimblescape.devenv.helper-run=true, the workspace volume at /workspaces, [the Docker socket and the cache volume],
- * [`--network none`], and for runs with the token a tmpfs mount (in memory, mode 0700).
- */
-export function helperRunArgs(spec: HelperRunSpec): string[] {
-  const args = [
-    'run',
-    '--rm',
-    '-i',
-    '--pull',
-    'never',
-    '--name',
-    spec.containerName,
-    '--label',
-    `${LABEL_HELPER_RUN}=true`,
-    '--mount',
-    mountOption({ type: 'volume', source: spec.volumeName, target: WORKSPACES_ROOT }),
-  ];
-  if (spec.hideConfigFolder === true) args.push('--mount', mountOption({ type: 'tmpfs', destination: CONFIG_FOLDER }));
-  if (spec.docker !== false) {
-    args.push(
-      '--mount',
-      mountOption({ type: 'bind', source: spec.socketPath, target: DOCKER_SOCKET }),
-      '--mount',
-      mountOption({ type: 'volume', source: HELPER_CACHE_VOLUME, target: HELPER_CACHE_FOLDER }),
-    );
-  }
-  if (spec.network === false) args.push('--network', 'none');
-  if (spec.secrets) args.push('--tmpfs', `${SECRETS_FOLDER}:rw,noexec,nosuid,nodev,size=1m,mode=0700`);
-  for (const [name, value] of Object.entries(spec.env)) args.push('-e', `${name}=${value}`);
-  args.push(spec.tag, ...spec.command);
-  return args;
-}
-
 function checkToken(token: string): void {
   if (!token || /\s/.test(token)) throw new UserFacingError('signInRequired', Messages.signInRequired, 'No valid GitHub token.');
 }
@@ -307,11 +228,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** `sha256:` and the first 12 hex characters of an image ID, for log lines. */
-function shortImageId(id: string): string {
-  return id.slice(0, 'sha256:'.length + 12);
-}
-
 function describeCommand(command: readonly string[]): string {
   if (command[0] === 'sh' && command[1] === '-c') return ['sh', '<script>', ...command.slice(4)].join(' ');
   if (command[0] === 'node' && command[1] === '-e') return ['node', '<script>', ...command.slice(3)].join(' ');
@@ -346,24 +262,17 @@ class ResultLineFilter {
 interface StreamOptions {
   env?: Record<string, string>;
   /**
-   * Time limit of the helper container (not of a build of the helper image before it). When it ends, the container is
-   * removed, and the run rejects with an Error that is not an AbortError.
+   * Time limit of the step in the batch helper (not of a build of the helper image before it). When it ends, the step is
+   * ended, and the run rejects with an Error that is not an AbortError.
    */
   timeoutMs?: number;
   input?: string;
-  secrets?: boolean;
-  /** See HelperRunSpec.docker (default `true`). */
-  docker?: boolean;
-  /** See HelperRunSpec.network (default `true`). */
-  network?: boolean;
-  /** See HelperRunSpec.hideConfigFolder. */
-  hideConfigFolder?: boolean;
   /**
    * Plan step 6, PR C: the step of the batch helper that this run is, with the inputs of its builder (batchSteps.ts) and
-   * the secret (the token: the standard input of the clone, or only masked). Within the batch scope of an open
-   * (batchScope.ts) the run goes only there; a run without it is refused (D1).
+   * the secret (the token: the standard input of the clone, or only masked). Plan step 7 (user decision of 2026-10-01):
+   * every run is such a step, and runs only in the batch scope of an operation (batchScope.ts).
    */
-  batch?: { kind: BatchStepKind; params: Record<string, unknown>; secret?: string };
+  batch: { kind: BatchStepKind; params: Record<string, unknown>; secret?: string };
   /** The helper image of the open (see HelperImageUse); without it, the image of this instance (WorkspaceHelper.image). */
   image?: HelperImageUse;
   signal?: AbortSignal;
@@ -531,42 +440,8 @@ export class WorkspaceHelper {
   }
 
   /**
-   * docker run --rm -i --label nimblescape.devenv.helper-run=true, the volume at /workspaces, [the Docker socket and
-   * the cache volume devenv-helper-cache, unless `docker: false`], [--network none for `network: false`], [a tmpfs for
-   * the token], [-e NAME=value…], then the command. Resolves also for a non-zero exit code. On an abort, the helper
-   * container is removed.
-   */
-  run(
-    volumeName: string,
-    command: readonly string[],
-    options: {
-      env?: Record<string, string>;
-      input?: string;
-      secrets?: boolean;
-      docker?: boolean;
-      network?: boolean;
-      /** The helper image of the open (HelperImageUse). */
-      image?: HelperImageUse;
-      onOutput?: (text: string) => void;
-      signal?: AbortSignal;
-    } = {},
-  ): Promise<RunResult> {
-    return this.runStreams(volumeName, command, {
-      image: options.image,
-      env: options.env,
-      input: options.input,
-      secrets: options.secrets,
-      docker: options.docker,
-      network: options.network,
-      signal: options.signal,
-      onStdout: options.onOutput,
-      onStderr: options.onOutput,
-    });
-  }
-
-  /**
-   * Clones the repository into the volume (idempotent), without the Docker socket and the cache volume. The token goes to
-   * the helper on stdin only. Throws CommandError.
+   * Clones the repository into the volume (idempotent): the step clone, as the Git user of the batch helper, without the
+   * Docker socket. The token is only the secret of the step (its standard input in the helper). Throws CommandError.
    */
   async clone(p: {
     volumeName: string;
@@ -586,9 +461,6 @@ export class WorkspaceHelper {
       // Plan step 6, PR C: in the batch helper the token travels only in the `secret` field.
       batch: { kind: 'clone', params: { repository: p.repository, ...(p.branch ? { branch: p.branch } : {}) }, secret: p.token },
       image: p.image,
-      input: p.token,
-      secrets: true,
-      docker: false,
       signal: p.signal,
       onStdout: output,
       onStderr: output,
@@ -617,8 +489,6 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
       batch: { kind: 'readFiles', params: { repository: p.repository, configPath: p.configPath, ...(p.dockerfile !== undefined ? { dockerfile: p.dockerfile } : {}) } },
       image: p.image,
-      docker: false,
-      network: false,
       signal: p.signal,
       onStderr: this.logOutput,
     });
@@ -642,8 +512,6 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, listConfigsCommand(folder), {
       batch: { kind: 'listConfigs', params: { repository: p.repository } },
       image: p.image,
-      docker: false,
-      network: false,
       signal: p.signal,
       onStderr: this.logOutput,
     });
@@ -820,10 +688,9 @@ export class WorkspaceHelper {
 
   /**
    * The merged model of a Docker Compose configuration (COMPOSE_MODEL_SCRIPT: `docker compose config --format json` of
-   * `files`, all profiles, with COMPOSE_PROJECT_NAME=`project`), without the Docker socket, the cache volume, and
-   * network, and with the configuration folder of the volume hidden (the GitHub token): the files of the repository can
-   * reach only files of the helper image and of the repository. `files` are absolute paths in the repository folder
-   * (resolveComposeFiles). `{ error }` carries the message of Docker Compose. Throws CommandError when the helper fails.
+   * `files`, all profiles, with COMPOSE_PROJECT_NAME=`project`): the step composeModel, as the owner of the repository,
+   * without the Docker socket and with the configuration folder of the volume closed (implementation notes §17). `files`
+   * are absolute paths in the repository folder (resolveComposeFiles). `{ error }` carries the message of Docker Compose. Throws CommandError when the helper fails.
    */
   async composeModel(p: {
     volumeName: string;
@@ -844,9 +711,6 @@ export class WorkspaceHelper {
       batch: { kind: 'composeModel', params: { repository: p.repository, files: [...p.files], project: p.project } },
       image: p.image,
       env: { COMPOSE_PROJECT_NAME: p.project },
-      docker: false,
-      network: false,
-      hideConfigFolder: true,
       timeoutMs: p.timeoutMs ?? COMPOSE_MODEL_TIMEOUT_MS,
       signal: p.signal,
       onStderr: this.logOutput,
@@ -858,8 +722,8 @@ export class WorkspaceHelper {
   /**
    * Recreate offer, review round 2: the configuration hash of each service of the up model `model` (its text, as `up`
    * gets it at COMPOSE_MODEL_PATH) with the project name `project`, computed by the Docker Compose of this helper, the
-   * one that runs `up` (COMPOSE_HASH_SCRIPT). Without the Docker socket, the cache volume, and network, and with the
-   * configuration folder of the volume hidden. Throws CommandError when Compose fails.
+   * one that runs `up` (COMPOSE_HASH_SCRIPT): the step composeHash, as the owner of the repository, without the Docker
+   * socket and with the configuration folder of the volume closed. Throws CommandError when Compose fails.
    */
   async composeServiceHashes(p: {
     volumeName: string;
@@ -876,9 +740,6 @@ export class WorkspaceHelper {
       image: p.image,
       input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },
-      docker: false,
-      network: false,
-      hideConfigFolder: true,
       timeoutMs: COMPOSE_MODEL_TIMEOUT_MS,
       signal: p.signal,
       onStderr: this.logOutput,
@@ -891,8 +752,8 @@ export class WorkspaceHelper {
    * Review round 8 (P8-2): creates the folders of the repository that the bind mounts of a Docker Compose configuration
    * name and that do not exist yet (composeUpModel's `createFolders`, absolute paths below the repository folder), as
    * Docker would create them on the computer (CREATE_FOLDERS_SCRIPT: no part through a link out of the repository).
-   * Without the Docker socket, the cache volume, and network, and with the configuration folder of the volume hidden.
-   * Throws CommandError when a folder cannot be created.
+   * The step createFolders, as the owner of the repository, without the Docker socket and with the configuration folder of
+   * the volume closed. Throws CommandError when a folder cannot be created.
    */
   async createRepositoryFolders(p: {
     volumeName: string;
@@ -911,9 +772,6 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
       batch: { kind: 'createFolders', params: { repository: p.repository, folders: [...p.folders] } },
       image: p.image,
-      docker: false,
-      network: false,
-      hideConfigFolder: true,
       signal: p.signal,
       onStderr: this.logOutput,
     });
@@ -1055,7 +913,7 @@ export class WorkspaceHelper {
 
   /**
    * Writes the Git and Docker configuration of the dev container into the volume (GIT_FILES_SCRIPT, concept section 9
-   * "Git inside the container"), without the Docker socket, the cache volume, and network. Unit 15: no token; the token
+   * "Git inside the container"): the step gitFiles of the batch helper (root). Unit 15: no token; the token
    * and the sign-in of the GitHub CLI go into the memory of the dev container after its start (writeContainerToken,
    * ./containerToken.ts). Throws CommandError.
    */
@@ -1074,8 +932,6 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
       batch: { kind: 'gitFiles', params: { repository: p.repository, identity: { name: p.identity.name, email: p.identity.email } } },
       image: p.image,
-      docker: false,
-      network: false,
       signal: p.signal,
       onStdout: output,
       onStderr: output,
@@ -1085,8 +941,8 @@ export class WorkspaceHelper {
 
   /**
    * Review round 15 (K3 = P15-1, D15-1, S15-3): gives the files in `folder` of the volume (the extension's internal folder,
-   * CONFIG_FOLDER) the owner `uid`:`gid` (numbers, as `id -u` and `id -g` print them in the dev container), in a helper
-   * container that mounts only the workspace volume (without the Docker socket, the cache volume, and network), with
+   * CONFIG_FOLDER) the owner `uid`:`gid` (numbers, as `id -u` and `id -g` print them in the dev container): the step
+   * ownershipFix of the batch helper, which mounts only the workspace volume of the dev container, with
    * CONFIG_OWNERSHIP_FIX_SCRIPT. No mount of the dev container (for example through a link of the repository,
    * `volumes_from`, or a tmpfs) is there: the fix walks only the folder of the volume. Throws for IDs that are not numbers
    * (configOwnershipFixCommand); returns the result also for a non-zero exit code.
@@ -1104,24 +960,21 @@ export class WorkspaceHelper {
     return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
       batch: { kind: 'ownershipFix', params: { folder: p.folder, uid: p.uid, gid: p.gid } },
       image: p.image,
-      docker: false,
-      network: false,
       timeoutMs: p.timeoutMs,
       signal: p.signal,
     });
   }
 
   /**
-   * Git state of the repository in the volume (for a container that does not run). Without the Docker socket, the cache
-   * volume, and network: Git runs programs that the repository configuration names. Throws CommandError.
+   * Git state of the repository in the volume (for a container that does not run). Plan step 7 (user decision of
+   * 2026-10-01): the step gitSummary, as the owner of the repository (as nobody when the folder is missing), without the
+   * Docker socket: Git runs programs that the repository configuration names. Throws CommandError.
    */
   async gitSummary(p: { volumeName: string; repository: string; signal?: AbortSignal }): Promise<GitSummary> {
     const folder = this.repositoryFolder(p.repository);
     const result = await this.runStreams(p.volumeName, gitSummaryCommand(folder), {
       // Plan step 7 (user decision of 2026-10-01): a step of the batch helper, as the owner of the repository.
       batch: { kind: 'gitSummary', params: { repository: p.repository } },
-      docker: false,
-      network: false,
       signal: p.signal,
       onStderr: this.logOutput,
     });
@@ -1412,60 +1265,30 @@ export class WorkspaceHelper {
   }
 
   private async runStreams(volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
-    // Plan step 6, PR C: within an open, only through the batch helper of the operation (never a `docker run` of its own).
+    // Plan step 6, PR C: within an operation, only through the batch helper of the operation (never a `docker run` of its
+    // own). Plan step 7 (user decision of 2026-10-01): the per-step `docker run` is removed; a volume step outside the
+    // batch scope of an operation is an internal error (D1), and no container is started for it.
     const scope = currentBatchScope();
-    if (scope !== undefined) return this.runInBatch(scope, volumeName, command, options);
-    const env = this.helperEnv(options.env ?? {}, options.secrets === true);
-    // Review round 2 of PR #64 (A-N1): a run of an open uses the helper image of that open, never the image that this
-    // instance resolved for another open meanwhile.
-    const pinned = options.image;
-    if (pinned !== undefined) {
-      // Review round 3 of PR #64 (P2): by the ID of its image, for the current tag too, so a rebuild of the tag by another
-      // window (`--pull --no-cache`, other packages) never changes the helper image in the middle of an open.
-      const reference = pinned.id ?? pinned.tag;
-      const result = await this.runContainer(reference, volumeName, command, env, options);
-      if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
-        // Review round 2 of PR #64 (A-N1, B3), review round 3 of PR #64 (P2, P8): the image of the open was removed (for
-        // example by `docker image prune -a`, or by another window that rebuilt the tag and removed the image that the tag
-        // had before). The open ends: nothing is built and no other image is
-        // used, because another helper image has another Dev Container CLI than the one that read and checked the
-        // configuration of this open. Review round 4 of PR #64 (R4-1): the cache of the window is reset when it still
-        // holds this image, so the next open resolves the helper image again instead of pinning the removed ID.
-        if (this.imageReadyAt !== undefined && this.imageTag === pinned.tag && this.imageCachedId === pinned.id) this.resetImage();
-        this.deps.logger.warn(
-          `The workspace helper image ${pinned.tag}${pinned.id !== undefined ? ` (${shortImageId(pinned.id)})` : ''} that this open uses was removed. The open cannot go on with another helper image.`,
-        );
-        throw new UserFacingError('helperFailed', Messages.helperFailed, `No such image: ${reference}`);
-      }
-      return result;
+    if (scope === undefined) {
+      const message = `Internal error: the workspace helper step ${options.batch.kind} (${describeCommand(command)}) on the volume ${volumeName} ran outside the batch helper of an operation; it was not run.`;
+      this.deps.logger.error(message);
+      throw new Error(message);
     }
-    let use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-    // A run outside an open runs the helper tag by its tag.
-    let result = await this.runContainer(use.tag, volumeName, command, env, options);
-    if (result.exitCode === 125 && /no such image/i.test(result.stderr)) {
-      // The image was removed after it was checked (for example by `docker image prune -a`). The run takes what
-      // ensureHelperImage returns now: the tag, built again.
-      this.deps.logger.warn(`The workspace helper image ${use.tag} is missing. It is built again.`);
-      this.resetImage();
-      use = await this.image({ onOutput: options.onStderr, signal: options.signal }, false);
-      result = await this.runContainer(use.tag, volumeName, command, env, options);
-    }
-    return result;
+    return this.runInBatch(scope, volumeName, command, options);
   }
 
   /**
-   * Plan step 6, PR C: a run as a step of the batch helper of the open (batchScope.ts), with the result of the per-step
-   * run: the exit code, the output, and for the time limit an Error that is not an AbortError. User decision D1: a run
-   * that is no step of the batch helper is refused, never run as a `docker run` of its own. The variables pass the same
+   * Plan step 6, PR C: a run as a step of the batch helper of the operation (batchScope.ts), with the result of the step:
+   * the exit code, the output, and for the time limit an Error that is not an AbortError. User decision D1: a run is
+   * never a `docker run` of its own (plan step 7: that path is removed). The variables pass the same
    * checks as for `-e` (helperEnv) and go on the process of the step in the helper. The session opens with the pinned
    * helper image of the open (its ID) and the socket of the engine.
    */
   private async runInBatch(scope: BatchScope, volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
     const batch = options.batch;
-    if (batch === undefined) throw scope.refuse(`The helper run ${describeCommand(command)} has no step in the batch helper`);
     const params: Record<string, unknown> = { ...batch.params };
     // The kinds with variables of the request; the Compose read steps set COMPOSE_PROJECT_NAME from their `project`.
-    const env = BATCH_ENV_KINDS.has(batch.kind) ? this.helperEnv(options.env ?? {}, false) : {};
+    const env = BATCH_ENV_KINDS.has(batch.kind) ? this.helperEnv(options.env ?? {}) : {};
     const names = Object.keys(env);
     if (names.length > 0) params.env = env;
     this.deps.logger.info(`Batch helper step ${batch.kind}` + (names.length > 0 ? ` (variables: ${names.join(', ')})` : '') + '.');
@@ -1494,71 +1317,13 @@ export class WorkspaceHelper {
     return result;
   }
 
-  private helperEnv(env: Record<string, string>, secrets: boolean): Record<string, string> {
+  private helperEnv(env: Record<string, string>): Record<string, string> {
     const names = Object.keys(env);
-    if (secrets && names.length > 0) {
-      // Runs with the token get no variables of the computer, so nothing can change how Git handles the token.
-      this.deps.logger.warn('Variables are not passed to a workspace helper run with credentials.');
-      return {};
-    }
     const result: Record<string, string> = {};
     for (const name of names) {
       if (isPassableEnvName(name)) result[name] = env[name];
       else this.deps.logger.warn(`The variable ${name} is not passed to the workspace helper.`);
     }
     return result;
-  }
-
-  private async runContainer(
-    image: string,
-    volumeName: string,
-    command: readonly string[],
-    env: Record<string, string>,
-    options: StreamOptions,
-  ): Promise<RunResult> {
-    const containerName = `devenv-helper-${crypto.randomBytes(6).toString('hex')}`;
-    const args = helperRunArgs({
-      tag: image,
-      volumeName,
-      socketPath: this.socketPathFor(await this.currentEngine()),
-      containerName,
-      env,
-      secrets: options.secrets === true,
-      docker: options.docker !== false,
-      network: options.network !== false,
-      hideConfigFolder: options.hideConfigFolder === true,
-      command,
-    });
-    const envNames = Object.keys(env);
-    this.deps.logger.info(
-      `Workspace helper ${containerName}: ${describeCommand(command)}` +
-        (envNames.length > 0 ? ` (variables: ${envNames.join(', ')})` : ''),
-    );
-    // The time limit ends the run like a cancel, but only of this container.
-    const limit = options.timeoutMs !== undefined ? new AbortController() : undefined;
-    const timer = limit ? setTimeout(() => limit.abort(), options.timeoutMs) : undefined;
-    const signal = limit ? (options.signal ? AbortSignal.any([options.signal, limit.signal]) : limit.signal) : options.signal;
-    // Killing the Docker CLI does not stop the container on every platform: remove it.
-    const onAbort = (): void => {
-      this.deps.docker.run(['rm', '-f', containerName], { timeoutMs: 30_000 }).catch(() => undefined);
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      return await this.deps.docker.run(args, {
-        input: options.input,
-        signal,
-        onStdout: options.onStdout,
-        onStderr: options.onStderr,
-      });
-    } catch (error) {
-      if (limit?.signal.aborted && !options.signal?.aborted && isAbortError(error)) {
-        const seconds = Math.round((options.timeoutMs ?? 0) / 1000);
-        throw new Error(`The workspace helper ${containerName} did not end within ${seconds} seconds.`);
-      }
-      throw error;
-    } finally {
-      if (timer) clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-    }
   }
 }

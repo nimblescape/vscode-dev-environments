@@ -6,15 +6,20 @@
 // helper: `docker compose config` without the Docker socket and without network (L-12), all profiles, the `.env` of the
 // project, the `$` probe, the configuration folder with the token hidden, and whether Compose reads our rewrite of its
 // own output again with the same values (L-6, D-1). The open, stop, and delete of a Compose environment are tested with
-// the pipeline (compose.test.ts).
+// the pipeline (compose.test.ts). Plan step 7 (user decision of 2026-10-01): the per-step path is removed, so the model
+// runs in the batch helper of the real worker under a lock, as an operation runs it (inBatchScope), as the owner of the
+// repository (user decision of 2026-10-01; Q2: without `--network none`); the seeds and the checks run in a plain
+// container of the helper image (runInVolume).
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { composeProjectName } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext } from './harness';
+import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, runInVolume } from './harness';
+import { inBatchScope, workerLocks } from './workerLocks';
 import { composeAccessReport } from '../../src/core/policy';
 
 const ENVIRONMENT_ID = 'c0ffee00-0000-4000-8000-000000000000';
@@ -62,6 +67,9 @@ describe('model run of a Docker Compose configuration', () => {
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volumeName = `devenv-test-compose-${run.runId}`;
   let apiVersion: string;
+  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the real workers, whose batch helper runs the model.
+  const targets = new DockerTargets(docker, env, log);
+  const locks = workerLocks({ run, cli, log }, docker, targets, 'composeModel', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
 
   beforeAll(async () => {
     await helper.ensureImage();
@@ -76,22 +84,29 @@ describe('model run of a Docker Compose configuration', () => {
       [`${REPO}/init.sql`]: 'select 1;\n',
       '/workspaces/.devenv+/github-token': `${DUMMY_TOKEN}\n`,
     };
-    const result = await helper.run(volumeName, ['node', '-e', WRITE_FILES_SCRIPT], { input: JSON.stringify(files), docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image.
+    const result = await runInVolume(docker, volumeName, ['node', '-e', WRITE_FILES_SCRIPT], JSON.stringify(files));
     expect(result.exitCode, result.stderr).toBe(0);
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no worker and no batch helper is left over.
+    const leftovers = await locks.dispose();
     removeRunObjects(cli, run.runId);
+    expect(leftovers).toEqual([]);
     expect(cli.volume(volumeName)).toBeUndefined();
   });
 
   async function model(names: string[]): Promise<ComposeModelOutput | { error: string }> {
     const resolved = resolveComposeFiles('.devcontainer/devcontainer.json', 'app', names);
     if (!('files' in resolved)) throw new Error(resolved.problem);
-    return helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the step in the batch helper of an operation.
+    return inBatchScope(locks, ENVIRONMENT_ID, volumeName, log, () => helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT }));
   }
 
-  it('prints the merged model of all profiles without the Docker socket and network, and the policy allows it', async () => {
+  it('prints the merged model of all profiles, and the policy allows it', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the model runs in the batch helper as the owner of the repository (was: a
+    // per-step run without the Docker socket and network).
     const output = await model(['compose.yml']);
     if ('error' in output) throw new Error(output.error);
     log.info(`Compose ${output.version}, dollarEscaped ${output.dollarEscaped}, model ${JSON.stringify(output.model)}`);
@@ -123,9 +138,10 @@ describe('model run of a Docker Compose configuration', () => {
 
   it('records the real path of a build context that links out of the repository, and the policy refuses it (review round 1, S1)', async () => {
     const files = { [`${REPO}/.devcontainer/linked.yml`]: 'services:\n  linked:\n    build:\n      context: ../ctx\n    command: sleep infinity\n' };
-    const written = await helper.run(volumeName, ['node', '-e', WRITE_FILES_SCRIPT], { input: JSON.stringify(files), docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image.
+    const written = await runInVolume(docker, volumeName, ['node', '-e', WRITE_FILES_SCRIPT], JSON.stringify(files));
     expect(written.exitCode, written.stderr).toBe(0);
-    const linked = await helper.run(volumeName, ['sh', '-c', `ln -sfn /workspaces/.devenv+ ${REPO}/ctx`], { docker: false, network: false });
+    const linked = await runInVolume(docker, volumeName, ['sh', '-c', `ln -sfn /workspaces/.devenv+ ${REPO}/ctx`]);
     expect(linked.exitCode, linked.stderr).toBe(0);
     const output = await model(['compose.yml', 'linked.yml']);
     if ('error' in output) throw new Error(output.error);
@@ -155,7 +171,8 @@ describe('model run of a Docker Compose configuration', () => {
       [`${REPO}/.devcontainer/dollar.yml`]: `services:\n  side:\n    build:\n      context: ..\n      dockerfile_inline: |\n        ARG X=${TEST_BASE_IMAGE}\n        FROM $$X\n    volumes:\n      - ../$$data:/data\n`,
       [`${REPO}/$data/x`]: 'x\n',
     };
-    const written = await helper.run(volumeName, ['node', '-e', WRITE_FILES_SCRIPT], { input: JSON.stringify(files), docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image.
+    const written = await runInVolume(docker, volumeName, ['node', '-e', WRITE_FILES_SCRIPT], JSON.stringify(files));
     expect(written.exitCode, written.stderr).toBe(0);
     const output = await model(['compose.yml', 'dollar.yml']);
     if ('error' in output) throw new Error(output.error);
@@ -178,7 +195,8 @@ describe('model run of a Docker Compose configuration', () => {
       image: 'devenv-c0ffee00:1',
     });
     const script = `mkdir -p /tmp/m && cat > /tmp/m/compose.json && docker compose -p ${PROJECT} -f /tmp/m/compose.json --profile '*' config --format json`;
-    const result = await helper.run(volumeName, ['sh', '-c', script], { input: JSON.stringify(rewritten), docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the check is a plain container of the helper image.
+    const result = await runInVolume(docker, volumeName, ['sh', '-c', script], JSON.stringify(rewritten));
     expect(result.exitCode, result.stderr).toBe(0);
     const again = JSON.parse(result.stdout) as Record<string, Record<string, Record<string, unknown>>>;
     expect(again.services.side.volumes).toContainEqual(
@@ -203,6 +221,12 @@ describe('model run of a Docker Compose configuration', () => {
   });
 
   it('hides the configuration folder with the token from the files of the repository', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed arrangement: the model runs as the owner of the repository with the
+    // configuration folder closed (root's, 0700) during the step (was: an empty tmpfs over it in a per-step run), so the
+    // repository gets a user other than root, as after the ownership fix of an open (a repository of root gets no such
+    // isolation: the known limitation, docs/implementation-notes.md §17).
+    const owned = await runInVolume(docker, volumeName, ['chown', '-R', '1000:1000', REPO]);
+    expect(owned.exitCode, owned.stderr).toBe(0);
     const output = await model(['compose.yml', 'token.yml']);
     expect('error' in output).toBe(true);
     expect(JSON.stringify(output)).not.toContain(DUMMY_TOKEN);
@@ -225,7 +249,8 @@ describe('model run of a Docker Compose configuration', () => {
       image: 'devenv-c0ffee00:1',
     });
     const script = `mkdir -p /tmp/m && cat > /tmp/m/compose.json && docker compose -p ${PROJECT} -f /tmp/m/compose.json --profile '*' config --format json`;
-    const result = await helper.run(volumeName, ['sh', '-c', script], { input: JSON.stringify(rewritten), docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the check is a plain container of the helper image.
+    const result = await runInVolume(docker, volumeName, ['sh', '-c', script], JSON.stringify(rewritten));
     expect(result.exitCode, result.stderr).toBe(0);
     const again = JSON.parse(result.stdout) as Record<string, Record<string, Record<string, unknown>>>;
     log.info(`Model read again: ${JSON.stringify(again)}`);

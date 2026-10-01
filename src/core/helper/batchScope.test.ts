@@ -7,8 +7,8 @@
 // `docker run`; the token goes only in the `secret` field; a session that cannot be opened, a lock without `batch`, a run
 // without a batch kind and a step for another volume refuse (D1) and run nothing; a session that ended between two steps
 // is replaced once under the same lock, a failed reopen refuses; a step that fails because its session was lost fails
-// the operation and is never repeated; the session is closed on success, failure and cancel; outside the scope the
-// per-step run is unchanged.
+// the operation and is never repeated; the session is closed on success, failure and cancel. Plan step 7 (user decision
+// of 2026-10-01): outside a scope a volume step throws an internal error and runs nothing (the per-step run is removed).
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -134,6 +134,23 @@ function setupWithImage() {
   return { docker, helper, lock: new FakeLock(), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed. The command, input and variables that
+ * WorkspaceHelper builds for each of its steps (the arguments of its runInBatch), as the reference of the equivalence
+ * tests below (was: the command, input and `-e` variables of the per-step run).
+ */
+function recordBuilt(helper: WorkspaceHelper): Array<{ command: readonly string[]; input?: string; env: Record<string, string> }> {
+  type RunInBatch = (scope: unknown, volume: string, command: readonly string[], options: { input?: string; env?: Record<string, string> }) => Promise<RunResult>;
+  const internal = helper as unknown as { runInBatch: RunInBatch };
+  const inner = internal.runInBatch.bind(helper);
+  const built: Array<{ command: readonly string[]; input?: string; env: Record<string, string> }> = [];
+  internal.runInBatch = (scope, volume, command, options) => {
+    built.push({ command, input: options.input, env: options.env ?? {} });
+    return inner(scope, volume, command, options);
+  };
+  return built;
+}
+
 async function refusal(promise: Promise<unknown>): Promise<UserFacingError> {
   try {
     await promise;
@@ -211,11 +228,12 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(currentBatchScope()).toBeUndefined();
   });
 
-  it('runs the per-step docker run outside the scope, unchanged', async () => {
+  it('outside the scope a volume step throws an internal error and runs nothing (plan step 7)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: outside a scope
+    // there is no `docker run` of its own any more (was: "runs the per-step docker run outside the scope, unchanged").
     const { docker, helper } = setup();
-    await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
-    expect(docker.runs).toHaveLength(1);
-    expect(docker.runs[0].args[0]).toBe('run');
+    await expect(helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })).rejects.toThrow(/^Internal error: .* ran outside the batch helper of an operation; it was not run\.$/);
+    expect(docker.runs).toEqual([]);
   });
 
   it('D1: a session that cannot be opened refuses the operation with the cause; nothing runs, also not the next step', async () => {
@@ -237,10 +255,11 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(docker.runs).toEqual([]);
   });
 
-  it('D1: a lock without batch, a run without a batch kind, a step for another volume, and an image without an ID refuse', async () => {
+  it('D1: a lock without batch, a step for another volume, and an image without an ID refuse', async () => {
     const cases: Array<[string, (helper: WorkspaceHelper) => Promise<unknown>, (lock: FakeLock) => HeldEnvironmentLock, string]> = [
       ['no batch', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), (lock) => ({ ...lock, environmentId: lock.environmentId, lost: lock.lost, docker: lock.docker, release: lock.release, batch: undefined }), 'has no batch helper'],
-      ['run', (helper) => helper.run(VOLUME, ['sh', '-c', 'true']), (lock) => lock, 'has no step in the batch helper'],
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it WorkspaceHelper.run, the run without a batch kind
+      // (was: the case 'run', refused with "has no step in the batch helper"; every run now names its kind).
       // Plan step 7 (user decision of 2026-10-01): changed expectation, gitSummary is a step of the batch helper now
       // (its routing is checked with the other kinds), so it is no longer refused here.
       ['volume', (helper) => helper.listConfigurations({ volumeName: 'other', repository: 'acme/app', image: IMAGE }), (lock) => lock, 'is for the volume other'],
@@ -595,27 +614,19 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       ['ownershipFix', (h) => h.fixConfigOwnership({ volumeName: VOLUME, folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 5000, image: IMAGE })],
     ];
     for (const [kind, call] of calls) {
-      // The per-step run (outside a scope): its command after the image, its `-e` variables, its standard input.
-      const single = setup();
-      await call(single.helper).catch(() => undefined);
-      const [run] = single.docker.runs;
-      const at = run.args.indexOf(IMAGE.id!);
-      const runEnv: Record<string, string> = {};
-      for (let i = 0; i < at; i++) {
-        if (run.args[i] !== '-e') continue;
-        const [name, ...value] = run.args[i + 1].split('=');
-        runEnv[name] = value.join('=');
-      }
-      // The same call as a step of the scope.
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed reference: the command, input and variables that
+      // WorkspaceHelper builds for the step (recordBuilt; was: those of its per-step run).
       const { helper, lock } = setup();
+      const built = recordBuilt(helper);
       await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
       // (readConfiguration reads once more when its first output has no configuration.)
       expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
       const command = batchStepCommand(kind, lock.steps[0].params);
-      expect(command.command, kind).toEqual(run.args.slice(at + 1));
-      expect(command.env, kind).toEqual(runEnv);
-      // The clone takes the token as its secret, not as the input of the per-step run.
-      if (kind !== 'clone') expect(command.input, kind).toBe(run.options.input);
+      expect(command.command, kind).toEqual(built[0].command);
+      expect(command.env, kind).toEqual(built[0].env);
+      // The clone takes the token as its secret, not as an input of the step.
+      if (kind !== 'clone') expect(command.input, kind).toBe(built[0].input);
+      else expect(lock.steps[0].options.secret, kind).toBe(TOKEN);
     }
   });
 
@@ -651,29 +662,29 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const files = { [COMPOSE_MODEL_PATH]: '{"services":{}}' };
     const call = (h: WorkspaceHelper): Promise<unknown> =>
       h.up({ volumeName: VOLUME, repository: 'acme/app', override: { name: 'o' }, environmentId: ENVIRONMENT_ID, removeExistingContainer: false, files, env: { COMPOSE_PROJECT_NAME: 'p' }, token: TOKEN, image: IMAGE });
-    const single = setup();
-    await call(single.helper).catch(() => undefined);
-    const [run] = single.docker.runs;
-    const at = run.args.indexOf(IMAGE.id!);
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed reference: the command and input that WorkspaceHelper
+    // builds for the step (recordBuilt; was: those of its per-step run).
     const { helper, lock } = setup();
+    const built = recordBuilt(helper);
     await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
     expect(lock.steps.map((step) => step.kind)).toEqual(['up']);
     expect(lock.steps[0].params).toEqual(expect.objectContaining({ files }));
     const command = batchStepCommand('up', lock.steps[0].params);
-    expect(command.command).toEqual(run.args.slice(at + 1));
-    expect(command.input).toBe(run.options.input);
+    expect(command.command).toEqual(built[0].command);
+    expect(command.input).toBe(built[0].input);
   });
 
-  /** The command and input of the per-step run of `call`, and the step params and helper command of the same call in a scope. */
+  /**
+   * The command and input that WorkspaceHelper builds for `call`, and the step params and helper command of the same call
+   * in a scope. Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed reference: recordBuilt (was: the
+   * command and input of the per-step run).
+   */
   async function perStepAndBatch(kind: BatchStepKind, call: (helper: WorkspaceHelper) => Promise<unknown>) {
-    const single = setup();
-    await call(single.helper).catch(() => undefined);
-    const [run] = single.docker.runs;
-    const at = run.args.indexOf(IMAGE.id!);
     const { helper, lock } = setup();
+    const built = recordBuilt(helper);
     await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
     expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
-    return { run: { command: run.args.slice(at + 1), input: run.options.input }, params: lock.steps[0].params, command: batchStepCommand(kind, lock.steps[0].params) };
+    return { run: { command: built[0].command, input: built[0].input }, params: lock.steps[0].params, command: batchStepCommand(kind, lock.steps[0].params) };
   }
 
   it('review round 3 of PR #82, B-R3-1: a runUserCommands with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {

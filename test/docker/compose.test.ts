@@ -48,7 +48,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, runInVolume } from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { workerLocks } from './workerLocks';
 
@@ -192,7 +192,8 @@ ${extra}volumes:
       [LABEL_REPOSITORY]: target.repository,
       [TEST_RUN_LABEL]: run.runId,
     });
-    const seeded = await helper.run(target.name, ['sh', '-c', SEED_SCRIPT, 'sh', target.folder, JSON.stringify(files)], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, target.name, ['sh', '-c', SEED_SCRIPT, 'sh', target.folder, JSON.stringify(files)]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({

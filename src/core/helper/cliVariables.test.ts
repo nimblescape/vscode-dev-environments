@@ -26,7 +26,8 @@ import {
   withDevcontainerIdPlaceholder,
   type CliVariables,
 } from './cliVariables';
-import { helperRunArgs } from './workspaceHelper';
+import { batchRunArgs } from '../helperChannel/batch';
+import { batchStepCommand } from './batchSteps';
 import { composeMountVolumes } from '../pipeline/pipelineRules';
 
 // Guard (hotfix M1): the substitution functions of Dev Container CLI 0.89.0, copied verbatim from
@@ -330,8 +331,21 @@ describe('the known variables of the helper process (hotfix review 1, N4)', () =
     const dockerfile = fs.readFileSync(path.resolve(__dirname, '../../../resources/helper/Dockerfile'), 'utf8');
     expect(dockerfile).not.toMatch(/^\s*USER\b/im);
     expect(dockerfile).not.toMatch(/^\s*ENV\s+HOME\b/im);
-    const args = helperRunArgs({ tag: 't', volumeName: 'v', socketPath: '/var/run/docker.sock', containerName: 'c', env: {}, secrets: false, command: ['sh'] });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the batch helper
+    // container (batchRunArgs) gets no user and no HOME (was: helperRunArgs), and its steps of the Dev Container CLI run
+    // as root with the variables of the helper (no owner, not the Git user).
+    const args = batchRunArgs({ session: 'a'.repeat(24), volume: 'v', image: `sha256:${'1'.repeat(64)}`, socket: '/var/run/docker.sock', scriptHash: 'f'.repeat(64) });
     expect(args.filter((arg) => arg === '--user' || arg === '-u' || arg.startsWith('--user=') || arg.startsWith('HOME='))).toEqual([]);
+    for (const step of [
+      batchStepCommand('readConfiguration', { repository: 'o/r', configPath: 'a.json', environmentId: 'e', merged: true }),
+      batchStepCommand('build', { repository: 'o/r', configPath: 'a.json', imageName: 'devenv-x:1' }),
+      batchStepCommand('up', { repository: 'o/r', override: {}, environmentId: 'e', removeExistingContainer: false }),
+      batchStepCommand('runUserCommands', { repository: 'o/r', override: {}, environmentId: 'e', containerId: 'c'.repeat(64) }),
+    ]) {
+      expect(step.owner).toBeUndefined();
+      expect(step.git).toBe(false);
+      expect(step.env.HOME).toBeUndefined();
+    }
   });
 });
 

@@ -14,10 +14,14 @@ import { preparingWorker } from '../docker/workerPreparation';
 import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
+import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, UserFacingError, isUserFacingError } from '../errors';
+import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
+import { runWithBatchScope } from './batchScope';
+import { batchStepCommand, type BatchStepKind } from './batchSteps';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup } from './helperImage';
@@ -46,7 +50,6 @@ import {
   helperDockerSocket,
   helperStatePathFor,
   type HelperEngine,
-  helperRunArgs,
   isPassableEnvName,
   type HelperDeps,
   type HelperDocker,
@@ -138,16 +141,6 @@ class FakeDocker implements HelperDocker {
   }
 }
 
-/** Whether docker run arguments mount the Docker socket or the cache volume. */
-function hasDockerAccess(args: string[]): boolean {
-  return args.some((arg) => arg.includes('docker.sock') || arg.includes('devenv-helper-cache'));
-}
-
-function hasNoNetwork(args: string[]): boolean {
-  const index = args.indexOf('--network');
-  return index >= 0 && args[index + 1] === 'none';
-}
-
 /** The command after the image reference `image` in docker run arguments. */
 function commandOfImage(args: string[], image: string): string[] {
   const index = args.indexOf(image);
@@ -155,9 +148,12 @@ function commandOfImage(args: string[], image: string): string[] {
   return args.slice(index + 1);
 }
 
-/** The command after the image tag in docker run arguments. */
+/**
+ * The command after the image in docker run arguments. Plan step 7 (user decision of 2026-10-01): the per-step path is
+ * removed; a step of the batch helper runs with the image ID of its session (was: the helper tag of a per-step run).
+ */
 function commandOf(args: string[]): string[] {
-  const index = args.findIndex((arg) => /^devenv-helper:/.test(arg));
+  const index = args.findIndex((arg) => /^devenv-helper:/.test(arg) || /^sha256:[0-9a-f]{64}$/.test(arg));
   expect(index).toBeGreaterThan(0);
   return args.slice(index + 1);
 }
@@ -182,15 +178,118 @@ let dir: string;
 let docker: FakeDocker;
 let logger: RecordingLogger;
 
-function createHelper(env: NodeJS.ProcessEnv = {}, platform: NodeJS.Platform = 'darwin'): WorkspaceHelper {
-  return new WorkspaceHelper({
-    docker,
-    logger,
-    dockerfilePath: path.join(dir, 'Dockerfile'),
-    env,
-    platform,
-    clock: { now: () => Date.parse('2026-09-24T17:10:00Z') },
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed. Every volume step of WorkspaceHelper runs in
+ * the batch helper of an operation; in these tests a fake lock opens sessions that run each step as one
+ * `docker run [-e NAME=value…] <image ID> <command>` of the FakeDocker, with the command, variables and input that the
+ * batch helper builds for it (batchStepCommand), the secret as the input of a step that takes it on stdin, and its
+ * output to the step. So the tests still see what each step runs. `openError`: the session cannot be opened (D1).
+ */
+class BridgeLock implements HeldEnvironmentLock {
+  readonly environmentId = 'e';
+  readonly lost = new Promise<string>(() => {});
+  /** The image of each session opened, in order. */
+  readonly opens: string[] = [];
+  /** The kind of each step, in order. */
+  readonly kinds: BatchStepKind[] = [];
+  openError: Error | undefined;
+  async docker(): Promise<RunResult> {
+    throw new Error('The fake lock runs no plain Docker call.');
+  }
+  async release(): Promise<void> {}
+  batch = async (p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> => {
+    this.opens.push(p.image);
+    if (this.openError !== undefined) throw this.openError;
+    const session: HelperBatchSession = {
+      session: `s${this.opens.length}`,
+      lost: new Promise<string>(() => {}),
+      step: async (kind: BatchStepKind, params: unknown, options: BatchStepOptions = {}): Promise<RunResult> => {
+        this.kinds.push(kind);
+        const step = batchStepCommand(kind, params);
+        const env = Object.entries(step.env).flatMap(([name, value]) => ['-e', `${name}=${value}`]);
+        // The time limit of the step ends it (the helper kills its process group) and reports `timedOut`.
+        const limit = new AbortController();
+        const timer = options.timeoutMs !== undefined ? setTimeout(() => limit.abort(), options.timeoutMs) : undefined;
+        const signal = options.signal !== undefined ? AbortSignal.any([options.signal, limit.signal]) : limit.signal;
+        try {
+          return await docker.run(['run', ...env, p.image, ...step.command], {
+            input: step.secret === 'stdin' ? options.secret : step.input,
+            signal,
+            onStdout: (text) => options.onOutput?.('stdout', text),
+            onStderr: (text) => options.onOutput?.('stderr', text),
+          });
+        } catch (error) {
+          if (limit.signal.aborted && !options.signal?.aborted) return { exitCode: null, stdout: '', stderr: '', timedOut: true };
+          throw error;
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      },
+      close: async () => {},
+    };
+    return session;
+  };
+}
+
+/** The volume steps of WorkspaceHelper (each one a step of the batch helper). */
+const VOLUME_METHODS = new Set([
+  'clone',
+  'readConfigFiles',
+  'listConfigurations',
+  'readConfiguration',
+  'build',
+  'composeModel',
+  'composeServiceHashes',
+  'createRepositoryFolders',
+  'up',
+  'runUserCommands',
+  'prepareGit',
+  'fixConfigOwnership',
+  'gitSummary',
+]);
+
+/** The lock of the last scope that batched() opened. */
+let bridge: BridgeLock;
+
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed. `helper` with each volume step run in a batch
+ * scope of its own (on its volume, with a BridgeLock), as an operation runs it; the other methods unchanged.
+ */
+function batched(helper: WorkspaceHelper, lock?: () => BridgeLock): WorkspaceHelper {
+  return new Proxy(helper, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof property !== 'string' || !VOLUME_METHODS.has(property) || typeof value !== 'function') return value;
+      return (p: { volumeName: string }) => {
+        bridge = lock?.() ?? new BridgeLock();
+        return runWithBatchScope(bridge, p.volumeName, logger, () => (value as (p: unknown) => Promise<unknown>).call(target, p));
+      };
+    },
   });
+}
+
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it WorkspaceHelper.run. A helper step
+ * of the tests of the helper image (was: `helperStep(helper, { image })`): the ownership fix of CONFIG_FOLDER in
+ * a batch scope on `vol`, which takes the pinned image of an open, or else the image of the window.
+ */
+function helperStep(helper: WorkspaceHelper, options: { image?: HelperImageUse; signal?: AbortSignal; lock?: BridgeLock } = {}): Promise<RunResult> {
+  const { lock, ...rest } = options;
+  return batched(helper, lock === undefined ? undefined : () => lock).fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1000', ...rest });
+}
+
+function createHelper(env: NodeJS.ProcessEnv = {}, platform: NodeJS.Platform = 'darwin'): WorkspaceHelper {
+  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the volume steps run in a batch scope.
+  return batched(
+    new WorkspaceHelper({
+      docker,
+      logger,
+      dockerfilePath: path.join(dir, 'Dockerfile'),
+      env,
+      platform,
+      clock: { now: () => Date.parse('2026-09-24T17:10:00Z') },
+    }),
+  );
 }
 
 beforeEach(() => {
@@ -246,204 +345,6 @@ describe('isPassableEnvName', () => {
       expect(isPassableEnvName(name)).toBe(false);
     },
   );
-});
-
-describe('helperRunArgs', () => {
-  it('builds the docker run arguments', () => {
-    expect(
-      helperRunArgs({
-        tag: 'devenv-helper:abc',
-        volumeName: 'devenv-acme-api-3f2a9c1e',
-        socketPath: '/var/run/docker.sock',
-        containerName: 'devenv-helper-1',
-        env: { HOME: '/Users/me' },
-        secrets: true,
-        command: ['git', 'status'],
-      }),
-    ).toEqual([
-      'run',
-      '--rm',
-      '-i',
-      '--pull',
-      'never',
-      '--name',
-      'devenv-helper-1',
-      '--label',
-      'nimblescape.devenv.helper-run=true',
-      '--mount',
-      'type=volume,source=devenv-acme-api-3f2a9c1e,target=/workspaces',
-      '--mount',
-      'type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock',
-      '--mount',
-      'type=volume,source=devenv-helper-cache,target=/devenv-cache',
-      '--tmpfs',
-      '/run/devenv-secrets:rw,noexec,nosuid,nodev,size=1m,mode=0700',
-      '-e',
-      'HOME=/Users/me',
-      'devenv-helper:abc',
-      'git',
-      'status',
-    ]);
-  });
-
-  it('leaves out the Docker socket and the cache volume, and the network when asked', () => {
-    const args = helperRunArgs({
-      tag: 'devenv-helper:abc',
-      volumeName: 'vol',
-      socketPath: '/var/run/docker.sock',
-      containerName: 'n',
-      env: {},
-      secrets: false,
-      docker: false,
-      network: false,
-      command: ['git', 'status'],
-    });
-    expect(args).toEqual([
-      'run',
-      '--rm',
-      '-i',
-      '--pull',
-      'never',
-      '--name',
-      'n',
-      '--label',
-      'nimblescape.devenv.helper-run=true',
-      '--mount',
-      'type=volume,source=vol,target=/workspaces',
-      '--network',
-      'none',
-      'devenv-helper:abc',
-      'git',
-      'status',
-    ]);
-  });
-
-  it('hides the configuration folder of the volume with an empty tmpfs when asked, and only then', () => {
-    const spec = {
-      tag: 'devenv-helper:abc',
-      volumeName: 'vol',
-      socketPath: '/var/run/docker.sock',
-      containerName: 'n',
-      env: {},
-      secrets: false,
-      docker: false,
-      network: false,
-      command: ['node'],
-    };
-    expect(helperRunArgs({ ...spec, hideConfigFolder: true })).toEqual([
-      'run',
-      '--rm',
-      '-i',
-      '--pull',
-      'never',
-      '--name',
-      'n',
-      '--label',
-      'nimblescape.devenv.helper-run=true',
-      '--mount',
-      'type=volume,source=vol,target=/workspaces',
-      '--mount',
-      'type=tmpfs,destination=/workspaces/.devenv+',
-      '--network',
-      'none',
-      'devenv-helper:abc',
-      'node',
-    ]);
-    expect(helperRunArgs(spec).join(' ')).not.toContain('tmpfs');
-  });
-
-  it('quotes a mount field with a comma', () => {
-    const args = helperRunArgs({
-      tag: 't',
-      volumeName: 'v',
-      socketPath: '/run/a,b/docker.sock',
-      containerName: 'n',
-      env: {},
-      secrets: false,
-      command: [],
-    });
-    expect(args).toContain('type=bind,"source=/run/a,b/docker.sock",target=/var/run/docker.sock');
-    expect(args).not.toContain('--tmpfs');
-  });
-});
-
-describe('WorkspaceHelper.run', () => {
-  it('builds the helper image once, then runs the command with the helper arguments', async () => {
-    const helper = createHelper({ DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, 'linux');
-    docker.handler = () => ({ stdout: 'ok\n' });
-    const output: string[] = [];
-    const result = await helper.run('vol', ['echo', 'ok'], { env: { HOME: '/home/me' }, onOutput: (text) => output.push(text) });
-    await helper.run('vol', ['true']);
-
-    expect(result.stdout).toBe('ok\n');
-    expect(output).toContain('ok\n');
-    expect(docker.builds).toHaveLength(1);
-    expect(docker.builds[0].tag).toBe(TAG);
-    const args = docker.runs[0].args;
-    expect(args.slice(0, 5)).toEqual(['run', '--rm', '-i', '--pull', 'never']);
-    expect(args[args.indexOf('--name') + 1]).toMatch(/^devenv-helper-[0-9a-f]{12}$/);
-    expect(args).toContain('type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock');
-    expect(args).toContain('HOME=/home/me');
-    expect(args).not.toContain('--tmpfs');
-    expect(args.join(' ')).not.toContain('DOCKER_HOST');
-    expect(commandOf(args)).toEqual(['echo', 'ok']);
-    // Each run gets its own container name.
-    expect(docker.runs[1].args[docker.runs[1].args.indexOf('--name') + 1]).not.toBe(args[args.indexOf('--name') + 1]);
-  });
-
-  it('does not pass reserved variables, and no variables at all to a run with credentials', async () => {
-    const helper = createHelper();
-    await helper.run('vol', ['true'], { env: { PATH: '/x', DOCKER_HOST: 'tcp://x', HOME: '/h' } });
-    expect(docker.runs[0].args.filter((arg) => arg.includes('='))).toContain('HOME=/h');
-    expect(docker.runs[0].args.join(' ')).not.toMatch(/PATH=|DOCKER_HOST=/);
-    expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('PATH'))).toBe(true);
-
-    await helper.run('vol', ['true'], { env: { HOME: '/h' }, secrets: true, input: 'x' });
-    expect(docker.runs[1].args).toContain('--tmpfs');
-    expect(docker.runs[1].args).not.toContain('-e');
-    expect(docker.runs[1].options.input).toBe('x');
-  });
-
-  it('never logs the values of variables', async () => {
-    const helper = createHelper();
-    await helper.run('vol', ['true'], { env: { API_KEY: 'value-of-the-key' } });
-    expect(logger.lines.join('\n')).toContain('API_KEY');
-    expect(logger.lines.join('\n')).not.toContain('value-of-the-key');
-  });
-
-  it('builds the image again when it was removed, and runs once more', async () => {
-    const helper = createHelper();
-    let first = true;
-    docker.handler = () => {
-      if (first) {
-        first = false;
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}\n` };
-      }
-      return { stdout: 'second\n' };
-    };
-    await helper.ensureImage();
-    docker.images.delete(TAG);
-    const result = await helper.run('vol', ['true']);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe('second\n');
-    expect(docker.builds).toHaveLength(2);
-    expect(docker.runs).toHaveLength(2);
-  });
-
-  it('removes the helper container when the signal aborts', async () => {
-    const helper = createHelper();
-    const controller = new AbortController();
-    docker.handler = (args, options) => {
-      if (args[0] !== 'run') return {};
-      return new Promise((_resolve, reject) => {
-        options.signal?.addEventListener('abort', () => reject(abortError()));
-        setTimeout(() => controller.abort(), 5);
-      });
-    };
-    await expect(helper.run('vol', ['sleep', '60'], { signal: controller.signal })).rejects.toThrow(/cancelled/);
-    const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
-    expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
-  });
 });
 
 describe('WorkspaceHelper.ensureImage', () => {
@@ -543,6 +444,7 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
   });
 
   it('uses the existing image when the registry cannot be reached', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     docker.images.add(TAG);
     const { helper, lookups, state, settled } = setup(async () => 'unreachable');
     expect(await helper.ensureImage()).toBe(TAG);
@@ -550,11 +452,12 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     expect(lookups).toHaveLength(1);
     expect(docker.builds).toHaveLength(0);
     expect(state().images[TAG].checkedAt).toBeUndefined();
-    const result = await helper.run('vol', ['true']);
+    const result = await helperStep(helper);
     expect(result.exitCode).toBe(0);
   });
 
   it('reuses the image for an hour; after that, ensureImage checks again, and the helper runs only record the use', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const { helper, lookups, advance, iso, state, settled } = setup();
     await helper.ensureImage();
     const calls = docker.imageIdCalls;
@@ -563,13 +466,13 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     // A long-lived window: the helper runs of a stop or a delete never check or rebuild.
     // 2026-10-01: the Switch branch command was dropped (user decision).
     advance(HELPER_CHECK_INTERVAL_MS + HELPER_IMAGE_RECHECK_MS);
-    await helper.run('vol', ['true']);
+    await helperStep(helper);
     expect(docker.imageIdCalls).toBe(calls);
     expect(lookups).toHaveLength(1);
     expect(state().images[TAG].lastUsedAt).toBe(iso());
     const used = iso();
     advance(10 * 60 * 1000);
-    await helper.run('vol', ['true']);
+    await helperStep(helper);
     expect(state().images[TAG].lastUsedAt).toBe(used);
 
     // The open pipeline (ensureImage) runs ensureHelperImage again: the weekly check is due.
@@ -613,10 +516,11 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
   }
 
   it('gives the next open of window A the image that window B rebuilt, without a build, after B removed the old image', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const { a, b, statePath } = windows();
     const first = await a.ensureImageUse();
     expect(first).toEqual({ tag: TAG, id: I1 });
-    expect((await a.run('vol', ['true'], { image: first })).exitCode).toBe(0);
+    expect((await helperStep(a, { image: first })).exitCode).toBe(0);
     // Window B rebuilds the tag from a new base image (a check asked for it); the image I1 is gone.
     const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState;
     saved.images[TAG] = { ...saved.images[TAG], baseImage: 'node:22-bookworm-slim', baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B };
@@ -630,11 +534,12 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
     const second = await a.ensureImageUse();
     expect(second).toEqual({ tag: TAG, id: I2 });
     expect(docker.builds).toHaveLength(builds);
-    expect((await a.run('vol', ['true'], { image: second })).exitCode).toBe(0);
+    expect((await helperStep(a, { image: second })).exitCode).toBe(0);
     expect(docker.runs[docker.runs.length - 1].args).toContain(I2);
   });
 
   it('builds the tag again for the next open of window A after a prune removed it', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const { a } = windows();
     expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I1 });
     // docker image prune -a.
@@ -645,17 +550,17 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
     const image = await a.ensureImageUse();
     expect(image).toEqual({ tag: TAG, id: I2 });
     expect(docker.builds).toHaveLength(2);
-    expect((await a.run('vol', ['true'], { image })).exitCode).toBe(0);
+    expect((await helperStep(a, { image })).exitCode).toBe(0);
   });
 
-  it('resets the cache of the window when a pinned run finds its image gone, and keeps it when Docker cannot answer the check', async () => {
+  it('resets the cache of the window when its image is gone, and keeps it when Docker cannot answer the check', async () => {
     const { a } = windows();
-    const image = await a.ensureImageUse();
-    const cache = a as unknown as { imagePromise: unknown };
+    await a.ensureImageUse();
     // Another window moved the tag; the pinned image of this open is gone.
     docker.ids.set(TAG, I2);
-    await expect(a.run('vol', ['true'], { image })).rejects.toMatchObject({ code: 'helperFailed' });
-    expect(cache.imagePromise).toBeUndefined();
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it the reset of the cache by a
+    // pinned run that found its image gone (a batch helper with that image cannot be started, the step is refused). Changed
+    // expectation: the next open finds the moved tag by the check of its cached image and resolves the new image.
     expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
 
     // Docker does not answer the check of the cached image: the cache stays.
@@ -669,20 +574,6 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
     expect(docker.imageIdCalls).toBe(calls);
     expect(docker.builds).toHaveLength(1);
     expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} could not be checked`);
-  });
-
-  it('keeps a newer cache of the window when a pinned run of an older open finds its image gone (review round 20 of PR #64, B-R20-4)', async () => {
-    const { a } = windows();
-    const old = await a.ensureImageUse();
-    // Another window moved the tag; the next open of this window resolves the new image.
-    docker.ids.set(TAG, I2);
-    expect(await a.ensureImageUse()).toEqual({ tag: TAG, id: I2 });
-    const cache = a as unknown as { imagePromise: unknown };
-    const held = cache.imagePromise;
-    expect(held).toBeDefined();
-    // The older open still pins I1, which is gone: it fails, and the cache of the window (I2) stays.
-    await expect(a.run('vol', ['true'], { image: old })).rejects.toMatchObject({ code: 'helperFailed' });
-    expect(cache.imagePromise).toBe(held);
   });
 
   it('awaits the new cache when it was replaced during the check', async () => {
@@ -902,6 +793,7 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
   const references = (from = 0) => docker.runs.slice(from).map((run) => run.args.find((arg) => arg.startsWith('sha256:') || arg.startsWith('devenv-helper:')));
 
   it('fails with helperFailed when the current tag cannot be built, never runs an older helper image, and builds the tag again at the next ensureImage', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     // user decision 2026-09-29: no previous helper image. Changed expectation: before, the older helper image of this
     // installation was returned and the helper runs used it by its image ID.
     const { helper, advance } = setup();
@@ -909,7 +801,7 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     const error = await helper.ensureImageUse().catch((e: unknown) => e);
     expect(error).toMatchObject({ code: 'helperFailed' });
     expect((error as UserFacingError).message).toBe('The workspace helper could not be prepared.');
-    await expect(helper.run('vol', ['true'])).rejects.toMatchObject({ code: 'helperFailed' });
+    await expect(helperStep(helper)).rejects.toMatchObject({ code: 'helperFailed' });
     expect(docker.runs).toEqual([]);
     expect(logger.lines.join('\n')).not.toContain('previous helper');
 
@@ -917,11 +809,14 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     docker.buildHandler = async () => undefined;
     advance(60_000);
     expect(await helper.ensureImageUse()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
-    await helper.run('vol', ['true']);
-    expect(references()).toEqual([TAG]);
+    await helperStep(helper);
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step runs in a
+    // batch helper, which is started with the image ID of the current tag (was: the tag).
+    expect(references()).toEqual([fakeImageId(TAG)]);
   });
 
   it('fails with helperFailed without a build when the current image of an open is gone at a run (review round 2 of PR #64, A-N1; review round 3 of PR #64, P2)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const { helper } = setup();
     // Review round 3 of PR #64 (P2): the open pins the current tag by the ID of its image.
     const image = await helper.ensureImageUse();
@@ -929,47 +824,48 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     // Changed expectation (review round 3 of PR #64, P2): before, the same tag was built again and the run went on with
     // it; a pinned run now uses the image ID, and when that image is gone the open ends with helperFailed: nothing is
     // built (a build may give another image).
-    docker.handler = (args) => {
-      if (args.includes(fakeImageId(TAG))) {
-        docker.images.delete(TAG);
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${fakeImageId(TAG)}.\n` };
-      }
-      return {};
-    };
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the batch helper of
+    // the open is started with the pinned image ID and cannot be started when that image is gone (the worker's
+    // `docker run --pull never` fails), so the step is refused (helperFailed, D1); nothing is built, and no other image is
+    // used (was: the per-step `docker run` failed with "No such image" and logged it).
+    docker.images.delete(TAG);
+    const lock = new BridgeLock();
+    lock.openError = new Error(`docker: Error response from daemon: No such image: ${fakeImageId(TAG)}`);
     const builds = docker.builds.length;
     const runs = docker.runs.length;
-    const error = await helper.run('vol', ['true'], { image }).catch((e: unknown) => e);
+    const error = await helperStep(helper, { image, lock }).catch((e: unknown) => e);
     expect(error).toMatchObject({ code: 'helperFailed' });
-    expect((error as UserFacingError).detail).toBe(`No such image: ${fakeImageId(TAG)}`);
-    expect(docker.runs).toHaveLength(runs + 1);
+    expect((error as UserFacingError).detail).toContain(`No such image: ${fakeImageId(TAG)}`);
+    expect(lock.opens).toEqual([fakeImageId(TAG)]);
+    expect(docker.runs).toHaveLength(runs);
     expect(docker.builds).toHaveLength(builds);
-    // user decision 2026-09-29: no previous helper image. Changed expectation: the check that no older helper image is
-    // run now covers every image other than the pinned one.
-    expect(references(runs)).toEqual([fakeImageId(TAG)]);
-    expect(logger.lines).toContain(
-      `warn The workspace helper image ${TAG} (${fakeImageId(TAG).slice(0, 19)}) that this open uses was removed. The open cannot go on with another helper image.`,
-    );
     expect(logger.lines.join('\n')).not.toContain('It is built again');
   });
 
   it('keeps the runs of an open on the image ID of its current tag when another window rebuilds the tag in the middle of the open (review round 3 of PR #64, P2)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const { helper } = setup();
     const image = await helper.ensureImageUse();
     expect(image.id).toBe(fakeImageId(TAG));
-    await helper.run('vol', ['true'], { image });
+    await helperStep(helper, { image });
     // Another window rebuilds the tag (--pull --no-cache): the tag points to another image now.
     const rebuilt = `sha256:${'7'.repeat(64)}`;
     docker.ids.set(TAG, rebuilt);
-    await helper.run('vol', ['true'], { image });
-    await helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
+    await helperStep(helper, { image });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the volume steps run in a batch scope.
+    await batched(helper).prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
     expect(references()).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
-    // A run outside an open uses the tag, whatever image it has now.
-    await helper.run('vol', ['true']);
-    expect(docker.runs[docker.runs.length - 1].args).toContain(TAG);
-    expect(docker.runs[docker.runs.length - 1].args).not.toContain(rebuilt);
+    // Plan step 7 (user decision of 2026-10-01): changed expectation (was: a run outside an open uses the tag): a step
+    // outside an open (Delete's check, the picker) runs after the ensure of withEnvironmentLock (ensureImagePresent),
+    // with the image that the tag has now, by its ID.
+    await helper.ensureImagePresent();
+    await helperStep(helper);
+    expect(docker.runs[docker.runs.length - 1].args).toContain(rebuilt);
+    expect(docker.runs[docker.runs.length - 1].args).not.toContain(fakeImageId(TAG));
   });
 
   it('pins the image that the ensure of the open awaited when the cache of the window is replaced while it is pending (review round 3 of PR #64, P1)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     // user decision 2026-09-29: no previous helper image. Changed expectation: before, the open was offline and pinned the
     // previous helper; now the pending ensure of the open builds the current tag while a helper run of another Docker
     // engine replaces the cache, and the open still gets the image that its ensure built.
@@ -988,7 +884,7 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
     // A helper run for another engine replaces the cache while the build of the open still runs.
     engineKey = 'ssh://build-box';
-    const other = helper.run('vol', ['true']).catch((e: unknown) => e);
+    const other = helperStep(helper).catch((e: unknown) => e);
     await vi.waitFor(() => expect(docker.runs.length).toBeGreaterThan(0));
     release();
     const image = await pending;
@@ -996,14 +892,14 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     await other;
     engineKey = '';
     const before = docker.runs.length;
-    await helper.run('vol', ['true'], { image });
+    await helperStep(helper, { image });
     expect(references(before)).toEqual([fakeImageId(TAG)]);
   });
 
   describe('every public method runs the helper image of the open that it gets as `image` (review round 3 of PR #64, P7)', () => {
     const OVERRIDE = { image: 'devenv-x:1' };
     const cases: Array<[string, (helper: WorkspaceHelper, image: HelperImageUse) => Promise<unknown>]> = [
-      ['run', (helper, image) => helper.run('vol', ['true'], { image })],
+      ['run', (helper, image) => helperStep(helper, { image })],
       ['clone', (helper, image) => helper.clone({ volumeName: 'vol', repository: 'o/a', token: TOKEN, image })],
       ['readConfigFiles', (helper, image) => helper.readConfigFiles({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', image })],
       ['listConfigurations', (helper, image) => helper.listConfigurations({ volumeName: 'vol', repository: 'o/a', image })],
@@ -1030,7 +926,8 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
         (helper, image) => helper.runUserCommands({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', containerId: 'c'.repeat(64), token: TOKEN, image }),
       ],
       ['prepareGit', (helper, image) => helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image })],
-      ['fixConfigOwnership', (helper, image) => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv', uid: '1000', gid: '1000', image })],
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the batch step ownershipFix takes CONFIG_FOLDER only (was: /workspaces/.devenv).
+      ['fixConfigOwnership', (helper, image) => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1000', image })],
     ];
 
     it.each(cases)('%s', async (_name, call) => {
@@ -1048,7 +945,8 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
         return { stdout: '{"outcome":"success","containerId":"cccc","configuration":{},"services":{}}\n' };
       };
       const before = docker.runs.length;
-      await call(helper, pinned).catch(() => undefined);
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the call runs in a batch scope.
+      await call(batched(helper), pinned).catch(() => undefined);
       const used = references(before);
       expect(used.length).toBeGreaterThan(0);
       expect(used.every((reference) => reference === fakeImageId(TAG))).toBe(true);
@@ -1095,12 +993,13 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
   }
 
   it('builds a missing tag once: an open that starts during the prebuild waits for it and does not build again', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const helper = stateHelper();
     const gate = blockingBuild();
     const pre = helper.prebuildImage({ signal: new AbortController().signal });
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
     const open = helper.ensureImageUse();
-    const run = helper.run('vol', ['true']);
+    const run = helperStep(helper);
     gate.release();
     expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(await open).toEqual({ tag: TAG, id: fakeImageId(TAG) });
@@ -1196,12 +1095,13 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
   });
 
   it('R16-2: a helper run that joined the build of an open that is cancelled builds for itself', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const helper = stateHelper();
     blockingBuild();
     const a = new AbortController();
     const openA = helper.ensureImageUse({ signal: a.signal }).catch((e: unknown) => e);
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
-    const run = helper.run('vol', ['true']);
+    const run = helperStep(helper);
     docker.buildHandler = async () => undefined;
     a.abort();
     expect(await openA).toMatchObject({ name: 'AbortError' });
@@ -1218,10 +1118,11 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     ];
 
     it.each(cases)('pinned run: %s is the result of the run', async (_name, failure) => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       const use = await helper.ensureImageUse();
       docker.handler = (args) => (args[0] === 'run' ? failure : {});
-      const result = await helper.run('vol', ['true'], { image: use });
+      const result = await helperStep(helper, { image: use });
       expect(result).toMatchObject(failure);
       expect(docker.runs).toHaveLength(1);
       // The cache of the window is kept: the next open reuses the image without a build.
@@ -1231,34 +1132,15 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     });
 
     it.each(cases)('unpinned run: %s is the result of the run, which is not run again', async (_name, failure) => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       await helper.ensureImageUse();
       docker.handler = (args) => (args[0] === 'run' ? failure : {});
-      const result = await helper.run('vol', ['true']);
+      const result = await helperStep(helper);
       expect(result).toMatchObject(failure);
       expect(docker.runs).toHaveLength(1);
       expect(logger.lines.join('\n')).not.toContain('It is built again');
     });
-  });
-
-  it('a helper run outside an open builds a removed image again without the maintenance of an open (review round 20 of PR #64, B-R20-5f)', async () => {
-    const helper = stateHelper();
-    let first = true;
-    docker.handler = (args) => {
-      if (args[0] !== 'run') return {};
-      if (first) {
-        first = false;
-        // docker image prune -a between the ensure and the run.
-        docker.images.delete(TAG);
-        return { exitCode: 125, stderr: `docker: Error response from daemon: No such image: ${TAG}\n` };
-      }
-      return {};
-    };
-    expect((await helper.run('vol', ['true'])).exitCode).toBe(0);
-    expect(docker.builds).toHaveLength(2);
-    expect(docker.runs).toHaveLength(2);
-    // No cleanup of old helper images (only an open maintains).
-    expect(docker.listCalls).toBe(0);
   });
 
   // Changed expectation (Plan step 6, PR D: the prebuild runs on every engine): this was "builds nothing when the Docker
@@ -1643,6 +1525,7 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     // Review round 21 of PR #64 (B-R21-1): the abort of an open that waits for the build of a helper run (here the
     // prebuild) keeps that still-running build in the cache, so a helper run that starts before it ends joins it.
     it('an open that cancels its wait keeps the running prebuild in the cache; a later helper run joins it', async () => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       const gate = blockingBuild();
       const pre = helper.prebuildImage({ signal: new AbortController().signal });
@@ -1653,7 +1536,7 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
       await vi.waitFor(() => expect(waits).toBe(true));
       controller.abort();
       await expect(open).rejects.toMatchObject({ name: 'AbortError' });
-      const run = helper.run('vol', ['true']);
+      const run = helperStep(helper);
       await new Promise((resolve) => setTimeout(resolve, 20));
       // The run waits for the build of the prebuild; it starts no build of its own (checked before the release, which a
       // second build would replace).
@@ -1666,13 +1549,14 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     });
 
     it('a helper run that waits for the prebuild ends at once when its signal aborts, without a docker run', async () => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       const gate = blockingBuild();
       const pre = helper.prebuildImage({ signal: new AbortController().signal });
       await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
       const controller = new AbortController();
       let runError: unknown;
-      const run = helper.run('vol', ['true'], { signal: controller.signal }).catch((error: unknown) => (runError = error));
+      const run = helperStep(helper, { signal: controller.signal }).catch((error: unknown) => (runError = error));
       // The run waits for the build now (the engine is known at once).
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(runError).toBeUndefined();
@@ -1687,12 +1571,13 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     });
 
     it('a caller whose signal was aborted before it joins ends at once', async () => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       const gate = blockingBuild();
       const pre = helper.prebuildImage({ signal: new AbortController().signal });
       await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
       await expect(helper.ensureImageUse({ signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
-      await expect(helper.run('vol', ['true'], { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(helperStep(helper, { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
       gate.release();
       expect(await pre).toEqual({ tag: TAG, id: fakeImageId(TAG) });
       expect(docker.builds).toHaveLength(1);
@@ -1814,12 +1699,13 @@ describe('WorkspaceHelper.prebuildImage and HelperPrebuild (background prebuild,
     });
 
     it('a helper run that joined the prebuild leaves no abort listener on its signal', async () => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
       const helper = stateHelper();
       const gate = blockingBuild();
       const pre = helper.prebuildImage({ signal: new AbortController().signal });
       await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
       const controller = new AbortController();
-      const run = helper.run('vol', ['true'], { signal: controller.signal });
+      const run = helperStep(helper, { signal: controller.signal });
       await new Promise((resolve) => setTimeout(resolve, 20));
       gate.release();
       await pre;
@@ -1888,9 +1774,10 @@ describe('WorkspaceHelper helper runs in a new window (implementation notes 7)',
 
   // 2026-10-01: the Switch branch command was dropped (user decision).
   it('never checks, rebuilds, or cleans up in the first helper run (a stop, a delete)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const w = newWindow();
     w.overdue();
-    const result = await w.helper.run('vol', ['true'], { docker: false, network: false });
+    const result = await helperStep(w.helper);
     expect(result.exitCode).toBe(0);
     await w.settled();
     expect(docker.runs).toHaveLength(1);
@@ -1915,10 +1802,11 @@ describe('WorkspaceHelper helper runs in a new window (implementation notes 7)',
   });
 
   it('builds a missing tag once in the first helper run, and the open pipeline then maintains without a second build', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const w = newWindow();
     let release: () => void = () => undefined;
     docker.buildHandler = () => new Promise<void>((resolve) => (release = resolve));
-    const run = w.helper.run('vol', ['true'], { docker: false, network: false });
+    const run = helperStep(w.helper);
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
     const ensured = w.helper.ensureImage();
     release();
@@ -1939,7 +1827,9 @@ describe('WorkspaceHelper.clone', () => {
     expect(run.options.input).toBe(TOKEN);
     expect(run.args.some((arg) => arg.includes(TOKEN))).toBe(false);
     expect(run.options.env).toBeUndefined();
-    expect(run.args).toContain('--tmpfs');
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the token is the secret of the step (the input of the clone in the batch helper,
+    // which keeps it in its own tmpfs); the per-step tmpfs mount is gone.
+    expect(bridge.kinds).toEqual(['clone']);
     expect(run.args).not.toContain('-e');
     expect(commandOf(run.args)).toEqual(['sh', '-c', CLONE_SCRIPT, 'sh', 'acme/api', 'api', 'dev']);
     expect(logger.lines.join('\n')).not.toContain(TOKEN);
@@ -1979,15 +1869,14 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
 
   // unit 15: prepareGit gets no token any more (the token goes into the memory of the dev container after its start,
   // writeContainerToken, tested in containerToken.test.ts): no stdin, no tmpfs, and no login argument.
-  it('runs without the token, without the Docker socket, and without network', async () => {
+  it('runs without the token, as the step gitFiles', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step gitFiles of the batch helper (root, as before; the
+    // per-step mounts and `--network none` are gone, Q2 of 2026-10-01); still no token, no input and no variable.
     await createHelper().prepareGit({ volumeName: 'vol', repository: 'acme/api', identity });
     const run = docker.runs[0];
+    expect(bridge.kinds).toEqual(['gitFiles']);
     expect(run.options.input).toBeUndefined();
-    expect(run.args).not.toContain('--tmpfs');
     expect(run.args).not.toContain('-e');
-    expect(run.args).not.toContain(`type=bind,source=${DOCKER_SOCKET},target=${DOCKER_SOCKET}`);
-    expect(run.args.join(' ')).not.toContain('devenv-helper-cache');
-    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
     expect(commandOf(run.args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
   });
 
@@ -2012,7 +1901,9 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
 // Greenfield (user decision 2026-09-27): removeGitToken, which ran this test, is gone; the time limit of a helper run
 // stays (fixConfigOwnership).
 describe('WorkspaceHelper helper run with a time limit', () => {
-  it('ends the helper run after the time limit and removes its container', async () => {
+  it('ends the helper run after the time limit', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the batch helper ends the step at its time limit (its
+    // process group); there is no per-step container to remove (was: `docker rm -f` of the helper container).
     let started!: () => void;
     const running = new Promise<void>((resolve) => (started = resolve));
     docker.handler = (args, options) => {
@@ -2029,8 +1920,7 @@ describe('WorkspaceHelper helper run with a time limit', () => {
       const error = await caught;
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toMatch(/did not end within 30 seconds/);
-      const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
-      expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+      expect(bridge.kinds).toEqual(['ownershipFix']);
     } finally {
       vi.useRealTimers();
     }
@@ -2038,16 +1928,15 @@ describe('WorkspaceHelper helper run with a time limit', () => {
 });
 
 describe('WorkspaceHelper.fixConfigOwnership (review round 15, K3)', () => {
-  it('fixes the internal folder with numeric IDs, with only the workspace volume: no Docker socket, cache volume, or network', async () => {
+  it('fixes the internal folder with numeric IDs, as the step ownershipFix', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step ownershipFix of the batch helper (was: a per-step run
+    // with only the workspace volume, without the Docker socket, the cache volume and network).
     const result = await createHelper().fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 30_000 });
     expect(result.exitCode).toBe(0);
     expect(docker.runs).toHaveLength(1);
     const run = docker.runs[0];
     expect(commandOf(run.args)).toEqual(configOwnershipFixCommand('/workspaces/.devenv+', '1000', '1001'));
-    expect(run.args.join(' ')).toContain('source=vol,target=/workspaces');
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(run.args).toEqual(expect.arrayContaining(['--network', 'none']));
-    expect(run.args).not.toContain('--tmpfs');
+    expect(bridge.kinds).toEqual(['ownershipFix']);
     expect(run.args).not.toContain('-e');
   });
 
@@ -2128,58 +2017,8 @@ describe('WorkspaceHelper file and Git queries', () => {
 });
 
 describe('Docker access of the helper runs', () => {
-  it('runs Git and the file scripts without the Docker socket and the cache volume', async () => {
-    const helper = createHelper();
-    docker.handler = (args) => {
-      const script = commandOf(args)[2];
-      if (script === GIT_SUMMARY_SCRIPT) return { stdout: 'main\n0\n0\n0\n' };
-      if (script === READ_FILES_SCRIPT) return { stdout: 'null\n' };
-      if (script === LIST_CONFIGS_SCRIPT) return { stdout: '[]\n' };
-      return {};
-    };
-    await helper.gitSummary({ volumeName: 'vol', repository: 'acme/api' });
-    await helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json' });
-    await helper.listConfigurations({ volumeName: 'vol', repository: 'acme/api' });
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its helper run is gone.
-    await helper.clone({ volumeName: 'vol', repository: 'acme/api', token: TOKEN });
-
-    const [summary, readFiles, listConfigs, clone] = docker.runs.map((run) => run.args);
-    for (const args of [summary, readFiles, listConfigs, clone]) {
-      expect(hasDockerAccess(args)).toBe(false);
-      expect(args).toContain('type=volume,source=vol,target=/workspaces');
-    }
-    // Only the runs that fetch or clone have network.
-    expect([summary, readFiles, listConfigs].every(hasNoNetwork)).toBe(true);
-    expect([clone].some(hasNoNetwork)).toBe(false);
-  });
-
-  // Unit 7: on a remote host the source of the socket mount is a path of that computer.
-  it('mounts the socket of the engine of the operation (remote rootful, remote rootless, local)', async () => {
-    let engine: HelperEngine = { key: 'box', socket: '/var/run/docker.sock' };
-    const helper = new WorkspaceHelper({
-      docker,
-      logger,
-      dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: { DOCKER_HOST: 'unix:///run/user/1000/docker.sock' },
-      platform: 'linux',
-      engine: async () => engine,
-    });
-    docker.handler = () => ({ stdout: '{"configuration":{}}\n' });
-    const read = () =>
-      helper.readConfiguration({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', environmentId: 'e' });
-    await read();
-    engine = { key: 'box', socket: '/run/user/1001/docker.sock' };
-    await read();
-    engine = { key: '', endpoint: 'unix:///run/user/1000/docker.sock' };
-    await read();
-    const sockets = docker.runs.map((run) => run.args.find((arg) => arg.includes('target=/var/run/docker.sock')));
-    expect(sockets).toEqual([
-      'type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock',
-      'type=bind,source=/run/user/1001/docker.sock,target=/var/run/docker.sock',
-      'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
-    ]);
-  });
-
+  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it the tests of the mounts of the
+  // per-step runs (the socket of the engine for the batch helper: batchScope.test.ts, B-R1-7).
   it('does not reuse the helper image of another engine (the Docker context changed)', async () => {
     let engine: HelperEngine = { key: '' };
     const statePath = path.join(dir, 'helper.json');
@@ -2203,28 +2042,6 @@ describe('Docker access of the helper runs', () => {
     // The same engine again: reused.
     await helper.ensureImage();
     expect(docker.builds).toHaveLength(2);
-  });
-
-  it('gives the runs of the Dev Container CLI the Docker socket and the cache volume', async () => {
-    const helper = createHelper();
-    docker.handler = (args) =>
-      commandOf(args)[0] === 'devcontainer'
-        ? { stdout: '{"configuration":{}}\n' }
-        : { stdout: '{"outcome":"success","containerId":"c1","imageName":"i:1"}\n' };
-    await helper.readConfiguration({
-      volumeName: 'vol',
-      repository: 'acme/api',
-      configPath: '.devcontainer.json',
-      environmentId: 'e',
-    });
-    await helper.build({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json', imageName: 'i:1' });
-    await helper.up({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', removeExistingContainer: false });
-
-    expect(docker.runs).toHaveLength(3);
-    for (const run of docker.runs) {
-      expect(hasDockerAccess(run.args)).toBe(true);
-      expect(hasNoNetwork(run.args)).toBe(false);
-    }
   });
 });
 
@@ -2300,7 +2117,8 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       vi.useRealTimers();
     });
 
-    it('stops the read with the merged configuration after the time limit, removes its container, and reads without it', async () => {
+    it('stops the read with the merged configuration after the time limit, and reads without it', async () => {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the batch helper ends the step (no per-step container to remove).
       const started = hangingMergedRead();
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       const result = read();
@@ -2311,9 +2129,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       await expect(result).resolves.toEqual({ config: { image: 'node:22' } });
       expect(docker.runs).toHaveLength(2);
       expect(docker.runs[1].args).not.toContain('--include-merged-configuration');
-      const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
-      expect(name).toMatch(/^devenv-helper-/);
-      expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+      expect(bridge.kinds).toEqual(['readConfiguration', 'readConfiguration']);
       expect(logger.lines.some((line) => line.startsWith('warn') && line.includes('merged configuration') && line.includes('10 seconds'))).toBe(true);
     });
 
@@ -2325,8 +2141,9 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       controller.abort();
       await expect(result).rejects.toThrow(/cancelled/);
       expect(docker.runs).toHaveLength(1);
-      const name = docker.runs[0].args[docker.runs[0].args.indexOf('--name') + 1];
-      expect(docker.calls.map((call) => call.args)).toContainEqual(['rm', '-f', name]);
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the cancel ends the step in the batch helper (no per-step
+      // container to remove); its signal aborted.
+      expect(docker.runs[0].options.signal?.aborted).toBe(true);
     });
 
     it('reads without the merged configuration and without a time limit when the caller does not need it', async () => {
@@ -2465,11 +2282,12 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       repository: 'acme/api',
       override,
       environmentId: '3f2a9c1e-5b7d',
-      containerId: 'c1',
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the batch step takes a Docker container ID (12 to 64 hex digits; was: 'c1').
+      containerId: 'c1c1c1c1c1c1',
       // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
       token: TOKEN,
     });
-    expect(result).toMatchObject({ outcome: 'success', containerId: 'c1' });
+    expect(result).toMatchObject({ outcome: 'success', containerId: 'c1c1c1c1c1c1' });
     // The token is only redacted: it is no argument, variable, or input of the helper.
     expect(JSON.stringify(docker.calls)).not.toContain(TOKEN);
     const run = docker.runs[0];
@@ -2489,7 +2307,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       '--id-label',
       'nimblescape.devenv.environment-id=3f2a9c1e-5b7d',
       '--container-id',
-      'c1',
+      'c1c1c1c1c1c1',
       '--user-data-folder',
       '/devenv-cache',
       '--skip-post-attach',
@@ -2513,29 +2331,31 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
 describe('WorkspaceHelper Docker Compose runs', () => {
   const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: 'devenv-3f2a9c1e', services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {}, inputsHash: 'abc' };
 
-  it('composeModel runs the model script without the Docker socket, network, and the configuration folder, with the project name', async () => {
+  it('composeModel runs the model script as the owner of the repository, with the project name', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step composeModel of the batch helper runs as the owner of the
+    // repository, with CONFIG_FOLDER closed (was: a per-step run without the socket and network, with a tmpfs over it).
     docker.handler = () => ({ stdout: `${JSON.stringify(MODEL_OUTPUT)}\n` });
     const files = ['/workspaces/api/.devcontainer/compose.yml'];
     const result = await createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: 'devenv-3f2a9c1e' });
     expect(result).toEqual(MODEL_OUTPUT);
     const run = docker.runs[0];
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(hasNoNetwork(run.args)).toBe(true);
-    expect(run.args).toContain('type=tmpfs,destination=/workspaces/.devenv+');
+    expect(bridge.kinds).toEqual(['composeModel']);
+    expect(batchStepCommand('composeModel', { repository: 'acme/api', files, project: 'devenv-3f2a9c1e' }).owner).toBe('/workspaces/api');
     expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
     expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT, '/workspaces/api', ...files]);
     expect(COMPOSE_MODEL_TIMEOUT_MS).toBe(60_000);
   });
 
-  it('composeServiceHashes (recreate offer, review round 2): the hash script on the model at the path of up, without the Docker socket and network', async () => {
+  it('composeServiceHashes (recreate offer, review round 2): the hash script on the model at the path of up', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step composeHash of the batch helper (was: a per-step run
+    // without the socket and network).
     const hash = 'c'.repeat(64);
     docker.handler = () => ({ stdout: `app ${hash}\ndb ${hash}\n` });
     const hashes = await createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{"services":{}}', project: 'devenv-3f2a9c1e' });
     expect(docker.runs[0].options.input).toBe('{"services":{}}');
     expect(hashes).toEqual(new Map([['app', hash], ['db', hash]]));
     const run = docker.runs[0];
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(hasNoNetwork(run.args)).toBe(true);
+    expect(bridge.kinds).toEqual(['composeHash']);
     expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
     expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_HASH_SCRIPT, COMPOSE_MODEL_PATH, 'devenv-3f2a9c1e']);
     docker.handler = () => ({ exitCode: 1, stderr: 'unknown flag: --hash' });
@@ -2560,14 +2380,15 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     expect(docker.calls).toHaveLength(0);
   });
 
-  it('createRepositoryFolders runs its script without the Docker socket, network, and the configuration folder (review round 8, P8-2)', async () => {
+  it('createRepositoryFolders runs its script as the owner of the repository (review round 8, P8-2)', async () => {
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step createFolders of the batch helper runs as the owner of the
+    // repository, with CONFIG_FOLDER closed (was: a per-step run without the socket and network, with a tmpfs over it).
     docker.handler = () => ({ stdout: '' });
     const folders = ['/workspaces/api/data/postgres', '/workspaces/api/logs'];
     await createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders });
     const run = docker.runs[0];
-    expect(hasDockerAccess(run.args)).toBe(false);
-    expect(hasNoNetwork(run.args)).toBe(true);
-    expect(run.args).toContain('type=tmpfs,destination=/workspaces/.devenv+');
+    expect(bridge.kinds).toEqual(['createFolders']);
+    expect(batchStepCommand('createFolders', { repository: 'acme/api', folders }).owner).toBe('/workspaces/api');
     expect(commandOf(run.args)).toEqual(['node', '-e', CREATE_FOLDERS_SCRIPT, '/workspaces/api', ...folders]);
     docker.handler = () => ({ exitCode: 2, stderr: '/workspaces/api/out leads out of the repository' });
     await expect(createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders })).rejects.toBeInstanceOf(CommandError);
@@ -2597,7 +2418,9 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     });
     expect(result).toEqual({ config: { service: 'app' } });
     const run = docker.runs[0];
-    expect(hasDockerAccess(run.args)).toBe(true);
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step readConfiguration of the batch helper (root, with the
+    // socket of the helper; was: a per-step run with the socket and the cache volume mounted).
+    expect(bridge.kinds).toEqual(['readConfiguration']);
     expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
     expect(commandOf(run.args)).toEqual([
       'node',
@@ -2686,7 +2509,8 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       repository: 'acme/api',
       override,
       environmentId: '3f2a9c1e-5b7d',
-      containerId: 'c1',
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the batch step takes a Docker container ID (12 to 64 hex digits; was: 'c1').
+      containerId: 'c1c1c1c1c1c1',
       files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
       env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
       // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
@@ -2704,7 +2528,7 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       '--id-label',
       'nimblescape.devenv.environment-id=3f2a9c1e-5b7d',
       '--container-id',
-      'c1',
+      'c1c1c1c1c1c1',
       '--user-data-folder',
       '/devenv-cache',
       '--skip-post-attach',
@@ -3221,4 +3045,41 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
       expect(docker.images.has(TAG)).toBe(false);
     },
   );
+});
+
+describe('plan step 7 (user decision of 2026-10-01): no volume step outside the batch scope of an operation', () => {
+  it('every volume step outside a scope throws an internal error (D1) and starts no container, builds nothing, and runs nothing', async () => {
+    const helper = new WorkspaceHelper({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux' });
+    const OVERRIDE = { image: 'devenv-x:1' };
+    const calls: Array<[string, () => Promise<unknown>]> = [
+      ['clone', () => helper.clone({ volumeName: 'vol', repository: 'o/a', token: TOKEN })],
+      ['readConfigFiles', () => helper.readConfigFiles({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json' })],
+      ['listConfigurations', () => helper.listConfigurations({ volumeName: 'vol', repository: 'o/a' })],
+      ['readConfiguration', () => helper.readConfiguration({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', environmentId: 'e' })],
+      ['build', () => helper.build({ volumeName: 'vol', repository: 'o/a', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1' })],
+      ['composeModel', () => helper.composeModel({ volumeName: 'vol', repository: 'o/a', files: ['/workspaces/a/compose.yaml'], project: 'p' })],
+      ['composeServiceHashes', () => helper.composeServiceHashes({ volumeName: 'vol', repository: 'o/a', model: '{}', project: 'p' })],
+      ['createRepositoryFolders', () => helper.createRepositoryFolders({ volumeName: 'vol', repository: 'o/a', folders: ['/workspaces/a/data'] })],
+      ['up', () => helper.up({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', removeExistingContainer: false })],
+      ['runUserCommands', () => helper.runUserCommands({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', containerId: 'c'.repeat(64), token: TOKEN })],
+      ['prepareGit', () => helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' } })],
+      ['fixConfigOwnership', () => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' })],
+      ['gitSummary', () => helper.gitSummary({ volumeName: 'vol', repository: 'o/a' })],
+    ];
+    for (const [name, call] of calls) {
+      const error = await call().then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(error, name).toBeInstanceOf(Error);
+      expect((error as Error).message, name).toMatch(/^Internal error: the workspace helper step \w+ \(.*\) on the volume vol ran outside the batch helper of an operation; it was not run\.$/s);
+      expect((error as Error).message, name).not.toContain(TOKEN);
+      expect(isUserFacingError(error), name).toBe(false);
+    }
+    expect(docker.calls).toEqual([]);
+    expect(docker.builds).toEqual([]);
+    // (readConfiguration reads once more without the merged configuration after its first read failed.)
+    expect(logger.lines.filter((line) => line.startsWith('error Internal error'))).toHaveLength(calls.length + 1);
+    expect(logger.lines.join('\n')).not.toContain(TOKEN);
+  });
 });

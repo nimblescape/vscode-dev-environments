@@ -4,8 +4,8 @@
 
 // Plan step 6, PR B: the batch helper (src/core/helperChannel/batch.ts), a second ChannelServer in the helper container
 // of one operation, loaded by the worker with the same script (main.ts, startBatchHelper). Its operations are the fixed
-// step kinds of src/core/helper/batchSteps.ts: each step builds its command from the builders of the per-step runs and
-// never runs a command line that it was sent. The steps run one at a time, each in a process group of its own; its time
+// step kinds of src/core/helper/batchSteps.ts: each step builds its command from the builders that WorkspaceHelper uses
+// too and never runs a command line that it was sent (plan step 7: the only path of the volume steps). The steps run one at a time, each in a process group of its own; its time
 // limit or its cancel ends that group alone (SIGTERM, then SIGKILL), and the session stays usable.
 //
 // Isolation in the one container (Q2 of 2026-10-01). The helper runs as root. The socket lies in BATCH_SOCKET_FOLDER,

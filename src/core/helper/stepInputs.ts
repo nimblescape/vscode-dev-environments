@@ -3,8 +3,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 6, PR B: the checks of the inputs of the helper steps and the commands of the runs of the Dev Container CLI,
-// shared by the per-step runs of WorkspaceHelper and the batch helper (batchSteps.ts), so that both build every command
-// from the same builders (moved here from workspaceHelper.ts unchanged, except the names refused by isPassableEnvName).
+// shared by WorkspaceHelper and the batch helper (batchSteps.ts), so that both build every command from the same builders
+// (moved here from workspaceHelper.ts unchanged, except the names refused by isPassableEnvName). Plan step 7 (user
+// decision of 2026-10-01): the per-step runs of WorkspaceHelper are removed; its steps run only in the batch helper.
 // Pure functions. No `vscode`.
 import { splitRepository } from '../names';
 import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, upCommand, writeAndRunCommand } from './scripts';
@@ -13,7 +14,7 @@ import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, upCommand, writeAndRunCommand } 
 export type HelperFiles = Readonly<Record<string, string>>;
 
 // Variables that would break the tools in the helper (or point them to the computer) if a caller passed them with the
-// `env` option of `run`. The pipeline passes no variable of the computer: `${localEnv:…}` resolves in the helper, to the
+// `env` option of a step. The pipeline passes no variable of the computer: `${localEnv:…}` resolves in the helper, to the
 // value of the helper for a variable that it sets itself (HELPER_ENV_NAMES, for example HOME=/root), otherwise to an empty
 // value or the default of the expression (concept section 9 "Host access").
 // Plan step 6, PR B: also the variables of the Dev Containers extension and of VS Code (REMOTE_CONTAINERS*, VSCODE_*),

@@ -4,9 +4,10 @@
 
 // Plan step 6, PR B: the fixed table of the step kinds of the batch helper (src/helperChannel/batchHelper.ts, decision
 // 2026-09-29: the volume steps of an operation run in one helper per operation). The extension sends a kind and the
-// inputs of its builder; the helper checks them strictly here and builds the command itself with the builders of the
-// per-step runs (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts), as WorkspaceHelper does. It never runs a
-// command line that it was sent. Pure functions. No `vscode`.
+// inputs of its builder; the helper checks them strictly here and builds the command itself with the same builders as
+// WorkspaceHelper (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts). It never runs a command line that it was
+// sent. Plan step 7 (user decision of 2026-10-01): the per-step runs of WorkspaceHelper are removed; every volume step is
+// a kind of this table and runs only in the batch helper of an operation. Pure functions. No `vscode`.
 import { configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { isStorageId } from '../storage/paths';
@@ -146,7 +147,7 @@ function stepEnv(kind: string, value: unknown): Record<string, string> {
   return env;
 }
 
-/** Runs `check` and turns its Error (the checks of the per-step runs) into a BatchStepError. */
+/** Runs `check` and turns its Error (the checks of stepInputs.ts, which WorkspaceHelper runs too) into a BatchStepError. */
 function checked<T>(kind: string, check: () => T): T {
   try {
     return check();
