@@ -1386,8 +1386,9 @@ export class EnvironmentService {
     // Plan step 6, PR A (user decision D2): the first open runs under the lock of the environment on the Docker host,
     // from before the volume is created through the pipeline and the removal after a failure. A refused lock (D1, D3)
     // has created nothing on Docker: only the new registry entry is removed again (no busy mark, no partial state). When
-    // the lock is lost during the removal, its Docker calls fail and the volume stays (the entry too, so the next open
-    // finds it); nothing is removed without the lock.
+    // the lock is lost during the removal, its Docker calls fail and the volume stays; PR #78 review round 1 (A-R1-1):
+    // the entry then stays too, with its create mark, so the next open completes the clone or Delete removes it
+    // (removeFailedFirstOpen keeps the entry whenever the volume cannot be removed); nothing is removed without the lock.
     let locked = false;
     try {
       return await this.withEnvironmentLock(environment, signal, async () => {
@@ -1399,7 +1400,9 @@ export class EnvironmentService {
           await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
           return await this.runPipeline(ctx);
         } catch (error) {
-          await this.removeFailedFirstOpen(ctx.env, ctx.compose === true);
+          // PR #78 review round 1 (A-R1-1): the volume could not be removed (for example the lock was lost): the entry keeps its create mark, so the
+          // next open completes the clone (resumeInterruptedClone) or Delete removes it.
+          if (!(await this.removeFailedFirstOpen(ctx.env, ctx.compose === true))) ctx.busy = false;
           throw error;
         }
       });
@@ -1582,7 +1585,9 @@ export class EnvironmentService {
       await this.quietly('restore the busy mark', () =>
         this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
           if (!entry.busy || !this.isOwnMark(entry.busy)) return;
-          if (interrupted && !this.isOwnMark(interrupted)) entry.busy = interrupted;
+          // PR #78 review round 1 (A-R1-1): the create mark of a failed first open of this window (kept because its
+          // volume could not be removed) comes back too, so a resume that fails again does not lose the clone.
+          if (interrupted) entry.busy = interrupted;
           else delete entry.busy;
         }),
       );
@@ -6634,7 +6639,7 @@ export class EnvironmentService {
   }
 
   /** A failed first open leaves nothing behind, so the next Start begins cleanly. `compose`: a Docker Compose configuration. */
-  private async removeFailedFirstOpen(env: Environment, compose = false): Promise<void> {
+  private async removeFailedFirstOpen(env: Environment, compose = false): Promise<boolean> {
     const { docker } = this.deps;
     this.logger.info(`Removing what the failed first open of ${env.repository} created.`);
     await this.quietly('remove the container', async () => {
@@ -6648,7 +6653,13 @@ export class EnvironmentService {
       if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)))) await this.removeComposeProject(env, true);
     });
     await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
-    await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
+    try {
+      await this.removeVolumeWithRetry(env.volumeName);
+    } catch (error) {
+      this.logger.warn(`Could not remove the volume ${env.volumeName}: ${errorMessage(error)}. The environment is kept; open it again to complete the clone, or delete it.`);
+      await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));
+      return false;
+    }
     // The additional volumes that the failed open recorded stay (a known limit), with their account: the environments of
     // other accounts must not mount them (concept section 9), as after a Delete that kept them.
     await this.quietly('remove the registry entry', async () => {
@@ -6656,6 +6667,7 @@ export class EnvironmentService {
       await this.deps.registry.remove(env.id, { kept: await this.existingVolumes(current.additionalVolumes ?? []) });
     });
     await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));
+    return true;
   }
 
   /** The Git summary from the running container, or `undefined` when Git is missing, fails, or `signal` aborts. */

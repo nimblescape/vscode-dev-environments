@@ -580,3 +580,61 @@ function recreateWithLock(take: () => Promise<HeldEnvironmentLock>): Harness {
   h.cleanup();
   return createHarness({ environmentLock: take });
 }
+
+// PR #78 review round 1 (A-R1-1): a failed first open whose volume cannot be removed (for example the lock was lost, so
+// every Docker call fails) keeps its registry entry with the create mark, so the interrupted clone is completed later.
+describe('a failed first open whose volume cannot be removed (PR #78 review round 1, A-R1-1)', () => {
+  function failing() {
+    const h = createHarness({});
+    h.helper.cloneError = new Error('clone cut off');
+    const remove = h.docker.removeVolume.bind(h.docker);
+    let lost = true;
+    h.docker.removeVolume = async (name: string) => {
+      if (lost) throw new CommandError(`docker volume rm ${name}`, null, '', 'The lock of the environment on the Docker host was lost (worker lost); docker volume rm was not run.');
+      return remove(name);
+    };
+    return {
+      h,
+      heal: () => {
+        lost = false;
+        h.helper.cloneError = undefined;
+      },
+    };
+  }
+
+  it('keeps the entry with its create mark and the volume; the next open completes the clone', async () => {
+    const { h, heal } = failing();
+    await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    const [entry] = await h.registry.list();
+    expect(entry?.busy?.operation).toBe('create');
+    expect(h.docker.volumes.has(entry!.volumeName)).toBe(true);
+    heal();
+    const before = h.helper.calls.length;
+    await h.service.open(TARGET, { progress: h.progress });
+    expect(h.helper.calls.slice(before)).toContain('clone main');
+    expect((await h.registry.get(entry!.id))?.busy).toBeUndefined();
+  });
+
+  it('keeps the create mark when the resumed clone fails again in the same window, so a later open still clones', async () => {
+    const { h, heal } = failing();
+    await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    const [entry] = await h.registry.list();
+    await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    expect((await h.registry.get(entry!.id))?.busy?.operation).toBe('create');
+    heal();
+    const before = h.helper.calls.length;
+    await h.service.open(TARGET, { progress: h.progress });
+    expect(h.helper.calls.slice(before)).toContain('clone main');
+    expect((await h.registry.get(entry!.id))?.busy).toBeUndefined();
+  });
+
+  it('Delete in the same window removes the kept environment', async () => {
+    const { h, heal } = failing();
+    await expect(h.service.open(TARGET, { progress: h.progress })).rejects.toThrow();
+    const [entry] = await h.registry.list();
+    heal();
+    await h.service.delete(entry!.id, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(await h.registry.list()).toEqual([]);
+    expect(h.docker.volumes.size).toBe(0);
+  });
+});
