@@ -6,7 +6,7 @@
 // runs from checked inputs; an unknown kind, a key too many, a path out of the repository, and a refused variable are
 // refused; a command line is never taken from the request.
 import { describe, expect, it } from 'vitest';
-import { configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
+import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, environmentIdLabel } from '../names';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, isBatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -172,7 +172,14 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
   });
 
   it('plan step 7: builds the Git summary of Delete with its builder, as the owner of the repository, without a secret', () => {
-    expect(batchStepCommand('gitSummary', { repository: REPO })).toEqual({ command: gitSummaryCommand(FOLDER), env: {}, git: false, owner: FOLDER });
+    // Review round 2 of PR #84, A-R2-1 and A-R2-2: changed expectation: the complete check, and the folder exits.
+    expect(batchStepCommand('gitSummary', { repository: REPO })).toEqual({
+      command: gitSummaryCommand(FOLDER, true),
+      env: {},
+      git: false,
+      owner: FOLDER,
+      folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
+    });
     expect(() => batchStepCommand('gitSummary', { repository: '../x' })).toThrow(BatchStepError);
     expect(() => batchStepCommand('gitSummary', { repository: REPO, folder: '/' })).toThrow(BatchStepError);
     expect(() => batchStepCommand('gitSummary', {})).toThrow(BatchStepError);

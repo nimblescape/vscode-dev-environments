@@ -251,7 +251,7 @@ export const Messages = {
    * read the Git state (`reason`, briefly); `recordedChanges`: the changes of the last recorded state, if any.
    */
   deleteGitStateUnknown: (repository: string, reason: string, recordedChanges?: string) =>
-    `The Git state of the environment of ${repository} could not be read, so it may have changes that are lost when you delete the environment. ${reason}` +
+    `The Git state of the environment of ${repository} could not be read, so it may have changes that are lost when you delete the environment. ${sentence(reason)}` +
     (recordedChanges ? ` Last recorded: ${recordedChanges}.` : ''),
   /**
    * Review round 9 (D9-2): the paths of the repository that the other services of Docker Compose mount
@@ -350,6 +350,12 @@ export const Messages = {
 function unnamedVolumesNotCarried(folders: readonly string[]): string {
   if (folders.length === 0) return '';
   return `These folders are volumes without a name, which are not carried over: in the new container they start as the image has them (often empty), and their old content stays in a Docker volume without a name: ${listSome(folders)}. `;
+}
+
+/** Review round 2 of PR #84, A-R2-3: `text` trimmed, with a full stop when it ends without one (raw Git output). */
+function sentence(text: string): string {
+  const trimmed = text.trim();
+  return trimmed === '' || /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 function describeHost(host: string): string {

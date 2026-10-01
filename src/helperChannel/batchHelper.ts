@@ -256,6 +256,23 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
   }
 }
 
+/**
+ * Review round 2 of PR #84, A-R2-2: the exit code of an `owner` step with `folderExits`. Its `missing` stands only when
+ * root, after the step, finds no folder at `step.owner` (ENOENT or ENOTDIR; `<folder>/.` follows a link, as the
+ * script's `[ -d ]`); a folder there, or any other error, gives `unreachable`: not reachable for the step's user.
+ */
+function folderExit(deps: BatchHelperDeps, step: BatchStepCommand, exitCode: number | null): number | null {
+  const exits = step.folderExits;
+  if (exits === undefined || exitCode !== exits.missing) return exitCode;
+  try {
+    deps.fs.lstatSync(`${step.owner!}/.`);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return exitCode;
+  }
+  return exits.unreachable;
+}
+
 function lstatOrUndefined(deps: BatchHelperDeps, path: string): fs.Stats | undefined {
   try {
     return deps.fs.lstatSync(path);
@@ -314,7 +331,7 @@ export function batchHelperOperations(deps: BatchHelperDeps): Record<string, Ope
       const exitCode = step.git
         ? await asGitUser(deps, gitUser, step, () => runStep(deps, step, input, context, gitPrivilegeArgs()))
         : step.owner !== undefined
-          ? await asRepositoryOwner(deps, step, (privilege) => runStep(deps, step, input, context, privilege))
+          ? folderExit(deps, step, await asRepositoryOwner(deps, step, (privilege) => runStep(deps, step, input, context, privilege)))
           : await runStep(deps, step, input, context);
       return { exitCode };
     } finally {

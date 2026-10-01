@@ -15,7 +15,7 @@ import * as path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, UserFacingError, isBatchHelperUnavailable } from '../errors';
-import { gitSummaryCommand } from '../git/gitSummary';
+import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, gitSummaryCommand } from '../git/gitSummary';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
@@ -638,7 +638,14 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0 });
     expect(lock.steps.map((step) => [step.kind, step.params])).toEqual([['gitSummary', { repository: 'acme/app' }]]);
     expect(lock.steps[0].options.secret).toBeUndefined();
-    expect(batchStepCommand('gitSummary', lock.steps[0].params)).toEqual({ command: gitSummaryCommand('/workspaces/app'), env: {}, git: false, owner: '/workspaces/app' });
+    // Review round 2 of PR #84, A-R2-1 and A-R2-2: changed expectation: the complete check, and the folder exits.
+    expect(batchStepCommand('gitSummary', lock.steps[0].params)).toEqual({
+      command: gitSummaryCommand('/workspaces/app', true),
+      env: {},
+      git: false,
+      owner: '/workspaces/app',
+      folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
+    });
     // The image of the window (WorkspaceHelper.image), by its ID.
     expect(lock.opens).toEqual([{ volume: VOLUME, image: IMAGE.id, socket: '/var/run/docker.sock' }]);
     expect(docker.runs.filter((run) => run.args[0] === 'run')).toEqual([]);

@@ -8,7 +8,7 @@
 // WorkspaceHelper (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts). It never runs a command line that it was
 // sent. Plan step 7 (user decision of 2026-10-01): the per-step runs of WorkspaceHelper are removed; every volume step is
 // a kind of this table and runs only in the batch helper of an operation. Pure functions. No `vscode`.
-import { configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
+import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { isStorageId } from '../storage/paths';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -88,6 +88,12 @@ export interface BatchStepCommand {
    * 0700 that a killed step left.
    */
   closeConfigFolder?: boolean;
+  /**
+   * Review round 2 of PR #84, A-R2-2: for an `owner` step whose script tests the folder as its user (`[ -d ]`, false on
+   * EACCES too): its exit code `missing` stands only when root finds no folder at `owner` either (following a link);
+   * otherwise the batch helper returns `unreachable` (the folder exists, but the step's user cannot reach it).
+   */
+  folderExits?: { missing: number; unreachable: number };
   /**
    * The secret of the request (the GitHub token): `stdin`: required, the standard input of the step (TOKEN_PRELUDE writes
    * it to the tmpfs and removes it); `mask`: optional, only masked in the output; undefined: refused.
@@ -338,7 +344,14 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       // so its `cd` fails and the check reports it as before. No secret.
       const p = fields(kind, params, ['repository']);
       const { folder } = folderOf(kind, p.repository);
-      return { command: gitSummaryCommand(folder), env: {}, git: false, owner: folder };
+      // Review round 2 of PR #84: the check that every file can be read (A-R2-1), and "missing" decided by root (A-R2-2).
+      return {
+        command: gitSummaryCommand(folder, true),
+        env: {},
+        git: false,
+        owner: folder,
+        folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
+      };
     }
     default:
       throw new BatchStepError(`The batch helper does not know the step ${String(kind).slice(0, 64)}.`);

@@ -17,7 +17,7 @@ import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, GitStateUnreadableError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
-import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
+import { GIT_SUMMARY_COMPLETE, GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
@@ -2007,7 +2007,8 @@ describe('WorkspaceHelper file and Git queries', () => {
       stashes: 0,
       recordedAt: '2026-09-24T17:10:00.000Z',
     });
-    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
+    // Review round 2 of PR #84, A-R2-1: changed expectation: Delete's check adds GIT_SUMMARY_COMPLETE.
+    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
   });
 
   it('throws CommandError when a query fails', async () => {

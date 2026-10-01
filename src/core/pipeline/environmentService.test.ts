@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
 import { CommandError, GitStateUnreadableError, UserFacingError } from '../errors';
-import { GIT_SUMMARY_NO_FOLDER_EXIT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
@@ -4012,6 +4012,19 @@ describe('safetyCheck', () => {
       recorded: env.gitSummary,
     });
     expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('review round 2 of PR #84, A-R2-2: a folder that exists but its owner cannot reach (GIT_SUMMARY_UNREACHABLE_EXIT) gives an unknown state, never the recorded state as current', async () => {
+    const env = await seedEnvironment(h);
+    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_UNREACHABLE_EXIT, '', 'The repository folder /workspaces/api is missing.');
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateUnreachable, recorded: env.gitSummary });
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('review round 2 of PR #84, A-R2-2: an unreachable folder with no recorded state is unknown with its own reason (not "missing")', async () => {
+    await seedEnvironment(h, { extra: { gitSummary: undefined } });
+    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_UNREACHABLE_EXIT, '', 'The repository folder /workspaces/api is missing.');
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateUnreachable });
   });
 
   it('review round 1 of PR #84, A-R1-2: exit code 128 (a root 0600 .git/index) gives an unknown state, never the recorded state as current', async () => {

@@ -13,6 +13,19 @@ import type { GitSummary, UnknownGitState } from '../types';
 export const GIT_SUMMARY_NO_FOLDER_EXIT = 3;
 
 /**
+ * Review round 2 of PR #84, A-R2-2: the exit code of the gitSummary step when GIT_SUMMARY_SCRIPT exited with
+ * GIT_SUMMARY_NO_FOLDER_EXIT but root sees a folder there (the batch helper checks it, asRepositoryOwner): the folder
+ * is not reachable for the step's user (`[ -d ]` is false on EACCES too), so the Git state is unknown, not missing.
+ */
+export const GIT_SUMMARY_UNREACHABLE_EXIT = 4;
+
+/**
+ * Review round 2 of PR #84, A-R2-1: the second argument of GIT_SUMMARY_SCRIPT for Delete's check: the script then
+ * checks that its user can read every file and folder of the repository (`.git` too).
+ */
+export const GIT_SUMMARY_COMPLETE = 'complete';
+
+/**
  * Review round 1 of PR #84, A-R1-2: the start of the line that GIT_SUMMARY_SCRIPT prints before its 4 lines when a
  * count could not be made (the rest of the line says which); parseGitSummaryOutput ignores it (it reads the last 4).
  */
@@ -33,6 +46,13 @@ export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
  * `git status` and `git stash list` reach stderr (a folder that Git cannot open: `could not open directory … Permission
  * denied`, with exit code 0); a count of unpushed commits that fails prints GIT_SUMMARY_INCOMPLETE_MARKER (it counted
  * 0 before, silently). Delete's check reads both as an unknown state (gitSummaryProblem).
+ *
+ * Review round 2 of PR #84, A-R2-1: Git skips without a word what it cannot read in `.git` (a root 0600 `refs/stash`
+ * counts as no stash; a `refs/heads` that cannot be listed hides its branches). With `$2` GIT_SUMMARY_COMPLETE (Delete's
+ * check; not the monitor's polls, for the cost of the walk) the script ends with one walk of the repository folder, its
+ * working tree and `.git`, as its user: a file or folder that it cannot read (a folder it cannot list or enter: the
+ * folder, or the entries below it), or a walk that fails, prints GIT_SUMMARY_INCOMPLETE_MARKER. Links are not tested
+ * (`access` follows them; Git does not). One file system (`-xdev`), as Git's own walk of the working tree.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
 if [ ! -d "$1" ]; then
@@ -65,6 +85,13 @@ else
   unpushed=$(g rev-list --count --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 fi
 stashes=$(g stash list)
+if [ "\${2:-}" = '${GIT_SUMMARY_COMPLETE}' ] && [ -z "$incomplete" ]; then
+  if ! unreadable=$(find . -xdev ! -type l ! -readable -print -quit); then
+    incomplete='not every file and folder of the repository could be read'
+  elif [ -n "$unreadable" ]; then
+    incomplete="$(printf '%s' "\${unreadable#./}" | tr '\\n' ' ') cannot be read"
+  fi
+fi
 if [ -n "$incomplete" ]; then
   printf '%s %s\\n' '${GIT_SUMMARY_INCOMPLETE_MARKER}' "$incomplete"
 fi
@@ -522,9 +549,12 @@ export function isUnknownGitState(value: GitSummary | UnknownGitState | undefine
   return value !== undefined && 'unknown' in value && value.unknown === true;
 }
 
-/** Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. */
-export function gitSummaryCommand(repoFolder: string): string[] {
-  return ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder];
+/**
+ * Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. Review round 2
+ * of PR #84, A-R2-1: `complete` (Delete's check) adds GIT_SUMMARY_COMPLETE, the check that every file can be read.
+ */
+export function gitSummaryCommand(repoFolder: string, complete = false): string[] {
+  return complete ? ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder, GIT_SUMMARY_COMPLETE] : ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder];
 }
 
 /**

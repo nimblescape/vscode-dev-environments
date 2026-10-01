@@ -1245,6 +1245,14 @@ describe('Delete', () => {
     expect(h.service.delete).not.toHaveBeenCalled();
   });
 
+  it('review round 2 of PR #84, A-R2-3: a reason from raw Git output ends with a full stop before "Last recorded"', () => {
+    const reason = PipelineTexts.gitStateUnreadable("warning: could not open directory 'data/': Permission denied");
+    expect(Messages.deleteGitStateUnknown('acme/api', reason, '2 uncommitted')).toContain("'data/': Permission denied. Last recorded: 2 uncommitted.");
+    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateFailed(128, 'fatal: x'))).toMatch(/fatal: x\.$/);
+    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateNoFolder)).toMatch(/is recorded\.$/);
+    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateNoFolder)).not.toContain('..');
+  });
+
   it('review round 1 of PR #84, A-R1-2: no summary at all (repository folder missing, nothing recorded) gets the warning, never the plain confirmation', async () => {
     await h.registry.add(environment());
     h.service.safetyCheck.mockResolvedValueOnce({ unknown: true, reason: PipelineTexts.gitStateNoFolder });

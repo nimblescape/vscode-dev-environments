@@ -16,6 +16,7 @@ import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, typ
 import { BatchHelperUnavailableError, CommandError, GitStateUnreadableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
 import {
   GIT_SUMMARY_NO_FOLDER_EXIT,
+  GIT_SUMMARY_UNREACHABLE_EXIT,
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
   existingPathsCommand,
@@ -236,6 +237,8 @@ export const PipelineTexts = {
   gitStateFailed: (exitCode: number | null, problem: string | undefined) =>
     exitCode === null ? 'Git was stopped before it ended.' : `Git failed with exit code ${exitCode}${problem ? `: ${problem}` : '.'}`,
   gitStateNoFolder: 'The repository folder is missing, and no Git state is recorded.',
+  /** Review round 2 of PR #84, A-R2-2: the folder exists, but its owner cannot reach it (GIT_SUMMARY_UNREACHABLE_EXIT). */
+  gitStateUnreachable: 'The repository folder exists, but its owner cannot reach it.',
   startFailed: 'The environment could not be started.',
   environmentMissing: 'This environment does not exist anymore.',
   environmentBusy: (repository: string) =>
@@ -868,6 +871,7 @@ function lifecycleClause(subject: string, ranBefore: boolean, what: string): str
 /** Review round 1 of PR #84, A-R1-2: the reason of an UnknownGitState for the error of the Git summary, briefly. */
 function gitStateUnknownReason(error: unknown): string {
   if (error instanceof GitStateUnreadableError) return PipelineTexts.gitStateUnreadable(error.problem);
+  if (error instanceof CommandError && error.exitCode === GIT_SUMMARY_UNREACHABLE_EXIT) return PipelineTexts.gitStateUnreachable;
   if (error instanceof CommandError) {
     const lastLine = error.stderr.trim().split('\n').at(-1)?.trim().slice(0, 300);
     return PipelineTexts.gitStateFailed(error.exitCode, gitSummaryProblem('', error.stderr) ?? (lastLine || undefined));

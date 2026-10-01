@@ -9,6 +9,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   CONFIG_OWNERSHIP_FIX_SCRIPT,
+  GIT_SUMMARY_COMPLETE,
   GIT_SUMMARY_INCOMPLETE_MARKER,
   GIT_SUMMARY_NO_FOLDER_EXIT,
   GIT_SUMMARY_SCRIPT,
@@ -1005,6 +1006,11 @@ describe('the problems of the Git summary (review round 1 of PR #84, A-R1-2)', (
     expect(isUnknownGitState(undefined)).toBe(false);
   });
 
+  it('review round 2 of PR #84, A-R2-1: the command adds GIT_SUMMARY_COMPLETE only for Delete\'s check', () => {
+    expect(gitSummaryCommand('/workspaces/api')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
+    expect(gitSummaryCommand('/workspaces/api', true)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
+  });
+
   it('review round 1 of PR #84, A-R1-2: a missing repository folder exits with GIT_SUMMARY_NO_FOLDER_EXIT', () => {
     const root = tempDir();
     const result = runSummary(path.join(root, 'missing'));
@@ -1045,8 +1051,8 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     return repo;
   }
 
-  function runAsOwner(repo: string): { status: number | null; stdout: string; stderr: string } {
-    const [file, ...args] = gitSummaryCommand(repo);
+  function runAsOwner(repo: string, complete = false): { status: number | null; stdout: string; stderr: string } {
+    const [file, ...args] = gitSummaryCommand(repo, complete);
     const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
@@ -1076,5 +1082,114 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     expect(result.status).toBe(128);
     expect(result.status).not.toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
     expect(gitSummaryProblem(result.stdout, result.stderr)).toContain('Permission denied');
+  });
+
+  /**
+   * Review round 2 of PR #84, A-R2-1: the repository of the reproduction: 1 unpushed commit on `feature` (main is on
+   * origin/main), and 2 stashes; the owner reads `main / 0 / 1 / 2`.
+   */
+  function stashRepo(): string | undefined {
+    const repo = ownerRepo();
+    if (repo === undefined) return undefined;
+    // The repository is the owner's already (ownerRepo); root's Git needs safe.directory for it.
+    const sgit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', ...args);
+    sgit(repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    sgit(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    sgit(repo, 'add', 'b.txt');
+    sgit(repo, 'commit', '-q', '-m', 'second');
+    sgit(repo, 'checkout', '-q', 'main');
+    for (const line of ['x', 'y']) {
+      fs.appendFileSync(path.join(repo, 'a.txt'), `${line}\n`);
+      sgit(repo, 'stash', '-q');
+    }
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  /** Gives `relative` in `repo` to root with `mode` (`recursive`: what it holds too). */
+  function toRoot(repo: string, relative: string, mode: number, recursive = false): void {
+    const target = path.join(repo, relative);
+    spawnSync('chown', [...(recursive ? ['-R'] : []), '0:0', target]);
+    fs.chmodSync(target, mode);
+  }
+
+  it('review round 2 of PR #84, A-R2-1: the baseline reads main / 0 / 1 / 2 with no problem, also with the complete check', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 2 });
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+    }
+  });
+
+  const silentCases: Array<{ name: string; setup: (repo: string) => void; lost: Record<string, unknown>; unreadable: string }> = [
+    { name: 'a root 0600 refs/stash', setup: (repo) => toRoot(repo, '.git/refs/stash', 0o600), lost: { stashes: 0 }, unreadable: '.git/refs/stash' },
+    { name: 'a root 0700 .git/logs', setup: (repo) => toRoot(repo, '.git/logs', 0o700, true), lost: { stashes: 0 }, unreadable: '.git/logs' },
+    { name: 'a root 0711 refs/heads (searchable, not listable)', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o711), lost: { unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
+    { name: 'a root 0700 refs/heads', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o700), lost: { branch: null, unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
+  ];
+  for (const { name, setup, lost, unreadable } of silentCases) {
+    it(`review round 2 of PR #84, A-R2-1: ${name}: Git alone reads a smaller state with exit code 0 and no problem; the complete check marks it unknown`, () => {
+      const repo = stashRepo();
+      if (repo === undefined) return;
+      setup(repo);
+      const plain = runAsOwner(repo);
+      expect(plain.status).toBe(0);
+      expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject(lost);
+      expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
+      const checked = runAsOwner(repo, true);
+      expect(checked.status).toBe(0);
+      expect(checked.stdout).toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+      expect(gitSummaryProblem(checked.stdout, checked.stderr)).toBe(`${unreadable} cannot be read`);
+    });
+  }
+
+  it('review round 2 of PR #84, A-R2-1: a folder that the owner can list but not enter (root 0644) is found through its entries', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.mkdirSync(path.join(repo, 'd'));
+    fs.writeFileSync(path.join(repo, 'd', 'f'), 'x');
+    toRoot(repo, 'd', 0o644, true);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} d/f cannot be read`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeDefined();
+  });
+
+  it('review round 2 of PR #84, A-R2-1: an untracked root 0700 folder (round 1) and a root 0600 file in the working tree are caught too', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, 'secret.txt'), 'x');
+    toRoot(repo, 'secret.txt', 0o600);
+    expect(runAsOwner(repo, true).stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} secret.txt cannot be read`);
+    fs.rmSync(path.join(repo, 'secret.txt'));
+    fs.mkdirSync(path.join(repo, 'data'));
+    toRoot(repo, 'data', 0o700);
+    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBe('data cannot be read');
+  });
+
+  it('review round 2 of PR #84, A-R2-1: links are not tested (a dangling link, a link to a root folder): no problem', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.symlinkSync('/nonexistent-target', path.join(repo, 'dangling'));
+    fs.symlinkSync('/root', path.join(repo, 'root-link'));
+    spawnSync('chown', ['-h', '1000:1000', path.join(repo, 'dangling'), path.join(repo, 'root-link')]);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+  });
+
+  it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const closed = path.join(path.dirname(repo), 'closed');
+    fs.mkdirSync(closed, { mode: 0o700 });
+    const hidden = path.join(closed, 'repo');
+    fs.renameSync(repo, hidden);
+    // The script alone cannot tell this from a missing folder; the batch helper decides it as root (folderExit).
+    expect(runAsOwner(hidden, true).status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
   });
 });
