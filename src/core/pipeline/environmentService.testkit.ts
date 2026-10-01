@@ -119,7 +119,7 @@ export class FakeDocker implements EnvironmentDocker {
   /** Changing calls, in order: `pull x`, `rm x`, `rmi x`, `stop x`, `volume create x`, `volume rm x`, `start x`. */
   readonly log: string[] = [];
   /** Each `docker exec`; unit 15: with its standard input (the token of TOKEN_WRITE_SCRIPT). */
-  readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal; input?: string }> = [];
+  readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal; input?: string; secret?: true }> = [];
   /** Each `docker pull`, with the credentials that it got instead of those of Docker. */
   readonly pulls: Array<{ reference: string; credentials?: PullCredentials }> = [];
   pullError: (reference: string, credentials?: PullCredentials) => Error | undefined = () => undefined;
@@ -285,9 +285,11 @@ export class FakeDocker implements EnvironmentDocker {
   async exec(
     container: string,
     command: readonly string[],
-    options: { user?: string; signal?: AbortSignal; timeoutMs?: number; input?: string } = {},
+    options: { user?: string; signal?: AbortSignal; timeoutMs?: number; input?: string; secretInput?: string } = {},
   ): Promise<RunResult> {
-    this.execs.push({ container, command, user: options.user, signal: options.signal, ...(options.input !== undefined ? { input: options.input } : {}) });
+    // Plan step 6, PR C (Q4): a secret input (the token) is recorded as the input, marked `secret`.
+    const input = options.secretInput ?? options.input;
+    this.execs.push({ container, command, user: options.user, signal: options.signal, ...(input !== undefined ? { input } : {}), ...(options.secretInput !== undefined ? { secret: true as const } : {}) });
     // Review round 11 (G3): the check of the recorded paths of the services prints those that exist.
     const existing =
       command[2] === EXISTING_PATHS_SCRIPT

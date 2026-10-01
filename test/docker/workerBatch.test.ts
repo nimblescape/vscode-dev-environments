@@ -11,6 +11,10 @@
 // are restored after the Git step; Docker Compose refuses remote includes in the helper; the helper container is gone
 // after a close (cancel), after a kill of the worker, and after its silence when the worker hangs. The clone uses a
 // derived image whose `git` only waits (so the Git step is deterministic and needs no network).
+// User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."; it
+// replaces option A): a Compose model step runs as the owner of the repository (1000 here): it cannot read a file in
+// CONFIG_FOLDER (root's and 0700 during the step, the owner's again after it), and it can read a 0600 file of the owner
+// in the repository (an `.env`); createFolders (agreed extension) creates folders of the owner.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -122,7 +126,13 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       `mkdir -p ${FOLDER}/.devcontainer /workspaces/.devenv+ && echo '{}' > ${FOLDER}/.devcontainer/devcontainer.json && ` +
         `printf 'services:\\n  a:\\n    image: alpine\\ninclude:\\n  - https://github.com/docker/compose.git#main\\n' > ${FOLDER}/git.yml && ` +
         `printf 'include:\\n  - oci://localhost:1/devenv/none:latest\\nservices:\\n  a:\\n    image: alpine\\n' > ${FOLDER}/oci.yml && ` +
-        `echo '[user]' > /workspaces/.devenv+/gitconfig && chown -R 1000:1000 ${FOLDER} /workspaces/.devenv+ && chmod 0755 /workspaces/.devenv+`,
+        // Plan step 6, PR C (option A): a compose file whose env_file is a file of CONFIG_FOLDER.
+        `printf 'services:\\n  a:\\n    image: alpine\\n    env_file: ../.devenv+/gitconfig\\n' > ${FOLDER}/token.yml && ` +
+        // User decision of 2026-10-01 (Compose reads as the repository owner): a compose file whose env_file is the
+        // `.env` of the repository, a file of the owner with mode 0600.
+        `printf 'services:\\n  a:\\n    image: alpine\\n    env_file: .env\\n' > ${FOLDER}/owner.yml && ` +
+        `echo 'OWNER_ONLY=read-by-the-owner' > ${FOLDER}/.env && ` +
+        `echo '[user]' > /workspaces/.devenv+/gitconfig && chown -R 1000:1000 ${FOLDER} /workspaces/.devenv+ && chmod 0755 /workspaces/.devenv+ && chmod 0600 ${FOLDER}/.env`,
     ]);
   });
 
@@ -222,6 +232,45 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout.trim().split('\n').pop()!)).toMatchObject({ error: expect.stringContaining(disabled) });
     }
+    await session.close();
+    await lock.release();
+  });
+
+  // User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."): the
+  // Compose model step runs as the owner of the repository (1000), so Compose, which follows `env_file`, cannot read a
+  // file in CONFIG_FOLDER, which belongs to that owner but is root's and 0700 during the step; the folder gets its owner
+  // and mode back. (Under option A, which this replaces, the step ran as the unprivileged Git user.)
+  it('a Compose model step as the repository owner cannot read a file in CONFIG_FOLDER (user decision of 2026-10-01)', async () => {
+    const channels = windowChannels();
+    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    const container = helpersOf(session.session)[0];
+    const result = await session.step('composeModel', { repository: REPOSITORY, files: [`${FOLDER}/token.yml`], project: 'devenv-batch-test' });
+    const output = `${result.stdout}\n${result.stderr}`;
+    expect(output).toMatch(/permission denied/i);
+    expect(output).not.toContain('[user]');
+    // User decision of 2026-10-01: the owner of CONFIG_FOLDER is restored as well (root's during the step).
+    expect(execIn(container, '0:0', 'stat -c %a:%u:%g /workspaces/.devenv+').out).toBe('755:1000:1000');
+    expect(execIn(container, '0:0', 'cat /workspaces/.devenv+/gitconfig').out).toBe('[user]');
+    await session.close();
+    await lock.release();
+  });
+
+  // User decision of 2026-10-01: the Compose read runs as the owner of the repository, as a real user would, so it reads
+  // a 0600 file of that owner in the repository (an `.env` that `env_file` names).
+  it('a Compose model step reads a 0600 file of the repository owner (user decision of 2026-10-01)', async () => {
+    const channels = windowChannels();
+    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    const container = helpersOf(session.session)[0];
+    const result = await session.step('composeModel', { repository: REPOSITORY, files: [`${FOLDER}/owner.yml`], project: 'devenv-batch-test' });
+    expect(result.exitCode).toBe(0);
+    const printed = JSON.parse(result.stdout.trim().split('\n').pop()!) as { error?: string; model?: { services: Record<string, { environment?: Record<string, string> }> } };
+    expect(printed.error).toBeUndefined();
+    expect(printed.model?.services.a.environment).toMatchObject({ OWNER_ONLY: 'read-by-the-owner' });
+    expect(execIn(container, '0:0', `stat -c %a:%u ${FOLDER}/.env`).out).toBe('600:1000');
+    // The agreed extension of the same day: createFolders runs as the owner too, so the folders it creates are the owner's.
+    const created = await session.step('createFolders', { repository: REPOSITORY, folders: [`${FOLDER}/data/pg`] });
+    expect(created.exitCode).toBe(0);
+    expect(execIn(container, '0:0', `stat -c %u:%g ${FOLDER}/data ${FOLDER}/data/pg`).out.split('\n')).toEqual(['1000:1000', '1000:1000']);
     await session.close();
     await lock.release();
   });

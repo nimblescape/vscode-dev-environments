@@ -10,7 +10,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import {
   BATCH_GIT_HOME,
@@ -18,6 +18,7 @@ import {
   describeStep,
   gitPrivilegeArgs,
   prepareBatchHelper,
+  privilegeArgs,
   runQuietProcess,
   spawnStepProcess,
   stepEnvironment,
@@ -112,8 +113,23 @@ describe('the variables and the log line of a step (plan step 6, PR B)', () => {
   });
 
   it('logs the command without its script, and the Git user', () => {
-    expect(describeStep(batchStepCommand('listConfigs', { repository: 'o/r' }))).toBe('node <script> /workspaces/r');
+    // User decision of 2026-10-01 (agreed extension): listConfigs runs as the repository owner, and its log line says so.
+    expect(describeStep(batchStepCommand('listConfigs', { repository: 'o/r' }))).toBe('(as the owner of /workspaces/r) node <script> /workspaces/r');
+    expect(describeStep(batchStepCommand('gitFiles', { repository: 'o/r', identity: { name: 'n', email: 'e' } }))).toMatch(/^sh <script> r n e /);
     expect(describeStep(batchStepCommand('clone', { repository: 'o/r', branch: 'b' }))).toBe(`(as ${BATCH_GIT_UID}) sh <script> o/r r b`);
+  });
+
+  // User decision of 2026-10-01: Compose reads as the repository owner, with HOME=/nonexistent as Git (no configuration
+  // of root's HOME), and the log line names that user.
+  it('gives the Compose read steps the HOME of Git and logs them as the repository owner (user decision of 2026-10-01)', () => {
+    const base = { PATH: '/usr/bin', HOME: '/root', DOCKER_HOST: 'tcp://x:2375', XDG_CONFIG_HOME: '/root/.config' };
+    const hash = batchStepCommand('composeHash', { repository: 'o/r', model: '{}', project: 'p' });
+    const env = stepEnvironment(base, hash);
+    expect(env.HOME).toBe(BATCH_GIT_HOME);
+    expect(env.XDG_CONFIG_HOME).toBeUndefined();
+    expect(env.DOCKER_HOST).toBeUndefined();
+    expect(env.COMPOSE_PROJECT_NAME).toBe('p');
+    expect(describeStep(hash)).toBe('(as the owner of /workspaces/r) node <script> /tmp/devenv-override/compose.json p');
   });
 
   it('drops privileges fully for Git', () => {
@@ -153,6 +169,32 @@ describeUnix('spawnStepProcess (plan step 6, PR B)', () => {
   });
 });
 
+/**
+ * User decision of 2026-10-01 (Compose reads as the repository owner; agreed extension: readFiles, listConfigs and
+ * createFolders too): `lstat` with owners. The repository folders below
+ * /workspaces belong to 1000:1000, everything else to root.
+ */
+function ownedLstat(name: string) {
+  const owner = name.startsWith(`${WORKSPACES_ROOT}/`) ? 1000 : 0;
+  return { isDirectory: () => true, isSymbolicLink: () => false, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750, uid: owner, gid: owner };
+}
+
+/**
+ * User decision of 2026-10-01: the file system of a step as the repository owner (listConfigs, readFiles, createFolders
+ * and the Compose reads need the owner of the repository folder): `lstat` with owners, every change a no-op (never a
+ * path of the machine that runs the tests).
+ */
+function ownerStepFiles(): BatchHelperDeps['fs'] {
+  return {
+    lstatSync: ownedLstat as never,
+    chmodSync: (() => {}) as never,
+    chownSync: (() => {}) as never,
+    readdirSync: (() => []) as never,
+    rmSync: (() => {}) as never,
+    mkdirSync: (() => {}) as never,
+  };
+}
+
 /** Settles with `promise`, or with 'pending' after `ms` (a step that never ends must fail the test, not hang it). */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | 'pending'> {
   return Promise.race([promise, new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), ms))]);
@@ -180,7 +222,8 @@ function recordingSpawn(options: { endOn: 'SIGTERM' | 'SIGKILL' | null; exitCode
 describe('the end of a step process group (review round 1 of PR #80, B-R1-2)', () => {
   it('review round 1 of PR #80, B-R1-2: a step that ignores SIGTERM gets SIGKILL after the grace time (H28)', async () => {
     const { signals, spawnStep } = recordingSpawn({ endOn: 'SIGKILL' });
-    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {}, killGraceMs: 30 });
+    // User decision of 2026-10-01: listConfigs runs as the repository owner, so the helper reads its owner (ownerStepFiles).
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: ownerStepFiles(), env: {}, killGraceMs: 30 });
     const controller = new AbortController();
     const running = operations.listConfigs({ repository: 'octo/hello' }, context(undefined, controller.signal));
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -191,7 +234,8 @@ describe('the end of a step process group (review round 1 of PR #80, B-R1-2)', (
 
   it('review round 1 of PR #80, B-R1-2: a signal that was aborted before the spawn ends the step at once (H29)', async () => {
     const { signals, spawnStep } = recordingSpawn({ endOn: 'SIGTERM' });
-    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {}, killGraceMs: 60_000 });
+    // User decision of 2026-10-01: listConfigs runs as the repository owner, so the helper reads its owner (ownerStepFiles).
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: ownerStepFiles(), env: {}, killGraceMs: 60_000 });
     const controller = new AbortController();
     controller.abort();
     expect(await within(operations.listConfigs({ repository: 'octo/hello' }, context(undefined, controller.signal)), 5_000)).toEqual({ exitCode: null });
@@ -200,7 +244,8 @@ describe('the end of a step process group (review round 1 of PR #80, B-R1-2)', (
 
   it('review round 1 of PR #80, B-R1-2: after a normal exit, what is left in the group gets SIGKILL (H27)', async () => {
     const { signals, spawnStep } = recordingSpawn({ endOn: null, exitCode: 0 });
-    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: {} as never, env: {} });
+    // User decision of 2026-10-01: listConfigs runs as the repository owner, so the helper reads its owner (ownerStepFiles).
+    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: ownerStepFiles(), env: {} });
     expect(await operations.listConfigs({ repository: 'octo/hello' }, context())).toEqual({ exitCode: 0 });
     expect(signals).toEqual(['SIGKILL']);
   });
@@ -213,11 +258,15 @@ describe('the secrets tmpfs after a step with a secret (review round 1 of PR #80
   function gitFiles(options: { secrets?: string; readdir?: () => string[] }): BatchHelperDeps['fs'] {
     const real = (name: string) => (options.secrets === undefined ? name : name.replace(SECRETS_FOLDER, options.secrets));
     return {
-      lstatSync: ((name: string) => ({ isDirectory: () => true, mode: name === WORKSPACES_ROOT ? 0o40755 : 0o40750 })) as never,
+      // User decision of 2026-10-01: listConfigs runs as the repository owner, so `lstat` names owners (ownedLstat).
+      lstatSync: ownedLstat as never,
       chmodSync: (() => {}) as never,
       chownSync: (() => {}) as never,
       readdirSync: ((name: string) => (options.readdir ? options.readdir() : fs.readdirSync(real(name)))) as never,
-      rmSync: ((name: string, rmOptions: fs.RmOptions) => fs.rmSync(real(name), rmOptions)) as never,
+      // Only the stand-in of the secrets tmpfs is removed for real (a step as the owner removes OVERRIDE_FOLDER, which
+      // must never be a path of the machine that runs the tests).
+      rmSync: ((name: string, rmOptions: fs.RmOptions) => (name === SECRETS_FOLDER || name.startsWith(`${SECRETS_FOLDER}/`) ? fs.rmSync(real(name), rmOptions) : undefined)) as never,
+      mkdirSync: (() => {}) as never,
     };
   }
 
@@ -317,4 +366,166 @@ describeUnix('the real processes of the helper (review round 1 of PR #80, B-R1-1
     },
     30_000,
   );
+});
+
+describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
+  const TOKEN = 'ghp_secret_token_of_the_test';
+  const uid = String(BATCH_GIT_UID);
+  const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'].join(' ');
+  const volumeWalk = repair;
+  const rootWalk = ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'].join(' ');
+  const kill = ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ');
+
+  function helper(): { quiet: string[]; operations: ReturnType<typeof batchHelperOperations> } {
+    const quiet: string[] = [];
+    const operations = batchHelperOperations({
+      spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
+      runQuiet: async (command) => {
+        quiet.push(command.join(' '));
+      },
+      fs: {
+        lstatSync: ownedLstat as never,
+        chmodSync: (() => {}) as never,
+        chownSync: (() => {}) as never,
+        readdirSync: (() => []) as never,
+        rmSync: (() => {}) as never,
+        mkdirSync: (() => {}) as never,
+      },
+      env: {},
+    });
+    return { quiet, operations };
+  }
+
+  it('review round 1 of PR #82, A-R1-2: the repair of a cut-off Git step runs once per helper process', async () => {
+    const first = helper();
+    expect(await first.operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+    // User decision of 2026-10-01: Compose reads as the repository owner, so composeModel is no Git step and repairs
+    // nothing (under option A the repair ran before it).
+    expect(first.quiet).toEqual([['setpriv', ...privilegeArgs(1000, 1000), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ')]);
+    expect(await first.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(await first.operations.composeHash({ repository: 'octo/hello', model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+    // User decision of 2026-10-01: the first walk of the volume is the repair before the clone (was: before
+    // composeModel); the second is the chown walk after the clone.
+    expect(first.quiet.filter((call) => call === repair)).toHaveLength(2);
+    expect(first.quiet.indexOf(repair)).toBeLessThan(first.quiet.indexOf(kill));
+    // A new helper process repairs again, once.
+    const second = helper();
+    expect(await second.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(await second.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    // Per clone: one chown walk after it; plus the one repair before the first.
+    expect(second.quiet.filter((call) => call === repair)).toHaveLength(3);
+  });
+
+  it('review round 1 of PR #82, A-R1-2: after a Compose read step, no walk of the volume', async () => {
+    const { quiet, operations } = helper();
+    await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context());
+    quiet.length = 0;
+    expect(await operations.composeHash({ repository: 'octo/hello', model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+    // User decision of 2026-10-01: Compose reads as the repository owner. Changed expectation (option A: the kill of the
+    // Git user and the removal of its files outside the volume): only the kill of the owner's processes; the owner's
+    // files are legitimate, so no walk at all.
+    expect(quiet).toEqual([['setpriv', ...privilegeArgs(1000, 1000), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ')]);
+    expect(quiet).not.toContain(kill);
+    expect(quiet).not.toContain(rootWalk);
+    expect(quiet).not.toContain(volumeWalk);
+  });
+});
+
+describe('the override folder before a read step (review round 1 of PR #82, B-R1-5)', () => {
+  it('review round 1 of PR #82, B-R1-5: a read step starts without the files that earlier root steps left below OVERRIDE_FOLDER (a folder with files)', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-override-'));
+    const override = path.join(temp, 'override');
+    try {
+      // What `up` or `build` of a Compose configuration leaves there: our configuration and a folder of files.
+      fs.mkdirSync(path.join(override, 'compose'), { recursive: true });
+      fs.writeFileSync(path.join(override, 'devcontainer.json'), '{}');
+      fs.writeFileSync(path.join(override, 'compose', 'model.json'), '{}');
+      const real = (name: string) => (name === OVERRIDE_FOLDER ? override : name);
+      const operations = batchHelperOperations({
+        spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
+        runQuiet: async () => {},
+        fs: {
+          lstatSync: ownedLstat as never,
+          chmodSync: (() => {}) as never,
+          chownSync: (() => {}) as never,
+          readdirSync: (() => []) as never,
+          // The real rmSync on the real folder: without `recursive`, a folder is refused (EISDIR or ERR_FS_EISDIR).
+          rmSync: ((name: string, rmOptions: fs.RmOptions) => fs.rmSync(real(name), rmOptions)) as never,
+          // User decision of 2026-10-01 (Compose reads as the repository owner): the folder is made new for the step.
+          mkdirSync: ((name: string, mkdirOptions: fs.MakeDirectoryOptions) => fs.mkdirSync(real(name), mkdirOptions)) as never,
+        },
+        env: {},
+      });
+      expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+      expect(fs.existsSync(override)).toBe(false);
+      // Also when there is nothing to remove.
+      expect(await operations.composeHash({ repository: 'octo/hello', model: '{}', project: 'p' }, context())).toEqual({ exitCode: 0 });
+      expect(fs.existsSync(override)).toBe(false);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the override folder is cleared before a read step runs (review round 3 of PR #82, B-R3-2)', () => {
+  it('review round 3 of PR #82, B-R3-2: the files that a root step left below OVERRIDE_FOLDER are gone when the read step starts, not only after it', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-override-'));
+    const override = path.join(temp, 'override');
+    try {
+      // What readConfiguration with Compose files leaves there as root: the model that composeHash writes to as well.
+      fs.mkdirSync(path.join(override, 'compose'), { recursive: true });
+      fs.writeFileSync(path.join(override, 'compose', 'model.json'), '{"root":true}');
+      const real = (name: string) => (name === OVERRIDE_FOLDER ? override : name);
+      const events: string[] = [];
+      const started: { resolve: () => void; promise: Promise<void> } = (() => {
+        let resolve!: () => void;
+        return { promise: new Promise<void>((r) => (resolve = r)), resolve };
+      })();
+      let exit!: (value: { exitCode: number | null }) => void;
+      const operations = batchHelperOperations({
+        spawnStep: () => {
+          const content = fs.existsSync(override) ? `present, ${fs.readdirSync(override).length === 0 ? 'empty' : 'with files'}` : 'gone';
+          events.push(`spawn (override folder ${content})`);
+          started.resolve();
+          return { exited: new Promise((resolve) => (exit = resolve)), killGroup: () => {} };
+        },
+        runQuiet: async () => {},
+        fs: {
+          lstatSync: ownedLstat as never,
+          chmodSync: (() => {}) as never,
+          chownSync: (() => {}) as never,
+          readdirSync: (() => []) as never,
+          // User decision of 2026-10-01 (Compose reads as the repository owner): the folder is made new for the step.
+          mkdirSync: ((name: string, mkdirOptions: fs.MakeDirectoryOptions) => {
+            events.push(name === OVERRIDE_FOLDER ? 'mkdir override folder' : `mkdir ${name}`);
+            if (name === OVERRIDE_FOLDER) fs.mkdirSync(real(name), mkdirOptions);
+          }) as never,
+          rmSync: ((name: string, rmOptions: fs.RmOptions) => {
+            // Review round 4 of PR #82 (A-R4-1): only the stand-in of OVERRIDE_FOLDER is ever removed for real; any other
+            // path is recorded, never a path of the machine that runs the tests.
+            if (name !== OVERRIDE_FOLDER) {
+              events.push(`rm ${name}`);
+              return;
+            }
+            events.push('rm override folder');
+            fs.rmSync(real(name), rmOptions);
+          }) as never,
+        },
+        env: {},
+      });
+      const running = operations.composeHash({ repository: 'octo/hello', model: '{}', project: 'p' }, context());
+      await started.promise;
+      // User decision of 2026-10-01: Compose reads as the repository owner. Changed expectation (option A: the folder
+      // was gone at the spawn): the files of root are gone, and the folder is new and empty for the owner.
+      expect(events).toEqual(['rm override folder', 'mkdir override folder', 'spawn (override folder present, empty)']);
+      expect(fs.existsSync(path.join(override, 'compose', 'model.json'))).toBe(false);
+      exit({ exitCode: 0 });
+      expect(await running).toEqual({ exitCode: 0 });
+      // User decision of 2026-10-01: after the step, root removes the folder of the owner again.
+      expect(events).toEqual(['rm override folder', 'mkdir override folder', 'spawn (override folder present, empty)', 'rm override folder']);
+      expect(fs.existsSync(override)).toBe(false);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
 });

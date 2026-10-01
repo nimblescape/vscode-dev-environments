@@ -28,7 +28,10 @@ describe('the token in the memory of a real container (review of unit 15)', () =
   });
 
   const exec: ContainerExec = async (container, command, options) => {
-    const result = cli.run(['exec', ...(options.input === undefined ? [] : ['-i']), ...(options.user ? ['-u', options.user] : []), container, ...command], options.input);
+    // Plan step 6, PR C (Q4): the token write passes the token as the secret input of the call; this stand-in for the
+    // worker's `docker exec -i` writes it to standard input as the worker does.
+    const input = options.secretInput ?? options.input;
+    const result = cli.run(['exec', ...(input === undefined ? [] : ['-i']), ...(options.user ? ['-u', options.user] : []), container, ...command], input);
     return { exitCode: result.code ?? -1, stdout: result.out, stderr: result.err, timedOut: false };
   };
 

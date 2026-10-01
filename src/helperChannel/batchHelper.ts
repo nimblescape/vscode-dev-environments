@@ -16,11 +16,19 @@
 // user is killed, its files in /workspaces get root (as the clone of the per-step helper had), its files elsewhere in the
 // container are removed, and the modes are restored. The variables of a step are set on its process only, after the
 // variables of the container; the secret is only ever the standard input of a step, and is masked in all output.
+//
+// User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."): the
+// Docker Compose read steps (composeModel, composeHash), and by the agreed extension of the same day readFiles,
+// listConfigs and createFolders, run as the user that owns the repository folder (its uid:gid,
+// read with lstat at step time; as root when root owns it), with HOME=/nonexistent. CONFIG_FOLDER is root's and 0700
+// during the step (it belongs to that user otherwise); OVERRIDE_FOLDER is new, empty and that user's for the step, and
+// is removed after it. After the step every process of that user is killed (not when it is root); its files elsewhere
+// are legitimate and stay (no walk).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { CHANNEL_KILL_GRACE_MS } from '../core/helperChannel/protocol';
 import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -30,10 +38,22 @@ export const BATCH_GIT_HOME = '/nonexistent';
 /** After a step ended, its pipes are closed after this time when a process outside its group still holds them. */
 const PIPE_CLOSE_MS = 2_000;
 
+/** The user and group nobody: a step for a repository folder that is not a real folder (asRepositoryOwner). */
+const NOBODY_ID = 65534;
+
+/** The arguments of `setpriv` before the command of a step that runs as `uid`:`gid` (no groups, capabilities, new privileges). */
+export function privilegeArgs(uid: number, gid: number): string[] {
+  return ['--reuid', String(uid), '--regid', String(gid), '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
+}
+
 /** The arguments of `setpriv` before the command of a Git step. */
 export function gitPrivilegeArgs(): string[] {
-  const id = String(BATCH_GIT_UID);
-  return ['--reuid', id, '--regid', id, '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
+  return privilegeArgs(BATCH_GIT_UID, BATCH_GIT_UID);
+}
+
+/** The command that kills every process of the user of `args` (privilegeArgs), the helper's cleanup after a step. */
+function killAllCommand(args: readonly string[]): string[] {
+  return ['setpriv', ...args, 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'];
 }
 
 /** A started step process (a process group of its own). */
@@ -50,7 +70,7 @@ export interface BatchHelperDeps {
   /** Runs a fixed command of the helper itself (no output, never fails). */
   runQuiet(command: readonly string[]): Promise<void>;
   /** The file system calls of the preparation of a Git step (the real `fs`). */
-  fs: Pick<typeof fs, 'lstatSync' | 'chmodSync' | 'chownSync' | 'readdirSync' | 'rmSync'>;
+  fs: Pick<typeof fs, 'lstatSync' | 'chmodSync' | 'chownSync' | 'readdirSync' | 'rmSync' | 'mkdirSync'>;
   /** The environment of the helper process. */
   env: NodeJS.ProcessEnv;
   /** Why the helper is not safe to run steps (prepareBatchHelper), or undefined. */
@@ -67,15 +87,19 @@ export function describeStep(step: BatchStepCommand): string {
       : command[0] === 'node' && command[1] === '-e'
         ? ['node', '<script>', ...command.slice(3)]
         : command;
-  return `${step.git ? `(as ${BATCH_GIT_UID}) ` : ''}${shown.join(' ')}`;
+  const user = step.git ? `(as ${BATCH_GIT_UID}) ` : step.owner !== undefined ? `(as the owner of ${step.owner}) ` : '';
+  return `${user}${shown.join(' ')}`;
 }
 
-/** The environment of a step process: the helper's, the step's, the Compose switches; for Git its HOME. */
+/**
+ * The environment of a step process: the helper's, the step's, the Compose switches; for Git, and for a step as the
+ * owner of the repository (user decision of 2026-10-01), HOME=/nonexistent (no configuration of root's HOME).
+ */
 export function stepEnvironment(base: NodeJS.ProcessEnv, step: BatchStepCommand): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base, ...step.env, ...COMPOSE_REMOTE_OFF };
   // Never a variable that points the tools elsewhere, whatever the image set.
   delete env.DOCKER_HOST;
-  if (step.git) {
+  if (step.git || step.owner !== undefined) {
     env.HOME = BATCH_GIT_HOME;
     delete env.XDG_CONFIG_HOME;
   }
@@ -104,12 +128,26 @@ async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
+/**
+ * Review round 1 of PR #82 (A-R1-2): the state of one helper process. A Git step is cut off only when the whole helper
+ * was killed (its `finally` runs to its end otherwise, also after a cancel or the time limit of the step), and the next
+ * helper is a new process: so repairCutOffGitStep runs once per process, before its first Git step, and never again.
+ */
+interface GitUserState {
+  repaired: boolean;
+}
+
 /** Runs `run` with the folders of the Git user opened for the step, and cleans up after it (see the module comment). */
-async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: () => Promise<T>): Promise<T> {
+async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: BatchStepCommand, run: () => Promise<T>): Promise<T> {
   const restores: Array<() => void> = [];
   const uid = String(BATCH_GIT_UID);
   try {
-    await repairCutOffGitStep(deps, uid);
+    // Review round 1 of PR #82 (A-R1-2): once per helper process (see GitUserState), so that no step of the Git user
+    // finds files of its own in the volume that a killed helper left.
+    if (!state.repaired) {
+      await repairCutOffGitStep(deps, uid);
+      state.repaired = true;
+    }
     const config = lstatOrUndefined(deps, CONFIG_FOLDER);
     if (config?.isDirectory()) {
       deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
@@ -134,7 +172,7 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
     // PR #80, A-R1-1: before the slow walks, which a kill of the whole helper may cut off); then the temporary folders
     // of its clone (A-R1-2: a clone whose own cleanup was cut off by its kill), and its files outside the volume; in the
     // volume its files get root, as the clone of the per-step helper (which ran as root) left them.
-    await deps.runQuiet(['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']);
+    await deps.runQuiet(killAllCommand(gitPrivilegeArgs()));
     try {
       for (const restore of restores.reverse()) restore();
     } finally {
@@ -143,11 +181,71 @@ async function asGitUser<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: 
   }
 }
 
-/** The files of the Git user after its step (its processes are gone): see the comment in asGitUser. */
+/**
+ * The files of the Git user after its step (its processes are gone): see the comment in asGitUser. (User decision of
+ * 2026-10-01: the Compose read steps no longer run as the Git user, so every step of it is the clone, a writing step.)
+ */
 async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string): Promise<void> {
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
   await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
+}
+
+/**
+ * User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."): runs
+ * `run` as the owner of the repository folder `step.owner` (see the module comment). `run` gets the arguments of
+ * `setpriv` for that user, or undefined when root owns the folder (then the step runs as root).
+ */
+async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepCommand, run: (privilege: string[] | undefined) => Promise<T>): Promise<T> {
+  const folder = step.owner!;
+  // At step time, the folder that the step reads: a real folder (no link), whose owner the step runs as.
+  const repository = lstatOrUndefined(deps, folder);
+  // Review round 5 of PR #82 (A-R5-1): a missing folder, a link or no folder runs the step as nobody (never as root), so
+  // that its script reports it as before (readFiles: no configuration; listConfigs: none).
+  const real = repository !== undefined && !repository.isSymbolicLink() && repository.isDirectory();
+  const { uid, gid } = real ? repository : { uid: NOBODY_ID, gid: NOBODY_ID };
+  const privilege = uid === 0 ? undefined : privilegeArgs(uid, gid);
+  const restores: Array<() => void> = [];
+  try {
+    // CONFIG_FOLDER belongs to the owner of the repository (GIT_FILES_SCRIPT): for the step it is root's and 0700, so
+    // that Compose (which follows `env_file` and `include` of the repository) cannot read it. For a root owner this
+    // protects nothing (accepted, docs/implementation-notes.md §17).
+    const config = lstatOrUndefined(deps, CONFIG_FOLDER);
+    if (config?.isDirectory()) {
+      // Review round 5 of PR #82 (A-R5-2): root:root 0700 is only what a killed step left (GIT_FILES_SCRIPT leaves 0755):
+      // it goes back to the owner of a real repository folder, with 0755.
+      const cutOff = config.uid === 0 && config.gid === 0 && (config.mode & 0o7777) === 0o700 && real;
+      const back = cutOff ? { uid: repository.uid, gid: repository.gid, mode: 0o755 } : { uid: config.uid, gid: config.gid, mode: config.mode & 0o7777 };
+      restores.push(() => {
+        deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
+        deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
+      });
+      deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
+      deps.fs.chownSync(CONFIG_FOLDER, 0, 0);
+    }
+    // Review rounds 1 and 3 of PR #82 (B-R1-5, B-R3-2): the step starts without the files that root steps before it
+    // left below OVERRIDE_FOLDER. The folder is new, empty, the owner's and 0700 (the Compose hash writes its model
+    // there); after the step it is removed as root, so that no later root step writes into a folder of that user.
+    deps.fs.rmSync(OVERRIDE_FOLDER, { recursive: true, force: true });
+    restores.push(() => deps.fs.rmSync(OVERRIDE_FOLDER, { recursive: true, force: true }));
+    deps.fs.mkdirSync(OVERRIDE_FOLDER, { mode: 0o700 });
+    if (uid !== 0) deps.fs.chownSync(OVERRIDE_FOLDER, uid, gid);
+    return await run(privilege);
+  } finally {
+    // No process of the owner outlives its step (never for root: that would end the helper; its group ends with the
+    // step); then the modes are restored. The files of the owner elsewhere are its own (no walk, no removal).
+    if (privilege !== undefined) await deps.runQuiet(killAllCommand(privilege));
+    // Review round 5 of PR #82 (A-R5-3): each restore runs, also when one before it throws; the first error is rethrown.
+    let failure: { error: unknown } | undefined;
+    for (const restore of restores.reverse()) {
+      try {
+        restore();
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+    if (failure !== undefined) throw failure.error;
+  }
 }
 
 function lstatOrUndefined(deps: BatchHelperDeps, path: string): fs.Stats | undefined {
@@ -159,8 +257,8 @@ function lstatOrUndefined(deps: BatchHelperDeps, path: string): fs.Stats | undef
 }
 
 /** Runs one step process until it ends; the signal ends its group (SIGTERM, then SIGKILL). */
-async function runStep(deps: BatchHelperDeps, step: BatchStepCommand, input: string | undefined, context: OperationContext): Promise<number | null> {
-  const command = step.git ? ['setpriv', ...gitPrivilegeArgs(), ...step.command] : step.command;
+async function runStep(deps: BatchHelperDeps, step: BatchStepCommand, input: string | undefined, context: OperationContext, privilege?: readonly string[]): Promise<number | null> {
+  const command = privilege !== undefined ? ['setpriv', ...privilege, ...step.command] : step.command;
   const started = Date.now();
   context.log(`$ ${describeStep(step)}`);
   let child: StepProcess;
@@ -189,6 +287,7 @@ async function runStep(deps: BatchHelperDeps, step: BatchStepCommand, input: str
 /** The operations of the batch helper: one per step kind, one step at a time. */
 export function batchHelperOperations(deps: BatchHelperDeps): Record<string, OperationHandler> {
   let running = false;
+  const gitUser: GitUserState = { repaired: false };
   const handler: (kind: string) => OperationHandler = (kind) => async (params, context) => {
     let step: BatchStepCommand;
     try {
@@ -204,7 +303,11 @@ export function batchHelperOperations(deps: BatchHelperDeps): Record<string, Ope
     try {
       context.progress(kind);
       const input = step.secret === 'stdin' ? context.secret : step.input;
-      const exitCode = step.git ? await asGitUser(deps, step, () => runStep(deps, step, input, context)) : await runStep(deps, step, input, context);
+      const exitCode = step.git
+        ? await asGitUser(deps, gitUser, step, () => runStep(deps, step, input, context, gitPrivilegeArgs()))
+        : step.owner !== undefined
+          ? await asRepositoryOwner(deps, step, (privilege) => runStep(deps, step, input, context, privilege))
+          : await runStep(deps, step, input, context);
       return { exitCode };
     } finally {
       // Review round 1 of PR #80 (B-R1-4): the slot is free again also when the secrets cannot be cleared (that step

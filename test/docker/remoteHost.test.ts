@@ -36,8 +36,8 @@ import {
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
-import { FakeEnvironmentLock } from '../../src/core/pipeline/environmentService.testkit';
 import { isoTime, systemClock } from '../../src/core/ports';
+import { workerLocks, type WorkerLocks } from './workerLocks';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
@@ -186,8 +186,12 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     }
   });
 
-  afterAll(() => {
+  /** Plan step 6, PR C: the workers of the open through SSH (disposed by the test, and here after a failure). */
+  let remoteLocks: WorkerLocks | undefined;
+
+  afterAll(async () => {
     timings.print('Timings of the remote Docker host scenarios:');
+    await remoteLocks?.dispose();
     removeRunObjects(localCli, run.runId);
     expect(localCli.container(containerName)).toBeUndefined();
     expect(localCli.volume(volumeName)).toBeUndefined();
@@ -239,11 +243,17 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     paths.ensureDirectoriesSync();
     const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
     const sessionFiles = new SessionFiles(paths);
+    // Plan step 6, PR C: the real worker of the engine reached through SSH (as extension.ts: the socket of that computer),
+    // whose batch helper runs the helper steps of the open; there is no other path (D1).
+    const locks = workerLocks({ run, cli: localCli, log }, docker, targets, 'remoteHost', async (target) =>
+      target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint),
+    );
+    remoteLocks = locks;
     const service = new EnvironmentService({
       analyzer: inProcessAnalyzer,
-      // Plan step 5, PR B (D1: no unlocked path): the lock is required; this file is not about it, so a lock that is always
-      // granted, whose plain Docker calls run directly as before.
-      environmentLock: new FakeEnvironmentLock((args, options) => docker.runDirect(args, options)).take,
+      // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
+      // was always granted, whose plain Docker calls ran directly): the real lock of the worker on the remote engine.
+      environmentLock: locks.take,
       docker,
       runner,
       helper,
@@ -329,5 +339,9 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     await useRemoteContext(docker, ALIAS);
     await targets.withOperation(() => service.stop(environmentId));
     expect(localCli.container(containerName)?.State.Running).toBe(false);
+    // Plan step 6, PR C: the open ran its helper steps in one batch helper of the worker on the remote engine; no worker
+    // and no batch helper is left over.
+    expect(locks.batches.get(environmentId)).toHaveLength(1);
+    expect(await locks.dispose()).toEqual([]);
   });
 });

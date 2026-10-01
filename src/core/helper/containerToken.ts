@@ -7,7 +7,9 @@
 // the override configuration adds (TOKEN_TMPFS). The extension writes them with `docker exec -i -u root` after each start
 // of an open (the container runs then), with the token on standard input only: never on a command line, in a variable
 // of the container, or in a log. They are gone when the container stops; a start without a window of the extension (the
-// Session Monitor, `docker start`) leaves the folder empty until the next open. No vscode import.
+// Session Monitor, `docker start`) leaves the folder empty until the next open. Plan step 6, PR C (Q4 of 2026-10-01): the
+// write goes through the worker that holds the lock of the environment (`docker exec -i` there), with the token as the
+// secret input of the call (ContainerAdapter.exec `secretInput`), never as a direct `docker exec`. No vscode import.
 import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER } from '../names';
 import { isGitHubLogin } from './containerGit';
@@ -331,7 +333,7 @@ export function tokenLogin(login: string): string {
 export type ContainerExec = (
   container: string,
   command: readonly string[],
-  options: { user?: string; input?: string; signal?: AbortSignal; timeoutMs?: number },
+  options: { user?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number },
 ) => Promise<RunResult>;
 
 /** The text of a failed run of the scripts, without the token. */
@@ -352,7 +354,8 @@ export async function writeContainerToken(
   if (!p.token || /\s/.test(p.token)) throw new Error('No valid GitHub token.');
   const result = await exec(p.container, tokenWriteCommand(p.user, tokenLogin(p.login)), {
     user: 'root',
-    input: p.token,
+    // Plan step 6, PR C (Q4): the secret input of the call, through the worker that holds the lock.
+    secretInput: p.token,
     signal: p.signal,
     timeoutMs: p.timeoutMs,
   });

@@ -694,7 +694,10 @@ describe('writeContainerToken', () => {
     const [container, command, options] = exec.mock.calls[0];
     expect(container).toBe('c1');
     expect(command).toEqual(tokenWriteCommand('dev', 'scalarion'));
-    expect(options).toMatchObject({ user: 'root', input: TOKEN, timeoutMs: 1000 });
+    // Plan step 6, PR C (Q4 of 2026-10-01): changed expectation (before: `input: TOKEN`): the token is the secret input of
+    // the call, which goes only through the worker that holds the lock (ContainerAdapter.exec), never a plain input.
+    expect(options).toMatchObject({ user: 'root', secretInput: TOKEN, timeoutMs: 1000 });
+    expect(options).not.toHaveProperty('input');
     expect(command.some((arg) => arg.includes(TOKEN))).toBe(false);
   });
 

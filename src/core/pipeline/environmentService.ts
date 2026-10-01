@@ -13,7 +13,7 @@ import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
+import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
@@ -60,6 +60,8 @@ import {
 } from '../helper/configurationAnalysis';
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
+import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
+import { channelStepLabel, newCleanupLabel } from '../helperChannel/protocol';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
@@ -1366,6 +1368,8 @@ export class EnvironmentService {
     // (removeFailedFirstOpen keeps the entry whenever the volume cannot be removed); nothing is removed without the lock.
     let locked = false;
     try {
+      // Plan step 6, PR C: with the batch scope of the volume `name` (one batch helper for the steps of the open; it opens
+      // at the first volume step, after createVolume, and closes before the lock is released).
       return await this.withEnvironmentLock(environment, signal, async () => {
         locked = true;
         try {
@@ -1388,7 +1392,7 @@ export class EnvironmentService {
           }
           throw error;
         }
-      });
+      }, { batchVolume: name });
     } catch (error) {
       if (!locked) await this.removeRefusedFirstOpen(environment);
       throw error;
@@ -1437,7 +1441,10 @@ export class EnvironmentService {
       // again (recoverMissingFiles, with its Delete, which holds the lock already: re-entrant), the resumed clone, and the
       // pipeline. D1: without the helper image or the worker the open is refused before anything is changed; D3: a lock
       // held elsewhere is refused after 10 s. The lock stays held while a question to the user is open (user decision Q3
-      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state.
+      // of 2026-10-01). The `finally` below runs after the release and changes no Docker state. Plan step 6, PR C: with the
+      // batch scope of the volume (batchScope.ts): every helper step of the open runs in one batch helper of the
+      // operation, opened at the first volume step (after Clone again created a missing volume) and closed before the
+      // release.
       const result = await this.withEnvironmentLock(env, signal, async () => {
         let forced = options.forceRebuild === true;
         let configPath = env.configPath;
@@ -1472,7 +1479,7 @@ export class EnvironmentService {
           await this.resumeInterruptedClone(opened, defaultBranch);
         }
         return this.runPipeline(opened);
-      });
+      }, { batchVolume: env.volumeName });
       succeeded = true;
       return result;
     } finally {
@@ -1615,6 +1622,11 @@ export class EnvironmentService {
       // that is outdated would be created again, which needs the helper, too. Review round 2 of PR #64 (A-N4): whether
       // it opens as it is (a Docker listing) is asked only when the answer is needed, and a failure of the listing counts
       // as `false`, so the error of the configuration is never lost.
+      // User decision of 2026-10-01 (D1): "refuse the operation, a helper that cannot be opened is an inconsistent state,
+      // we already defined that." The refusal of the batch scope (the session cannot be opened, a lost lock, a step
+      // without a batch kind) is rethrown before the rule of 2026-09-29: Start, Rebuild and Select configuration are
+      // refused, and a running, current container is not opened as it is.
+      if (isBatchHelperUnavailable(error)) throw error;
       if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record, false)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
@@ -2727,7 +2739,7 @@ export class EnvironmentService {
         // gone, so nothing opens as it is), but the open ends with helperFailed, with the detail of the switch.
         if (helperFailed) {
           this.logger.error(`The workspace helper is not available for ${env.repository}. The switch of its configuration could not be completed.`, error);
-          throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+          throw helperFailedError(error, detail);
         }
         throw new UserFacingError('startFailed', PipelineTexts.startFailed, detail);
       }
@@ -2760,9 +2772,8 @@ export class EnvironmentService {
           const change = `The dev service changed from ${previousService} to ${loaded.compose.service}.`;
           const previous = await this.previousDevContainerAfterFailedSwitch(ctx, previousService);
           const withdrawn = ctx.upWithdrawn;
-          throw new UserFacingError(
-            'helperFailed',
-            Messages.helperFailed,
+          throw helperFailedError(
+            error,
             withdrawn !== undefined
               ? // Review round 5 of PR #68 (A-R5-2): afterUpClause, "runs already" for a container that ran before `up`.
                 `${change} ${afterUpClause(`The dev container of the service ${loaded.compose.service}`, withdrawn)} ${withdrawnOutcome(withdrawn, true)} ${previous} The previous configuration stays selected. ${causeOf(error)}`
@@ -2917,7 +2928,10 @@ export class EnvironmentService {
     this.throwIfCancelled(ctx.signal);
     this.logger.error(`The workspace helper is not available for ${ctx.env.repository}. The build or start of its environment could not be completed; the open ends.`, error);
     // Review round 1 of PR #68 (A-R1-1): with `detail`, the error says what happened to the container.
-    if (detail !== undefined) throw new UserFacingError('helperFailed', Messages.helperFailed, detail);
+    // Review round 5 of PR #82 (A-R5-4): the refusal of the batch scope keeps its message (batchHelperUnavailable).
+    if (detail !== undefined) {
+      throw helperFailedError(error, detail);
+    }
     throw error;
   }
 
@@ -4973,6 +4987,9 @@ export class EnvironmentService {
         ctx.helperUnavailable = true;
         throw error;
       }
+      // User decision of 2026-10-01 (D1): the refusal of the batch scope is no warning about the Git configuration; it
+      // refuses the operation, also for a running container that would open as it is.
+      if (isBatchHelperUnavailable(error)) throw error;
       this.logger.error(`The Git configuration of ${env.repository} could not be written.`, error);
       this.deps.ui.warn(Messages.gitSetupFailed);
     }
@@ -5199,6 +5216,7 @@ export class EnvironmentService {
     const { docker } = this.deps;
     const env = ctx.env;
     const folder = repositoryFolder(env.repository);
+    let cleanup: string | undefined;
     try {
       const user = await this.imageUser(ctx, image, runArgs);
       if (user === undefined) {
@@ -5217,16 +5235,23 @@ export class EnvironmentService {
         ctx.serviceFolders = facts.overflow ? 'repository' : facts.folders;
       }
       const [shell, ...args] = ownershipFixCommand(folder, user, ctx.resumedClone === true ? ctx.serviceFolders : undefined);
+      // Review round 1 of PR #82 (A-R1-1): a cleanup label of its own (channelStepLabel with a new value), by which a
+      // cancel or a failure removes the container before anything removes the volume, and `--init`, so that a SIGTERM
+      // ends `sh` (as PID 1 it would ignore it) and the container does not keep the volume.
+      cleanup = newCleanupLabel();
       await docker.runChecked(
         [
           'run',
           '--rm',
+          '--init',
           '--pull',
           'never',
           '--network',
           'none',
           '--label',
           `${LABEL_HELPER_RUN}=true`,
+          '--label',
+          channelStepLabel(cleanup),
           '--user',
           'root',
           '--entrypoint',
@@ -5239,9 +5264,26 @@ export class EnvironmentService {
         { timeoutMs: OWNERSHIP_TIMEOUT_MS, signal: ctx.signal },
       );
     } catch (error) {
+      // Review round 1 of PR #82 (A-R1-1): the container of the run goes first (also after a cancel, before the error
+      // reaches removeFailedFirstOpen and its volume removal).
+      if (cleanup !== undefined) await this.removeOwnershipContainers(cleanup);
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed before the container was created: ${errorDetail(error)}`);
     }
+  }
+
+  /**
+   * Review round 1 of PR #82 (A-R1-1): `docker rm -f` of the containers of a prepareOwnership run, by its cleanup label
+   * (`docker ps -aq --no-trunc --filter label=…`). Without the signal of the operation, which may be aborted: under the
+   * lock, both calls go through the worker that holds it. Best effort: a failure is logged.
+   */
+  private async removeOwnershipContainers(cleanup: string): Promise<void> {
+    await this.quietly('remove the container of the ownership fix', async () => {
+      const listed = await this.deps.docker.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(cleanup)}`], {
+        timeoutMs: IMAGE_INSPECT_TIMEOUT_MS,
+      });
+      for (const id of listed.split('\n').map((line) => line.trim()).filter((line) => line !== '')) await this.deps.docker.removeContainer(id);
+    });
   }
 
   /**
@@ -5341,6 +5383,8 @@ export class EnvironmentService {
       }
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
+      // Review round 5 of PR #82 (A-R5-4): the refusal of the batch scope (D1) refuses the operation, also after `up`.
+      if (isBatchHelperUnavailable(error)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed: ${errorMessage(error)}`);
     }
   }
@@ -6371,6 +6415,9 @@ export class EnvironmentService {
   }
 
   private async removeVolumeWithRetry(name: string): Promise<void> {
+    // Plan step 6, PR C: the batch helper of the open mounts the volume; it ends first (a later step would open a new one).
+    const scope = currentBatchScope();
+    if (scope !== undefined && scope.volume === name) await scope.closeSession();
     for (let attempt = 1; ; attempt++) {
       try {
         await this.deps.docker.removeVolume(name);
@@ -6551,7 +6598,14 @@ export class EnvironmentService {
    * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear. Plan step 6, PR A: also
    * the opens (openExisting: Start, Rebuild, Select configuration, Clone again; openFirst), see there.
    */
-  private async withEnvironmentLock<T>(env: Environment, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  private async withEnvironmentLock<T>(
+    env: Environment,
+    signal: AbortSignal | undefined,
+    fn: () => Promise<T>,
+    // Plan step 6, PR C: `batchVolume` (the opens): `fn` runs in the batch scope of that volume (batchScope.ts) under the
+    // lock; its session is closed before the lock is released.
+    options: { batchVolume?: string } = {},
+  ): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();
     try {
       // PR #74 review round 1 (A-R1-1): only a missing tag is built (no rebuild, check, or cleanup before Stop or Delete).
@@ -6575,8 +6629,9 @@ export class EnvironmentService {
       throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
     }
     this.logger.info(`${env.repository} is locked on the Docker host.`);
+    const batchVolume = options.batchVolume;
     try {
-      return await runWithEnvironmentLock(lock, fn);
+      return await runWithEnvironmentLock(lock, batchVolume === undefined ? fn : () => runWithBatchScope(lock, batchVolume, this.logger, fn));
     } finally {
       await lock.release();
       this.logger.info(`${env.repository} is unlocked on the Docker host.`);
@@ -6678,4 +6733,12 @@ export class EnvironmentService {
       this.logger.warn(`Could not ${what}: ${errorMessage(error)}`);
     }
   }
+}
+
+/**
+ * Review round 5 of PR #82 (A-R5-4): a helperFailed of Step 8 with `detail`; the refusal of the batch scope keeps its
+ * message (Messages.batchHelperUnavailable) and its kind (isBatchHelperUnavailable).
+ */
+function helperFailedError(error: unknown, detail: string): UserFacingError {
+  return isBatchHelperUnavailable(error) ? new BatchHelperUnavailableError(error.message, detail) : new UserFacingError('helperFailed', Messages.helperFailed, detail);
 }

@@ -23,14 +23,14 @@ import {
   batchVolumeArgs,
 } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
 import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage } from '../core/helperChannel/protocol';
 import { bundleHash } from '../core/loader/pipeLoader';
 import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
 import { BATCH_MISSING_VOLUME_CODE, batchChunkOperation, batchOperation, batchStepOperation, type BatchDeps } from './batch';
-import { batchHelperOperations, gitPrivilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
+import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
 import { ChannelServer, type ContextDockerOptions, type ServerChild, type SpawnDocker } from './server';
 
 const TOKEN = 'ghp_secret_token_of_the_test';
@@ -81,7 +81,7 @@ interface SetupOptions {
    * Review round 2 of PR #80, B-R2-2: what `lstat` of CONFIG_FOLDER finds: a folder (default), a symbolic link (planted by
    * the Git user while /workspaces was 1777), or nothing (it throws ENOENT).
    */
-  configFolder?: 'folder' | 'symlink' | 'missing';
+  configFolder?: 'folder' | 'symlink' | 'missing' | 'cutOff';
   /**
    * Review round 3 of PR #80, B-R3-1: the helper (a ChannelServer) reads its input only once this settles, so its hello
    * comes late; and it ignores SIGTERM (as Node.js as PID 1 of its container) and ends only by SIGKILL or its input.
@@ -89,6 +89,11 @@ interface SetupOptions {
   lateHello?: Promise<void>;
   /** Review round 3 of PR #80, B-R3-1: the kill grace time of the worker's ChannelServer (default 50 ms). */
   workerKillGraceMs?: number;
+  /**
+   * User decision of 2026-10-01: Compose reads as the repository owner. What `lstat` of the repository folder
+   * (/workspaces/hello) finds: a folder of 1000:1000 (default), of root, a symbolic link, or nothing.
+   */
+  repository?: 'user' | 'root' | 'symlink' | 'missing';
 }
 
 function setup(options: SetupOptions = {}) {
@@ -130,8 +135,18 @@ function setup(options: SetupOptions = {}) {
       lstatSync: ((path: string) => {
         // Review round 2 of PR #80, B-R2-2: CONFIG_FOLDER may be a symbolic link or missing.
         if (path === CONFIG_FOLDER && options.configFolder === 'missing') throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
-        if (path === CONFIG_FOLDER && options.configFolder === 'symlink') return { isDirectory: () => false, isSymbolicLink: () => true, mode: 0o120777 };
-        return { isDirectory: () => true, mode: path === WORKSPACES_ROOT ? (options.workspacesMode ?? 0o40755) : 0o40750 };
+        if (path === CONFIG_FOLDER && options.configFolder === 'cutOff') return { isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40700, uid: 0, gid: 0 };
+        if (path === CONFIG_FOLDER && options.configFolder === 'symlink') return { isDirectory: () => false, isSymbolicLink: () => true, mode: 0o120777, uid: 1000, gid: 1000 };
+        // User decision of 2026-10-01: Compose reads as the repository owner (the owner of /workspaces/hello).
+        if (path === `${WORKSPACES_ROOT}/hello`) {
+          if (options.repository === 'missing') throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+          if (options.repository === 'symlink') return { isDirectory: () => false, isSymbolicLink: () => true, mode: 0o120777, uid: 1000, gid: 1000 };
+          const id = options.repository === 'root' ? 0 : 1000;
+          return { isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40755, uid: id, gid: id };
+        }
+        // CONFIG_FOLDER belongs to the owner of the repository, as GIT_FILES_SCRIPT leaves it.
+        const owner = path === CONFIG_FOLDER ? 1000 : 0;
+        return { isDirectory: () => true, isSymbolicLink: () => false, mode: path === WORKSPACES_ROOT ? (options.workspacesMode ?? 0o40755) : 0o40750, uid: owner, gid: owner };
       }) as never,
       chmodSync: ((path: string, mode: number) => {
         fsCalls.push(`chmod ${path} ${mode.toString(8)}`);
@@ -140,6 +155,7 @@ function setup(options: SetupOptions = {}) {
       chownSync: ((path: string, uid: number, gid: number) => fsCalls.push(`chown ${path} ${uid}:${gid}`)) as never,
       readdirSync: (() => ['github-token']) as never,
       rmSync: ((path: string) => fsCalls.push(`rm ${path}`)) as never,
+      mkdirSync: ((path: string, mkdirOptions: { mode: number }) => fsCalls.push(`mkdir ${path} ${mkdirOptions.mode.toString(8)}`)) as never,
     },
     env: { PATH: '/usr/bin', HOME: '/root', DOCKER_HOST: 'tcp://elsewhere:2375', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'true' },
   };
@@ -281,7 +297,7 @@ function setup(options: SetupOptions = {}) {
   };
   const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
   const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
-  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperExit: (code: number | null) => helperExit?.(code) };
+  return { calls, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperDeps, helperExit: (code: number | null) => helperExit?.(code) };
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -406,10 +422,293 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     const kill = t.order.findIndex((entry) => entry.includes('kill -9 -1'));
     // Review round 2 of PR #80 (A-R2-3): the mode of the secrets tmpfs is restored first (the restores run in reverse).
     expect(t.order.slice(kill + 1, kill + 4)).toEqual([`chmod ${SECRETS_FOLDER} 700`, `chmod ${WORKSPACES_ROOT} 755`, `chmod ${CONFIG_FOLDER} 750`]);
-    // A root step runs without setpriv and without the token.
-    await session.step('listConfigs', { repository: 'octo/hello' });
-    expect(t.steps[1].command[0]).toBe('node');
+    // A root step runs without setpriv and without the token. (User decision of 2026-10-01, agreed extension:
+    // listConfigs runs as the repository owner now, so the root step here is gitFiles, and listConfigs gets the owner's
+    // setpriv, without the token.)
+    await session.step('gitFiles', { repository: 'octo/hello', identity: { name: 'n', email: 'e' } });
+    expect(t.steps[1].command[0]).toBe('sh');
     expect(t.steps[1].input).toBeUndefined();
+    await session.step('listConfigs', { repository: 'octo/hello' });
+    expect(t.steps[2].command).toEqual(['setpriv', ...privilegeArgs(1000, 1000), ...batchStepCommand('listConfigs', { repository: 'octo/hello' }).command]);
+    expect(t.steps[2].input).toBeUndefined();
+  });
+
+  // User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."; it
+  // replaces option A, under which these steps ran as the unprivileged Git user): the Compose read steps run as the owner
+  // of the repository folder (1000:1000 here), with HOME=/nonexistent and no secret. CONFIG_FOLDER (the owner's) is
+  // root's and 0700 during the step and gets its owner and mode back; OVERRIDE_FOLDER is cleared, made new for the owner
+  // (0700) and removed after the step; /workspaces is not opened. After the step only the owner's processes are killed:
+  // no walk of the volume, no removal of the owner's files, no repair of a cut-off Git step.
+  // User decision of 2026-10-01, agreed extension: readFiles, listConfigs and createFolders run as the owner the same way.
+  it('runs the Compose read steps, readFiles, listConfigs and createFolders as the repository owner (user decision of 2026-10-01)', async () => {
+    const { t, session } = await started();
+    for (const [kind, params] of [
+      ['composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }],
+      ['composeHash', { repository: 'octo/hello', model: '{}', project: 'p' }],
+      ['readFiles', { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }],
+      ['listConfigs', { repository: 'octo/hello' }],
+      ['createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] }],
+    ] as const) {
+      t.fsCalls.length = 0;
+      t.quiet.length = 0;
+      const index = t.steps.length;
+      const result = await session.step(kind, params);
+      expect(result.exitCode, kind).toBe(0);
+      const step = t.steps[index];
+      // User decision of 2026-10-01: Compose reads as the repository owner (was: setpriv as the Git user, option A).
+      expect(step.command, kind).toEqual(['setpriv', ...privilegeArgs(1000, 1000), ...batchStepCommand(kind, params).command]);
+      expect(privilegeArgs(1000, 1000)).toEqual(['--reuid', '1000', '--regid', '1000', '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--']);
+      expect(step.env.HOME, kind).toBe('/nonexistent');
+      if (kind === 'composeModel' || kind === 'composeHash') expect(step.env.COMPOSE_PROJECT_NAME, kind).toBe('p');
+      expect(step.input, kind).toBe(batchStepCommand(kind, params).input);
+      // User decision of 2026-10-01: Compose reads as the repository owner (CONFIG_FOLDER is also made root's for the
+      // step, since it belongs to the owner; OVERRIDE_FOLDER is made new for the owner and removed after the step).
+      expect(t.fsCalls, kind).toEqual([
+        `chmod ${CONFIG_FOLDER} 700`,
+        `chown ${CONFIG_FOLDER} 0:0`,
+        `rm ${OVERRIDE_FOLDER}`,
+        `mkdir ${OVERRIDE_FOLDER} 700`,
+        `chown ${OVERRIDE_FOLDER} 1000:1000`,
+        `rm ${OVERRIDE_FOLDER}`,
+        `chown ${CONFIG_FOLDER} 1000:1000`,
+        `chmod ${CONFIG_FOLDER} 750`,
+      ]);
+      // User decision of 2026-10-01: Compose reads as the repository owner. After its step only the kill of its
+      // processes; never a walk of the volume, a removal of its files, or the repair of a cut-off Git step.
+      expect(t.quiet, kind).toEqual([['setpriv', ...privilegeArgs(1000, 1000), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']]);
+    }
+    // User decision of 2026-10-01, agreed extension (was: createFolders stays root): the steps that need the Docker
+    // socket stay root, without setpriv.
+    await session.step('up', UP);
+    expect(t.steps.at(-1)!.command).toEqual(batchStepCommand('up', UP).command);
+  });
+
+  // User decision of 2026-10-01: Compose reads as the repository owner; a repository of root is read as root (no
+  // setpriv, and no `kill -9 -1`, which would end the helper itself), with HOME=/nonexistent all the same.
+  it('runs the Compose read steps as root when root owns the repository (user decision of 2026-10-01)', async () => {
+    const { t, session } = await started({ repository: 'root' });
+    const params = { repository: 'octo/hello', model: '{}', project: 'p' };
+    expect((await session.step('composeHash', params)).exitCode).toBe(0);
+    expect(t.steps[0].command).toEqual(batchStepCommand('composeHash', params).command);
+    expect(t.steps[0].env.HOME).toBe('/nonexistent');
+    expect(t.fsCalls).toEqual([
+      `chmod ${CONFIG_FOLDER} 700`,
+      `chown ${CONFIG_FOLDER} 0:0`,
+      `rm ${OVERRIDE_FOLDER}`,
+      `mkdir ${OVERRIDE_FOLDER} 700`,
+      `rm ${OVERRIDE_FOLDER}`,
+      `chown ${CONFIG_FOLDER} 1000:1000`,
+      `chmod ${CONFIG_FOLDER} 750`,
+    ]);
+    expect(t.quiet).toEqual([]);
+  });
+
+  for (const repository of ['symlink', 'missing'] as const) {
+    // Review round 5 of PR #82 (A-R5-1): a repository folder that is not a real folder runs the step as nobody (never as
+    // root), so that its script reports it as before (no configuration); the session is not refused.
+    it(`runs a step as nobody when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'} (A-R5-1)`, async () => {
+      const { t, session } = await started({ repository });
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand('readFiles', params).command]);
+      expect(t.fsCalls).toContain(`chown ${OVERRIDE_FOLDER} 65534:65534`);
+      expect(t.quiet).toEqual([['setpriv', ...privilegeArgs(65534, 65534), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']]);
+      expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
+    });
+  }
+
+  // Review round 5 of PR #82 (A-R5-2): a CONFIG_FOLDER that a killed owner step left root:root 0700 goes back to the owner.
+  it('gives a cut-off CONFIG_FOLDER back to the repository owner with 0755 after an owner step (A-R5-2)', async () => {
+    const { t, session } = await started({ configFolder: 'cutOff' });
+    expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
+    expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 755`]);
+  });
+
+  // Review round 5 of PR #82 (A-R5-3): the restore of CONFIG_FOLDER runs also when the removal of OVERRIDE_FOLDER throws.
+  it('restores CONFIG_FOLDER also when the removal of OVERRIDE_FOLDER fails after an owner step (A-R5-3)', async () => {
+    const { t, session } = await started();
+    const { helperDeps } = t;
+    let removals = 0;
+    const rmSync = helperDeps.fs.rmSync;
+    helperDeps.fs.rmSync = ((path: string, options: unknown) => {
+      removals += 1;
+      if (removals === 2) throw new Error('EBUSY');
+      return (rmSync as (p: string, o: unknown) => void)(path, options);
+    }) as never;
+    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'failed' });
+    expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 750`]);
+  });
+
+  // Review round 5 of PR #82 (B-R5-1): the uid and the gid of the repository owner are kept apart (every other fake has
+  // uid === gid). 1001:0 (an arbitrary uid with group root) runs as 1001:0, never as root; 0:1000 is root (decided by the
+  // uid only). CONFIG_FOLDER gets its own uid:gid back, OVERRIDE_FOLDER is the owner's uid:gid.
+  for (const [repoUid, repoGid] of [
+    [1001, 0],
+    [0, 1000],
+  ] as const) {
+    for (const configFolder of ['folder', 'cutOff'] as const) {
+      it(`review round 5 of PR #82, B-R5-1: an owner step of a repository of ${repoUid}:${repoGid} (CONFIG_FOLDER ${configFolder}) keeps uid and gid apart`, async () => {
+        const { t, session } = await started();
+        const { helperDeps } = t;
+        const lstatSync = helperDeps.fs.lstatSync as (path: string) => unknown;
+        const folder = (uid: number, gid: number, mode: number) => ({ isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40000 | mode, uid, gid });
+        Object.assign(helperDeps.fs, {
+          lstatSync: (path: string) => {
+            if (path === `${WORKSPACES_ROOT}/hello`) return folder(repoUid, repoGid, 0o755);
+            if (path === CONFIG_FOLDER) return configFolder === 'cutOff' ? folder(0, 0, 0o700) : folder(1001, 1002, 0o750);
+            return lstatSync(path);
+          },
+        });
+        const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+        expect((await session.step('readFiles', params)).exitCode).toBe(0);
+        const restored = configFolder === 'cutOff' ? [`chown ${CONFIG_FOLDER} ${repoUid}:${repoGid}`, `chmod ${CONFIG_FOLDER} 755`] : [`chown ${CONFIG_FOLDER} 1001:1002`, `chmod ${CONFIG_FOLDER} 750`];
+        if (repoUid === 0) {
+          // Root (by the uid): no setpriv, no `kill -9 -1`, no chown of OVERRIDE_FOLDER.
+          expect(t.steps[0].command).toEqual(batchStepCommand('readFiles', params).command);
+          expect(t.quiet).toEqual([]);
+          expect(t.fsCalls).toEqual([`chmod ${CONFIG_FOLDER} 700`, `chown ${CONFIG_FOLDER} 0:0`, `rm ${OVERRIDE_FOLDER}`, `mkdir ${OVERRIDE_FOLDER} 700`, `rm ${OVERRIDE_FOLDER}`, ...restored]);
+        } else {
+          const privilege = ['--reuid', '1001', '--regid', '0', '--clear-groups', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
+          expect(t.steps[0].command).toEqual(['setpriv', ...privilege, ...batchStepCommand('readFiles', params).command]);
+          expect(t.quiet).toEqual([['setpriv', ...privilege, 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0']]);
+          expect(t.fsCalls).toEqual([
+            `chmod ${CONFIG_FOLDER} 700`,
+            `chown ${CONFIG_FOLDER} 0:0`,
+            `rm ${OVERRIDE_FOLDER}`,
+            `mkdir ${OVERRIDE_FOLDER} 700`,
+            `chown ${OVERRIDE_FOLDER} 1001:0`,
+            `rm ${OVERRIDE_FOLDER}`,
+            ...restored,
+          ]);
+        }
+      });
+    }
+  }
+
+  // Review round 6 of PR #82 (B-R6-1): a cut-off CONFIG_FOLDER goes back to an owner only when the repository folder is
+  // real. With a link or a missing folder the step runs as nobody, and CONFIG_FOLDER keeps root:root 0700 (never the
+  // owner of the link, never nobody).
+  for (const repository of ['symlink', 'missing'] as const) {
+    it(`review round 6 of PR #82, B-R6-1: a cut-off CONFIG_FOLDER stays root:root 0700 when the repository folder is ${repository === 'symlink' ? 'a symbolic link' : 'missing'}`, async () => {
+      const { t, session } = await started({ repository, configFolder: 'cutOff' });
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.steps[0].command).toEqual(['setpriv', ...privilegeArgs(65534, 65534), ...batchStepCommand('readFiles', params).command]);
+      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} 0:0`, `chmod ${CONFIG_FOLDER} 700`]);
+    });
+  }
+
+  // Review round 6 of PR #82 (B-R6-3): only root:root 0700 counts as cut off. Each of uid, gid and mode alone keeps
+  // CONFIG_FOLDER as it was found (a repository of 1001:0, so that a wrong repair would show as 1001:0 755).
+  for (const [configUid, configGid, configMode] of [
+    [1001, 0, 0o700],
+    [0, 1002, 0o700],
+    [0, 0, 0o755],
+  ] as const) {
+    it(`review round 6 of PR #82, B-R6-3: a CONFIG_FOLDER of ${configUid}:${configGid} ${configMode.toString(8)} is restored as it was found`, async () => {
+      const { t, session } = await started();
+      const { helperDeps } = t;
+      const lstatSync = helperDeps.fs.lstatSync as (path: string) => unknown;
+      const folder = (uid: number, gid: number, mode: number) => ({ isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40000 | mode, uid, gid });
+      Object.assign(helperDeps.fs, {
+        lstatSync: (path: string) => {
+          if (path === `${WORKSPACES_ROOT}/hello`) return folder(1001, 0, 0o755);
+          if (path === CONFIG_FOLDER) return folder(configUid, configGid, configMode);
+          return lstatSync(path);
+        },
+      });
+      const params = { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' };
+      expect((await session.step('readFiles', params)).exitCode).toBe(0);
+      expect(t.fsCalls.slice(-2)).toEqual([`chown ${CONFIG_FOLDER} ${configUid}:${configGid}`, `chmod ${CONFIG_FOLDER} ${configMode.toString(8)}`]);
+    });
+  }
+
+  // Review round 5 of PR #82 (B-R5-2): an owner step never chmods or chowns CONFIG_FOLDER when it is a symbolic link
+  // (chmod and chown follow it, and the restore would give its target to the owner) or missing.
+  for (const configFolder of ['symlink', 'missing'] as const) {
+    it(`review round 5 of PR #82, B-R5-2: an owner step leaves CONFIG_FOLDER alone when it is ${configFolder === 'symlink' ? 'a symbolic link' : 'missing'}`, async () => {
+      const { t, session } = await started({ configFolder });
+      expect((await session.step('composeModel', { repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' })).exitCode).toBe(0);
+      expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual([]);
+      expect(t.fsCalls).toEqual([`rm ${OVERRIDE_FOLDER}`, `mkdir ${OVERRIDE_FOLDER} 700`, `chown ${OVERRIDE_FOLDER} 1000:1000`, `rm ${OVERRIDE_FOLDER}`]);
+    });
+  }
+
+  // Review round 5 of PR #82 (B-R5-3): the processes of the owner are killed (and the kill has ended) before root removes
+  // OVERRIDE_FOLDER and gives CONFIG_FOLDER back, so that a process that left its group cannot plant a folder or link there.
+  it('review round 5 of PR #82, B-R5-3: an owner step kills the owner before the removal of OVERRIDE_FOLDER and the restore of CONFIG_FOLDER', async () => {
+    const { t, session } = await started();
+    const { helperDeps } = t;
+    const runQuiet = helperDeps.runQuiet;
+    // The kill ends only after a turn of the event loop (no timer); its end is recorded in `order`.
+    helperDeps.runQuiet = async (command) => {
+      await runQuiet(command);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.order.push(`ended: ${command.join(' ')}`);
+    };
+    const { rmSync, chownSync } = helperDeps.fs;
+    helperDeps.fs.rmSync = ((path: string, options: unknown) => {
+      t.order.push(`rm ${path}`);
+      return (rmSync as (p: string, o: unknown) => void)(path, options);
+    }) as never;
+    helperDeps.fs.chownSync = ((path: string, uid: number, gid: number) => {
+      t.order.push(`chown ${path} ${uid}:${gid}`);
+      return (chownSync as (p: string, u: number, g: number) => void)(path, uid, gid);
+    }) as never;
+    expect((await session.step('listConfigs', { repository: 'octo/hello' })).exitCode).toBe(0);
+    const kill = ['setpriv', ...privilegeArgs(1000, 1000), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ');
+    const start = t.order.indexOf(`chown ${OVERRIDE_FOLDER} 1000:1000`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(t.order.slice(start + 1)).toEqual([kill, `ended: ${kill}`, `rm ${OVERRIDE_FOLDER}`, `chown ${CONFIG_FOLDER} 1000:1000`, `chmod ${CONFIG_FOLDER} 750`]);
+  });
+
+  // Review round 1 of PR #82, A-R1-2: a Git step is cut off only when the whole helper is killed, so the repair runs once
+  // per helper process; a writing Git step still walks the volume after it, every time.
+  it('repairs a cut-off Git step only before the first Git step of the helper, and walks the volume after every writing Git step', async () => {
+    const { t, session } = await started();
+    const uid = String(BATCH_GIT_UID);
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    const oldClones = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'];
+    const afterWritingStep = [
+      ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
+      ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-user', uid, '-exec', 'rm', '-rf', '{}', '+'],
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
+    ];
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect(t.quiet).toEqual([repair, oldClones, ...afterWritingStep]);
+    t.quiet.length = 0;
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect(t.quiet).toEqual(afterWritingStep);
+    // A step that timed out is not cut off: its cleanup ran, and the next Git step does not repair either. (User decision
+    // of 2026-10-01: Compose reads as the repository owner, so the Git step that times out is a clone now, not composeHash;
+    // the fake step of a clone hangs on the secret `hang`.)
+    t.quiet.length = 0;
+    expect(await session.step('clone', { repository: 'octo/hello' }, { secret: 'hang', timeoutMs: 100 })).toMatchObject({ timedOut: true });
+    expect(t.quiet).toEqual(afterWritingStep);
+    t.quiet.length = 0;
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    // Exactly the cleanup, with no repair before it (the repair has the command of the chown walk, so the exact list
+    // is the check; the removal of old clones belongs to the repair alone).
+    expect(t.quiet).toEqual(afterWritingStep);
+    expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(repair))).toHaveLength(1);
+    expect(t.quiet).not.toContainEqual(oldClones);
+  });
+
+  it('repairs a cut-off Git step again in a new helper process', async () => {
+    const uid = String(BATCH_GIT_UID);
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    for (let round = 0; round < 2; round += 1) {
+      // Review round 1 of PR #82, A-R1-2: the flag lives in the helper process, so each new helper repairs once.
+      const { t, session } = await started();
+      // User decision of 2026-10-01: Compose reads as the repository owner, so the first Git step is a clone (was:
+      // composeHash, which ran as the Git user under option A).
+      await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+      await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+      // The repair is the first walk; the chown walk after each clone has the same command, so only the first is the repair.
+      expect(t.quiet[0], `helper ${round}`).toEqual(repair);
+      expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(repair)), `helper ${round}`).toHaveLength(3);
+    }
   });
 
   it('never leaves /workspaces sticky or writable for others, also after a Git step whose cleanup was cut off', async () => {
@@ -471,7 +770,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
 
   it('ends a step at its time limit alone (its group), and the session goes on', async () => {
     const { t, session } = await started();
-    const result = await session.step('composeHash', { model: 'hang', project: 'p' }, { timeoutMs: 100 });
+    const result = await session.step('composeHash', { repository: 'octo/hello', model: 'hang', project: 'p' }, { timeoutMs: 100 });
     expect(result).toMatchObject({ exitCode: null, timedOut: true });
     expect(t.steps[0].signals[0]).toBe('SIGTERM');
     expect(await session.step('listConfigs', { repository: 'octo/hello' })).toMatchObject({ exitCode: 0, timedOut: false });
@@ -511,7 +810,16 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
         return { exited: new Promise((resolve) => (done = resolve)), killGroup: () => {} };
       },
       runQuiet: async () => {},
-      fs: {} as never,
+      // User decision of 2026-10-01 (agreed extension): listConfigs and readFiles run as the repository owner, so the
+      // helper reads the owner of the repository folder; every change is a no-op.
+      fs: {
+        lstatSync: (() => ({ isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40755, uid: 1000, gid: 1000 })) as never,
+        chmodSync: (() => {}) as never,
+        chownSync: (() => {}) as never,
+        readdirSync: (() => []) as never,
+        rmSync: (() => {}) as never,
+        mkdirSync: (() => {}) as never,
+      },
       env: {},
     });
     const context = {

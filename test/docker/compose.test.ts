@@ -16,9 +16,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
 import { supportsVolumeSubpath } from '../../src/core/helper/compose';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { Messages } from '../../src/core/messages';
 import {
@@ -40,7 +41,6 @@ import {
   resourceName,
 } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
-import { FakeEnvironmentLock } from '../../src/core/pipeline/environmentService.testkit';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -50,6 +50,7 @@ import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
+import { workerLocks } from './workerLocks';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const INIT_SQL = 'select 1;';
@@ -96,11 +97,16 @@ describe('open pipeline for a Docker Compose configuration', () => {
   const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
   const sessionFiles = new SessionFiles(paths);
   const ui = new FakeUi();
+  // Plan step 6, PR C: the real locks of the workers (the opens run their helper steps in the batch helper of the worker
+  // that holds the lock; there is no other path, D1).
+  const targets = new DockerTargets(docker, env, log);
+  const locks = workerLocks({ run, cli, log }, docker, targets, 'compose', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
   const service = new EnvironmentService({
     analyzer: inProcessAnalyzer,
-    // Plan step 5, PR B (D1: no unlocked path): the lock is required; this file is not about it, so a lock that is always
-    // granted, whose plain Docker calls run directly as before.
-    environmentLock: new FakeEnvironmentLock((args, options) => docker.runDirect(args, options)).take,
+    // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
+    // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs the
+    // helper steps of the opens.
+    environmentLock: locks.take,
     docker,
     runner,
     helper,
@@ -247,9 +253,12 @@ ${extra}volumes:
     cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--name', `devenv-test-compose-guard-${run.runId}`, TEST_BASE_IMAGE, 'true']);
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // Plan step 6, PR C: no worker and no batch helper is left over.
+    const leftovers = await locks.dispose();
     removeProjectObjects();
     removeRunObjects(cli, run.runId);
+    expect(leftovers).toEqual([]);
     expect(containers(app)).toEqual([]);
     expect(cli.volume(app.name)).toBeUndefined();
   });
@@ -291,9 +300,13 @@ ${extra}volumes:
       return;
     }
     const progress = new RecordingProgress();
+    const batchesBefore = locks.batches.get(app.id)?.length ?? 0;
     const result = await service.openEnvironment(app.id, { progress });
     expect(result).toMatchObject({ containerName: app.name, remoteWorkspaceFolder: app.folder });
     expect(progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
+    // Plan step 6, PR C: the whole open (the reads, the Compose model and hashes, the folders, the build, `up`, the
+    // lifecycle commands, the Git files) ran in exactly one batch helper container.
+    expect((locks.batches.get(app.id) ?? []).length - batchesBefore).toBe(1);
 
     // The dev container: the name of the environment, the labels, the project, the environment image, the workspace volume.
     const dev = cli.container(app.name);
