@@ -9,11 +9,11 @@
 //
 // GitHub token (implementation notes 7, concept section 9): the token never appears on a command line, in an environment
 // variable of a container, or in .git/config. It arrives on standard input and is written to a file in a tmpfs mount
-// (SECRETS_FOLDER). For the clone and the branch switch, a Git credential helper that exists only for one command
+// (SECRETS_FOLDER). For the clone, a Git credential helper that exists only for one command
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // Unit 15: no copy is in the volume. The token file of the dev container and the sign-in of the GitHub CLI are only in the
 // memory of the dev container (TOKEN_FOLDER, ./containerToken.ts).
-import { GIT_SUMMARY_SCRIPT, SERVICE_OWNER_FIX, SERVICE_REAL_PATHS, servicePathArguments, type ServiceFolders } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
 import { CONFIG_FOLDER, GH_VOLUME_FOLDER, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
@@ -53,9 +53,6 @@ export const CREDENTIAL_HELPER =
 // - the trap that removes the token file on every exit, also after a stop signal,
 // - read_token: stdin → token file, only if SECRETS_FOLDER is a tmpfs mount,
 // - git_net: Git with the credential helper, without hooks, only over https, never with a prompt,
-// - git_local: Git without hooks and without fsmonitor. Git still runs other programs that the repository configuration
-//   names (for example the smudge filter of a filter driver in `git switch`), so these runs get no Docker socket and no
-//   cache volume (WorkspaceHelper): the helper is no trust boundary against the repository.
 const TOKEN_PRELUDE = `set -eu
 secrets='${SECRETS_FOLDER}'
 token_file='${TOKEN_FILE}'
@@ -103,9 +100,6 @@ git_net() {
     -c protocol.allow=never -c protocol.https.allow=always \\
     "$@"
 }
-git_local() {
-  git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
-}
 `;
 
 /**
@@ -142,52 +136,6 @@ fi
 rm -f "$token_file"
 mv "$work/repo" "$target"
 echo "The repository is in $target."
-`;
-
-/**
- * `$1` = repository folder (absolute), `$2` = branch, `$3` = owner/repository, `$4`… (review round 9, D9-1) the `find`
- * test of the paths that the other services of Docker Compose mount (servicePathArguments, review round 11), which the
- * restore of the owner leaves out with their content, except (review round 10, D10-3) their files and folders of root,
- * which `git switch` wrote (SERVICE_OWNER_FIX). Token on stdin. Review round 13 (D13-2): the real paths of the paths of
- * the services behind links are resolved before `git fetch` and `git switch` too (SERVICE_REAL_PATHS, the same code as
- * in service_owner_fix, which unites them with the real paths after the switch, against one bound): a link of the branch
- * before the switch (for example `data -> storage/pg`, which db mounts) that the other branch replaces with a folder
- * still protects the data behind it.
- * Fetches the branches of https://github.com/<owner>/<repository>.git into refs/remotes/origin (the same result as
- * `git fetch origin`, but independent of the remote in .git/config), removes the token, runs `git switch <branch>`
- * (a remote branch gets a local tracking branch), and gives files that the helper created as root the owner of the
- * repository folder again. The owner is restored also when Git fails: a fetch writes .git/FETCH_HEAD, refs, and
- * objects before a refused switch, and Git in the dev container could not write them anymore.
- * On a Git error, Git's message goes to stderr and the exit code is 1.
- */
-export const SWITCH_BRANCH_SCRIPT = `${TOKEN_PRELUDE}
-dir="$1"
-branch="$2"
-repo="$3"
-shift 3
-${SERVICE_OWNER_FIX}check_repository "$repo"
-check_branch "$branch"
-if [ -z "$branch" ]; then
-  fail 2 'No branch name.'
-fi
-cd "$dir"
-read_token
-owner=$(stat -c '%u:%g' "$dir")
-folder=$dir
-${SERVICE_REAL_PATHS}status=0
-out=$(git_net fetch -- "https://github.com/$repo.git" '+refs/heads/*:refs/remotes/origin/*' 2>&1) || status=$?
-rm -f "$token_file"
-if [ "$status" -eq 0 ]; then
-  if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
-  out=$(git_local switch "$branch" 2>&1) || status=$?
-fi
-if ! service_owner_fix "$dir" "\${owner%%:*}" "\${owner#*:}" "$owner" "$@"; then
-  echo 'The owner of some files could not be restored.'
-fi
-if [ "$status" -ne 0 ]; then
-  fail 1 "$out"
-fi
-if [ -n "$out" ]; then printf '%s\\n' "$out"; fi
 `;
 
 /**
@@ -910,11 +858,6 @@ export function gitFilesCommand(folderName: string, identity: { name: string; em
   return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper];
 }
 
-
-/** `sh -c` command that switches the branch. Token on stdin, secrets mount required. */
-export function switchBranchCommand(repoFolder: string, branch: string, repository: string, serviceFolders?: ServiceFolders): string[] {
-  return ['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', repoFolder, branch, repository, ...servicePathArguments(repoFolder, serviceFolders)];
-}
 
 export function listConfigsCommand(repoFolder: string): string[] {
   return ['node', '-e', LIST_CONFIGS_SCRIPT, repoFolder];

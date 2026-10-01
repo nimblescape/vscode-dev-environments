@@ -58,7 +58,7 @@ export interface ComposeBuildRecord {
   inputsHash: string;
 }
 
-export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete' | 'switchBranch';
+export type BusyOperation = 'create' | 'update' | 'rebuild' | 'delete';
 
 /** Marks an environment as busy, so the Session Monitor does not stop it (concept 7.9 rule 1). */
 export interface BusyMark {
@@ -112,8 +112,8 @@ export interface Environment {
    * containers of the other services of Docker Compose may mount from the workspace volume (composeUpModel's
    * `serviceFolders`), written before each `up`, also before the first build record. The list does not shrink while such
    * a container may still mount a path of it: an `up` adds the paths of its model; only an `up` before which no
-   * container of another service exists (all of them were removed) replaces it. The ownership fixes after `up` and of
-   * Switch branch… leave the data of the services there alone, and the question of Delete names them.
+   * container of another service exists (all of them were removed) replaces it. The ownership fixes after `up` leave the
+   * data of the services there alone, and the question of Delete names them.
    * Review round 11 (G3, G4, G5): the record of the list that the pipeline computes from facts at each `up`
    * (boundServiceFolders): the paths of the model, the paths that the existing containers of the other services mount
    * (their volume subpaths), and the recorded paths of earlier models while they still exist in the volume; at most

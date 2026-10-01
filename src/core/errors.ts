@@ -15,7 +15,6 @@ export type UserErrorCode =
   | 'buildFailed'
   | 'startFailed'
   | 'filesMissing'
-  | 'gitSwitchFailed'
   | 'signInRequired'
   | 'hostAccess'
   | 'unencryptedDockerConnection'

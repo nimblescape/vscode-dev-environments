@@ -12,7 +12,6 @@ import type { DiscoveryData, RepositoryInfo } from '../types';
 import { GitHubApi, GitHubApiError, type GraphQLError } from './githubApi';
 import {
   BRANCH_CONFIGURATIONS_QUERY,
-  BRANCHES_QUERY,
   classifyGraphQLError,
   DISCOVERY_QUERY,
   DiscoveryService,
@@ -600,30 +599,6 @@ describe('DiscoveryService.loadStored', () => {
 });
 
 describe('DiscoveryService single repository queries', () => {
-  it('listBranches puts the default branch first and removes duplicates', async () => {
-    const transport = new FakeGitHub(() => ({
-      body: {
-        data: {
-          repository: {
-            defaultBranchRef: { name: 'main' },
-            refs: { nodes: [{ name: 'develop' }, { name: 'feature-x' }, { name: 'main' }, null, { name: 42 }] },
-          },
-        },
-      },
-    }));
-    const branches = await service(transport).listBranches('acme/api', TOKEN);
-    expect(branches).toEqual(['main', 'develop', 'feature-x']);
-    expect(transport.requests[0].query).toBe(BRANCHES_QUERY);
-    expect(transport.requests[0].variables).toEqual({ owner: 'acme', name: 'api' });
-  });
-
-  it('listBranches throws when GitHub does not return the repository', async () => {
-    const transport = new FakeGitHub(() => ({
-      body: { data: { repository: null }, errors: [{ type: 'NOT_FOUND', message: "Could not resolve to a Repository with the name 'acme/gone'." }] },
-    }));
-    await expect(service(transport).listBranches('acme/gone', TOKEN)).rejects.toThrow(/Could not resolve/);
-  });
-
   it('configurationsOnBranch passes the branch in the expressions, as variables', async () => {
     const transport = new FakeGitHub(() => ({
       body: {

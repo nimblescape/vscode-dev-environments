@@ -168,48 +168,6 @@ export function configurationChoices(configPaths: readonly string[], current: st
   });
 }
 
-export interface BranchChoice {
-  branch: string;
-  description: string;
-}
-
-/**
- * Choices of "Switch branch…" (concept 6.2): the branches of GitHub (default branch first), the current branch marked
- * (and added when GitHub does not list it, for example a local branch), and a typed name that is not listed first.
- */
-export function branchChoices(
-  branches: readonly string[],
-  options: { current?: string; defaultBranch?: string; typed?: string } = {},
-): BranchChoice[] {
-  const names = [...new Set(branches.filter((branch) => branch !== ''))];
-  if (options.current && !names.includes(options.current)) names.unshift(options.current);
-  const choices = names.map((branch) => ({
-    branch,
-    description: [
-      branch === options.current ? ControllerTexts.current : '',
-      branch === options.defaultBranch ? ControllerTexts.defaultBranch : '',
-    ]
-      .filter((text) => text !== '')
-      .join(' · '),
-  }));
-  const typed = options.typed?.trim();
-  if (typed && !names.includes(typed) && isPlausibleBranchName(typed)) {
-    choices.unshift({ branch: typed, description: ControllerTexts.typedBranch });
-  }
-  return choices;
-}
-
-/**
- * A loose form of `git check-ref-format --branch`: rejects names that Git certainly refuses, and names that look like an
- * option. Git checks the rest (its message is shown, concept 7.5).
- */
-export function isPlausibleBranchName(name: string): boolean {
-  if (name === '' || name.startsWith('-') || name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
-  if (name.endsWith('.lock') || name.includes('..') || name.includes('//') || name.includes('@{') || name === '@') return false;
-  // Control characters, space, and ~ ^ : ? * [ \ are not allowed in Git reference names.
-  return !/[\u0000- \u007f~^:?*[\\]/.test(name);
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

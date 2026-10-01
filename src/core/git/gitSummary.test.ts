@@ -244,7 +244,8 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     });
   });
 
-  it('counts unpushed commits on a local branch that is not checked out (Switch branch…)', () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('counts unpushed commits on a local branch that is not checked out', () => {
     const root = tempDir();
     const remote = path.join(root, 'remote.git');
     const repo = path.join(root, 'repo');

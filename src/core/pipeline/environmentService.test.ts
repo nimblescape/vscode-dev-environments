@@ -226,11 +226,6 @@ describe('open: first open', () => {
     expect(h.helper.silentlyCreatedVolumes).toEqual([]);
   });
 
-  it('clones the selected branch', async () => {
-    await h.service.open(TARGET, options({ branch: 'feature-x' }));
-    expect(h.helper.clones[0].branch).toBe('feature-x');
-  });
-
   it('asks before the first open of a repository of another owner', async () => {
     h.ui.trust = false;
     const error = await rejection(h.service.open({ ...TARGET, trusted: false }, options()));
@@ -488,7 +483,8 @@ describe('open: first open', () => {
 
   it('lists and reads the fallback configuration with the helper image of the open (review round 3 of PR #64, P7)', async () => {
     h.helper.files = { '.devcontainer/python/devcontainer.json': { configText: DEFAULT_CONFIG_TEXT } };
-    await h.service.open(TARGET, options({ branch: 'feature-x' }));
+    // 2026-10-01: the Switch branch command was dropped (user decision). The open has no branch option.
+    await h.service.open(TARGET, options());
     expect(h.ui.infos).toEqual([Messages.configurationNotFound(DEFAULT_CONFIG_PATH, 'python')]);
     // user decision 2026-09-29: no previous helper image. Changed expectation: the helper image of the open is the
     // current tag with its image ID (before, a previous helper).
@@ -502,7 +498,8 @@ describe('open: first open', () => {
 
   it('falls back to the first configuration on the branch and says so', async () => {
     h.helper.files = { '.devcontainer/python/devcontainer.json': { configText: DEFAULT_CONFIG_TEXT } };
-    await h.service.open(TARGET, options({ branch: 'feature-x' }));
+    // 2026-10-01: the Switch branch command was dropped (user decision). The open has no branch option.
+    await h.service.open(TARGET, options());
     expect(h.ui.infos).toEqual([Messages.configurationNotFound(DEFAULT_CONFIG_PATH, 'python')]);
     const env = await h.registry.findForAccount(REPO, ACCOUNT.id);
     expect(env?.configPath).toBe('.devcontainer/python/devcontainer.json');
@@ -2608,7 +2605,8 @@ describe('open: existing environment', () => {
 
       it('A-R4-6: an outer mark of this window is never overwritten nor cleared by the withdrawal', async () => {
         await seedEnvironment(h, { container: 'stopped' });
-        const outer = { operation: 'switchBranch' as const, since: new Date(T0).toISOString(), pid: PID, windowId: WINDOW_ID };
+        // 2026-10-01: the Switch branch command was dropped (user decision). The outer mark is of a rebuild.
+        const outer = { operation: 'rebuild' as const, since: new Date(T0).toISOString(), pid: PID, windowId: WINDOW_ID };
         const up = h.helper.up.bind(h.helper);
         h.helper.up = async (p) => {
           const result = await up(p);
@@ -3341,16 +3339,6 @@ describe('open: selected configuration missing on the branch', () => {
     expect(env?.buildRecord?.configPath).toBe(PYTHON);
     expect(env?.configPath).toBe(PYTHON);
   });
-
-  it('configurationChanged compares the build record with the configuration that the pipeline would use', async () => {
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-    h.ui.configurationChangedAnswer = 'rebuildNow';
-    await h.service.open(TARGET, options());
-    // Built from the fallback of this branch: nothing to ask after a branch switch to it.
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
-    onMain();
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-  });
 });
 
 describe('open: registry lost', () => {
@@ -3833,78 +3821,7 @@ describe('safetyCheck', () => {
   });
 });
 
-describe('switchBranch', () => {
-  it('switches with the token and records the branch', async () => {
-    await seedEnvironment(h);
-    let busy: Environment['busy'];
-    const original = h.helper.switchBranch.bind(h.helper);
-    h.helper.switchBranch = async (p) => {
-      busy = (await entry())?.busy;
-      return original(p);
-    };
-    await h.service.switchBranch(ENV_ID, 'feature-x', options());
-    expect(h.helper.calls).toEqual(['switchBranch feature-x']);
-    expect(busy?.operation).toBe('switchBranch');
-    const env = await entry();
-    expect(env?.gitSummary).toMatchObject({ branch: 'feature-x', uncommittedFiles: 3 });
-    expect(env?.busy).toBeUndefined();
-  });
-
-  it('passes the message of Git and clears the busy mark', async () => {
-    await seedEnvironment(h);
-    h.helper.switchError = new UserFacingError('gitSwitchFailed', Messages.gitSwitchFailed('feature-x', 'error: Your local changes would be overwritten'));
-    const error = await rejection(h.service.switchBranch(ENV_ID, 'feature-x', options()));
-    expect(error.code).toBe('gitSwitchFailed');
-    const env = await entry();
-    expect(env?.gitSummary?.branch).toBe('main');
-    expect(env?.busy).toBeUndefined();
-    expect(h.rejectedTokens).toEqual([]);
-  });
-
-  it('reports a token that github.com rejects in the fetch of Switch branch to the sign-in state (the sign-in fix)', async () => {
-    await seedEnvironment(h);
-    h.helper.switchError = new UserFacingError(
-      'gitSwitchFailed',
-      Messages.gitSwitchFailed('feature-x', "fatal: Authentication failed for 'https://github.com/acme/api.git/'"),
-      "fatal: Authentication failed for 'https://github.com/acme/api.git/'",
-    );
-    const error = await rejection(h.service.switchBranch(ENV_ID, 'feature-x', options()));
-    expect(error.code).toBe('gitSwitchFailed');
-    expect(h.rejectedTokens).toEqual([h.token]);
-    expect((await entry())?.busy).toBeUndefined();
-  });
-
-  it('reports missing files without creating a volume', async () => {
-    await seedEnvironment(h, { volume: false });
-    const error = await rejection(h.service.switchBranch(ENV_ID, 'feature-x', options()));
-    expect(error.code).toBe('filesMissing');
-    expect(h.docker.volumes.size).toBe(0);
-  });
-});
-
 describe('configuration queries', () => {
-  it('configurationChanged compares path and hash with the build record', async () => {
-    await seedEnvironment(h);
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "image": "ubuntu" }' };
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-  });
-
-  it('configurationChanged is true when the configuration is missing on the branch or no record exists', async () => {
-    await seedEnvironment(h);
-    h.helper.files = {};
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(true);
-    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', record: null });
-    expect(await h.service.configurationChanged(OTHER_ID, options())).toBe(true);
-  });
-
-  it('configurationChanged is false for a missing volume or environment', async () => {
-    await seedEnvironment(h, { volume: false });
-    expect(await h.service.configurationChanged(ENV_ID, options())).toBe(false);
-    expect(await h.service.configurationChanged(OTHER_ID, options())).toBe(false);
-    expect(h.docker.volumes.size).toBe(0);
-  });
-
   it('listConfigurations lists the configurations in the volume', async () => {
     await seedEnvironment(h);
     h.helper.configurations = ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'];
@@ -4217,15 +4134,14 @@ describe('accounts (concept 7.5, section 9 "Accounts")', () => {
     expect((await rejection(h.service.stop(ENV_ID))).code).toBe('signInRequired');
   });
 
-  it('refuses stop, delete, the safety check, a branch switch, and the configuration questions for another account', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('refuses stop, delete, the safety check, and the configuration questions for another account', async () => {
     await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: 'running' });
     const operations: Array<[string, () => Promise<unknown>]> = [
       ['stop', () => h.service.stop(ENV_ID)],
       ['delete', () => h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }))],
       ['safetyCheck', () => h.service.safetyCheck(ENV_ID, options())],
-      ['switchBranch', () => h.service.switchBranch(ENV_ID, 'dev', options())],
       ['listConfigurations', () => h.service.listConfigurations(ENV_ID, options())],
-      ['configurationChanged', () => h.service.configurationChanged(ENV_ID, options())],
     ];
     for (const [name, operation] of operations) {
       const error = await rejection(operation());
@@ -5535,10 +5451,9 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
     await h.service.open(TARGET, options());
     const [env] = await h.registry.list();
     expect(env.buildRecord?.configHash).toBe(configHash(text, 'FROM alpine:3.22\n'));
-    expect(await h.service.configurationChanged(env.id, options())).toBe(false);
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone; the open
+    // finds the change.
     h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM alpine:3.23\n' };
-    expect(await h.service.configurationChanged(env.id, options())).toBe(true);
-    // The open finds the same change.
     h.ui.configurationChangedAnswer = 'later';
     await h.service.openEnvironment(env.id, options());
     expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);

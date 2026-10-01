@@ -9,8 +9,8 @@ import type { GitSummary } from '../types';
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
  * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
- * repository folder. The unpushed commits include the branches that Switch branch… left (concept 7.5, 7.14 step 1):
- * the volume keeps them, and Delete removes them.
+ * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
+ * keeps them, and Delete removes them.
  *
  * Git runs without hooks, without an fsmonitor, and without optional locks, so that it runs no hook and never writes to
  * `.git` as another user. It still runs other programs that the repository configuration names (for example the clean
@@ -75,10 +75,8 @@ seen=$nl
  * a path of a mount of the dev container, which servicePathArguments marks one by one with `(` before it and `)` after
  * its patterns (`mount`): the target of the mount may be a link into `.git` (`data -> .git/pg`), where Docker mounts it.
  * The marker is read only where no path can be (never right after `-path`); the text of the test starts with `1` then,
- * so that the case of `.git` does not match. It runs in service_owner_fix (at the time of the fix) and, in
- * SWITCH_BRANCH_SCRIPT, also at the top level before `git fetch` and `git switch` (the real paths of the branch before
- * the switch, which service_owner_fix gets as arguments and unites with its own). The paths stay arguments: no shell
- * text is built from them.
+ * so that the case of `.git` does not match. It runs in service_owner_fix (at the time of the fix). The paths stay
+ * arguments: no shell text is built from them.
  */
 export const SERVICE_REAL_PATHS = `  here=$PWD
   previous=''
@@ -136,7 +134,7 @@ export const SERVICE_REAL_PATHS = `  here=$PWD
  * ownership fixes: `find <folder> -xdev` gives `<owner>` (`chown -h`, never the target of a link) to each file that does
  * not have the user `<uid>` and the group `<gid>`, except in the paths that other services mount (the test "in a path of
  * a service" of servicePathArguments, `"$@"`); in those, only to the files and folders of root (uid 0): the workspace
- * helper writes as root (a clone, the `git switch` of Switch branch…), while the data of a service (for example of
+ * helper writes as root (a clone), while the data of a service (for example of
  * Postgres, uid 999) keeps its owner. A service that runs as root keeps its access to files of another owner (unless its
  * capabilities are dropped). Review round 11 (G5): the arguments come ready from servicePathArguments (built in linear
  * time), in place of the shell loop of round 9 that rebuilt `"$@"` for each pattern (quadratic: 5000 paths took 51 s).

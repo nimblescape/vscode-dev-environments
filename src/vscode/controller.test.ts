@@ -15,7 +15,7 @@ import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
 import { tokenRemoveCommand } from '../core/helper/containerToken';
-import type { ConfigurationKindChange, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
+import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -34,7 +34,7 @@ import { DOUBLE_CLICK_INTERVAL_MS, type ListOpenMode } from './rowActivation';
 import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { LOADED_CONTEXT_KEY, LOAD_FAILED_CONTEXT_KEY } from './sidebar';
 import { contextValue as treeContextValue, rowActions } from './treeModel';
-import { EventEmitter, fakeVscode, resetFakeVscode } from './testing/fakeVscode';
+import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -140,47 +140,6 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-/** Fake of vscode.QuickPick for Switch branch…. */
-class FakeQuickPick {
-  items: Array<{ label: string; description?: string; branch: string }> = [];
-  selectedItems: FakeQuickPick['items'] = [];
-  activeItems: FakeQuickPick['items'] = [];
-  value = '';
-  title = '';
-  placeholder = '';
-  matchOnDescription = false;
-  busy = false;
-  shown = false;
-  private readonly accept = new EventEmitter<void>();
-  private readonly hideEmitter = new EventEmitter<void>();
-  private readonly valueEmitter = new EventEmitter<string>();
-  readonly onDidAccept = this.accept.event;
-  readonly onDidHide = this.hideEmitter.event;
-  readonly onDidChangeValue = this.valueEmitter.event;
-
-  show(): void {
-    this.shown = true;
-  }
-
-  hide(): void {
-    this.hideEmitter.fire();
-  }
-
-  dispose(): void {}
-
-  type(value: string): void {
-    this.value = value;
-    this.valueEmitter.fire(value);
-  }
-
-  pick(label: string): void {
-    const item = this.items.find((candidate) => candidate.label === label);
-    if (!item) throw new Error(`No item ${label}: ${this.items.map((candidate) => candidate.label).join(', ')}`);
-    this.selectedItems = [item];
-    this.accept.fire();
-  }
-}
-
 /** Waits until the pending promise callbacks (file I/O included) have run. */
 async function settle(condition: () => boolean, what: string): Promise<void> {
   const deadline = Date.now() + 5000;
@@ -216,8 +175,6 @@ interface Harness {
     /** Review round 11 (G3, G4). */
     repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
-    switchBranch: ReturnType<typeof vi.fn<(id: string, branch: string, options: OperationOptions) => Promise<void>>>;
-    configurationChanged: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<boolean | ConfigurationKindChange>>>;
     listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
@@ -249,8 +206,6 @@ interface Harness {
   };
   dockerSetup: Record<'install' | 'start' | 'installWsl' | 'show', ReturnType<typeof vi.fn>>;
   repositoryGroupsEditor: { open: ReturnType<typeof vi.fn> };
-  ui: { configurationChanged: ReturnType<typeof vi.fn>; configurationKindChanged: ReturnType<typeof vi.fn> };
-  discovery: { listBranches: ReturnType<typeof vi.fn> };
   sidebar: {
     infos: Map<string, RepositoryInfo>;
     render: ReturnType<typeof vi.fn>;
@@ -261,7 +216,6 @@ interface Harness {
   };
   statusBar: Record<'showConnected' | 'showNotConnected' | 'showBusy' | 'clearBusy' | 'showConnectionLost', ReturnType<typeof vi.fn>>;
   logger: Record<'info' | 'warn' | 'error' | 'output' | 'show', ReturnType<typeof vi.fn>>;
-  quickPicks: FakeQuickPick[];
   progressTitles: string[];
   alive: Set<number>;
   settings: ExtensionSettings;
@@ -314,8 +268,6 @@ function createHarness(
     safetyCheck: vi.fn(async () => undefined),
     repositoryServiceData: vi.fn(async () => []),
     delete: vi.fn(async () => {}),
-    switchBranch: vi.fn(async () => {}),
-    configurationChanged: vi.fn(async () => false),
     listConfigurations: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
     reconcileFromVolumes: vi.fn(async () => 0),
@@ -359,8 +311,7 @@ function createHarness(
     show: vi.fn(async () => {}),
   };
   const repositoryGroupsEditor = { open: vi.fn(async () => {}) };
-  const ui = { configurationChanged: vi.fn(async () => 'later'), configurationKindChanged: vi.fn(async () => 'later') };
-  const discovery = { listBranches: vi.fn(async () => ['main', 'feature-x']) };
+  const discovery = {};
   const infos = new Map<string, RepositoryInfo>();
   const sidebar = {
     infos,
@@ -393,7 +344,6 @@ function createHarness(
     service,
     discovery,
     auth,
-    ui,
     connection,
     coordinator,
     sidebar,
@@ -433,12 +383,6 @@ function createHarness(
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
     ),
   );
-  const quickPicks: FakeQuickPick[] = [];
-  fakeVscode.window.createQuickPick.mockImplementation(() => {
-    const quickPick = new FakeQuickPick();
-    quickPicks.push(quickPick);
-    return quickPick;
-  });
 
   return {
     root,
@@ -455,12 +399,9 @@ function createHarness(
     auth,
     dockerSetup,
     repositoryGroupsEditor,
-    ui,
-    discovery,
     sidebar,
     statusBar,
     logger,
-    quickPicks,
     progressTitles,
     alive,
     settings,
@@ -612,7 +553,8 @@ describe('Controller commands', () => {
     // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
     // 33 with the choice of the Docker host, the command of the first row of the view (user requests 2026-09-28).
     // 34 with Ask Again Before Changing the Docker Host (user decision 2026-09-28: "Don't Ask Again" for all questions).
-    expect(declared).toHaveLength(34);
+    // 2026-10-01: the Switch branch command was dropped (user decision). 33 without it.
+    expect(declared).toHaveLength(33);
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -1707,105 +1649,6 @@ describe('Select configuration…', () => {
   });
 });
 
-describe('Switch branch…', () => {
-  it('switches the branch of the connected environment and offers the rebuild when the configuration changed', async () => {
-    const env = environment();
-    await h.registry.add(env);
-    await connectHere(env);
-    h.service.configurationChanged.mockResolvedValue(true);
-    h.ui.configurationChanged.mockResolvedValue('rebuildNow');
-    const command = run('switchBranch', row('acme/api', env));
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    expect(h.quickPicks[0].items.map((item) => [item.label, item.description])).toEqual([
-      ['main', 'current'],
-      ['feature-x', ''],
-    ]);
-    h.quickPicks[0].pick('feature-x');
-    await command;
-    expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, 'feature-x', expect.anything());
-    expect(h.ui.configurationChanged).toHaveBeenCalledWith('acme/api');
-    expect(await h.sessionFiles.readOperations()).toEqual([
-      expect.objectContaining({ operation: 'rebuild', reason: 'configChanged' }),
-    ]);
-    expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
-    expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', 'feature-x');
-  });
-
-  it.each(['rebuildNow', 'later'] as const)(
-    'asks about a switch between Docker Compose and a single container as the pipeline asks, and hands off the rebuild on Rebuild now (review round 5, D5-3, %s)',
-    async (answer) => {
-      const env = environment();
-      await h.registry.add(env);
-      await connectHere(env);
-      h.service.configurationChanged.mockResolvedValue({ question: 'the kind question' });
-      h.ui.configurationKindChanged.mockResolvedValue(answer);
-      const command = run('switchBranch', row('acme/api', env));
-      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-      h.quickPicks[0].pick('feature-x');
-      await command;
-      expect(h.ui.configurationKindChanged).toHaveBeenCalledWith('acme/api', 'the kind question');
-      expect(h.ui.configurationChanged).not.toHaveBeenCalled();
-      if (answer === 'rebuildNow') {
-        expect(await h.sessionFiles.readOperations()).toEqual([expect.objectContaining({ operation: 'rebuild', reason: 'configChanged' })]);
-        expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
-      } else {
-        expect(await h.sessionFiles.readOperations()).toEqual([]);
-        expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
-        // Review round 20 of PR #64 (R20-2): Later in the connected window starts nothing, as its question
-        // (Messages.configurationKindChangedConnected) says.
-        expect(h.service.openEnvironment).not.toHaveBeenCalled();
-        expect(h.service.open).not.toHaveBeenCalled();
-      }
-    },
-  );
-
-  it('creates the environment on a typed branch when the repository has none', async () => {
-    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
-    const command = run('switchBranch', row('acme/api'));
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    h.quickPicks[0].type('release/2.0');
-    h.quickPicks[0].pick('release/2.0');
-    await command;
-    expect(h.service.open).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ branch: 'release/2.0' }));
-  });
-
-  it('connects the current window after Switch branch… also while the setting openInNewWindow is on (unit 14 review)', async () => {
-    h.settings.openInNewWindow = true;
-    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
-    const command = run('switchBranch', row('acme/api'));
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    h.quickPicks[0].type('release/2.0');
-    h.quickPicks[0].pick('release/2.0');
-    await command;
-    expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
-    expect(h.connection.open).toHaveBeenCalled();
-  });
-
-  it('switches and connects an environment that this window is not connected to', async () => {
-    await h.registry.add(environment());
-    const command = run('switchBranch', row('acme/api', environment()));
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    h.quickPicks[0].pick('feature-x');
-    await command;
-    expect(h.service.switchBranch).toHaveBeenCalled();
-    expect(h.service.configurationChanged).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).toHaveBeenCalled();
-    expect(h.connection.open).toHaveBeenCalled();
-  });
-
-  it('shows the message of Git when the switch fails', async () => {
-    await h.registry.add(environment());
-    const message = Messages.gitSwitchFailed('feature-x', 'error: Your local changes would be overwritten.');
-    h.service.switchBranch.mockRejectedValue(new UserFacingError('gitSwitchFailed', message));
-    const command = run('switchBranch', row('acme/api', environment()));
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    h.quickPicks[0].pick('feature-x');
-    await command;
-    expect(warningMessages()).toContain(message);
-    expect(h.connection.open).not.toHaveBeenCalled();
-  });
-});
-
 describe('Show on GitHub', () => {
   it('opens the page of the repository', async () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
@@ -2382,18 +2225,19 @@ describe('Connection of this window', () => {
 });
 
 describe('Accounts (concept 7.5)', () => {
-  it('refuses Start, Stop, Delete, Rebuild, Switch branch, and Select configuration of an environment of another account', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision). Its row is gone (6 warnings, before 7).
+  it('refuses Start, Stop, Delete, Rebuild, and Select configuration of an environment of another account', async () => {
     const env = environment({ owner: OTHER_ACCOUNT });
     await h.registry.add(env);
-    for (const command of ['start', 'stop', 'delete', 'rebuild', 'switchBranch', 'selectConfiguration'] as const) {
+    for (const command of ['start', 'stop', 'delete', 'rebuild', 'selectConfiguration'] as const) {
       await run(command, row('acme/api', env));
     }
     // The status bar item Reconnect.
     await run('start', { environmentId: ENV_ID });
-    expect(warningMessages()).toEqual(Array(7).fill(Messages.otherAccount('acme/api')));
+    expect(warningMessages()).toEqual(Array(6).fill(Messages.otherAccount('acme/api')));
     for (const call of Object.values(h.service)) expect(call).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
-    expect(h.quickPicks).toEqual([]);
+    expect(fakeVscode.window.createQuickPick).not.toHaveBeenCalled();
   });
 
   it('starts the own environment of the account for a repository that has an environment of another account (D-3)', async () => {
@@ -2846,16 +2690,6 @@ describe('Accounts (concept 7.5)', () => {
       expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
     });
 
-    it('Switch branch… of the repository creates the environment of the new account on the branch', async () => {
-      const command = run('switchBranch', row('acme/api'));
-      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-      h.quickPicks[0].pick('feature-x');
-      await command;
-      expect(h.service.switchBranch).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ branch: 'feature-x' }));
-      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
-    });
-
     it('the repository choice of the switcher does the same', async () => {
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
       fakeVscode.window.showQuickPick.mockImplementation(
@@ -2913,30 +2747,8 @@ describe('Accounts (concept 7.5)', () => {
     });
   });
 
-  it('connects the environment whose branch Switch branch… switched, also when the account changed during the switch', async () => {
-    await h.registry.add(environment());
-    await h.registry.add(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' }));
-    h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
-    h.service.switchBranch.mockImplementation(async () => {
-      // Another account signs in while the branch is switched.
-      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
-      h.auth.getToken.mockResolvedValue('gho_other');
-    });
-    // The Command Palette: a repository, then the branch.
-    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
-    const command = run('switchBranch');
-    await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-    h.quickPicks[0].pick('feature-x');
-    await command;
-    expect(h.service.switchBranch).toHaveBeenCalledWith(ENV_ID, expect.anything(), expect.anything());
-    expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID]);
-    expect(h.service.open).not.toHaveBeenCalled();
-    // The environment of ACCOUNT is refused to OTHER_ACCOUNT, as after any account change during an open.
-    expect(h.connection.open).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
-  });
-
-  describe('Try again of a first open of Switch branch… or Select configuration… after the account changed', () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  describe('Try again of a first open of Select configuration… after the account changed', () => {
     const OTHER_ENV = () =>
       environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' });
 
@@ -2951,16 +2763,6 @@ describe('Accounts (concept 7.5)', () => {
         h.auth.getToken.mockResolvedValue('gho_other');
         return Actions.tryAgain;
       });
-    });
-
-    it('switches the branch of the environment of the account signed in now', async () => {
-      const command = run('switchBranch', row('acme/api'));
-      await settle(() => h.quickPicks.length === 1 && h.quickPicks[0].items.length === 2, 'the branch list');
-      h.quickPicks[0].pick('feature-x');
-      await command;
-      await settle(() => h.service.switchBranch.mock.calls.length === 1, 'Try again');
-      expect(h.service.open).toHaveBeenCalledTimes(1);
-      expect(h.service.switchBranch).toHaveBeenCalledWith(OTHER_ENV_ID, 'feature-x', expect.anything());
     });
 
     it('rebuilds the environment of the account signed in now with the selected configuration', async () => {
@@ -4007,7 +3809,8 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     await click(viewRow('acme/api', environment(), 'stopped'), 0);
     expect(start).not.toHaveBeenCalled();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
-    expect(h.quickPicks).toEqual([]);
+    // 2026-10-01: the Switch branch command was dropped (user decision). No FakeQuickPick any more.
+    expect(fakeVscode.window.createQuickPick).not.toHaveBeenCalled();
   });
 
   it('runs Start with the row on two clicks of the same row within the interval', async () => {
