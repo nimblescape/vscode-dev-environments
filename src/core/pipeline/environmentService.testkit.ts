@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
+import { EXISTING_PATHS_SCRIPT } from '../git/gitSummary';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
@@ -592,7 +592,6 @@ export class FakeHelper implements EnvironmentHelper {
    */
   lifecycleFailureReport: 'error' | 'result' = 'error';
   gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
-  switchError: Maybe<Error>;
   /** Named volumes that a container created by `up` mounts besides the workspace volume. */
   containerVolumes: string[] = [];
   /**
@@ -1119,16 +1118,6 @@ export class FakeHelper implements EnvironmentHelper {
     this.configOwnershipFixes.push({ volumeName: p.volumeName, folder: p.folder, uid: p.uid, gid: p.gid });
     if (this.configOwnershipResult instanceof Error) throw this.configOwnershipResult;
     return { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...this.configOwnershipResult };
-  }
-
-  /** Review round 9 (D9-1): the serviceFolders of each switchBranch. */
-  readonly switchServiceFolders: Array<ServiceFolders | undefined> = [];
-
-  async switchBranch(p: { volumeName: string; branch: string; token: string; serviceFolders?: ServiceFolders }): Promise<void> {
-    this.mount(p.volumeName);
-    this.calls.push(`switchBranch ${p.branch}`);
-    this.switchServiceFolders.push(p.serviceFolders);
-    if (this.switchError) throw this.switchError;
   }
 }
 

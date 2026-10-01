@@ -10,7 +10,7 @@ import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { runPreparingWorker } from '../docker/workerPreparation';
 import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput, type ServiceFolders } from '../git/gitSummary';
+import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput } from '../git/gitSummary';
 import { Messages } from '../messages';
 import {
   CONFIG_FOLDER,
@@ -56,7 +56,6 @@ import {
   listConfigsCommand,
   parseComposeHashes,
   readFilesCommand,
-  switchBranchCommand,
   writeAndRunCommand,
 } from './scripts';
 // Plan step 6, PR B: the checks of the inputs and the commands of the Dev Container CLI runs are shared with the batch
@@ -292,18 +291,6 @@ class RedactingStream {
     if (this.buffer) this.forward(redact(this.buffer, this.secret));
     this.buffer = '';
   }
-}
-
-/** Git's message for the user: at most 15 lines. */
-function gitMessageFromOutput(text: string): string {
-  const lines = text
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line !== '');
-  const shown = lines.slice(0, 15);
-  if (lines.length > shown.length) shown.push('…');
-  return shown.join('\n').slice(0, 2000);
 }
 
 /** The last non-empty line of stdout, parsed as JSON. Throws if it is missing or invalid. */
@@ -1077,48 +1064,6 @@ export class WorkspaceHelper {
     return parseGitSummaryOutput(result.stdout, isoTime(this.clock));
   }
 
-  /**
-   * git fetch + git switch in the volume (concept 7.5), without the Docker socket and the cache volume. Throws
-   * UserFacingError('gitSwitchFailed', Messages.gitSwitchFailed(branch, gitMessage)) when Git refuses; CommandError when
-   * the helper itself fails.
-   */
-  async switchBranch(p: {
-    volumeName: string;
-    repository: string;
-    branch: string;
-    token: string;
-    /**
-     * Review round 9 (D9-1): the paths of the repository that the other services of Docker Compose mount
-     * (Environment.serviceFolders); the restore of the owner leaves them out. Review round 11 (G5):
-     * `'repository'` over MAX_SERVICE_FOLDERS (only the files of root get their owner).
-     */
-    serviceFolders?: ServiceFolders;
-    onOutput?: (text: string) => void;
-    signal?: AbortSignal;
-  }): Promise<void> {
-    checkToken(p.token);
-    const folder = this.repositoryFolder(p.repository);
-    const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
-    this.deps.logger.info(`Switching ${p.repository} to the branch ${p.branch}.`);
-    const result = await this.runStreams(p.volumeName, switchBranchCommand(folder, p.branch, p.repository, p.serviceFolders), {
-      input: p.token,
-      secrets: true,
-      docker: false,
-      signal: p.signal,
-      onStdout: output,
-      onStderr: output,
-    });
-    if (result.exitCode === 0) return;
-    const stdout = redact(result.stdout, p.token);
-    const stderr = redact(result.stderr, p.token);
-    // 1: Git refused (its message is on stderr), 2: invalid argument or missing folder. Other codes: the helper failed.
-    if (result.exitCode === 1 || result.exitCode === 2) {
-      const gitMessage = gitMessageFromOutput(stderr || stdout);
-      throw new UserFacingError('gitSwitchFailed', Messages.gitSwitchFailed(p.branch, gitMessage), `${stderr}\n${stdout}`.trim());
-    }
-    throw new CommandError('git switch', result.exitCode, stdout, stderr);
-  }
-
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
   /**
@@ -1126,7 +1071,7 @@ export class WorkspaceHelper {
    * than HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
    * and only record the use (at most once per hour); without a result (a new window), they run ensureHelperImage without
    * the maintenance, which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays
-   * a stop, a delete, or a branch switch. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
+   * a stop or a delete. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
    * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
   private image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {

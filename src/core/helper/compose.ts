@@ -629,7 +629,7 @@ function rewriteModel(
       // Review round 9 (D9-1): a path of the repository that another service mounts (from the workspace volume) may hold
       // the data of that service, with the owner that the service gives it: the ownership fix leaves it out. Review
       // round 10 (D10-3): not a read-only mount (the service writes nothing there, and a file that root rewrote, for
-      // example at Switch branch…, must get its owner back), and never .git (serviceRepositoryPath). Review round 10
+      // example at a clone, must get its owner back), and never .git (serviceRepositoryPath). Review round 10
       // (D10-2): also the real path, when a link in the repository leads elsewhere in it (Docker follows the link of
       // the subpath), or where a created folder below a link lands.
       if (!isDev && decision.action === 'replace' && !(isRecord(decision.value) && decision.value.read_only === true)) {
@@ -725,7 +725,7 @@ function serviceRepositoryPath(value: unknown, repositoryFolder: string): string
 /**
  * Review round 10: whether `folder` may be recorded as a path that another service mounts: below the repository folder
  * (never the folder itself), and (D10-3) never `.git` or a path in it, of the repository or of a nested repository
- * (Git writes there as root, for example at Switch branch…, and the files must get their owner back).
+ * (Git writes there as root, for example at a clone, and the files must get their owner back).
  */
 function isServiceFolderPath(folder: string, repositoryFolder: string): boolean {
   if (folder === repositoryFolder || !folder.startsWith(`${repositoryFolder}/`)) return false;

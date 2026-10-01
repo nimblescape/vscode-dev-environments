@@ -104,7 +104,6 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   firstOpenOffline: 'retryOnly',
   dockerEngineNotRunning: ['showDetails', 'startDocker'],
   noConfiguration: ['showDetails'],
-  gitSwitchFailed: ['showDetails'],
   filesMissing: ['showDetails'],
   signInRequired: ['signIn'],
   hostAccess: ['showDetails'],
@@ -120,7 +119,6 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
 /** Situations that the user can resolve, rather than failures. */
 const WARNINGS = new Set<UserErrorCode>([
   'noConfiguration',
-  'gitSwitchFailed',
   'signInRequired',
   'hostAccess',
   'unencryptedDockerConnection',

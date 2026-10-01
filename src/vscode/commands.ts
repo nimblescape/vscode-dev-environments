@@ -11,7 +11,6 @@ export const Commands = {
   startInCurrentWindow: 'devEnvironments.startInCurrentWindow',
   stop: 'devEnvironments.stop',
   delete: 'devEnvironments.delete',
-  switchBranch: 'devEnvironments.switchBranch',
   selectConfiguration: 'devEnvironments.selectConfiguration',
   rebuild: 'devEnvironments.rebuild',
   showOnGitHub: 'devEnvironments.showOnGitHub',

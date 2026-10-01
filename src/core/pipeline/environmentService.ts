@@ -303,7 +303,6 @@ export type EnvironmentHelper = Pick<
   | 'up'
   | 'runUserCommands'
   | 'gitSummary'
-  | 'switchBranch'
   | 'prepareGit'
   | 'createRepositoryFolders'
   | 'fixConfigOwnership'
@@ -451,24 +450,12 @@ export interface RepositoryTarget {
   trusted: boolean;
 }
 
-/**
- * Review round 5 (D5-3): configurationChanged of an environment without a build record whose containers are of another
- * kind than the configuration that the pipeline would use: `question` asks about the switch (Messages.configurationKindChanged
- * of a single container, configurationKindChangedConnected of Docker Compose, where Later only keeps the connected window,
- * review round 20 of PR #64, R20-2, or configurationKindChangedDevContainerMissing).
- */
-export interface ConfigurationKindChange {
-  question: string;
-}
-
 export interface OperationOptions {
   progress: ProgressReporter;
   signal?: AbortSignal;
 }
 
 export interface OpenOptions extends OperationOptions {
-  /** Only for the first creation ("Switch branch…" on a repository without environment). */
-  branch?: string;
   /** Manual rebuild: build the environment image also when no digest changed (concept 7.14). */
   forceRebuild?: boolean;
   /** "Select configuration…": change the configuration first. Implies a rebuild when an environment exists. */
@@ -982,22 +969,6 @@ export function lifecycleMarkClears(mark: string | undefined, read: string | und
   return ranFor !== undefined && sameContainer(mark, ranFor);
 }
 
-/**
- * Whether the text of a configuration names a Dockerfile (`build.dockerfile` or the older `dockerFile`), also one that
- * the text names with a variable. A text that is no valid JSONC names none.
- */
-function namesDockerfile(configText: string): boolean {
-  let config: unknown;
-  try {
-    config = parseJsonc(configText);
-  } catch {
-    return false;
-  }
-  if (!isRecord(config)) return false;
-  const build = isRecord(config.build) ? config.build : {};
-  return typeof build.dockerfile === 'string' || typeof config.dockerFile === 'string';
-}
-
 /** The workspace helper could not be prepared, or the helper image of the open is gone (UserFacingError helperFailed). */
 function isHelperFailed(error: unknown): boolean {
   return isUserFacingError(error) && error.code === 'helperFailed';
@@ -1289,9 +1260,6 @@ export class EnvironmentService {
         const session = await this.requireSession();
         const existing = await this.deps.registry.findForAccount(target.repository, session.account.id, await this.currentDockerHost());
         if (existing) {
-          if (options.branch !== undefined) {
-            this.logger.info(`The branch ${options.branch} applies only to a first open; use Switch branch for an environment.`);
-          }
           return await this.openExisting(existing, options, target.defaultBranch ?? undefined, session);
         }
         return await this.openFirst(target, options, session);
@@ -1340,9 +1308,6 @@ export class EnvironmentService {
       const restored = await this.deps.registry.findForAccount(target.repository, session.account.id, dockerHost);
       if (restored) {
         this.logger.info(`An environment of ${target.repository} was restored from its volume ${restored.volumeName}. It is used.`);
-        if (options.branch !== undefined) {
-          this.logger.info(`The branch ${options.branch} applies only to a first open; use Switch branch for an environment.`);
-        }
         return this.openExisting(restored, options, target.defaultBranch ?? undefined, session);
       }
     }
@@ -1407,7 +1372,7 @@ export class EnvironmentService {
           steps.step('downloadingRepository');
           await this.deps.docker.createVolume(name, volumeLabels(environment));
           await this.prepareHelper(ctx);
-          await this.clone(ctx, session.token, options.branch ?? target.defaultBranch ?? undefined);
+          await this.clone(ctx, session.token, target.defaultBranch ?? undefined);
           return await this.runPipeline(ctx);
         } catch (error) {
           // PR #78 review round 1 (A-R1-1): the volume could not be removed (for example the lock was lost): the entry keeps its create mark, so the
@@ -1927,7 +1892,7 @@ export class EnvironmentService {
     return {
       configPath,
       fallback,
-      // Review round 3 (P3-2): the Dockerfile at the resolved path, as configurationChanged hashes it.
+      // Review round 3 (P3-2): the Dockerfile at the resolved path.
       configHash: configHash(files.configText, dockerfile.text),
       config,
       dockerfileText: dockerfile.text,
@@ -4586,16 +4551,6 @@ export class EnvironmentService {
   }
 
   /**
-   * Review round 11 (G4, G5): what Switch branch… leaves to the services: the recorded paths and those that the existing
-   * containers of the other services mount (also for an entry without a record, for example one that
-   * reconcileFromVolumes restored).
-   */
-  private async switchServiceFolders(env: Environment): Promise<ServiceFolders> {
-    const facts = await this.serviceFolderFacts(env, []);
-    return facts.overflow ? 'repository' : facts.folders;
-  }
-
-  /**
    * Review round 9 (D9-2), round 11 (G3, G4): the paths of the repository with data of the services, relative to the
    * repository folder (`./data/postgres`), for the confirmation of Delete: the recorded paths and those that the existing
    * containers of the other services mount. Never throws: without Docker, the recorded paths.
@@ -5256,7 +5211,7 @@ export class EnvironmentService {
       // Review round 9 (D9-1): after a new clone, no service has run on the files yet: every file gets its owner (also the
       // source folders that a service mounts). After a resumed clone, the paths of the services are left out. Review
       // round 12 (D12-1): on the path of a single container, runComposeUp has not computed them: from the facts
-      // (serviceFolderFacts: the recorded paths and those of the existing containers), as for Switch branch….
+      // (serviceFolderFacts: the recorded paths and those of the existing containers).
       if (ctx.resumedClone === true && ctx.serviceFolders === undefined) {
         const facts = await this.serviceFolderFacts(env, []);
         ctx.serviceFolders = facts.overflow ? 'repository' : facts.folders;
@@ -5738,124 +5693,6 @@ export class EnvironmentService {
     }
   }
 
-  /** Switch branch… in an existing environment (concept 7.5): fetch and switch in the volume. Throws gitSwitchFailed. */
-  async switchBranch(environmentId: string, branch: string, options: OperationOptions): Promise<void> {
-    const environment = await this.deps.registry.get(environmentId);
-    if (!environment) throw environmentMissing();
-    await this.requireCurrentHost(environment);
-    await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
-      const steps = new StepReporter(options.progress, this.logger);
-      let busy = false;
-      try {
-        const session = await this.requireSession();
-        await this.startDocker(steps, options.signal);
-        const found = await this.deps.registry.get(environmentId);
-        if (!found) throw environmentMissing(environment.repository);
-        const current = this.availableEntry(found, session.account);
-        let env = await this.waitForOtherOperation(current, options.signal);
-        await this.requireVolume(env);
-        const token = session.token;
-        env = await this.setBusyMark(env, 'switchBranch');
-        busy = true;
-        steps.step('downloadingRepository');
-        await this.deps.helper
-          .switchBranch({
-            volumeName: env.volumeName,
-            repository: env.repository,
-            branch,
-            token,
-            // Review round 9 (D9-1): the restore of the owner leaves out the paths that the other services mount.
-            // Review round 10 (D10-1): all that their containers may mount (Environment.serviceFolders). Review round 11
-            // (G4): also the paths that the existing containers mount, for an entry without a record too.
-            serviceFolders: await this.switchServiceFolders(env),
-            onOutput: this.output,
-            signal: options.signal,
-          })
-          .catch((error: unknown) => {
-            this.reportIfTokenRejected(error, token);
-            throw error;
-          });
-        await this.deps.registry.updateEnvironment(env.id, (entry) => {
-          if (entry.gitSummary) entry.gitSummary = { ...entry.gitSummary, branch };
-          if (entry.busy && this.isOwnMark(entry.busy)) delete entry.busy;
-        });
-        busy = false;
-        this.logger.info(`${env.repository} is on the branch ${branch}.`);
-      } catch (error) {
-        throw this.toUserError(error, options.signal);
-      } finally {
-        if (busy) await this.clearOwnMark(environmentId);
-      }
-    });
-  }
-
-  /**
-   * True if the configuration in the volume differs from the build record (path or configHash, concept 7.12). An
-   * environment without a build record counts as changed; a missing volume or environment as unchanged. Review round 5
-   * (D5-3): for an environment without a build record whose containers are of another kind than the configuration (as
-   * the pipeline tells them, containersUseCompose), a ConfigurationKindChange with the question about the switch.
-   */
-  async configurationChanged(environmentId: string, options: OperationOptions): Promise<boolean | ConfigurationKindChange> {
-    const env = await this.deps.registry.get(environmentId);
-    if (!env) return false;
-    await this.requireCurrentHost(env);
-    const record = env.buildRecord;
-    if (!record) return this.configurationKindChange(env, options);
-    const steps = new StepReporter(options.progress, this.logger);
-    try {
-      await this.requireOwnAccount(env, true);
-      await this.startDocker(steps, options.signal);
-      if (!(await this.deps.docker.volumeExists(env.volumeName))) return false;
-      // The configuration that the pipeline would use: on a branch without the selected one, the fallback.
-      const resolved = await this.resolveConfigFiles(env, env.configPath, options.signal);
-      if (!resolved) return true;
-      const { files } = resolved;
-      if (record.configPath !== resolved.configPath) return true;
-      if (checkConfiguration(files.configText).compose) {
-        const current = await this.composeConfigurationHash(env, resolved.configPath, files, options.signal);
-        // Review round 1 (P-4): a new version of the Compose plugin alone is no change (the next open takes it over).
-        return current === undefined || composeConfigurationChange(record, current) === 'changed';
-      }
-      return record.configHash !== (await this.singleConfigurationHash(env, resolved.configPath, files, options.signal));
-    } catch (error) {
-      throw this.toUserError(error, options.signal);
-    }
-  }
-
-  /**
-   * Review round 5 (D5-3): configurationChanged of an environment without a build record: a ConfigurationKindChange when
-   * its containers are of another kind than the configuration that the pipeline would use, else true (changed).
-   */
-  private async configurationKindChange(env: Environment, options: OperationOptions): Promise<true | ConfigurationKindChange> {
-    const steps = new StepReporter(options.progress, this.logger);
-    try {
-      await this.requireOwnAccount(env, true);
-      await this.startDocker(steps, options.signal);
-      if (!(await this.deps.docker.volumeExists(env.volumeName))) return true;
-      const container = await this.deps.docker.findContainer(env.id, env.containerName);
-      const containersCompose = await this.containersUseCompose(env, container);
-      if (containersCompose === undefined) return true;
-      const resolved = await this.resolveConfigFiles(env, env.configPath, options.signal);
-      if (!resolved) return true;
-      const configurationCompose = checkConfiguration(resolved.files.configText).compose;
-      if (containersCompose === configurationCompose) return true;
-      this.logger.info(
-        `The containers of ${env.repository} are of another kind than the configuration ${resolved.configPath}, and the environment has no build record.`,
-      );
-      return {
-        question:
-          container === undefined
-            ? Messages.configurationKindChangedDevContainerMissing(resolved.configPath)
-            : // Review round 20 of PR #64 (R20-2): the only caller is the connected window, where Later starts nothing.
-              containersCompose
-              ? Messages.configurationKindChangedConnected(resolved.configPath)
-              : Messages.configurationKindChanged(false, resolved.configPath),
-      };
-    } catch (error) {
-      throw this.toUserError(error, options.signal);
-    }
-  }
-
   /**
    * Whether the containers of an environment use Docker Compose, as the pipeline tells them before a switch of the kind
    * (review round 3, D3-2; round 4, D4-2): its dev container `container`, or else a container of another service of
@@ -5864,71 +5701,6 @@ export class EnvironmentService {
   private async containersUseCompose(env: Environment, container: ContainerInfo | undefined): Promise<boolean | undefined> {
     if (container !== undefined) return isComposeContainer(container.labels, composeProjectName(env.id));
     return (await this.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
-  }
-
-  /**
-   * Review round 3 (P3-2): configHash of a single-container configuration as loadConfiguration computes it, with the
-   * Dockerfile at the path that the resolved configuration names (resolvedDockerfile). The CLI resolves the configuration
-   * only when the text names a Dockerfile that READ_FILES_SCRIPT could not locate (for example with a variable).
-   */
-  private async singleConfigurationHash(env: Environment, configPath: string, files: ConfigFiles, signal: AbortSignal | undefined): Promise<string> {
-    if (files.dockerfilePath !== undefined || !namesDockerfile(files.configText)) return configHash(files.configText, files.dockerfileText);
-    await this.requireVolume(env);
-    const { config } = await this.deps.helper.readConfiguration({
-      volumeName: env.volumeName,
-      repository: env.repository,
-      configPath,
-      environmentId: env.id,
-      merged: false,
-      onOutput: this.output,
-      signal,
-    });
-    const dockerfile = await this.resolvedDockerfile(env, configPath, config, files, signal);
-    return configHash(files.configText, dockerfile.text);
-  }
-
-  /**
-   * composeConfigHash, composeInputsHash, and the Compose version of the Docker Compose configuration `configPath` (the
-   * model run, as in loadComposeConfiguration), or `undefined` when its compose files cannot be read: then it counts as
-   * changed.
-   */
-  private async composeConfigurationHash(
-    env: Environment,
-    configPath: string,
-    files: ConfigFiles,
-    signal: AbortSignal | undefined,
-  ): Promise<{ configHash: string; inputsHash: string; version: string } | undefined> {
-    const { helper } = this.deps;
-    await this.requireVolume(env);
-    // Review round 19 (D19-1): with the project name, as loadComposeConfiguration reads it.
-    const { config } = await helper.readConfiguration({
-      volumeName: env.volumeName,
-      repository: env.repository,
-      configPath,
-      environmentId: env.id,
-      merged: false,
-      env: { COMPOSE_PROJECT_NAME: composeProjectName(env.id) },
-      onOutput: this.output,
-      signal,
-    });
-    const composeFiles = resolveComposeFiles(configPath, splitRepository(env.repository).name, config.dockerComposeFile);
-    if ('problem' in composeFiles) return undefined;
-    await this.requireVolume(env);
-    const output = await helper.composeModel({
-      volumeName: env.volumeName,
-      repository: env.repository,
-      files: composeFiles.files,
-      project: composeProjectName(env.id),
-      signal,
-    });
-    // Review round 9 (S9-1): a model beyond the limits counts as a change; the open refuses it.
-    // Review round 10 (S10-2): with the Dockerfiles, before the hashes read them.
-    if ('error' in output || composeModelLimit(output.model, output.dockerfiles) !== undefined) return undefined;
-    return {
-      configHash: composeConfigHash(files.configText, output.model, output.dockerfiles),
-      inputsHash: composeInputsHash(files.configText, output.inputsHash, output.dockerfiles),
-      version: output.version,
-    };
   }
 
   /** Configuration paths in the volume (current branch), in the order of precedence. */
@@ -6078,7 +5850,7 @@ export class EnvironmentService {
         .map((volume) => volume.name);
       if (serviceVolumes.length > 0) candidate.serviceVolumes = serviceVolumes;
       // Review round 11 (G4): the paths of the repository that the containers of the other services mount, so that
-      // Switch branch… and the ownership fixes leave their data alone before the next open writes the list.
+      // the ownership fixes leave their data alone before the next open writes the list.
       const serviceFolders = boundServiceFolders(repositoryFolder(candidate.repository), [
         liveServiceFolders(
           containers.filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === candidate.id),

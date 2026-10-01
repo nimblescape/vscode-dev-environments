@@ -33,7 +33,6 @@ import {
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   READ_FILES_SCRIPT,
-  SWITCH_BRANCH_SCRIPT,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
 } from './scripts';
@@ -561,7 +560,8 @@ describe('WorkspaceHelper.ensureImage with a state file (implementation notes 7)
     const calls = docker.imageIdCalls;
     expect(calls).toBeGreaterThan(0);
 
-    // A long-lived window: the helper runs of a stop, a delete, or a branch switch never check or rebuild.
+    // A long-lived window: the helper runs of a stop or a delete never check or rebuild.
+    // 2026-10-01: the Switch branch command was dropped (user decision).
     advance(HELPER_CHECK_INTERVAL_MS + HELPER_IMAGE_RECHECK_MS);
     await helper.run('vol', ['true']);
     expect(docker.imageIdCalls).toBe(calls);
@@ -1886,7 +1886,8 @@ describe('WorkspaceHelper helper runs in a new window (implementation notes 7)',
     };
   }
 
-  it('never checks, rebuilds, or cleans up in the first helper run (a stop, a delete, a branch switch)', async () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('never checks, rebuilds, or cleans up in the first helper run (a stop, a delete)', async () => {
     const w = newWindow();
     w.overdue();
     const result = await w.helper.run('vol', ['true'], { docker: false, network: false });
@@ -1970,41 +1971,6 @@ describe('WorkspaceHelper.clone', () => {
     await expect(helper.clone({ volumeName: 'vol', repository: 'acme/a b', token: TOKEN })).rejects.toThrow(/Invalid repository/);
     await expect(helper.clone({ volumeName: 'vol', repository: 'acme/..', token: TOKEN })).rejects.toThrow(/Invalid repository/);
     expect(docker.calls).toHaveLength(0);
-  });
-});
-
-describe('WorkspaceHelper.switchBranch', () => {
-  it('passes the token only on stdin and runs the switch script', async () => {
-    await createHelper().switchBranch({ volumeName: 'vol', repository: 'acme/api', branch: 'feature/x', token: TOKEN });
-    const run = docker.runs[0];
-    expect(run.options.input).toBe(TOKEN);
-    expect(run.args.some((arg) => arg.includes(TOKEN))).toBe(false);
-    expect(run.args).toContain('--tmpfs');
-    expect(commandOf(run.args)).toEqual(['sh', '-c', SWITCH_BRANCH_SCRIPT, 'sh', '/workspaces/api', 'feature/x', 'acme/api']);
-  });
-
-  it('shows the message of Git when Git refuses the switch', async () => {
-    docker.handler = () => ({
-      exitCode: 1,
-      stderr:
-        'error: Your local changes to the following files would be overwritten by checkout:\n\tREADME.md\nPlease commit your changes or stash them before you switch branches.\nAborting\n',
-    });
-    const error = await createHelper()
-      .switchBranch({ volumeName: 'vol', repository: 'acme/api', branch: 'dev', token: TOKEN })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(UserFacingError);
-    expect(error).toMatchObject({ code: 'gitSwitchFailed' });
-    expect((error as Error).message).toBe(
-      'The branch dev could not be checked out. error: Your local changes to the following files would be overwritten by checkout:\n\tREADME.md\nPlease commit your changes or stash them before you switch branches.\nAborting',
-    );
-  });
-
-  it('throws a CommandError when the helper itself fails', async () => {
-    docker.handler = () => ({ exitCode: 3, stderr: '/run/devenv-secrets is not a tmpfs mount.\n' });
-    const error = await createHelper()
-      .switchBranch({ volumeName: 'vol', repository: 'acme/api', branch: 'dev', token: TOKEN })
-      .catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(CommandError);
   });
 });
 
@@ -2174,17 +2140,17 @@ describe('Docker access of the helper runs', () => {
     await helper.gitSummary({ volumeName: 'vol', repository: 'acme/api' });
     await helper.readConfigFiles({ volumeName: 'vol', repository: 'acme/api', configPath: '.devcontainer.json' });
     await helper.listConfigurations({ volumeName: 'vol', repository: 'acme/api' });
-    await helper.switchBranch({ volumeName: 'vol', repository: 'acme/api', branch: 'dev', token: TOKEN });
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its helper run is gone.
     await helper.clone({ volumeName: 'vol', repository: 'acme/api', token: TOKEN });
 
-    const [summary, readFiles, listConfigs, switchBranch, clone] = docker.runs.map((run) => run.args);
-    for (const args of [summary, readFiles, listConfigs, switchBranch, clone]) {
+    const [summary, readFiles, listConfigs, clone] = docker.runs.map((run) => run.args);
+    for (const args of [summary, readFiles, listConfigs, clone]) {
       expect(hasDockerAccess(args)).toBe(false);
       expect(args).toContain('type=volume,source=vol,target=/workspaces');
     }
     // Only the runs that fetch or clone have network.
     expect([summary, readFiles, listConfigs].every(hasNoNetwork)).toBe(true);
-    expect([switchBranch, clone].some(hasNoNetwork)).toBe(false);
+    expect([clone].some(hasNoNetwork)).toBe(false);
   });
 
   // Unit 7: on a remote host the source of the socket mount is a path of that computer.

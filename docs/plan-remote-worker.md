@@ -35,6 +35,7 @@ On a remote Docker host every Docker call of the extension opens its own SSH con
 | 2026-10-01 | **Q2: isolation inside the one helper.** Git runs as an unprivileged user, without the Docker socket and without the token. Compose remote includes are turned off where supported. The read steps lose `--network none`; this is accepted. |
 | 2026-10-01 | **Q3: the lock and questions to the user.** The environment lock stays held while a question to the user is open; other windows and computers are refused after 10 s (D3). |
 | 2026-10-01 | **Q4: the token write into the dev container**, as recommended: through the worker's `docker exec -i`, with the secret on standard input. (The user agreed to "all three", which covered Q1–Q3; Q4 is taken as recommended.) |
+| 2026-10-01 | **Switch branch is dropped.** The user: "We drop the Switch Branch command, it is not needed anymore." The command and the code that only it used are removed; step 7 keeps only Delete's check. |
 
 ## 3. Steps
 
@@ -48,7 +49,7 @@ Every step is its own pull request: local checks, CI (`test`, `docker`), review 
 | 4 | Hanging `docker stop` | measure the gap between monitor ticks from the end of the previous tick | merged (PR #70) |
 | 5 | Worker: operations and environment lock | every plain Docker call, the batched refresh (containers and branches), Stop, the Docker part of Delete; the `flock` per environment | merged (PRs #71, #72, #74, #76) |
 | 6 | Worker: Start batch | one helper per operation runs the bootstrap batch; covers Start, Rebuild, Select configuration, Clone again; the background prebuild of the helper image runs on every engine, not only the local one | in progress: PR D (#77) and PR A (#78) merged; PR B in review |
-| 7 | Worker: Switch branch and Delete's check | a batch in one helper, with the working-copy checks | queued |
+| 7 | Worker: Delete's check | Delete's Git summary in one helper, with the working-copy checks | queued |
 | 8 | One Session Monitor on every engine | the monitor container on the local Docker too; the local Node.js monitor removed; heartbeats, "in use elsewhere", `forget` from each window's worker; automatic stops, Close and Keep Running (today it needs a remote host), the window context, the stop when heartbeats end, engine-side cleanup and the optional image updates the same on every engine | queued |
 | 9 | Naming 1 | container short ID; Docker context named after the SSH host | queued |
 | 10 | Naming 2 | readable image names with the reworked image checks | queued |

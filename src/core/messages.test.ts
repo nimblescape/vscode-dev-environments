@@ -175,7 +175,8 @@ describe('the question of a switch from Docker Compose to a single container (re
   const configPath = '.devcontainer/python/devcontainer.json';
   it.each([
     ['at an open', Messages.configurationKindChanged(true, configPath)],
-    ['in the connected window', Messages.configurationKindChangedConnected(configPath)],
+    // 2026-10-01: the Switch branch command was dropped (user decision). Its question in the connected window
+    // (configurationKindChangedConnected) is gone.
   ])('names the switch, what Rebuild now removes, and Select configuration… (%s)', (_where, text) => {
     expect(text).toContain(`The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container.`);
     expect(text).toContain(

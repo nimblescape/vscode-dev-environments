@@ -49,13 +49,6 @@ export const Messages = {
       ? `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: if the dev container runs already and no container of the environment must be created again, the dev container opens as it is, and the stopped containers of the other services are started. Otherwise nothing starts: a stopped dev container, or containers that must be created again (for example because an older version created them, or because they were created while the host access checks were off and the checks are on now), start only with a Docker Compose configuration. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`
       : `The container of this environment is a single container, but the configuration ${configPath} uses Docker Compose. Rebuild now switches the environment to Docker Compose: it removes the container and the files outside the volumes; named volumes are kept. Later keeps the single container. To use the configuration of the single container, choose Select configuration… in the list of environments.`,
   /**
-   * Review round 20 of PR #64 (R20-2): configurationKindChanged(true, …) in the window that is connected to the
-   * environment (Switch branch…, configurationChanged). Later there only keeps the window connected: nothing is started
-   * or removed (the next open starts the stopped services, D-22).
-   */
-  configurationKindChangedConnected: (configPath: string) =>
-    `The containers of this environment use Docker Compose, but the configuration ${configPath} uses a single container. Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept. Later keeps Docker Compose without a rebuild: this window stays connected, and nothing is started or removed. To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.`,
-  /**
    * Review round 5 (P5-4): configurationKindChanged when the dev container of Docker Compose is missing: Later starts
    * nothing then (composeDevContainerMissing).
    */
@@ -248,7 +241,6 @@ export const Messages = {
   untrustedRepository: (repository: string) =>
     `${repository} does not belong to you or to one of your organizations. Opening it runs code from the repository (Dockerfile, Features, and commands) on your computer. Open it?`,
   signInRequired: 'Sign in with GitHub to use Dev Environments.',
-  gitSwitchFailed: (branch: string, gitMessage: string) => `The branch ${branch} could not be checked out. ${gitMessage}`,
   opening: (repository: string) => `Opening ${repository}…`,
   deleteConfirm: (repository: string) =>
     `Delete the environment of ${repository}? The container and the files in the environment are removed.`,

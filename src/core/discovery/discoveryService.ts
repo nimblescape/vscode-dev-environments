@@ -45,7 +45,6 @@ const MAX_PAGES = 1000;
 const ORGANIZATIONS_PAGE_SIZE = 100;
 const MAX_ORGANIZATION_PAGES = 20;
 const PROBE_CHUNK_SIZE = 50;
-const BRANCH_LIMIT = 100;
 
 /** Client ID of the GitHub OAuth app that VS Code uses for the GitHub sign-in. */
 export const VSCODE_GITHUB_OAUTH_APP_CLIENT_ID = '01ab8ac9400c4e429b23';
@@ -183,20 +182,6 @@ export const REPOSITORY_QUERY = `query Repository($owner: String!, $name: String
 }
 ${REPOSITORY_FIELDS_FRAGMENT}
 ${CONFIGURATION_FOLDER_FRAGMENT}`;
-
-/** Branches of a repository, and its default branch. */
-export const BRANCHES_QUERY = `query Branches($owner: String!, $name: String!) {
-  repository(owner: $owner, name: $name) {
-    defaultBranchRef {
-      name
-    }
-    refs(refPrefix: "refs/heads/", first: ${BRANCH_LIMIT}, orderBy: { field: ALPHABETICAL, direction: ASC }) {
-      nodes {
-        name
-      }
-    }
-  }
-}`;
 
 /** Configuration files on one branch. The expressions are variables, so a branch name is never part of the query text. */
 export const BRANCH_CONFIGURATIONS_QUERY = `query BranchConfigurations($owner: String!, $name: String!, $rootFile: String!, $folder: String!) {
@@ -369,13 +354,6 @@ interface OrganizationsData {
 
 interface RepositoryData {
   repository?: RepositoryNode | null;
-}
-
-interface BranchesData {
-  repository?: {
-    defaultBranchRef?: { name?: string } | null;
-    refs?: Connection<{ name?: string }> | null;
-  } | null;
 }
 
 interface BranchConfigurationsData {
@@ -638,25 +616,6 @@ export class DiscoveryService {
       throw new Error(`GitHub did not return the account: ${describeGraphQLErrors(result.errors)}`);
     }
     return { databaseId: viewer.databaseId, login: viewer.login, name: typeof viewer.name === 'string' ? viewer.name : null };
-  }
-
-  /** Branch names (refs/heads, up to 100, alphabetical), the default branch first. */
-  async listBranches(repository: string, token: string, signal?: AbortSignal): Promise<string[]> {
-    const { owner, name } = splitRepository(repository);
-    const result = await this.api.graphql<BranchesData>(BRANCHES_QUERY, { owner, name }, token, signal);
-    const node = result.data?.repository;
-    if (!isRecord(node)) {
-      throw new Error(`GitHub did not return the repository ${repository}: ${describeGraphQLErrors(result.errors)}`);
-    }
-    if (result.errors) this.logger.warn(`Branches of ${repository}: ${describeGraphQLErrors(result.errors)}`);
-    const names: string[] = [];
-    const defaultBranch = node.defaultBranchRef?.name;
-    if (typeof defaultBranch === 'string' && defaultBranch !== '') names.push(defaultBranch);
-    for (const ref of asArray(node.refs?.nodes)) {
-      const branch = isRecord(ref) ? ref.name : undefined;
-      if (typeof branch === 'string' && branch !== '' && !names.includes(branch)) names.push(branch);
-    }
-    return names;
   }
 
   /**

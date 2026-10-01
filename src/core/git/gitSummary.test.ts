@@ -106,6 +106,16 @@ describe('commands', () => {
     expect(ownershipFixCommand('/workspaces/api', 'vscode')).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/api', 'vscode']);
   });
 
+  it('never follows a link and never leaves the file system of the folder, on every branch of the fix (review round 3 of PR #81, B-R3-1, B-R3-2)', () => {
+    // Review round 3 of PR #81: the tests with real tools and mounts need root and are skipped elsewhere (CI); this one
+    // runs everywhere. Each of the three find commands of the fix keeps -xdev and chown -h.
+    for (const script of [OWNERSHIP_FIX_SCRIPT, CONFIG_OWNERSHIP_FIX_SCRIPT]) {
+      const finds = script.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
+      expect(finds).toHaveLength(3);
+      for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
+    }
+  });
+
   it.each([
     ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
     ['OWNERSHIP_FIX_SCRIPT', OWNERSHIP_FIX_SCRIPT],
@@ -244,7 +254,8 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     });
   });
 
-  it('counts unpushed commits on a local branch that is not checked out (Switch branch…)', () => {
+  // 2026-10-01: the Switch branch command was dropped (user decision).
+  it('counts unpushed commits on a local branch that is not checked out', () => {
     const root = tempDir();
     const remote = path.join(root, 'remote.git');
     const repo = path.join(root, 'repo');
@@ -919,5 +930,35 @@ describe.skipIf(!canBindMount)('review round 15 (K3): a mount of the dev contain
     expect(result.status).toBe(0);
     for (const name of ['.', 'github-token', 'gh', 'gh/hosts.yml']) expect(uidOf(path.join(config, name)), name).toBe(nobody);
     for (const pg of pgFiles) expect(uidOf(pg), pg).toBe(999);
+  });
+});
+
+describe.skipIf(!canBindMount)('review round 3 of PR #81: the ownership fix without paths of the services, with real tools and mounts as root', () => {
+  const nobody = Number(spawnSync('id', ['-u', 'nobody'], { encoding: 'utf8' }).stdout.trim());
+
+  /** Runs OWNERSHIP_FIX_SCRIPT for `repo` and user nobody (no paths of the services) after `setup`, in a mount namespace; prints the uid of each of `files`. */
+  function fixAndStat(repo: string, setup: string, files: string[]): string[] {
+    const script = `${setup}\nsh -c "$1" sh "$2" nobody || exit 1\nshift 2\nfor f do stat -c %u "$f"; done`;
+    const result = spawnSync('unshare', ['-m', 'sh', '-c', script, 'sh', OWNERSHIP_FIX_SCRIPT, repo, ...files], { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    return result.stdout.trim().split('\n');
+  }
+
+  it('gives a link of the repository the user, never its target outside (review round 3 of PR #81, B-R3-1)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'api');
+    fs.mkdirSync(repo);
+    fs.writeFileSync(path.join(root, 'secret'), 'x');
+    fs.symlinkSync('../secret', path.join(repo, 'x'));
+    // Before (chown without -h): the target, a file of root outside the repository (such as /etc/sudoers), got the user.
+    expect(fixAndStat(repo, ':', [path.join(repo, 'x'), path.join(root, 'secret')])).toEqual([String(nobody), '0']);
+  });
+
+  it('leaves the files of another file system mounted in the repository alone (review round 3 of PR #81, B-R3-2)', () => {
+    const repo = path.join(tempDir(), 'api');
+    fs.mkdirSync(path.join(repo, 'mnt'), { recursive: true });
+    // Before (find without -xdev): the file of root in the tmpfs got the user.
+    expect(fixAndStat(repo, 'mount -t tmpfs devenv "$2/mnt" && touch "$2/mnt/f" || exit 1', [repo, path.join(repo, 'mnt/f')])).toEqual([String(nobody), '0']);
   });
 });
