@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CONFIG_OWNERSHIP_FIX_SCRIPT,
   GIT_SUMMARY_COMPLETE,
+  GIT_SUMMARY_FLAGGED_FILES,
   GIT_SUMMARY_INCOMPLETE_MARKER,
   GIT_SUMMARY_NO_FOLDER_EXIT,
   GIT_SUMMARY_SCRIPT,
@@ -1465,6 +1466,112 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     fs.rmdirSync(path.join(repo, 'datax'));
     toRoot(repo, '.git/refs/stash', 0o600);
     expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBe('.git/refs/stash cannot be read');
+  });
+
+  /** Review round 5 of PR #84, A-R5-2: runs the complete check as the owner and expects the marker of flagged files. */
+  function expectFlaggedMarker(repo: string): void {
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} ${GIT_SUMMARY_FLAGGED_FILES}\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe(GIT_SUMMARY_FLAGGED_FILES);
+  }
+
+  it('review round 5 of PR #84, A-R5-2: an edited file marked assume-unchanged reads clean to Git; the complete check prints the marker', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    rootGit(repo, 'update-index', '--assume-unchanged', 'a.txt');
+    fs.appendFileSync(path.join(repo, 'a.txt'), 'edited\n');
+    giveToOwner(repo);
+    const plain = runAsOwner(repo);
+    expect(plain.status).toBe(0);
+    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
+    expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
+    expectFlaggedMarker(repo);
+  });
+
+  it('review round 5 of PR #84, A-R5-2: an edited file marked skip-worktree reads clean to Git; the complete check prints the marker', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    rootGit(repo, 'update-index', '--skip-worktree', 'b.txt');
+    fs.appendFileSync(path.join(repo, 'b.txt'), 'edited\n');
+    giveToOwner(repo);
+    expect(parseGitSummaryOutput(runAsOwner(repo).stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
+    expectFlaggedMarker(repo);
+  });
+
+  it('review round 5 of PR #84, A-R5-2: with core.ignoreStat, an edited file reads clean to Git; the complete check prints the marker', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    rootGit(repo, 'config', 'core.ignoreStat', 'true');
+    fs.writeFileSync(path.join(repo, 'c.txt'), 'c\n');
+    rootGit(repo, 'add', 'c.txt');
+    rootGit(repo, 'commit', '-q', '-m', 'third');
+    fs.appendFileSync(path.join(repo, 'c.txt'), 'edited\n');
+    giveToOwner(repo);
+    expect(parseGitSummaryOutput(runAsOwner(repo).stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
+    expectFlaggedMarker(repo);
+  });
+
+  it('review round 5 of PR #84, A-R5-2: a sparse checkout (skip-worktree files absent from the working tree) and a plain repository print no marker', () => {
+    const plainRepo = remoteTrackingRepo({ missing: false });
+    if (plainRepo === undefined) return;
+    const plain = runAsOwner(plainRepo, true);
+    expect(plain.status).toBe(0);
+    expect(plain.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+    expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    fs.mkdirSync(path.join(repo, 'docs'));
+    fs.writeFileSync(path.join(repo, 'docs', 'd.txt'), 'd\n');
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    rootGit(repo, 'add', '.');
+    rootGit(repo, 'commit', '-q', '-m', 'more');
+    rootGit(repo, 'sparse-checkout', 'set', '--no-cone', '/a.txt');
+    expect(fs.existsSync(path.join(repo, 'docs', 'd.txt'))).toBe(false);
+    expect(fs.existsSync(path.join(repo, 'b.txt'))).toBe(false);
+    expect(rootGit(repo, 'ls-files', '-v')).toMatch(/^S b\.txt$/m);
+    giveToOwner(repo);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+  });
+
+  it('review round 5 of PR #84: log.showSignature and gpg.program of the repository configuration do not run a program', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const out = path.join(path.dirname(repo), 'out');
+    fs.mkdirSync(out);
+    spawnSync('chown', ['1000:1000', out]);
+    const ran = path.join(out, 'ran');
+    const stub = path.join(path.dirname(repo), 'fake-gpg');
+    fs.writeFileSync(stub, `#!/bin/sh\nid -u >> '${ran}'\nexit 1\n`, { mode: 0o755 });
+    fs.chmodSync(stub, 0o755);
+    // A stash commit with a signature header (never verified: the stub fails), named by refs/stash and its reflog.
+    const tree = rootGit(repo, 'rev-parse', 'HEAD^{tree}').trim();
+    const parent = rootGit(repo, 'rev-parse', 'HEAD').trim();
+    const commit = `tree ${tree}\nparent ${parent}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\nWIP on main\n`;
+    const hashed = spawnSync('git', ['-c', 'safe.directory=*', 'hash-object', '-t', 'commit', '-w', '--stdin'], {
+      cwd: repo,
+      input: commit,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    });
+    expect(hashed.status).toBe(0);
+    rootGit(repo, 'update-ref', '--create-reflog', '-m', 'WIP on main', 'refs/stash', hashed.stdout.trim());
+    rootGit(repo, 'config', 'log.showSignature', 'true');
+    rootGit(repo, 'config', 'gpg.program', stub);
+    giveToOwner(repo);
+    // The setup is live: Git's own `git stash list` runs the stub.
+    rootGit(repo, 'stash', 'list');
+    expect(fs.existsSync(ran)).toBe(true);
+    fs.rmSync(ran);
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', stashes: 1 });
+      expect(fs.existsSync(ran)).toBe(false);
+    }
   });
 
   it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {

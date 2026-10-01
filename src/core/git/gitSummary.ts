@@ -39,6 +39,12 @@ export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
 export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
 
 /**
+ * Review round 5 of PR #84, A-R5-2: the text of GIT_SUMMARY_INCOMPLETE_MARKER for tracked files that `git status` does
+ * not compare with the working tree (GIT_SUMMARY_SCRIPT).
+ */
+export const GIT_SUMMARY_FLAGGED_FILES = 'files marked assume-unchanged or skip-worktree are not checked';
+
+/**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
  * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
  * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
@@ -83,6 +89,15 @@ export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
  * Review round 4 of PR #84, A-R4-2: a stash that `refs/stash` still names while its reflog is empty (`git reflog expire
  * --expire=now --all`, a packed `refs/stash` without a reflog, or a reftable repository) is listed by no `git stash
  * list`; in every mode it counts as 1 stash then (whatever the ref backend).
+ *
+ * Review round 5 of PR #84, A-R5-2: `git status` does not compare files marked assume-unchanged (`git update-index
+ * --assume-unchanged`, or every file with `core.ignoreStat`) or skip-worktree with the working tree, so their edits
+ * counted as clean. With `$2` GIT_SUMMARY_COMPLETE, after the checks above, GIT_SUMMARY_INCOMPLETE_MARKER
+ * (GIT_SUMMARY_FLAGGED_FILES) is printed when `git ls-files -v` lists a file with a lowercase tag (assume-unchanged),
+ * or a file tagged `S` (skip-worktree) that exists in the working tree (a name that Git quotes counts as existing); a
+ * skip-worktree file that is absent (sparse checkout) is not. A failing `git ls-files` (or grep) prints the marker
+ * too. Git runs with `log.showSignature=false` too (review round 5 of PR #84): with it set in the repository
+ * configuration, `git stash list` ran the program of `gpg.program`.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
 export LC_ALL=C LANG=C
@@ -98,7 +113,7 @@ fi
 GIT_OPTIONAL_LOCKS=0
 export GIT_OPTIONAL_LOCKS
 g() {
-  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false "$@"
 }
 count_lines() {
   if [ -z "$1" ]; then
@@ -156,6 +171,36 @@ if [ "\${2:-}" = '${GIT_SUMMARY_COMPLETE}' ] && [ -z "$incomplete" ]; then
       incomplete='other worktrees are not checked'
     elif { [ -e "$gitdir/refs/stash" ] || [ -s "$gitdir/logs/refs/stash" ]; } && ! g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
       incomplete='the stash could not be read'
+    fi
+  fi
+  if [ -z "$incomplete" ]; then
+    if ! tracked=$(g -c core.quotePath=false ls-files -v); then
+      incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
+    else
+      flagged=$(printf '%s\\n' "$tracked" | grep '^[a-zS] ') || [ "$?" -eq 1 ] || flagged='?'
+      set -f
+      IFS='
+'
+      for line in $flagged; do
+        case $line in
+          'S "'*)
+            incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
+            break
+            ;;
+          'S '*)
+            if [ -e "\${line#S }" ] || [ -L "\${line#S }" ]; then
+              incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
+              break
+            fi
+            ;;
+          *)
+            incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
+            break
+            ;;
+        esac
+      done
+      unset IFS
+      set +f
     fi
   fi
 fi
