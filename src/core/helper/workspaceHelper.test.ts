@@ -2114,6 +2114,38 @@ describe('WorkspaceHelper file and Git queries', () => {
     }
   });
 
+  it('review round 5 of PR #84, B-R5-7: a timeoutMs passed to gitSummary is the time limit of the batch step (not GIT_SUMMARY_TIMEOUT_MS)', async () => {
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => (started = resolve));
+    docker.handler = (args, options) => {
+      if (args[0] !== 'run') return {};
+      started();
+      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(abortError())));
+    };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const caught = createHelper()
+        .gitSummary({ volumeName: 'vol', repository: 'acme/api', timeoutMs: 7_000 })
+        .then(() => undefined, (reason: unknown) => reason);
+      await running;
+      await vi.advanceTimersByTimeAsync(6_999);
+      let settled = false;
+      void caught.then(() => (settled = true));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect(settled).toBe(true);
+      const error = await caught;
+      expect(error).toBeInstanceOf(Error);
+      expect(isAbortError(error)).toBe(false);
+      expect((error as Error).message).toMatch(/did not end within 7 seconds/);
+      expect(bridge.kinds).toEqual(['gitSummary']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('review round 1 of PR #84, A-R1-2: gitSummary keeps CommandError for exit code 128 (a root 0600 .git/index)', async () => {
     docker.handler = () => ({ exitCode: 128, stderr: 'fatal: .git/index: index file open failed: Permission denied\n' });
     await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({ name: 'CommandError', exitCode: 128 });

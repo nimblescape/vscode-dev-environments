@@ -12,6 +12,7 @@ import {
   GIT_SUMMARY_COMPLETE,
   GIT_SUMMARY_FLAGGED_FILES,
   GIT_SUMMARY_INCOMPLETE_MARKER,
+  GIT_SUMMARY_MAX_PRUNED_FOLDERS,
   GIT_SUMMARY_NO_FOLDER_EXIT,
   GIT_SUMMARY_SCRIPT,
   GitProblemWatcher,
@@ -1572,6 +1573,156 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
       expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', stashes: 1 });
       expect(fs.existsSync(ran)).toBe(false);
     }
+  });
+
+  it('review round 5 of PR #84, B-R5-1: a commit on a detached HEAD that no branch holds counts as unpushed, with an empty branch, in both modes', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    rootGit(repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    rootGit(repo, 'checkout', '-q', '--detach');
+    fs.writeFileSync(path.join(repo, 'd.txt'), 'd\n');
+    rootGit(repo, 'add', 'd.txt');
+    rootGit(repo, 'commit', '-q', '-m', 'detached');
+    giveToOwner(repo);
+    for (const complete of [false, true]) {
+      const result = runAsOwner(repo, complete);
+      expect(result.status).toBe(0);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+      expect(result.stdout.split('\n')[0]).toBe('');
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
+    }
+  });
+
+  it('review round 5 of PR #84, B-R5-2: an ignored folder named `d*` is walked, not left out as a pattern: an unreadable `dz` that Git does not ignore still prints the marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'd\\*/\n');
+    rootGit(repo, 'add', '.gitignore');
+    rootGit(repo, 'commit', '-q', '-m', 'ignore');
+    fs.mkdirSync(path.join(repo, 'd*'));
+    fs.writeFileSync(path.join(repo, 'd*', 'f'), 'x');
+    fs.mkdirSync(path.join(repo, 'dz'));
+    fs.writeFileSync(path.join(repo, 'dz', 'f'), 'x');
+    giveToOwner(repo);
+    // Git ignores the folder `d*` alone (the pattern escapes the star), and lists it as such.
+    expect(rootGit(repo, '-c', 'core.quotePath=false', 'ls-files', '-o', '-i', '--exclude-standard', '--directory')).toBe('d*/\n');
+    for (const mode of [0o711, 0o700]) {
+      toRoot(repo, 'dz', mode, true);
+      const result = runAsOwner(repo, true);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} dz cannot be read\n`);
+      expect(gitSummaryProblem(result.stdout, '')).toBe('dz cannot be read');
+    }
+  });
+
+  it('review round 5 of PR #84, B-R5-2: a folder that Git ignores at the root only (`/data/`) leaves out that folder alone: an unreadable src/data still prints the marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.gitignore'), '/data/\n');
+    rootGit(repo, 'add', '.gitignore');
+    rootGit(repo, 'commit', '-q', '-m', 'ignore');
+    fs.mkdirSync(path.join(repo, 'data'));
+    fs.writeFileSync(path.join(repo, 'data', 'f'), 'x');
+    fs.mkdirSync(path.join(repo, 'src', 'data'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src', 'data', 'f'), 'x');
+    giveToOwner(repo);
+    toRoot(repo, 'data', 0o700, true);
+    toRoot(repo, 'src/data', 0o700, true);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} src/data cannot be read\n`);
+    expect(gitSummaryProblem(result.stdout, '')).toBe('src/data cannot be read');
+    // Without src/data, the ignored root folder alone is left out: no marker.
+    fs.rmSync(path.join(repo, 'src'), { recursive: true });
+    const without = runAsOwner(repo, true);
+    expect(without.status).toBe(0);
+    expect(without.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+  });
+
+  it('review round 5 of PR #84, B-R5-3: a committed .gitmodules without a modules folder, and a dangling link .gitmodules, print the marker of submodules', () => {
+    const repo = remoteTrackingRepo({ missing: false });
+    if (repo === undefined) return;
+    fs.writeFileSync(path.join(repo, '.gitmodules'), '[submodule "sub"]\n\tpath = sub\n\turl = ../sub\n');
+    rootGit(repo, 'add', '.gitmodules');
+    rootGit(repo, 'commit', '-q', '-m', 'gitmodules');
+    giveToOwner(repo);
+    expect(fs.existsSync(path.join(repo, '.git', 'modules'))).toBe(false);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('submodules are not checked');
+    // A dangling link in its place (`[ -e ]` is false for it) is caught too.
+    fs.rmSync(path.join(repo, '.gitmodules'));
+    fs.symlinkSync('missing-target', path.join(repo, '.gitmodules'));
+    spawnSync('chown', ['-h', '1000:1000', path.join(repo, '.gitmodules')]);
+    const dangling = runAsOwner(repo, true);
+    expect(dangling.status).toBe(0);
+    expect(dangling.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
+  });
+
+  it('review round 5 of PR #84, B-R5-4: with a separate Git folder, a linked worktree prints the marker, in the main worktree and in the linked one', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const base = path.dirname(repo);
+    const main = path.join(base, 'main');
+    const gitFolder = path.join(base, 'gitfolder');
+    git(base, 'init', '-q', '-b', 'main', '--separate-git-dir', gitFolder, main);
+    fs.writeFileSync(path.join(main, 'a.txt'), 'a\n');
+    rootGit(main, 'add', 'a.txt');
+    rootGit(main, 'commit', '-q', '-m', 'first');
+    rootGit(main, 'update-ref', 'refs/remotes/origin/main', 'main');
+    const linked = path.join(base, 'linked');
+    rootGit(main, 'worktree', 'add', '-q', '--detach', linked);
+    expect(fs.statSync(path.join(main, '.git')).isFile()).toBe(true);
+    for (const folder of [main, gitFolder, linked]) giveToOwner(folder);
+    for (const folder of [main, linked]) {
+      const result = runAsOwner(folder, true);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} other worktrees are not checked\n`);
+      expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('other worktrees are not checked');
+    }
+  });
+
+  it('review round 5 of PR #84, B-R5-5: a stash whose loose refs/stash is gone while its reflog stays prints the marker of the stash', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    const ref = path.join(repo, '.git', 'refs', 'stash');
+    expect(fs.existsSync(ref)).toBe(true);
+    fs.rmSync(ref);
+    expect(fs.statSync(path.join(repo, '.git', 'logs', 'refs', 'stash')).size).toBeGreaterThan(0);
+    expect(rootGit(repo, 'stash', 'list')).toBe('');
+    const plain = runAsOwner(repo);
+    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the stash could not be read\n`);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the stash could not be read');
+  });
+
+  it('review round 5 of PR #84, B-R5-6: past GIT_SUMMARY_MAX_PRUNED_FOLDERS ignored folders, the next one is walked: an unreadable ig256 prints the marker', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    const names = Array.from({ length: GIT_SUMMARY_MAX_PRUNED_FOLDERS + 1 }, (_, i) => `ig${String(i).padStart(3, '0')}`);
+    expect(names[names.length - 1]).toBe('ig256');
+    fs.writeFileSync(path.join(repo, '.gitignore'), names.map((name) => `${name}/\n`).join(''));
+    rootGit(repo, 'add', '.gitignore');
+    rootGit(repo, 'commit', '-q', '-m', 'ignore');
+    for (const name of names) {
+      fs.mkdirSync(path.join(repo, name));
+      fs.writeFileSync(path.join(repo, name, 'f'), 'x');
+    }
+    giveToOwner(repo);
+    toRoot(repo, 'ig256', 0o700, true);
+    const result = runAsOwner(repo, true);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} ig256 cannot be read\n`);
+    expect(gitSummaryProblem(result.stdout, '')).toBe('ig256 cannot be read');
+    // The last folder within the cap (ig255) is still left out.
+    giveToOwner(repo);
+    toRoot(repo, 'ig255', 0o700, true);
+    const within = runAsOwner(repo, true);
+    expect(within.status).toBe(0);
+    expect(within.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
   });
 
   it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {
