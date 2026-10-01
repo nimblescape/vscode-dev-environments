@@ -9,7 +9,10 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   CONFIG_OWNERSHIP_FIX_SCRIPT,
+  GIT_SUMMARY_INCOMPLETE_MARKER,
+  GIT_SUMMARY_NO_FOLDER_EXIT,
   GIT_SUMMARY_SCRIPT,
+  GitProblemWatcher,
   OWNERSHIP_FIX_SCRIPT,
   MAX_SERVICE_ARGUMENT_CHARACTERS,
   MAX_SERVICE_FOLDERS,
@@ -19,7 +22,9 @@ import {
   boundServiceFolders,
   configOwnershipFixCommand,
   gitSummaryCommand,
+  gitSummaryProblem,
   isNumericId,
+  isUnknownGitState,
   ownershipFixCommand,
   parseGitSummaryOutput,
   serviceFolderPaths,
@@ -960,5 +965,116 @@ describe.skipIf(!canBindMount)('review round 3 of PR #81: the ownership fix with
     fs.mkdirSync(path.join(repo, 'mnt'), { recursive: true });
     // Before (find without -xdev): the file of root in the tmpfs got the user.
     expect(fixAndStat(repo, 'mount -t tmpfs devenv "$2/mnt" && touch "$2/mnt/f" || exit 1', [repo, path.join(repo, 'mnt/f')])).toEqual([String(nobody), '0']);
+  });
+});
+
+/**
+ * Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): the problems in the output of
+ * GIT_SUMMARY_SCRIPT that make the Git state unknown.
+ */
+describe('the problems of the Git summary (review round 1 of PR #84, A-R1-2)', () => {
+  it('review round 1 of PR #84, A-R1-2: finds the permission problems on stderr, and the marker of a count on stdout', () => {
+    expect(gitSummaryProblem('main\n0\n0\n0\n', "warning: could not open directory 'data/pg/': Permission denied\n")).toBe(
+      "warning: could not open directory 'data/pg/': Permission denied",
+    );
+    expect(gitSummaryProblem('', 'fatal: .git/index: index file open failed: Permission denied')).toBe('fatal: .git/index: index file open failed: Permission denied');
+    expect(gitSummaryProblem('', "warning: unable to access 'x/.gitattributes': Input/output error")).toContain('unable to access');
+    expect(gitSummaryProblem('', 'error: cannot open .git/FETCH_HEAD')).toContain('cannot open');
+    expect(gitSummaryProblem(`${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\nmain\n0\n0\n0\n`, '')).toBe('the unpushed commits could not be counted');
+    expect(gitSummaryProblem('main\n1\n0\n0\n', '')).toBeUndefined();
+    expect(gitSummaryProblem('main\n1\n0\n0\n', 'hint: something else\n')).toBeUndefined();
+    // The marker line is ignored by the parser (it reads the last 4 lines).
+    expect(parseGitSummaryOutput(`${GIT_SUMMARY_INCOMPLETE_MARKER} x\nmain\n1\n0\n0\n`, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 1 });
+  });
+
+  it('review round 1 of PR #84, A-R1-2: the watcher finds a problem split across chunks, and one in a last line without its newline', () => {
+    const watcher = new GitProblemWatcher();
+    watcher.push('warning: could not open dir');
+    expect(watcher.problem()).toBeUndefined();
+    watcher.push("ectory 'data/': Permission denied\nother\n");
+    expect(watcher.problem()).toBe("warning: could not open directory 'data/': Permission denied");
+    const last = new GitProblemWatcher();
+    last.push('fatal: x: Permission denied');
+    expect(last.problem()).toBe('fatal: x: Permission denied');
+    expect(new GitProblemWatcher().problem()).toBeUndefined();
+  });
+
+  it('review round 1 of PR #84, A-R1-2: isUnknownGitState tells an unknown state from a summary and from none', () => {
+    expect(isUnknownGitState({ unknown: true, reason: 'r' })).toBe(true);
+    expect(isUnknownGitState({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: RECORDED_AT })).toBe(false);
+    expect(isUnknownGitState(undefined)).toBe(false);
+  });
+
+  it('review round 1 of PR #84, A-R1-2: a missing repository folder exits with GIT_SUMMARY_NO_FOLDER_EXIT', () => {
+    const root = tempDir();
+    const result = runSummary(path.join(root, 'missing'));
+    expect(result.status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
+    expect(result.stderr).toContain('is missing');
+    fs.writeFileSync(path.join(root, 'file'), '');
+    expect(runSummary(path.join(root, 'file')).status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
+  });
+});
+
+/** Whether every folder above `folder` can be passed by other users (for a run as another uid). */
+function passableForOthers(folder: string): boolean {
+  for (let dir = path.dirname(folder); ; dir = path.dirname(dir)) {
+    if ((fs.statSync(dir).mode & 0o001) === 0) return false;
+    if (dir === path.dirname(dir)) return true;
+  }
+}
+
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+const hasSetpriv = hasProgram('setpriv', ['--version']);
+
+/**
+ * Review round 1 of PR #84, A-R1-2: the two reproduced cases with the real script, as the owner (uid 1000) of the
+ * repository, as the batch helper runs it (needs root, setpriv and Git).
+ */
+describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the repository owner (review round 1 of PR #84, A-R1-2)', () => {
+  function ownerRepo(): string | undefined {
+    const base = fs.mkdtempSync(path.join(fs.existsSync('/var/tmp') ? '/var/tmp' : os.tmpdir(), 'devenv-owner-'));
+    tempDirs.push(base);
+    fs.chmodSync(base, 0o755);
+    if (!passableForOthers(base)) return undefined;
+    const repo = path.join(base, 'repo');
+    git(base, 'init', '-q', '-b', 'main', repo);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    git(repo, 'add', 'a.txt');
+    git(repo, 'commit', '-q', '-m', 'first');
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  function runAsOwner(repo: string): { status: number | null; stdout: string; stderr: string } {
+    const [file, ...args] = gitSummaryCommand(repo);
+    const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  it('review round 1 of PR #84, A-R1-2: an untracked 0700 folder of another uid: exit code 0, 0 changes, and a problem that makes the state unknown', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    fs.mkdirSync(path.join(repo, 'data'));
+    fs.writeFileSync(path.join(repo, 'data', 'f'), 'x');
+    spawnSync('chown', ['-R', '999:999', path.join(repo, 'data')]);
+    fs.chmodSync(path.join(repo, 'data'), 0o700);
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT).uncommittedFiles).toBe(0);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toContain('Permission denied');
+  });
+
+  it('review round 1 of PR #84, A-R1-2: a root 0600 .git/index: exit code 128 (not the missing folder)', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    spawnSync('chown', ['0:0', path.join(repo, '.git', 'index')]);
+    fs.chmodSync(path.join(repo, '.git', 'index'), 0o600);
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(128);
+    expect(result.status).not.toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
+    expect(gitSummaryProblem(result.stdout, result.stderr)).toContain('Permission denied');
   });
 });

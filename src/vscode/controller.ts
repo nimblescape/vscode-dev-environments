@@ -15,6 +15,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
+import { isUnknownGitState } from '../core/git/gitSummary';
 import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
@@ -774,7 +775,10 @@ export class Controller implements vscode.Disposable {
           ? ` ${ControllerTexts.otherWindowClosesConnection(repository)}`
           : '';
         // Without a summary (the volume is missing), the confirmation follows at once.
-        const changes = summary ? formatChanges(summary) : '';
+        // Review round 1 of PR #84, A-R1-2: an unknown Git state always gets the warning with "Delete anyway", never the
+        // plain confirmation (safetyCheck returns no summary only for a missing volume).
+        const unknown = isUnknownGitState(summary) ? summary : undefined;
+        const changes = summary && !isUnknownGitState(summary) ? formatChanges(summary) : '';
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.
         // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
@@ -786,9 +790,13 @@ export class Controller implements vscode.Disposable {
           ]),
         ];
         const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
-        if (changes !== '') {
+        if (unknown !== undefined || changes !== '') {
+          const question =
+            unknown !== undefined
+              ? Messages.deleteGitStateUnknown(repository, unknown.reason, unknown.recorded ? formatChanges(unknown.recorded) || undefined : undefined)
+              : Messages.deleteUnsaved(repository, changes);
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteUnsaved(repository, changes)}${repositoryDataText}${otherWindow}`,
+            `${question}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.openEnvironment,
             Actions.deleteAnyway,

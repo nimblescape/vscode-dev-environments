@@ -7,8 +7,8 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
-import { CommandError, UserFacingError } from '../errors';
-import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { CommandError, GitStateUnreadableError, UserFacingError } from '../errors';
+import { GIT_SUMMARY_NO_FOLDER_EXIT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
@@ -3984,16 +3984,55 @@ describe('safetyCheck', () => {
     expect(h.docker.volumes.size).toBe(0);
   });
 
-  it('returns the last recorded state when Git cannot read the repository, so known changes are still named', async () => {
+  // Review round 1 of PR #84, A-R1-2: changed input (before: exit code 2 of a failed `cd`): GIT_SUMMARY_SCRIPT reports a
+  // missing repository folder with GIT_SUMMARY_NO_FOLDER_EXIT; only that falls back to the recorded state.
+  it('returns the last recorded state when the repository folder is missing, so known changes are still named', async () => {
     const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new CommandError('git summary', 2, '', "sh: cd: can't cd to /workspaces/api");
+    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_NO_FOLDER_EXIT, '', 'The repository folder /workspaces/api is missing.');
     expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
   });
 
-  it('returns undefined when Git cannot read the repository and no state is recorded', async () => {
+  // Review round 1 of PR #84, A-R1-2: changed expectation (before: undefined, which showed the plain "Delete?"): with
+  // nothing recorded the state is unknown, and Delete shows the warning.
+  it('returns an unknown state when the repository folder is missing and no state is recorded (review round 1 of PR #84, A-R1-2)', async () => {
+    await seedEnvironment(h, { extra: { gitSummary: undefined } });
+    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_NO_FOLDER_EXIT, '', 'The repository folder /workspaces/api is missing.');
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateNoFolder });
+  });
+
+  // Review round 1 of PR #84, A-R1-2: as the owner, Git may not read everything. "Could not read" never reads as
+  // "nothing to lose": the state is unknown, with the reason; the recorded state is passed as recorded only, and the
+  // registry keeps it unchanged.
+  it('review round 1 of PR #84, A-R1-2: exit code 0 with a permission warning on stderr gives an unknown state, not the counts', async () => {
+    const env = await seedEnvironment(h);
+    h.helper.gitSummaryResult = new GitStateUnreadableError("warning: could not open directory 'data/pg/': Permission denied");
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({
+      unknown: true,
+      reason: PipelineTexts.gitStateUnreadable("warning: could not open directory 'data/pg/': Permission denied"),
+      recorded: env.gitSummary,
+    });
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('review round 1 of PR #84, A-R1-2: exit code 128 (a root 0600 .git/index) gives an unknown state, never the recorded state as current', async () => {
+    const env = await seedEnvironment(h);
+    h.helper.gitSummaryResult = new CommandError('git summary', 128, '', 'fatal: .git/index: index file open failed: Permission denied\n');
+    const result = await h.service.safetyCheck(ENV_ID, options());
+    expect(result).toEqual({
+      unknown: true,
+      reason: PipelineTexts.gitStateFailed(128, 'fatal: .git/index: index file open failed: Permission denied'),
+      recorded: env.gitSummary,
+    });
+    expect(PipelineTexts.gitStateFailed(128, 'x')).toBe('Git failed with exit code 128: x');
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('review round 1 of PR #84, A-R1-2: any other failure (exit code 2, no recorded state) gives an unknown state, never undefined', async () => {
     await seedEnvironment(h, { extra: { gitSummary: undefined } });
     h.helper.gitSummaryResult = new CommandError('git summary', 2, '', "sh: cd: can't cd to /workspaces/api");
-    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateFailed(2, "sh: cd: can't cd to /workspaces/api") });
+    h.helper.gitSummaryResult = new Error('Unexpected output of the Git summary: ""');
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: 'Unexpected output of the Git summary: ""' });
   });
 
   it('starts Docker when needed', async () => {

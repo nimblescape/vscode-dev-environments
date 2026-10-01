@@ -247,6 +247,13 @@ export const Messages = {
   deleteUnsaved: (repository: string, changes: string) =>
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   /**
+   * Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): Delete's check could not
+   * read the Git state (`reason`, briefly); `recordedChanges`: the changes of the last recorded state, if any.
+   */
+  deleteGitStateUnknown: (repository: string, reason: string, recordedChanges?: string) =>
+    `The Git state of the environment of ${repository} could not be read, so it may have changes that are lost when you delete the environment. ${reason}` +
+    (recordedChanges ? ` Last recorded: ${recordedChanges}.` : ''),
+  /**
    * Review round 9 (D9-2): the paths of the repository that the other services of Docker Compose mount
    * (Environment.serviceFolders): they are in the workspace volume, so Delete removes them with the repository;
    * the confirmation names them, as the question about the data volumes of the services (D-19) names those.

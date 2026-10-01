@@ -4,7 +4,19 @@
 
 // Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>`,
 // either in the workspace helper or with `docker exec` in a dev container. Values arrive as positional parameters.
-import type { GitSummary } from '../types';
+import type { GitSummary, UnknownGitState } from '../types';
+
+/**
+ * Review round 1 of PR #84, A-R1-2: the exit code of GIT_SUMMARY_SCRIPT when the repository folder is missing (or no
+ * folder): Delete's check then names the recorded state, as before. Every other failure leaves the Git state unknown.
+ */
+export const GIT_SUMMARY_NO_FOLDER_EXIT = 3;
+
+/**
+ * Review round 1 of PR #84, A-R1-2: the start of the line that GIT_SUMMARY_SCRIPT prints before its 4 lines when a
+ * count could not be made (the rest of the line says which); parseGitSummaryOutput ignores it (it reads the last 4).
+ */
+export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
 
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
@@ -16,8 +28,17 @@ import type { GitSummary } from '../types';
  * `.git` as another user. It still runs other programs that the repository configuration names (for example the clean
  * filter of a filter driver in `git status`). So the workspace helper runs this script without the Docker socket, without
  * the cache volume, and without network (WorkspaceHelper.gitSummary): it is no trust boundary against the repository.
+ *
+ * Review round 1 of PR #84, A-R1-2: a missing repository folder exits with GIT_SUMMARY_NO_FOLDER_EXIT. The warnings of
+ * `git status` and `git stash list` reach stderr (a folder that Git cannot open: `could not open directory … Permission
+ * denied`, with exit code 0); a count of unpushed commits that fails prints GIT_SUMMARY_INCOMPLETE_MARKER (it counted
+ * 0 before, silently). Delete's check reads both as an unknown state (gitSummaryProblem).
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
+if [ ! -d "$1" ]; then
+  echo "The repository folder $1 is missing." >&2
+  exit ${GIT_SUMMARY_NO_FOLDER_EXIT}
+fi
 cd "$1"
 if ! command -v git >/dev/null 2>&1; then
   echo 'Git is not installed.' >&2
@@ -37,12 +58,16 @@ count_lines() {
 }
 branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short -q HEAD) || branch=''
 status=$(g status --porcelain --untracked-files=normal)
+incomplete=''
 if g rev-parse -q --verify HEAD >/dev/null 2>&1; then
-  unpushed=$(g rev-list --count HEAD --branches --not --remotes 2>/dev/null) || unpushed=0
+  unpushed=$(g rev-list --count HEAD --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 else
-  unpushed=$(g rev-list --count --branches --not --remotes 2>/dev/null) || unpushed=0
+  unpushed=$(g rev-list --count --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
 fi
 stashes=$(g stash list)
+if [ -n "$incomplete" ]; then
+  printf '%s %s\\n' '${GIT_SUMMARY_INCOMPLETE_MARKER}' "$incomplete"
+fi
 printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "$(count_lines "$stashes")"
 `;
 
@@ -448,6 +473,53 @@ export function parseGitSummaryOutput(stdout: string, recordedAt: string): GitSu
     stashes: numbers[2],
     recordedAt,
   };
+}
+
+/**
+ * Review round 1 of PR #84, A-R1-2: the problems on stderr of GIT_SUMMARY_SCRIPT that mean Git could not read everything
+ * (with exit code 0 Git counts what it could read: an untracked folder that it cannot open counts as no change).
+ */
+const GIT_PERMISSION_PROBLEM = /Permission denied|could not open directory|unable to access|cannot open/i;
+
+/** The longest problem text that gitSummaryProblem returns. */
+const MAX_PROBLEM_LENGTH = 300;
+
+/**
+ * Review round 1 of PR #84, A-R1-2: why the output of GIT_SUMMARY_SCRIPT does not show the whole Git state: the first
+ * line of `stderr` with a permission problem, or the incomplete count that `stdout` names. Undefined when there is none.
+ */
+export function gitSummaryProblem(stdout: string, stderr: string): string | undefined {
+  const lines = (text: string) => text.replace(/\r\n/g, '\n').split('\n');
+  const permission = lines(stderr).find((line) => GIT_PERMISSION_PROBLEM.test(line));
+  if (permission !== undefined) return permission.trim().slice(0, MAX_PROBLEM_LENGTH);
+  const marker = lines(stdout).find((line) => line.startsWith(GIT_SUMMARY_INCOMPLETE_MARKER));
+  return marker?.slice(GIT_SUMMARY_INCOMPLETE_MARKER.length).trim().slice(0, MAX_PROBLEM_LENGTH);
+}
+
+/**
+ * Review round 1 of PR #84, A-R1-2: watches the stderr of GIT_SUMMARY_SCRIPT as it streams, line by line (the captured
+ * stderr keeps only its end), for the first permission problem (gitSummaryProblem).
+ */
+export class GitProblemWatcher {
+  private rest = '';
+  private found: string | undefined;
+
+  push(text: string): void {
+    if (this.found !== undefined) return;
+    const lines = (this.rest + text).split('\n');
+    this.rest = (lines.pop() ?? '').slice(-4096);
+    this.found = gitSummaryProblem('', lines.join('\n'));
+  }
+
+  /** The first problem seen, also in a last line without its newline. */
+  problem(): string | undefined {
+    return this.found ?? gitSummaryProblem('', this.rest);
+  }
+}
+
+/** Review round 1 of PR #84, A-R1-2: whether Delete's check could not read the Git state. */
+export function isUnknownGitState(value: GitSummary | UnknownGitState | undefined): value is UnknownGitState {
+  return value !== undefined && 'unknown' in value && value.unknown === true;
 }
 
 /** Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. */

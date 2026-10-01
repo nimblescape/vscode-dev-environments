@@ -12,8 +12,8 @@
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { runPreparingWorker } from '../docker/workerPreparation';
-import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { configOwnershipFixCommand, gitSummaryCommand, parseGitSummaryOutput } from '../git/gitSummary';
+import { CommandError, GitStateUnreadableError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
+import { GitProblemWatcher, configOwnershipFixCommand, gitSummaryCommand, gitSummaryProblem, parseGitSummaryOutput } from '../git/gitSummary';
 import { Messages } from '../messages';
 import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { abortError, isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
@@ -968,17 +968,25 @@ export class WorkspaceHelper {
   /**
    * Git state of the repository in the volume (for a container that does not run). Plan step 7 (user decision of
    * 2026-10-01): the step gitSummary, as the owner of the repository (as nobody when the folder is missing), without the
-   * Docker socket: Git runs programs that the repository configuration names. Throws CommandError.
+   * Docker socket: Git runs programs that the repository configuration names. Throws CommandError. Review round 1 of
+   * PR #84, A-R1-2: throws GitStateUnreadableError when Git exits with 0 but could not read everything (a permission
+   * problem on stderr, or a count that failed), so that its counts are never taken for the whole state.
    */
   async gitSummary(p: { volumeName: string; repository: string; signal?: AbortSignal }): Promise<GitSummary> {
     const folder = this.repositoryFolder(p.repository);
+    const problems = new GitProblemWatcher();
     const result = await this.runStreams(p.volumeName, gitSummaryCommand(folder), {
       // Plan step 7 (user decision of 2026-10-01): a step of the batch helper, as the owner of the repository.
       batch: { kind: 'gitSummary', params: { repository: p.repository } },
       signal: p.signal,
-      onStderr: this.logOutput,
+      onStderr: (text) => {
+        this.logOutput(text);
+        problems.push(text);
+      },
     });
     if (result.exitCode !== 0) throw new CommandError('git summary', result.exitCode, result.stdout, result.stderr);
+    const problem = problems.problem() ?? gitSummaryProblem(result.stdout, result.stderr);
+    if (problem !== undefined) throw new GitStateUnreadableError(problem);
     return parseGitSummaryOutput(result.stdout, isoTime(this.clock));
   }
 

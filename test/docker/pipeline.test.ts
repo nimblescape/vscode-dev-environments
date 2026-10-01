@@ -1207,13 +1207,33 @@ describe('open pipeline on a seeded environment', () => {
       await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
       const now = isoTime(systemClock);
       await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
-      // The folder is missing: the step runs as nobody, its `cd` fails, and the check gives the recorded state (as before).
+      // The folder is missing: the step runs as nobody, the script exits with GIT_SUMMARY_NO_FOLDER_EXIT (review round 1
+      // of PR #84, A-R1-2; before: its `cd` failed), and the check gives the recorded state (as before).
       expect(await online.safetyCheck(id, { progress: new RecordingProgress() })).toEqual(recorded);
       expect(locks.batches.get(id) ?? []).toHaveLength(1);
       expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_RUN}=true`, '--filter', `volume=${name}`])).toEqual([]);
     } finally {
       await registry.remove(id);
       cli.run(['volume', 'rm', name]);
+    }
+  });
+
+  // Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): an untracked 0700 folder of
+  // another uid. Git as the owner cannot open it, warns, and exits 0 with fewer changes; the check reports the state as
+  // unknown (with the warning), and the registry keeps its recorded state. The folder is removed again after.
+  it('review round 1 of PR #84, A-R1-2: an untracked 0700 folder of another uid makes the safety check report an unknown Git state', async () => {
+    const before = (await registry.get(environmentId))?.gitSummary;
+    const planted = await runInVolume(docker, volumeName, ['sh', '-c', `mkdir ${FOLDER}/private-data && echo x > ${FOLDER}/private-data/f && chown -R 4242:4242 ${FOLDER}/private-data && chmod 0700 ${FOLDER}/private-data`]);
+    expect(planted.exitCode, planted.stderr).toBe(0);
+    try {
+      const summary = await online.safetyCheck(environmentId, { progress: new RecordingProgress() });
+      expect(summary).toMatchObject({ unknown: true });
+      expect((summary as { reason: string }).reason).toContain('Permission denied');
+      expect((await registry.get(environmentId))?.gitSummary).toEqual(before);
+      expect(helperContainers()).toEqual([]);
+    } finally {
+      const removed = await runInVolume(docker, volumeName, ['rm', '-rf', `${FOLDER}/private-data`]);
+      expect(removed.exitCode, removed.stderr).toBe(0);
     }
   });
 

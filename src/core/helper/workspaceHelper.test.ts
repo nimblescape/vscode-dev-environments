@@ -15,7 +15,7 @@ import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { CommandError, UserFacingError, isUserFacingError } from '../errors';
+import { CommandError, GitStateUnreadableError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
@@ -2013,6 +2013,33 @@ describe('WorkspaceHelper file and Git queries', () => {
   it('throws CommandError when a query fails', async () => {
     docker.handler = () => ({ exitCode: 128, stderr: 'fatal: not a git repository\n' });
     await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toBeInstanceOf(CommandError);
+  });
+
+  // Review round 1 of PR #84, A-R1-2: as the owner, Git may not open an untracked folder of another uid (0700): it warns
+  // and exits 0 with 0 changes. Those counts are never returned as the Git state.
+  for (const forward of [true, false]) {
+    it(`review round 1 of PR #84, A-R1-2: gitSummary throws GitStateUnreadableError for exit code 0 with a permission warning on stderr (${forward ? 'streamed' : 'captured only'})`, async () => {
+      docker.forwardOutput = forward;
+      docker.handler = () => ({ stdout: 'main\n0\n0\n0\n', stderr: "warning: could not open directory 'data/pg/': Permission denied\n" });
+      const error = await createHelper()
+        .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
+        .then(() => undefined, (reason: unknown) => reason);
+      expect(error).toBeInstanceOf(GitStateUnreadableError);
+      expect((error as GitStateUnreadableError).problem).toBe("warning: could not open directory 'data/pg/': Permission denied");
+    });
+  }
+
+  it('review round 1 of PR #84, A-R1-2: gitSummary throws GitStateUnreadableError when the script marks a count it could not make', async () => {
+    docker.handler = () => ({ stdout: 'devenv-git-summary-incomplete: the unpushed commits could not be counted\nmain\n0\n0\n0\n' });
+    await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({
+      name: 'GitStateUnreadableError',
+      problem: 'the unpushed commits could not be counted',
+    });
+  });
+
+  it('review round 1 of PR #84, A-R1-2: gitSummary keeps CommandError for exit code 128 (a root 0600 .git/index)', async () => {
+    docker.handler = () => ({ exitCode: 128, stderr: 'fatal: .git/index: index file open failed: Permission denied\n' });
+    await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({ name: 'CommandError', exitCode: 128 });
   });
 });
 
