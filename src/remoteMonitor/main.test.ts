@@ -10,6 +10,8 @@ import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT
 import {
   EXIT_INVALID,
   PS_FORMAT,
+  REMOTE_IDLE_EXIT_MS,
+  idleExitFromEnv,
   RemoteMonitorLoop,
   heartbeatDir,
   imageScheduleFromEnv,
@@ -31,6 +33,7 @@ import {
   type DockerResult,
 } from './main';
 import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
+import type { StopLockAttempt } from './stopLock';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -40,6 +43,12 @@ const T0 = Date.parse('2026-09-27T12:00:00.000Z');
 const MINUTE = 60_000;
 const DEV_ID = 'a'.repeat(64);
 const DB_ID = 'b'.repeat(64);
+
+/**
+ * Plan step 8, PR B (D2): the lock of an automatic stop, always free (the tests of the lock are in the describe
+ * 'RemoteMonitorLoop: the environment lock of a stop').
+ */
+const lockAlways = async () => ({ kind: 'locked' as const, release: () => {} });
 
 let stateDir: string;
 
@@ -367,6 +376,7 @@ describe('RemoteMonitorLoop', () => {
         return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
       },
       dir: heartbeatDir(stateDir),
+      lockEnvironment: lockAlways,
       now: () => now,
       log: (message) => lines.push(message),
     });
@@ -463,13 +473,15 @@ describe('RemoteMonitorLoop', () => {
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     calls = [];
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
-    // Changed expectation, review round 2 of PR #63 (R2-1): was ['ps', 'forget', 'stop', 'stop'].
-    expect(calls.map((call) => call[0])).toEqual(['ps', 'stop', 'stop', 'forget']);
+    // Changed expectation, review round 2 of PR #63 (R2-1): was ['ps', 'forget', 'stop', 'stop']. Changed expectation,
+    // plan step 8 PR B (D2): was ['ps', 'stop', 'stop', 'forget']; the second `ps` lists the containers of A again under
+    // its lock.
+    expect(calls.map((call) => call[0])).toEqual(['ps', 'ps', 'stop', 'stop', 'forget']);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
   it('logs a removal that failed', async () => {
-    const failing = new RemoteMonitorLoop({ docker: async () => ps, removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    const failing = new RemoteMonitorLoop({ docker: async () => ps, removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     await failing.tick();
     // Review round 4 of PR #63 (N4-5): the removals run in the background.
@@ -484,6 +496,7 @@ describe('RemoteMonitorLoop', () => {
       docker: async () => ps,
       removeRecord: async () => (fail ? Promise.reject(new Error('locked')) : false),
       dir: heartbeatDir(stateDir),
+      lockEnvironment: lockAlways,
       now: () => T0,
       log: (message) => lines.push(message),
     });
@@ -529,6 +542,7 @@ describe('RemoteMonitorLoop', () => {
         return new Promise<boolean>((resolve) => pending.push(resolve));
       },
       dir: heartbeatDir(stateDir),
+      lockEnvironment: lockAlways,
       now: () => clock,
       log: (message) => lines.push(message),
     });
@@ -591,7 +605,7 @@ describe('RemoteMonitorLoop', () => {
     writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     const attempts: string[] = [];
     const removeRecord = (record: RemoteRecord) => (attempts.push(names[record.source]) === 1 ? first() : Promise.resolve(true));
-    const ordered = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    const ordered = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     await ordered.tick();
     await ordered.removals;
     expect(attempts).toEqual(expected);
@@ -612,7 +626,7 @@ describe('RemoteMonitorLoop', () => {
       if (record.environmentId === B && record.source === OTHER) throw new Error('locked');
       return true;
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     await loop.tick();
     await loop.removals;
     expect([...attempts].sort()).toEqual([`${A}.${SOURCE}`, `${B}.${OTHER}`, `${C}.${SOURCE}`].sort());
@@ -638,7 +652,7 @@ describe('RemoteMonitorLoop', () => {
       if (record.source === SOURCE) throw new Error('locked');
       return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => listed, removeRecord: remove, dir: heartbeatDir(stateDir), now: () => clock, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ docker: async () => listed, removeRecord: remove, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => clock, log: (message) => lines.push(message) });
     await loop.tick();
     await loop.removals;
     expect(attempts).toEqual([]);
@@ -667,7 +681,7 @@ describe('RemoteMonitorLoop', () => {
       if (record.source === OTHER) return results.shift() ?? true;
       throw new Error('locked');
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), now: () => T0, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     for (let pass = 0; pass < 4; pass++) {
@@ -720,6 +734,306 @@ describe('RemoteMonitorLoop', () => {
 
 // Review round 2 of PR #63 (R2-4): the removal of the loop, `forget <source> <env id> <at>` under the lock of the records
 // (with the real script and `flock` in heartbeatLock.test.ts).
+// Plan step 8, PR B (user decision D2 of 2026-09-30): each automatic stop of the monitor takes the lock of its
+// environment without waiting; a busy or unopenable lock skips the environment; under the lock the monitor reads the
+// containers and records of it again and decides again.
+describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D2)', () => {
+  let now: number;
+  let lines: string[];
+  let events: string[];
+  let ps: DockerResult;
+  let attempts: Array<() => StopLockAttempt>;
+  let onLocked: (() => void) | undefined;
+  let stopFails: Error | undefined;
+  let loop: RemoteMonitorLoop;
+
+  const locked = (): StopLockAttempt => ({ kind: 'locked', release: () => events.push('release') });
+
+  beforeEach(() => {
+    now = T0;
+    lines = [];
+    events = [];
+    attempts = [];
+    onLocked = undefined;
+    stopFails = undefined;
+    ps = { code: 0, stdout: `${DB_ID}\trunning\tdevenv-api-db-1\t${A}\tdb\n${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    loop = new RemoteMonitorLoop({
+      docker: async (args) => {
+        if (args[0] === 'ps') {
+          const filter = args[args.indexOf('--filter') + 1];
+          events.push(filter === 'label=nimblescape.devenv.environment-id' ? 'ps' : `ps ${filter}`);
+          return ps;
+        }
+        events.push(`${args[0]} ${args[1]}`);
+        if (stopFails) throw stopFails;
+        return { code: 0, stdout: '', stderr: '' };
+      },
+      removeRecord: async () => false,
+      dir: heartbeatDir(stateDir),
+      now: () => now,
+      log: (message) => lines.push(message),
+      lockEnvironment: async (environmentId) => {
+        events.push(`lock ${environmentId}`);
+        const attempt = (attempts.shift() ?? locked)();
+        if (attempt.kind === 'locked') onLocked?.();
+        return attempt;
+      },
+    });
+  });
+
+  /** Ticks through the grace of the start; the next tick wants to stop A. */
+  async function pastGrace(): Promise<void> {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    for (let time = T0; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) {
+      now = time;
+      expect(await loop.tick()).toEqual([]);
+    }
+    events = [];
+  }
+
+  async function tickAt(time: number): Promise<string[]> {
+    now = time;
+    const stopped = await loop.tick();
+    await loop.removals;
+    return stopped;
+  }
+
+  it('locks, lists the containers of the environment again, stops the dev container first, then releases', async () => {
+    await pastGrace();
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, `stop ${DEV_ID}`, `stop ${DB_ID}`, 'release']);
+  });
+
+  it('a busy lock: no stop in this tick, logged once per busy streak; a free lock at a later tick stops it', async () => {
+    await pastGrace();
+    attempts = [() => ({ kind: 'busy' }), () => ({ kind: 'busy' }), () => ({ kind: 'busy' })];
+    for (let i = 0; i < 3; i += 1) expect(await tickAt(T0 + REMOTE_GRACE_MS + i * REMOTE_TICK_MS)).toEqual([]);
+    expect(events.filter((event) => event.startsWith('stop') || event.startsWith('ps label'))).toEqual([]);
+    expect(lines.filter((line) => line.includes('is busy with an operation'))).toEqual([
+      `${A} is busy with an operation; it is not stopped now and is checked again at the next tick.`,
+    ]);
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + 3 * REMOTE_TICK_MS)).toEqual([A]);
+    // A new busy streak is logged again.
+    attempts = [() => ({ kind: 'busy' })];
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + 4 * REMOTE_TICK_MS)).toEqual([]);
+    expect(lines.filter((line) => line.includes('is busy with an operation'))).toHaveLength(2);
+  });
+
+  it('a heartbeat that arrives before the lock is taken: decided again under the lock, no stop, released', async () => {
+    await pastGrace();
+    onLocked = () => writeRecord(OTHER, A, { at: T0 + REMOTE_GRACE_MS, keepRunning: false, limitSeconds: 600 });
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, 'release']);
+    expect(lines).toContain(`${A} is not stopped: a heartbeat or another change came before its lock was taken.`);
+  });
+
+  it('a keep that arrives before the lock is taken: no stop', async () => {
+    await pastGrace();
+    onLocked = () => writeRecord(SOURCE, A, { at: T0 + REMOTE_GRACE_MS, keepRunning: true, limitSeconds: 600 });
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
+    expect(events.filter((event) => event.startsWith('stop'))).toEqual([]);
+    expect(events.at(-1)).toBe('release');
+  });
+
+  it('containers that stopped before the lock was taken: nothing to stop, released', async () => {
+    await pastGrace();
+    onLocked = () => (ps = { code: 0, stdout: `${DEV_ID}\texited\tdevenv-api\t${A}\t\n`, stderr: '' });
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
+    expect(events.filter((event) => event.startsWith('stop'))).toEqual([]);
+    expect(events.at(-1)).toBe('release');
+  });
+
+  it('releases the lock after a failed list, records that cannot be read, or a stop that throws', async () => {
+    await pastGrace();
+    onLocked = () => (ps = { code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' });
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, 'release']);
+    expect(lines.some((line) => line.startsWith(`${A} is not stopped: its containers could not be listed again.`))).toBe(true);
+
+    ps = { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    onLocked = undefined;
+    stopFails = new Error('the Docker CLI broke');
+    events = [];
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS)).toEqual([]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, `stop ${DEV_ID}`, 'release']);
+    expect(lines).toContain(`${A} is not stopped: the Docker CLI broke`);
+
+    // The records folder is replaced by a file under the lock: readRecords fails.
+    stopFails = undefined;
+    events = [];
+    onLocked = () => {
+      fs.rmSync(heartbeatDir(stateDir), { recursive: true, force: true });
+      fs.writeFileSync(heartbeatDir(stateDir), 'not a folder');
+    };
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + 2 * REMOTE_TICK_MS)).toEqual([]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, 'release']);
+  });
+
+  it('a lock that cannot be opened or taken: no stop, logged once per streak', async () => {
+    await pastGrace();
+    attempts = [
+      () => ({ kind: 'failed', detail: 'the lock file could not be opened: ELOOP' }),
+      () => ({ kind: 'failed', detail: 'the lock file could not be opened: ELOOP' }),
+    ];
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS)).toEqual([]);
+    expect(events.filter((event) => event.startsWith('stop') || event.startsWith('ps label'))).toEqual([]);
+    expect(lines.filter((line) => line.startsWith(`The lock of ${A} could not be taken; it is not stopped.`))).toEqual([
+      `The lock of ${A} could not be taken; it is not stopped. the lock file could not be opened: ELOOP`,
+    ]);
+  });
+});
+
+// Plan step 8, PR B (user decision Q5 of 2026-10-02): `run` ends with 0 after REMOTE_IDLE_EXIT_MS without a running
+// environment container while it maintains no images, between two ticks only.
+describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
+  interface Monitor {
+    result: Promise<number>;
+    out: () => string;
+    events: string[];
+    ticks: () => number;
+    mono: () => number;
+  }
+
+  /** `run` with a clock that the waits between the ticks move; `ps` gives the containers of each tick. */
+  function startRun(options: {
+    env?: NodeJS.ProcessEnv;
+    ps: () => DockerResult;
+    onStop?: () => void;
+    stopMs?: number;
+    lock?: () => StopLockAttempt;
+    exec?: ExecFile;
+    maxTicks?: number;
+  }): Monitor {
+    let mono = 0;
+    let ticks = 0;
+    let out = '';
+    const events: string[] = [];
+    const result = main(['run'], {
+      env: options.env ?? {},
+      stateDir,
+      docker: async (args) => {
+        if (args[0] === 'ps') return options.ps();
+        events.push(`${args[0]} ${args[1]}`);
+        mono += options.stopMs ?? 0;
+        options.onStop?.();
+        return { code: 0, stdout: '', stderr: '' };
+      },
+      exec: options.exec ?? ((_file, _args, _options, callback) => callback(null, 'removed\n', '')),
+      lockEnvironment: async (id) => {
+        events.push(`lock ${id}`);
+        return options.lock?.() ?? { kind: 'locked', release: () => events.push('release') };
+      },
+      monotonic: () => mono,
+      now: () => T0 + mono,
+      sleep: async (ms) => {
+        ticks += 1;
+        mono += ms;
+        if (ticks >= (options.maxTicks ?? 1_000)) await new Promise(() => {});
+      },
+      out: (text) => {
+        out += text;
+        if (text.includes('Session Monitor exits')) events.push('exit');
+      },
+    });
+    return { result, out: () => out, events, ticks: () => ticks, mono: () => mono };
+  }
+
+  const listed = (stdout: string): DockerResult => ({ code: 0, stdout, stderr: '' });
+  const pending = async (promise: Promise<unknown>) =>
+    (await Promise.race([promise.then(() => 'ended'), new Promise((resolve) => setTimeout(() => resolve('pending'), 200))])) as string;
+
+  it('the idle time is 5 minutes; the Docker tests can set another', () => {
+    expect(REMOTE_IDLE_EXIT_MS).toBe(5 * 60_000);
+    expect(idleExitFromEnv({})).toBe(REMOTE_IDLE_EXIT_MS);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '3000' })).toBe(3000);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '99' })).toBe(REMOTE_IDLE_EXIT_MS);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '-1' })).toBe(REMOTE_IDLE_EXIT_MS);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '99999999' })).toBe(REMOTE_IDLE_EXIT_MS);
+  });
+
+  it('exits with 0 after the idle time without a labelled container and with image updates off; the records stay', async () => {
+    writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
+    const monitor = startRun({ ps: () => listed('') });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.mono()).toBeGreaterThanOrEqual(REMOTE_IDLE_EXIT_MS);
+    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+    expect(monitor.out()).toContain('No environment container ran for 300 s and image updates are off; the Session Monitor exits.');
+    expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
+  });
+
+  it('exits with 0 also when only stopped labelled containers exist', async () => {
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\texited\tdevenv-api\t${A}\t\n`) });
+    expect(await monitor.result).toBe(0);
+  });
+
+  it('does not exit while a labelled container runs, also one that a record keeps running', async () => {
+    writeRecord(SOURCE, A, { at: T0, keepRunning: true, limitSeconds: 600 });
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+    expect(await pending(monitor.result)).toBe('pending');
+    expect(monitor.out()).not.toContain('exits');
+  });
+
+  it('does not exit while a labelled container runs and the records cannot be read', async () => {
+    fs.writeFileSync(heartbeatDir(stateDir), 'not a folder');
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+    expect(await pending(monitor.result)).toBe('pending');
+    expect(monitor.out()).toContain('The heartbeat records could not be read');
+  });
+
+  it('does not exit while Docker does not answer', async () => {
+    const monitor = startRun({ ps: () => ({ code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' }), maxTicks: 100 });
+    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+    expect(await pending(monitor.result)).toBe('pending');
+  });
+
+  it('does not exit with image updates on', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    try {
+      const monitor = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']) }, ps: () => listed(''), maxTicks: 100 });
+      await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+      expect(monitor.out()).not.toContain('exits');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts the idle time from the end of the last stop, and exits only after the release', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    let running = true;
+    // The `docker stop` takes 4 minutes; after it the container is gone.
+    const monitor = startRun({
+      ps: () => listed(running ? `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n` : ''),
+      stopMs: 4 * MINUTE,
+      onStop: () => (running = false),
+    });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.events).toEqual([`lock ${A}`, `stop ${DEV_ID}`, 'release', 'exit']);
+    // The grace of the start (2 minutes), the stop (4 minutes), then 5 minutes idle.
+    expect(monitor.mono()).toBeGreaterThanOrEqual(REMOTE_GRACE_MS + 4 * MINUTE + REMOTE_IDLE_EXIT_MS);
+  });
+
+  it('waits for a removal of a record that runs before it exits', async () => {
+    writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    let finishRemoval: (() => void) | undefined;
+    const monitor = startRun({
+      env: { DEVENV_MONITOR_IDLE_MS: '1000' },
+      ps: () => listed(''),
+      exec: (_file, _args, _options, callback) => {
+        finishRemoval = () => callback(null, 'removed\n', '');
+      },
+    });
+    await vi.waitFor(() => expect(finishRemoval).toBeDefined());
+    expect(await pending(monitor.result)).toBe('pending');
+    expect(monitor.out()).not.toContain('exits');
+    finishRemoval!();
+    expect(await monitor.result).toBe(0);
+    expect(monitor.out().indexOf(`Removed the old record of ${B}`)).toBeLessThan(monitor.out().indexOf('the Session Monitor exits'));
+  });
+});
+
 describe('recordRemover', () => {
   const old: RemoteRecord = { source: SOURCE, environmentId: B, at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 };
   type Result = Parameters<Parameters<ExecFile>[3]>;

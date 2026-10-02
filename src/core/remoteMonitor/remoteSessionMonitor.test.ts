@@ -288,8 +288,10 @@ describe('RemoteSessionMonitor.ensure', () => {
       // Review round 1 of PR #69 (A-R1-2): changed expectation (before: no second label): the nonce of this create.
       '--label',
       `${LABEL_MONITOR_CREATE}=${createId}`,
+      // Changed expectation, plan step 8 PR B (Q5): was `unless-stopped`. The monitor exits with 0 when it is idle and stays
+      // exited; a failure (the loader's exit 3) is still restarted.
       '--restart',
-      'unless-stopped',
+      'on-failure',
       '--network',
       'none',
       '--cap-drop',

@@ -14,7 +14,10 @@
 // `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
 // replaces the container (review round 1 of PR #69, A-R1-1: with the restart policy kept); a monitor whose first load
 // was cut off is replaced too. Plan step 8, PR A: a heartbeat of the window (WindowHeartbeats, also sendFor of Close and
-// Keep Running) and Delete's forget through a real worker on the local engine, as extension.ts routes them.
+// Keep Running) and Delete's forget through a real worker on the local engine, as extension.ts routes them. Plan step 8,
+// PR B: the restart policy `on-failure` (Q5); an automatic stop waits for the environment lock that a worker holds, and
+// a monitor killed during its stop under the lock leaves no lock held (D2); the monitor exits with 0 when idle and stays
+// exited until ensure starts it (Q5).
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as path from 'path';
@@ -38,7 +41,7 @@ import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSession
 import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
 import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { HELPER_DOCKERFILE, Timings, dockerTestContext } from './harness';
+import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
 import { workerLocks } from './workerLocks';
 
 const SOURCE = crypto.randomBytes(16).toString('hex');
@@ -154,7 +157,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(details.Config.Labels[LABEL_SESSION_MONITOR]).toMatch(/^[0-9a-f]{12}$/);
     expect(details.Config.Labels[LABEL_ENVIRONMENT_ID]).toBeUndefined();
     expect(details.HostConfig.NetworkMode).toBe('none');
-    expect(details.HostConfig.RestartPolicy.Name).toBe('unless-stopped');
+    // Changed expectation, plan step 8 PR B (Q5): was `unless-stopped`; the monitor exits when idle and stays exited.
+    expect(details.HostConfig.RestartPolicy.Name).toBe('on-failure');
     expect(details.HostConfig.CapDrop).toEqual(['ALL']);
     // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: `sh -c <bootstrap> sh <script>`):
     // the command is the pipe loader with the path, the hash and the entry; the script came over stdin and is nowhere in
@@ -254,21 +258,22 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const id = cli.container(containerName)!.Id;
     cli.ok(['exec', containerName, 'sh', '-c', `echo '// changed' >> ${REMOTE_MONITOR_SCRIPT_PATH}`]);
     // Review round 1 of PR #69 (A-R1-1): changed expectation (before: `docker update --restart no` first, and a wait for
-    // `restarting` or `exited` with 3): the production configuration, unless-stopped, stays. The loader exits 3 at once
+    // `restarting` or `exited` with 3): the production configuration (its restart policy) stays. The loader exits 3 at once
     // (the marker of its first start: started before without its bundle), Docker restarts it (RestartCount ≥ 1), and
-    // ensure replaces it whether it finds it `restarting` or, between two restarts, `running` (the hash check).
+    // ensure replaces it whether it finds it `restarting` or, between two restarts, `running` (the hash check). Changed
+    // expectation, plan step 8 PR B (Q5): the policy is `on-failure` (was `unless-stopped`), which restarts the exit 3 too.
     cli.ok(['restart', containerName]);
     await timings.measure('exit 3 of the loader and a restart by the policy', () =>
       waitUntil(() => (cli.container(containerName)?.RestartCount ?? 0) >= 1, 'a restart by the policy', 90_000),
     );
-    expect(cli.container(containerName)!.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(cli.container(containerName)!.HostConfig.RestartPolicy?.Name).toBe('on-failure');
     expect(cli.run(['logs', containerName]).err).toContain('devenv loader: started before without its bundle');
     expect(LOADER_EXIT_CODE).toBe(3);
     expect(await monitor.ensure(helperTag, socket)).toBe('created');
     const details = cli.container(containerName)!;
     expect(details.Id).not.toBe(id);
     expect(details.State.Running).toBe(true);
-    expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(details.HostConfig.RestartPolicy?.Name).toBe('on-failure');
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
   });
 
@@ -296,7 +301,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
       if (client.exitCode === null && client.signalCode === null) client.kill('SIGKILL');
     }
     const interrupted = cli.container(containerName)!;
-    expect(interrupted.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    // Changed expectation, plan step 8 PR B (Q5): `on-failure` (was `unless-stopped`); the loader's exit 3 is restarted.
+    expect(interrupted.HostConfig.RestartPolicy?.Name).toBe('on-failure');
     // Review round 2 of PR #69 (A-R2-5): changed expectation (before: `docker exec … test -f` not 0, which a restarting
     // container fails anyway, as Docker refuses the exec): `docker cp` reads the file system of a container in any state.
     const copied = cli.run(['cp', `${containerName}:${REMOTE_MONITOR_SCRIPT_PATH}`, '-']);
@@ -307,7 +313,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const details = cli.container(containerName)!;
     expect(details.Id).not.toBe(interrupted.Id);
     expect(details.State.Running).toBe(true);
-    expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    expect(details.HostConfig.RestartPolicy?.Name).toBe('on-failure');
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
   });
   // Plan step 8, PR A (user decisions Q1 and Q4 of 2026-10-02): the heartbeats of a window go through this window's
@@ -382,5 +388,143 @@ describe('the Session Monitor container of a remote Docker host', () => {
       windowDocker.setRouter(undefined);
       expect(await locks.dispose()).toEqual([]);
     }
+  });
+});
+
+// Plan step 8, PR B (user decisions D2 of 2026-09-30 and Q5 of 2026-10-02): the automatic stops of the monitor take the
+// environment lock, which the workers of the windows hold during their operations (the same lock file in the same
+// volume); a monitor killed while it holds the lock leaves none behind (the kernel frees it); the monitor exits with 0
+// when it is idle and stays exited under its restart policy, until ensure starts it again.
+describe('the Session Monitor container: the environment lock of its stops and its exit when idle (plan step 8 PR B)', () => {
+  const { run, env, cli, log } = dockerTestContext('remoteMonitor');
+  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
+  const containerName = `devenv-test-monitor-lock-${run.runId}`;
+  const socket = helperDockerSocket(env, process.platform, run.dockerHost);
+  let script = '';
+  let helperTag = '';
+  let volumeName = '';
+  let monitor: RemoteSessionMonitor;
+  let locks: ReturnType<typeof workerLocks>;
+  const timings = new Timings();
+
+  const running = (name: string): boolean => cli.container(name)?.State.Running === true;
+  const logs = (): string => cli.run(['logs', containerName]).out;
+
+  /** A labeled container of an environment; without --init, `sleep` as PID 1 ignores SIGTERM, so a stop takes 10 s. */
+  function startEnvironmentContainer(name: string, environmentId: string, init: boolean): void {
+    cli.ok([
+      'run', '-d', ...(init ? ['--init'] : []), '--name', name,
+      '--label', `${LABEL_ENVIRONMENT_ID}=${environmentId}`,
+      '--label', `${TEST_RUN_LABEL}=${run.runId}`,
+      TEST_BASE_IMAGE, 'sleep', '3600',
+    ]);
+  }
+
+  function writeStaleRecord(environmentId: string): void {
+    const longAgo = Date.now() - 30 * 60_000;
+    const file = `/state/heartbeats/${heartbeatFileName(SOURCE, environmentId)}`;
+    cli.ok(['exec', '-i', containerName, 'sh', '-c', `mkdir -p /state/heartbeats && cat > ${file}`], JSON.stringify({ at: longAgo, keepRunning: false, limitSeconds: 60, seq: longAgo }));
+  }
+
+  function newMonitor(idleMs: number): RemoteSessionMonitor {
+    return new RemoteSessionMonitor({
+      docker,
+      logger: log,
+      script: async () => script,
+      containerName,
+      volumeName,
+      labels: { [TEST_RUN_LABEL]: run.runId },
+      containerEnv: { DEVENV_MONITOR_TICK_MS: String(TICK_MS), DEVENV_MONITOR_IDLE_MS: String(idleMs) },
+    });
+  }
+
+  beforeAll(async () => {
+    script = await bundleScript();
+    helperTag = await helper.ensureImage();
+    // The volume of the workers' lock files is the volume of this monitor, as on an engine.
+    volumeName = testStateVolume({ run, cli }, 'remoteMonitor-locks');
+    const targets = new DockerTargets(docker, env, log);
+    await targets.resolve();
+    locks = workerLocks({ run, cli, log }, docker, targets, 'remoteMonitor-locks', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
+    // Long idle time: these tests do not wait for the exit.
+    monitor = newMonitor(3_600_000);
+  });
+
+  afterAll(async () => {
+    timings.print('Timings of the environment lock and the idle exit of the Session Monitor:');
+    log.output(`docker logs ${containerName}:\n${cli.run(['logs', containerName]).out}\n`);
+    const left = await locks.dispose();
+    removeRunObjects(cli, run.runId);
+    expect(left).toEqual([]);
+    expect(cli.container(containerName)).toBeUndefined();
+  });
+
+  it('does not stop an environment while a worker holds its lock, and stops it after the release (D2)', async () => {
+    const id = crypto.randomUUID();
+    const name = `devenv-test-monitor-locked-${run.runId}`;
+    const lock = await locks.take(id, 10, undefined);
+    let released = false;
+    try {
+      expect(await monitor.ensure(helperTag, socket)).toBe('created');
+      startEnvironmentContainer(name, id, true);
+      writeStaleRecord(id);
+      // The grace of the start (8 ticks), then some ticks that want to stop it.
+      await waitUntil(() => logs().includes(`${id} is busy with an operation`), 'the busy lock in the log', 30_000);
+      await new Promise((resolve) => setTimeout(resolve, 10 * TICK_MS));
+      expect(running(name)).toBe(true);
+      // Logged once per busy streak.
+      expect(logs().split(`${id} is busy with an operation`).length - 1).toBe(1);
+      await lock.release();
+      released = true;
+      await timings.measure('stop after the release of the lock', () => waitUntil(() => !running(name), 'the stop after the release', 30_000));
+      expect(logs()).toContain(`Stopping the container ${name} of ${id}`);
+      // The monitor released the lock after its stop: a worker takes it at once.
+      const again = await locks.take(id, 1, undefined);
+      await again.release();
+    } finally {
+      if (!released) await lock.release();
+    }
+  });
+
+  it('holds the lock during its stop, and a monitor killed while it holds the lock leaves no lock held (D2)', async () => {
+    expect(['created', 'running', 'started']).toContain(await monitor.ensure(helperTag, socket));
+    const id = crypto.randomUUID();
+    const name = `devenv-test-monitor-slow-${run.runId}`;
+    // `sleep` as PID 1 ignores SIGTERM: the `docker stop` of the monitor takes 10 s, under the lock.
+    startEnvironmentContainer(name, id, false);
+    writeStaleRecord(id);
+    await waitUntil(() => logs().includes(`Stopping the container ${name} of ${id}`), 'the start of the slow stop', 60_000);
+    // During the stop, the lock is held by the monitor: a worker is refused after its wait.
+    await expect(locks.take(id, 1, undefined)).rejects.toMatchObject({ kind: 'busy' });
+    cli.ok(['kill', containerName]);
+    await waitUntil(() => !running(containerName), 'the end of the killed monitor', 30_000);
+    // The kernel freed the lock with the process: a worker takes it at once.
+    const lock = await locks.take(id, 1, undefined);
+    await lock.release();
+    cli.run(['rm', '-f', name]);
+  });
+
+  it('exits with 0 when no environment container runs and image updates are off, stays exited, and ensure starts it again (Q5)', async (context) => {
+    // The idle exit needs a quiet engine: no running container with the environment label (of this run or another).
+    if (cli.lines(['ps', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}`]).length > 0) {
+      log.info('A container with the environment label runs on this engine; the idle exit is not checked.');
+      context.skip();
+    }
+    cli.run(['rm', '-f', containerName]);
+    const idle = newMonitor(3_000);
+    expect(await idle.ensure(helperTag, socket)).toBe('created');
+    expect(cli.container(containerName)!.HostConfig.RestartPolicy?.Name).toBe('on-failure');
+    await timings.measure('exit when idle', () => waitUntil(() => !running(containerName), 'the exit when idle', 60_000));
+    const exited = cli.container(containerName) as unknown as { State: { Status: string; ExitCode: number }; RestartCount: number };
+    expect(exited.State.Status).toBe('exited');
+    expect(exited.State.ExitCode).toBe(0);
+    expect(logs()).toContain('image updates are off; the Session Monitor exits.');
+    // The restart policy leaves it exited.
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    expect(running(containerName)).toBe(false);
+    expect(cli.container(containerName)!.RestartCount).toBe(0);
+    expect(await idle.ensure(helperTag, socket)).toBe('started');
+    expect(running(containerName)).toBe(true);
   });
 });

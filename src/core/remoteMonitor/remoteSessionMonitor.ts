@@ -54,6 +54,12 @@ const STDERR_TAIL_LENGTH = 4_000;
  */
 export const REMOTE_MONITOR_LOG_OPTIONS: readonly string[] = ['--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=2'];
 
+/**
+ * Plan step 8, PR B (Q5): the restart policy of the monitor container (see runArgs). Every monitor of an older version
+ * is replaced at the next open, as its script, and so its label, changed with this policy.
+ */
+export const MONITOR_RESTART_POLICY = 'on-failure';
+
 /** The part of ContainerAdapter that is used here. */
 export interface RemoteMonitorDocker {
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
@@ -706,11 +712,15 @@ export class RemoteSessionMonitor {
     const args = ['run', '-i', '--sig-proxy=false', '--pull', 'never', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
     if (createId !== undefined) args.push('--label', `${LABEL_MONITOR_CREATE}=${createId}`);
     for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
-    // Our own container: it survives a restart of the daemon (the refusal of restart policies is for the containers of
-    // repositories); after a restart the loader resumes from the stored script. No published port, no capability: it
-    // needs the socket and its volume. User requests 2026-09-28: with image maintenance it reads the tags of the
-    // registry, so it has the default network then (outbound only); without it, no network.
-    args.push('--restart', 'unless-stopped');
+    // Our own container (the refusal of restart policies is for the containers of repositories). Plan step 8, PR B (user
+    // decision Q5 of 2026-10-02): `on-failure`, no longer `unless-stopped`: the monitor exits with 0 when it is idle (no
+    // running environment container for 5 minutes, REMOTE_IDLE_EXIT_MS of src/remoteMonitor/main.ts, no image maintenance) and stays exited until an open
+    // ensures it (`docker start`) or the heartbeats of a window repair it; a failure (an uncaught error, the loader's exit
+    // 3) is restarted, and the loader resumes from the stored script. A monitor that a `docker stop`, or the shutdown of
+    // the daemon, ended (SIGTERM, exit 0) is not started with the daemon: no environment container is either. No
+    // published port, no capability: it needs the socket and its volume. User requests 2026-09-28: with image maintenance
+    // it reads the tags of the registry, so it has the default network then (outbound only); without it, no network.
+    args.push('--restart', MONITOR_RESTART_POLICY);
     if (imagePrefixes.length === 0) args.push('--network', 'none');
     args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
     // Monitor cleanup, user decision 2026-09-29 (R5): its own Docker log is capped (two files of at most 1 MB). The driver
