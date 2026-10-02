@@ -4,7 +4,7 @@
 
 // Decisions at the activation of a window (concept 7.9, 7.10, 7.14). No `vscode` import, so they are unit-tested.
 import type { ExtensionSettings, PendingConnection, PendingOperation, ReopenRecord } from '../core/types';
-import { PENDING_MAX_AGE_MS } from '../monitor/rules';
+import { PENDING_MAX_AGE_MS } from '../core/busy';
 
 /** A pending operation older than this is stale: it is removed without running (its request is long forgotten). */
 export const PENDING_OPERATION_MAX_AGE_MS = 10 * 60_000;

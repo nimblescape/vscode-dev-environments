@@ -48,7 +48,7 @@ export const HEARTBEAT_LOCK_WAIT_SECONDS = 5;
 /** A heartbeat that holds HEARTBEAT_LOCK_PATH longer than this, in seconds, is killed (the lock with it). */
 export const HEARTBEAT_RUN_LIMIT_SECONDS = 10;
 
-/** Default of the setting devEnvLauncher.remoteStopAfterMinutes (10 minutes). */
+/** Default of the setting devEnvLauncher.stopAfterMinutes (10 minutes; plan step 8, PR A: every engine). */
 export const DEFAULT_REMOTE_STOP_AFTER_SECONDS = 600;
 /** The smallest time limit that a heartbeat can set. */
 export const MIN_LIMIT_SECONDS = 60;
@@ -273,7 +273,7 @@ export function forgetIfUnchangedCommand(source: string, environmentId: string, 
 }
 
 // ---- The images of the remote host (user requests 2026-09-28: pull the latest major version of all images of the
-// setting remoteImageUpdates, keep the two newest versions, only on a remote host) ----
+// setting imageUpdates, keep the two newest versions; plan step 8, PR A: on every engine) ----
 
 /** A prefix of image repositories: `registry/path…`, lower case, no tag, no digest (the setting drops a trailing `*`). */
 export function isImagePrefix(value: unknown): value is string {
@@ -291,7 +291,7 @@ export function isImagePrefix(value: unknown): value is string {
 }
 
 /**
- * The prefixes of the setting remoteImageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. Review
+ * The prefixes of the setting imageUpdates: a trailing `*` dropped, invalid ones and duplicates left out. Review
  * round 5 of PR #57 (P1): at most MAX_IMAGE_PREFIXES, as the monitor takes (`settings -`); before, more were sent and
  * refused at every open.
  */

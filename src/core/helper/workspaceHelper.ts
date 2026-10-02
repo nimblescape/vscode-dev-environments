@@ -106,6 +106,14 @@ export interface HelperDeps {
   onImageBuilt?: () => void;
 }
 
+/** The options of WorkspaceHelper.ensureImagePresent. */
+export interface PresentImageOptions {
+  onOutput?: (text: string) => void;
+  signal?: AbortSignal;
+  /** Review round 4 of PR #85 (A-R4-1): called when the call starts or joins a build of the helper image. */
+  onBuild?: (kind: HelperBuildKind) => void;
+}
+
 /** See HelperDeps.engine. */
 export interface HelperEngine {
   key: string;
@@ -366,15 +374,17 @@ export class WorkspaceHelper {
    * PR #74 review round 2, A-R2-1: it does not join a pending maintaining ensure of an open (a `--pull --no-cache`
    * rebuild, the cleanup), which the caller could not cancel: when the tag exists, its image is used at once (the worker
    * is pinned to its ID; a rebuild that moves the tag later cannot remove an image that a container uses). Only a missing
-   * tag, or a tag that cannot be checked, joins it, like before. Throws like ensureImage.
+   * tag, or a tag that cannot be checked, joins it, like before. Throws like ensureImage. Review round 4 of PR #85
+   * (A-R4-1): `onBuild` is called when the call starts or joins a build (a failure before it, such as an engine that
+   * does not answer, is no failed build).
    */
-  async ensureImagePresent(options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
+  async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
     // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its calls
     // run without the worker (workerPreparation.ts).
     return runPreparingWorker(() => this.ensureImagePresentNow(options));
   }
 
-  private async ensureImagePresentNow(options: { onOutput?: (text: string) => void; signal?: AbortSignal }): Promise<HelperImageUse> {
+  private async ensureImagePresentNow(options: PresentImageOptions): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     this.adoptEngine(engine.key);
     if (this.imagePromise && this.imageReadyAt !== undefined && !(await this.cachedImageCurrent())) this.resetImage();
@@ -385,7 +395,7 @@ export class WorkspaceHelper {
       // The cache may have been replaced during the await (another engine): image() joins a promise of this engine.
       this.adoptEngine(engine.key);
     }
-    return this.image({ onOutput: options.onOutput, signal: options.signal }, false);
+    return this.image({ onOutput: options.onOutput, signal: options.signal, onBuild: options.onBuild }, false);
   }
 
   /**
@@ -397,6 +407,16 @@ export class WorkspaceHelper {
   async checkImagePresent(options: { signal?: AbortSignal } = {}): Promise<void> {
     const present = await runPreparingWorker(() => this.presentTag(options.signal));
     if (present === undefined) throw new UserFacingError('helperFailed', Messages.helperImageNotPresent);
+  }
+
+  /**
+   * Review round 4 of PR #85 (A-R4-1): the current helper tag with the ID of its image when the tag exists on the engine
+   * of the operation, else `undefined` (missing, or it cannot be checked); never builds and never joins a build (its
+   * check has a time limit). An AbortError when `signal` aborts. In the scope of the worker preparation, like
+   * checkImagePresent.
+   */
+  async presentImage(options: { signal?: AbortSignal } = {}): Promise<HelperImageUse | undefined> {
+    return runPreparingWorker(() => this.presentTag(options.signal));
   }
 
   /**

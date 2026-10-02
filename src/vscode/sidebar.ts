@@ -22,7 +22,7 @@ import type { EnvironmentService } from '../core/pipeline/environmentService';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
-import { isProcessAlive } from '../monitor/lock';
+import { isProcessAlive } from '../core/session/sessionRules';
 import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
 import { RepositoryGroupTexts, parseRepositoryGroups, type RepositoryGroupPattern } from './repositoryGroups';
 import type { SessionCoordinator } from './sessionCoordinator';

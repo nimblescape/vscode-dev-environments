@@ -242,8 +242,9 @@ describe('monitor protocol version and exit request', () => {
   });
 
   // Versions reset to 1 (user decision 2026-09-27); 2 since review round 3 of PR #58 (F1: heartbeats under flock).
-  it('is version 2', () => {
-    expect(MONITOR_PROTOCOL_VERSION).toBe(2);
+  // Changed expectation, review round 1 of PR #85, A-R1-1: version 3 (was 2).
+  it('is version 3', () => {
+    expect(MONITOR_PROTOCOL_VERSION).toBe(3);
   });
 
   it('writes and reads the version of a process ID, atomically and next to the lock', () => {
@@ -428,7 +429,7 @@ describe('monitor protocol version and exit request', () => {
 
   // Round-2 review finding 3 of PR #26: transient file errors of Windows (a virus scanner holds the file).
   it('retries transient errors when it reads the version, and an unreadable version is unknown, never older', () => {
-    // Version 1 is older than the current version 2 (review round 3 of PR #58), so a window retires it.
+    // Version 1 is older than the current version (3 since review round 1 of PR #85, A-R1-1), so a window retires it.
     writeMonitorVersion(versionFile, 1111, 1);
     let failures = 0;
     fsHooks.readFileSync = (file) => {

@@ -331,10 +331,11 @@ export interface MonitorSettings {
   stopOnClose: boolean;
   respectShutdownActionNone: boolean;
   /**
-   * Unit 7, PR 2: the time limit that the heartbeats give the Session Monitor on a remote Docker host (the setting
-   * remoteStopAfterMinutes in seconds).
+   * Review round 2 of PR #85, A-R2-3: still written (the setting stopAfterMinutes, in seconds) until plan step 8, PR C,
+   * so a monitor of version 2 reads valid settings while it retires, and when a window that was not reloaded starts one.
+   * Not read by this version.
    */
-  remoteStopAfterSeconds: number;
+  remoteStopAfterSeconds?: number;
   updatedAt: string;
 }
 
@@ -365,20 +366,23 @@ export interface ExtensionSettings {
    */
   openInNewWindow?: boolean;
   /**
-   * `remoteStopAfterMinutes` (unit 7, PR 2): a container on a remote Docker host stops after this many minutes without
-   * contact from this computer, unless it keeps running when closed. 5 to 1440. Missing: 10.
+   * `stopAfterMinutes` (unit 7, PR 2; plan step 8, PR A: named remoteStopAfterMinutes before, user decision Q1 of
+   * 2026-10-02, no migration): the time limit of the heartbeats of a window to the Session Monitor container of the
+   * engine of its environment, on every engine: a container stops after this many minutes without a heartbeat, unless it
+   * keeps running when closed. 5 to 1440. Missing: 10.
    */
-  remoteStopAfterMinutes?: number;
+  stopAfterMinutes?: number;
   /**
    * User requests 2026-09-28: the image repositories (a prefix with a trailing `*`) whose latest major version the Session
-   * Monitor on a remote Docker host pulls, keeping the two newest versions of each. Only on a remote host. Empty: none.
+   * Monitor container pulls, keeping the two newest versions of each. Plan step 8, PR A: on every engine (named
+   * remoteImageUpdates before). Empty: none.
    */
-  remoteImageUpdates?: string[];
+  imageUpdates?: string[];
   /**
    * User requests 2026-09-28: when the image maintenance runs after its first pass: a cron expression of five fields
    * (minute hour day-of-month month day-of-week) in the time zone of this computer. Default `7 6 * * *`.
    */
-  remoteImageUpdateSchedule?: string;
+  imageUpdateSchedule?: string;
 }
 
 /** State of a container as Docker reports it, simplified. */

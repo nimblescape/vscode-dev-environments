@@ -16,8 +16,9 @@ import type { ExtensionSettings, WindowStatus } from '../core/types';
 import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
-// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58. To test the retirement of an older
-// monitor, a test sets the protocol version of the window to a future version 3 (`windowVersion.value`); the
+// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58, 3 since review round 1 of PR #85
+// (A-R1-1). To test the retirement of an older monitor, a test sets the protocol version of the window to a future
+// version 4 (`windowVersion.value`); the
 // protocol version of the monitor module stays the real one otherwise.
 const windowVersion = vi.hoisted(() => ({ value: undefined as number | undefined }));
 vi.mock('../monitor/lock', async (importOriginal) => {
@@ -211,6 +212,8 @@ describe('SessionCoordinator', () => {
       stopOnClose: true,
       respectShutdownActionNone: false,
       // Unit 7, PR 2: the time limit of the heartbeats to a remote Session Monitor (the default of 10 minutes).
+      // Changed expectation, review round 2 of PR #85, A-R2-3: written again until plan step 8, PR C, for a monitor of
+      // version 2 (the setting stopAfterMinutes, default 10 minutes).
       remoteStopAfterSeconds: 600,
       updatedAt: iso(T0),
     });
@@ -291,8 +294,10 @@ describe('SessionCoordinator', () => {
   // The window runs as a future version, the older monitor is of the current version.
   describe('a monitor of an older version', () => {
     // Review round 3 of PR #58 (F1): the current version is 2, so the future window is 3 and the older monitor is 2.
-    const FUTURE_VERSION = 3;
-    const OLDER_VERSION = 2;
+    // Changed expectation, review round 1 of PR #85, A-R1-1: the current version is 3, so the future window is 4 and
+    // the older monitor is 3.
+    const FUTURE_VERSION = 4;
+    const OLDER_VERSION = 3;
     beforeEach(() => {
       windowVersion.value = FUTURE_VERSION;
     });
@@ -326,6 +331,20 @@ describe('SessionCoordinator', () => {
         // Review round 3 of PR #58 (F1): the versions of the fixture moved up by one.
         `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version ${OLDER_VERSION}, older than ${FUTURE_VERSION}.`,
       );
+    });
+
+    // Review round 1 of PR #85, A-R1-1: a live monitor of version 2 (before plan step 8, PR A) reads monitor.json without
+    // remoteStopAfterSeconds and would stop kept environments with its defaults; a window of the real current version
+    // (3) asks it to exit and starts its own.
+    it('retires a live monitor of version 2 from a window of the current version 3', async () => {
+      windowVersion.value = undefined;
+      expect(MONITOR_PROTOCOL_VERSION).toBe(3);
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: 2 }));
+      await h.coordinator.start(null);
+      expect(exitRequestPid()).toBe(OTHER_PID);
+      expect(h.spawns).toHaveLength(1);
+      expect(h.logger.lines.join('\n')).toContain(`Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version 2, older than 3.`);
     });
 
     it('leaves a monitor of the current version alone', async () => {
@@ -404,6 +423,35 @@ describe('SessionCoordinator', () => {
     });
   });
 
+  // Review round 2 of PR #85, A-R2-3: a monitor of version 2 (main before plan step 8, PR A) requires
+  // remoteStopAfterSeconds in monitor.json; without it, it decides with its defaults and stops kept environments.
+  it('writes remoteStopAfterSeconds from stopAfterMinutes, so a monitor of version 2 reads valid settings', async () => {
+    /** isMonitorSettings of main (the format that a monitor of version 2 reads), copied as it is there. */
+    const isMainMonitorSettings = (value: unknown): boolean => {
+      if (typeof value !== 'object' || value === null) return false;
+      const v = value as Record<string, unknown>;
+      return (
+        typeof v.waitingTimeSeconds === 'number' &&
+        Number.isFinite(v.waitingTimeSeconds) &&
+        v.waitingTimeSeconds >= 0 &&
+        typeof v.stopOnClose === 'boolean' &&
+        typeof v.respectShutdownActionNone === 'boolean' &&
+        typeof v.remoteStopAfterSeconds === 'number' &&
+        Number.isFinite(v.remoteStopAfterSeconds) &&
+        v.remoteStopAfterSeconds > 0 &&
+        typeof v.updatedAt === 'string' &&
+        Number.isFinite(Date.parse(v.updatedAt))
+      );
+    };
+    h.settings = { ...SETTINGS, stopOnClose: false, stopAfterMinutes: 7 };
+    await h.coordinator.writeMonitorSettings();
+    const written: unknown = JSON.parse(fs.readFileSync(h.paths.monitorSettings, 'utf8'));
+    expect(written).toMatchObject({ stopOnClose: false, remoteStopAfterSeconds: 420 });
+    expect(isMainMonitorSettings(written)).toBe(true);
+    // This version reads it too (the field is ignored).
+    expect(await h.sessionFiles.readMonitorSettings()).toMatchObject({ remoteStopAfterSeconds: 420 });
+  });
+
   it('updates the status file periodically, removes the pending file each time, and fires onDidHeartbeat', async () => {
     const coordinator = h.create({ heartbeatMs: 20 });
     h.coordinator.dispose();
@@ -414,6 +462,67 @@ describe('SessionCoordinator', () => {
     await nextHeartbeat(coordinator);
     expect(readStatus(h)?.updatedAt).toBe(iso(T0 + HEARTBEAT_INTERVAL_MS));
     expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  // Plan step 8, PR A: the window's tick drives its heartbeats to the Session Monitor container (not awaited).
+  it('drives the window heartbeats at each periodic update, and not after dispose', async () => {
+    let ticks = 0;
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    const coordinator = h.create({
+      heartbeatMs: 20,
+      windowHeartbeats: {
+        tick: () => {
+          ticks += 1;
+          // A heartbeat that hangs does not hold the status updates back.
+          return blocked;
+        },
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    expect(ticks).toBe(0);
+    await nextHeartbeat(coordinator);
+    await nextHeartbeat(coordinator);
+    expect(ticks).toBeGreaterThanOrEqual(2);
+    coordinator.dispose();
+    const after = ticks;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(ticks).toBe(after);
+    release();
+  });
+
+  // Review round 1 of PR #85 (mutant K02): a window that stops during a periodic update sends no more heartbeats.
+  it('does not drive the window heartbeats when the coordinator stops during an update', async () => {
+    let ticks = 0;
+    let disposeOnSpawn = false;
+    let spawned = 0;
+    const coordinator: SessionCoordinator = h.create({
+      heartbeatMs: 20,
+      windowHeartbeats: {
+        tick: async () => {
+          ticks += 1;
+        },
+      },
+      spawnProcess: () => {
+        spawned += 1;
+        // The window closes while this update runs (between the status write and the heartbeats).
+        if (disposeOnSpawn) coordinator.dispose();
+        return { unref: () => {}, on: () => undefined };
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    const before = ticks;
+    const spawnedBefore = spawned;
+    disposeOnSpawn = true;
+    h.clock.time += MONITOR_START_GRACE_MS;
+    for (let i = 0; i < 50 && spawned === spawnedBefore; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(spawned).toBeGreaterThan(spawnedBefore);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(ticks).toBe(before);
   });
 
   it('checks at each update that a monitor runs', async () => {

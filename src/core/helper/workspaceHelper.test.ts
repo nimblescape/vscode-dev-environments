@@ -18,7 +18,7 @@ import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { configOwnershipFixCommand } from '../git/gitSummary';
-import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { abortError, isAbortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
@@ -2864,6 +2864,59 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     const helper = helperOn(REMOTE);
     await expect(helper.ensureImagePresent()).rejects.toMatchObject({ code: 'helperFailed' });
     expect(docker.images.has(TAG)).toBe(false);
+  });
+
+  // Review round 4 of PR #85 (A-R4-1): the heartbeats back off only a build that started and failed (onBuild), never an
+  // engine that does not answer; within the wait they check the tag only (presentImage), which never builds.
+  it('reports a build that it starts (onBuild), not a failure before it; presentImage never builds', async () => {
+    const helper = helperOn(REMOTE);
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async () => {
+      throw new CommandError('docker image inspect', 255, '', 'ssh: connect to host build-box port 22: Connection refused');
+    };
+    const unreachable = vi.fn();
+    await expect(helper.ensureImagePresent({ onBuild: unreachable })).rejects.toBeDefined();
+    expect(unreachable).not.toHaveBeenCalled();
+    expect(await helper.presentImage()).toBeUndefined();
+    docker.imageId = imageId;
+    expect(await helper.presentImage()).toBeUndefined();
+    expect(docker.builds).toEqual([]);
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'no space left on device');
+    };
+    const failing = vi.fn();
+    await expect(helper.ensureImagePresent({ onBuild: failing })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(failing).toHaveBeenCalledWith('create');
+    docker.buildHandler = async () => undefined;
+    const built = vi.fn();
+    expect(await helper.ensureImagePresent({ onBuild: built })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(built).toHaveBeenCalledTimes(1);
+    expect(await helper.presentImage()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    const builds = docker.builds.length;
+    const present = vi.fn();
+    expect(await helper.ensureImagePresent({ onBuild: present })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(present).not.toHaveBeenCalled();
+    expect(docker.builds).toHaveLength(builds);
+  });
+
+  // Review round 5 of PR #85 (B-R5-4, B-R5-5): presentImage checks the tag in the scope of the worker preparation (its
+  // check cannot go through the worker), and an aborted signal ends it with an AbortError.
+  it('presentImage checks the tag in the scope of the worker preparation, and passes the abort of its signal through', async () => {
+    const helper = helperOn(REMOTE);
+    const scopes: boolean[] = [];
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async (reference: string) => {
+      scopes.push(preparingWorker());
+      return imageId(reference);
+    };
+    expect(await helper.presentImage()).toBeUndefined();
+    expect(scopes.length).toBeGreaterThanOrEqual(1);
+    expect(scopes.every((inScope) => inScope)).toBe(true);
+    expect(preparingWorker()).toBe(false);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(helper.presentImage({ signal: aborted.signal })).rejects.toSatisfy(isAbortError);
+    expect(docker.builds).toEqual([]);
   });
 
   // PR #74 review round 2, A-R2-1: a pending maintaining ensure of an open in the same window (a `--pull --no-cache`

@@ -8,8 +8,8 @@
 // images and clean the images from docker regularly"; "only in the remote scenario"; "1 minute after the monitor starts
 // then in the morning again, at 6:07 CEST"; "a setting that tells the monitor to fetch in a guided cron style manner"). A
 // pass one minute after the start of the monitor, then at each time of the cron schedule of the setting
-// remoteImageUpdateSchedule (default `7 6 * * *`: 06:07) in the time zone of the computer that created the monitor:
-//   1. The repositories whose name starts with one of the prefixes (the setting remoteImageUpdates): those on the engine,
+// imageUpdateSchedule (default `7 6 * * *`: 06:07) in the time zone of the computer that created the monitor:
+//   1. The repositories whose name starts with one of the prefixes (the setting imageUpdates): those on the engine,
 //      and those of the list that the extension sent ("all images": the registry lists no repositories without a token,
 //      so the extension reads the packages with its GitHub session and sends only the names; `monitor.js images -`).
 //   2. For each: the tags of the registry (anonymous, the token of its challenge); the highest major tag (a plain number,

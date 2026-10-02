@@ -2,9 +2,9 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The Session Monitor container on a remote Docker host, from the side of this computer (unit 7, PR 2; implementation
-// notes 16): the open pipeline ensures it (ensure), the window of Close and Keep Running sends one heartbeat, and Delete
-// removes the record of this computer. The Docker calls go through the current Docker context of the operation
+// The Session Monitor container on a Docker engine, from the side of this computer (unit 7, PR 2; implementation notes
+// 16; plan step 8, PR A: on every engine, local and remote): the open pipeline ensures it (ensureOrThrow), the windows
+// send their heartbeats (src/core/session/windowHeartbeats.ts), and Delete removes the record of this computer. The Docker calls go through the current Docker context of the operation
 // (ContainerAdapter.run and start pin DOCKER_CONTEXT); DOCKER_HOST is never set. No `vscode`.
 //
 // Plan step 3 (pipe loading, user decisions 2026-09-29): the container runs the pipe loader; the script is never an
@@ -68,8 +68,8 @@ export interface RemoteSessionMonitorOptions {
   script: () => Promise<string>;
   /**
    * User requests 2026-09-28: the image maintenance of the monitor: the prefixes of the images that it updates and cleans
-   * (the setting remoteImageUpdates, a trailing `*` dropped; none: no image maintenance), the schedule (a cron expression,
-   * the setting remoteImageUpdateSchedule), and the time zone of this computer.
+   * (the setting imageUpdates, a trailing `*` dropped; none: no image maintenance), the schedule (a cron expression,
+   * the setting imageUpdateSchedule), and the time zone of this computer.
    */
   imageMaintenance?: () => ImageMaintenanceSettings;
   /** Only for the Docker tests: another container and volume name, more labels, and variables of the container. */
@@ -87,7 +87,7 @@ export interface ImageMaintenanceSettings {
   timeZone: string;
 }
 
-/** What ensure found or did. `failed`: logged as a warning; the open goes on. */
+/** What ensure found or did. `failed`: logged as a warning (ensureOrThrow rejects instead; plan step 8, PR A). */
 export type EnsureOutcome = 'running' | 'started' | 'created' | 'failed';
 
 /** The result of a `docker exec` in the monitor container. `missing`: the container does not exist or does not run. */
@@ -250,75 +250,81 @@ export class RemoteSessionMonitor {
    * a warning.
    */
   async ensure(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<EnsureOutcome> {
-    const { logger } = this.options;
     try {
-      const script = await this.options.script();
-      // Plan step 3 (user decision 2026-09-29): the memory guard of the loader, before an old monitor is removed.
-      const scriptLine = encodeBundle(script);
-      if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
-        throw new Error(`The script of the Session Monitor is too long (${scriptLine.length - 1} characters as JSON).`);
-      }
-      const images = this.options.imageMaintenance?.();
-      // Review round 1 of PR #57 (C): only whether it maintains images is part of the label (its network); the prefixes,
-      // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
-      // time zone on the same engine do not replace it at each open.
-      const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
-      // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
-      const createId = randomUUID();
-      const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images, createId);
-      let current = await this.inspect(signal);
-      // Review round 4 of PR #69 (A-R4-1): a `created` container (of any label) may be the create of another window
-      // between its create and its start: look again for a while before anything is decided.
-      if (current.exists && current.status === 'created') current = await this.waitWhileCreated(current, signal);
-      if (current.exists) {
-        const decided = await this.decide(current, label, script, signal);
-        if (decided !== 'replace') return decided;
-        // Review round 2 of PR #69 (A-R2-2), review round 4 (A-R4-5): by its ID only, so never a container that another
-        // window created meanwhile.
-        await this.docker(['rm', '-f', this.idOf(current)], signal);
-      }
-      let created = await this.create(runArgs, scriptLine, signal);
-      let triedAgain = false;
-      // Another window creates or removes it at the same time: accept it when it is the same version and runs. It is not
-      // ours, so it is not removed. Review round 3 of PR #69 (A-R3-1, A-R3-2): wait while it is being created or removed,
-      // and create once more when the name became free. A create that met the conflict made no container, so the nonce
-      // of this create stays that of the next one.
-      while (created.kind === 'exited' && created.conflict) {
-        // Review round 4 of PR #69 (A-R4-2): a container with the nonce of this create means that this create did make
-        // one: no conflict. A list that fails is no evidence either way: fail, and remove nothing but by the nonce.
-        const own = await this.listOwn(createId, signal);
-        if (own === undefined || own.length > 0) {
-          await this.removeBestEffort(createId);
-          throw new Error(`docker run failed: ${created.detail}`);
-        }
-        const found = await this.resolveConflict(label, script, signal);
-        if (found === 'running') return 'running';
-        if (found === 'missing' && !triedAgain) {
-          triedAgain = true;
-          created = await this.create(runArgs, scriptLine, signal);
-          continue;
-        }
-        // Review round 4 of PR #69 (A-R4-2): by the nonce only, so after a true conflict it finds nothing.
+      return await this.ensureOrThrow(helperTag, socketPath, signal, helperImage);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.options.logger.warn(`The Session Monitor on the Docker host could not be started: ${errorMessage(error)}`);
+      return 'failed';
+    }
+  }
+
+  /**
+   * Plan step 8, PR A (user decision Q3 of 2026-10-02): ensure, but a failure rejects with its cause (an Error) instead
+   * of `failed`, so the open is refused. Nothing is logged for the failure here; the caller says it.
+   */
+  async ensureOrThrow(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<Exclude<EnsureOutcome, 'failed'>> {
+    const { logger } = this.options;
+    const script = await this.options.script();
+    // Plan step 3 (user decision 2026-09-29): the memory guard of the loader, before an old monitor is removed.
+    const scriptLine = encodeBundle(script);
+    if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
+      throw new Error(`The script of the Session Monitor is too long (${scriptLine.length - 1} characters as JSON).`);
+    }
+    const images = this.options.imageMaintenance?.();
+    // Review round 1 of PR #57 (C): only whether it maintains images is part of the label (its network); the prefixes,
+    // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
+    // time zone on the same engine do not replace it at each open.
+    const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
+    // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
+    const createId = randomUUID();
+    const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images, createId);
+    let current = await this.inspect(signal);
+    // Review round 4 of PR #69 (A-R4-1): a `created` container (of any label) may be the create of another window
+    // between its create and its start: look again for a while before anything is decided.
+    if (current.exists && current.status === 'created') current = await this.waitWhileCreated(current, signal);
+    if (current.exists) {
+      const decided = await this.decide(current, label, script, signal);
+      if (decided !== 'replace') return decided;
+      // Review round 2 of PR #69 (A-R2-2), review round 4 (A-R4-5): by its ID only, so never a container that another
+      // window created meanwhile.
+      await this.docker(['rm', '-f', this.idOf(current)], signal);
+    }
+    let created = await this.create(runArgs, scriptLine, signal);
+    let triedAgain = false;
+    // Another window creates or removes it at the same time: accept it when it is the same version and runs. It is not
+    // ours, so it is not removed. Review round 3 of PR #69 (A-R3-1, A-R3-2): wait while it is being created or removed,
+    // and create once more when the name became free. A create that met the conflict made no container, so the nonce
+    // of this create stays that of the next one.
+    while (created.kind === 'exited' && created.conflict) {
+      // Review round 4 of PR #69 (A-R4-2): a container with the nonce of this create means that this create did make
+      // one: no conflict. A list that fails is no evidence either way: fail, and remove nothing but by the nonce.
+      const own = await this.listOwn(createId, signal);
+      if (own === undefined || own.length > 0) {
         await this.removeBestEffort(createId);
         throw new Error(`docker run failed: ${created.detail}`);
       }
-      if (created.kind === 'ready') {
-        logger.info(`The Session Monitor on the Docker host was created (${this.containerName}, image ${helperTag}).`);
-        return 'created';
+      const found = await this.resolveConflict(label, script, signal);
+      if (found === 'running') return 'running';
+      if (found === 'missing' && !triedAgain) {
+        triedAgain = true;
+        created = await this.create(runArgs, scriptLine, signal);
+        continue;
       }
+      // Review round 4 of PR #69 (A-R4-2): by the nonce only, so after a true conflict it finds nothing.
       await this.removeBestEffort(createId);
-      if (created.kind === 'aborted') throw abortError();
-      if (created.kind === 'timeout') {
-        throw new Error(`the monitor did not report its start within ${REMOTE_MONITOR_DOCKER_TIMEOUT_MS / 1000} seconds.`);
-      }
       throw new Error(`docker run failed: ${created.detail}`);
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      logger.warn(
-        `The Session Monitor on the Docker host could not be started: ${errorMessage(error)} Without it, a container there stops after its waiting time only while this computer is online and Docker is set to that host.`,
-      );
-      return 'failed';
     }
+    if (created.kind === 'ready') {
+      logger.info(`The Session Monitor on the Docker host was created (${this.containerName}, image ${helperTag}).`);
+      return 'created';
+    }
+    await this.removeBestEffort(createId);
+    if (created.kind === 'aborted') throw abortError();
+    if (created.kind === 'timeout') {
+      throw new Error(`the monitor did not report its start within ${REMOTE_MONITOR_DOCKER_TIMEOUT_MS / 1000} seconds.`);
+    }
+    throw new Error(`docker run failed: ${created.detail}`);
   }
 
   /**
@@ -634,9 +640,12 @@ export class RemoteSessionMonitor {
     return NO_STORED_SCRIPT.test(`${result.stderr}\n${result.stdout}`) ? 'other' : 'unknown';
   }
 
-  /** One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). */
-  async heartbeat(input: HeartbeatInput): Promise<MonitorExecResult> {
-    return this.exec(heartbeatCommand(input));
+  /**
+   * One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). Review round 1 of PR
+   * #85 (A-R1-2): `signal` ends the `docker exec` (the deadline of the window's attempt); the result is then a failure.
+   */
+  async heartbeat(input: HeartbeatInput, signal?: AbortSignal): Promise<MonitorExecResult> {
+    return this.exec(heartbeatCommand(input), signal);
   }
 
   /** The records of an environment (`monitor.js records <id>`); undefined when they cannot be read. */
@@ -725,9 +734,9 @@ export class RemoteSessionMonitor {
     return args;
   }
 
-  private async exec(command: readonly string[]): Promise<MonitorExecResult> {
+  private async exec(command: readonly string[], signal?: AbortSignal): Promise<MonitorExecResult> {
     try {
-      const result = await this.options.docker.run(['exec', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS });
+      const result = await this.options.docker.run(['exec', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, ...(signal ? { signal } : {}) });
       if (result.exitCode === 0 && !result.timedOut) return { ok: true, stdout: result.stdout };
       const detail = result.timedOut
         ? `docker exec did not end within ${REMOTE_MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`

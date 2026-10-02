@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { writeJsonAtomicSync } from '../core/storage/atomicJson';
 import { parseJson, readJsonTolerantSync, readTextFileSync, retryTransientSync } from '../core/storage/paths';
+import { isProcessAlive } from '../core/session/sessionRules';
 
 /**
  * A lock file that was not refreshed for this time counts as stale, also when its process ID belongs to a live process.
@@ -26,26 +27,19 @@ export const MONITOR_LOCK_STALE_MS = 120_000;
  */
 // Review round 3 of PR #58 (F1): 2, because a monitor of version 1 sends heartbeats without the kernel lock of the
 // records (heartbeatCommand), which races the heartbeats of the windows of this version.
-export const MONITOR_PROTOCOL_VERSION = 2;
+// Review round 1 of PR #85 (A-R1-1): 3, because monitor.json no longer has remoteStopAfterSeconds and the heartbeats
+// moved to the windows (plan step 8, PR A): a monitor of version 2 would read no settings, decide with its defaults
+// (stop on close after 30 s, also an environment the user keeps), and send heartbeats that compete with the windows'.
+// Review round 2 of PR #85 (A-R2-3): monitor.json keeps remoteStopAfterSeconds until plan step 8, PR C, so a monitor of
+// version 2 still reads valid settings while it retires; the version stays 3 because of its competing heartbeats.
+export const MONITOR_PROTOCOL_VERSION = 3;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */
 const INCOMPLETE_LOCK_MS = 5_000;
 const MAX_PID = 0x7fffffff;
 
-/**
- * The process exists: `process.kill(pid, 0)` does not throw `ESRCH` (implementation notes 12). `EPERM` (a process of
- * another user) counts as alive. Works on macOS, Linux, and Windows. Invalid IDs (0, negative, not an integer) give false,
- * because `kill` with 0 or a negative ID would address a process group.
- */
-export function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0 || pid > MAX_PID) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
+// Plan step 8, PR A: isProcessAlive lives in src/core/session/sessionRules.ts; re-exported until this monitor is removed.
+export { isProcessAlive };
 
 /** The process ID in the lock file. `undefined` if the file is missing or does not contain a valid process ID. */
 export function readMonitorLockPid(lockFile: string): number | undefined {

@@ -521,7 +521,7 @@ export function imageTimesFromEnv(env: NodeJS.ProcessEnv): { firstMs: number; in
 
 /**
  * The schedule of the passes (user request 2026-09-28, "in a guided cron style manner"): DEVENV_IMAGE_SCHEDULE (a cron
- * expression of five fields, the setting remoteImageUpdateSchedule) in DEVENV_IMAGE_TZ (the time zone of the computer
+ * expression of five fields, the setting imageUpdateSchedule) in DEVENV_IMAGE_TZ (the time zone of the computer
  * that created the monitor). Invalid or missing: `7 6 * * *` (06:07) in Europe/Vienna.
  */
 export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { text: string; schedule: CronSchedule; timeZone: string } {

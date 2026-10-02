@@ -292,6 +292,20 @@ export const Messages = {
   workerUnavailable: (cause: string) =>
     `The Dev Environments worker on the Docker host could not be prepared (${cause}), so nothing was run. Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
   /**
+   * Plan step 8, PR A, user decision Q3 of 2026-10-02 (D1): the Session Monitor container of the engine could not be
+   * started at an open, so the open was refused (SessionMonitorUnavailableError, src/core/errors.ts).
+   */
+  sessionMonitorUnavailable: (repository: string, cause: string) =>
+    `${repository} was not opened: the Session Monitor on the Docker engine could not be started (${cause}). Without it, an environment that no window uses any more would not be stopped. Check that Docker runs (see the Dev Environments output), then try again.`,
+  /**
+   * Plan step 8, PR A, user decision Q4 of 2026-10-02: the heartbeats of this window to the Session Monitor of the engine
+   * of its environment failed HEARTBEAT_WARN_AFTER_FAILURES times in a row (once per failure streak).
+   */
+  heartbeatsFailing: (repository: string, engine: string, minutesLeft: number) =>
+    `Dev Environments cannot reach the Session Monitor on ${engine === 'the local Docker' ? engine : `the Docker host ${engine}`}. If this goes on, it may stop the container of ${repository} ${
+      minutesLeft <= 0 ? 'at any moment' : `in about ${minutesLeft} minute${minutesLeft === 1 ? '' : 's'}`
+    }. Check that Docker runs (see the Dev Environments output); the window keeps trying.`,
+  /**
    * Review round 4 of PR #64 (R4-4), review round 14 (R14-1): the helper image could not be prepared at Step 5 of a
    * Rebuild or of the switch to a newly selected configuration, and the running container, which is current, opened as
    * it is. `change` names what was not applied; with a selected configuration, `previous` names the configuration that

@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { ContainerAdapter } from './containerAdapter';
-import { DockerTargets, operationDockerTarget, runWithDockerTarget } from './dockerTargets';
+import { CONTEXT_INSPECT_TIMEOUT_MS, DockerTargets, operationDockerTarget, runWithDockerTarget } from './dockerTargets';
 
 const DOCKER = '/usr/local/bin/docker';
 
@@ -26,7 +26,10 @@ class FakeDockerCli implements ProcessRunner {
     if (args[0] === 'context' && args[1] === 'inspect') {
       if (this.inspectFails) return { exitCode: 1, stdout: '', stderr: 'context "x": context not found', timedOut: false };
       const host = options.env?.DOCKER_HOST;
-      const name = host ? 'default' : (options.env?.DOCKER_CONTEXT ?? this.context);
+      // Review round 1 of PR #85 (A-R1-3): `docker context inspect --format {{json .}} <name>` reads a named context.
+      const named = args[4];
+      if (named !== undefined && !(named in this.contexts)) return { exitCode: 1, stdout: '', stderr: `context "${named}": context not found`, timedOut: false };
+      const name = host ? 'default' : (named ?? options.env?.DOCKER_CONTEXT ?? this.context);
       const endpoint = host ?? this.contexts[name];
       return { exitCode: 0, stdout: `${JSON.stringify({ Name: name, Endpoints: { docker: { Host: endpoint } } })}\n`, stderr: '', timedOut: false };
     }
@@ -225,5 +228,87 @@ describe('DockerTargets.resolve with overlapping reads', () => {
     await expect(older).resolves.toMatchObject({ kind: 'local' });
     expect(seen).toEqual(['box']);
     expect(targets.last?.host).toBe('box');
+  });
+});
+
+// Review round 1 of PR #85 (A-R1-3): the engine of a window's own Docker context, whatever context is current.
+describe('DockerTargets.ofContext', () => {
+  it('reads the named context, not the current one, and changes neither `last` nor tells a listener', async () => {
+    const { targets, cli } = setup();
+    cli.context = 'devenv-remote-26f8567f';
+    const seen: string[] = [];
+    targets.onDidResolve((target) => seen.push(target.host));
+    await expect(targets.ofContext('desktop-linux')).resolves.toEqual({
+      kind: 'local',
+      host: '',
+      endpoint: 'unix:///home/me/.docker/desktop/docker.sock',
+      context: 'desktop-linux',
+    });
+    expect(cli.calls[0].args).toEqual(['context', 'inspect', '--format', '{{json .}}', 'desktop-linux']);
+    expect(targets.last).toBeUndefined();
+    expect(seen).toEqual([]);
+  });
+
+  it('is undefined for a context that cannot be read, a name that is no context name, or without a Docker CLI', async () => {
+    const { targets, cli } = setup();
+    await expect(targets.ofContext('gone')).resolves.toBeUndefined();
+    await expect(targets.ofContext('--host=tcp://x')).resolves.toBeUndefined();
+    expect(cli.calls.map((call) => call.args[4])).toEqual(['gone']);
+    await expect(setup({ PATH: '/usr/bin' }, false).targets.ofContext('default')).resolves.toBeUndefined();
+  });
+
+  // Review round 3 of PR #85 (mutants D03, D09, D11; B-R3-6): bounded, never an option, never throws.
+  function reader(run: (args: readonly string[], options?: RunOptions) => Promise<RunResult>, installed: () => boolean = () => true) {
+    const calls: Array<{ args: readonly string[]; options?: RunOptions }> = [];
+    const warnings: string[] = [];
+    const logger = { ...silentLogger, warn: (message: string) => warnings.push(message) };
+    const targets = new DockerTargets(
+      {
+        isInstalled: installed,
+        run: (args, options) => {
+          calls.push({ args, options });
+          return run(args, options);
+        },
+      },
+      { PATH: '/usr/bin' },
+      logger,
+      'linux',
+    );
+    return { targets, calls, warnings };
+  }
+  const inspected = async (): Promise<RunResult> => ({
+    exitCode: 0,
+    stdout: JSON.stringify({ Name: 'desktop-linux', Endpoints: { docker: { Host: 'unix:///home/me/.docker/desktop/docker.sock' } } }),
+    stderr: '',
+    timedOut: false,
+  });
+
+  it('reads the context within CONTEXT_INSPECT_TIMEOUT_MS', async () => {
+    const r = reader(inspected);
+    await expect(r.targets.ofContext('desktop-linux')).resolves.toMatchObject({ context: 'desktop-linux' });
+    expect(r.calls[0].options?.timeoutMs).toBe(CONTEXT_INSPECT_TIMEOUT_MS);
+  });
+
+  it('is undefined with a warning when the Docker CLI rejects or the check of the CLI throws; never throws', async () => {
+    const r = reader(() => Promise.reject(new Error('spawn docker EACCES')));
+    await expect(r.targets.ofContext('desktop-linux')).resolves.toBeUndefined();
+    expect(r.warnings).toEqual(['The Docker context desktop-linux could not be read: spawn docker EACCES']);
+    const s = reader(inspected, () => {
+      throw new Error('stat failed');
+    });
+    await expect(s.targets.ofContext('desktop-linux')).resolves.toBeUndefined();
+    expect(s.warnings).toHaveLength(1);
+  });
+
+  it('never passes a name that starts with a dash (an option) to the CLI', async () => {
+    const r = reader(inspected);
+    await expect(r.targets.ofContext('-D')).resolves.toBeUndefined();
+    await expect(r.targets.ofContext('--help')).resolves.toBeUndefined();
+    expect(r.calls).toEqual([]);
+  });
+
+  it('follows DOCKER_HOST of VS Code, as resolve does', async () => {
+    const { targets } = setup({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///run/user/1000/docker.sock' });
+    await expect(targets.ofContext('desktop-linux')).resolves.toEqual({ kind: 'local', host: '', endpoint: 'unix:///run/user/1000/docker.sock' });
   });
 });

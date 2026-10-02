@@ -243,13 +243,13 @@ describe('limits and the label', () => {
 
 // Review round 9 of PR #57 (T2): the pattern of the setting and isImagePrefix agree, so no pattern that the settings UI
 // accepts is left out without a word.
-describe('the pattern of devEnvLauncher.remoteImageUpdates', () => {
+describe('the pattern of devEnvLauncher.imageUpdates', () => {
   it('accepts exactly what the code takes', () => {
     const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../package.json'), 'utf8')) as {
       contributes: { configuration: Array<{ properties?: Record<string, { items?: { pattern?: string } }> }> | { properties?: Record<string, { items?: { pattern?: string } }> } };
     };
     const sections = ([] as Array<{ properties?: Record<string, { items?: { pattern?: string } }> }>).concat(manifest.contributes.configuration);
-    const pattern = new RegExp(sections.find((section) => section.properties?.['devEnvLauncher.remoteImageUpdates'])!.properties!['devEnvLauncher.remoteImageUpdates'].items!.pattern!);
+    const pattern = new RegExp(sections.find((section) => section.properties?.['devEnvLauncher.imageUpdates'])!.properties!['devEnvLauncher.imageUpdates'].items!.pattern!);
     for (const value of [
       'ghcr.io/majikmate/devcontainer-dev*',
       'ghcr.io/majikmate/devcontainer-dev',

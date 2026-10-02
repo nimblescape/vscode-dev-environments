@@ -23,7 +23,7 @@ import {
   isStaleLiveWindowStatus,
   waitingTimeMs,
 } from '../core/busy';
-import { DEFAULT_REMOTE_STOP_AFTER_SECONDS, clampLimitSeconds } from '../core/remoteMonitor/protocol';
+import { keptWhenClosed as keptWhenClosedOf, stopAfterSeconds } from '../core/session/sessionRules';
 import type { MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 
 /** Interval between two ticks of the Session Monitor (concept 7.9). */
@@ -315,21 +315,18 @@ export function decide(input: DecideInput): MonitorDecision {
 }
 
 /**
- * Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host, in seconds, from the
- * setting remoteStopAfterMinutes (clamped to one minute..one day as the protocol allows; the setting itself is 5..1440 minutes; a missing or invalid value gives 10 minutes).
+ * Unit 7, PR 2: the time limit of the heartbeats, in seconds. Plan step 8, PR A: moved to src/core/session/sessionRules.ts
+ * (stopAfterSeconds, the setting stopAfterMinutes); kept here under its old name until this monitor is removed (PR C).
  */
-export function remoteStopAfterSeconds(minutes: number | undefined): number {
-  if (typeof minutes !== 'number' || !Number.isFinite(minutes)) return DEFAULT_REMOTE_STOP_AFTER_SECONDS;
-  return clampLimitSeconds(minutes * 60);
-}
+export const remoteStopAfterSeconds = stopAfterSeconds;
 
 /**
  * Unit 7, PR 2: the keep-running flag of a heartbeat for this environment. True when rule 2 never stops it here (Keep
- * Running When Closed, Close and Keep Running, stopOnClose off, a respected `"shutdownAction": "none"`), so the Session
- * Monitor on the remote host does not stop it either when this computer goes offline.
+ * Running When Closed, Close and Keep Running, stopOnClose off, a respected `"shutdownAction": "none"`). Plan step 8,
+ * PR A: the rule lives in src/core/session/sessionRules.ts (the window sends the heartbeats now).
  */
 export function keptWhenClosed(environment: MonitorEnvironment, settings: MonitorSettings): boolean {
-  return !mayStop(environment, settings);
+  return keptWhenClosedOf(environment, settings);
 }
 
 function mayStop(environment: MonitorEnvironment, settings: MonitorSettings): boolean {

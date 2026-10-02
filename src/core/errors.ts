@@ -22,6 +22,7 @@ export type UserErrorCode =
   | 'dockerHostUnreachable'
   | 'dockerEndpointUnsupported'
   | 'otherDockerHost'
+  | 'sessionMonitorFailed'
   | 'cancelled';
 
 export class UserFacingError extends Error {
@@ -59,6 +60,14 @@ export class BatchHelperUnavailableError extends UserFacingError {
 /** Whether `error` is the refusal of the batch scope (BatchHelperUnavailableError). */
 export function isBatchHelperUnavailable(error: unknown): error is BatchHelperUnavailableError {
   return error instanceof BatchHelperUnavailableError;
+}
+
+/**
+ * Plan step 8, PR A, user decision Q3 of 2026-10-02 (D1): the Session Monitor container of the engine could not be ensured
+ * at an open (Messages.sessionMonitorUnavailable). The open is refused; no rule that opens an environment as it is applies.
+ */
+export function isSessionMonitorFailed(error: unknown): error is UserFacingError {
+  return isUserFacingError(error) && error.code === 'sessionMonitorFailed';
 }
 
 /** A command that ended with a non-zero exit code. */

@@ -233,8 +233,8 @@ function createHarness(
     /** Unit 7: the current Docker host and the remote Docker commands. Default: none (the local Docker). */
     dockerTargets?: ControllerDeps['dockerTargets'];
     remoteDocker?: ControllerDeps['remoteDocker'];
-    /** Unit 7, PR 2: the heartbeat of Close and Keep Running. */
-    remoteMonitor?: ControllerDeps['remoteMonitor'];
+    /** Unit 7, PR 2: the heartbeat of Close and Keep Running (plan step 8, PR A: on every engine). */
+    sessionMonitor?: ControllerDeps['sessionMonitor'];
     /** User decision 2026-09-28: the pause between the checks of the container (default 0). */
     readyPollMs?: number;
   } = {},
@@ -354,7 +354,7 @@ function createHarness(
     viewVisible: () => false,
     dockerTargets: options.dockerTargets,
     remoteDocker: options.remoteDocker,
-    remoteMonitor: options.remoteMonitor,
+    sessionMonitor: options.sessionMonitor,
     listOpenMode: () => listOpenMode.value,
     clock,
     isAlive: (pid: number) => alive.has(pid),
@@ -1145,6 +1145,34 @@ describe('Keep Running When Closed and Stop When Closed (unit 26)', () => {
     await run('keepRunning', row('acme/web'));
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(Messages.noEnvironment('acme/web'));
     expect(await h.registry.list()).toEqual([]);
+  });
+
+  // Plan step 8, PR A: the Session Monitor of the engine (here the local Docker) learns the choice at once.
+  it('sends a heartbeat for the environment after the switch was stored, on the local Docker too', async () => {
+    const flags: Array<boolean | undefined> = [];
+    const sendHeartbeat = vi.fn(async (id: string) => {
+      flags.push((await h.registry.get(id))?.keepRunning);
+      return { ok: true as const };
+    });
+    recreateHarness({ sessionMonitor: { sendHeartbeat } });
+    await h.registry.add(environment());
+    await run('keepRunning', row('acme/api', environment()));
+    await run('stopWhenClosed', row('acme/api', environment({ keepRunning: true })));
+    expect(sendHeartbeat.mock.calls).toEqual([[ENV_ID], [ENV_ID]]);
+    expect(flags).toEqual([true, undefined]);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.keptRunning('acme/api'));
+  });
+
+  it('keeps the switch and warns when the Session Monitor cannot be told', async () => {
+    const sendHeartbeat = vi.fn(async () => ({ ok: false as const, detail: 'No such container: devenv-session-monitor' }));
+    recreateHarness({ sessionMonitor: { sendHeartbeat } });
+    await h.registry.add(environment());
+    await run('keepRunning', row('acme/api', environment()));
+    expect((await h.registry.get(ENV_ID))?.keepRunning).toBe(true);
+    expect(warningMessages()).toContain(ControllerTexts.keepRunningNotSent('acme/api'));
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('No such container'));
+    // Review round 1 of PR #85 (mutant C03): no message of success after the warning.
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.keptRunning('acme/api'));
   });
 
   it('offers exactly one of the two commands in the context menu, by the flag of the row, and both with a picker in the Command Palette', () => {
@@ -3696,14 +3724,16 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
 describe('Close and Keep Running (unit 7, PR 2)', () => {
   const REMOTE_TARGET = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
   let current: DockerTarget;
-  let sendKeepRunning: ReturnType<typeof vi.fn<(environmentId: string, seq: number) => Promise<{ ok: true } | { ok: false; detail: string }>>>;
+  let sendHeartbeat: ReturnType<typeof vi.fn<(environmentId: string) => Promise<{ ok: true } | { ok: false; detail: string }>>>;
   const order: string[] = [];
 
-  function remoteHarness(options: { leaveCheckMs?: number } = {}): void {
-    current = REMOTE_TARGET;
+  /** Plan step 8, PR A: the harness with a Session Monitor on every engine; `target` is the current Docker target. */
+  function monitorHarness(target: DockerTarget, options: { leaveCheckMs?: number } = {}): void {
+    current = target;
     order.length = 0;
-    sendKeepRunning = vi.fn(async (id: string, _seq: number) => {
-      order.push(`heartbeat ${id}`);
+    sendHeartbeat = vi.fn(async (id: string) => {
+      // The flag is stored before the heartbeat reads it (WindowHeartbeats.sendFor reads the registry).
+      order.push(`heartbeat ${id} ${(await h.registry.get(id))?.keepRunningOnce === true ? 'kept' : 'not kept'}`);
       return { ok: true as const };
     });
     const dockerTargets = {
@@ -3713,15 +3743,21 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     };
     recreateHarness({
       dockerTargets: dockerTargets as unknown as ControllerDeps['dockerTargets'],
-      remoteMonitor: { sendKeepRunning },
+      sessionMonitor: { sendHeartbeat },
       leaveCheckMs: options.leaveCheckMs,
     });
     h.connection.closeWindow.mockImplementation(async () => {
       order.push('close');
     });
     // Review of the attach context (A3): a window of this version names the context of its host in its authority.
-    h.connection.currentDockerContext.mockReturnValue('devenv-remote-11111111');
+    if (target.kind === 'remote') h.connection.currentDockerContext.mockReturnValue('devenv-remote-11111111');
   }
+
+  function remoteHarness(options: { leaveCheckMs?: number } = {}): void {
+    monitorHarness(REMOTE_TARGET, options);
+  }
+
+  const LOCAL_TARGET = dockerTargetOf('unix:///var/run/docker.sock', 'default');
 
   it('says so in a window without an environment, and changes nothing', async () => {
     await h.registry.add(environment());
@@ -3731,12 +3767,17 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
   });
 
-  it('local environment: sets the flag and closes the window, without a heartbeat', async () => {
+  // Changed expectation, plan step 8 PR A: on the local Docker too, one heartbeat with the keep flag goes to the Session
+  // Monitor of the engine first (before: no heartbeat for a local environment).
+  it('local environment: sends one heartbeat with the keep flag first, then closes the window', async () => {
+    monitorHarness(LOCAL_TARGET);
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);
     await run('closeAndKeepRunning');
     expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
+    expect(sendHeartbeat).toHaveBeenCalledWith(ENV_ID);
+    expect(order).toEqual([`heartbeat ${ENV_ID} kept`, 'close']);
     expect(h.connection.closeWindow).toHaveBeenCalledTimes(1);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     // The row argument of the context menu does not matter: the command acts on the environment of this window.
@@ -3749,16 +3790,17 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     await h.registry.add(env);
     await connectHere(env);
     await run('closeAndKeepRunning', row('acme/api', env));
-    // Review round 2 of PR #39 (L1): seq is the time right after the flag was set.
-    expect(sendKeepRunning).toHaveBeenCalledWith(ENV_ID, NOW);
-    expect(order).toEqual([`heartbeat ${ENV_ID}`, 'close']);
+    // Changed expectation, plan step 8 PR A: WindowHeartbeats.sendFor takes the seq itself before it reads the flag, which
+    // is stored before (review round 2 of PR #39, L1).
+    expect(sendHeartbeat).toHaveBeenCalledWith(ENV_ID);
+    expect(order).toEqual([`heartbeat ${ENV_ID} kept`, 'close']);
     expect((await h.registry.get(ENV_ID))?.keepRunningOnce).toBe(true);
   });
 
   it('remote environment: when the host cannot be reached, clears the flag, says so, and the window stays open', async () => {
     remoteHarness();
-    h.settings.remoteStopAfterMinutes = 15;
-    sendKeepRunning.mockResolvedValue({ ok: false, detail: 'ssh: connect to host build-box port 22: Connection timed out' });
+    h.settings.stopAfterMinutes = 15;
+    sendHeartbeat.mockResolvedValue({ ok: false, detail: 'ssh: connect to host build-box port 22: Connection timed out' });
     const env = environment({ dockerHost: 'build-box' });
     await h.registry.add(env);
     await connectHere(env);
@@ -3779,14 +3821,52 @@ describe('Close and Keep Running (unit 7, PR 2)', () => {
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await run('closeAndKeepRunning');
     expect(warningMessages()).toContain(Messages.otherDockerHost('acme/api', 'build-box', ''));
-    expect(sendKeepRunning).not.toHaveBeenCalled();
+    expect(sendHeartbeat).not.toHaveBeenCalled();
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+  });
+
+  // Plan step 8, PR A: the same rules on the local Docker.
+  it('local environment: when the Session Monitor cannot be reached, clears the flag, says so, and the window stays open', async () => {
+    monitorHarness(LOCAL_TARGET);
+    sendHeartbeat.mockResolvedValue({ ok: false, detail: 'The Session Monitor could not be started again: image not found' });
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning');
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(
+      'The Session Monitor of the local Docker cannot be reached. The container would stop after 10 minutes without contact. The window stays open.',
+    );
+  });
+
+  it('local environment while Docker is set to a remote host: refused, nothing changed', async () => {
+    monitorHarness(LOCAL_TARGET);
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    current = REMOTE_TARGET;
+    await run('closeAndKeepRunning');
+    expect(warningMessages()).toContain(Messages.otherDockerHost('acme/api', '', 'build-box'));
+    expect(sendHeartbeat).not.toHaveBeenCalled();
+    expect(h.connection.closeWindow).not.toHaveBeenCalled();
+    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+  });
+
+  it('refuses without a Session Monitor in this window, and clears the flag', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    await run('closeAndKeepRunning');
     expect(h.connection.closeWindow).not.toHaveBeenCalled();
     expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
   });
 
   // Review round 1 of PR #39 (F1): closeWindow resolves when the close starts, not after the dialog about unsaved files.
   it('keeps the flag when the window stays open (Cancel in the dialog about unsaved files), until the next connect', async () => {
-    recreateHarness({ leaveCheckMs: 10 });
+    // Changed fixture, plan step 8 PR A: with the Session Monitor of the local Docker (every engine needs its heartbeat).
+    monitorHarness(LOCAL_TARGET, { leaveCheckMs: 10 });
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);

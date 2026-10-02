@@ -36,8 +36,7 @@ import type {
   RepositoryInfo,
   WindowStatus,
 } from '../core/types';
-import { isProcessAlive } from '../monitor/lock';
-import { remoteStopAfterSeconds } from '../monitor/rules';
+import { isProcessAlive, stopAfterSeconds } from '../core/session/sessionRules';
 import { decideReopen, pipelineJustRan, sortPendingOperations } from './activationRules';
 import type { VsCodeGitHubAuth } from './auth';
 import { Commands, type CommandName } from './commands';
@@ -136,16 +135,13 @@ export interface ControllerDeps {
   /** Unit 7: "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
   /**
-   * Unit 7, PR 2: one heartbeat with the keep-running flag for an environment to the Session Monitor on the remote
-   * Docker host of the current context (Close and Keep Running). Without it, Close and Keep Running refuses a remote
-   * environment.
+   * Unit 7, PR 2: one heartbeat with the current keep-running flag of an environment to the Session Monitor container of
+   * its engine (Close and Keep Running, Keep Running When Closed, Stop When Closed). Plan step 8, PR A: on every engine,
+   * through this window's worker (WindowHeartbeats.sendFor; its `seq` is the time before it reads the flags, so it is
+   * later than the change in the registry). Without it, Close and Keep Running refuses.
    */
-  remoteMonitor?: {
-    /**
-     * `seq` (review round 2 of PR #39, L1): the wall clock right after the flag was set in the registry, so that a
-     * heartbeat of the Session Monitor that read the registry before cannot overwrite this one on the remote host.
-     */
-    sendKeepRunning(environmentId: string, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
+  sessionMonitor?: {
+    sendHeartbeat(environmentId: string): Promise<{ ok: true } | { ok: false; detail: string }>;
   };
   /** The VS Code setting `workbench.list.openMode` (double-click on a row, rowActivation.ts). Default: `readListOpenMode`. */
   listOpenMode?: () => ListOpenMode;
@@ -678,6 +674,15 @@ export class Controller implements vscode.Disposable {
     }
     this.logger.info(keep ? `${repository} keeps running when no window uses it.` : `${repository} stops when no window uses it.`);
     await this.renderQuietly();
+    // Plan step 8, PR A: the Session Monitor of the engine learns the choice at once, on every engine (it keeps or stops
+    // the container when no window sends heartbeats). The choice stays stored when it fails; a window that uses the
+    // environment tells it at its next heartbeat.
+    const sent = (await this.deps.sessionMonitor?.sendHeartbeat(environment.id)) ?? { ok: true as const };
+    if (!sent.ok) {
+      this.logger.warn(`The Session Monitor could not be told that ${repository} ${keep ? 'keeps running' : 'stops'} when closed: ${sent.detail}`);
+      this.warn(ControllerTexts.keepRunningNotSent(repository));
+      return;
+    }
     // With the setting stopOnClose off, every environment keeps running already; say so instead of a promise that the
     // environment stops.
     if (!keep && this.deps.settings().stopOnClose === false) this.inform(ControllerTexts.keepAllRunning);
@@ -687,9 +692,9 @@ export class Controller implements vscode.Disposable {
   /**
    * Close and Keep Running (unit 7, PR 2): closes this window, and the container of its environment keeps running this
    * time. It sets `keepRunningOnce` in the registry (under its lock), which the Session Monitor treats like Keep Running
-   * When Closed until a window connects again, or Stop or Delete. For an environment on a remote Docker host, one
-   * heartbeat with the keep-running flag goes to the Session Monitor there first, so that it keeps the container also
-   * when this computer goes offline; when it fails, the flag is cleared again, an error says so, and the window stays
+   * When Closed until a window connects again, or Stop or Delete. One heartbeat with the keep-running flag goes to the
+   * Session Monitor container of its engine first (plan step 8, PR A: on every engine), so that it keeps the container
+   * also when this computer goes offline; when it fails, the flag is cleared again, an error says so, and the window stays
    * open. The flag stays until the next open or attach of the environment, or Stop or Delete, also when the user
    * cancels the close (the dialog about unsaved files): `workbench.action.closeWindow` resolves when the close starts,
    * not after that dialog, so the window cannot tell (review round 1 of PR #39, F1). A cancelled close leaves the
@@ -703,13 +708,13 @@ export class Controller implements vscode.Disposable {
     }
     const environment = current.environment;
     const repository = this.displayName({ repository: environment.repository });
+    // Plan step 8, PR A: on every engine (before: only for a remote host); the heartbeat goes to the engine of the
+    // environment, so Docker must still be set to it.
     const host = dockerHostOf(environment);
-    if (host !== '') {
-      const currentHost = await this.currentDockerHost();
-      if (currentHost !== host) {
-        this.warn(Messages.otherDockerHost(repository, host, currentHost));
-        return;
-      }
+    const currentHost = await this.currentDockerHost();
+    if (currentHost !== host) {
+      this.warn(Messages.otherDockerHost(repository, host, currentHost));
+      return;
     }
     const updated = await this.deps.registry.updateEnvironment(environment.id, (entry) => {
       entry.keepRunningOnce = true;
@@ -718,21 +723,18 @@ export class Controller implements vscode.Disposable {
       this.inform(PipelineTexts.environmentMissing);
       return;
     }
-    if (host !== '') {
-      const seq = this.clock.now();
-      const sent = (await this.deps.remoteMonitor?.sendKeepRunning(environment.id, seq)) ?? {
-        ok: false as const,
-        detail: 'The Session Monitor on the remote host is not available in this window.',
-      };
-      if (!sent.ok) {
-        this.logger.warn(`Close and Keep Running: the heartbeat to the Session Monitor on ${host} failed: ${sent.detail}`);
-        await this.clearKeepRunningOnce(environment.id);
-        const minutes = Math.round(remoteStopAfterSeconds(this.deps.settings().remoteStopAfterMinutes) / 60);
-        vscode.window
-          .showErrorMessage(ControllerTexts.closeAndKeepRunningUnreachable(host, minutes))
-          .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
-        return;
-      }
+    const sent = (await this.deps.sessionMonitor?.sendHeartbeat(environment.id)) ?? {
+      ok: false as const,
+      detail: 'The Session Monitor is not available in this window.',
+    };
+    if (!sent.ok) {
+      this.logger.warn(`Close and Keep Running: the heartbeat to the Session Monitor on ${host === '' ? 'the local Docker' : host} failed: ${sent.detail}`);
+      await this.clearKeepRunningOnce(environment.id);
+      const minutes = Math.round(stopAfterSeconds(this.deps.settings().stopAfterMinutes) / 60);
+      vscode.window
+        .showErrorMessage(ControllerTexts.closeAndKeepRunningUnreachable(host, minutes))
+        .then(undefined, (error: unknown) => this.logger.error('Could not show the message.', error));
+      return;
     }
     this.logger.info(`${repository} keeps running this time. The window closes.`);
     await this.deps.connection.closeWindow();

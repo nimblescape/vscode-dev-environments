@@ -13,7 +13,7 @@ import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
+import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isSessionMonitorFailed, isUserFacingError } from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
@@ -103,6 +103,7 @@ import {
   splitRepository,
 } from '../names';
 import { isAvailableTo, ownerOf } from '../ownership';
+import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
 import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
@@ -322,31 +323,33 @@ export type EnvironmentSessionFiles = Pick<
 >;
 
 /**
- * Unit 7, PR 2: the Session Monitor container on a remote Docker host (RemoteSessionMonitor, with the socket of that
- * host and the id of this computer). Both never throw, except an AbortError.
+ * Unit 7, PR 2: the Session Monitor container of the Docker engine of the operation (RemoteSessionMonitor, with the
+ * socket of that engine and the id of this computer). Plan step 8, PR A: on every engine, local and remote (user decision
+ * of 2026-09-30, "One Session Monitor on every engine"). `target` is the Docker target of the operation; the calls run in
+ * it (through its worker where they are plain Docker calls).
  */
-export interface EnvironmentRemoteMonitor {
+export interface EnvironmentSessionMonitor {
   /**
-   * Makes sure that the monitor container runs with the helper image `helperTag` on `host` (the current context).
-   * `helperImage`: the image reference of its `docker run` when it is not the tag: the checked image ID of the helper
-   * image of the open (review round 1 of PR #64, S1; review round 3 of PR #64, P2: for the current tag too); the label
-   * and the log lines keep the tag. Review round 2 of PR #64 (B-M9): the
-   * parameters are required, so an implementation states what it does with them.
+   * Makes sure that the monitor container runs with the helper image `helperTag` on the engine of `target`. `helperImage`:
+   * the image reference of its `docker run` when it is not the tag: the checked image ID of the helper image of the open
+   * (review round 1 of PR #64, S1; review round 3 of PR #64, P2: for the current tag too); the label and the log lines keep
+   * the tag. Plan step 8, PR A (user decision Q3 of 2026-10-02): rejects with the cause when it cannot (the open is
+   * refused), and with an AbortError when `signal` aborts.
    */
-  ensure(host: string, helperTag: string, signal: AbortSignal | undefined, helperImage: string | undefined): Promise<unknown>;
+  ensure(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, helperTag: string, signal: AbortSignal | undefined, helperImage: string | undefined): Promise<unknown>;
   /**
-   * One heartbeat of this computer for the environment (with the time limit of the settings). The remote monitor acts
-   * only on environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
+   * One heartbeat of this computer for the environment (with the time limit of the settings). The monitor acts only on
+   * environments that a computer sent a heartbeat for. `seq`: the wall clock when the keep flag was read
    * (HeartbeatEntry).
    */
-  heartbeat(host: string, environmentId: string, keepRunning: boolean, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
+  heartbeat(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, environmentId: string, keepRunning: boolean, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
   /** Removes the heartbeat record of this computer for a deleted environment (best effort). */
-  forget(host: string, environmentId: string): Promise<void>;
+  forget(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, environmentId: string): Promise<void>;
   /**
-   * User requests 2026-09-28: gives the monitor on `host` the image repositories to update and clean (read from the
-   * registry; at most once an hour per host). Best effort: never throws, except an AbortError.
+   * User requests 2026-09-28: gives the monitor of the engine the image repositories to update and clean (read from the
+   * registry; at most once an hour per engine). Best effort: never throws, except an AbortError.
    */
-  images?(host: string, signal?: AbortSignal): Promise<void>;
+  images?(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, signal?: AbortSignal): Promise<void>;
 }
 
 /** Starts Docker when it does not run and waits until it is ready (concept 7.6 "Docker start"). */
@@ -399,11 +402,11 @@ export interface EnvironmentServiceDeps {
    */
   dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
   /**
-   * Unit 7, PR 2: the Session Monitor on a remote Docker host. The open pipeline ensures it right after the helper image
-   * on a remote host (before the container is created or started); Delete removes the record of this computer there.
-   * Without it: nothing on the remote host (the local Session Monitor stops the container while the computer is online).
+   * Unit 7, PR 2: the Session Monitor container of the engine. The open pipeline ensures it right after the helper image
+   * (before the container is created or started); Delete removes the record of this computer there. Plan step 8, PR A:
+   * on every engine, local and remote; an open is refused when it cannot be ensured (Q3). Without it (tests): nothing.
    */
-  remoteMonitor?: EnvironmentRemoteMonitor;
+  sessionMonitor?: EnvironmentSessionMonitor;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
   /**
@@ -627,8 +630,8 @@ interface PipelineContext {
    * for example Docker did not answer for its images): the reason of a Docker Compose start that fails says so.
    */
   configurationUnchecked?: boolean;
-  /** Unit 7, PR 2: the Session Monitor on the remote Docker host was ensured in this run (once per run). */
-  remoteMonitorEnsured?: boolean;
+  /** Unit 7, PR 2: the Session Monitor of the engine was ensured in this run (once per run; plan step 8, PR A: any engine). */
+  sessionMonitorEnsured?: boolean;
   /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
   session: GitHubSession;
   /** The token and the Git configuration were written into the volume in this run. */
@@ -1626,6 +1629,9 @@ export class EnvironmentService {
       // without a batch kind) is rethrown before the rule of 2026-09-29: Start, Rebuild and Select configuration are
       // refused, and a running, current container is not opened as it is.
       if (isBatchHelperUnavailable(error)) throw error;
+      // Plan step 8, PR A (user decision Q3 of 2026-10-02, D1): without the Session Monitor nothing is opened, not even a
+      // running container as it is.
+      if (isSessionMonitorFailed(error)) throw error;
       if (helperFailed && (cancelled || !(await this.opensAsItIsOrFalse(ctx, container, record, false)))) throw error;
       // Review round 9 (P9-2): an analysis that could not run blames no configuration: the existing environment starts
       // as it is (nothing is built or created from the configuration), as with a configuration that cannot be read.
@@ -5742,10 +5748,12 @@ export class EnvironmentService {
         removed = true;
       });
       await this.removeEnvironmentFiles(env.id);
-      // Unit 7, PR 2: the heartbeat record of this computer on the remote host (best effort).
-      const host = dockerHostOf(env);
-      if (host !== '' && this.deps.remoteMonitor) {
-        await this.quietly('remove the heartbeat record on the remote host', () => this.deps.remoteMonitor!.forget(host, env.id));
+      // Unit 7, PR 2: the heartbeat record of this computer in the Session Monitor of the engine (best effort). Plan step 8,
+      // PR A: on every engine, local and remote.
+      const sessionMonitor = this.deps.sessionMonitor;
+      if (sessionMonitor) {
+        const target = await this.dockerTarget();
+        await this.quietly('remove the heartbeat record from the Session Monitor', () => sessionMonitor.forget(target, env.id));
       }
       this.logger.info(`The environment of ${env.repository} was deleted.`);
     } finally {
@@ -6111,59 +6119,60 @@ export class EnvironmentService {
     } finally {
       if (announced) ctx.steps.clearDetail();
     }
+    // Plan step 8, PR A (Q3): the Session Monitor first; when it cannot be ensured, the open is refused, and the helper
+    // image is not taken for resolved, so no later step of this run goes on without the monitor.
+    await this.ensureSessionMonitor(ctx, image);
     // Review round 3 of PR #64 (P2): pinned by the ID of its image, for the current tag too.
     ctx.helperImage = { ...image };
-    await this.ensureRemoteMonitor(ctx, image);
   }
 
   /**
-   * Unit 7, PR 2: on a remote Docker host, the Session Monitor container there (with the helper image just ensured), and
-   * the first heartbeat of this computer for the environment, once per run and before the container is created or
-   * started: the remote monitor acts only on environments with a record, so this keeps the stop without contact for
-   * every remote environment. The keep-running flag follows the rules of the local Session Monitor (keptWhenClosed). A
-   * failure of either is logged as a warning and does not fail the open (the local Session Monitor sends heartbeats on
-   * its ticks). Review round 3 of PR #64 (P2): the monitor gets the tag for its label and the log lines, and the ID of the
-   * helper image of the open as the image of its `docker run`, like every helper run of the open;
-   * the tag only when the ID could not be read.
+   * Unit 7, PR 2: the Session Monitor container of the engine (with the helper image just ensured), and the first
+   * heartbeat of this computer for the environment, once per run and before the container is created or started: the
+   * monitor acts only on environments with a record, so this keeps the stop without contact for every environment. The
+   * keep-running flag follows keptWhenClosed. Review round 3 of PR #64 (P2): the monitor gets the tag for its label and
+   * the log lines, and the ID of the helper image of the open as the image of its `docker run`, like every helper run of
+   * the open; the tag only when the ID could not be read.
+   * Plan step 8, PR A: on every engine, local and remote (decision of 2026-09-30). User decision Q3 of 2026-10-02 (D1):
+   * when the monitor cannot be ensured, the open is refused (UserFacingError sessionMonitorFailed with the cause); the
+   * image list and the first heartbeat stay best effort (logged; the window's heartbeats try again, Q4).
    */
-  private async ensureRemoteMonitor(ctx: PipelineContext, image: HelperImageUse): Promise<void> {
-    const remoteMonitor = this.deps.remoteMonitor;
-    if (!remoteMonitor || ctx.remoteMonitorEnsured) return;
+  private async ensureSessionMonitor(ctx: PipelineContext, image: HelperImageUse): Promise<void> {
+    const sessionMonitor = this.deps.sessionMonitor;
+    if (!sessionMonitor || ctx.sessionMonitorEnsured) return;
     const target = await this.dockerTarget();
-    if (target.kind !== 'remote') return;
-    ctx.remoteMonitorEnsured = true;
+    if (target.kind !== 'remote' && target.kind !== 'local') return;
+    const engine = target.kind === 'local' ? 'the local Docker' : target.host;
     try {
       // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): by the ID of the image that the open pinned.
-      await remoteMonitor.ensure(target.host, image.tag, ctx.signal, image.id);
+      await sessionMonitor.ensure(target, image.tag, ctx.signal, image.id);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
-      this.logger.warn(`The Session Monitor on ${target.host} could not be started: ${errorMessage(error)}`);
+      const cause = errorMessage(error);
+      this.logger.warn(`The Session Monitor on ${engine} could not be started; the open of ${ctx.env.repository} is refused: ${cause}`);
+      throw new UserFacingError('sessionMonitorFailed', Messages.sessionMonitorUnavailable(ctx.env.repository, cause), cause);
     }
+    ctx.sessionMonitorEnsured = true;
     this.throwIfCancelled(ctx.signal);
     // User requests 2026-09-28: the list of image repositories for the image maintenance of the monitor.
     try {
-      await remoteMonitor.images?.(target.host, ctx.signal);
+      await sessionMonitor.images?.(target, ctx.signal);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
-      this.logger.warn(`The image list for the Session Monitor on ${target.host} could not be sent: ${errorMessage(error)}`);
+      this.logger.warn(`The image list for the Session Monitor on ${engine} could not be sent: ${errorMessage(error)}`);
     }
     this.throwIfCancelled(ctx.signal);
     // Review round 2 of PR #39 (L1): `seq` is the time at which the flags are read; the entry is read again for them.
     const seq = this.deps.clock.now();
     const env = (await this.deps.registry.get(ctx.env.id)) ?? ctx.env;
-    const settings = this.deps.settings();
-    const keepRunning =
-      env.keepRunning === true ||
-      env.keepRunningOnce === true ||
-      settings.stopOnClose === false ||
-      (settings.respectShutdownActionNone === true && env.shutdownActionNone === true);
+    const keepRunning = keptWhenClosed(keepFlagsOf(env), this.deps.settings());
     try {
-      const sent = await remoteMonitor.heartbeat(target.host, env.id, keepRunning, seq);
+      const sent = await sessionMonitor.heartbeat(target, env.id, keepRunning, seq);
       if (!sent.ok) {
-        this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${target.host} failed; the Session Monitor of this computer tries again. ${sent.detail}`);
+        this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${engine} failed; the window tries again. ${sent.detail}`);
       }
     } catch (error) {
-      this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${target.host} failed: ${errorMessage(error)}`);
+      this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${engine} failed: ${errorMessage(error)}`);
     }
   }
 
