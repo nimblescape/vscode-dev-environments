@@ -70,6 +70,12 @@ export const HEARTBEAT_NO_ANSWER = 'no answer in time';
  */
 export const REPAIR_BACKOFF_MS: readonly number[] = [60_000, 120_000, 300_000];
 
+/**
+ * Review round 4 of PR #85: a lookup of an engine (engineFor) past its deadline that still has not settled this long
+ * after it started is given up (WindowHeartbeats.lookUpEngine): the next tick starts a new one.
+ */
+export const LOOKUP_ABANDON_MS = 2 * HEARTBEAT_ATTEMPT_DEADLINE_MS;
+
 /** The result of one heartbeat. `missing`: the monitor container does not exist or does not run. */
 export type HeartbeatSendResult = { ok: true } | { ok: false; missing: boolean; detail: string };
 
@@ -216,8 +222,8 @@ export class WindowHeartbeats {
   private readonly envSentAt = new Map<string, number>();
   /** A-R1-2: engine key → the call that runs on it. */
   private readonly inFlight = new Map<string, InFlight>();
-  /** B-R3-6: env id and role → the lookup of its engine (engineFor) that runs. */
-  private readonly resolving = new Map<string, { done: Promise<DockerTarget | undefined>; expired: boolean }>();
+  /** B-R3-6: env id and role → the lookup of its engine (engineFor) that runs, and when it started. */
+  private readonly resolving = new Map<string, { done: Promise<DockerTarget | undefined>; expired: boolean; startedAt: number }>();
   /** The environments and engines of a tick are being read (the sends of a tick then run per engine). */
   private collecting = false;
   private disposed = false;
@@ -589,12 +595,18 @@ export class WindowHeartbeats {
 
   /**
    * B-R3-6: `engineFor`, within HEARTBEAT_ATTEMPT_DEADLINE_MS; undefined when it throws or passed the deadline. A lookup
-   * that runs is joined; once it passed its deadline, undefined at once (no second lookup piles up).
+   * that runs is joined; once it passed its deadline, undefined at once (no second lookup piles up). Review round 4 of
+   * PR #85: the sources of engineFor are bounded themselves (`docker context inspect` within CONTEXT_INSPECT_TIMEOUT_MS);
+   * should one still never settle, its entry is dropped LOOKUP_ABANDON_MS after it started and a new lookup starts.
    */
   private async lookUpEngine(environment: Environment, connected: boolean): Promise<DockerTarget | undefined> {
     const id = `${environment.id} ${connected}`;
     let entry = this.resolving.get(id);
-    if (entry?.expired) return undefined;
+    if (entry?.expired) {
+      if (Math.abs(this.clock.now() - entry.startedAt) < LOOKUP_ABANDON_MS) return undefined;
+      this.resolving.delete(id);
+      entry = undefined;
+    }
     if (entry === undefined) {
       let started: Promise<DockerTarget | undefined>;
       try {
@@ -606,7 +618,7 @@ export class WindowHeartbeats {
         this.deps.logger.warn(`The Docker engine of ${environment.repository} could not be found: ${errorMessage(error)}`);
         return undefined;
       });
-      const registered = { done, expired: false };
+      const registered = { done, expired: false, startedAt: this.clock.now() };
       entry = registered;
       this.resolving.set(id, registered);
       void done.finally(() => {

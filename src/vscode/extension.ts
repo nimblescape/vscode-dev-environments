@@ -40,6 +40,7 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { heartbeatHelperImage } from '../core/session/heartbeatHelperImage';
 import { HeartbeatPreparation } from '../core/session/heartbeatPreparation';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
@@ -178,6 +179,8 @@ async function activateExtension(
   });
   const imageChecker = new ImageChecker(registryClient, logger);
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
+  // Review round 2 of PR #85 (A-R2-2), the preparation of the heartbeats (see below); here for onImageBuilt (A-R4-1).
+  const heartbeatPreparation = new HeartbeatPreparation();
   const helper = new WorkspaceHelper({
     docker,
     logger,
@@ -195,7 +198,14 @@ async function activateExtension(
       return { key: target.host, socket: (await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
     },
     // Plan step 5, PR A: a worker that could not be opened for want of the helper image is tried again at once.
-    onImageBuilt: () => helperChannels?.clearFailures(),
+    // Review round 4 of PR #85 (A-R4-1): a build that succeeded also ends the wait of the heartbeats' builds on its engine
+    // (the target of the operation that built it; every wait when it is not known).
+    onImageBuilt: () => {
+      helperChannels?.clearFailures();
+      const built = operationDockerTarget();
+      if (built !== undefined) heartbeatPreparation.clear(built);
+      else heartbeatPreparation.clearAll();
+    },
   });
   // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
   // remote. The plain Docker calls of an operation go through it (ContainerAdapter.run, dockerRouting.ts); everything
@@ -214,19 +224,24 @@ async function activateExtension(
   // the heartbeat's attempt ends only its wait, so the next attempt joins the build instead of starting it again.
   // Review round 3 of PR #85 (A-R3-1): after a failed build for a heartbeat, the next one on that engine waits 1, 2, then
   // 5 minutes (REPAIR_BACKOFF_MS); a heartbeat within the wait fails at once and counts towards the Q4 warning.
-  const heartbeatPreparation = new HeartbeatPreparation();
+  // Review round 4 of PR #85 (A-R4-1): only a build that started and failed starts the wait; within it a heartbeat goes
+  // on when the helper tag is present (presentImage, never a build), and any successful preparation there ends it.
   context.subscriptions.push({ dispose: () => heartbeatPreparation.dispose() });
+  // Review round 4 of PR #85 (B-R4-1): the helper image of the worker and of a repair of a heartbeat, on its engine.
+  const heartbeatImage = heartbeatHelperImage({
+    preparation: heartbeatPreparation,
+    helper,
+    inTarget: runWithDockerTarget,
+    onOutput: (text) => logger.output(text),
+  });
   const channels = new HelperChannels({
     logger,
     // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image on the engine of the operation, as withEnvironmentLock
     // ensures it before the lock (only a missing tag is built). A-R2-2: for a heartbeat, with the long signal.
     prepare: async (target, signal) => {
-      await heartbeatPreparation.prepare(
-        (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
-        signal,
-        // Review round 3 of PR #85 (A-R3-1): for a heartbeat, no new build on this engine within the wait after a failed one.
-        target,
-      );
+      // Review round 3 of PR #85 (A-R3-1): for a heartbeat, no new build on this engine within the wait after a failed one;
+      // review round 4 of PR #85 (A-R4-1): within it, the heartbeat goes on when the tag is present (heartbeatImage).
+      await heartbeatImage.prepareWorker(target, signal);
     },
     // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks that the helper image is present.
     checkPresent: async (target, signal) => {
@@ -369,12 +384,9 @@ async function activateExtension(
   const repairSessionMonitor = async (target: DockerTarget, signal: AbortSignal): Promise<void> =>
     heartbeatPreparation.scope(() =>
       runWithDockerTarget(target, async () => {
-        const image = await heartbeatPreparation.run(
-          (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
-          signal,
-          // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat.
-          target,
-        );
+        // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it,
+        // the repair goes on with the tag when it is present.
+        const image = await heartbeatImage.repairImage(target, signal);
         await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
       }),
     );

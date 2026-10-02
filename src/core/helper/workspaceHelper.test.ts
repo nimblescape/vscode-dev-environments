@@ -2866,6 +2866,39 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(docker.images.has(TAG)).toBe(false);
   });
 
+  // Review round 4 of PR #85 (A-R4-1): the heartbeats back off only a build that started and failed (onBuild), never an
+  // engine that does not answer; within the wait they check the tag only (presentImage), which never builds.
+  it('reports a build that it starts (onBuild), not a failure before it; presentImage never builds', async () => {
+    const helper = helperOn(REMOTE);
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async () => {
+      throw new CommandError('docker image inspect', 255, '', 'ssh: connect to host build-box port 22: Connection refused');
+    };
+    const unreachable = vi.fn();
+    await expect(helper.ensureImagePresent({ onBuild: unreachable })).rejects.toBeDefined();
+    expect(unreachable).not.toHaveBeenCalled();
+    expect(await helper.presentImage()).toBeUndefined();
+    docker.imageId = imageId;
+    expect(await helper.presentImage()).toBeUndefined();
+    expect(docker.builds).toEqual([]);
+    docker.buildHandler = async () => {
+      throw new CommandError('docker build', 1, '', 'no space left on device');
+    };
+    const failing = vi.fn();
+    await expect(helper.ensureImagePresent({ onBuild: failing })).rejects.toMatchObject({ code: 'helperFailed' });
+    expect(failing).toHaveBeenCalledWith('create');
+    docker.buildHandler = async () => undefined;
+    const built = vi.fn();
+    expect(await helper.ensureImagePresent({ onBuild: built })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(built).toHaveBeenCalledTimes(1);
+    expect(await helper.presentImage()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    const builds = docker.builds.length;
+    const present = vi.fn();
+    expect(await helper.ensureImagePresent({ onBuild: present })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(present).not.toHaveBeenCalled();
+    expect(docker.builds).toHaveLength(builds);
+  });
+
   // PR #74 review round 2, A-R2-1: a pending maintaining ensure of an open in the same window (a `--pull --no-cache`
   // rebuild, the cleanup) is not joined when the tag exists: the Stop could not cancel that wait.
   const NEW_ID = `sha256:${'e'.repeat(64)}`;

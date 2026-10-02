@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { describeDockerHost, remoteContextName, type DockerTarget } from '../docker/dockerHost';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
-import { abortError } from '../ports';
+import { abortError, isAbortError } from '../ports';
 import { Messages } from '../messages';
 import type { HeartbeatInput } from '../remoteMonitor/protocol';
 import type { Environment, ExtensionSettings } from '../types';
@@ -15,6 +15,7 @@ import {
   HEARTBEAT_ATTEMPT_DEADLINE_MS,
   HEARTBEAT_NO_ANSWER,
   HEARTBEAT_WARN_AFTER_FAILURES,
+  LOOKUP_ABANDON_MS,
   REPAIR_BACKOFF_MS,
   WINDOW_HEARTBEAT_INTERVAL_MS,
   WindowHeartbeats,
@@ -130,7 +131,7 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
     clock: { now: () => now.value },
   };
   const heartbeats = new WindowHeartbeats(deps);
-  return { heartbeats, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks, checkSignals };
+  return { heartbeats, deps, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks, checkSignals };
 }
 
 const entriesOf = (item: Sent) => item.input.environments.map(({ id, keepRunning }) => ({ id, keepRunning }));
@@ -1232,8 +1233,11 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
         preparation
           .scope(() =>
             preparation.prepare(
-              async () => {
+              // Review round 4 of PR #85, A-R4-1: only a failure after the build started (onBuild) starts the wait, so this
+              // work reports its build; without a presence check (no `present`) a heartbeat within the wait is refused.
+              async (_signal, onBuild) => {
                 builds.push(h.now.value - T0);
+                onBuild();
                 if (build.fails) throw new Error('docker build failed: no space left on device');
               },
               signal,
@@ -1286,8 +1290,10 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
       const now = { value: T0 };
       const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => now.value });
       let builds = 0;
-      const failing = async (): Promise<void> => {
+      // Review round 4 of PR #85, A-R4-1: only a failed build (after onBuild) starts the wait, so the work reports it.
+      const failing = async (_signal: AbortSignal | undefined, onBuild: () => void): Promise<void> => {
         builds += 1;
+        onBuild();
         throw new Error('build failed');
       };
       await expect(preparation.scope(() => preparation.prepare(failing, undefined, LOCAL))).rejects.toThrow('build failed');
@@ -1308,7 +1314,9 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
 
     it('preparations that fail together count once', async () => {
       const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
-      const failing = async (): Promise<void> => {
+      // Review round 4 of PR #85, A-R4-1: only a failed build (after onBuild) starts the wait, so the work reports it.
+      const failing = async (_signal: AbortSignal, onBuild: () => void): Promise<void> => {
+        onBuild();
         await Promise.resolve();
         throw new Error('build failed');
       };
@@ -1415,6 +1423,289 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
       h.environments.push(environment('8d2e3f40-0000-4000-8000-000000000003', 'acme/lib', busyMark({ since: new Date(T0 + BUSY_MARK_MAX_AGE_MS + 60_000).toISOString() })));
       await h.heartbeats.tick();
       expect(h.sent).toEqual([]);
+    });
+  });
+  // Review round 4 of PR #85 (A-R4-1): the wait exists only to avoid repeated builds of the helper image; it never holds
+  // back a heartbeat that needs no build.
+  describe('only a failed build backs off, and never a heartbeat whose image is present (review round 4 of PR #85, A-R4-1)', () => {
+    const IMAGE = { tag: 'devenv-helper:0123456789ab', id: 'sha256:1111' };
+    type Image = typeof IMAGE;
+
+    /** A heartbeat's send that prepares the worker like extension.ts does (ensureImagePresent, presentImage in the wait). */
+    function imageHarness() {
+      const h = harness();
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => h.now.value });
+      const engine = { reachable: true, present: false, buildFails: true };
+      const builds: number[] = [];
+      const attempts: number[] = [];
+      const checks: number[] = [];
+      // ensureImagePresent: the presence query first (it fails when the engine does not answer), then the build.
+      const work = async (_signal: AbortSignal | undefined, onBuild: () => void): Promise<Image> => {
+        attempts.push(h.now.value - T0);
+        if (!engine.reachable) throw new Error('ssh: connect to host build-box port 22: Connection refused');
+        if (engine.present) return IMAGE;
+        onBuild();
+        builds.push(h.now.value - T0);
+        if (engine.buildFails) throw new Error('docker build failed: no space left on device');
+        engine.present = true;
+        return IMAGE;
+      };
+      // presentImage: never builds; undefined when the tag is missing or cannot be checked.
+      const present = async (): Promise<Image | undefined> => {
+        checks.push(h.now.value - T0);
+        return engine.reachable && engine.present ? IMAGE : undefined;
+      };
+      h.state.answer = (target, signal) =>
+        preparation
+          .scope(() => preparation.prepare(work, signal, target, present))
+          .then(
+            (): HeartbeatSendResult => ({ ok: true }),
+            (error: unknown): HeartbeatSendResult => failed(`the helper image could not be prepared: ${errorMessage(error)}`),
+          );
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      const tickAt = async (t: number): Promise<void> => {
+        h.now.value = T0 + t;
+        await h.heartbeats.tick();
+      };
+      return { h, preparation, engine, builds, attempts, checks, work, tickAt };
+    }
+
+    it('failures of an unreachable engine start no wait: after the recovery the next tick sends its heartbeat', async () => {
+      const { h, preparation, engine, builds, attempts, tickAt } = imageHarness();
+      engine.reachable = false;
+      engine.present = true;
+      await tickAt(0);
+      await tickAt(WINDOW_HEARTBEAT_INTERVAL_MS);
+      await tickAt(2 * WINDOW_HEARTBEAT_INTERVAL_MS);
+      expect(attempts).toEqual([0, WINDOW_HEARTBEAT_INTERVAL_MS, 2 * WINDOW_HEARTBEAT_INTERVAL_MS]);
+      expect(h.logs.some((line) => line.includes('prepared again in'))).toBe(false);
+      engine.reachable = true;
+      await tickAt(3 * WINDOW_HEARTBEAT_INTERVAL_MS);
+      expect(attempts).toHaveLength(4);
+      expect(builds).toEqual([]);
+      expect(h.logs.some((line) => line.includes('answers again'))).toBe(true);
+      preparation.dispose();
+    });
+
+    it('within the wait after a failed build, a heartbeat goes on when the image is present (and the wait ends)', async () => {
+      const { h, preparation, engine, builds, checks, tickAt } = imageHarness();
+      // Two failed builds: a wait until 3 minutes.
+      await tickAt(0);
+      await tickAt(30_000);
+      await tickAt(60_000);
+      expect(builds).toEqual([0, 60_000]);
+      // Another window (or an operation) built the tag meanwhile.
+      engine.present = true;
+      await tickAt(90_000);
+      expect(checks).toEqual([30_000, 90_000]);
+      expect(builds).toEqual([0, 60_000]);
+      expect(h.logs.some((line) => line.includes('answers again'))).toBe(true);
+      // The presence ended the wait: when the tag is gone again, the next heartbeat builds at once.
+      engine.present = false;
+      await tickAt(120_000);
+      expect(builds).toEqual([0, 60_000, 120_000]);
+      preparation.dispose();
+    });
+
+    it('within the wait after a failed build, a heartbeat whose image is missing is refused and starts no build', async () => {
+      const { h, preparation, builds, checks, attempts, tickAt } = imageHarness();
+      await tickAt(0);
+      await tickAt(WINDOW_HEARTBEAT_INTERVAL_MS);
+      expect(builds).toEqual([0]);
+      expect(attempts).toEqual([0]);
+      expect(checks).toEqual([WINDOW_HEARTBEAT_INTERVAL_MS]);
+      expect(h.logs.some((line) => line.includes('prepared again in 30 seconds') && line.includes('not on the Docker engine'))).toBe(true);
+      preparation.dispose();
+    });
+
+    it("an operation's successful preparation (outside the scope of a heartbeat) ends the wait", async () => {
+      const { preparation, engine, builds, checks, work, tickAt } = imageHarness();
+      await tickAt(0);
+      engine.buildFails = false;
+      await preparation.prepare(work, undefined, LOCAL);
+      expect(builds).toEqual([0, 0]);
+      // The tag is gone again: the next heartbeat builds at once (no wait, no presence check).
+      engine.present = false;
+      await tickAt(WINDOW_HEARTBEAT_INTERVAL_MS);
+      expect(builds).toEqual([0, 0, WINDOW_HEARTBEAT_INTERVAL_MS]);
+      expect(checks).toEqual([]);
+      preparation.dispose();
+    });
+
+    it('a failed build still waits 1, 2, then 5 minutes (only the presence is checked within), and a success resets', async () => {
+      const { h, preparation, engine, builds, checks, tickAt } = imageHarness();
+      for (let t = 0; t < 480_000; t += WINDOW_HEARTBEAT_INTERVAL_MS) await tickAt(t);
+      expect(builds).toEqual([0, 60_000, 180_000]);
+      // Each tick within a wait checked the presence only.
+      expect(checks).toHaveLength(480_000 / WINDOW_HEARTBEAT_INTERVAL_MS - 3);
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 9)]);
+      engine.buildFails = false;
+      await tickAt(480_000);
+      expect(builds).toEqual([0, 60_000, 180_000, 480_000]);
+      // The success reset the wait: the next failed build waits 1 minute again.
+      engine.present = false;
+      engine.buildFails = true;
+      await tickAt(510_000);
+      await tickAt(540_000);
+      await tickAt(570_000);
+      expect(builds).toEqual([0, 60_000, 180_000, 480_000, 510_000, 570_000]);
+      preparation.dispose();
+    });
+
+    it('clear and clearAll end the wait (a build that succeeded, onImageBuilt)', async () => {
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+      let builds = 0;
+      const failing = async (_signal: AbortSignal, onBuild: () => void): Promise<void> => {
+        builds += 1;
+        onBuild();
+        throw new Error('build failed');
+      };
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      await expect(preparation.run(failing, undefined, REMOTE)).rejects.toThrow('build failed');
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('prepared again');
+      preparation.clear(LOCAL);
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      await expect(preparation.run(failing, undefined, REMOTE)).rejects.toThrow('prepared again');
+      preparation.clearAll();
+      await expect(preparation.run(failing, undefined, REMOTE)).rejects.toThrow('build failed');
+      expect(builds).toBe(4);
+      preparation.dispose();
+    });
+  });
+
+  // Review round 4 of PR #85: the rules that the mutation tests of this round found untested.
+  describe('round 4', () => {
+    it('a failed build that settles after a newer success starts no wait (B-R4-3)', async () => {
+      const now = { value: T0 };
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => now.value });
+      const failing = async (_signal: AbortSignal, onBuild: () => void): Promise<void> => {
+        onBuild();
+        throw new Error('build failed');
+      };
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      now.value = T0 + 60_000;
+      // A slow build that fails, and a newer one that succeeds before it.
+      let failSlow: () => void = () => {};
+      const slow = preparation.run(
+        (_signal, onBuild) =>
+          new Promise<void>((_resolve, reject) => {
+            onBuild();
+            failSlow = () => reject(new Error('build failed late'));
+          }),
+        undefined,
+        LOCAL,
+      );
+      slow.catch(() => undefined);
+      await preparation.run(async (_signal, onBuild) => onBuild(), undefined, LOCAL);
+      failSlow();
+      await expect(slow).rejects.toThrow('build failed late');
+      // The success ended the wait; the late failure does not start a new one.
+      let ran = false;
+      await preparation.run(
+        async () => {
+          ran = true;
+        },
+        undefined,
+        LOCAL,
+      );
+      expect(ran).toBe(true);
+      preparation.dispose();
+    });
+
+    it('a wait that was aborted before the preparation rejects at once, runs nothing and keeps the wait as it is (B-R4-5)', async () => {
+      const now = { value: T0 };
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => now.value });
+      let calls = 0;
+      const failing = async (_signal: AbortSignal, onBuild: () => void): Promise<void> => {
+        calls += 1;
+        onBuild();
+        throw new Error('build failed');
+      };
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      now.value = T0 + 60_000;
+      const aborted = new AbortController();
+      aborted.abort();
+      const error = await preparation.run(failing, aborted.signal, LOCAL).then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+      expect(isAbortError(error)).toBe(true);
+      expect(calls).toBe(1);
+      // Still 1 failure: the next build after the wait fails into a wait of 2 minutes.
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('prepared again in 120 seconds');
+      preparation.dispose();
+    });
+
+    it('the lookup of the connected environment does not join an expired lookup of its busy role (B-R4-2)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api', busyMark()));
+      h.state.lookUp = async (_env, use) => (use.connected ? LOCAL : new Promise<DockerTarget | undefined>(() => {}));
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await first;
+      expect(h.sent).toEqual([]);
+      h.state.connected = ID_A;
+      h.now.value = T0 + HEARTBEAT_ATTEMPT_DEADLINE_MS + 15_000;
+      const second = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(0);
+      await second;
+      expect(h.engineRoles).toEqual([false, true]);
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: false }]]);
+    });
+
+    it('an engineFor that throws at once for one environment stops no other heartbeat; sendFor gives a failure (B-R4-4)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', busyMark()));
+      h.state.connected = ID_A;
+      const asked = h.deps.engineFor;
+      h.deps.engineFor = (env, use) => {
+        if (env.id === ID_A) throw new Error('context store broken');
+        return asked(env, use);
+      };
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_B, keepRunning: false }]]);
+      expect(h.logs.some((line) => line.includes('context store broken'))).toBe(true);
+      expect(await h.heartbeats.sendFor(ID_A)).toEqual({ ok: false, detail: 'The Docker engine of the environment cannot be reached from this window.' });
+    });
+
+    it('the deadline of a lookup that answered is cleared: no false log of an engine not found (B-R4-6)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(0);
+      await first;
+      expect(h.sent).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      expect(h.logs.some((line) => line.includes('could not be found'))).toBe(false);
+    });
+
+    it('a lookup that never settles is given up LOOKUP_ABANDON_MS after it started: then a new one starts', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      let hang = true;
+      h.state.lookUp = async () => (hang ? new Promise<DockerTarget | undefined>(() => {}) : LOCAL);
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await first;
+      h.now.value = T0 + LOOKUP_ABANDON_MS - 1;
+      await h.heartbeats.tick();
+      expect(h.engineCalls).toHaveLength(1);
+      hang = false;
+      h.now.value = T0 + LOOKUP_ABANDON_MS;
+      const third = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(0);
+      await third;
+      expect(h.engineCalls).toHaveLength(2);
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: false }]]);
     });
   });
 });
