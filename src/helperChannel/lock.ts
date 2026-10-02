@@ -6,8 +6,8 @@
 // host. The worker opens the lock file (never through a symbolic link) and keeps it open; `flock` takes the kernel lock on
 // that open file, which it inherits as its file descriptor 3, and exits; the lock then stays with the file of the worker
 // until the operation is cancelled (the file is closed) or the worker ends (the kernel frees it). A lock is never taken
-// over or forced, and the lock files are never deleted.
-import { spawn } from 'child_process';
+// over or forced, and the lock files are never deleted. Plan step 8, PR B: the open of the lock file and the start of
+// `flock` are in src/core/helperChannel/lockFile.ts, which the Session Monitor container uses for its stops too (D2).
 import * as fs from 'fs';
 import {
   LOCK_BUSY_CODE,
@@ -16,21 +16,12 @@ import {
   LOCK_HOLD_LIMIT_MS,
   LOCK_STATE_DIR,
   flockArgs,
-  lockFilePath,
-  lockFolder,
   parseLockParams,
 } from '../core/helperChannel/protocol';
+import { FLOCK_FD, openLockFile, startFlockProcess, type FlockProcess } from '../core/helperChannel/lockFile';
 import { OperationError, type OperationHandler } from './server';
 
-/** The file descriptor of the lock file in `flock`. */
-export const FLOCK_FD = 3;
-
-/** A started `flock`. */
-export interface FlockProcess {
-  /** Its exit code (null after a signal); `error` when it could not be started. */
-  readonly exited: Promise<{ exitCode: number | null; error?: string; stderr?: string }>;
-  kill(signal: 'SIGTERM' | 'SIGKILL'): void;
-}
+export { FLOCK_FD, openLockFile, startFlockProcess, type FlockProcess };
 
 export interface LockDeps {
   /** The mount point of the volume of the Session Monitor. */
@@ -42,63 +33,6 @@ export interface LockDeps {
   startFlock(args: readonly string[], fd: number): FlockProcess;
   /** Only for the tests: LOCK_HOLD_LIMIT_MS. */
   holdLimitMs?: number;
-}
-
-/**
- * Opens the lock file of an environment: the folder `locks` (0700, created when missing, never a symbolic link), then
- * the file with O_NOFOLLOW (0600; a symbolic link fails with ELOOP) and O_NONBLOCK (an open never waits; on Linux an
- * O_RDWR open of a FIFO does not wait anyway); anything but a plain file is refused (PR #74 review round 1, B-R1-6). Node.js opens it with O_CLOEXEC, so the Docker calls of the worker never
- * inherit it (only `flock`, on purpose).
- */
-export function openLockFile(stateDir: string, environmentId: string): number {
-  const folder = lockFolder(stateDir);
-  try {
-    fs.mkdirSync(folder, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-  }
-  const folderStat = fs.lstatSync(folder);
-  if (!folderStat.isDirectory()) throw new Error(`${folder} is not a folder.`);
-  if ((folderStat.mode & 0o777) !== 0o700) fs.chmodSync(folder, 0o700);
-  const { O_RDWR, O_CREAT, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-  const fd = fs.openSync(lockFilePath(environmentId, stateDir), O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`The lock file of ${environmentId} is not a plain file.`);
-    if ((stat.mode & 0o777) !== 0o600) fs.fchmodSync(fd, 0o600);
-  } catch (error) {
-    fs.closeSync(fd);
-    throw error;
-  }
-  return fd;
-}
-
-/** `flock` without a shell and without variables of its own; `fd` becomes its file descriptor FLOCK_FD. */
-export function startFlockProcess(args: readonly string[], fd: number): FlockProcess {
-  const child = spawn('flock', [...args], { shell: false, stdio: ['ignore', 'ignore', 'pipe', fd] });
-  let stderr = '';
-  child.stderr?.on('data', (chunk: Buffer) => {
-    stderr = (stderr + chunk.toString('utf8')).slice(-2_000);
-  });
-  const exited = new Promise<{ exitCode: number | null; error?: string; stderr?: string }>((resolve) => {
-    let done = false;
-    child.on('error', (error) => {
-      if (done) return;
-      done = true;
-      resolve({ exitCode: null, error: error.message });
-    });
-    child.on('close', (code) => {
-      if (done) return;
-      done = true;
-      resolve({ exitCode: code, stderr: stderr.trim() });
-    });
-  });
-  return {
-    exited,
-    kill: (signal) => {
-      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-    },
-  };
 }
 
 export const LOCK_DEPS: LockDeps = {

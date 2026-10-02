@@ -8,7 +8,10 @@
 // 3, src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
 // /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The computers
 // run the other subcommands with `docker exec node /opt/devenv/monitor.js …`:
-//   run                          the loop: a tick every 15 s (rules.ts)
+//   run                          the loop: a tick every 15 s (rules.ts); each automatic stop under the environment lock
+//                                (plan step 8, PR B, D2); exits with 0 after REMOTE_IDLE_EXIT_MS without a running
+//                                environment container and without a fresh record while it maintains no images (Q5;
+//                                review round 1 of PR #86, A-R1-1; round 2, A-R2-1: a created one does not count)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
@@ -50,7 +53,9 @@ import {
   REMOTE_TICK_MS,
   decide,
   initialRemoteState,
+  isRunningState,
   type RemoteContainer,
+  type RemoteStop,
   type RemoteMonitorState,
   type RemoteRecord,
   type RemoteTiming,
@@ -69,6 +74,7 @@ import {
   type HttpGet,
 } from './images';
 import type { CronSchedule } from '../core/remoteMonitor/cron';
+import { stopLockDeps, stopLocker, type StopLocker } from './stopLock';
 
 /** Time limit of the container list. */
 export const LIST_TIMEOUT_MS = 30_000;
@@ -267,6 +273,16 @@ export interface RemoteLoopDeps {
   now: () => number;
   log: (message: string) => void;
   timing?: RemoteTiming;
+  /**
+   * Plan step 8, PR B (user decision D2): the environment lock of an automatic stop, without waiting (stopLock.ts). An
+   * environment is stopped only while the monitor holds its lock.
+   */
+  lockEnvironment: StopLocker;
+  /**
+   * Plan step 8, PR B (Q5): a monotonic clock in ms for the idle time of the monitor (default `performance.now()`, which
+   * a step of the wall clock does not move).
+   */
+  monotonic?: () => number;
 }
 
 /** The loop of `run`: one `tick()` per interval. The log names each event once, not every tick. */
@@ -283,12 +299,41 @@ export class RemoteMonitorLoop {
   private removeFailedLogged = new Set<string>();
   private graceLogged = false;
   /**
+   * Plan step 8, PR B (D2): env ids whose lock was busy at the last tick that wanted to stop them (logged once per busy
+   * streak), and those whose lock file could not be opened or locked (logged once per streak).
+   */
+  private busyLogged = new Set<string>();
+  private lockFailedLogged = new Set<string>();
+  /**
+   * Plan step 8, PR B (Q5): the monotonic time at which a container with the label nimblescape.devenv.environment-id was
+   * last seen running (or Docker did not answer, which is not known to be idle); the start of the loop at first. Review
+   * round 1 of PR #86, A-R1-1: also when the decision of a tick was `active` (a fresh record; review round 2 of PR #86,
+   * A-R2-1: only that, no longer a `created` labelled container or a keep of an environment whose container has not
+   * ended).
+   */
+  private activeAt: number;
+  /**
    * Review round 4 of PR #63 (N4-5): the pass of removals that runs in the background, at most one at a time. Never
    * rejects (each removal catches its error). Read by the tests through `removals`.
    */
   private removing?: Promise<void>;
 
-  constructor(private readonly deps: RemoteLoopDeps) {}
+  constructor(private readonly deps: RemoteLoopDeps) {
+    this.activeAt = this.monotonic();
+  }
+
+  private monotonic(): number {
+    return (this.deps.monotonic ?? (() => performance.now()))();
+  }
+
+  /**
+   * Plan step 8, PR B (Q5): how long (ms) no container with the label nimblescape.devenv.environment-id ran, as the
+   * finished ticks saw it. A kept environment that runs counts as running. Review round 1 of PR #86, A-R1-1: nor was a
+   * tick `active` (decide).
+   */
+  idleMs(): number {
+    return this.monotonic() - this.activeAt;
+  }
 
   get currentState(): RemoteMonitorState {
     return this.state;
@@ -306,10 +351,16 @@ export class RemoteMonitorLoop {
     if (listed.code !== 0) {
       if (!this.listFailing) log(`Docker does not answer; nothing is stopped while it does not answer. ${listed.stderr.trim()}`);
       this.listFailing = true;
+      // Plan step 8, PR B (Q5): not known to be idle.
+      this.activeAt = this.monotonic();
       return [];
     }
     if (this.listFailing) log('Docker answers again.');
     this.listFailing = false;
+    const containers = parseContainerLines(listed.stdout);
+    const anyRunning = containers.some((container) => isRunningState(container.state));
+    // Plan step 8, PR B (Q5): also when the records cannot be read below.
+    if (anyRunning) this.activeAt = this.monotonic();
     let records: RemoteRecord[];
     try {
       records = await readRecords(this.deps.dir);
@@ -319,12 +370,16 @@ export class RemoteMonitorLoop {
     }
     const decision = decide({
       now: this.deps.now(),
-      containers: parseContainerLines(listed.stdout),
+      containers,
       records,
       state: this.state,
       timing: this.deps.timing ?? DEFAULT_REMOTE_TIMING,
     });
     this.state = decision.state;
+    // Review round 1 of PR #86, A-R1-1: a fresh record (a window still sends heartbeats, for example while an open clones
+    // and builds before its container exists) counts as activity too (decide: `active`). Review round 2 of PR #86, A-R2-1:
+    // a `created` container or a keep alone does not, so a container left `created` for ever lets the monitor exit.
+    if (decision.active) this.activeAt = this.monotonic();
     if (decision.grace && !this.graceLogged) log('A pause or a start: nothing is stopped until the computers have sent heartbeats again.');
     this.graceLogged = decision.grace;
 
@@ -334,25 +389,40 @@ export class RemoteMonitorLoop {
     this.keptLogged.clear();
     for (const id of decision.kept) this.keptLogged.add(id);
 
+    // Plan step 8, PR B (user decision D2): each stop under the lock of its environment, taken without a wait. A busy lock
+    // (an operation of a window, or a Stop or Delete) skips the environment in this tick (logged once per busy streak); a
+    // lock that cannot be opened or taken skips it too (logged once per streak): never a stop without the lock. Under the
+    // lock, its containers and records are read again and decided again (the newest record decides), so a heartbeat or a
+    // Start that came before the lock was taken is seen; then the stop (the dev container first) and the release.
     const stopped: string[] = [];
-    for (const { environmentId, containers, reason } of decision.stop) {
-      let failed = false;
-      for (const container of containers) {
-        log(`Stopping the container ${container.name} of ${environmentId}: ${reason}.`);
-        const result = await docker(['stop', container.id], STOP_TIMEOUT_MS);
-        if (result.code !== 0 && !/no such container/i.test(result.stderr)) {
-          failed = true;
-          // Tried again at the next tick; logged once per series.
-          if (!this.stopFailedLogged.has(environmentId)) log(`The container ${container.name} could not be stopped: ${result.stderr.trim()}`);
-        }
+    const busy = new Set<string>();
+    const lockFailed = new Set<string>();
+    for (const { environmentId } of decision.stop) {
+      const attempt = await this.deps.lockEnvironment(environmentId);
+      if (attempt.kind === 'busy') {
+        busy.add(environmentId);
+        if (!this.busyLogged.has(environmentId)) log(`${environmentId} is busy with an operation; it is not stopped now and is checked again at the next tick.`);
+        continue;
       }
-      if (failed) {
-        this.stopFailedLogged.add(environmentId);
-      } else {
-        this.stopFailedLogged.delete(environmentId);
-        stopped.push(environmentId);
+      if (attempt.kind === 'failed') {
+        lockFailed.add(environmentId);
+        if (!this.lockFailedLogged.has(environmentId)) log(`The lock of ${environmentId} could not be taken; it is not stopped. ${attempt.detail}`);
+        continue;
+      }
+      try {
+        const again = await this.decideAgain(environmentId);
+        if (again === undefined) continue;
+        if (await this.stopContainers(environmentId, again)) stopped.push(environmentId);
+      } catch (error) {
+        log(`${environmentId} is not stopped: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        attempt.release();
       }
     }
+    this.busyLogged = busy;
+    this.lockFailedLogged = lockFailed;
+    // Plan step 8, PR B (Q5): measured again when the stops are done, so a long stop is no idle time.
+    if (anyRunning) this.activeAt = this.monotonic();
 
     // Monitor cleanup, user decision 2026-09-29 (R1): the log line names why a record is removed. Review round 1 of PR #63
     // (F2): each under the lock of the records and only while the file still holds the record that `decide` saw, so a
@@ -394,6 +464,50 @@ export class RemoteMonitorLoop {
     })().finally(() => (this.removing = undefined));
     return stopped;
   }
+
+  /**
+   * Plan step 8, PR B (D2): under the lock of `environmentId`, its containers and records read again and decided again
+   * with the state of this tick (no new gap: the time since the start of the tick is no pause). The stop of `decide` for
+   * it, or undefined (logged) when it is no longer to be stopped. Throws when the containers or the records cannot be
+   * read (no stop).
+   */
+  private async decideAgain(environmentId: string): Promise<RemoteStop | undefined> {
+    const listed = await this.deps.docker(
+      ['ps', '-a', '--no-trunc', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${environmentId}`, '--format', PS_FORMAT],
+      LIST_TIMEOUT_MS,
+    );
+    if (listed.code !== 0) throw new Error(`its containers could not be listed again. ${listed.stderr.trim()}`);
+    const records = (await readRecords(this.deps.dir)).filter((record) => record.environmentId === environmentId);
+    const now = this.deps.now();
+    const decision = decide({
+      now,
+      containers: parseContainerLines(listed.stdout).filter((container) => container.environmentId === environmentId),
+      records,
+      state: { ...this.state, lastTickAt: now },
+      timing: this.deps.timing ?? DEFAULT_REMOTE_TIMING,
+    });
+    const stop = decision.stop.find((entry) => entry.environmentId === environmentId);
+    if (stop === undefined) this.deps.log(`${environmentId} is not stopped: a heartbeat or another change came before its lock was taken.`);
+    return stop;
+  }
+
+  /** `docker stop` of the containers of one stop, the dev container first. True when all are stopped (or gone). */
+  private async stopContainers(environmentId: string, { containers, reason }: RemoteStop): Promise<boolean> {
+    const { docker, log } = this.deps;
+    let failed = false;
+    for (const container of containers) {
+      log(`Stopping the container ${container.name} of ${environmentId}: ${reason}.`);
+      const result = await docker(['stop', container.id], STOP_TIMEOUT_MS);
+      if (result.code !== 0 && !/no such container/i.test(result.stderr)) {
+        failed = true;
+        // Tried again at the next tick; logged once per series.
+        if (!this.stopFailedLogged.has(environmentId)) log(`The container ${container.name} could not be stopped: ${result.stderr.trim()}`);
+      }
+    }
+    if (failed) this.stopFailedLogged.add(environmentId);
+    else this.stopFailedLogged.delete(environmentId);
+    return !failed;
+  }
 }
 
 /**
@@ -409,6 +523,27 @@ export function timingFromEnv(env: NodeJS.ProcessEnv): { tickMs: number; timing:
   return { tickMs: REMOTE_TICK_MS, timing: DEFAULT_REMOTE_TIMING };
 }
 
+/**
+ * Plan step 8, PR B (user decision Q5 of 2026-10-02): the monitor exits (code 0, so the restart policy `on-failure`
+ * leaves it exited) after this time without a running container with the label nimblescape.devenv.environment-id, when
+ * it maintains no images. Review round 1 of PR #86, A-R1-1: nor a fresh record (RemoteDecision.active), so an open whose
+ * clone and build take longer than this keeps it (its window sends heartbeats for its busy mark). Review round 2 of PR
+ * #86, A-R2-1: a `created` container or a keep without a running container does not keep it. The next open ensures it again (`docker start`), and
+ * again right after its container started; the heartbeats of a window start it again when it is missing (their repair,
+ * Q4).
+ */
+export const REMOTE_IDLE_EXIT_MS = 5 * 60_000;
+
+/**
+ * The idle time of the tests of the container (DEVENV_MONITOR_IDLE_MS, 100..86400000 ms); without it, or with another
+ * value, REMOTE_IDLE_EXIT_MS.
+ */
+export function idleExitFromEnv(env: NodeJS.ProcessEnv): number {
+  const text = env.DEVENV_MONITOR_IDLE_MS;
+  if (text !== undefined && /^\d{3,8}$/.test(text) && Number(text) >= 100 && Number(text) <= 86_400_000) return Number(text);
+  return REMOTE_IDLE_EXIT_MS;
+}
+
 export interface MainDeps {
   env: NodeJS.ProcessEnv;
   stateDir?: string;
@@ -418,6 +553,11 @@ export interface MainDeps {
   readStdin?: () => Promise<string>;
   /** Review round 2 of PR #63 (R2-4): the start of the removals of `run` (recordRemover). */
   exec?: ExecFile;
+  /** Plan step 8, PR B (D2): the lock of an automatic stop (default: stopLocker on the lock files of the volume). */
+  lockEnvironment?: StopLocker;
+  /** Plan step 8, PR B (Q5): the monotonic clock of the idle time, and the wait between two ticks (the tests). */
+  monotonic?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   out?: (text: string) => void;
   err?: (text: string) => void;
@@ -662,7 +802,10 @@ export class ImageSchedule {
   }
 }
 
-/** Runs one subcommand of `argv` (without node and the script). Resolves with the exit code; `run` never resolves. */
+/**
+ * Runs one subcommand of `argv` (without node and the script). Resolves with the exit code; `run` resolves only when the
+ * monitor is idle (plan step 8, PR B, Q5), with 0.
+ */
 export async function main(argv: readonly string[], deps: MainDeps): Promise<number> {
   const out = deps.out ?? ((text: string) => process.stdout.write(text));
   const err = deps.err ?? ((text: string) => process.stderr.write(text));
@@ -728,7 +871,10 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       const docker = deps.docker ?? nodeDocker;
       // Review round 2 of PR #63 (R2-10): the removals run /opt/devenv/monitor.js under the lock of /state, so they always
       // act on /state; deps.stateDir only moves the reading (the tests).
-      const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing });
+      // Plan step 8, PR B (D2): the lock files of the volume (as the workers open them; deps.stateDir for the tests).
+      const lockEnvironment = deps.lockEnvironment ?? stopLocker(stopLockDeps(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR));
+      const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing, lockEnvironment, monotonic: deps.monotonic });
+      const idleExitMs = idleExitFromEnv(deps.env);
       // Plan step 3 (pipe loading): the extension waits for this line (REMOTE_MONITOR_READY_TEXT) after `docker run`.
       log(`${REMOTE_MONITOR_READY_TEXT} (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
       // Monitor cleanup, user decision 2026-09-29 (R4): the temporary files that killed writes of the volume left behind.
@@ -762,9 +908,20 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         if (intervalMs !== undefined) setInterval(() => void schedule.run(), intervalMs);
         else setInterval(() => void schedule.check(), IMAGE_CHECK_MS);
       }
+      // Plan step 8, PR B (Q5): with image maintenance, the monitor never exits by itself.
+      const maintainsImages = prefixesFromEnv(deps.env).length > 0;
+      const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
       for (;;) {
         await loop.tick();
-        await new Promise((resolve) => setTimeout(resolve, tickMs));
+        // Plan step 8, PR B (Q5): only here, between two ticks, so never while it holds a lock or stops a container; the
+        // removals of the records (each under the lock of the records) end first. The records stay in the volume.
+        if (!maintainsImages && loop.idleMs() >= idleExitMs) {
+          await loop.removals;
+          // Review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats too.
+          log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and image updates are off; the Session Monitor exits. The next open starts it again.`);
+          return 0;
+        }
+        await sleep(tickMs);
       }
     }
     default:

@@ -632,6 +632,11 @@ interface PipelineContext {
   configurationUnchecked?: boolean;
   /** Unit 7, PR 2: the Session Monitor of the engine was ensured in this run (once per run; plan step 8, PR A: any engine). */
   sessionMonitorEnsured?: boolean;
+  /**
+   * Review round 1 of PR #86, A-R1-1: the Session Monitor was ensured again after `up` started the container of this run
+   * (ensureSessionMonitorAfterStart; once per run).
+   */
+  sessionMonitorEnsuredAfterStart?: boolean;
   /** The GitHub session of the owner account, for the token file of the container (concept section 9). */
   session: GitHubSession;
   /** The token and the Git configuration were written into the volume in this run. */
@@ -3724,9 +3729,13 @@ export class EnvironmentService {
       });
       ctx.upStarted = true;
       upContainer = nonEmptyString(result.containerId);
+      // Review round 1 of PR #86, A-R1-1: the container runs now; the monitor again, before the lifecycle commands.
+      await this.ensureSessionMonitorAfterStart(ctx);
       // Lifecycle token (user decision 2026-09-27): `up` ran no lifecycle command; they run now, with the token.
       result = await this.runUserCommands(ctx, result, { override }, configRemoteUser(config, runArgs));
     } catch (error) {
+      // Review round 1 of PR #86, A-R1-1: a failed `up` may have left a container running (once per run).
+      if (!this.isCancellation(error, ctx.signal)) await this.ensureSessionMonitorAfterStart(ctx).catch(() => undefined);
       if (upContainer !== undefined && isHelperFailed(error)) await this.withdrawAfterHelperFailed(ctx, upContainer, before, false);
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
@@ -3905,9 +3914,13 @@ export class EnvironmentService {
       });
       ctx.upStarted = true;
       upContainer = nonEmptyString(result.containerId);
+      // Review round 1 of PR #86, A-R1-1: as in runUp.
+      await this.ensureSessionMonitorAfterStart(ctx);
       // Lifecycle token (user decision 2026-09-27): as for a single container (runUp). The CLI ignores runArgs for Compose.
       result = await this.runUserCommands(ctx, result, inputs, configRemoteUser(config, undefined));
     } catch (error) {
+      // Review round 1 of PR #86, A-R1-1: as in runUp.
+      if (!this.isCancellation(error, ctx.signal)) await this.ensureSessionMonitorAfterStart(ctx).catch(() => undefined);
       if (upContainer !== undefined && isHelperFailed(error)) await this.withdrawAfterHelperFailed(ctx, upContainer, containersBefore, true);
       const kept = await this.keptAfterLifecycleFailure(ctx, error);
       if (!kept) {
@@ -6173,6 +6186,39 @@ export class EnvironmentService {
       }
     } catch (error) {
       this.logger.warn(`The first heartbeat for ${env.repository} to the Session Monitor on ${engine} failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Review round 1 of PR #86, A-R1-1: the Session Monitor of the engine again, right after `up` created or started the
+   * container of this run (once per run, only when ensureSessionMonitor ran in it). The monitor may have exited when idle
+   * (Q5) between the ensure before the clone and build and this start: the window's heartbeat repair starts it again only
+   * once the container exists, and a sleep, quit or crash before that would leave the container running without a
+   * monitor. A cheap check when it runs (`docker inspect`); it starts or creates it when it is missing.
+   * A failure does not refuse the open (unlike Q3 before the start): the container runs already, and a refusal would not
+   * stop it, while the open's window, once connected, repairs the monitor with its heartbeats (Q4). It is logged, and the
+   * user is warned (Messages.sessionMonitorAfterStartFailed). Throws only an AbortError of the run.
+   */
+  private async ensureSessionMonitorAfterStart(ctx: PipelineContext): Promise<void> {
+    const sessionMonitor = this.deps.sessionMonitor;
+    const image = ctx.helperImage;
+    if (!sessionMonitor || !ctx.sessionMonitorEnsured || ctx.sessionMonitorEnsuredAfterStart || image === undefined) return;
+    ctx.sessionMonitorEnsuredAfterStart = true;
+    // Review round 2 of PR #86: the target is read inside the try, so that a failure to read it is a warning too, never
+    // the refusal of an open whose container runs already. `undefined` while the engine is not known.
+    let engine: string | undefined;
+    try {
+      const target = await this.dockerTarget();
+      if (target.kind !== 'remote' && target.kind !== 'local') return;
+      engine = target.kind === 'local' ? 'the local Docker' : target.host;
+      await sessionMonitor.ensure(target, image.tag, ctx.signal, image.id);
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      const cause = errorMessage(error);
+      this.logger.warn(
+        `The Session Monitor on ${engine ?? 'the Docker engine'} could not be started again after the container of ${ctx.env.repository} started; the heartbeats of the window try again: ${cause}`,
+      );
+      this.deps.ui.warn(Messages.sessionMonitorAfterStartFailed(ctx.env.repository, engine, cause));
     }
   }
 

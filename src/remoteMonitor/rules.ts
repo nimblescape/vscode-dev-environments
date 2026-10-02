@@ -118,6 +118,17 @@ export interface RemoteDecision {
   superseded: RemoteRecord[];
   /** The gap rule holds every stop in this tick. */
   grace: boolean;
+  /**
+   * Review round 1 of PR #86, A-R1-1: whether the engine is in use for the idle exit of the monitor (main.ts, Q5), besides
+   * a running labelled container (which the loop counts itself): a record that is fresh (its `at`, as the rules see it,
+   * clamped, at most its `limitSeconds` ago: a window still sends heartbeats, for example during the clone and the build
+   * of an open, before any container exists). Review round 2 of PR #86, A-R2-1: only that. A labelled container in the
+   * state `created` no longer counts (a failed start after `up`, or a Compose service whose dependency never becomes
+   * healthy, leaves it so for ever; the window of the open sends heartbeats until it started), nor does a keepRunning
+   * record of an environment whose container has not ended (a kept container that runs counts as running). Records age
+   * out, so an engine with nothing running still lets the monitor exit.
+   */
+  active: boolean;
 }
 
 /** True for a state of `docker ps` in which the container runs (as mapContainerState of the extension). */
@@ -230,10 +241,14 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     if (input.records.some((other) => other.environmentId === record.environmentId && other.keepRunning && other.source !== record.source && other.at <= record.at)) return false;
     return same.some((other) => other.at > at);
   });
+  // Review round 1 of PR #86, A-R1-1: activity for the idle exit (RemoteDecision.active). Review round 2 of PR #86,
+  // A-R2-1: only a fresh record. Neither a `created` labelled container (a failed start after `up` leaves one for ever)
+  // nor a keep counts: a running container counts in the loop itself (a kept one that runs among them).
+  const active = clamped.some((record) => now - record.at <= record.limitSeconds * 1000);
   const state: RemoteMonitorState = { lastTickAt: now };
   if (Object.keys(futureSeen).length > 0) state.futureSeen = futureSeen;
   if (graceUntil !== undefined && now < graceUntil) state.graceUntil = graceUntil;
-  return { state, stop, kept, forget, superseded, grace };
+  return { state, stop, kept, forget, superseded, grace, active };
 }
 
 /**

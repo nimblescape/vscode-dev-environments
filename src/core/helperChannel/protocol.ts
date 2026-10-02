@@ -728,3 +728,11 @@ export function lockFilePath(environmentId: string, stateDir: string = LOCK_STAT
 export function flockArgs(waitSeconds: number, fd: number): string[] {
   return ['-w', String(waitSeconds), '-E', String(LOCK_BUSY_EXIT), String(fd)];
 }
+
+/**
+ * Plan step 8, PR B (user decision D2): the arguments of `flock` for an automatic stop of the Session Monitor container:
+ * no wait (`-n`); a lock held by an operation exits with LOCK_BUSY_EXIT, and the monitor tries again at a later tick.
+ */
+export function flockNoWaitArgs(fd: number): string[] {
+  return ['-n', '-E', String(LOCK_BUSY_EXIT), String(fd)];
+}

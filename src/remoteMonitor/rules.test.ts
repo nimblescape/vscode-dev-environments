@@ -426,3 +426,49 @@ describe('decide of the remote Session Monitor', () => {
     expect(state).toEqual(copy);
   });
 });
+
+// Review round 1 of PR #86, A-R1-1: the activity of the engine for the idle exit of the monitor (main.ts, Q5).
+describe('decide: active (review round 1 of PR #86, A-R1-1)', () => {
+  const at = (records: RemoteRecord[], containers: RemoteContainer[] = [], now = T0, state = running({}, now)) => decide({ now, containers, records, state });
+
+  it('is false without containers and records, and with only ended containers', () => {
+    expect(at([]).active).toBe(false);
+    expect(at([], [container(A, 'exited'), container(B, 'dead')]).active).toBe(false);
+  });
+
+  it('is true for a record within its limit, also without any container, and false once it aged past it', () => {
+    expect(at([record(A, T0 - 10 * MINUTE)]).active).toBe(true);
+    expect(at([record(A, T0 - 10 * MINUTE - 1)]).active).toBe(false);
+    expect(at([record(A, T0 - 2 * MINUTE, { limitSeconds: 60 })]).active).toBe(false);
+  });
+
+  // Changed expectation, review round 2 of PR #86, A-R2-1 (was: true): a container left `created` for ever (a failed start
+  // after `up`) must not keep the monitor; the window of an open sends heartbeats until its container started.
+  it('is false for a labelled container in the state created with only stale records (review round 2 of PR #86, A-R2-1)', () => {
+    expect(at([], [container(A, 'created')]).active).toBe(false);
+    expect(at([record(A, T0 - 10 * MINUTE - 1)], [container(A, 'created')]).active).toBe(false);
+    // A fresh record still counts.
+    expect(at([record(A, T0 - 10 * MINUTE)], [container(A, 'created')]).active).toBe(true);
+  });
+
+  // Changed expectation, review round 2 of PR #86, A-R2-1 (was: true for a container that has not ended): an old keep
+  // never counts; a kept container that runs counts in the loop itself (anyRunning).
+  it('is false for an old keep, whatever the state of its containers (review round 2 of PR #86, A-R2-1)', () => {
+    const keep = record(A, T0 - 60 * MINUTE, { keepRunning: true });
+    expect(at([keep], [container(A, 'created')]).active).toBe(false);
+    expect(at([keep], [container(A, 'paused')]).active).toBe(false);
+    expect(at([keep], [container(A, 'removing')]).active).toBe(false);
+    expect(at([keep], [container(A, 'exited')]).active).toBe(false);
+    expect(at([keep]).active).toBe(false);
+    // A container of another environment is not its.
+    expect(at([keep], [container(B, 'removing')]).active).toBe(false);
+  });
+
+  it('ages a record from the future from when it was first seen, as the stop does', () => {
+    const future = [record(A, T0 + 60 * MINUTE, { limitSeconds: 60 })];
+    const first = at(future);
+    expect(first.active).toBe(true);
+    const later = at(future, [], T0 + 2 * MINUTE, { ...first.state, lastTickAt: T0 + 2 * MINUTE - REMOTE_TICK_MS });
+    expect(later.active).toBe(false);
+  });
+});
