@@ -7,8 +7,8 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
-import { CommandError, GitStateUnreadableError, UserFacingError } from '../errors';
-import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { CommandError, UserFacingError } from '../errors';
+import { OWNERSHIP_FIX_SCRIPT, gitSummaryCommand } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
@@ -3970,11 +3970,85 @@ describe('delete', () => {
 });
 
 describe('safetyCheck', () => {
-  it('reads the Git state through the helper and records it', async () => {
-    await seedEnvironment(h);
+  // user decision 2026-10-02: Delete runs no Git ("No git needs delete. ... we may flag uncommitted changes though, but
+  // that does not hinder deletion."): the check names the recorded Git state, refreshed in a running dev container.
+  // Changed expectation (was: 'reads the Git state through the helper and records it'): no helper step runs.
+  it('user decision 2026-10-02: returns the recorded Git state without any Git or helper step when the container does not run', async () => {
+    const env = await seedEnvironment(h, { container: 'stopped' });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('user decision 2026-10-02: returns undefined (the plain confirmation) when nothing is recorded and the container does not run', async () => {
+    await seedEnvironment(h, { container: 'stopped', extra: { gitSummary: undefined } });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: returns the recorded Git state when there is no container at all', async () => {
+    const env = await seedEnvironment(h, { container: null });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: refreshes the Git state in a running dev container as its user (as after a stop), records and returns it', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
     const summary = await h.service.safetyCheck(ENV_ID, options());
-    expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1 });
-    expect((await entry())?.gitSummary).toMatchObject({ uncommittedFiles: 2, unpushedCommits: 1 });
+    expect(summary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    const container = h.docker.containersOf(ENV_ID)[0];
+    expect(h.docker.execs).toHaveLength(1);
+    expect(h.docker.execs[0]).toMatchObject({ container: container.id, user: 'vscode' });
+    expect(h.docker.execs[0].command).toEqual(gitSummaryCommand('/workspaces/api'));
+    expect((await entry())?.gitSummary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    // No helper step, and the container keeps running.
+    expect(h.helper.calls).toEqual([]);
+    expect(container.state).toBe('running');
+  });
+
+  it('user decision 2026-10-02: a refresh that fails falls back to the recorded state, which stays recorded', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    for (const result of [{ exitCode: 127, stderr: 'Git is not installed.' }, { exitCode: 128, stderr: 'fatal: not a git repository' }, { stdout: 'garbage\n' }]) {
+      h.docker.execHandler = () => result;
+      expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+      expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+    }
+    expect(h.helper.calls).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: a refresh that fails with nothing recorded gives undefined (the plain confirmation), never a refusal', async () => {
+    await seedEnvironment(h, { container: 'running', extra: { gitSummary: undefined } });
+    h.docker.execHandler = () => ({ exitCode: 1, stderr: 'container is not running' });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
+  });
+
+  it('user decision 2026-10-02: a refresh whose exec throws, or a container that cannot be found, falls back to the recorded state', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.docker.exec = async () => {
+      throw new Error('docker exec failed');
+    };
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    h.docker.findContainer = async () => {
+      throw new Error('docker inspect failed');
+    };
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('user decision 2026-10-02: a cancel during the refresh rejects as cancelled and records nothing', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    const controller = new AbortController();
+    h.docker.execHandler = () => {
+      controller.abort();
+      return { stdout: gitExecOutput('feature-z', [5, 6, 2]) };
+    };
+    const error = await rejection(h.service.safetyCheck(ENV_ID, options({ signal: controller.signal })));
+    expect(error.code).toBe('cancelled');
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
   });
 
   it('returns undefined when the volume is missing, without creating one', async () => {
@@ -3982,78 +4056,6 @@ describe('safetyCheck', () => {
     expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
     expect(h.helper.calls).toEqual([]);
     expect(h.docker.volumes.size).toBe(0);
-  });
-
-  // Review round 1 of PR #84, A-R1-2: changed input (before: exit code 2 of a failed `cd`): GIT_SUMMARY_SCRIPT reports a
-  // missing repository folder with GIT_SUMMARY_NO_FOLDER_EXIT; only that falls back to the recorded state.
-  it('returns the last recorded state when the repository folder is missing, so known changes are still named', async () => {
-    const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_NO_FOLDER_EXIT, '', 'The repository folder /workspaces/api is missing.');
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
-  });
-
-  // Review round 1 of PR #84, A-R1-2: changed expectation (before: undefined, which showed the plain "Delete?"): with
-  // nothing recorded the state is unknown, and Delete shows the warning.
-  it('returns an unknown state when the repository folder is missing and no state is recorded (review round 1 of PR #84, A-R1-2)', async () => {
-    await seedEnvironment(h, { extra: { gitSummary: undefined } });
-    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_NO_FOLDER_EXIT, '', 'The repository folder /workspaces/api is missing.');
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateNoFolder });
-  });
-
-  // Review round 1 of PR #84, A-R1-2: as the owner, Git may not read everything. "Could not read" never reads as
-  // "nothing to lose": the state is unknown, with the reason; the recorded state is passed as recorded only, and the
-  // registry keeps it unchanged.
-  it('review round 1 of PR #84, A-R1-2: exit code 0 with a permission warning on stderr gives an unknown state, not the counts', async () => {
-    const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new GitStateUnreadableError("warning: could not open directory 'data/pg/': Permission denied");
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({
-      unknown: true,
-      reason: PipelineTexts.gitStateUnreadable("warning: could not open directory 'data/pg/': Permission denied"),
-      recorded: env.gitSummary,
-    });
-    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
-  });
-
-  it('review round 2 of PR #84, A-R2-2: a folder that exists but its owner cannot reach (GIT_SUMMARY_UNREACHABLE_EXIT) gives an unknown state, never the recorded state as current', async () => {
-    const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_UNREACHABLE_EXIT, '', 'The repository folder /workspaces/api is missing.');
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateUnreachable, recorded: env.gitSummary });
-    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
-  });
-
-  it('review round 2 of PR #84, A-R2-2: an unreachable folder with no recorded state is unknown with its own reason (not "missing")', async () => {
-    await seedEnvironment(h, { extra: { gitSummary: undefined } });
-    h.helper.gitSummaryResult = new CommandError('git summary', GIT_SUMMARY_UNREACHABLE_EXIT, '', 'The repository folder /workspaces/api is missing.');
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateUnreachable });
-  });
-
-  it('review round 1 of PR #84, A-R1-2: exit code 128 (a root 0600 .git/index) gives an unknown state, never the recorded state as current', async () => {
-    const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new CommandError('git summary', 128, '', 'fatal: .git/index: index file open failed: Permission denied\n');
-    const result = await h.service.safetyCheck(ENV_ID, options());
-    expect(result).toEqual({
-      unknown: true,
-      reason: PipelineTexts.gitStateFailed(128, 'fatal: .git/index: index file open failed: Permission denied'),
-      recorded: env.gitSummary,
-    });
-    expect(PipelineTexts.gitStateFailed(128, 'x')).toBe('Git failed with exit code 128: x');
-    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
-  });
-
-  it('review round 1 of PR #84, A-R1-2: any other failure (exit code 2, no recorded state) gives an unknown state, never undefined', async () => {
-    await seedEnvironment(h, { extra: { gitSummary: undefined } });
-    h.helper.gitSummaryResult = new CommandError('git summary', 2, '', "sh: cd: can't cd to /workspaces/api");
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: PipelineTexts.gitStateFailed(2, "sh: cd: can't cd to /workspaces/api") });
-    h.helper.gitSummaryResult = new Error('Unexpected output of the Git summary: ""');
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: 'Unexpected output of the Git summary: ""' });
-  });
-
-  it('review round 3 of PR #84, A-R3-4: the time limit of the check (an Error of the batch helper, no AbortError) gives an unknown state with "Delete anyway", not a cancel', async () => {
-    const env = await seedEnvironment(h);
-    const message = 'The step gitSummary of the batch helper did not end within 300 seconds.';
-    h.helper.gitSummaryResult = new Error(message);
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual({ unknown: true, reason: message, recorded: env.gitSummary });
-    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
   });
 
   it('starts Docker when needed', async () => {

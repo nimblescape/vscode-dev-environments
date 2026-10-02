@@ -13,15 +13,12 @@ import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { ensureDockerRunning } from '../docker/dockerStart';
 import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { BatchHelperUnavailableError, CommandError, GitStateUnreadableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
+import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isUserFacingError } from '../errors';
 import {
-  GIT_SUMMARY_NO_FOLDER_EXIT,
-  GIT_SUMMARY_UNREACHABLE_EXIT,
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
   existingPathsCommand,
   gitSummaryCommand,
-  gitSummaryProblem,
   ownershipFixCommand,
   parseExistingPaths,
   isNumericId,
@@ -173,7 +170,6 @@ import type {
   GitSummary,
   PendingConnection,
   RefusedUpdate,
-  UnknownGitState,
   WindowStatus,
 } from '../types';
 import {
@@ -232,13 +228,6 @@ import type { PullCredentials, PullCredentialsProvider } from './pullCredentials
 // User-visible texts that messages.ts lacks (plain language, NFR-02); to be moved there.
 export const PipelineTexts = {
   cancelled: 'The operation was cancelled.',
-  /** Review round 1 of PR #84, A-R1-2: why Delete's check could not read the Git state (UnknownGitState.reason). */
-  gitStateUnreadable: (problem: string) => `Git could not read all files: ${problem}`,
-  gitStateFailed: (exitCode: number | null, problem: string | undefined) =>
-    exitCode === null ? 'Git was stopped before it ended.' : `Git failed with exit code ${exitCode}${problem ? `: ${problem}` : '.'}`,
-  gitStateNoFolder: 'The repository folder is missing, and no Git state is recorded.',
-  /** Review round 2 of PR #84, A-R2-2: the folder exists, but its owner cannot reach it (GIT_SUMMARY_UNREACHABLE_EXIT). */
-  gitStateUnreachable: 'The repository folder exists, but its owner cannot reach it.',
   startFailed: 'The environment could not be started.',
   environmentMissing: 'This environment does not exist anymore.',
   environmentBusy: (repository: string) =>
@@ -315,7 +304,6 @@ export type EnvironmentHelper = Pick<
   | 'build'
   | 'up'
   | 'runUserCommands'
-  | 'gitSummary'
   | 'prepareGit'
   | 'createRepositoryFolders'
   | 'fixConfigOwnership'
@@ -866,17 +854,6 @@ export function afterUpClause(subject: string, withdrawn: UpWithdrawn): string {
 /** afterUpClause, with `what` for a container that did not run before `up` ("created", "started", ...). */
 function lifecycleClause(subject: string, ranBefore: boolean, what: string): string {
   return ranBefore ? `${subject} runs already, but its lifecycle commands could not run.` : `${subject} was ${what}, but its lifecycle commands could not run.`;
-}
-
-/** Review round 1 of PR #84, A-R1-2: the reason of an UnknownGitState for the error of the Git summary, briefly. */
-function gitStateUnknownReason(error: unknown): string {
-  if (error instanceof GitStateUnreadableError) return PipelineTexts.gitStateUnreadable(error.problem);
-  if (error instanceof CommandError && error.exitCode === GIT_SUMMARY_UNREACHABLE_EXIT) return PipelineTexts.gitStateUnreachable;
-  if (error instanceof CommandError) {
-    const lastLine = error.stderr.trim().split('\n').at(-1)?.trim().slice(0, 300);
-    return PipelineTexts.gitStateFailed(error.exitCode, gitSummaryProblem('', error.stderr) ?? (lastLine || undefined));
-  }
-  return errorMessage(error).slice(0, 300);
 }
 
 /** The cause at the end of a detail: the detail of a UserFacingError (for example of helperFailed), else errorDetail. */
@@ -5650,15 +5627,16 @@ export class EnvironmentService {
   }
 
   /**
-   * Safety check before Delete (concept 7.14 step 1), through the workspace helper on the volume (plan step 7: a step of
-   * the batch helper under the lock of the environment, released before this returns). Starts Docker if needed.
-   * `undefined` when the volume is missing. When the repository folder is missing, the last recorded state, so that
-   * known changes are still named (FR-09) and a broken clone can still be deleted. A new result is recorded in the
-   * registry. Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): an UnknownGitState
-   * when Git could not read the whole state (a failure, or a permission problem with exit code 0), and when the folder
-   * is missing with no recorded state. A cancel stays a cancel.
+   * Safety check before Delete (concept 7.14 step 1). User decision 2026-10-02 ("No git needs delete. When we delete the
+   * remote, we delete the container with the volumes and everything is gone. we may flag uncommitted changes though, but
+   * that does not hinder deletion."): Delete runs no Git in a workspace helper (nor a batch step). The result is the Git
+   * state recorded in the registry (the Session Monitor's polls, and after an open or a stop); when the dev container
+   * runs, it is refreshed first in the container as its user (gitSummaryInContainer, as after a stop) and the new state
+   * is recorded. A refresh that fails falls back to the recorded state and never refuses Delete. Starts Docker if needed.
+   * `undefined` when the volume is missing (the files of the environment are missing: plain confirmation) or nothing is
+   * recorded. A cancel stays a cancel.
    */
-  async safetyCheck(environmentId: string, options: OperationOptions): Promise<GitSummary | UnknownGitState | undefined> {
+  async safetyCheck(environmentId: string, options: OperationOptions): Promise<GitSummary | undefined> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return undefined;
     await this.requireCurrentHost(env);
@@ -5667,38 +5645,36 @@ export class EnvironmentService {
       await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       if (!(await this.deps.docker.volumeExists(env.volumeName))) return undefined;
-      let summary: GitSummary;
-      try {
-        // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the Git summary runs as a step of the
-        // batch helper of the volume under the lock of the environment (D1: refused when either cannot be had; D3: busy
-        // after 10 s). The lock is released before the user's confirmation; Delete takes it again (deleteLocked).
-        summary = await this.withEnvironmentLock(
-          env,
-          options.signal,
-          () => this.deps.helper.gitSummary({ volumeName: env.volumeName, repository: env.repository, signal: options.signal }),
-          { batchVolume: env.volumeName },
-        );
-      } catch (error) {
-        if (this.isCancellation(error, options.signal) || isUserFacingError(error)) throw error;
-        this.logger.warn(`The Git state of ${env.repository} could not be read: ${errorDetail(error)}`);
-        // Review round 1 of PR #84, A-R1-2: only a missing repository folder falls back to the recorded state (as
-        // before); with none recorded, the state is unknown (never "no changes").
-        if (error instanceof CommandError && error.exitCode === GIT_SUMMARY_NO_FOLDER_EXIT) {
-          return env.gitSummary ?? { unknown: true, reason: PipelineTexts.gitStateNoFolder };
-        }
-        const unknown: UnknownGitState = { unknown: true, reason: gitStateUnknownReason(error) };
-        if (env.gitSummary !== undefined) unknown.recorded = env.gitSummary;
-        return unknown;
-      }
+      const refreshed = await this.gitSummaryBeforeDelete(env, options.signal);
+      this.throwIfCancelled(options.signal);
+      if (refreshed === undefined) return env.gitSummary;
       await this.quietly('record the Git state', () =>
         this.deps.registry.updateEnvironment(env.id, (entry) => {
-          entry.gitSummary = summary;
+          entry.gitSummary = refreshed;
         }),
       );
-      return summary;
+      return refreshed;
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }
+  }
+
+  /**
+   * User decision 2026-10-02: the Git state from the running dev container before Delete's confirmation (the path of
+   * Stop, gitSummaryInContainer, as `remoteUser`), or `undefined` when the container does not run or the refresh fails
+   * (Delete then names the recorded state). No lock: it only reads in the container, and must never hold Delete up.
+   */
+  private async gitSummaryBeforeDelete(env: Environment, signal: AbortSignal | undefined): Promise<GitSummary | undefined> {
+    let container: ContainerInfo | undefined;
+    try {
+      container = await this.deps.docker.findContainer(env.id, env.containerName);
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      this.logger.info(`The container of ${env.repository} could not be found: ${errorMessage(error)}. The recorded Git state is used.`);
+      return undefined;
+    }
+    if (!container || container.state !== 'running') return undefined;
+    return this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
   }
 
   /** Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. */

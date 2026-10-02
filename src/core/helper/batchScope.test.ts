@@ -9,13 +9,9 @@
 // is replaced once under the same lock, a failed reopen refuses; a step that fails because its session was lost fails
 // the operation and is never repeated; the session is closed on success, failure and cancel. Plan step 7 (user decision
 // of 2026-10-01): outside a scope a volume step throws an internal error and runs nothing (the per-step run is removed).
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import { describe, expect, it, onTestFinished } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { CommandError, UserFacingError, isBatchHelperUnavailable } from '../errors';
-import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, gitSummaryCommand } from '../git/gitSummary';
+import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
@@ -123,15 +119,6 @@ function setup(engine?: HelperDeps['engine']) {
   const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux', ...(engine ? { engine } : {}) });
   const lock = new FakeLock();
   return { docker, helper, lock };
-}
-
-/** Plan step 7: setup with a Dockerfile, for a step without a pinned image (the image of the window, WorkspaceHelper.image). */
-function setupWithImage() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-batch-scope-'));
-  fs.writeFileSync(path.join(dir, 'Dockerfile'), 'FROM node:22-bookworm-slim\n');
-  const docker = new RecordingDocker();
-  const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux' });
-  return { docker, helper, lock: new FakeLock(), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 /**
@@ -260,8 +247,8 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       ['no batch', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), (lock) => ({ ...lock, environmentId: lock.environmentId, lost: lock.lost, docker: lock.docker, release: lock.release, batch: undefined }), 'has no batch helper'],
       // Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it WorkspaceHelper.run, the run without a batch kind
       // (was: the case 'run', refused with "has no step in the batch helper"; every run now names its kind).
-      // Plan step 7 (user decision of 2026-10-01): changed expectation, gitSummary is a step of the batch helper now
-      // (its routing is checked with the other kinds), so it is no longer refused here.
+      // user decision 2026-10-02: Delete runs no Git: WorkspaceHelper.gitSummary is removed (was: refused with "has no
+      // step in the batch helper" before plan step 7, a step of the batch helper in plan step 7), so it has no case here.
       ['volume', (helper) => helper.listConfigurations({ volumeName: 'other', repository: 'acme/app', image: IMAGE }), (lock) => lock, 'is for the volume other'],
       ['no image ID', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: { tag: IMAGE.tag } }), (lock) => lock, 'the ID of the helper image'],
     ];
@@ -628,41 +615,6 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       if (kind !== 'clone') expect(command.input, kind).toBe(built[0].input);
       else expect(lock.steps[0].options.secret, kind).toBe(TOKEN);
     }
-  });
-
-  it('plan step 7: the Git summary of Delete is the step gitSummary, with the image of the window (no pinned image), and parses its output', async () => {
-    const { docker, helper, lock, cleanup } = setupWithImage();
-    onTestFinished(cleanup);
-    lock.stepResult = async () => ({ exitCode: 0, stdout: 'main\n2\n1\n0\n', stderr: '', timedOut: false });
-    const summary = await runWithBatchScope(lock, VOLUME, silentLogger, () => helper.gitSummary({ volumeName: VOLUME, repository: 'acme/app' }));
-    expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0 });
-    expect(lock.steps.map((step) => [step.kind, step.params])).toEqual([['gitSummary', { repository: 'acme/app' }]]);
-    expect(lock.steps[0].options.secret).toBeUndefined();
-    // Review round 2 of PR #84, A-R2-1 and A-R2-2: changed expectation: the complete check, and the folder exits.
-    expect(batchStepCommand('gitSummary', lock.steps[0].params)).toEqual({
-      command: gitSummaryCommand('/workspaces/app', true),
-      env: {},
-      git: false,
-      owner: '/workspaces/app',
-      folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
-    });
-    // The image of the window (WorkspaceHelper.image), by its ID.
-    expect(lock.opens).toEqual([{ volume: VOLUME, image: IMAGE.id, socket: '/var/run/docker.sock' }]);
-    expect(docker.runs.filter((run) => run.args[0] === 'run')).toEqual([]);
-  });
-
-  it('plan step 7: a Git summary that fails in the helper is a CommandError (Delete then shows the recorded state), not a refusal', async () => {
-    const { helper, lock, cleanup } = setupWithImage();
-    onTestFinished(cleanup);
-    lock.stepResult = async () => ({ exitCode: 2, stdout: '', stderr: "sh: cd: can't cd to /workspaces/app", timedOut: false });
-    await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
-      const error = await helper.gitSummary({ volumeName: VOLUME, repository: 'acme/app' }).then(
-        () => undefined,
-        (reason: unknown) => reason,
-      );
-      expect(error).toBeInstanceOf(CommandError);
-      expect(isBatchHelperUnavailable(error)).toBe(false);
-    });
   });
 
   it('review round 2 of PR #82, B-R2-2: an up with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {

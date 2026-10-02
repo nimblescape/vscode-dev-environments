@@ -24,7 +24,7 @@ import { availableEnvironments } from '../core/ownership';
 import { dockerTargetOf, remoteContextName, type DockerTarget } from '../core/docker/dockerHost';
 import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { silentLogger } from '../core/ports';
-import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, UnknownGitState, WindowStatus } from '../core/types';
+import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, type ControllerDeps } from './controller';
@@ -171,7 +171,7 @@ interface Harness {
     open: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
     openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
     stop: ReturnType<typeof vi.fn<(id: string) => Promise<void>>>;
-    safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | UnknownGitState | undefined>>>;
+    safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
     /** Review round 11 (G3, G4). */
     repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
@@ -1198,71 +1198,31 @@ describe('Keep Running When Closed and Stop When Closed (unit 26)', () => {
 });
 
 describe('Delete', () => {
-  // Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): an unknown Git state always
-  // gets the warning with "Delete anyway", never the plain "Delete?".
-  it('review round 1 of PR #84, A-R1-2: an unknown Git state gets the warning with Delete anyway and says why', async () => {
+  // user decision 2026-10-02: Delete runs no Git ("we may flag uncommitted changes though, but that does not hinder
+  // deletion."): the dialog names the numbers of the recorded (possibly refreshed) state and always lets the user delete.
+  it('user decision 2026-10-02: recorded changes are named with their numbers, and Delete anyway deletes', async () => {
     await h.registry.add(environment());
-    const reason = "Git could not read all files: warning: could not open directory 'data/pg/': Permission denied";
-    h.service.safetyCheck.mockResolvedValue({ unknown: true, reason });
-    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 3, recordedAt: iso(NOW) });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.deleteAnyway);
     await run('delete', row('acme/api', environment()));
     expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toEqual([
-      Messages.deleteGitStateUnknown('acme/api', reason),
+      Messages.deleteUnsaved('acme/api', '2 uncommitted · 1 unpushed · 3 stashed'),
       { modal: true },
       Actions.openEnvironment,
       Actions.deleteAnyway,
     ]);
-    expect(Messages.deleteGitStateUnknown('acme/api', reason)).toContain('could not be read');
-    expect(Messages.deleteGitStateUnknown('acme/api', reason)).toContain(reason);
-    expect(h.service.delete).not.toHaveBeenCalled();
-    // Delete anyway deletes.
-    fakeVscode.window.showWarningMessage.mockReset();
-    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.deleteAnyway);
-    await run('delete', row('acme/api', environment()));
     expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
-  it('review round 1 of PR #84, A-R1-2: an unknown Git state with a recorded summary of no changes still gets the warning; recorded changes are named as recorded', async () => {
+  it('user decision 2026-10-02: with nothing recorded, the plain confirmation follows and Delete deletes', async () => {
     await h.registry.add(environment());
-    const clean = { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) };
-    h.service.safetyCheck.mockResolvedValueOnce({ unknown: true, reason: 'Git failed with exit code 128: fatal: .git/index: index file open failed: Permission denied', recorded: clean });
-    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
-    await run('delete', row('acme/api', environment()));
-    expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toEqual([
-      Messages.deleteGitStateUnknown('acme/api', 'Git failed with exit code 128: fatal: .git/index: index file open failed: Permission denied'),
-      { modal: true },
-      Actions.openEnvironment,
-      Actions.deleteAnyway,
-    ]);
-    fakeVscode.window.showWarningMessage.mockReset();
-    const changed = { ...clean, uncommittedFiles: 2 };
-    h.service.safetyCheck.mockResolvedValueOnce({ unknown: true, reason: 'r', recorded: changed });
-    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
-    await run('delete', row('acme/api', environment()));
-    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(Messages.deleteGitStateUnknown('acme/api', 'r', '2 uncommitted'));
-    expect(Messages.deleteGitStateUnknown('acme/api', 'r', '2 uncommitted')).toContain('Last recorded: 2 uncommitted.');
-    expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toContain(Actions.deleteAnyway);
-    expect(h.service.delete).not.toHaveBeenCalled();
-  });
-
-  it('review round 2 of PR #84, A-R2-3: a reason from raw Git output ends with a full stop before "Last recorded"', () => {
-    const reason = PipelineTexts.gitStateUnreadable("warning: could not open directory 'data/': Permission denied");
-    expect(Messages.deleteGitStateUnknown('acme/api', reason, '2 uncommitted')).toContain("'data/': Permission denied. Last recorded: 2 uncommitted.");
-    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateFailed(128, 'fatal: x'))).toMatch(/fatal: x\.$/);
-    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateNoFolder)).toMatch(/is recorded\.$/);
-    expect(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateNoFolder)).not.toContain('..');
-  });
-
-  it('review round 1 of PR #84, A-R1-2: no summary at all (repository folder missing, nothing recorded) gets the warning, never the plain confirmation', async () => {
-    await h.registry.add(environment());
-    h.service.safetyCheck.mockResolvedValueOnce({ unknown: true, reason: PipelineTexts.gitStateNoFolder });
-    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    h.service.safetyCheck.mockResolvedValue(undefined);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
     await run('delete', row('acme/api', environment()));
     const call = fakeVscode.window.showWarningMessage.mock.calls[0];
-    expect(call[0]).toBe(Messages.deleteGitStateUnknown('acme/api', PipelineTexts.gitStateNoFolder));
-    expect(call).toContain(Actions.deleteAnyway);
-    expect(call).not.toContain(Actions.delete);
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(call).toEqual([Messages.deleteConfirm('acme/api'), { modal: true }, Actions.delete]);
+    expect(call).not.toContain(Actions.deleteAnyway);
+    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
   it('names the unsaved changes, and deletes after Delete anyway while keeping the additional volumes on Keep', async () => {

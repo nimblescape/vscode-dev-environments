@@ -448,8 +448,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       ['readFiles', { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }],
       ['listConfigs', { repository: 'octo/hello' }],
       ['createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] }],
-      // Review round 1 of PR #84, A-R1-1: gitSummary (plan step 7) is an owner step as well.
-      ['gitSummary', { repository: 'octo/hello' }],
+      // user decision 2026-10-02: Delete runs no Git: changed input, gitSummary (plan step 7, an owner step as well) is
+      // no step any more.
     ] as const) {
       t.fsCalls.length = 0;
       t.quiet.length = 0;
@@ -466,7 +466,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       // User decision of 2026-10-01: Compose reads as the repository owner (CONFIG_FOLDER is also made root's for the
       // step, since it belongs to the owner; OVERRIDE_FOLDER is made new for the owner and removed after the step).
       // Review round 1 of PR #84, A-R1-1: changed expectation (before: every owner step closed CONFIG_FOLDER): only the
-      // Compose steps close it; readFiles, listConfigs, createFolders and gitSummary leave its owner and mode unchanged.
+      // Compose steps close it; readFiles, listConfigs and createFolders leave its owner and mode unchanged.
       const compose = kind === 'composeModel' || kind === 'composeHash';
       expect(batchStepCommand(kind, params).closeConfigFolder === true, kind).toBe(compose);
       expect(t.fsCalls, kind).toEqual([
@@ -545,7 +545,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     ['readFiles', { repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }],
     ['listConfigs', { repository: 'octo/hello' }],
     ['createFolders', { repository: 'octo/hello', folders: ['/workspaces/hello/data'] }],
-    ['gitSummary', { repository: 'octo/hello' }],
+    // user decision 2026-10-02: Delete runs no Git: the case gitSummary is removed with its step.
   ] as const) {
     it(`review round 1 of PR #84, A-R1-1: ${kind} repairs a cut-off CONFIG_FOLDER (back to the owner with 0755)`, async () => {
       const { t, session } = await started({ configFolder: 'cutOff' });

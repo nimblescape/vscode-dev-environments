@@ -9,13 +9,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   CONFIG_OWNERSHIP_FIX_SCRIPT,
-  GIT_SUMMARY_COMPLETE,
-  GIT_SUMMARY_FLAGGED_FILES,
-  GIT_SUMMARY_INCOMPLETE_MARKER,
-  GIT_SUMMARY_MAX_PRUNED_FOLDERS,
-  GIT_SUMMARY_NO_FOLDER_EXIT,
   GIT_SUMMARY_SCRIPT,
-  GitProblemWatcher,
   OWNERSHIP_FIX_SCRIPT,
   MAX_SERVICE_ARGUMENT_CHARACTERS,
   MAX_SERVICE_FOLDERS,
@@ -25,9 +19,7 @@ import {
   boundServiceFolders,
   configOwnershipFixCommand,
   gitSummaryCommand,
-  gitSummaryProblem,
   isNumericId,
-  isUnknownGitState,
   ownershipFixCommand,
   parseGitSummaryOutput,
   serviceFolderPaths,
@@ -971,65 +963,14 @@ describe.skipIf(!canBindMount)('review round 3 of PR #81: the ownership fix with
   });
 });
 
-/**
- * Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): the problems in the output of
- * GIT_SUMMARY_SCRIPT that make the Git state unknown.
- */
-describe('the problems of the Git summary (review round 1 of PR #84, A-R1-2)', () => {
-  it('review round 1 of PR #84, A-R1-2: finds the permission problems on stderr, and the marker of a count on stdout', () => {
-    expect(gitSummaryProblem('main\n0\n0\n0\n', "warning: could not open directory 'data/pg/': Permission denied\n")).toBe(
-      "warning: could not open directory 'data/pg/': Permission denied",
-    );
-    expect(gitSummaryProblem('', 'fatal: .git/index: index file open failed: Permission denied')).toBe('fatal: .git/index: index file open failed: Permission denied');
-    expect(gitSummaryProblem('', "warning: unable to access 'x/.gitattributes': Input/output error")).toContain('unable to access');
-    expect(gitSummaryProblem('', 'error: cannot open .git/FETCH_HEAD')).toContain('cannot open');
-    expect(gitSummaryProblem(`${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\nmain\n0\n0\n0\n`, '')).toBe('the unpushed commits could not be counted');
-    expect(gitSummaryProblem('main\n1\n0\n0\n', '')).toBeUndefined();
-    expect(gitSummaryProblem('main\n1\n0\n0\n', 'hint: something else\n')).toBeUndefined();
-    // The marker line is ignored by the parser (it reads the last 4 lines).
-    expect(parseGitSummaryOutput(`${GIT_SUMMARY_INCOMPLETE_MARKER} x\nmain\n1\n0\n0\n`, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 1 });
-  });
-
-  it('review round 1 of PR #84, A-R1-2: the watcher finds a problem split across chunks, and one in a last line without its newline', () => {
-    const watcher = new GitProblemWatcher();
-    watcher.push('warning: could not open dir');
-    expect(watcher.problem()).toBeUndefined();
-    watcher.push("ectory 'data/': Permission denied\nother\n");
-    expect(watcher.problem()).toBe("warning: could not open directory 'data/': Permission denied");
-    const last = new GitProblemWatcher();
-    last.push('fatal: x: Permission denied');
-    expect(last.problem()).toBe('fatal: x: Permission denied');
-    expect(new GitProblemWatcher().problem()).toBeUndefined();
-  });
-
-  it('review round 1 of PR #84, A-R1-2: isUnknownGitState tells an unknown state from a summary and from none', () => {
-    expect(isUnknownGitState({ unknown: true, reason: 'r' })).toBe(true);
-    expect(isUnknownGitState({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: RECORDED_AT })).toBe(false);
-    expect(isUnknownGitState(undefined)).toBe(false);
-  });
-
-  it('review round 2 of PR #84, A-R2-1: the command adds GIT_SUMMARY_COMPLETE only for Delete\'s check', () => {
-    expect(gitSummaryCommand('/workspaces/api')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
-    expect(gitSummaryCommand('/workspaces/api', true)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
-  });
-
-  it('review round 1 of PR #84, A-R1-2: a missing repository folder exits with GIT_SUMMARY_NO_FOLDER_EXIT', () => {
-    const root = tempDir();
-    const result = runSummary(path.join(root, 'missing'));
-    expect(result.status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
-    expect(result.stderr).toContain('is missing');
-    fs.writeFileSync(path.join(root, 'file'), '');
-    expect(runSummary(path.join(root, 'file')).status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
-  });
-});
-
 describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs Git in the C locale', () => {
   it('hardening (LC_ALL): the script exports LC_ALL=C and LANG=C at its start, before any other command', () => {
     const lines = GIT_SUMMARY_SCRIPT.split('\n');
     expect(lines[0]).toBe('set -eu');
     expect(lines[1]).toBe('export LC_ALL=C LANG=C');
     // Set in the script itself, never as an argument or through `-e`: the command is the script and its parameters.
-    expect(gitSummaryCommand('/workspaces/api', true)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
+    // user decision 2026-10-02: Delete runs no Git (the script has one mode, the poll mode; no `complete` argument).
+    expect(gitSummaryCommand('/workspaces/api')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
   });
 
   it('hardening (LC_ALL): every Git call of the script sees LC_ALL=C and LANG=C, whatever locale the caller has', () => {
@@ -1041,18 +982,16 @@ describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs 
     fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s %s\\n' "\${LC_ALL-unset}" "\${LANG-unset}" >> '${log}'\n`, { mode: 0o755 });
     const repo = path.join(root, 'repo');
     fs.mkdirSync(repo);
-    for (const complete of [false, true]) {
-      fs.rmSync(log, { force: true });
-      const [file, ...args] = gitSummaryCommand(repo, complete);
-      const result = spawnSync(file, args, {
-        encoding: 'utf8',
-        env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
-      });
-      expect(result.status).toBe(0);
-      const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
-      expect(calls.length).toBeGreaterThanOrEqual(4);
-      for (const call of calls) expect(call).toBe('C C');
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: also the complete mode).
+    const [file, ...args] = gitSummaryCommand(repo);
+    const result = spawnSync(file, args, {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
+    });
+    expect(result.status).toBe(0);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const call of calls) expect(call).toBe('C C');
   });
 });
 
@@ -1068,8 +1007,9 @@ const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 const hasSetpriv = hasProgram('setpriv', ['--version']);
 
 /**
- * Review round 1 of PR #84, A-R1-2: the two reproduced cases with the real script, as the owner (uid 1000) of the
- * repository, as the batch helper runs it (needs root, setpriv and Git).
+ * Review round 1 of PR #84, A-R1-2: the real script as another user (uid 1000) who owns the repository, as `docker
+ * exec` runs it in the dev container as `remoteUser` (needs root, setpriv and Git). User decision 2026-10-02: Delete runs
+ * no Git, so only the poll mode of the script is left; its counts are tested here.
  */
 describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the repository owner (review round 1 of PR #84, A-R1-2)', () => {
   function ownerRepo(): string | undefined {
@@ -1086,39 +1026,14 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     return repo;
   }
 
-  function runAsOwner(repo: string, complete = false, binFolder?: string): { status: number | null; stdout: string; stderr: string } {
-    const [file, ...args] = gitSummaryCommand(repo, complete);
-    const searchPath = process.env.PATH ?? '/usr/bin:/bin';
+  function runAsOwner(repo: string): { status: number | null; stdout: string; stderr: string } {
+    const [file, ...args] = gitSummaryCommand(repo);
     const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
       encoding: 'utf8',
-      env: { PATH: binFolder === undefined ? searchPath : `${binFolder}:${searchPath}`, HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   }
-
-  it('review round 1 of PR #84, A-R1-2: an untracked 0700 folder of another uid: exit code 0, 0 changes, and a problem that makes the state unknown', () => {
-    const repo = ownerRepo();
-    if (repo === undefined) return;
-    fs.mkdirSync(path.join(repo, 'data'));
-    fs.writeFileSync(path.join(repo, 'data', 'f'), 'x');
-    spawnSync('chown', ['-R', '999:999', path.join(repo, 'data')]);
-    fs.chmodSync(path.join(repo, 'data'), 0o700);
-    const result = runAsOwner(repo);
-    expect(result.status).toBe(0);
-    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT).uncommittedFiles).toBe(0);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toContain('Permission denied');
-  });
-
-  it('review round 1 of PR #84, A-R1-2: a root 0600 .git/index: exit code 128 (not the missing folder)', () => {
-    const repo = ownerRepo();
-    if (repo === undefined) return;
-    spawnSync('chown', ['0:0', path.join(repo, '.git', 'index')]);
-    fs.chmodSync(path.join(repo, '.git', 'index'), 0o600);
-    const result = runAsOwner(repo);
-    expect(result.status).toBe(128);
-    expect(result.status).not.toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toContain('Permission denied');
-  });
 
   /**
    * Review round 2 of PR #84, A-R2-1: the repository of the reproduction: 1 unpushed commit on `feature` (main is on
@@ -1143,88 +1058,19 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     return repo;
   }
 
-  /** Gives `relative` in `repo` to root with `mode` (`recursive`: what it holds too). */
-  function toRoot(repo: string, relative: string, mode: number, recursive = false): void {
-    const target = path.join(repo, relative);
-    spawnSync('chown', [...(recursive ? ['-R'] : []), '0:0', target]);
-    fs.chmodSync(target, mode);
-  }
-
-  it('review round 2 of PR #84, A-R2-1: the baseline reads main / 0 / 1 / 2 with no problem, also with the complete check', () => {
+  it('review round 2 of PR #84, A-R2-1: the baseline reads main / 0 / 1 / 2', () => {
     const repo = stashRepo();
     if (repo === undefined) return;
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 2 });
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-    }
-  });
-
-  const silentCases: Array<{ name: string; setup: (repo: string) => void; lost: Record<string, unknown>; unreadable: string }> = [
-    { name: 'a root 0600 refs/stash', setup: (repo) => toRoot(repo, '.git/refs/stash', 0o600), lost: { stashes: 0 }, unreadable: '.git/refs/stash' },
-    // Review round 4 of PR #84, A-R4-2: without its reflog, refs/stash still counts as 1 stash (of 2).
-    { name: 'a root 0700 .git/logs', setup: (repo) => toRoot(repo, '.git/logs', 0o700, true), lost: { stashes: 1 }, unreadable: '.git/logs' },
-    { name: 'a root 0711 refs/heads (searchable, not listable)', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o711), lost: { unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
-    { name: 'a root 0700 refs/heads', setup: (repo) => toRoot(repo, '.git/refs/heads', 0o700), lost: { branch: null, unpushedCommits: 0 }, unreadable: '.git/refs/heads' },
-  ];
-  for (const { name, setup, lost, unreadable } of silentCases) {
-    it(`review round 2 of PR #84, A-R2-1: ${name}: Git alone reads a smaller state with exit code 0 and no problem; the complete check marks it unknown`, () => {
-      const repo = stashRepo();
-      if (repo === undefined) return;
-      setup(repo);
-      const plain = runAsOwner(repo);
-      expect(plain.status).toBe(0);
-      expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject(lost);
-      expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
-      const checked = runAsOwner(repo, true);
-      expect(checked.status).toBe(0);
-      expect(checked.stdout).toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-      expect(gitSummaryProblem(checked.stdout, checked.stderr)).toBe(`${unreadable} cannot be read`);
-    });
-  }
-
-  it('review round 2 of PR #84, A-R2-1: a folder that the owner can list but not enter (root 0644) is found through its entries', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.mkdirSync(path.join(repo, 'd'));
-    fs.writeFileSync(path.join(repo, 'd', 'f'), 'x');
-    toRoot(repo, 'd', 0o644, true);
-    const result = runAsOwner(repo, true);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} d/f cannot be read`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeDefined();
-  });
-
-  it('review round 2 of PR #84, A-R2-1: an untracked root 0700 folder (round 1) and a root 0600 file in the working tree are caught too', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, 'secret.txt'), 'x');
-    toRoot(repo, 'secret.txt', 0o600);
-    expect(runAsOwner(repo, true).stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} secret.txt cannot be read`);
-    fs.rmSync(path.join(repo, 'secret.txt'));
-    fs.mkdirSync(path.join(repo, 'data'));
-    toRoot(repo, 'data', 0o700);
-    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBe('data cannot be read');
-  });
-
-  it('review round 2 of PR #84, A-R2-1: links are not tested (a dangling link, a link to a root folder): no problem', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.symlinkSync('/nonexistent-target', path.join(repo, 'dangling'));
-    fs.symlinkSync('/root', path.join(repo, 'root-link'));
-    spawnSync('chown', ['-h', '1000:1000', path.join(repo, 'dangling'), path.join(repo, 'root-link')]);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 2 });
   });
 
   /**
-   * Review round 2 of PR #84, B-R2-1: a repository of the owner with 2 commits on main, and `origin/main` at the first;
-   * `missing`: the loose object of that first commit is deleted (the remote-tracking ref points at a missing commit),
-   * `unborn`: HEAD is then an unborn branch (the other branch of the count in the script).
+   * Review round 2 of PR #84, B-R2-1: a repository of the owner with 2 commits on main, and `origin/main` at the first.
    */
-  function remoteTrackingRepo(options: { missing: boolean; unborn?: boolean }): string | undefined {
+  function remoteTrackingRepo(): string | undefined {
     const repo = ownerRepo();
     if (repo === undefined) return undefined;
     const sgit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', ...args);
@@ -1232,91 +1078,27 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     sgit(repo, 'add', 'b.txt');
     sgit(repo, 'commit', '-q', '-m', 'second');
     sgit(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD~1');
-    if (options.missing) {
-      const id = sgit(repo, 'rev-parse', 'HEAD~1').trim();
-      const object = path.join(repo, '.git', 'objects', id.slice(0, 2), id.slice(2));
-      expect(fs.existsSync(object)).toBe(true);
-      fs.rmSync(object);
-    }
-    if (options.unborn) sgit(repo, 'checkout', '-q', '--orphan', 'fresh');
     spawnSync('chown', ['-R', '1000:1000', repo]);
     return repo;
   }
 
-  const PERMISSION_PHRASE = /Permission denied|could not open directory|unable to access|cannot open/i;
-
-  for (const unborn of [false, true]) {
-    it(`review round 2 of PR #84, B-R2-1: a remote-tracking ref at a deleted commit object (${unborn ? 'unborn HEAD' : 'HEAD with commits'}): exit code 0, no permission phrase, and only the incomplete marker tells`, () => {
-      const repo = remoteTrackingRepo({ missing: true, unborn });
-      if (repo === undefined) return;
-      for (const complete of [false, true]) {
-        const result = runAsOwner(repo, complete);
-        expect(result.status).toBe(0);
-        expect(result.stderr).not.toMatch(PERMISSION_PHRASE);
-        expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\n`);
-        expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the unpushed commits could not be counted');
-        expect(gitSummaryProblem(result.stdout, '')).toBe('the unpushed commits could not be counted');
-      }
-    });
-  }
-
-  it('review round 2 of PR #84, B-R2-1: a healthy repository with a remote-tracking ref prints no incomplete marker and has no problem', () => {
-    const repo = remoteTrackingRepo({ missing: false });
+  it('review round 2 of PR #84, B-R2-1: a healthy repository with a remote-tracking ref counts its unpushed commit', () => {
+    const repo = remoteTrackingRepo();
     if (repo === undefined) return;
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-      expect(result.stderr).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
   });
 
   /** Review round 3 of PR #84: Git as root on a repository of the owner (safe.directory), then the owner gets it back. */
   const rootGit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', '-c', 'protocol.file.allow=always', ...args);
   const giveToOwner = (folder: string) => spawnSync('chown', ['-R', '1000:1000', folder]);
 
-  it('review round 3 of PR #84, A-R3-1: a repository with a submodule prints the incomplete marker (its commits and stashes are not counted)', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    const sub = path.join(path.dirname(repo), 'sub');
-    git(path.dirname(repo), 'init', '-q', '-b', 'main', sub);
-    fs.writeFileSync(path.join(sub, 's.txt'), 's\n');
-    git(sub, 'add', 's.txt');
-    git(sub, 'commit', '-q', '-m', 'sub');
-    rootGit(repo, 'submodule', '-q', 'add', sub, 'sub');
-    rootGit(repo, 'commit', '-q', '-m', 'add sub');
-    giveToOwner(repo);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('submodules are not checked');
-    // The submodule's Git folder in .git/modules alone (no `.gitmodules` any more) is enough too.
-    fs.rmSync(path.join(repo, '.gitmodules'));
-    const withoutFile = runAsOwner(repo, true);
-    expect(withoutFile.status).toBe(0);
-    expect(gitSummaryProblem(withoutFile.stdout, '')).toBe('submodules are not checked');
-  });
-
-  it('review round 3 of PR #84, A-R3-2: a linked worktree prints the incomplete marker (its changes and detached commits are not counted)', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    const linked = path.join(path.dirname(repo), 'linked');
-    rootGit(repo, 'worktree', 'add', '-q', '--detach', linked);
-    fs.writeFileSync(path.join(linked, 'u.txt'), 'u\n');
-    giveToOwner(repo);
-    giveToOwner(linked);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} other worktrees are not checked\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('other worktrees are not checked');
-  });
-
   for (const unborn of [false, true]) {
     // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
     it(`review round 4 of PR #84, A-R4-1: a commit that only a tag reaches is not counted as unpushed (${unborn ? 'unborn HEAD' : 'HEAD with commits'})`, () => {
-      const repo = remoteTrackingRepo({ missing: false });
+      const repo = remoteTrackingRepo();
       if (repo === undefined) return;
       rootGit(repo, 'checkout', '-q', '--detach');
       fs.writeFileSync(path.join(repo, 't.txt'), 't\n');
@@ -1327,9 +1109,9 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
       if (unborn) rootGit(repo, 'rm', '-q', '-r', '--cached', '.');
       if (unborn) for (const file of ['a.txt', 'b.txt', 't.txt']) fs.rmSync(path.join(repo, file), { force: true });
       giveToOwner(repo);
-      const result = runAsOwner(repo, true);
+      // user decision 2026-10-02: Delete runs no Git (the poll mode; before: the complete mode of Delete's check).
+      const result = runAsOwner(repo);
       expect(result.status).toBe(0);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
       // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
       // main has 1 commit that origin/main lacks; the commit that only the tag reaches is not counted.
       expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
@@ -1354,15 +1136,13 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     // The clone has the tag (and so the commit of the deleted branch), but no remote branch contains it.
     expect(rootGit(clone, 'tag', '--list').trim()).toBe('v1');
     giveToOwner(clone);
-    for (const complete of [false, true]) {
-      const result = runAsOwner(clone, complete);
-      expect(result.status).toBe(0);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 });
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(clone);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 });
   });
 
-  it('review round 4 of PR #84, A-R4-2: a stash whose reflog was expired still counts as 1 stash, in both modes; after `git stash clear` 0', () => {
+  it('review round 4 of PR #84, A-R4-2: a stash whose reflog was expired still counts as 1 stash; after `git stash clear` 0', () => {
     const repo = stashRepo();
     if (repo === undefined) return;
     rootGit(repo, 'reflog', 'expire', '--expire=now', '--all');
@@ -1370,172 +1150,29 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     // Git's own listing shows no stash any more, while refs/stash still names one.
     expect(rootGit(repo, 'stash', 'list')).toBe('');
     expect(rootGit(repo, 'rev-parse', '-q', '--verify', 'refs/stash').trim()).not.toBe('');
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 1 });
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 1 });
     rootGit(repo, 'stash', 'clear');
     giveToOwner(repo);
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const cleared = runAsOwner(repo);
+    expect(cleared.status).toBe(0);
+    expect(parseGitSummaryOutput(cleared.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
   });
 
-  it('review round 3 of PR #84, B-R3-1: a stash whose object is deleted makes `git stash list` fail: the script exits non-zero (Delete reads unknown)', () => {
+  it('review round 3 of PR #84, B-R3-1: a stash whose object is deleted makes `git stash list` fail: the script exits non-zero', () => {
     const repo = stashRepo();
     if (repo === undefined) return;
     const id = rootGit(repo, 'rev-parse', 'refs/stash').trim();
     const object = path.join(repo, '.git', 'objects', id.slice(0, 2), id.slice(2));
     expect(fs.existsSync(object)).toBe(true);
     fs.rmSync(object);
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).not.toBe(0);
-      expect(result.status).not.toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
-      expect(result.stdout).toBe('');
-    }
-  });
-
-  it('review round 3 of PR #84, B-R3-2: a readability walk that fails without printing a path prints the incomplete marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    const bin = path.join(path.dirname(repo), 'bin');
-    fs.mkdirSync(bin);
-    fs.writeFileSync(path.join(bin, 'find'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-    fs.chmodSync(bin, 0o755);
-    const result = runAsOwner(repo, true, bin);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} not every file and folder of the repository could be read\n`);
-    expect(gitSummaryProblem(result.stdout, '')).toBe('not every file and folder of the repository could be read');
-    // The same repository without the stub: complete, no problem.
-    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBeUndefined();
-  });
-
-  it('review round 3 of PR #84, A-R3-3: an empty refs/stash whose reflog still has entries prints the incomplete marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.git', 'refs', 'stash'), '');
-    spawnSync('chown', ['1000:1000', path.join(repo, '.git', 'refs', 'stash')]);
-    const plain = runAsOwner(repo);
-    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the stash could not be read\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the stash could not be read');
-  });
-
-  it('review round 3 of PR #84, A-R3-5: a folder that Git ignores and the owner cannot read (a database folder) is not walked: no marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.gitignore'), 'data/\nmy data/\n-x/\n');
-    rootGit(repo, 'add', '.gitignore');
-    rootGit(repo, 'commit', '-q', '-m', 'ignore');
-    for (const folder of ['data/pg', 'my data/pg', '-x']) fs.mkdirSync(path.join(repo, folder), { recursive: true });
-    fs.writeFileSync(path.join(repo, 'data', 'pg', 'f'), 'x');
-    giveToOwner(repo);
-    toRoot(repo, 'data', 0o700, true);
-    spawnSync('chown', ['-R', '999:999', path.join(repo, 'data')]);
-    toRoot(repo, 'my data', 0o700, true);
-    toRoot(repo, '-x', 0o700, true);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 2, stashes: 2 });
-  });
-
-  it('review round 3 of PR #84, A-R3-5: with ignored folders left out, an unreadable folder that Git does not ignore still prints the marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.gitignore'), 'data/\n');
-    rootGit(repo, 'add', '.gitignore');
-    rootGit(repo, 'commit', '-q', '-m', 'ignore');
-    fs.mkdirSync(path.join(repo, 'data'));
-    fs.mkdirSync(path.join(repo, 'datax'));
-    giveToOwner(repo);
-    toRoot(repo, 'data', 0o700);
-    toRoot(repo, 'datax', 0o700);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(gitSummaryProblem(result.stdout, '')).toBe('datax cannot be read');
-    // An unreadable entry in .git is still found, whatever the working tree ignores.
-    fs.rmdirSync(path.join(repo, 'datax'));
-    toRoot(repo, '.git/refs/stash', 0o600);
-    expect(gitSummaryProblem(runAsOwner(repo, true).stdout, '')).toBe('.git/refs/stash cannot be read');
-  });
-
-  /** Review round 5 of PR #84, A-R5-2: runs the complete check as the owner and expects the marker of flagged files. */
-  function expectFlaggedMarker(repo: string): void {
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} ${GIT_SUMMARY_FLAGGED_FILES}\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe(GIT_SUMMARY_FLAGGED_FILES);
-  }
-
-  it('review round 5 of PR #84, A-R5-2: an edited file marked assume-unchanged reads clean to Git; the complete check prints the marker', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    rootGit(repo, 'update-index', '--assume-unchanged', 'a.txt');
-    fs.appendFileSync(path.join(repo, 'a.txt'), 'edited\n');
-    giveToOwner(repo);
-    const plain = runAsOwner(repo);
-    expect(plain.status).toBe(0);
-    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
-    expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
-    expectFlaggedMarker(repo);
-  });
-
-  it('review round 5 of PR #84, A-R5-2: an edited file marked skip-worktree reads clean to Git; the complete check prints the marker', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    rootGit(repo, 'update-index', '--skip-worktree', 'b.txt');
-    fs.appendFileSync(path.join(repo, 'b.txt'), 'edited\n');
-    giveToOwner(repo);
-    expect(parseGitSummaryOutput(runAsOwner(repo).stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
-    expectFlaggedMarker(repo);
-  });
-
-  it('review round 5 of PR #84, A-R5-2: with core.ignoreStat, an edited file reads clean to Git; the complete check prints the marker', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    rootGit(repo, 'config', 'core.ignoreStat', 'true');
-    fs.writeFileSync(path.join(repo, 'c.txt'), 'c\n');
-    rootGit(repo, 'add', 'c.txt');
-    rootGit(repo, 'commit', '-q', '-m', 'third');
-    fs.appendFileSync(path.join(repo, 'c.txt'), 'edited\n');
-    giveToOwner(repo);
-    expect(parseGitSummaryOutput(runAsOwner(repo).stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
-    expectFlaggedMarker(repo);
-  });
-
-  it('review round 5 of PR #84, A-R5-2: a sparse checkout (skip-worktree files absent from the working tree) and a plain repository print no marker', () => {
-    const plainRepo = remoteTrackingRepo({ missing: false });
-    if (plainRepo === undefined) return;
-    const plain = runAsOwner(plainRepo, true);
-    expect(plain.status).toBe(0);
-    expect(plain.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-    expect(gitSummaryProblem(plain.stdout, plain.stderr)).toBeUndefined();
-    const repo = ownerRepo();
-    if (repo === undefined) return;
-    fs.mkdirSync(path.join(repo, 'docs'));
-    fs.writeFileSync(path.join(repo, 'docs', 'd.txt'), 'd\n');
-    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
-    rootGit(repo, 'add', '.');
-    rootGit(repo, 'commit', '-q', '-m', 'more');
-    rootGit(repo, 'sparse-checkout', 'set', '--no-cone', '/a.txt');
-    expect(fs.existsSync(path.join(repo, 'docs', 'd.txt'))).toBe(false);
-    expect(fs.existsSync(path.join(repo, 'b.txt'))).toBe(false);
-    expect(rootGit(repo, 'ls-files', '-v')).toMatch(/^S b\.txt$/m);
-    giveToOwner(repo);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe('');
   });
 
   it('review round 5 of PR #84: log.showSignature and gpg.program of the repository configuration do not run a program', () => {
@@ -1567,15 +1204,14 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     rootGit(repo, 'stash', 'list');
     expect(fs.existsSync(ran)).toBe(true);
     fs.rmSync(ran);
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', stashes: 1 });
-      expect(fs.existsSync(ran)).toBe(false);
-    }
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', stashes: 1 });
+    expect(fs.existsSync(ran)).toBe(false);
   });
 
-  it('review round 5 of PR #84, B-R5-1: a commit on a detached HEAD that no branch holds counts as unpushed, with an empty branch, in both modes', () => {
+  it('review round 5 of PR #84, B-R5-1: a commit on a detached HEAD that no branch holds counts as unpushed, with an empty branch', () => {
     const repo = ownerRepo();
     if (repo === undefined) return;
     rootGit(repo, 'update-ref', 'refs/remotes/origin/main', 'main');
@@ -1584,155 +1220,11 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     rootGit(repo, 'add', 'd.txt');
     rootGit(repo, 'commit', '-q', '-m', 'detached');
     giveToOwner(repo);
-    for (const complete of [false, true]) {
-      const result = runAsOwner(repo, complete);
-      expect(result.status).toBe(0);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBeUndefined();
-      expect(result.stdout.split('\n')[0]).toBe('');
-      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
-    }
-  });
-
-  it('review round 5 of PR #84, B-R5-2: an ignored folder named `d*` is walked, not left out as a pattern: an unreadable `dz` that Git does not ignore still prints the marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.gitignore'), 'd\\*/\n');
-    rootGit(repo, 'add', '.gitignore');
-    rootGit(repo, 'commit', '-q', '-m', 'ignore');
-    fs.mkdirSync(path.join(repo, 'd*'));
-    fs.writeFileSync(path.join(repo, 'd*', 'f'), 'x');
-    fs.mkdirSync(path.join(repo, 'dz'));
-    fs.writeFileSync(path.join(repo, 'dz', 'f'), 'x');
-    giveToOwner(repo);
-    // Git ignores the folder `d*` alone (the pattern escapes the star), and lists it as such.
-    expect(rootGit(repo, '-c', 'core.quotePath=false', 'ls-files', '-o', '-i', '--exclude-standard', '--directory')).toBe('d*/\n');
-    for (const mode of [0o711, 0o700]) {
-      toRoot(repo, 'dz', mode, true);
-      const result = runAsOwner(repo, true);
-      expect(result.status).toBe(0);
-      expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} dz cannot be read\n`);
-      expect(gitSummaryProblem(result.stdout, '')).toBe('dz cannot be read');
-    }
-  });
-
-  it('review round 5 of PR #84, B-R5-2: a folder that Git ignores at the root only (`/data/`) leaves out that folder alone: an unreadable src/data still prints the marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.gitignore'), '/data/\n');
-    rootGit(repo, 'add', '.gitignore');
-    rootGit(repo, 'commit', '-q', '-m', 'ignore');
-    fs.mkdirSync(path.join(repo, 'data'));
-    fs.writeFileSync(path.join(repo, 'data', 'f'), 'x');
-    fs.mkdirSync(path.join(repo, 'src', 'data'), { recursive: true });
-    fs.writeFileSync(path.join(repo, 'src', 'data', 'f'), 'x');
-    giveToOwner(repo);
-    toRoot(repo, 'data', 0o700, true);
-    toRoot(repo, 'src/data', 0o700, true);
-    const result = runAsOwner(repo, true);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} src/data cannot be read\n`);
-    expect(gitSummaryProblem(result.stdout, '')).toBe('src/data cannot be read');
-    // Without src/data, the ignored root folder alone is left out: no marker.
-    fs.rmSync(path.join(repo, 'src'), { recursive: true });
-    const without = runAsOwner(repo, true);
-    expect(without.status).toBe(0);
-    expect(without.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
+    expect(result.stdout.split('\n')[0]).toBe('');
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
   });
 
-  it('review round 5 of PR #84, B-R5-3: a committed .gitmodules without a modules folder, and a dangling link .gitmodules, print the marker of submodules', () => {
-    const repo = remoteTrackingRepo({ missing: false });
-    if (repo === undefined) return;
-    fs.writeFileSync(path.join(repo, '.gitmodules'), '[submodule "sub"]\n\tpath = sub\n\turl = ../sub\n');
-    rootGit(repo, 'add', '.gitmodules');
-    rootGit(repo, 'commit', '-q', '-m', 'gitmodules');
-    giveToOwner(repo);
-    expect(fs.existsSync(path.join(repo, '.git', 'modules'))).toBe(false);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('submodules are not checked');
-    // A dangling link in its place (`[ -e ]` is false for it) is caught too.
-    fs.rmSync(path.join(repo, '.gitmodules'));
-    fs.symlinkSync('missing-target', path.join(repo, '.gitmodules'));
-    spawnSync('chown', ['-h', '1000:1000', path.join(repo, '.gitmodules')]);
-    const dangling = runAsOwner(repo, true);
-    expect(dangling.status).toBe(0);
-    expect(dangling.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} submodules are not checked\n`);
-  });
-
-  it('review round 5 of PR #84, B-R5-4: with a separate Git folder, a linked worktree prints the marker, in the main worktree and in the linked one', () => {
-    const repo = ownerRepo();
-    if (repo === undefined) return;
-    const base = path.dirname(repo);
-    const main = path.join(base, 'main');
-    const gitFolder = path.join(base, 'gitfolder');
-    git(base, 'init', '-q', '-b', 'main', '--separate-git-dir', gitFolder, main);
-    fs.writeFileSync(path.join(main, 'a.txt'), 'a\n');
-    rootGit(main, 'add', 'a.txt');
-    rootGit(main, 'commit', '-q', '-m', 'first');
-    rootGit(main, 'update-ref', 'refs/remotes/origin/main', 'main');
-    const linked = path.join(base, 'linked');
-    rootGit(main, 'worktree', 'add', '-q', '--detach', linked);
-    expect(fs.statSync(path.join(main, '.git')).isFile()).toBe(true);
-    for (const folder of [main, gitFolder, linked]) giveToOwner(folder);
-    for (const folder of [main, linked]) {
-      const result = runAsOwner(folder, true);
-      expect(result.status).toBe(0);
-      expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} other worktrees are not checked\n`);
-      expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('other worktrees are not checked');
-    }
-  });
-
-  it('review round 5 of PR #84, B-R5-5: a stash whose loose refs/stash is gone while its reflog stays prints the marker of the stash', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    const ref = path.join(repo, '.git', 'refs', 'stash');
-    expect(fs.existsSync(ref)).toBe(true);
-    fs.rmSync(ref);
-    expect(fs.statSync(path.join(repo, '.git', 'logs', 'refs', 'stash')).size).toBeGreaterThan(0);
-    expect(rootGit(repo, 'stash', 'list')).toBe('');
-    const plain = runAsOwner(repo);
-    expect(parseGitSummaryOutput(plain.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} the stash could not be read\n`);
-    expect(gitSummaryProblem(result.stdout, result.stderr)).toBe('the stash could not be read');
-  });
-
-  it('review round 5 of PR #84, B-R5-6: past GIT_SUMMARY_MAX_PRUNED_FOLDERS ignored folders, the next one is walked: an unreadable ig256 prints the marker', () => {
-    const repo = stashRepo();
-    if (repo === undefined) return;
-    const names = Array.from({ length: GIT_SUMMARY_MAX_PRUNED_FOLDERS + 1 }, (_, i) => `ig${String(i).padStart(3, '0')}`);
-    expect(names[names.length - 1]).toBe('ig256');
-    fs.writeFileSync(path.join(repo, '.gitignore'), names.map((name) => `${name}/\n`).join(''));
-    rootGit(repo, 'add', '.gitignore');
-    rootGit(repo, 'commit', '-q', '-m', 'ignore');
-    for (const name of names) {
-      fs.mkdirSync(path.join(repo, name));
-      fs.writeFileSync(path.join(repo, name, 'f'), 'x');
-    }
-    giveToOwner(repo);
-    toRoot(repo, 'ig256', 0o700, true);
-    const result = runAsOwner(repo, true);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain(`${GIT_SUMMARY_INCOMPLETE_MARKER} ig256 cannot be read\n`);
-    expect(gitSummaryProblem(result.stdout, '')).toBe('ig256 cannot be read');
-    // The last folder within the cap (ig255) is still left out.
-    giveToOwner(repo);
-    toRoot(repo, 'ig255', 0o700, true);
-    const within = runAsOwner(repo, true);
-    expect(within.status).toBe(0);
-    expect(within.stdout).not.toContain(GIT_SUMMARY_INCOMPLETE_MARKER);
-  });
-
-  it('review round 2 of PR #84, A-R2-2: a repository folder below a folder that its user cannot search exits with GIT_SUMMARY_NO_FOLDER_EXIT as that user', () => {
-    const repo = ownerRepo();
-    if (repo === undefined) return;
-    const closed = path.join(path.dirname(repo), 'closed');
-    fs.mkdirSync(closed, { mode: 0o700 });
-    const hidden = path.join(closed, 'repo');
-    fs.renameSync(repo, hidden);
-    // The script alone cannot tell this from a missing folder; the batch helper decides it as root (folderExit).
-    expect(runAsOwner(hidden, true).status).toBe(GIT_SUMMARY_NO_FOLDER_EXIT);
-  });
 });

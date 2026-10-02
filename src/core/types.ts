@@ -15,17 +15,6 @@ export interface GitSummary {
   recordedAt: string;
 }
 
-/**
- * Review round 1 of PR #84, A-R1-2: the result of Delete's check when the Git state could not be read (D1: "could not
- * read" never reads as "nothing to lose"). `reason`: why, briefly (the Git error or warning). `recorded`: the last
- * recorded state, if any; it is not current and is only named as such.
- */
-export interface UnknownGitState {
-  unknown: true;
-  reason: string;
-  recorded?: GitSummary;
-}
-
 /** Name of the current environment image and the digests it was built from (concept 7.5, 7.7). */
 export interface BuildRecord {
   builtAt: string;

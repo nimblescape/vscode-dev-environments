@@ -8,7 +8,7 @@
 // WorkspaceHelper (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts). It never runs a command line that it was
 // sent. Plan step 7 (user decision of 2026-10-01): the per-step runs of WorkspaceHelper are removed; every volume step is
 // a kind of this table and runs only in the batch helper of an operation. Pure functions. No `vscode`.
-import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
+import { configOwnershipFixCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { isStorageId } from '../storage/paths';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -42,7 +42,6 @@ export const BATCH_STEP_KINDS = [
   'runUserCommands',
   'gitFiles',
   'ownershipFix',
-  'gitSummary',
 ] as const;
 export type BatchStepKind = (typeof BATCH_STEP_KINDS)[number];
 
@@ -74,26 +73,19 @@ export interface BatchStepCommand {
    * step, as root when root owns it. The Docker Compose read steps (composeModel, composeHash): Compose follows `env_file`
    * and `include` of the repository, so it reads as that user, with CONFIG_FOLDER root's and 0700 during the step
    * (closeConfigFolder). By the
-   * agreed extension of the same day, readFiles, listConfigs and createFolders too; plan step 7 (user decision of
-   * 2026-10-01, "step 7 proposal accepted"): gitSummary, Delete's check, too. The steps that need the Docker
+   * agreed extension of the same day, readFiles, listConfigs and createFolders too. The steps that need the Docker
    * socket (readConfiguration, build, up, runUserCommands) and gitFiles and ownershipFix stay root; the clone stays Git's.
    */
   owner?: string;
   /**
    * Review round 1 of PR #84, A-R1-1: for an `owner` step, CONFIG_FOLDER is root's and 0700 during the step. Only the
    * steps that follow references in repository files (Docker Compose: `env_file`, `include`): composeModel and
-   * composeHash. The other owner steps (readFiles, listConfigs, createFolders, gitSummary) leave its owner and mode as
+   * composeHash. The other owner steps (readFiles, listConfigs, createFolders) leave its owner and mode as
    * they are, so that Git in a running dev container keeps reading its configuration there during the step (the
    * command-line `include.path` of credentials.gitconfig fails with EACCES otherwise); they still repair the root:root
    * 0700 that a killed step left.
    */
   closeConfigFolder?: boolean;
-  /**
-   * Review round 2 of PR #84, A-R2-2: for an `owner` step whose script tests the folder as its user (`[ -d ]`, false on
-   * EACCES too): its exit code `missing` stands only when root finds no folder at `owner` either (following a link);
-   * otherwise the batch helper returns `unreachable` (the folder exists, but the step's user cannot reach it).
-   */
-  folderExits?: { missing: number; unreachable: number };
   /**
    * The secret of the request (the GitHub token): `stdin`: required, the standard input of the step (TOKEN_PRELUDE writes
    * it to the tmpfs and removes it); `mask`: optional, only masked in the output; undefined: refused.
@@ -335,23 +327,6 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const p = fields(kind, params, ['folder', 'uid', 'gid']);
       if (p.folder !== CONFIG_FOLDER) fail(kind);
       return { command: checked(kind, () => configOwnershipFixCommand(CONFIG_FOLDER, text(kind, p.uid, 16), text(kind, p.gid, 16))), env: {}, git: false };
-    }
-    case 'gitSummary': {
-      // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): Delete's Git summary (GIT_SUMMARY_SCRIPT,
-      // built as WorkspaceHelper.gitSummary builds it) runs as the owner of the repository, like the other read steps: so
-      // Git meets no "dubious ownership", and a program that the repository configuration names (a filter driver) runs as
-      // that user, without the socket and with CONFIG_FOLDER closed. A folder that is missing (or a link) runs as nobody,
-      // so its `cd` fails and the check reports it as before. No secret.
-      const p = fields(kind, params, ['repository']);
-      const { folder } = folderOf(kind, p.repository);
-      // Review round 2 of PR #84: the check that every file can be read (A-R2-1), and "missing" decided by root (A-R2-2).
-      return {
-        command: gitSummaryCommand(folder, true),
-        env: {},
-        git: false,
-        owner: folder,
-        folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
-      };
     }
     default:
       throw new BatchStepError(`The batch helper does not know the step ${String(kind).slice(0, 64)}.`);

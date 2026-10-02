@@ -4,12 +4,10 @@
 
 // Plan step 6, PR B: the parts of the batch helper around its steps: the checks before the first step, the variables and
 // the log line of a step, the refusal of an unsafe helper, and a step process that ends with its whole group.
-import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT } from '../core/git/gitSummary';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
@@ -96,8 +94,8 @@ describe('prepareBatchHelper (plan step 6, PR B)', () => {
     });
     await expect(operations.listConfigs({ repository: 'octo/hello' }, context())).rejects.toMatchObject({ code: 'unsafe' });
     await expect(operations.listConfigs({ repository: '../x' }, context())).rejects.toMatchObject({ code: 'invalid' });
-    // Plan step 7 (user decision of 2026-10-01): changed expectation, the operation gitSummary is new.
-    expect(Object.keys(operations).sort()).toEqual(['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'gitSummary', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up']);
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, no operation gitSummary (was in plan step 7).
+    expect(Object.keys(operations).sort()).toEqual(['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up']);
     expect(new OperationError('x', 'y').code).toBe('x');
   });
 });
@@ -529,88 +527,6 @@ describe('the override folder is cleared before a read step runs (review round 3
       expect(fs.existsSync(override)).toBe(false);
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
-    }
-  });
-});
-
-/**
- * Review round 2 of PR #84, A-R2-2: "the repository folder is missing" (GIT_SUMMARY_NO_FOLDER_EXIT) is decided by the
- * batch helper as root (lstat of `<folder>/.`, which follows a link), not by `[ -d ]` as the step's user.
- */
-describe('the missing repository folder of gitSummary, decided as root (review round 2 of PR #84, A-R2-2)', () => {
-  const FOLDER = `${WORKSPACES_ROOT}/hello`;
-
-  /** ownerStepFiles, with root's view of `<folder>/.`: a folder, or an error with `code`. */
-  function rootView(view: 'folder' | string): BatchHelperDeps['fs'] {
-    return {
-      ...ownerStepFiles(),
-      lstatSync: ((name: string) => {
-        if (name !== `${FOLDER}/.`) return ownedLstat(name);
-        if (view === 'folder') return ownedLstat(FOLDER);
-        throw Object.assign(new Error(view), { code: view });
-      }) as never,
-    };
-  }
-
-  const cases: Array<{ view: string; exitCode: number; expected: number }> = [
-    { view: 'ENOENT', exitCode: GIT_SUMMARY_NO_FOLDER_EXIT, expected: GIT_SUMMARY_NO_FOLDER_EXIT },
-    { view: 'ENOTDIR', exitCode: GIT_SUMMARY_NO_FOLDER_EXIT, expected: GIT_SUMMARY_NO_FOLDER_EXIT },
-    { view: 'folder', exitCode: GIT_SUMMARY_NO_FOLDER_EXIT, expected: GIT_SUMMARY_UNREACHABLE_EXIT },
-    { view: 'ELOOP', exitCode: GIT_SUMMARY_NO_FOLDER_EXIT, expected: GIT_SUMMARY_UNREACHABLE_EXIT },
-    { view: 'folder', exitCode: 0, expected: 0 },
-    { view: 'folder', exitCode: 128, expected: 128 },
-  ];
-  for (const { view, exitCode, expected } of cases) {
-    it(`review round 2 of PR #84, A-R2-2: exit code ${exitCode} with root's view ${view} gives ${expected}`, async () => {
-      const { spawnStep } = recordingSpawn({ endOn: null, exitCode });
-      const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: rootView(view), env: {} });
-      expect(await operations.gitSummary({ repository: 'octo/hello' }, context())).toEqual({ exitCode: expected });
-    });
-  }
-
-  it('review round 2 of PR #84, A-R2-2: the other owner steps keep exit code 3 (no folderExits)', async () => {
-    const { spawnStep } = recordingSpawn({ endOn: null, exitCode: GIT_SUMMARY_NO_FOLDER_EXIT });
-    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: rootView('folder'), env: {} });
-    expect(await operations.listConfigs({ repository: 'octo/hello' }, context())).toEqual({ exitCode: GIT_SUMMARY_NO_FOLDER_EXIT });
-  });
-
-  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-  const hasTools = ['git', 'setpriv'].every((name) => !spawnSync(name, ['--version'], { stdio: 'ignore' }).error);
-
-  /**
-   * The real step: the real script as the user that asRepositoryOwner picks (nobody for a folder that its lstat cannot
-   * see as a real folder, here a link), the real lstat as root; the folder of the step is mapped to `real`.
-   */
-  async function realGitSummary(real: string): Promise<unknown> {
-    const files: BatchHelperDeps['fs'] = {
-      ...ownerStepFiles(),
-      lstatSync: ((name: string) => (name === FOLDER || name.startsWith(`${FOLDER}/`) ? fs.lstatSync(real + name.slice(FOLDER.length)) : ownedLstat(name))) as never,
-    };
-    const spawnStep: BatchHelperDeps['spawnStep'] = (command, env, input, onStdout, onStderr) =>
-      spawnStepProcess(
-        command.map((arg) => (arg === FOLDER ? real : arg)),
-        { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: env.HOME, GIT_CONFIG_NOSYSTEM: '1' },
-        input,
-        onStdout,
-        onStderr,
-      );
-    const operations = batchHelperOperations({ spawnStep, runQuiet: async () => {}, fs: files, env: {} });
-    return operations.gitSummary({ repository: 'octo/hello' }, context());
-  }
-
-  it.skipIf(!isRoot || !hasTools)('review round 2 of PR #84, A-R2-2: a link to a folder below one that nobody cannot search is unreachable; a dangling link and a missing folder are missing', async () => {
-    const base = fs.mkdtempSync(path.join(fs.existsSync('/var/tmp') ? '/var/tmp' : os.tmpdir(), 'devenv-reach-'));
-    try {
-      fs.chmodSync(base, 0o755);
-      fs.mkdirSync(path.join(base, 'x', 'sub'), { recursive: true, mode: 0o755 });
-      fs.chmodSync(path.join(base, 'x'), 0o700);
-      fs.symlinkSync(path.join(base, 'x', 'sub'), path.join(base, 'link'));
-      fs.symlinkSync(path.join(base, 'gone'), path.join(base, 'dangling'));
-      expect(await realGitSummary(path.join(base, 'link'))).toEqual({ exitCode: GIT_SUMMARY_UNREACHABLE_EXIT });
-      expect(await realGitSummary(path.join(base, 'dangling'))).toEqual({ exitCode: GIT_SUMMARY_NO_FOLDER_EXIT });
-      expect(await realGitSummary(path.join(base, 'missing'))).toEqual({ exitCode: GIT_SUMMARY_NO_FOLDER_EXIT });
-    } finally {
-      fs.rmSync(base, { recursive: true, force: true });
     }
   });
 });

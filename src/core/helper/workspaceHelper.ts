@@ -12,12 +12,12 @@
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { runPreparingWorker } from '../docker/workerPreparation';
-import { CommandError, GitStateUnreadableError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
-import { GitProblemWatcher, configOwnershipFixCommand, gitSummaryCommand, gitSummaryProblem, parseGitSummaryOutput } from '../git/gitSummary';
+import { CommandError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
+import { configOwnershipFixCommand } from '../git/gitSummary';
 import { Messages } from '../messages';
 import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT, environmentIdLabel } from '../names';
-import { abortError, isAbortError, isoTime, systemClock, type Clock, type Logger, type RunResult } from '../ports';
-import type { DevcontainerConfig, DevcontainerResult, GitSummary } from '../types';
+import { abortError, isAbortError, systemClock, type Clock, type Logger, type RunResult } from '../ports';
+import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import {
   DevcontainerCommandError,
   buildArgs,
@@ -288,13 +288,6 @@ const BATCH_ENV_KINDS: ReadonlySet<BatchStepKind> = new Set<BatchStepKind>(['rea
 
 /** Time limit of the model run of a Docker Compose configuration (composeModel). */
 export const COMPOSE_MODEL_TIMEOUT_MS = 60_000;
-
-/**
- * Review round 3 of PR #84, A-R3-4: the time limit of the step gitSummary (Delete's check, WorkspaceHelper.gitSummary),
- * which holds the lock of the environment: generous, for a large repository and its readability walk. A hanging
- * program of the repository configuration (a filter driver) then ends the check with an unknown Git state.
- */
-export const GIT_SUMMARY_TIMEOUT_MS = 5 * 60_000;
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
 export class WorkspaceHelper {
@@ -970,35 +963,6 @@ export class WorkspaceHelper {
       timeoutMs: p.timeoutMs,
       signal: p.signal,
     });
-  }
-
-  /**
-   * Git state of the repository in the volume (for a container that does not run). Plan step 7 (user decision of
-   * 2026-10-01): the step gitSummary, as the owner of the repository (as nobody when the folder is missing), without the
-   * Docker socket: Git runs programs that the repository configuration names. Throws CommandError. Review round 1 of
-   * PR #84, A-R1-2: throws GitStateUnreadableError when Git exits with 0 but could not read everything (a permission
-   * problem on stderr, or a count that failed), so that its counts are never taken for the whole state. Review round 3
-   * of PR #84, A-R3-4: the step ends after `timeoutMs` (GIT_SUMMARY_TIMEOUT_MS by default) with an Error that is no
-   * AbortError, so that Delete's check reads it as an unknown state (with "Delete anyway"), never as a cancel.
-   */
-  async gitSummary(p: { volumeName: string; repository: string; signal?: AbortSignal; timeoutMs?: number }): Promise<GitSummary> {
-    const folder = this.repositoryFolder(p.repository);
-    const problems = new GitProblemWatcher();
-    const result = await this.runStreams(p.volumeName, gitSummaryCommand(folder, true), {
-      // Plan step 7 (user decision of 2026-10-01): a step of the batch helper, as the owner of the repository.
-      batch: { kind: 'gitSummary', params: { repository: p.repository } },
-      // Review round 3 of PR #84, A-R3-4: the step holds the lock of the environment; its time limit ends it.
-      timeoutMs: p.timeoutMs ?? GIT_SUMMARY_TIMEOUT_MS,
-      signal: p.signal,
-      onStderr: (text) => {
-        this.logOutput(text);
-        problems.push(text);
-      },
-    });
-    if (result.exitCode !== 0) throw new CommandError('git summary', result.exitCode, result.stdout, result.stderr);
-    const problem = problems.problem() ?? gitSummaryProblem(result.stdout, result.stderr);
-    if (problem !== undefined) throw new GitStateUnreadableError(problem);
-    return parseGitSummaryOutput(result.stdout, isoTime(this.clock));
   }
 
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);

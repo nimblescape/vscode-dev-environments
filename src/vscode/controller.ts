@@ -15,7 +15,6 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, listSome } from '../core/messages';
-import { isUnknownGitState } from '../core/git/gitSummary';
 import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
@@ -774,11 +773,11 @@ export class Controller implements vscode.Disposable {
         const otherWindow = (await this.connectedInOtherWindow(environment.id))
           ? ` ${ControllerTexts.otherWindowClosesConnection(repository)}`
           : '';
-        // Without a summary (the volume is missing), the confirmation follows at once.
-        // Review round 1 of PR #84, A-R1-2: an unknown Git state always gets the warning with "Delete anyway", never the
-        // plain confirmation (safetyCheck returns no summary only for a missing volume).
-        const unknown = isUnknownGitState(summary) ? summary : undefined;
-        const changes = summary && !isUnknownGitState(summary) ? formatChanges(summary) : '';
+        // User decision 2026-10-02 ("No git needs delete. ... we may flag uncommitted changes though, but that does not
+        // hinder deletion."): the summary is the recorded Git state (refreshed when the dev container runs); changes in it
+        // are named with "Delete anyway". Without a summary (nothing recorded, or the volume is missing), the plain
+        // confirmation follows at once. Either way the user can delete.
+        const changes = summary ? formatChanges(summary) : '';
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.
         // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
@@ -790,13 +789,9 @@ export class Controller implements vscode.Disposable {
           ]),
         ];
         const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
-        if (unknown !== undefined || changes !== '') {
-          const question =
-            unknown !== undefined
-              ? Messages.deleteGitStateUnknown(repository, unknown.reason, unknown.recorded ? formatChanges(unknown.recorded) || undefined : undefined)
-              : Messages.deleteUnsaved(repository, changes);
+        if (changes !== '') {
           const choice = await vscode.window.showWarningMessage(
-            `${question}${repositoryDataText}${otherWindow}`,
+            `${Messages.deleteUnsaved(repository, changes)}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.openEnvironment,
             Actions.deleteAnyway,

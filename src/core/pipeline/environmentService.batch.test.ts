@@ -5,8 +5,9 @@
 // Plan step 6, PR C: the batch scope of the opens in the environment service. Start, Rebuild, Select configuration, Clone
 // again and a first open run their helper steps in the batch scope of the volume of the environment (batchScope.ts),
 // opened under the held lock and closed before its release: on success, on a failure, and on a cancel; before the
-// removal of the volume (a failed first open) its session is closed first. Plan step 7 (user decision of 2026-10-01):
-// Delete's Git summary and the listing of the configuration picker run in a scope of their own under the lock too. The token write into the dev container uses the secret input of the
+// removal of the volume (a failed first open) its session is closed first. Plan step 7 (user decision of 2026-10-01): the
+// listing of the configuration picker runs in a scope of its own under the lock too. User decision 2026-10-02: Delete's
+// check runs no Git in the batch helper (no scope, no lock). The token write into the dev container uses the secret input of the
 // call (Q4: through the worker that holds the lock). The FakeHelper does not route itself; each of its volume steps
 // runs one step of the scope here, as WorkspaceHelper does.
 import { createHash } from 'crypto';
@@ -43,8 +44,6 @@ const VOLUME_STEPS = [
   'runUserCommands',
   'prepareGit',
   'fixConfigOwnership',
-  // Plan step 7 (user decision of 2026-10-01): Delete's Git summary is a step of the batch helper too.
-  'gitSummary',
 ] as const;
 
 /** A HelperDocker for the real WorkspaceHelper (plan step 7): in the scope it runs nothing. */
@@ -278,8 +277,9 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
     expect(h.helper.calls).not.toContain('listConfigurations');
   });
 
-  // Review round 3 of PR #84, B-R3-3: as Delete's check (B-R1-1), a cancel of the picker's listing passes its signal to
-  // the step: the listing rejects as cancelled, the session is closed, and the lock is released.
+  // Review round 3 of PR #84, B-R3-3: as Delete's check did (B-R1-1; it runs no step since the user decision
+  // 2026-10-02), a cancel of the picker's listing passes its signal to the step: the listing rejects as cancelled, the
+  // session is closed, and the lock is released.
   for (const when of ['lock wait', 'listConfigs step'] as const) {
     it(`review round 3 of PR #84, B-R3-3: a cancel during the ${when} of the picker's listing rejects as cancelled; the lock is released`, async () => {
       await seedEnvironment(h, { container: 'stopped' });
@@ -552,109 +552,43 @@ describe('a batch helper that cannot be opened refuses the open (user decision o
 });
 
 /**
- * Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): Delete's Git summary runs in the batch helper of
- * the volume under the lock of the environment, as the owner of the repository; the lock is released before the check
- * returns (so before the user's confirmation), and Delete takes it again. A lock held elsewhere refuses after its wait
- * (D3); a batch helper that cannot be opened refuses the check (D1).
+ * User decision 2026-10-02 ("No git needs delete. ... we may flag uncommitted changes though, but that does not hinder
+ * deletion."): Delete's check runs no step of the batch helper and takes no lock (was in plan step 7: the step
+ * gitSummary in a session under the lock). It names the recorded Git state, refreshed with `docker exec` in a running
+ * dev container; Delete itself still takes the lock.
  */
-describe("Delete's check in the batch helper (plan step 7)", () => {
-  /** A HelperDocker for the real WorkspaceHelper: in the scope it runs nothing. */
-  const noDocker: HelperDocker = {
-    run: async () => {
-      throw new Error('A docker run in the scope.');
-    },
-    imageExists: async () => true,
-    imageId: async () => PINNED.id,
-    buildImage: async () => PINNED.id,
-    listImagesByLabel: async () => [],
-    removeImage: async () => true,
-  };
-
-  it('opens one session under the lock, runs gitSummary as the owner, releases the lock before it returns, and records the summary', async () => {
-    await seedEnvironment(h, { container: 'stopped' });
-    // Delete has no pinned image: the step takes the image of the window (WorkspaceHelper.image), by its ID.
-    const dockerfile = path.join(h.root, 'Dockerfile');
-    fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
-    realHelper = new WorkspaceHelper({ docker: noDocker, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
-    const summary = await h.service.safetyCheck(ENV_ID, { progress: h.progress });
-    // The lock is released when the check returns: nothing is held while the user is asked.
-    expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
-    expect(lockWaits).toEqual([ENVIRONMENT_LOCK_WAIT_SECONDS]);
-    expect(scopes).toEqual([`gitSummary ${VOLUME}`]);
-    expect(recorded).toEqual([{ kind: 'gitSummary', params: { repository: REPO } }]);
-    expect(batchStepCommand('gitSummary', recorded[0].params).owner).toBe(`/workspaces/${REPO.split('/')[1]}`);
-    const { recordedAt: _recordedAt, ...expected } = h.helper.gitSummaryResult as Exclude<typeof h.helper.gitSummaryResult, Error>;
-    expect(summary).toMatchObject(expected);
-    expect((await h.registry.get(ENV_ID))?.gitSummary).toMatchObject(expected);
-    // Delete takes the lock again for itself.
+describe("Delete's check runs no Git in the batch helper (user decision 2026-10-02)", () => {
+  it('user decision 2026-10-02: a stopped container: no lock, no session, no step; the recorded state; Delete takes the lock for itself', async () => {
+    const env = await seedEnvironment(h, { container: 'stopped' });
+    expect(await h.service.safetyCheck(ENV_ID, { progress: h.progress })).toEqual(env.gitSummary);
+    expect(events).toEqual([]);
+    expect(scopes).toEqual([]);
+    expect(recorded).toEqual([]);
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
     await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
-    expect(frame().filter((event) => event === 'lock')).toHaveLength(2);
+    expect(frame().filter((event) => event === 'lock')).toHaveLength(1);
     expect(await h.registry.get(ENV_ID)).toBeUndefined();
   });
 
-  it('user decision D3: a lock held by another window refuses the check after its wait; nothing runs and the record stays', async () => {
-    await seedEnvironment(h, { container: 'stopped' });
-    const before = (await h.registry.get(ENV_ID))?.gitSummary;
-    lockError = new EnvironmentLockError('busy', 'The lock stayed held by another holder for 10 s.');
-    const error = await h.service.safetyCheck(ENV_ID, { progress: h.progress }).then(
-      () => undefined,
-      (reason: unknown) => reason as UserFacingError,
-    );
-    expect(error?.message).toBe(PipelineTexts.environmentLockBusy(REPO));
-    expect(lockWaits).toEqual([ENVIRONMENT_LOCK_WAIT_SECONDS]);
+  it('user decision 2026-10-02: a running container: the refresh runs in the dev container, never as a step of the batch helper', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: 'feature\n1\n2\n3\n' });
+    expect(await h.service.safetyCheck(ENV_ID, { progress: h.progress })).toMatchObject({ branch: 'feature', uncommittedFiles: 1, unpushedCommits: 2, stashes: 3 });
+    expect(h.docker.execs.map((exec) => exec.user)).toEqual(['vscode']);
+    expect(events).toEqual([]);
     expect(scopes).toEqual([]);
-    expect(h.helper.calls).not.toContain('gitSummary');
-    expect((await h.registry.get(ENV_ID))?.gitSummary).toEqual(before);
+    expect(recorded).toEqual([]);
+    expect(h.helper.calls).toEqual([]);
   });
 
-  it('user decision D1: a batch helper that cannot be opened refuses the check (no recorded state instead); the lock is released', async () => {
-    await seedEnvironment(h, { container: 'stopped' });
-    const before = (await h.registry.get(ENV_ID))?.gitSummary;
+  it('user decision 2026-10-02: a batch helper that cannot be opened and a busy lock do not hinder the check', async () => {
+    const env = await seedEnvironment(h, { container: 'stopped' });
     batchError = new Error('the helper image is not on the host');
-    const error = await h.service.safetyCheck(ENV_ID, { progress: h.progress }).then(
-      () => undefined,
-      (reason: unknown) => reason,
-    );
-    expect(isBatchHelperUnavailable(error)).toBe(true);
-    expect((error as UserFacingError).detail).toContain('the helper image is not on the host');
-    expect(frame()).toEqual(['lock', `open refused ${VOLUME}`, 'release']);
-    expect(h.helper.calls).not.toContain('gitSummary');
-    expect((await h.registry.get(ENV_ID))?.gitSummary).toEqual(before);
+    lockError = new EnvironmentLockError('busy', 'The lock stayed held by another holder for 10 s.');
+    expect(await h.service.safetyCheck(ENV_ID, { progress: h.progress })).toEqual(env.gitSummary);
+    expect(events).toEqual([]);
   });
-
-  // Review round 1 of PR #84, B-R1-1: a cancelled check is refused as cancelled. It never falls back to the recorded
-  // summary, and never becomes an unknown Git state (A-R1-2); the registry keeps its entry, and no lock stays held.
-  for (const when of ['lock wait', 'gitSummary step'] as const) {
-    it(`review round 1 of PR #84, B-R1-1: a cancel during the ${when} rejects as cancelled, never with the recorded summary; the lock is released`, async () => {
-      await seedEnvironment(h, { container: 'stopped' });
-      const before = await h.registry.get(ENV_ID);
-      expect(before?.gitSummary).toBeDefined();
-      const controller = new AbortController();
-      if (when === 'lock wait') onLockWait = () => controller.abort();
-      else onStep = () => controller.abort();
-      // The step runs as the real WorkspaceHelper sends it (kind gitSummary), with the image of the window.
-      const dockerfile = path.join(h.root, 'Dockerfile');
-      fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
-      realHelper = new WorkspaceHelper({ docker: noDocker, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
-      const error = await h.service.safetyCheck(ENV_ID, { progress: h.progress, signal: controller.signal }).then(
-        (summary) => ({ summary }),
-        (reason: unknown) => reason,
-      );
-      expect(error).toBeInstanceOf(UserFacingError);
-      expect((error as UserFacingError).code).toBe('cancelled');
-      expect(await h.registry.get(ENV_ID)).toEqual(before);
-      if (when === 'lock wait') {
-        // The lock was never granted: nothing to release, no session, no step.
-        expect(frame()).toEqual(['lock']);
-        expect(recorded).toEqual([]);
-      } else {
-        // The session is closed and the lock released, in that order.
-        expect(frame()).toEqual(['lock', `open s1 ${VOLUME}`, 'close s1', 'release']);
-        expect(recorded.map((step) => step.kind)).toEqual(['gitSummary']);
-      }
-      expect(h.helper.calls).not.toContain('gitSummary');
-    });
-  }
 
   it('a missing volume needs no lock: the check returns undefined', async () => {
     await seedEnvironment(h, { volume: false, container: null });

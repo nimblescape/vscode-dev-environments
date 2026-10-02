@@ -61,17 +61,6 @@ export function isBatchHelperUnavailable(error: unknown): error is BatchHelperUn
   return error instanceof BatchHelperUnavailableError;
 }
 
-/**
- * Review round 1 of PR #84, A-R1-2: the Git summary ran (exit code 0) but Git could not read everything (`problem`, for
- * example `warning: could not open directory 'data/': Permission denied`), so its counts may miss changes.
- */
-export class GitStateUnreadableError extends Error {
-  constructor(readonly problem: string) {
-    super(`Git could not read the whole repository: ${problem}`);
-    this.name = 'GitStateUnreadableError';
-  }
-}
-
 /** A command that ended with a non-zero exit code. */
 export class CommandError extends Error {
   constructor(

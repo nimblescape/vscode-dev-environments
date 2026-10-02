@@ -15,11 +15,10 @@ import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import { CommandError, GitStateUnreadableError, UserFacingError, isUserFacingError } from '../errors';
+import { CommandError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
-import { GIT_SUMMARY_COMPLETE, GIT_SUMMARY_INCOMPLETE_MARKER, GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
-import { MAX_CAPTURED_STDERR_CHARACTERS } from './analysisLimits';
-import { abortError, isAbortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { configOwnershipFixCommand } from '../git/gitSummary';
+import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
@@ -45,7 +44,6 @@ import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
   COMPOSE_MODEL_TIMEOUT_MS,
   DOCKER_SOCKET,
-  GIT_SUMMARY_TIMEOUT_MS,
   HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
@@ -247,7 +245,7 @@ const VOLUME_METHODS = new Set([
   'runUserCommands',
   'prepareGit',
   'fixConfigOwnership',
-  'gitSummary',
+  // user decision 2026-10-02: Delete runs no Git: WorkspaceHelper.gitSummary is removed (no step of it to batch).
 ]);
 
 /** The lock of the last scope that batched() opened. */
@@ -858,7 +856,7 @@ describe('WorkspaceHelper without a previous helper image (user decision 2026-09
     await batched(helper).prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' }, image });
     expect(references()).toEqual([fakeImageId(TAG), fakeImageId(TAG), fakeImageId(TAG)]);
     // Plan step 7 (user decision of 2026-10-01): changed expectation (was: a run outside an open uses the tag): a step
-    // outside an open (Delete's check, the picker) runs after the ensure of withEnvironmentLock (ensureImagePresent),
+    // outside an open (the picker; user decision 2026-10-02: Delete's check runs no step) runs after the ensure of withEnvironmentLock (ensureImagePresent),
     // with the image that the tag has now, by its ID.
     await helper.ensureImagePresent();
     await helperStep(helper);
@@ -1999,157 +1997,6 @@ describe('WorkspaceHelper file and Git queries', () => {
     ]);
     expect(commandOf(docker.runs[0].args)).toEqual(['node', '-e', LIST_CONFIGS_SCRIPT, '/workspaces/api']);
   });
-
-  it('gitSummary parses the output of the script', async () => {
-    docker.handler = () => ({ stdout: 'main\n1\n2\n0\n' });
-    expect(await createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).toEqual({
-      branch: 'main',
-      uncommittedFiles: 1,
-      unpushedCommits: 2,
-      stashes: 0,
-      recordedAt: '2026-09-24T17:10:00.000Z',
-    });
-    // Review round 2 of PR #84, A-R2-1: changed expectation: Delete's check adds GIT_SUMMARY_COMPLETE.
-    expect(commandOf(docker.runs[0].args)).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api', GIT_SUMMARY_COMPLETE]);
-  });
-
-  it('throws CommandError when a query fails', async () => {
-    docker.handler = () => ({ exitCode: 128, stderr: 'fatal: not a git repository\n' });
-    await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toBeInstanceOf(CommandError);
-  });
-
-  // Review round 1 of PR #84, A-R1-2: as the owner, Git may not open an untracked folder of another uid (0700): it warns
-  // and exits 0 with 0 changes. Those counts are never returned as the Git state.
-  for (const forward of [true, false]) {
-    it(`review round 1 of PR #84, A-R1-2: gitSummary throws GitStateUnreadableError for exit code 0 with a permission warning on stderr (${forward ? 'streamed' : 'captured only'})`, async () => {
-      docker.forwardOutput = forward;
-      docker.handler = () => ({ stdout: 'main\n0\n0\n0\n', stderr: "warning: could not open directory 'data/pg/': Permission denied\n" });
-      const error = await createHelper()
-        .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
-        .then(() => undefined, (reason: unknown) => reason);
-      expect(error).toBeInstanceOf(GitStateUnreadableError);
-      expect((error as GitStateUnreadableError).problem).toBe("warning: could not open directory 'data/pg/': Permission denied");
-    });
-  }
-
-  it('review round 1 of PR #84, A-R1-2: gitSummary throws GitStateUnreadableError when the script marks a count it could not make', async () => {
-    docker.handler = () => ({ stdout: 'devenv-git-summary-incomplete: the unpushed commits could not be counted\nmain\n0\n0\n0\n' });
-    await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({
-      name: 'GitStateUnreadableError',
-      problem: 'the unpushed commits could not be counted',
-    });
-  });
-
-  // Review round 2 of PR #84, B-R2-1: the output of the real GIT_SUMMARY_SCRIPT for a remote-tracking ref at a deleted
-  // commit object (gitSummary.test.ts reproduces it): exit code 0, no permission phrase on stderr, only the marker.
-  for (const forward of [true, false]) {
-    it(`review round 2 of PR #84, B-R2-1: the incomplete marker alone, with exit code 0 and no permission phrase on stderr, makes the state unknown (${forward ? 'streamed' : 'captured only'})`, async () => {
-      docker.forwardOutput = forward;
-      const stderr = 'fatal: bad object origin/main\n';
-      expect(stderr).not.toMatch(/Permission denied|could not open directory|unable to access|cannot open/i);
-      docker.handler = () => ({ exitCode: 0, stdout: `${GIT_SUMMARY_INCOMPLETE_MARKER} the unpushed commits could not be counted\nmain\n0\n0\n0\n`, stderr });
-      await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({
-        name: 'GitStateUnreadableError',
-        problem: 'the unpushed commits could not be counted',
-      });
-    });
-  }
-
-  it('review round 2 of PR #84, B-R2-2: a permission warning streamed across chunks, then more than 1 MiB of other stderr (not in the captured end), makes the state unknown', async () => {
-    // The fake forwards nothing itself: the handler streams the chunks, and the result keeps only the captured end.
-    docker.forwardOutput = false;
-    const filler = "warning: in the working copy of 'src/file.txt', LF will be replaced by CRLF the next time Git touches it\n";
-    const fillerChunk = filler.repeat(Math.ceil(64 * 1024 / filler.length));
-    const fillerChunks = Math.ceil((MAX_CAPTURED_STDERR_CHARACTERS + 1) / fillerChunk.length) + 1;
-    let streamed = '';
-    docker.handler = (_args, options) => {
-      const send = (text: string) => {
-        streamed += text;
-        options.onStderr?.(text);
-      };
-      send("warning: could not open directory 'data/': Perm");
-      send('ission denied\n');
-      for (let i = 0; i < fillerChunks; i++) send(fillerChunk);
-      return { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: streamed.slice(-MAX_CAPTURED_STDERR_CHARACTERS) };
-    };
-    const error = await createHelper()
-      .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
-      .then(() => undefined, (reason: unknown) => reason);
-    // The warning is only in the stream: more than MAX_CAPTURED_STDERR_CHARACTERS of other stderr followed it.
-    expect(streamed.length - streamed.indexOf('Permission denied')).toBeGreaterThan(MAX_CAPTURED_STDERR_CHARACTERS);
-    expect(streamed.slice(-MAX_CAPTURED_STDERR_CHARACTERS)).not.toContain('Permission denied');
-    expect(error).toBeInstanceOf(GitStateUnreadableError);
-    expect((error as GitStateUnreadableError).problem).toBe("warning: could not open directory 'data/': Permission denied");
-  });
-
-  it('review round 3 of PR #84, A-R3-4: gitSummary ends at GIT_SUMMARY_TIMEOUT_MS with an Error that is no AbortError (an unknown state, never a cancel)', async () => {
-    expect(GIT_SUMMARY_TIMEOUT_MS).toBe(5 * 60_000);
-    let started!: () => void;
-    const running = new Promise<void>((resolve) => (started = resolve));
-    docker.handler = (args, options) => {
-      if (args[0] !== 'run') return {};
-      started();
-      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(abortError())));
-    };
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const caught = createHelper()
-        .gitSummary({ volumeName: 'vol', repository: 'acme/api' })
-        .then(() => undefined, (reason: unknown) => reason);
-      await running;
-      await vi.advanceTimersByTimeAsync(GIT_SUMMARY_TIMEOUT_MS - 1);
-      let settled = false;
-      void caught.then(() => (settled = true));
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      const error = await caught;
-      expect(error).toBeInstanceOf(Error);
-      expect(isAbortError(error)).toBe(false);
-      expect(isUserFacingError(error)).toBe(false);
-      expect((error as Error).message).toMatch(/did not end within 300 seconds/);
-      expect(bridge.kinds).toEqual(['gitSummary']);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('review round 5 of PR #84, B-R5-7: a timeoutMs passed to gitSummary is the time limit of the batch step (not GIT_SUMMARY_TIMEOUT_MS)', async () => {
-    let started!: () => void;
-    const running = new Promise<void>((resolve) => (started = resolve));
-    docker.handler = (args, options) => {
-      if (args[0] !== 'run') return {};
-      started();
-      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(abortError())));
-    };
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const caught = createHelper()
-        .gitSummary({ volumeName: 'vol', repository: 'acme/api', timeoutMs: 7_000 })
-        .then(() => undefined, (reason: unknown) => reason);
-      await running;
-      await vi.advanceTimersByTimeAsync(6_999);
-      let settled = false;
-      void caught.then(() => (settled = true));
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      await Promise.resolve();
-      expect(settled).toBe(true);
-      const error = await caught;
-      expect(error).toBeInstanceOf(Error);
-      expect(isAbortError(error)).toBe(false);
-      expect((error as Error).message).toMatch(/did not end within 7 seconds/);
-      expect(bridge.kinds).toEqual(['gitSummary']);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('review round 1 of PR #84, A-R1-2: gitSummary keeps CommandError for exit code 128 (a root 0600 .git/index)', async () => {
-    docker.handler = () => ({ exitCode: 128, stderr: 'fatal: .git/index: index file open failed: Permission denied\n' });
-    await expect(createHelper().gitSummary({ volumeName: 'vol', repository: 'acme/api' })).rejects.toMatchObject({ name: 'CommandError', exitCode: 128 });
-  });
 });
 
 describe('Docker access of the helper runs', () => {
@@ -3200,7 +3047,7 @@ describe('plan step 7 (user decision of 2026-10-01): no volume step outside the 
       ['runUserCommands', () => helper.runUserCommands({ volumeName: 'vol', repository: 'o/a', override: OVERRIDE, environmentId: 'e', containerId: 'c'.repeat(64), token: TOKEN })],
       ['prepareGit', () => helper.prepareGit({ volumeName: 'vol', repository: 'o/a', identity: { name: 'A', email: 'a@example.com' } })],
       ['fixConfigOwnership', () => helper.fixConfigOwnership({ volumeName: 'vol', folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' })],
-      ['gitSummary', () => helper.gitSummary({ volumeName: 'vol', repository: 'o/a' })],
+      // user decision 2026-10-02: Delete runs no Git: changed expectation, WorkspaceHelper.gitSummary is removed (no case).
     ];
     for (const [name, call] of calls) {
       const error = await call().then(

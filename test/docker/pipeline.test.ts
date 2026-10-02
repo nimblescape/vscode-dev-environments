@@ -1198,7 +1198,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(helperContainers()).toEqual([]);
   });
 
-  it('plan step 7: the safety check of a volume without the repository folder runs as nobody in one batch helper and gives the recorded state', async () => {
+  it('user decision 2026-10-02: the safety check of a volume without the repository folder runs no batch helper and gives the recorded state', async () => {
     const repository = 'devenv-test/empty';
     const id = newEnvironmentId();
     const name = resourceName(repository, id);
@@ -1207,10 +1207,10 @@ describe('open pipeline on a seeded environment', () => {
       await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
       const now = isoTime(systemClock);
       await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
-      // The folder is missing: the step runs as nobody, the script exits with GIT_SUMMARY_NO_FOLDER_EXIT (review round 1
-      // of PR #84, A-R1-2; before: its `cd` failed), and the check gives the recorded state (as before).
+      // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: one batch helper, its
+      // step as nobody): no container runs, so the check gives the recorded state without any helper or lock.
       expect(await online.safetyCheck(id, { progress: new RecordingProgress() })).toEqual(recorded);
-      expect(locks.batches.get(id) ?? []).toHaveLength(1);
+      expect(locks.batches.get(id) ?? []).toHaveLength(0);
       expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_RUN}=true`, '--filter', `volume=${name}`])).toEqual([]);
     } finally {
       await registry.remove(id);
@@ -1218,35 +1218,16 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
-  // Review round 1 of PR #84, A-R1-2 (D1: "could not read" never reads as "nothing to lose"): an untracked 0700 folder of
-  // another uid. Git as the owner cannot open it, warns, and exits 0 with fewer changes; the check reports the state as
-  // unknown (with the warning), and the registry keeps its recorded state. The folder is removed again after.
-  it('review round 1 of PR #84, A-R1-2: an untracked 0700 folder of another uid makes the safety check report an unknown Git state', async () => {
-    const before = (await registry.get(environmentId))?.gitSummary;
-    const planted = await runInVolume(docker, volumeName, ['sh', '-c', `mkdir ${FOLDER}/private-data && echo x > ${FOLDER}/private-data/f && chown -R 4242:4242 ${FOLDER}/private-data && chmod 0700 ${FOLDER}/private-data`]);
-    expect(planted.exitCode, planted.stderr).toBe(0);
-    try {
-      const summary = await online.safetyCheck(environmentId, { progress: new RecordingProgress() });
-      expect(summary).toMatchObject({ unknown: true });
-      expect((summary as { reason: string }).reason).toContain('Permission denied');
-      expect((await registry.get(environmentId))?.gitSummary).toEqual(before);
-      expect(helperContainers()).toEqual([]);
-    } finally {
-      const removed = await runInVolume(docker, volumeName, ['rm', '-rf', `${FOLDER}/private-data`]);
-      expect(removed.exitCode, removed.stderr).toBe(0);
-    }
-  });
-
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {
     const progress = new RecordingProgress();
     const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
     const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
-    // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the Git summary ran in exactly one batch
-    // helper under the lock, as the owner of the repository (the remote user after the ownership fix), and no helper is
-    // left. Its counts are those of before (the untracked file, the one commit without a remote).
+    // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: the Git summary in exactly
+    // one batch helper under the lock): the check opens no batch helper; it names the recorded state, refreshed in the
+    // dev container when it runs. Its counts are those of before (the untracked file, the one commit without a remote).
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
     expect((await registry.get(environmentId))?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
-    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(0);
     expect(helperContainers()).toEqual([]);
 
     await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));

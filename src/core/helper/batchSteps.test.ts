@@ -6,7 +6,7 @@
 // runs from checked inputs; an unknown kind, a key too many, a path out of the repository, and a refused variable are
 // refused; a command line is never taken from the request.
 import { describe, expect, it } from 'vitest';
-import { GIT_SUMMARY_NO_FOLDER_EXIT, GIT_SUMMARY_UNREACHABLE_EXIT, configOwnershipFixCommand, gitSummaryCommand } from '../git/gitSummary';
+import { configOwnershipFixCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, environmentIdLabel } from '../names';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, isBatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -31,12 +31,14 @@ const FOLDER = '/workspaces/hello';
 const ID = 'env-1';
 
 describe('batchStepCommand (plan step 6, PR B)', () => {
-  it('knows exactly the thirteen kinds of the plan', () => {
-    // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): changed expectation, gitSummary (Delete's
-    // check) is a kind of its own (was: twelve kinds).
+  it('knows exactly the twelve kinds of the plan', () => {
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, gitSummary is no kind any more (was in plan step
+    // 7: thirteen kinds with gitSummary, Delete's check), and the batch helper refuses it as unknown.
     expect([...BATCH_STEP_KINDS].sort()).toEqual(
-      ['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'gitSummary', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up'],
+      ['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up'],
     );
+    expect(isBatchStepKind('gitSummary')).toBe(false);
+    expect(() => batchStepCommand('gitSummary', { repository: REPO })).toThrow(BatchStepError);
     expect(isBatchStepKind('clone')).toBe(true);
     expect(isBatchStepKind('docker')).toBe(false);
     expect(isBatchStepKind('toString')).toBe(false);
@@ -105,12 +107,12 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
         runUserCommands: { repository: REPO, override: {}, environmentId: ID, containerId: 'a'.repeat(64) },
         gitFiles: { repository: REPO, identity: { name: 'n', email: 'e' } },
         ownershipFix: { folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' },
-        gitSummary: { repository: REPO },
       };
       return batchStepCommand(kind, samples[kind]).owner !== undefined;
     });
-    // Plan step 7 (user decision of 2026-10-01): changed expectation, gitSummary runs as the owner too.
-    expect(owners).toEqual(['readFiles', 'listConfigs', 'composeModel', 'composeHash', 'createFolders', 'gitSummary']);
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, no gitSummary step runs as the owner (was in plan
+    // step 7: gitSummary too).
+    expect(owners).toEqual(['readFiles', 'listConfigs', 'composeModel', 'composeHash', 'createFolders']);
     expect(batchStepCommand('clone', { repository: REPO }).git).toBe(true);
   });
 
@@ -169,20 +171,6 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
     });
     expect(batchStepCommand('ownershipFix', { folder: CONFIG_FOLDER, uid: '1000', gid: '1000' })).toEqual({ command: configOwnershipFixCommand(CONFIG_FOLDER, '1000', '1000'), env: {}, git: false });
-  });
-
-  it('plan step 7: builds the Git summary of Delete with its builder, as the owner of the repository, without a secret', () => {
-    // Review round 2 of PR #84, A-R2-1 and A-R2-2: changed expectation: the complete check, and the folder exits.
-    expect(batchStepCommand('gitSummary', { repository: REPO })).toEqual({
-      command: gitSummaryCommand(FOLDER, true),
-      env: {},
-      git: false,
-      owner: FOLDER,
-      folderExits: { missing: GIT_SUMMARY_NO_FOLDER_EXIT, unreachable: GIT_SUMMARY_UNREACHABLE_EXIT },
-    });
-    expect(() => batchStepCommand('gitSummary', { repository: '../x' })).toThrow(BatchStepError);
-    expect(() => batchStepCommand('gitSummary', { repository: REPO, folder: '/' })).toThrow(BatchStepError);
-    expect(() => batchStepCommand('gitSummary', {})).toThrow(BatchStepError);
   });
 
   it('refuses an unknown kind and never takes a command line from the request', () => {

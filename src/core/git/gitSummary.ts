@@ -2,109 +2,34 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>`,
-// either in the workspace helper or with `docker exec` in a dev container. Values arrive as positional parameters.
-import type { GitSummary, UnknownGitState } from '../types';
-
-/**
- * Review round 1 of PR #84, A-R1-2: the exit code of GIT_SUMMARY_SCRIPT when the repository folder is missing (or no
- * folder): Delete's check then names the recorded state, as before. Every other failure leaves the Git state unknown.
- */
-export const GIT_SUMMARY_NO_FOLDER_EXIT = 3;
-
-/**
- * Review round 2 of PR #84, A-R2-2: the exit code of the gitSummary step when GIT_SUMMARY_SCRIPT exited with
- * GIT_SUMMARY_NO_FOLDER_EXIT but root sees a folder there (the batch helper checks it, asRepositoryOwner): the folder
- * is not reachable for the step's user (`[ -d ]` is false on EACCES too), so the Git state is unknown, not missing.
- */
-export const GIT_SUMMARY_UNREACHABLE_EXIT = 4;
-
-/**
- * Review round 2 of PR #84, A-R2-1: the second argument of GIT_SUMMARY_SCRIPT for Delete's check: the script then
- * checks that its user can read every file and folder of the repository (`.git` too).
- */
-export const GIT_SUMMARY_COMPLETE = 'complete';
-
-/**
- * Review round 1 of PR #84, A-R1-2: the start of the line that GIT_SUMMARY_SCRIPT prints before its 4 lines when a
- * count could not be made (the rest of the line says which); parseGitSummaryOutput ignores it (it reads the last 4).
- */
-export const GIT_SUMMARY_INCOMPLETE_MARKER = 'devenv-git-summary-incomplete:';
-
-/**
- * Review round 3 of PR #84, A-R3-5: the most folders that Git ignores which the readability walk of Delete's check
- * leaves out (GIT_SUMMARY_SCRIPT); the folders beyond it are walked (a folder that cannot be read then still makes the
- * state unknown: never less safe, only less quiet).
- */
-export const GIT_SUMMARY_MAX_PRUNED_FOLDERS = 256;
-
-/**
- * Review round 5 of PR #84, A-R5-2: the text of GIT_SUMMARY_INCOMPLETE_MARKER for tracked files that `git status` does
- * not compare with the working tree (GIT_SUMMARY_SCRIPT).
- */
-export const GIT_SUMMARY_FLAGGED_FILES = 'files marked assume-unchanged or skip-worktree are not checked';
+// Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>` and
+// `docker exec` in a running dev container. Values arrive as positional parameters.
+import type { GitSummary } from '../types';
 
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
  * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
  * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
- * keeps them, and Delete removes them.
+ * keeps them, and Delete removes them. Commits that only the reflog or a tag still reaches are not counted (review round
+ * 4 of PR #84, A-R4-1: a clone fetches every tag of the upstream).
+ *
+ * The script runs in the running dev container as its user (`remoteUser`): the polls of the Session Monitor, and after
+ * an open or a stop (and, user decision 2026-10-02, before Delete's confirmation when the container runs). Delete runs no
+ * Git anywhere else (user decision 2026-10-02: "No git needs delete."): no workspace helper runs this script.
  *
  * Git runs without hooks, without an fsmonitor, and without optional locks, so that it runs no hook and never writes to
  * `.git` as another user. It still runs other programs that the repository configuration names (for example the clean
- * filter of a filter driver in `git status`). So the workspace helper runs this script without the Docker socket, without
- * the cache volume, and without network (WorkspaceHelper.gitSummary): it is no trust boundary against the repository.
- *
- * Review round 1 of PR #84, A-R1-2: a missing repository folder exits with GIT_SUMMARY_NO_FOLDER_EXIT. The warnings of
- * `git status` and `git stash list` reach stderr (a folder that Git cannot open: `could not open directory … Permission
- * denied`, with exit code 0); a count of unpushed commits that fails prints GIT_SUMMARY_INCOMPLETE_MARKER (it counted
- * 0 before, silently). Delete's check reads both as an unknown state (gitSummaryProblem).
- *
- * Review round 2 of PR #84, A-R2-1: Git skips without a word what it cannot read in `.git` (a root 0600 `refs/stash`
- * counts as no stash; a `refs/heads` that cannot be listed hides its branches). With `$2` GIT_SUMMARY_COMPLETE (Delete's
- * check; not the monitor's polls, for the cost of the walk) the script ends with one walk of the repository folder, its
- * working tree and `.git`, as its user: a file or folder that it cannot read (a folder it cannot list or enter: the
- * folder, or the entries below it), or a walk that fails, prints GIT_SUMMARY_INCOMPLETE_MARKER. Links are not tested
- * (`access` follows them; Git does not). One file system (`-xdev`), as Git's own walk of the working tree.
- *
- * Hardening (LC_ALL), review round 2 of PR #84: the script runs Git (and find, tr, wc) in the C locale (`LC_ALL=C`,
- * `LANG=C`, set in the script itself, never with `docker exec -e`), so that Git's messages on stderr are never
- * translated and the patterns of gitSummaryProblem always match. Nothing else in the script depends on the locale: the
- * counts are line counts, and paths pass through as bytes.
- *
- * Review round 3 of PR #84 (decision D1: what the check cannot vouch for is never reported clean): the unpushed
- * commits are those of HEAD and of every local branch that no remote-tracking branch contains; commits that only the
- * reflog or a tag still reaches (for example of a deleted branch) are not counted, by decision (review round 4 of PR
- * #84, A-R4-1: a clone fetches every tag of the upstream, and a tag on a commit that no remote branch contains made an
- * untouched clone show unpushed commits for good). With `$2`
- * GIT_SUMMARY_COMPLETE, after the walk, GIT_SUMMARY_INCOMPLETE_MARKER is printed for submodules (a `.gitmodules`, or a
- * non-empty `modules` folder in the Git folder: their commits, stashes and changes are not counted; A-R3-1), for other
- * worktrees (a non-empty `worktrees` folder: their changes and detached commits are not counted; A-R3-2), and for a
- * stash that exists (`refs/stash`, or a non-empty reflog of it) but that Git cannot resolve (A-R3-3). A-R3-5: the walk
- * leaves out the working-tree folders that Git ignores (`git ls-files -o -i --exclude-standard --directory`, for
- * example the data folder of a database), at most GIT_SUMMARY_MAX_PRUNED_FOLDERS; `.git` is always walked in full. A
- * name that Git quotes (a control character, `"` or `\`) or with a character that `-path` reads as a pattern is not
- * left out (it is walked). The names pass to find as positional parameters (`-path ./<name>`), never as shell text.
+ * filter of a filter driver in `git status`): it is no trust boundary against the repository. Review round 5 of PR #84:
+ * with `log.showSignature=false` too (with it set in the repository configuration, `git stash list` ran the program of
+ * `gpg.program`). Review round 2 of PR #84: in the C locale (`LC_ALL=C`, `LANG=C`, set in the script itself), so that
+ * Git's messages are never translated; the counts are line counts, and paths pass through as bytes.
  *
  * Review round 4 of PR #84, A-R4-2: a stash that `refs/stash` still names while its reflog is empty (`git reflog expire
  * --expire=now --all`, a packed `refs/stash` without a reflog, or a reftable repository) is listed by no `git stash
- * list`; in every mode it counts as 1 stash then (whatever the ref backend).
- *
- * Review round 5 of PR #84, A-R5-2: `git status` does not compare files marked assume-unchanged (`git update-index
- * --assume-unchanged`, or every file with `core.ignoreStat`) or skip-worktree with the working tree, so their edits
- * counted as clean. With `$2` GIT_SUMMARY_COMPLETE, after the checks above, GIT_SUMMARY_INCOMPLETE_MARKER
- * (GIT_SUMMARY_FLAGGED_FILES) is printed when `git ls-files -v` lists a file with a lowercase tag (assume-unchanged),
- * or a file tagged `S` (skip-worktree) that exists in the working tree (a name that Git quotes counts as existing); a
- * skip-worktree file that is absent (sparse checkout) is not. A failing `git ls-files` (or grep) prints the marker
- * too. Git runs with `log.showSignature=false` too (review round 5 of PR #84): with it set in the repository
- * configuration, `git stash list` ran the program of `gpg.program`.
+ * list`; it counts as 1 stash then.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
 export LC_ALL=C LANG=C
-if [ ! -d "$1" ]; then
-  echo "The repository folder $1 is missing." >&2
-  exit ${GIT_SUMMARY_NO_FOLDER_EXIT}
-fi
 cd "$1"
 if ! command -v git >/dev/null 2>&1; then
   echo 'Git is not installed.' >&2
@@ -124,88 +49,14 @@ count_lines() {
 }
 branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short -q HEAD) || branch=''
 status=$(g status --porcelain --untracked-files=normal)
-incomplete=''
 if g rev-parse -q --verify HEAD >/dev/null 2>&1; then
-  unpushed=$(g rev-list --count HEAD --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count HEAD --branches --not --remotes 2>/dev/null) || unpushed=0
 else
-  unpushed=$(g rev-list --count --branches --not --remotes) || { unpushed=0; incomplete='the unpushed commits could not be counted'; }
+  unpushed=$(g rev-list --count --branches --not --remotes 2>/dev/null) || unpushed=0
 fi
 stashes=$(g stash list)
 if [ -z "$stashes" ] && g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
   stashes='(stash without reflog)'
-fi
-if [ "\${2:-}" = '${GIT_SUMMARY_COMPLETE}' ] && [ -z "$incomplete" ]; then
-  set --
-  ignored=$(g -c core.quotePath=false ls-files -o -i --exclude-standard --directory 2>/dev/null) || ignored=''
-  pruned=0
-  set -f
-  IFS='
-'
-  for entry in $ignored; do
-    case $entry in
-      '"'* | *[[\\\\*?]*) ;;
-      ?*/)
-        if [ "$pruned" -lt ${GIT_SUMMARY_MAX_PRUNED_FOLDERS} ]; then
-          if [ "$pruned" -gt 0 ]; then set -- "$@" -o; fi
-          set -- "$@" -path "./\${entry%/}"
-          pruned=$((pruned + 1))
-        fi
-        ;;
-    esac
-  done
-  unset IFS
-  set +f
-  if [ "$#" -gt 0 ]; then set -- '(' "$@" ')' -prune -o; fi
-  if ! unreadable=$(find . -xdev "$@" ! -type l ! -readable -print -quit); then
-    incomplete='not every file and folder of the repository could be read'
-  elif [ -n "$unreadable" ]; then
-    incomplete="$(printf '%s' "\${unreadable#./}" | tr '\\n' ' ') cannot be read"
-  fi
-  if [ -z "$incomplete" ]; then
-    gitdir=$(g rev-parse --git-common-dir)
-    if [ -z "$gitdir" ]; then
-      incomplete='the Git folder could not be found'
-    elif [ -e .gitmodules ] || [ -L .gitmodules ] || [ -n "$(ls -A -- "$gitdir/modules" 2>/dev/null)" ]; then
-      incomplete='submodules are not checked'
-    elif [ -n "$(ls -A -- "$gitdir/worktrees" 2>/dev/null)" ]; then
-      incomplete='other worktrees are not checked'
-    elif { [ -e "$gitdir/refs/stash" ] || [ -s "$gitdir/logs/refs/stash" ]; } && ! g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
-      incomplete='the stash could not be read'
-    fi
-  fi
-  if [ -z "$incomplete" ]; then
-    if ! tracked=$(g -c core.quotePath=false ls-files -v); then
-      incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
-    else
-      flagged=$(printf '%s\\n' "$tracked" | grep '^[a-zS] ') || [ "$?" -eq 1 ] || flagged='?'
-      set -f
-      IFS='
-'
-      for line in $flagged; do
-        case $line in
-          'S "'*)
-            incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
-            break
-            ;;
-          'S '*)
-            if [ -e "\${line#S }" ] || [ -L "\${line#S }" ]; then
-              incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
-              break
-            fi
-            ;;
-          *)
-            incomplete='${GIT_SUMMARY_FLAGGED_FILES}'
-            break
-            ;;
-        esac
-      done
-      unset IFS
-      set +f
-    fi
-  fi
-fi
-if [ -n "$incomplete" ]; then
-  printf '%s %s\\n' '${GIT_SUMMARY_INCOMPLETE_MARKER}' "$incomplete"
 fi
 printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "$(count_lines "$stashes")"
 `;
@@ -614,59 +465,9 @@ export function parseGitSummaryOutput(stdout: string, recordedAt: string): GitSu
   };
 }
 
-/**
- * Review round 1 of PR #84, A-R1-2: the problems on stderr of GIT_SUMMARY_SCRIPT that mean Git could not read everything
- * (with exit code 0 Git counts what it could read: an untracked folder that it cannot open counts as no change).
- */
-const GIT_PERMISSION_PROBLEM = /Permission denied|could not open directory|unable to access|cannot open/i;
-
-/** The longest problem text that gitSummaryProblem returns. */
-const MAX_PROBLEM_LENGTH = 300;
-
-/**
- * Review round 1 of PR #84, A-R1-2: why the output of GIT_SUMMARY_SCRIPT does not show the whole Git state: the first
- * line of `stderr` with a permission problem, or the incomplete count that `stdout` names. Undefined when there is none.
- */
-export function gitSummaryProblem(stdout: string, stderr: string): string | undefined {
-  const lines = (text: string) => text.replace(/\r\n/g, '\n').split('\n');
-  const permission = lines(stderr).find((line) => GIT_PERMISSION_PROBLEM.test(line));
-  if (permission !== undefined) return permission.trim().slice(0, MAX_PROBLEM_LENGTH);
-  const marker = lines(stdout).find((line) => line.startsWith(GIT_SUMMARY_INCOMPLETE_MARKER));
-  return marker?.slice(GIT_SUMMARY_INCOMPLETE_MARKER.length).trim().slice(0, MAX_PROBLEM_LENGTH);
-}
-
-/**
- * Review round 1 of PR #84, A-R1-2: watches the stderr of GIT_SUMMARY_SCRIPT as it streams, line by line (the captured
- * stderr keeps only its end), for the first permission problem (gitSummaryProblem).
- */
-export class GitProblemWatcher {
-  private rest = '';
-  private found: string | undefined;
-
-  push(text: string): void {
-    if (this.found !== undefined) return;
-    const lines = (this.rest + text).split('\n');
-    this.rest = (lines.pop() ?? '').slice(-4096);
-    this.found = gitSummaryProblem('', lines.join('\n'));
-  }
-
-  /** The first problem seen, also in a last line without its newline. */
-  problem(): string | undefined {
-    return this.found ?? gitSummaryProblem('', this.rest);
-  }
-}
-
-/** Review round 1 of PR #84, A-R1-2: whether Delete's check could not read the Git state. */
-export function isUnknownGitState(value: GitSummary | UnknownGitState | undefined): value is UnknownGitState {
-  return value !== undefined && 'unknown' in value && value.unknown === true;
-}
-
-/**
- * Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. Review round 2
- * of PR #84, A-R2-1: `complete` (Delete's check) adds GIT_SUMMARY_COMPLETE, the check that every file can be read.
- */
-export function gitSummaryCommand(repoFolder: string, complete = false): string[] {
-  return complete ? ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder, GIT_SUMMARY_COMPLETE] : ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder];
+/** Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. */
+export function gitSummaryCommand(repoFolder: string): string[] {
+  return ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder];
 }
 
 /**
