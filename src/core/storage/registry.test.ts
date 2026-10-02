@@ -772,6 +772,41 @@ describe('EnvironmentRegistry.markSeenInUse (review round 2 of PR #87, A-R2-2)',
     await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
     expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T10:00:00.000Z');
   });
+
+  // Review round 3 of PR #87, A-R3-1: the mark runs at activation, before the restore check; it must not drop the lost
+  // entries by normalizing the file.
+  it('writes nothing while the file still needs its restore (an invalid entry; review round 3 of PR #87, A-R3-1)', async () => {
+    writeRaw({ version: 1, environments: [{ id: 'broken' }, environment(ID_A, 'o/a')] });
+    const before = fs.readFileSync(paths.registry);
+    const registry = new EnvironmentRegistry(paths);
+    await expect(registry.needsRestore()).resolves.toBe(true);
+    await expect(registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z')).resolves.toBeUndefined();
+    expect(fs.readFileSync(paths.registry).equals(before)).toBe(true);
+    await expect(registry.needsRestore()).resolves.toBe(true);
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBeUndefined();
+    expect(fs.readdirSync(root).filter((name) => name.includes('.backup-'))).toEqual([]);
+  });
+
+  it('writes nothing for an invalid record of a kept volume nor for an invalid file (review round 3 of PR #87, A-R3-1)', async () => {
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/a')], keptVolumes: [{ name: 'x' }] });
+    let before = fs.readFileSync(paths.registry);
+    const registry = new EnvironmentRegistry(paths);
+    await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
+    expect(fs.readFileSync(paths.registry).equals(before)).toBe(true);
+    writeRaw('{ not json');
+    before = fs.readFileSync(paths.registry);
+    await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
+    expect(fs.readFileSync(paths.registry).equals(before)).toBe(true);
+    await expect(registry.needsRestore()).resolves.toBe(true);
+  });
+
+  it('writes as before for a clean file (review round 3 of PR #87, A-R3-1)', async () => {
+    writeRaw({ version: 1, environments: [environment(ID_A, 'o/a')] });
+    const registry = new EnvironmentRegistry(paths);
+    await expect(registry.needsRestore()).resolves.toBe(false);
+    await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
+    expect(readRaw()).toEqual({ version: 1, environments: [{ ...environment(ID_A, 'o/a'), lastSeenInUseAt: '2026-10-02T10:00:00.000Z' }] });
+  });
 });
 
 describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.14 step 4)', () => {
