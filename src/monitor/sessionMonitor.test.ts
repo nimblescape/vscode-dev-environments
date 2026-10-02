@@ -200,8 +200,8 @@ describe('sessionMonitor bundle', () => {
       const child = start([root]);
       const exit = exitOf(child);
       await waitFor(() => readLog(root).includes('Session Monitor started'));
-      // Review round 3 of PR #58 (F1): the current version is 2.
-      expect(JSON.parse(fs.readFileSync(path.join(root, 'monitor.version'), 'utf8'))).toEqual({ pid: child.pid, version: 2 });
+      // Review round 3 of PR #58 (F1): the current version was 2. Changed expectation, review round 1 of PR #85, A-R1-1: 3.
+      expect(JSON.parse(fs.readFileSync(path.join(root, 'monitor.version'), 'utf8'))).toEqual({ pid: child.pid, version: 3 });
       fs.writeFileSync(path.join(root, 'monitor.exit'), JSON.stringify({ pid: child.pid, requestedAt: new Date().toISOString() }));
       expect(await exit).toBe(0);
       expect(readLog(root)).toContain('A window of a newer version asked this Session Monitor to exit.');

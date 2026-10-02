@@ -47,6 +47,9 @@ export async function runWithDockerTarget<T>(target: DockerTarget, fn: () => Pro
 /** Time limit of `docker context inspect` (it reads only local files; the daemon is not asked). */
 export const CONTEXT_INSPECT_TIMEOUT_MS = 15_000;
 
+/** A name of a Docker context as the Docker CLI accepts it (never an option). */
+const CONTEXT_NAME = /^[A-Za-z0-9][A-Za-z0-9_.+-]*$/;
+
 /** The part of ContainerAdapter that the resolver uses. */
 export interface ContextReader {
   isInstalled(): boolean;
@@ -122,6 +125,27 @@ export class DockerTargets {
     if (operationDockerTarget()) return fn();
     const target = await this.resolve();
     return runWithDockerTarget(target, fn);
+  }
+
+  /**
+   * Review round 1 of PR #85 (A-R1-3): the target of the Docker context `name` (for example the one in a window's
+   * authority, or `default`), whatever context is current. With DOCKER_HOST set in VS Code's environment, DOCKER_HOST
+   * decides, as for `resolve`. Undefined without a Docker CLI, for a name that is not a context name, or when the
+   * context cannot be read (logged). Does not change `last` and tells no listener. Never throws.
+   */
+  async ofContext(name: string): Promise<DockerTarget | undefined> {
+    if (!this.docker.isInstalled() || !CONTEXT_NAME.test(name)) return undefined;
+    const dockerHost = envValue(this.env, 'DOCKER_HOST', this.platform)?.trim();
+    if (dockerHost) return dockerTargetOf(dockerHost, undefined);
+    try {
+      const result = await this.docker.run(['context', 'inspect', '--format', '{{json .}}', name], { timeoutMs: CONTEXT_INSPECT_TIMEOUT_MS });
+      const parsed = result.exitCode === 0 ? parseContextInspect(result.stdout) : undefined;
+      if (parsed) return dockerTargetOf(parsed.endpoint, parsed.name);
+      this.logger.warn(`The Docker context ${name} could not be read: ${(result.stderr || result.stdout).trim()}`);
+    } catch (error) {
+      this.logger.warn(`The Docker context ${name} could not be read: ${errorMessage(error)}`);
+    }
+    return undefined;
   }
 
   private async read(): Promise<DockerTarget> {

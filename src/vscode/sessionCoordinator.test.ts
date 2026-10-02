@@ -16,8 +16,9 @@ import type { ExtensionSettings, WindowStatus } from '../core/types';
 import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
 import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
-// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58. To test the retirement of an older
-// monitor, a test sets the protocol version of the window to a future version 3 (`windowVersion.value`); the
+// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58, 3 since review round 1 of PR #85
+// (A-R1-1). To test the retirement of an older monitor, a test sets the protocol version of the window to a future
+// version 4 (`windowVersion.value`); the
 // protocol version of the monitor module stays the real one otherwise.
 const windowVersion = vi.hoisted(() => ({ value: undefined as number | undefined }));
 vi.mock('../monitor/lock', async (importOriginal) => {
@@ -290,8 +291,10 @@ describe('SessionCoordinator', () => {
   // The window runs as a future version, the older monitor is of the current version.
   describe('a monitor of an older version', () => {
     // Review round 3 of PR #58 (F1): the current version is 2, so the future window is 3 and the older monitor is 2.
-    const FUTURE_VERSION = 3;
-    const OLDER_VERSION = 2;
+    // Changed expectation, review round 1 of PR #85, A-R1-1: the current version is 3, so the future window is 4 and
+    // the older monitor is 3.
+    const FUTURE_VERSION = 4;
+    const OLDER_VERSION = 3;
     beforeEach(() => {
       windowVersion.value = FUTURE_VERSION;
     });
@@ -325,6 +328,20 @@ describe('SessionCoordinator', () => {
         // Review round 3 of PR #58 (F1): the versions of the fixture moved up by one.
         `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version ${OLDER_VERSION}, older than ${FUTURE_VERSION}.`,
       );
+    });
+
+    // Review round 1 of PR #85, A-R1-1: a live monitor of version 2 (before plan step 8, PR A) reads monitor.json without
+    // remoteStopAfterSeconds and would stop kept environments with its defaults; a window of the real current version
+    // (3) asks it to exit and starts its own.
+    it('retires a live monitor of version 2 from a window of the current version 3', async () => {
+      windowVersion.value = undefined;
+      expect(MONITOR_PROTOCOL_VERSION).toBe(3);
+      writeLock(3_000);
+      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: 2 }));
+      await h.coordinator.start(null);
+      expect(exitRequestPid()).toBe(OTHER_PID);
+      expect(h.spawns).toHaveLength(1);
+      expect(h.logger.lines.join('\n')).toContain(`Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version 2, older than 3.`);
     });
 
     it('leaves a monitor of the current version alone', async () => {

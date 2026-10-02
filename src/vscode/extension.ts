@@ -41,7 +41,7 @@ import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials'
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { stopAfterSeconds } from '../core/session/sessionRules';
-import { WindowHeartbeats } from '../core/session/windowHeartbeats';
+import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -351,10 +351,11 @@ async function activateExtension(
   // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
   // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
   // worker is made ready first, D1); a missing monitor is started again as the open starts it.
-  const repairSessionMonitor = async (target: DockerTarget): Promise<void> =>
+  // Review round 1 of PR #85 (A-R1-2): `signal` aborts at the deadline of the heartbeat's attempt.
+  const repairSessionMonitor = async (target: DockerTarget, signal?: AbortSignal): Promise<void> =>
     runWithDockerTarget(target, async () => {
-      const image = await helper.ensureImagePresent({ onOutput: (text) => logger.output(text) });
-      await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), undefined, image.id);
+      const image = await helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal });
+      await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
     });
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
@@ -364,19 +365,17 @@ async function activateExtension(
     registry,
     settings: getSettings,
     sourceId: computerId,
-    // The engine the window opened the environment on: the current Docker target when the environment is on it (right
-    // after the open it is); else, for a remote host, the context in this window's authority or the one of "Use a Remote
-    // Docker Host…". A local environment while Docker is set elsewhere cannot be reached (logged).
-    engineFor: async (environment) => {
-      const current = await outsideOperation(() => targets.resolve());
-      if (current.kind !== 'unsupported' && isOnDockerHost(environment, current.host)) return current;
-      const host = dockerHostOf(environment);
-      if (host === '') return undefined;
-      const own = connection.currentContainerName() === environment.containerName ? connection.currentDockerContext() : undefined;
-      return { kind: 'remote', host, endpoint: sshEndpoint(host), context: own ?? remoteContextName(host) };
-    },
-    send: async (target, input) => {
-      const result = await runWithDockerTarget(target, () => remoteMonitor.heartbeat(input));
+    // Review round 1 of PR #85 (A-R1-3): the engine of the connected environment is the one of this window's own Docker
+    // context (its authority, which its status file records as dockerContext), also for a local environment; never the
+    // global current context when the window has its own (resolveHeartbeatEngine).
+    engineFor: (environment, use) =>
+      resolveHeartbeatEngine(environment, use, {
+        windowContext: (shown) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
+        current: () => outsideOperation(() => targets.resolve()),
+        ofContext: (name) => outsideOperation(() => targets.ofContext(name)),
+      }),
+    send: async (target, input, signal) => {
+      const result = await runWithDockerTarget(target, () => remoteMonitor.heartbeat(input, signal));
       return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
     },
     repair: repairSessionMonitor,

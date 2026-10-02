@@ -640,9 +640,12 @@ export class RemoteSessionMonitor {
     return NO_STORED_SCRIPT.test(`${result.stderr}\n${result.stdout}`) ? 'other' : 'unknown';
   }
 
-  /** One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). */
-  async heartbeat(input: HeartbeatInput): Promise<MonitorExecResult> {
-    return this.exec(heartbeatCommand(input));
+  /**
+   * One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). Review round 1 of PR
+   * #85 (A-R1-2): `signal` ends the `docker exec` (the deadline of the window's attempt); the result is then a failure.
+   */
+  async heartbeat(input: HeartbeatInput, signal?: AbortSignal): Promise<MonitorExecResult> {
+    return this.exec(heartbeatCommand(input), signal);
   }
 
   /** The records of an environment (`monitor.js records <id>`); undefined when they cannot be read. */
@@ -731,9 +734,9 @@ export class RemoteSessionMonitor {
     return args;
   }
 
-  private async exec(command: readonly string[]): Promise<MonitorExecResult> {
+  private async exec(command: readonly string[], signal?: AbortSignal): Promise<MonitorExecResult> {
     try {
-      const result = await this.options.docker.run(['exec', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS });
+      const result = await this.options.docker.run(['exec', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, ...(signal ? { signal } : {}) });
       if (result.exitCode === 0 && !result.timedOut) return { ok: true, stdout: result.stdout };
       const detail = result.timedOut
         ? `docker exec did not end within ${REMOTE_MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`

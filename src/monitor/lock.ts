@@ -27,7 +27,10 @@ export const MONITOR_LOCK_STALE_MS = 120_000;
  */
 // Review round 3 of PR #58 (F1): 2, because a monitor of version 1 sends heartbeats without the kernel lock of the
 // records (heartbeatCommand), which races the heartbeats of the windows of this version.
-export const MONITOR_PROTOCOL_VERSION = 2;
+// Review round 1 of PR #85 (A-R1-1): 3, because monitor.json no longer has remoteStopAfterSeconds and the heartbeats
+// moved to the windows (plan step 8, PR A): a monitor of version 2 would read no settings, decide with its defaults
+// (stop on close after 30 s, also an environment the user keeps), and send heartbeats that compete with the windows'.
+export const MONITOR_PROTOCOL_VERSION = 3;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */
 const INCOMPLETE_LOCK_MS = 5_000;

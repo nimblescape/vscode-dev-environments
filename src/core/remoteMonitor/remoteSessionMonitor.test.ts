@@ -873,6 +873,16 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
   });
 
+  // Review round 1 of PR #85 (A-R1-2): the deadline of the window's attempt ends the docker exec.
+  it('passes the signal of the heartbeat to the docker exec', async () => {
+    const docker = new FakeDocker(() => result(0));
+    const controller = new AbortController();
+    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [] };
+    await monitor(docker).heartbeat(heartbeat, controller.signal);
+    expect(docker.calls[0].options?.signal).toBe(controller.signal);
+    expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
+  });
+
   it('tells a missing container from another failure', async () => {
     const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [] };
     expect(await monitor(new FakeDocker(() => MISSING)).heartbeat(heartbeat)).toMatchObject({ ok: false, missing: true });
