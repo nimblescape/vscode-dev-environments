@@ -101,6 +101,14 @@ describe('parseGitSummaryOutput', () => {
 });
 
 describe('commands', () => {
+  // Review round 6 of PR #84 (B-R6-5): Git runs without the hooks of the repository configuration and without optional
+  // locks (no refresh of .git/index by `git status`), so the summary never writes to the repository.
+  it('review round 6 of PR #84 (B-R6-5): runs Git without hooks and without optional locks', () => {
+    expect(GIT_SUMMARY_SCRIPT).toContain('-c core.hooksPath=/dev/null');
+    expect(GIT_SUMMARY_SCRIPT).toMatch(/^GIT_OPTIONAL_LOCKS=0$/m);
+    expect(GIT_SUMMARY_SCRIPT).toMatch(/^export GIT_OPTIONAL_LOCKS$/m);
+  });
+
   it('passes the folder as a positional parameter', () => {
     expect(gitSummaryCommand('/workspaces/it\'s "api"')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/it\'s "api"']);
     expect(ownershipFixCommand('/workspaces/api', 'vscode')).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/api', 'vscode']);
@@ -351,6 +359,28 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     const result = runSummary(repo);
     expect(result.status).toBe(0);
     expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('review round 6 of PR #84 (B-R6-5): leaves .git/index unchanged when its stat data is stale (no optional locks)', () => {
+    const repo = tempDir();
+    git(repo, 'init', '-q', '-b', 'main', '.');
+    const file = path.join(repo, 'a.txt');
+    fs.writeFileSync(file, 'a\n');
+    git(repo, 'add', 'a.txt');
+    git(repo, 'commit', '-q', '-m', 'first');
+    // Same content, a new modification time: a plain `git status` would refresh the stat data in the index.
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(file, later, later);
+    const index = path.join(repo, '.git', 'index');
+    const before = fs.readFileSync(index);
+    const beforeTime = fs.statSync(index).mtimeMs;
+
+    const result = runSummary(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
+    expect(fs.readFileSync(index).equals(before)).toBe(true);
+    expect(fs.statSync(index).mtimeMs).toBe(beforeTime);
+    expect(fs.existsSync(path.join(repo, '.git', 'index.lock'))).toBe(false);
   });
 
   it('fails with a message for a folder that is not a repository', () => {

@@ -4010,6 +4010,64 @@ describe('safetyCheck', () => {
     expect(container.state).toBe('running');
   });
 
+  // Review round 6 of PR #84 (B-R6-2): the refresh's exec gets the operation's signal and the time limit of the Git
+  // execs (GIT_EXEC_TIMEOUT_MS, 30 s), so a hanging Git in the container never holds Delete up.
+  it('review round 6 of PR #84 (B-R6-2): the refresh runs with the signal of the Delete and a time limit of 30 s', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    const exec = vi.spyOn(h.docker, 'exec');
+    const controller = new AbortController();
+    await h.service.safetyCheck(ENV_ID, options({ signal: controller.signal }));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][2]).toMatchObject({ user: 'vscode', timeoutMs: 30_000 });
+    expect(exec.mock.calls[0][2]?.signal).toBe(controller.signal);
+  });
+
+  it('review round 6 of PR #84 (B-R6-2): a cancel while the refresh hangs ends it promptly as cancelled', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    const controller = new AbortController();
+    let execStarted!: () => void;
+    const started = new Promise<void>((resolve) => (execStarted = resolve));
+    // An exec that ends only when its signal aborts (as the process runner kills the process).
+    h.docker.exec = (_container, _command, execOptions = {}) =>
+      new Promise((_resolve, reject) => {
+        execStarted();
+        execOptions.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    const check = h.service.safetyCheck(ENV_ID, options({ signal: controller.signal }));
+    await started;
+    controller.abort();
+    let timer: NodeJS.Timeout | undefined;
+    const tooLate = new Promise<'hangs'>((resolve) => (timer = setTimeout(() => resolve('hangs'), 2_000)));
+    const outcome = await Promise.race([rejection(check), tooLate]);
+    clearTimeout(timer);
+    expect(outcome).not.toBe('hangs');
+    expect((outcome as UserFacingError).code).toBe('cancelled');
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  // Review round 6 of PR #84 (B-R6-4): the refresh looks for the dev container by the environment and its container name
+  // (as Stop), so the container of another service of a Docker Compose environment is never taken for it.
+  it('review round 6 of PR #84 (B-R6-4): the refresh looks for the container by the environment id and its container name', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    const findContainer = vi.spyOn(h.docker, 'findContainer');
+    await h.service.safetyCheck(ENV_ID, options());
+    expect(findContainer).toHaveBeenCalledWith(ENV_ID, env.containerName);
+    expect(env.containerName).toEqual(expect.any(String));
+  });
+
+  // Review round 6 of PR #84 (B-R6-3): the refreshed state is recorded quietly; a registry that cannot be written still
+  // gives the refreshed state (Delete is never refused for it), with a warning in the log.
+  it('review round 6 of PR #84 (B-R6-3): a refreshed state that cannot be recorded is still returned, with a warning', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    vi.spyOn(h.registry, 'updateEnvironment').mockRejectedValueOnce(new Error('the registry is locked'));
+    const summary = await h.service.safetyCheck(ENV_ID, options());
+    expect(summary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    expect(h.logger.warnings.some((w) => w.includes('Could not record the Git state') && w.includes('the registry is locked'))).toBe(true);
+  });
+
   it('user decision 2026-10-02: a refresh that fails falls back to the recorded state, which stays recorded', async () => {
     const env = await seedEnvironment(h, { container: 'running' });
     for (const result of [{ exitCode: 127, stderr: 'Git is not installed.' }, { exitCode: 128, stderr: 'fatal: not a git repository' }, { stdout: 'garbage\n' }]) {

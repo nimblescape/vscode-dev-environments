@@ -1404,6 +1404,32 @@ describe('Delete', () => {
     expect(h.connection.open).toHaveBeenCalled();
   });
 
+  // Review round 6 of PR #84 (B-R6-1): only Delete anyway deletes after the warning about changes; Escape (undefined)
+  // and any other answer cancel the Delete without opening the environment.
+  it('review round 6 of PR #84 (B-R6-1): Escape on the warning about changes neither deletes nor opens the environment', async () => {
+    await h.registry.add(environment());
+    h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(warningMessages()).toHaveLength(1);
+    expect(warningMessages()[0]).toBe(Messages.deleteUnsaved('acme/api', '1 uncommitted'));
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.connection.open).not.toHaveBeenCalled();
+  });
+
+  it('review round 6 of PR #84 (B-R6-1): an answer other than Delete anyway on the warning about changes does not delete', async () => {
+    await h.registry.add(environment());
+    h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 2, stashes: 0, recordedAt: iso(NOW) });
+    for (const answer of [Actions.delete, 'Something else']) {
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(answer);
+      await run('delete', row('acme/api', environment()));
+    }
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
+    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+  });
+
   it('asks for the plain confirmation when there are no changes or the volume is missing, and stops on Cancel', async () => {
     await h.registry.add(environment());
     await run('delete', row('acme/api', environment()));
