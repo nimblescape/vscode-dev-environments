@@ -1597,7 +1597,9 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
         LOCAL,
       );
       slow.catch(() => undefined);
-      await preparation.run(async (_signal, onBuild) => onBuild(), undefined, LOCAL);
+      // Review round 5 of PR #85 (A-R5-1): a heartbeat's preparation on LOCAL now joins the slow one, so the newer success
+      // is the one of an operation of the user (outside the scope of a heartbeat), which ends the wait too.
+      await preparation.prepare(async (_signal, onBuild) => onBuild(), undefined, LOCAL);
       failSlow();
       await expect(slow).rejects.toThrow('build failed late');
       // The success ended the wait; the late failure does not start a new one.
@@ -1707,5 +1709,105 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
       expect(h.engineCalls).toHaveLength(2);
       expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: false }]]);
     });
+  });
+});
+
+// Review round 5 of PR #85: rules found by mutation.
+describe('WindowHeartbeats rules found by mutation (review round 5 of PR #85)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A preparation whose engine LOCAL waits after a failed build. */
+  async function waitingPreparation(): Promise<HeartbeatPreparation> {
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    const failing = async (_signal: AbortSignal, onBuild: () => void): Promise<void> => {
+      onBuild();
+      throw new Error('build failed');
+    };
+    await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+    return preparation;
+  }
+
+  it('within the wait, a presence check that never settles ends with the wait: an AbortError at once (B-R5-5, P08)', async () => {
+    const preparation = await waitingPreparation();
+    const wait = new AbortController();
+    const waiting = preparation.run(async () => undefined, wait.signal, LOCAL, () => new Promise<undefined>(() => {}));
+    const outcome = waiting.then(
+      () => 'resolved',
+      (error: unknown) => (isAbortError(error) ? 'abort' : 'other'),
+    );
+    wait.abort();
+    const first = await Promise.race([outcome, new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 50))]);
+    expect(first).toBe('abort');
+    preparation.dispose();
+  });
+
+  it('within the wait, the presence check gets the signal of the wait (B-R5-5, P09)', async () => {
+    const preparation = await waitingPreparation();
+    const wait = new AbortController();
+    const got: (AbortSignal | undefined)[] = [];
+    await expect(
+      preparation.run(async () => 'built', wait.signal, LOCAL, async (signal) => {
+        got.push(signal);
+        return 'present';
+      }),
+    ).resolves.toBe('present');
+    expect(got).toEqual([wait.signal]);
+    preparation.dispose();
+  });
+
+  it('a heartbeat on an engine whose build runs joins it, with no second build; it starts again once the build settled (A-R5-1)', async () => {
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    let builds = 0;
+    let finish: (value: string) => void = () => {};
+    const work = (_signal: AbortSignal, onBuild: () => void): Promise<string> => {
+      builds += 1;
+      onBuild();
+      return new Promise<string>((resolve) => (finish = resolve));
+    };
+    const deadline = new AbortController();
+    const first = preparation.run(work, deadline.signal, LOCAL);
+    first.catch(() => undefined);
+    await Promise.resolve();
+    deadline.abort();
+    await expect(first).rejects.toSatisfy(isAbortError);
+    const second = preparation.run(work, undefined, LOCAL);
+    const other = preparation.run(async () => 'remote', undefined, REMOTE);
+    await expect(other).resolves.toBe('remote');
+    expect(builds).toBe(1);
+    finish('image');
+    await expect(second).resolves.toBe('image');
+    await Promise.resolve();
+    const third = preparation.run(work, undefined, LOCAL);
+    await Promise.resolve();
+    expect(builds).toBe(2);
+    finish('again');
+    await expect(third).resolves.toBe('again');
+    preparation.dispose();
+  });
+
+  it('LOOKUP_ABANDON_MS is at least one deadline and at most a few (B-R5-6, L08)', () => {
+    expect(LOOKUP_ABANDON_MS).toBeGreaterThanOrEqual(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+    expect(LOOKUP_ABANDON_MS).toBeLessThanOrEqual(5 * HEARTBEAT_ATTEMPT_DEADLINE_MS);
+  });
+
+  it('a lookup that never settles is given up also when the clock went back by LOOKUP_ABANDON_MS (B-R5-6, L02)', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = ID_A;
+    let hang = true;
+    h.state.lookUp = async () => (hang ? new Promise<DockerTarget | undefined>(() => {}) : LOCAL);
+    const first = h.heartbeats.tick();
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+    await first;
+    expect(h.engineCalls).toHaveLength(1);
+    hang = false;
+    h.now.value = T0 - LOOKUP_ABANDON_MS;
+    const second = h.heartbeats.tick();
+    await vi.advanceTimersByTimeAsync(0);
+    await second;
+    expect(h.engineCalls).toHaveLength(2);
   });
 });

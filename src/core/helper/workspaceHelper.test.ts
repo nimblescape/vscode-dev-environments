@@ -18,7 +18,7 @@ import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { CommandError, UserFacingError, isUserFacingError } from '../errors';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { configOwnershipFixCommand } from '../git/gitSummary';
-import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
+import { abortError, isAbortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
@@ -2897,6 +2897,26 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(await helper.ensureImagePresent({ onBuild: present })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(present).not.toHaveBeenCalled();
     expect(docker.builds).toHaveLength(builds);
+  });
+
+  // Review round 5 of PR #85 (B-R5-4, B-R5-5): presentImage checks the tag in the scope of the worker preparation (its
+  // check cannot go through the worker), and an aborted signal ends it with an AbortError.
+  it('presentImage checks the tag in the scope of the worker preparation, and passes the abort of its signal through', async () => {
+    const helper = helperOn(REMOTE);
+    const scopes: boolean[] = [];
+    const imageId = docker.imageId.bind(docker);
+    docker.imageId = async (reference: string) => {
+      scopes.push(preparingWorker());
+      return imageId(reference);
+    };
+    expect(await helper.presentImage()).toBeUndefined();
+    expect(scopes.length).toBeGreaterThanOrEqual(1);
+    expect(scopes.every((inScope) => inScope)).toBe(true);
+    expect(preparingWorker()).toBe(false);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(helper.presentImage({ signal: aborted.signal })).rejects.toSatisfy(isAbortError);
+    expect(docker.builds).toEqual([]);
   });
 
   // PR #74 review round 2, A-R2-1: a pending maintaining ensure of an open in the same window (a `--pull --no-cache`

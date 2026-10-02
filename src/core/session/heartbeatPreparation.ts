@@ -19,6 +19,12 @@
 // checks (bounded, never builds: `present`) whether the tag exists: if so it succeeds with it (and ends the wait), else it
 // is refused without a build. Any successful preparation on the engine ends its wait, also one of an operation of the
 // user (outside the scope) and a build that succeeded (`clear`).
+//
+// Review round 5 of PR #85 (A-R5-1): a heartbeat's preparation on an engine joins the one that still runs there (its
+// wait, and the accounting of its build: `onBuild`, the failures at its start) instead of starting the work again. The
+// workspace helper keeps one cache of the image per window, which a preparation on another engine resets, so the work
+// itself would not join the running build: each attempt on the engine started another one while the previous one still
+// ran under the long signal.
 // No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
 import type { DockerTarget } from '../docker/dockerHost';
@@ -46,6 +52,8 @@ export class HeartbeatPreparation {
   private readonly disposal = new AbortController();
   /** A-R3-1: engine key → the wait after failed preparations there. */
   private readonly backoffs = new Map<string, Backoff>();
+  /** A-R5-1: engine key → the preparation of a heartbeat that runs there (until it settles). */
+  private readonly pending = new Map<string, Promise<unknown>>();
 
   constructor(
     private readonly timeoutMs: number = HELPER_PREBUILD_TIMEOUT_MS,
@@ -82,11 +90,15 @@ export class HeartbeatPreparation {
    * `work` with the long signal, waited for until `wait` aborts. With `engine` (A-R3-1, A-R4-1): within the wait after a
    * failed build there, `work` does not run: `present` (bounded by `wait`) gives the image when its tag exists (the wait
    * ends), else the preparation is refused at once. A failure of `work` after its build started (`onBuild`) starts or
-   * lengthens the wait, any other failure leaves it as it is; a success ends it.
+   * lengthens the wait, any other failure leaves it as it is; a success ends it. A-R5-1: while a preparation runs on
+   * `engine`, another one there joins it (waits for its result until its own `wait` aborts) and runs no `work`.
    */
   run<T>(work: PreparationWork<T>, wait: AbortSignal | undefined, engine?: DockerTarget, present?: PresenceCheck<T>): Promise<T> {
     if (wait?.aborted) return Promise.reject(abortError());
     const key = engine === undefined ? undefined : engineKey(engine);
+    // A-R5-1: the work that runs on this engine is joined, never started a second time.
+    const running = key === undefined ? undefined : this.pending.get(key);
+    if (running !== undefined) return waitFor(running as Promise<T>, wait);
     const backoff = key === undefined ? undefined : this.backoffs.get(key);
     const now = this.clock.now();
     if (key !== undefined && backoff !== undefined && now < backoff.notBefore) {
@@ -120,9 +132,17 @@ export class HeartbeatPreparation {
         this.disposal.signal.removeEventListener('abort', onDispose);
       });
     if (key !== undefined) {
+      this.pending.set(key, job);
+      const settled = (): void => {
+        if (this.pending.get(key) === job) this.pending.delete(key);
+      };
       job.then(
-        () => this.backoffs.delete(key),
         () => {
+          settled();
+          this.backoffs.delete(key);
+        },
+        () => {
+          settled();
           if (built) this.recordFailure(key, failuresAtStart);
         },
       );

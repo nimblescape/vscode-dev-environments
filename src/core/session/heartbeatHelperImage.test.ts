@@ -2,11 +2,13 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { describe, expect, it } from 'vitest';
+import { AsyncLocalStorage } from 'async_hooks';
+import { describe, expect, it, vi } from 'vitest';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperImageUse } from '../helper/helperImage';
 import type { PresentImageOptions } from '../helper/workspaceHelper';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
+import { isAbortError } from '../ports';
 import { heartbeatHelperImage } from './heartbeatHelperImage';
 import { HeartbeatPreparation } from './heartbeatPreparation';
 
@@ -95,4 +97,112 @@ describe('heartbeatHelperImage (review round 4 of PR #85, B-R4-1)', () => {
     expect(builds).toEqual([LOCAL, LOCAL, LOCAL, LOCAL]);
     preparation.dispose();
   });
+});
+
+/** prepareWorker or repairImage. */
+type Call = (target: DockerTarget, signal: AbortSignal | undefined) => Promise<unknown>;
+
+/** Whether `promise` rejects with an AbortError within a few turns of the event loop. */
+async function rejectsAtOnceWithAbort(promise: Promise<unknown>): Promise<boolean> {
+  const outcome = await Promise.race([
+    promise.then(
+      () => 'resolved',
+      (error: unknown) => (isAbortError(error) ? 'abort' : 'other'),
+    ),
+    new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 50)),
+  ]);
+  return outcome === 'abort';
+}
+
+// Review round 5 of PR #85: rules found by mutation, and the join of a running build per engine (A-R5-1).
+describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
+  it('a second attempt on an engine joins its running build, also after a preparation on another engine reset the helper cache (A-R5-1)', async () => {
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    const ambient = new AsyncLocalStorage<DockerTarget>();
+    const builds: DockerTarget[] = [];
+    // Like WorkspaceHelper: one cache of the image per window, reset by a preparation on another engine.
+    let cache: { target: DockerTarget; image: Promise<HelperImageUse> } | undefined;
+    const helper = {
+      ensureImagePresent: (options: PresentImageOptions): Promise<HelperImageUse> => {
+        const target = ambient.getStore() as DockerTarget;
+        if (cache?.target === target) return cache.image;
+        options.onBuild?.('create');
+        builds.push(target);
+        // The build on LOCAL hangs; the one on REMOTE succeeds.
+        const image = target === LOCAL ? new Promise<HelperImageUse>(() => {}) : Promise.resolve(IMAGE);
+        cache = { target, image };
+        return image;
+      },
+      presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
+    };
+    const image = heartbeatHelperImage({ preparation, helper, inTarget: (target, fn) => ambient.run(target, fn), onOutput: () => {} });
+    const firstDeadline = new AbortController();
+    const first = preparation.scope(() => image.prepareWorker(LOCAL, firstDeadline.signal));
+    await vi.waitFor(() => expect(builds).toEqual([LOCAL]));
+    await preparation.scope(() => image.prepareWorker(REMOTE, undefined));
+    expect(builds).toEqual([LOCAL, REMOTE]);
+    firstDeadline.abort();
+    expect(await rejectsAtOnceWithAbort(first)).toBe(true);
+    const secondDeadline = new AbortController();
+    const second = preparation.scope(() => image.prepareWorker(LOCAL, secondDeadline.signal));
+    const repair = preparation.scope(() => image.repairImage(LOCAL, secondDeadline.signal));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(builds).toEqual([LOCAL, REMOTE]);
+    secondDeadline.abort();
+    expect(await rejectsAtOnceWithAbort(second)).toBe(true);
+    expect(await rejectsAtOnceWithAbort(repair)).toBe(true);
+    expect(builds).toEqual([LOCAL, REMOTE]);
+    preparation.dispose();
+  });
+
+  it.each(['prepareWorker', 'repairImage'] as const)(
+    "in the scope of a heartbeat, %s builds with the long signal: not the caller's, and not aborted with it (B-R5-2, I10)",
+    async (method) => {
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+      const got: (AbortSignal | undefined)[] = [];
+      const helper = {
+        ensureImagePresent: (options: PresentImageOptions): Promise<HelperImageUse> => {
+          got.push(options.signal);
+          return new Promise<HelperImageUse>(() => {});
+        },
+        presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
+      };
+      const image = heartbeatHelperImage({ preparation, helper, inTarget: (_target, fn) => fn(), onOutput: () => {} });
+      const caller = new AbortController();
+      const waiting = preparation.scope(() => (image[method] as Call)(LOCAL, caller.signal));
+      await vi.waitFor(() => expect(got).toHaveLength(1));
+      caller.abort();
+      expect(await rejectsAtOnceWithAbort(waiting)).toBe(true);
+      expect(got[0]).toBeDefined();
+      expect(got[0]).not.toBe(caller.signal);
+      expect(got[0]?.aborted).toBe(false);
+      preparation.dispose();
+      expect(got[0]?.aborted).toBe(true);
+    },
+  );
+
+  it.each(['prepareWorker', 'repairImage'] as const)(
+    'within the wait, %s checks the tag as an operation on its engine, with the signal of its caller (B-R5-3 I04, B-R5-5 I09)',
+    async (method) => {
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+      const ambient = new AsyncLocalStorage<DockerTarget>();
+      const checks: { target: DockerTarget | undefined; signal: AbortSignal | undefined }[] = [];
+      const helper = {
+        ensureImagePresent: async (options: PresentImageOptions): Promise<HelperImageUse> => {
+          options.onBuild?.('create');
+          throw new Error('docker build failed: no space left on device');
+        },
+        presentImage: async (options: { signal?: AbortSignal }): Promise<HelperImageUse | undefined> => {
+          checks.push({ target: ambient.getStore(), signal: options.signal });
+          return IMAGE;
+        },
+      };
+      const image = heartbeatHelperImage({ preparation, helper, inTarget: (target, fn) => ambient.run(target, fn), onOutput: () => {} });
+      await expect(preparation.scope(() => (image[method] as Call)(REMOTE, undefined))).rejects.toThrow('no space left');
+      const caller = new AbortController();
+      await preparation.scope(() => (image[method] as Call)(REMOTE, caller.signal));
+      expect(checks).toEqual([{ target: REMOTE, signal: caller.signal }]);
+      preparation.dispose();
+    },
+  );
 });
