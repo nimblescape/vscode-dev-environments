@@ -1811,3 +1811,79 @@ describe('WindowHeartbeats rules found by mutation (review round 5 of PR #85)', 
     expect(h.engineCalls).toHaveLength(2);
   });
 });
+
+// Review round 6 of PR #85 (B-R6-7, B-R6-8): a build whose work ignores its long signal blocks its engine only until that
+// signal aborts.
+describe('HeartbeatPreparation joins a build only while its long signal lasts (review round 6 of PR #85)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A work that never ends by itself (it ignores its signal), with its signals and the means to finish each one. */
+  function stuckWork() {
+    const signals: AbortSignal[] = [];
+    const finishes: ((value: string) => void)[] = [];
+    const work = (signal: AbortSignal, onBuild: () => void): Promise<string> => {
+      signals.push(signal);
+      onBuild();
+      return new Promise<string>((resolve) => finishes.push(resolve));
+    };
+    return { signals, finishes, work };
+  }
+
+  it('after the long timeout the next run on the engine starts new work; the old work settling late leaves it joined (B-R6-7, B-R6-8)', async () => {
+    vi.useFakeTimers();
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    const { signals, finishes, work } = stuckWork();
+    const first = preparation.run(work, undefined, LOCAL);
+    await vi.advanceTimersByTimeAsync(0);
+    const joined = preparation.run(work, undefined, LOCAL);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signals).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(HELPER_PREBUILD_TIMEOUT_MS);
+    expect(signals[0].aborted).toBe(true);
+    // The work ignored the abort: the next run starts new work instead of joining it.
+    const fresh = preparation.run(work, undefined, LOCAL);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signals).toHaveLength(2);
+    expect(signals[1].aborted).toBe(false);
+    // B-R6-8: the old work settles late; the new one is still the one that runs on the engine and is joined.
+    finishes[0]('late');
+    await expect(first).resolves.toBe('late');
+    await expect(joined).resolves.toBe('late');
+    const third = preparation.run(work, undefined, LOCAL);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signals).toHaveLength(2);
+    finishes[1]('fresh');
+    await expect(fresh).resolves.toBe('fresh');
+    await expect(third).resolves.toBe('fresh');
+    preparation.dispose();
+  });
+
+  it('after dispose, a work that ignored the abort is no longer joined (B-R6-7)', async () => {
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    const { signals, finishes, work } = stuckWork();
+    const first = preparation.run(work, undefined, LOCAL);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(signals).toHaveLength(1);
+    preparation.dispose();
+    expect(signals[0].aborted).toBe(true);
+    const next = preparation.run(work, undefined, LOCAL);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(signals).toHaveLength(2);
+    // A preparation that starts after dispose (its long signal aborted from the start) is not joined either.
+    expect(signals[1].aborted).toBe(true);
+    const last = preparation.run(work, undefined, LOCAL);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(signals).toHaveLength(3);
+    finishes[0]('old');
+    finishes[1]('new');
+    finishes[2]('last');
+    await expect(first).resolves.toBe('old');
+    await expect(next).resolves.toBe('new');
+    await expect(last).resolves.toBe('last');
+  });
+});

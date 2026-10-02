@@ -25,6 +25,9 @@
 // workspace helper keeps one cache of the image per window, which a preparation on another engine resets, so the work
 // itself would not join the running build: each attempt on the engine started another one while the previous one still
 // ran under the long signal.
+//
+// Review round 6 of PR #85 (B-R6-7): the join lasts only as long as the long signal of the work: when it aborts (the
+// timeout, dispose) and the work ignores it, the next preparation on the engine starts new work instead of joining.
 // No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
 import type { DockerTarget } from '../docker/dockerHost';
@@ -91,7 +94,8 @@ export class HeartbeatPreparation {
    * failed build there, `work` does not run: `present` (bounded by `wait`) gives the image when its tag exists (the wait
    * ends), else the preparation is refused at once. A failure of `work` after its build started (`onBuild`) starts or
    * lengthens the wait, any other failure leaves it as it is; a success ends it. A-R5-1: while a preparation runs on
-   * `engine`, another one there joins it (waits for its result until its own `wait` aborts) and runs no `work`.
+   * `engine`, another one there joins it (waits for its result until its own `wait` aborts) and runs no `work`;
+   * B-R6-7: only until its long signal aborts.
    */
   run<T>(work: PreparationWork<T>, wait: AbortSignal | undefined, engine?: DockerTarget, present?: PresenceCheck<T>): Promise<T> {
     if (wait?.aborted) return Promise.reject(abortError());
@@ -133,9 +137,16 @@ export class HeartbeatPreparation {
       });
     if (key !== undefined) {
       this.pending.set(key, job);
+      // B-R6-8: only this job's own entry is dropped. It matters when the long signal dropped it already (below) and a
+      // later preparation on the engine started new work there: this job settling late must not drop that one.
       const settled = (): void => {
         if (this.pending.get(key) === job) this.pending.delete(key);
       };
+      // Review round 6 of PR #85 (B-R6-7): a work that ignores its long signal must not block the engine forever. When
+      // the long signal aborts (its timeout, the window closes), the job is no longer joined: the next preparation on
+      // the engine starts fresh.
+      if (controller.signal.aborted) settled();
+      else controller.signal.addEventListener('abort', settled, { once: true });
       job.then(
         () => {
           settled();

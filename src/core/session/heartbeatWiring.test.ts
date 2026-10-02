@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { AsyncLocalStorage } from 'async_hooks';
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
@@ -9,19 +10,25 @@ import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperImageUse } from '../helper/helperImage';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import type { PresentImageOptions } from '../helper/workspaceHelper';
+import { isAbortError } from '../ports';
 import { HeartbeatPreparation } from './heartbeatPreparation';
-import { heartbeatWiring } from './heartbeatWiring';
+import { heartbeatWiring, monitorEnsure } from './heartbeatWiring';
+
+/** Lets the promises that are ready run (no timers). */
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 const T0 = Date.parse('2026-10-02T10:00:00.000Z');
 const LOCAL: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock', context: 'default' };
 const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devenv-remote-11111111' };
+const OTHER: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: 'devenv-remote-22222222' };
 const IMAGE: HelperImageUse = { tag: 'devenv-helper:0123456789ab', id: 'sha256:1111' };
 
 /** The wiring with a helper whose tag is missing and whose builds fail (or succeed), with the targets of its builds. */
 function setup() {
   const now = { value: T0 };
   const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => now.value });
-  const state = { buildFails: true, operation: undefined as DockerTarget | undefined };
+  // Review round 6 of PR #85 (B-R6-2): `hang` makes a build that never ends.
+  const state = { buildFails: true, hang: false, operation: undefined as DockerTarget | undefined };
   const builds: DockerTarget[] = [];
   const disposables: { dispose(): void }[] = [];
   const signals: (AbortSignal | undefined)[] = [];
@@ -33,6 +40,7 @@ function setup() {
         signals.push(options.signal);
         options.onBuild?.('create');
         builds.push(current as DockerTarget);
+        if (state.hang) return new Promise<HelperImageUse>(() => {});
         if (state.buildFails) throw new Error('docker build failed: no space left on device');
         return IMAGE;
       },
@@ -85,7 +93,7 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
   });
 
   it("the worker's preparation goes through the preparation: in a heartbeat, with its long signal and its wait (E04)", async () => {
-    const { preparation, builds, signals, wiring, failOn } = setup();
+    const { preparation, state, builds, signals, wiring, failOn } = setup();
     const caller = new AbortController();
     await expect(preparation.scope(() => wiring.prepareWorker(LOCAL, caller.signal))).rejects.toThrow('no space left');
     expect(signals[0]).toBeDefined();
@@ -94,6 +102,21 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
     expect(builds).toEqual([LOCAL]);
     await failOn(REMOTE);
     expect(builds).toEqual([LOCAL, REMOTE]);
+    // Review round 6 of PR #85 (B-R6-2): the heartbeat's own signal ends only its wait; the build goes on with the long
+    // signal.
+    state.hang = true;
+    const deadline = new AbortController();
+    const hanging = preparation.scope(() => wiring.prepareWorker(OTHER, deadline.signal));
+    let gaveUp = false;
+    hanging.catch(() => (gaveUp = true));
+    await settle();
+    expect(builds).toEqual([LOCAL, REMOTE, OTHER]);
+    deadline.abort();
+    await settle();
+    expect(gaveUp).toBe(true);
+    await expect(hanging).rejects.toSatisfy(isAbortError);
+    expect(signals[2]).not.toBe(deadline.signal);
+    expect(signals[2]?.aborted).toBe(false);
     preparation.dispose();
   });
 
@@ -154,5 +177,209 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
     expect(source).not.toContain('new HeartbeatPreparation(');
     expect(source).not.toContain('heartbeatHelperImage(');
     expect(source).not.toMatch(/\.clearAll\(\)/);
+  });
+});
+
+// Review round 6 of PR #85 (B-R6-1 to B-R6-6): the waits, the target and the failures of the heartbeat wiring.
+describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)', () => {
+  /** A deferred promise. */
+  function deferred<T>() {
+    let resolve: (value: T) => void = () => {};
+    let reject: (error: unknown) => void = () => {};
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** The wiring with builds that end only when the test ends them, and an operation target kept like runWithDockerTarget. */
+  function setupBuilds() {
+    const operation = new AsyncLocalStorage<DockerTarget>();
+    const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+    const builds: { target: DockerTarget | undefined; signal: AbortSignal | undefined; done: ReturnType<typeof deferred<HelperImageUse>> }[] = [];
+    const wiring = heartbeatWiring({
+      preparation,
+      helper: {
+        ensureImagePresent: (options: PresentImageOptions): Promise<HelperImageUse> => {
+          options.onBuild?.('create');
+          const done = deferred<HelperImageUse>();
+          builds.push({ target: operation.getStore(), signal: options.signal, done });
+          return done.promise;
+        },
+        presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
+      },
+      inTarget: (target, fn) => operation.run(target, fn),
+      onOutput: () => {},
+      operationTarget: () => undefined,
+      subscriptions: { push: () => 0 },
+    });
+    return { operation, preparation, builds, wiring };
+  }
+
+  /** Whether `promise` settled (after the ready promises ran). */
+  async function settledYet(promise: Promise<unknown>): Promise<boolean> {
+    let settled = false;
+    promise.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await settle();
+    return settled;
+  }
+
+  it("the repair's signal ends its wait at once while the build goes on, and no monitor is started (B-R6-1)", async () => {
+    const { preparation, builds, wiring } = setupBuilds();
+    const started: DockerTarget[] = [];
+    const deadline = new AbortController();
+    const repairing = wiring.repair(async (_image, target) => {
+      started.push(target);
+    })(LOCAL, deadline.signal);
+    repairing.catch(() => undefined);
+    await settle();
+    expect(builds).toHaveLength(1);
+    deadline.abort();
+    expect(await settledYet(repairing)).toBe(true);
+    await expect(repairing).rejects.toSatisfy(isAbortError);
+    expect(started).toEqual([]);
+    expect(builds[0].signal).not.toBe(deadline.signal);
+    expect(builds[0].signal?.aborted).toBe(false);
+    // The build ends later: still no monitor for the repair that gave up.
+    builds[0].done.resolve(IMAGE);
+    await settle();
+    expect(started).toEqual([]);
+    preparation.dispose();
+  });
+
+  it("in a heartbeat, the worker's signal ends its wait at once while the build goes on (B-R6-2)", async () => {
+    const { preparation, builds, wiring } = setupBuilds();
+    const deadline = new AbortController();
+    const preparing = preparation.scope(() => wiring.prepareWorker(LOCAL, deadline.signal));
+    preparing.catch(() => undefined);
+    await settle();
+    expect(builds).toHaveLength(1);
+    deadline.abort();
+    expect(await settledYet(preparing)).toBe(true);
+    await expect(preparing).rejects.toSatisfy(isAbortError);
+    expect(builds[0].signal).not.toBe(deadline.signal);
+    expect(builds[0].signal?.aborted).toBe(false);
+    preparation.dispose();
+  });
+
+  it('the monitor is started as an operation on the engine of the repair (B-R6-3)', async () => {
+    const { operation, preparation, builds, wiring } = setupBuilds();
+    const seen: (DockerTarget | undefined)[] = [];
+    const repairing = wiring.repair(async () => {
+      seen.push(operation.getStore());
+    })(REMOTE, new AbortController().signal);
+    await settle();
+    expect(builds[0].target).toBe(REMOTE);
+    builds[0].done.resolve(IMAGE);
+    await repairing;
+    expect(seen).toEqual([REMOTE]);
+    preparation.dispose();
+  });
+
+  it('the repair fails with the failure of the monitor, and ends only when the monitor did (B-R6-4)', async () => {
+    const { preparation, builds, wiring } = setupBuilds();
+    const monitor = deferred<void>();
+    let called = 0;
+    const repair = wiring.repair(() => {
+      called += 1;
+      return monitor.promise;
+    });
+    const repairing = repair(LOCAL, new AbortController().signal);
+    repairing.catch(() => undefined);
+    await settle();
+    builds[0].done.resolve(IMAGE);
+    await settle();
+    expect(called).toBe(1);
+    expect(await settledYet(repairing)).toBe(false);
+    const failure = new Error('the Session Monitor container did not start');
+    monitor.reject(failure);
+    await expect(repairing).rejects.toBe(failure);
+    // And a monitor that starts: the repair ends only then.
+    const second = deferred<void>();
+    const repairingAgain = wiring.repair(() => second.promise)(LOCAL, new AbortController().signal);
+    await settle();
+    builds[1].done.resolve(IMAGE);
+    await settle();
+    expect(await settledYet(repairingAgain)).toBe(false);
+    second.resolve();
+    await expect(repairingAgain).resolves.toBeUndefined();
+    preparation.dispose();
+  });
+
+  it("outside a heartbeat, the worker's preparation is the user's: its own signal, never refused or joined, and it ends the wait (B-R6-5)", async () => {
+    const { preparation, builds, wiring } = setupBuilds();
+    // A failed build of a heartbeat on LOCAL: its engine waits.
+    const failed = preparation.scope(() => wiring.prepareWorker(LOCAL, undefined));
+    await settle();
+    builds[0].done.reject(new Error('docker build failed'));
+    await expect(failed).rejects.toThrow('docker build failed');
+    await expect(preparation.scope(() => wiring.prepareWorker(LOCAL, undefined))).rejects.toThrow('prepared again in 60 seconds');
+    expect(builds).toHaveLength(1);
+    // The user's preparation within that wait: built with its own signal, and its success ends the wait.
+    const user = new AbortController();
+    const preparing = wiring.prepareWorker(LOCAL, user.signal);
+    await settle();
+    expect(builds).toHaveLength(2);
+    expect(builds[1].signal).toBe(user.signal);
+    expect(builds[1].target).toBe(LOCAL);
+    builds[1].done.resolve(IMAGE);
+    await expect(preparing).resolves.toBeUndefined();
+    const heartbeat = preparation.scope(() => wiring.prepareWorker(LOCAL, undefined));
+    await settle();
+    expect(builds).toHaveLength(3);
+    // While that heartbeat's build runs on LOCAL, the user's preparation starts its own, never joins it.
+    const own = new AbortController();
+    const preparingOwn = wiring.prepareWorker(LOCAL, own.signal);
+    await settle();
+    expect(builds).toHaveLength(4);
+    expect(builds[3].signal).toBe(own.signal);
+    builds[3].done.resolve(IMAGE);
+    await expect(preparingOwn).resolves.toBeUndefined();
+    expect(await settledYet(heartbeat)).toBe(false);
+    builds[2].done.resolve(IMAGE);
+    await expect(heartbeat).resolves.toBeUndefined();
+    preparation.dispose();
+  });
+
+  it('monitorEnsure starts the monitor with the tag and ID of the image, the socket of the engine and the signal (B-R6-6: X05, X08)', async () => {
+    const calls: unknown[][] = [];
+    const sockets: DockerTarget[] = [];
+    const failure = new Error('docker run failed');
+    let fail = false;
+    const ensure = monitorEnsure(
+      {
+        ensureOrThrow: async (...args: unknown[]) => {
+          calls.push(args);
+          if (fail) throw failure;
+          return 'started';
+        },
+      },
+      async (target) => {
+        sockets.push(target);
+        return '/run/user/1000/docker.sock';
+      },
+    );
+    const signal = new AbortController().signal;
+    await expect(ensure(IMAGE, REMOTE, signal)).resolves.toBeUndefined();
+    expect(sockets).toEqual([REMOTE]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toHaveLength(4);
+    expect(calls[0][0]).toBe(IMAGE.tag);
+    expect(calls[0][1]).toBe('/run/user/1000/docker.sock');
+    expect(calls[0][2]).toBe(signal);
+    expect(calls[0][3]).toBe(IMAGE.id);
+    fail = true;
+    await expect(ensure(IMAGE, LOCAL, signal)).rejects.toBe(failure);
+  });
+
+  it('extension.ts starts the monitor of a repair through monitorEnsure and retries the workers after a build (B-R6-6: X05, X06, X08)', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', '..', 'vscode', 'extension.ts'), 'utf8');
+    expect(source).toContain('const repairSessionMonitor = heartbeats.repair(monitorEnsure(remoteMonitor, engineSocket));');
+    expect(source).not.toContain('ensureOrThrow(image.tag');
+    expect(source).toMatch(/onImageBuilt: \(\) => \{\s*helperChannels\?\.clearFailures\(\);\s*heartbeats\.imageBuilt\(\);\s*\}/);
   });
 });

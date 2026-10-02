@@ -26,6 +26,22 @@ export interface HeartbeatWiringDeps extends Omit<HeartbeatHelperImageDeps, 'pre
 /** Starts the Session Monitor container of `target` with the helper image `image` (RemoteMonitor.ensureOrThrow). */
 export type EnsureMonitor = (image: HelperImageUse, target: DockerTarget, signal: AbortSignal) => Promise<void>;
 
+/** The Session Monitor container of an engine (RemoteSessionMonitor). */
+export interface MonitorStart {
+  ensureOrThrow(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<unknown>;
+}
+
+/**
+ * Review round 6 of PR #85 (B-R6-6): the EnsureMonitor of the repair that extension.ts had inline: the Session Monitor
+ * container of `target` with the tag and the ID of the helper image, the socket mount of its engine and the repair's
+ * signal.
+ */
+export function monitorEnsure(monitor: MonitorStart, socketPath: (target: DockerTarget) => Promise<string>): EnsureMonitor {
+  return async (image, target, signal) => {
+    await monitor.ensureOrThrow(image.tag, await socketPath(target), signal, image.id);
+  };
+}
+
 export interface HeartbeatWiring {
   /** The preparation of the heartbeats (its scope for their send, repair and check). */
   readonly preparation: HeartbeatPreparation;

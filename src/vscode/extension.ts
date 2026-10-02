@@ -40,7 +40,7 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
-import { heartbeatWiring } from '../core/session/heartbeatWiring';
+import { heartbeatWiring, monitorEnsure } from '../core/session/heartbeatWiring';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { readOrCreateComputerId } from '../core/storage/computerId';
@@ -382,9 +382,8 @@ async function activateExtension(
   // #85 (A-R2-2): it ends only the wait for the helper image, whose build runs with the long signal of the preparation.
   // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it, the
   // repair goes on with the tag when it is present (heartbeatWiring.repair).
-  const repairSessionMonitor = heartbeats.repair(async (image, target, signal) => {
-    await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
-  });
+  // Review round 6 of PR #85 (B-R6-6): its start of the monitor (monitorEnsure) is tested in core.
+  const repairSessionMonitor = heartbeats.repair(monitorEnsure(remoteMonitor, engineSocket));
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
   const windowHeartbeats = new WindowHeartbeats({
