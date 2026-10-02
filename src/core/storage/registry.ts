@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Environment Registry (concept 7.5): registry.json in the global storage folder.
-// Several VS Code windows and the Session Monitor process change it. Every read-modify-write runs under the lock folder
+// Several VS Code windows change it (plan step 8, PR C: the local Session Monitor process is removed). Every read-modify-write runs under the lock folder
 // registry.lock, and every write is atomic (temporary file, then rename), so a read without the lock sees either the old
 // or the new content (implementation notes 4).
 import * as fs from 'fs';
@@ -77,7 +77,7 @@ export function isEnvironmentOf(
   );
 }
 
-/** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
+/** The Environment Registry. Used by the windows. It keeps no cache. */
 export class EnvironmentRegistry {
   private readonly logger: Logger;
   private readonly lockStaleMs: number;

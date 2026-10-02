@@ -4,54 +4,41 @@
 
 // Session Coordinator (concept 7.2, 7.9, 7.10): the window side of the stop-on-close mechanism. It writes the window
 // status file at activation and every 15 seconds (and then drives the window's heartbeats to the Session Monitor
-// container of each engine, plan step 8 PR A), removes the pending connection file of the connected environment,
-// writes monitor.json, starts the Session Monitor process when none runs, and writes `closing` plus the reopen record in
-// deactivate().
+// container of each engine, plan step 8 PR A), removes the pending connection file of the connected environment, and
+// writes `closing` plus the reopen record in deactivate().
+//
+// Plan step 8, PR C: the local Node.js Session Monitor (src/monitor) is removed, with monitor.json, its lock, version,
+// exit and log files and its protocol version. The window does its remaining work:
+//   - when the window leaves its environment (setEnvironment to another one or none, a second start) and when it closes
+//     (deactivate), the short release of the environment it leaves (user decisions Q1 and Q2 of 2026-10-02:
+//     src/core/session/windowRelease.ts, which records the Git state first), bounded; deactivate() waits for it, within
+//     CLOSE_RELEASE_BOUNDS, after the synchronous `closing` write;
+//   - at activation and every hour, the sweep of the storage folder (sweepStorage) and the removal of the status files of
+//     other windows whose process ended (cleanUpStorage).
 //
 // It needs only types from `vscode` (the event is a small own emitter), so it runs in unit tests without VS Code.
-import { spawn, type SpawnOptions } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type * as vscode from 'vscode';
+import { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS, waitingTimeMs } from '../core/busy';
 import { errorMessage } from '../core/errors';
 import { isoTime, systemClock, type Clock, type Logger } from '../core/ports';
+import { isProcessAlive } from '../core/session/sessionRules';
+import { CLOSE_RELEASE_BOUNDS, SWITCH_RELEASE_BOUNDS, type ReleaseBounds } from '../core/session/windowRelease';
 import { atomicTemporaryPath } from '../core/storage/atomicJson';
 import { retryTransient, retryTransientSync, type StoragePaths } from '../core/storage/paths';
 import type { SessionFiles } from '../core/storage/sessionFiles';
-import type { ExtensionSettings, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
-import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../core/busy';
-import { isProcessAlive, stopAfterSeconds } from '../core/session/sessionRules';
-import {
-  isMonitorRunning,
-  MONITOR_PROTOCOL_VERSION,
-  readMonitorVersion,
-  requestMonitorExit,
-  runningMonitor,
-} from '../monitor/lock';
+import { STORAGE_SWEEP_INTERVAL_MS, sweepStorage } from '../core/storage/storageSweep';
+import type { ExtensionSettings, PendingConnection, WindowStatus } from '../core/types';
 
 /** Interval of the window status file updates (concept 7.9). */
 export const HEARTBEAT_INTERVAL_MS = 15_000;
-/**
- * A monitor that was started less than this time ago is not started again, although its lock file does not exist yet:
- * the new process needs a moment until it has taken the lock.
- */
-export const MONITOR_START_GRACE_MS = 10_000;
-
-/** The part of a child process that the coordinator uses. */
-export interface SpawnedProcess {
-  unref(): void;
-  on(event: 'error', listener: (error: Error) => void): unknown;
-}
-
-export type SpawnFunction = (command: string, args: readonly string[], options: SpawnOptions) => SpawnedProcess;
 
 export interface SessionCoordinatorDeps {
   paths: StoragePaths;
   sessionFiles: SessionFiles;
   logger: Logger;
-  /** Absolute path of dist/sessionMonitor.js. */
-  monitorScript: string;
   settings: () => ExtensionSettings;
   /** The Docker context in the authority of this window (ConnectionAdapter.currentDockerContext), for its status file. */
   windowDockerContext?: () => string | undefined;
@@ -63,18 +50,22 @@ export interface SessionCoordinatorDeps {
   pid?: number;
   /** Default: `isProcessAlive`. */
   isAlive?: (pid: number) => boolean;
-  /** Default: `child_process.spawn`. */
-  spawnProcess?: SpawnFunction;
-  /** Default: `process.execPath` (the VS Code executable; it runs as Node.js with ELECTRON_RUN_AS_NODE=1). */
-  execPath?: string;
   /** Default: HEARTBEAT_INTERVAL_MS. */
   heartbeatMs?: number;
+  /** Plan step 8, PR C: the interval of cleanUpStorage after the one at activation. Default: STORAGE_SWEEP_INTERVAL_MS. */
+  cleanupMs?: number;
   /**
    * Plan step 8, PR A: the heartbeats of this window to the Session Monitor container of each engine
    * (src/core/session/windowHeartbeats.ts), driven by this tick after each status write. Not awaited (a heartbeat over
    * SSH, or the repair of a missing monitor, must not hold the status file back); it skips a tick while one runs.
    */
   windowHeartbeats?: { tick(): Promise<void> };
+  /**
+   * Plan step 8, PR C (user decisions Q1 and Q2 of 2026-10-02): the release of an environment this window leaves
+   * (releaseEnvironment of src/core/session/windowRelease.ts, the recorded state of its repository first, then the short
+   * release), within `bounds`. Without it: no release (the long limit of the heartbeats applies).
+   */
+  release?: (environmentId: string, bounds: ReleaseBounds) => Promise<unknown>;
 }
 
 /** Minimal `vscode.EventEmitter` replacement, so that this module has no runtime dependency on `vscode`. */
@@ -108,6 +99,15 @@ class Emitter<T> {
   }
 }
 
+/** `promise`, but resolved after `ms` at the latest. */
+function settledWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return Promise.race([promise.then(() => undefined, () => undefined), deadline]).finally(() => clearTimeout(timer));
+}
+
 export class SessionCoordinator implements vscode.Disposable {
   /** Random ID of this window, new at each activation (a window reload creates a new ID, concept 7.9). */
   readonly windowId: string;
@@ -120,13 +120,14 @@ export class SessionCoordinator implements vscode.Disposable {
   private readonly clock: Clock;
   private readonly pid: number;
   private readonly isAlive: (pid: number) => boolean;
-  private readonly spawnProcess: SpawnFunction;
-  private readonly execPath: string;
   private readonly heartbeatMs: number;
+  private readonly cleanupMs: number;
   private readonly heartbeatEmitter: Emitter<void>;
 
   private currentEnvironmentId: string | null = null;
   private timer: NodeJS.Timeout | undefined;
+  private cleanupTimer: NodeJS.Timeout | undefined;
+  private cleanupRunning = false;
   private started = false;
   private heartbeatRunning = false;
   /** Set by deactivateSync() and dispose(): no further asynchronous status writes. */
@@ -134,7 +135,8 @@ export class SessionCoordinator implements vscode.Disposable {
   private deactivated = false;
   /** Incremented by each status write. Only the newest write may replace the file. */
   private writeGeneration = 0;
-  private monitorStartedAt: number | undefined;
+  /** Plan step 8, PR C: the releases of a switch that still run (deactivate waits for them within its bound). */
+  private readonly releases = new Set<Promise<void>>();
 
   constructor(private readonly deps: SessionCoordinatorDeps) {
     this.paths = deps.paths;
@@ -144,9 +146,8 @@ export class SessionCoordinator implements vscode.Disposable {
     this.windowId = deps.windowId ?? crypto.randomUUID();
     this.pid = deps.pid ?? process.pid;
     this.isAlive = deps.isAlive ?? isProcessAlive;
-    this.spawnProcess = deps.spawnProcess ?? ((command, args, options) => spawn(command, [...args], options));
-    this.execPath = deps.execPath ?? process.execPath;
     this.heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+    this.cleanupMs = deps.cleanupMs ?? STORAGE_SWEEP_INTERVAL_MS;
     this.heartbeatEmitter = new Emitter<void>(deps.logger);
     this.onDidHeartbeat = this.heartbeatEmitter.event;
   }
@@ -159,8 +160,8 @@ export class SessionCoordinator implements vscode.Disposable {
   /**
    * Writes the status file (`active`) at once and then every 15 seconds; each write removes the pending connection file
    * of the environment (concept 7.9: the window that connects deletes this file when it writes its status file).
-   * Writes monitor.json and starts the Session Monitor if none runs. A second call works like `setEnvironment`.
-   * Never throws: errors are logged, and the next update tries again.
+   * Plan step 8, PR C: then cleans up the storage folder (cleanUpStorage), and again every hour. A second call works like
+   * `setEnvironment`. Never throws: errors are logged, and the next update tries again.
    *
    * Resolves with the pending connection file of the environment that existed before this call removed it, if it is
    * younger than PENDING_MAX_AGE_MS: the open pipeline has just run for this window (it was opened by our own
@@ -168,12 +169,15 @@ export class SessionCoordinator implements vscode.Disposable {
    */
   async start(environmentId: string | null): Promise<PendingConnection | undefined> {
     if (this.stopped) return undefined;
-    this.currentEnvironmentId = environmentId;
     if (this.started) {
+      const previous = this.currentEnvironmentId;
+      this.currentEnvironmentId = environmentId;
       const pending = await this.freshPending(environmentId);
       await this.writeStatus();
+      this.releaseLeft(previous, environmentId);
       return pending;
     }
+    this.currentEnvironmentId = environmentId;
     this.started = true;
     try {
       await this.paths.ensureDirectories();
@@ -185,43 +189,33 @@ export class SessionCoordinator implements vscode.Disposable {
     if (this.stopped) return undefined;
     this.timer = setInterval(() => this.heartbeat(), this.heartbeatMs);
     this.timer.unref?.();
+    this.cleanupTimer = setInterval(() => void this.cleanUpStorage(), this.cleanupMs);
+    this.cleanupTimer.unref?.();
     await this.writeStatus();
-    await this.writeMonitorSettings();
-    await this.ensureMonitorRunning();
+    await this.cleanUpStorage();
     return pending;
   }
 
-  /** Changes the environment of this window and writes the status file at once. */
+  /**
+   * Changes the environment of this window and writes the status file at once. Plan step 8, PR C (Q1): the environment
+   * that the window leaves gets its release (not awaited here; deactivate waits for it within its bound).
+   */
   async setEnvironment(environmentId: string | null): Promise<void> {
     if (this.stopped) return;
+    const previous = this.currentEnvironmentId;
     this.currentEnvironmentId = environmentId;
-    if (this.started) await this.writeStatus();
+    if (!this.started) return;
+    await this.writeStatus();
+    this.releaseLeft(previous, environmentId);
   }
 
   /**
-   * Writes the pending connection file of an environment (concept 7.9), so that the Session Monitor does not stop its
-   * container while this window connects. Throws if the file cannot be written: the caller relies on the protection.
+   * Writes the pending connection file of an environment (concept 7.9), so that another window does not take the
+   * environment for unused while this window connects. Throws if the file cannot be written: the caller relies on the
+   * protection.
    */
   async writePending(environmentId: string): Promise<void> {
     await this.sessionFiles.writePending(environmentId, this.windowId);
-  }
-
-  /** Writes monitor.json from the settings. Call at start and when the configuration changes. Never throws. */
-  async writeMonitorSettings(): Promise<void> {
-    try {
-      await this.sessionFiles.writeMonitorSettings(this.monitorSettings());
-    } catch (error) {
-      this.logger.warn(`The settings for the Session Monitor could not be written. ${errorMessage(error)}`);
-    }
-  }
-
-  /**
-   * Starts the Session Monitor when monitor.lock holds no live, fresh process ID (implementation notes 12). Never throws.
-   * Called at start, at each status update, and in deactivateSync(): the monitor ends when it has no work, and a
-   * window must not stay without one.
-   */
-  async ensureMonitorRunning(): Promise<void> {
-    this.ensureMonitorRunningSync();
   }
 
   /** Status files of OTHER windows whose process exists, whose state is `active`, and that were updated ≤ 60 s ago. */
@@ -237,10 +231,51 @@ export class SessionCoordinator implements vscode.Disposable {
   }
 
   /**
+   * Plan step 8, PR C (moved from the removed local Session Monitor, monitor cleanup of 2026-09-29): the sweep of the
+   * storage folder (sweepStorage: stale pending files, disconnect requests, temporary files), and the removal of the status
+   * files of other windows whose process ended and that were not updated for HEARTBEAT_MAX_AGE_MS plus the waiting time
+   * (a window that just closed keeps its `closing` file that long). At activation and every hour; one at a time. Never
+   * throws.
+   */
+  async cleanUpStorage(): Promise<void> {
+    if (this.cleanupRunning) return;
+    this.cleanupRunning = true;
+    try {
+      const now = this.clock.now();
+      try {
+        const removed = await sweepStorage(this.paths, now);
+        const files = [...removed.pending, ...removed.disconnect, ...removed.temporary];
+        if (files.length > 0) this.logger.info(`Removed outdated files from the storage folder: ${files.join(', ')}`);
+      } catch (error) {
+        this.logger.warn(`The storage folder could not be cleaned up. ${errorMessage(error)}`);
+      }
+      const maxAgeMs = HEARTBEAT_MAX_AGE_MS + waitingTimeMs(this.deps.settings());
+      let statuses: WindowStatus[] = [];
+      try {
+        statuses = await this.sessionFiles.readWindowStatuses();
+      } catch (error) {
+        this.logger.warn(`The window status files could not be read. ${errorMessage(error)}`);
+      }
+      for (const status of statuses) {
+        if (status.windowId === this.windowId || this.isAlive(status.pid)) continue;
+        const updatedAt = Date.parse(status.updatedAt);
+        if (Number.isFinite(updatedAt) && Math.abs(now - updatedAt) <= maxAgeMs) continue;
+        try {
+          await this.sessionFiles.removeWindowStatus(status.windowId);
+          this.logger.info(`Removed the status file of the closed window ${status.windowId}.`);
+        } catch (error) {
+          this.logger.warn(`The status file of the closed window ${status.windowId} could not be removed. ${errorMessage(error)}`);
+        }
+      }
+    } finally {
+      this.cleanupRunning = false;
+    }
+  }
+
+  /**
    * For `deactivate()`: synchronous write of the state `closing`, plus the reopen record when the window is connected
    * (concept 7.9, 7.10). Stops the updates first; an update that is still running cannot replace the file afterwards
-   * (see `writeActiveStatus`). Then makes sure that a Session Monitor runs, which stops the container after the
-   * waiting time. Never throws.
+   * (see `writeActiveStatus`). Never throws.
    */
   deactivateSync(): void {
     if (this.deactivated) return;
@@ -268,7 +303,23 @@ export class SessionCoordinator implements vscode.Disposable {
         this.logger.error('The reopen record could not be written.', error);
       }
     }
-    this.ensureMonitorRunningSync();
+  }
+
+  /**
+   * Plan step 8, PR C: `deactivate()` of the extension. First deactivateSync() (synchronously, before any await), then
+   * the release of the connected environment (user decision Q1 of 2026-10-02; the recorded state of its repository first,
+   * Q2) and of the releases of a switch that still run, all within CLOSE_RELEASE_BOUNDS.totalMs. Never rejects. A second
+   * call releases nothing more.
+   */
+  deactivate(): Promise<void> {
+    const first = !this.deactivated;
+    this.deactivateSync();
+    if (!first || !this.started) return Promise.resolve();
+    const work = [...this.releases];
+    const environmentId = this.currentEnvironmentId;
+    if (environmentId !== null) work.push(this.runRelease(environmentId, CLOSE_RELEASE_BOUNDS));
+    if (work.length === 0) return Promise.resolve();
+    return settledWithin(Promise.all(work), CLOSE_RELEASE_BOUNDS.totalMs);
   }
 
   dispose(): void {
@@ -284,6 +335,34 @@ export class SessionCoordinator implements vscode.Disposable {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
+  }
+
+  /** Plan step 8, PR C (Q1): the release of `previous` when the window left it for `next`. Not awaited; tracked. */
+  private releaseLeft(previous: string | null, next: string | null): void {
+    if (previous === null || previous === next) return;
+    const running = this.runRelease(previous, SWITCH_RELEASE_BOUNDS);
+    this.releases.add(running);
+    void running.finally(() => this.releases.delete(running));
+  }
+
+  /** The release of `environmentId` within `bounds`. Never rejects. */
+  private runRelease(environmentId: string, bounds: ReleaseBounds): Promise<void> {
+    const release = this.deps.release;
+    if (release === undefined) return Promise.resolve();
+    let started: Promise<unknown>;
+    try {
+      started = release(environmentId, bounds);
+    } catch (error) {
+      started = Promise.reject(error);
+    }
+    return settledWithin(
+      started.catch((error: unknown) => this.logger.warn(`The release of the environment could not be sent. ${errorMessage(error)}`)),
+      bounds.totalMs,
+    );
   }
 
   private heartbeat(): void {
@@ -293,7 +372,6 @@ export class SessionCoordinator implements vscode.Disposable {
     (async () => {
       try {
         await this.writeStatus();
-        this.ensureMonitorRunningSync();
         if (!this.stopped) {
           // Plan step 8, PR A: never throws; not awaited.
           void this.deps.windowHeartbeats?.tick();
@@ -366,86 +444,5 @@ export class SessionCoordinator implements vscode.Disposable {
       // Normally gone after the rename; left over after a dropped or failed write.
       await fs.promises.rm(temp, { force: true }).catch(() => {});
     }
-  }
-
-  private monitorSettings(): MonitorSettings {
-    const settings = this.deps.settings();
-    const seconds = settings.waitingTimeSeconds;
-    return {
-      waitingTimeSeconds:
-        typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_WAITING_TIME_SECONDS,
-      stopOnClose: settings.stopOnClose !== false,
-      respectShutdownActionNone: settings.respectShutdownActionNone === true,
-      // Review round 2 of PR #85, A-R2-3: kept until plan step 8, PR C. A monitor of version 2 requires it (main's
-      // isMonitorSettings) and else decides with its defaults, stopping kept environments: one whose tick runs while it
-      // retires, or one that a window that was not reloaded starts later. This version does not read it.
-      remoteStopAfterSeconds: stopAfterSeconds(settings.stopAfterMinutes),
-      updatedAt: isoTime(this.clock),
-    };
-  }
-
-  /**
-   * Synchronous, for deactivateSync(). Returns true if a monitor process was started. A live monitor of a known, older
-   * protocol version (MONITOR_PROTOCOL_VERSION) is asked to exit, and the current monitor is started; it waits until the
-   * older one has ended. A monitor whose version is unknown (no version file, or it cannot be read) is left alone this
-   * time: a failed read is never taken for an older version.
-   */
-  private ensureMonitorRunningSync(): boolean {
-    try {
-      let older: { pid: number; version: number } | undefined;
-      if (isMonitorRunning(this.paths.monitorLock, this.isAlive)) {
-        const monitor = runningMonitor(this.paths.monitorLock, this.isAlive);
-        // A lock without a valid process ID yet: its creator is still writing it.
-        if (!monitor) return false;
-        const version = readMonitorVersion(this.paths.monitorVersion, monitor.pid);
-        if (version === undefined || version >= MONITOR_PROTOCOL_VERSION) return false;
-        older = { pid: monitor.pid, version };
-      }
-      const now = this.clock.now();
-      if (this.monitorStartedAt !== undefined && Math.abs(now - this.monitorStartedAt) < MONITOR_START_GRACE_MS) {
-        return false;
-      }
-      this.monitorStartedAt = now;
-      if (older) this.retireMonitor(older.pid, older.version);
-      this.startMonitor();
-      return true;
-    } catch (error) {
-      this.logger.error('The Session Monitor could not be started.', error);
-      return false;
-    }
-  }
-
-  /**
-   * Asks an older monitor to exit, never forces it and sends it no signal: monitor.exit names it, and the monitor ends
-   * after its current step (a `docker stop` that has started is finished).
-   */
-  private retireMonitor(pid: number, version: number): void {
-    this.logger.info(
-      `Asked the Session Monitor (process ${pid}) to exit: it has protocol version ${version}, older than ${MONITOR_PROTOCOL_VERSION}.`,
-    );
-    try {
-      requestMonitorExit(this.paths.monitorExit, pid);
-    } catch (error) {
-      this.logger.warn(`The exit request for the Session Monitor could not be written. ${errorMessage(error)}`);
-    }
-  }
-
-  /** implementation notes 12: detached, without standard streams, with the Node.js runtime of VS Code. */
-  private startMonitor(): void {
-    const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
-    // Options for Node.js (for example --inspect of a debugged extension host) must not reach the monitor.
-    delete env.NODE_OPTIONS;
-    // Assumption (V-3): a detached process keeps running after VS Code quits, on macOS, Windows, and Linux.
-    const child = this.spawnProcess(this.execPath, [this.deps.monitorScript, this.paths.root], {
-      detached: true,
-      stdio: 'ignore',
-      env,
-      // The monitor must not keep the folder that VS Code was started in busy (Windows), and needs no console window.
-      cwd: this.paths.root,
-      windowsHide: true,
-    });
-    child.on('error', (error) => this.logger.error('The Session Monitor could not be started.', error));
-    child.unref();
-    this.logger.info('Started the Session Monitor.');
   }
 }

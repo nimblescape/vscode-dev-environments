@@ -13,8 +13,8 @@ import type { GitSummary } from '../types';
  * keeps them, and Delete removes them. Commits that only the reflog or a tag still reaches are not counted (review round
  * 4 of PR #84, A-R4-1: a clone fetches every tag of the upstream).
  *
- * The script runs in the running dev container as its user (`remoteUser`): the polls of the Session Monitor, and after
- * an open or a stop (and, user decision 2026-10-02, before Delete's confirmation when the container runs). Delete runs no
+ * The script runs in the running dev container as its user (`remoteUser`): before the release of a window on close or
+ * switch (plan step 8, PR C; before, the polls of the local Session Monitor), and after an open or a stop (and, user decision 2026-10-02, before Delete's confirmation when the container runs). Delete runs no
  * Git anywhere else (user decision 2026-10-02: "No git needs delete."): no workspace helper runs this script.
  *
  * Git runs without hooks, without an fsmonitor, and without optional locks, so that it runs no hook and never writes to

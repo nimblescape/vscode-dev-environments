@@ -2,10 +2,9 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 8, PR A: the session helpers that moved from src/monitor to src/core/session.
+// Plan step 8, PR A: the session helpers that moved from src/monitor to src/core/session. Plan step 8, PR C: src/monitor
+// is removed, so the checks that its re-exports were the same are gone with it.
 import { describe, expect, it } from 'vitest';
-import { isProcessAlive as monitorIsProcessAlive } from '../../monitor/lock';
-import { keptWhenClosed as monitorKeptWhenClosed, remoteStopAfterSeconds } from '../../monitor/rules';
 import { isProcessAlive, keepFlagsOf, keptWhenClosed, stopAfterSeconds } from './sessionRules';
 
 describe('sessionRules (plan step 8, PR A)', () => {
@@ -16,8 +15,6 @@ describe('sessionRules (plan step 8, PR A)', () => {
     expect(stopAfterSeconds(5000)).toBe(86_400);
     expect(stopAfterSeconds(undefined)).toBe(600);
     expect(stopAfterSeconds(Number.NaN)).toBe(600);
-    // The monitor keeps the old name until it is removed (PR C).
-    expect(remoteStopAfterSeconds).toBe(stopAfterSeconds);
   });
 
   it('keptWhenClosed follows Keep Running, Close and Keep Running, stopOnClose and a respected shutdownAction none', () => {
@@ -30,9 +27,6 @@ describe('sessionRules (plan step 8, PR A)', () => {
     expect(keptWhenClosed(keepFlagsOf({}), { ...settings, stopOnClose: false })).toBe(true);
     // Anything but an explicit false keeps the default (stop).
     expect(keptWhenClosed(keepFlagsOf({}), {})).toBe(false);
-    // The monitor's rule is the same.
-    const monitorSettings = { waitingTimeSeconds: 30, stopOnClose: true, respectShutdownActionNone: true, updatedAt: '' };
-    expect(monitorKeptWhenClosed({ id: 'x', busy: false, keepRunning: false, shutdownActionNone: true }, monitorSettings)).toBe(true);
   });
 
   // Review round 1 of PR #85 (mutants R05, R08): a flag or setting that is not set is never a keep.
@@ -42,12 +36,11 @@ describe('sessionRules (plan step 8, PR A)', () => {
     expect(keptWhenClosed({ keepRunning: false, shutdownActionNone: true }, { stopOnClose: true, respectShutdownActionNone: undefined })).toBe(false);
   });
 
-  it('isProcessAlive: this process lives, invalid IDs do not; the monitor re-exports it', () => {
+  it('isProcessAlive: this process lives, invalid IDs do not', () => {
     expect(isProcessAlive(process.pid)).toBe(true);
     expect(isProcessAlive(0)).toBe(false);
     expect(isProcessAlive(-1)).toBe(false);
     expect(isProcessAlive(1.5)).toBe(false);
     expect(isProcessAlive(0x80000000)).toBe(false);
-    expect(monitorIsProcessAlive).toBe(isProcessAlive);
   });
 });

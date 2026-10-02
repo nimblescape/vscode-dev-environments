@@ -4124,6 +4124,64 @@ describe('safetyCheck', () => {
   });
 });
 
+// Plan step 8, PR C (user decision Q2 (c) of 2026-10-02): the window records the Git state itself just before its release
+// on close or switch, with the refresh that Delete uses.
+describe('recordGitState (plan step 8, PR C, Q2)', () => {
+  it('reads the Git state in the running dev container as its user and records it, without Docker start, lock or helper', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    const findContainer = vi.spyOn(h.docker, 'findContainer');
+    const controller = new AbortController();
+    const exec = vi.spyOn(h.docker, 'exec');
+    expect(await h.service.recordGitState(ENV_ID, controller.signal)).toBe(true);
+    const container = h.docker.containersOf(ENV_ID)[0];
+    expect(findContainer).toHaveBeenCalledWith(ENV_ID, expect.any(String));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][0]).toBe(container.id);
+    expect(exec.mock.calls[0][1]).toEqual(gitSummaryCommand('/workspaces/api'));
+    expect(exec.mock.calls[0][2]).toMatchObject({ user: 'vscode', timeoutMs: 30_000 });
+    expect(exec.mock.calls[0][2]?.signal).toBe(controller.signal);
+    expect((await entry())?.gitSummary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    expect(h.helper.calls).toEqual([]);
+    expect(h.progress.steps).toEqual([]);
+    expect(container.state).toBe('running');
+  });
+
+  it('records nothing when the container does not run, is missing, or the environment is gone', async () => {
+    const env = await seedEnvironment(h, { container: 'stopped' });
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    expect(await h.service.recordGitState('00000000-0000-4000-8000-00000000dead')).toBe(false);
+    expect(h.docker.execs).toEqual([]);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('records nothing for an environment of another Docker host', async () => {
+    const env = await seedEnvironment(h, { container: 'running', extra: { dockerHost: 'build-box' } });
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    expect(h.docker.execs).toEqual([]);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('never throws: a failed read, an exec or lookup that throws, an aborted signal keep the recorded state', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ exitCode: 128, stderr: 'fatal: not a git repository' });
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    const aborted = new AbortController();
+    aborted.abort();
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    expect(await h.service.recordGitState(ENV_ID, aborted.signal)).toBe(false);
+    h.docker.exec = async () => {
+      throw new Error('docker exec failed');
+    };
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    h.docker.findContainer = async () => {
+      throw new Error('docker inspect failed');
+    };
+    await expect(h.service.recordGitState(ENV_ID)).resolves.toBe(false);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+});
+
 describe('configuration queries', () => {
   it('listConfigurations lists the configurations in the volume', async () => {
     await seedEnvironment(h);

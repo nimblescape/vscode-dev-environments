@@ -48,19 +48,6 @@
       "preLaunchTask": "open extension development host (profile)"
     },
     {
-      // Runs the Session Monitor under the debugger. Only one monitor runs per storage folder (monitor.lock): quit the
-      // running one first, or give another folder.
-      "name": "Debug Session Monitor",
-      "type": "node",
-      "request": "launch",
-      "program": "${workspaceFolder}/dist/sessionMonitor.js",
-      "args": ["${input:monitorStorage}"],
-      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
-      "preLaunchTask": "build",
-      "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"]
-    },
-    {
       // Runs the unit tests of the file open in the editor.
       "name": "Debug Unit Tests (current file)",
       "type": "node",
@@ -84,14 +71,6 @@
       "smartStep": true,
       "console": "integratedTerminal",
       "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
-    }
-  ],
-  "inputs": [
-    {
-      "id": "monitorStorage",
-      "type": "promptString",
-      "description": "Storage folder of the extension (the Session Monitor's argument)",
-      "default": "${userHome}/Library/Application Support/Code/User/globalStorage/nimblescape.vscode-dev-environments"
     }
   ]
 }

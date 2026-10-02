@@ -134,7 +134,12 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
   return { heartbeats, deps, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks, checkSignals };
 }
 
-const entriesOf = (item: Sent) => item.input.environments.map(({ id, keepRunning }) => ({ id, keepRunning }));
+// Changed helper, plan step 8 PR C: the entries of the environments the window uses. The clear-only entries that the
+// first heartbeat of a series carries for the environments of this computer that are not kept (the replacement of the
+// full sync) are left out here and checked by their own tests (clearsOf).
+const entriesOf = (item: Sent) => item.input.environments.filter((entry) => entry.clearOnly !== true).map(({ id, keepRunning }) => ({ id, keepRunning }));
+/** Plan step 8, PR C: the ids of the clear-only entries of a heartbeat. */
+const clearsOf = (item: Sent) => item.input.environments.filter((entry) => entry.clearOnly === true).map(({ id }) => id);
 
 describe('WindowHeartbeats (plan step 8, PR A)', () => {
   it('sends nothing without an environment of this window', async () => {
@@ -1885,5 +1890,144 @@ describe('HeartbeatPreparation joins a build only while its long signal lasts (r
     await expect(first).resolves.toBe('old');
     await expect(next).resolves.toBe('new');
     await expect(last).resolves.toBe('last');
+  });
+});
+
+// Plan step 8, PR C (user decision Q1 of 2026-10-02): the short release of an environment the window leaves.
+describe('WindowHeartbeats.release (plan step 8, PR C, Q1)', () => {
+  it('sends one heartbeat with the short limit and the flag of the entry to the engine of the connected environment', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    h.now.value = T0 + 5_000;
+    expect(await h.heartbeats.release(ID_A, 60, new AbortController().signal)).toEqual({ ok: true });
+    expect(h.sent).toHaveLength(2);
+    expect(h.sent[1].target).toEqual(REMOTE);
+    expect(h.sent[1].input).toEqual({ source: SOURCE, limitSeconds: 60, environments: [{ id: ID_A, keepRunning: false, seq: T0 + 5_000 }] });
+    // The engine is asked as the connected environment, and only once (it was remembered).
+    expect(h.engineRoles).toEqual([true]);
+  });
+
+  it('also after the window left the environment (switch): the engine of its connected role, not the busy one', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = null;
+    expect(await h.heartbeats.release(ID_A, 90, new AbortController().signal)).toEqual({ ok: true });
+    expect(h.engineRoles).toEqual([true]);
+    expect(h.sent[0].input.limitSeconds).toBe(90);
+  });
+
+  it('a tick that still uses the environment sends the long limit again at once after the release', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    h.now.value = T0 + 1_000;
+    await h.heartbeats.release(ID_A, 60, new AbortController().signal);
+    h.now.value = T0 + 2_000;
+    await h.heartbeats.tick();
+    expect(h.sent.map((item) => item.input.limitSeconds)).toEqual([600, 60, 600]);
+  });
+
+  it('sends nothing to an engine without the container of the environment, and nothing for an environment that is gone', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.containerExists = () => false;
+    expect(await h.heartbeats.release(ID_A, 60, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await h.heartbeats.release(ID_B, 60, new AbortController().signal)).toEqual({ ok: false, detail: 'The environment is not in the registry.' });
+    expect(h.sent).toEqual([]);
+  });
+
+  it('ends with a failure when its signal aborts during a send that hangs, and aborts the signal of the send', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.answer = (_target, signal) =>
+      new Promise((resolve) => signal?.addEventListener('abort', () => resolve({ ok: false, missing: false, detail: 'aborted' })));
+    const controller = new AbortController();
+    const result = h.heartbeats.release(ID_A, 60, controller.signal);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(1));
+    controller.abort();
+    expect(await result).toMatchObject({ ok: false });
+    expect(h.signals[0].aborted).toBe(true);
+  });
+
+  it('never throws (a registry that rejects)', async () => {
+    const h = harness();
+    h.deps.registry.list = async () => {
+      throw new Error('registry unreadable');
+    };
+    expect(await h.heartbeats.release(ID_A, 60, new AbortController().signal)).toEqual({ ok: false, detail: 'registry unreadable' });
+  });
+});
+
+// Plan step 8, PR C: stale keep records (review note of PR A): the replacement of the full sync of the removed monitor.
+describe('WindowHeartbeats: clear-only entries for environments that are no longer kept (plan step 8, PR C)', () => {
+  const ID_C = '8d2e3f40-0000-4000-8000-000000000003';
+  const ID_D = '9e3f4051-0000-4000-8000-000000000004';
+
+  it('the first heartbeat of a series carries clear-only entries for the environments on that engine that are not kept', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    // Not kept, on the same engine: cleared.
+    h.environments.push(environment(ID_B, 'acme/web'));
+    // Kept: never cleared.
+    h.environments.push(environment(ID_C, 'acme/lib', { keepRunning: true }));
+    // On another engine: not in this heartbeat.
+    h.environments.push(environment(ID_D, 'acme/ops', { dockerHost: 'build-box' }));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(entriesOf(h.sent[0])).toEqual([{ id: ID_A, keepRunning: false }]);
+    expect(clearsOf(h.sent[0])).toEqual([ID_B]);
+    expect(h.sent[0].input.environments.find((entry) => entry.id === ID_B)).toEqual({ id: ID_B, keepRunning: false, seq: T0, clearOnly: true });
+    // Later heartbeats of the series carry none.
+    h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+    expect(clearsOf(h.sent[1])).toEqual([]);
+  });
+
+  it('sends them again after the keep settings changed, and only once', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.environments.push(environment(ID_B, 'acme/web', { shutdownActionNone: true }));
+    h.settings.respectShutdownActionNone = true;
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(clearsOf(h.sent[0])).toEqual([]);
+    // The setting is turned off: ID_B is no longer kept, and its keep record is withdrawn at once.
+    h.settings.respectShutdownActionNone = false;
+    h.now.value = T0 + 5_000;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+    expect(clearsOf(h.sent[1])).toEqual([ID_B]);
+    h.now.value = T0 + 10_000;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+  });
+
+  it('keeps them for the next attempt after a failed heartbeat', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.environments.push(environment(ID_B, 'acme/web'));
+    h.state.connected = ID_A;
+    h.state.answer = () => ({ ok: false, missing: false, detail: 'timed out' });
+    await h.heartbeats.tick();
+    h.state.answer = () => ({ ok: true });
+    h.now.value = T0 + 15_000;
+    await h.heartbeats.tick();
+    expect(h.sent.map(clearsOf)).toEqual([[ID_B], [ID_B]]);
+  });
+
+  it('never more entries than the protocol allows', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    for (let index = 0; index < MAX_HEARTBEAT_ENVIRONMENTS + 5; index += 1) {
+      h.environments.push(environment(`5a5a5a5a-0000-4000-8000-${String(index).padStart(12, '0')}`, `acme/r${index}`));
+    }
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(h.sent[0].input.environments).toHaveLength(MAX_HEARTBEAT_ENVIRONMENTS);
+    expect(entriesOf(h.sent[0])).toEqual([{ id: ID_A, keepRunning: false }]);
   });
 });

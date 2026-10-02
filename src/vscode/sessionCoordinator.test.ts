@@ -2,7 +2,6 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import type { SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import { createRequire, syncBuiltinESMExports } from 'module';
 import * as os from 'os';
@@ -11,25 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import { ATOMIC_TEMPORARY_FILE } from '../core/storage/storageSweep';
+import { ATOMIC_TEMPORARY_FILE, STALE_PENDING_MAX_AGE_MS } from '../core/storage/storageSweep';
 import type { ExtensionSettings, WindowStatus } from '../core/types';
-import { MONITOR_PROTOCOL_VERSION } from '../monitor/lock';
-import { HEARTBEAT_INTERVAL_MS, MONITOR_START_GRACE_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
-
-// Versions reset to 1 (user decision 2026-09-27), 2 since review round 3 of PR #58, 3 since review round 1 of PR #85
-// (A-R1-1). To test the retirement of an older monitor, a test sets the protocol version of the window to a future
-// version 4 (`windowVersion.value`); the
-// protocol version of the monitor module stays the real one otherwise.
-const windowVersion = vi.hoisted(() => ({ value: undefined as number | undefined }));
-vi.mock('../monitor/lock', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../monitor/lock')>();
-  return {
-    ...actual,
-    get MONITOR_PROTOCOL_VERSION(): number {
-      return windowVersion.value ?? actual.MONITOR_PROTOCOL_VERSION;
-    },
-  };
-});
+import { CLOSE_RELEASE_BOUNDS, SWITCH_RELEASE_BOUNDS, type ReleaseBounds } from '../core/session/windowRelease';
+import { HEARTBEAT_INTERVAL_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -37,8 +21,6 @@ const T0 = Date.parse('2026-09-24T17:00:00.000Z');
 const OWN_PID = 4242;
 const OTHER_PID = 4343;
 const DEAD_PID = 5151;
-const SCRIPT = '/ext/dist/sessionMonitor.js';
-const EXEC_PATH = '/Applications/Code.app/Contents/Frameworks/Code Helper (Plugin)';
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
@@ -54,12 +36,6 @@ const SETTINGS: ExtensionSettings = {
   refreshIntervalMinutes: 60,
   hostAccessChecksOff: [],
 };
-
-interface SpawnCall {
-  command: string;
-  args: readonly string[];
-  options: SpawnOptions;
-}
 
 class MemoryLogger implements Logger {
   lines: string[] = [];
@@ -80,8 +56,11 @@ interface Harness {
   paths: StoragePaths;
   sessionFiles: SessionFiles;
   clock: { time: number; now(): number };
-  spawns: SpawnCall[];
   alive: Set<number>;
+  /** Plan step 8, PR C: the releases the coordinator asked for, in order. */
+  releases: Array<{ environmentId: string; bounds: ReleaseBounds }>;
+  /** Plan step 8, PR C: what the next release does (default: resolves at once). */
+  releaseImpl: (environmentId: string, bounds: ReleaseBounds) => Promise<unknown>;
   logger: MemoryLogger;
   settings: ExtensionSettings;
   coordinator: SessionCoordinator;
@@ -101,25 +80,23 @@ function createHarness(): Harness {
     },
   };
   const sessionFiles = new SessionFiles(paths, clock);
-  const spawns: SpawnCall[] = [];
   const alive = new Set<number>([OWN_PID, OTHER_PID]);
   const logger = new MemoryLogger();
-  const harness = { root, paths, sessionFiles, clock, spawns, alive, logger, settings: { ...SETTINGS } } as Harness;
+  const harness = { root, paths, sessionFiles, clock, alive, logger, settings: { ...SETTINGS }, releases: [] } as unknown as Harness;
+  harness.releaseImpl = async () => undefined;
   harness.create = (overrides = {}) =>
     new SessionCoordinator({
       paths,
       sessionFiles,
       logger,
-      monitorScript: SCRIPT,
       settings: () => harness.settings,
       clock,
       windowId: 'window-1',
       pid: OWN_PID,
       isAlive: (pid) => alive.has(pid),
-      execPath: EXEC_PATH,
-      spawnProcess: (command, args, options) => {
-        spawns.push({ command, args, options });
-        return { unref: () => {}, on: () => undefined };
+      release: (environmentId, bounds) => {
+        harness.releases.push({ environmentId, bounds });
+        return harness.releaseImpl(environmentId, bounds);
       },
       ...overrides,
     });
@@ -164,8 +141,8 @@ describe('SessionCoordinator', () => {
   });
 
   it('has a random UUID as window ID by default', () => {
-    const first = new SessionCoordinator({ paths: h.paths, sessionFiles: h.sessionFiles, logger: h.logger, monitorScript: SCRIPT, settings: () => SETTINGS });
-    const second = new SessionCoordinator({ paths: h.paths, sessionFiles: h.sessionFiles, logger: h.logger, monitorScript: SCRIPT, settings: () => SETTINGS });
+    const first = new SessionCoordinator({ paths: h.paths, sessionFiles: h.sessionFiles, logger: h.logger, settings: () => SETTINGS });
+    const second = new SessionCoordinator({ paths: h.paths, sessionFiles: h.sessionFiles, logger: h.logger, settings: () => SETTINGS });
     expect(first.windowId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(first.windowId).not.toBe(second.windowId);
     first.dispose();
@@ -195,7 +172,8 @@ describe('SessionCoordinator', () => {
     }
   });
 
-  it('start writes the active status file, removes the pending file, writes monitor.json, and starts the monitor', async () => {
+  // Changed expectation, plan step 8 PR C: no monitor.json and no Session Monitor process any more (src/monitor removed).
+  it('start writes the active status file and removes the pending file; it writes no monitor.json and starts nothing', async () => {
     await h.sessionFiles.writePending(ID_A, 'window-0');
     await h.coordinator.start(ID_A);
     expect(h.coordinator.environmentId).toBe(ID_A);
@@ -207,17 +185,9 @@ describe('SessionCoordinator', () => {
       updatedAt: iso(T0),
     });
     expect(await h.sessionFiles.readPendings()).toEqual([]);
-    expect(await h.sessionFiles.readMonitorSettings()).toEqual({
-      waitingTimeSeconds: 45,
-      stopOnClose: true,
-      respectShutdownActionNone: false,
-      // Unit 7, PR 2: the time limit of the heartbeats to a remote Session Monitor (the default of 10 minutes).
-      // Changed expectation, review round 2 of PR #85, A-R2-3: written again until plan step 8, PR C, for a monitor of
-      // version 2 (the setting stopAfterMinutes, default 10 minutes).
-      remoteStopAfterSeconds: 600,
-      updatedAt: iso(T0),
-    });
-    expect(h.spawns).toHaveLength(1);
+    expect(fs.existsSync(path.join(h.root, 'monitor.json'))).toBe(false);
+    expect(fs.existsSync(path.join(h.root, 'monitor.lock'))).toBe(false);
+    expect(h.releases).toEqual([]);
     // No temporary files are left behind.
     expect(sessionFileNames(h)).toEqual(['window-1.json']);
   });
@@ -263,195 +233,6 @@ describe('SessionCoordinator', () => {
     expect((await h.sessionFiles.readPendings()).map((pending) => pending.environmentId)).toEqual([ID_B]);
   });
 
-  it('starts the monitor detached with the VS Code executable as Node.js and the storage folder', async () => {
-    await h.coordinator.start(null);
-    const [call] = h.spawns;
-    expect(call.command).toBe(EXEC_PATH);
-    expect(call.args).toEqual([SCRIPT, h.root]);
-    expect(call.options).toMatchObject({ detached: true, stdio: 'ignore', cwd: h.root, windowsHide: true });
-    expect(call.options.env?.ELECTRON_RUN_AS_NODE).toBe('1');
-    expect(call.options.env?.NODE_OPTIONS).toBeUndefined();
-    expect(call.options.env?.PATH).toBe(process.env.PATH);
-  });
-
-  it('does not start a monitor while monitor.lock holds a live and fresh process ID', async () => {
-    fs.mkdirSync(h.root, { recursive: true });
-    fs.writeFileSync(h.paths.monitorLock, `${OTHER_PID}\n`);
-    // A monitor of the current version (review finding F2 of PR #26: an older one is asked to exit, see below).
-    fs.writeFileSync(path.join(h.root, 'monitor.version'), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION }));
-    await h.coordinator.start(null);
-    expect(h.spawns).toEqual([]);
-
-    // The monitor process ended: the next check starts a new one.
-    h.alive.delete(OTHER_PID);
-    await h.coordinator.ensureMonitorRunning();
-    expect(h.spawns).toHaveLength(1);
-  });
-
-  // A Session Monitor of an older protocol version may decide wrongly with the files of a newer window. A window asks it
-  // to exit and starts the current monitor, which waits for it (monitor protocol version, monitor.version next to
-  // monitor.lock). It never sends a signal (round-2 review of PR #26): a monitor without a version is left alone.
-  // The window runs as a future version, the older monitor is of the current version.
-  describe('a monitor of an older version', () => {
-    // Review round 3 of PR #58 (F1): the current version is 2, so the future window is 3 and the older monitor is 2.
-    // Changed expectation, review round 1 of PR #85, A-R1-1: the current version is 3, so the future window is 4 and
-    // the older monitor is 3.
-    const FUTURE_VERSION = 4;
-    const OLDER_VERSION = 3;
-    beforeEach(() => {
-      windowVersion.value = FUTURE_VERSION;
-    });
-    afterEach(() => {
-      windowVersion.value = undefined;
-    });
-    const versionFile = (): string => path.join(h.root, 'monitor.version');
-    const exitFile = (): string => path.join(h.root, 'monitor.exit');
-    const writeLock = (ageMs: number): void => {
-      fs.mkdirSync(h.root, { recursive: true });
-      fs.writeFileSync(h.paths.monitorLock, `${OTHER_PID}\n`);
-      const time = new Date(Date.now() - ageMs);
-      fs.utimesSync(h.paths.monitorLock, time, time);
-    };
-    const exitRequestPid = (): number | undefined => {
-      try {
-        return (JSON.parse(fs.readFileSync(exitFile(), 'utf8')) as { pid: number }).pid;
-      } catch {
-        return undefined;
-      }
-    };
-
-    it('asks a monitor of an older version through the control file, and starts the current one', async () => {
-      expect(MONITOR_PROTOCOL_VERSION).toBe(FUTURE_VERSION);
-      writeLock(3_000);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBe(OTHER_PID);
-      expect(h.spawns).toHaveLength(1);
-      expect(h.logger.lines.join('\n')).toContain(
-        // Review round 3 of PR #58 (F1): the versions of the fixture moved up by one.
-        `Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version ${OLDER_VERSION}, older than ${FUTURE_VERSION}.`,
-      );
-    });
-
-    // Review round 1 of PR #85, A-R1-1: a live monitor of version 2 (before plan step 8, PR A) reads monitor.json without
-    // remoteStopAfterSeconds and would stop kept environments with its defaults; a window of the real current version
-    // (3) asks it to exit and starts its own.
-    it('retires a live monitor of version 2 from a window of the current version 3', async () => {
-      windowVersion.value = undefined;
-      expect(MONITOR_PROTOCOL_VERSION).toBe(3);
-      writeLock(3_000);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: 2 }));
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBe(OTHER_PID);
-      expect(h.spawns).toHaveLength(1);
-      expect(h.logger.lines.join('\n')).toContain(`Asked the Session Monitor (process ${OTHER_PID}) to exit: it has protocol version 2, older than 3.`);
-    });
-
-    it('leaves a monitor of the current version alone', async () => {
-      writeLock(3_000);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: MONITOR_PROTOCOL_VERSION }));
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBeUndefined();
-      expect(h.spawns).toEqual([]);
-    });
-
-    it('leaves a monitor of the current version alone while the window is of that version too', async () => {
-      windowVersion.value = undefined;
-      expect(MONITOR_PROTOCOL_VERSION).toBe(OLDER_VERSION);
-      writeLock(3_000);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBeUndefined();
-      expect(h.spawns).toEqual([]);
-    });
-
-    it('leaves a monitor without a version alone, also when the version file names another process ID', async () => {
-      writeLock(3_000);
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBeUndefined();
-      expect(h.spawns).toEqual([]);
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID + 1, version: OLDER_VERSION }));
-      await h.coordinator.ensureMonitorRunning();
-      expect(exitRequestPid()).toBeUndefined();
-      expect(h.spawns).toEqual([]);
-    });
-
-    // Round-2 review finding 3 of PR #26: a version file that cannot be read (on Windows for example while a virus
-    // scanner holds it) is an unknown version, never an older one. The window does nothing this time.
-    it('does nothing this time when the version file cannot be read', async () => {
-      writeLock(3_000);
-      fs.mkdirSync(versionFile());
-      await h.coordinator.start(null);
-      expect(exitRequestPid()).toBeUndefined();
-      expect(h.spawns).toEqual([]);
-      // Once it can be read again, an older monitor is asked to exit.
-      fs.rmdirSync(versionFile());
-      fs.writeFileSync(versionFile(), JSON.stringify({ pid: OTHER_PID, version: OLDER_VERSION }));
-      await h.coordinator.ensureMonitorRunning();
-      expect(exitRequestPid()).toBe(OTHER_PID);
-      expect(h.spawns).toHaveLength(1);
-    });
-  });
-
-  it('does not start a second monitor while the first one is still starting', async () => {
-    await h.coordinator.start(null);
-    await h.coordinator.ensureMonitorRunning();
-    expect(h.spawns).toHaveLength(1);
-    h.clock.time += MONITOR_START_GRACE_MS;
-    await h.coordinator.ensureMonitorRunning();
-    expect(h.spawns).toHaveLength(2);
-  });
-
-  it('logs a failed start of the monitor and does not throw', async () => {
-    const coordinator = h.create({
-      spawnProcess: () => {
-        throw new Error('spawn EACCES');
-      },
-    });
-    await expect(coordinator.start(null)).resolves.toBeUndefined();
-    expect(h.logger.lines).toContain('error The Session Monitor could not be started.');
-    coordinator.dispose();
-  });
-
-  it('writes a valid default waiting time for an invalid setting', async () => {
-    h.settings = { ...SETTINGS, waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true };
-    await h.coordinator.writeMonitorSettings();
-    expect(await h.sessionFiles.readMonitorSettings()).toMatchObject({
-      waitingTimeSeconds: 30,
-      stopOnClose: false,
-      respectShutdownActionNone: true,
-    });
-  });
-
-  // Review round 2 of PR #85, A-R2-3: a monitor of version 2 (main before plan step 8, PR A) requires
-  // remoteStopAfterSeconds in monitor.json; without it, it decides with its defaults and stops kept environments.
-  it('writes remoteStopAfterSeconds from stopAfterMinutes, so a monitor of version 2 reads valid settings', async () => {
-    /** isMonitorSettings of main (the format that a monitor of version 2 reads), copied as it is there. */
-    const isMainMonitorSettings = (value: unknown): boolean => {
-      if (typeof value !== 'object' || value === null) return false;
-      const v = value as Record<string, unknown>;
-      return (
-        typeof v.waitingTimeSeconds === 'number' &&
-        Number.isFinite(v.waitingTimeSeconds) &&
-        v.waitingTimeSeconds >= 0 &&
-        typeof v.stopOnClose === 'boolean' &&
-        typeof v.respectShutdownActionNone === 'boolean' &&
-        typeof v.remoteStopAfterSeconds === 'number' &&
-        Number.isFinite(v.remoteStopAfterSeconds) &&
-        v.remoteStopAfterSeconds > 0 &&
-        typeof v.updatedAt === 'string' &&
-        Number.isFinite(Date.parse(v.updatedAt))
-      );
-    };
-    h.settings = { ...SETTINGS, stopOnClose: false, stopAfterMinutes: 7 };
-    await h.coordinator.writeMonitorSettings();
-    const written: unknown = JSON.parse(fs.readFileSync(h.paths.monitorSettings, 'utf8'));
-    expect(written).toMatchObject({ stopOnClose: false, remoteStopAfterSeconds: 420 });
-    expect(isMainMonitorSettings(written)).toBe(true);
-    // This version reads it too (the field is ignored).
-    expect(await h.sessionFiles.readMonitorSettings()).toMatchObject({ remoteStopAfterSeconds: 420 });
-  });
-
   it('updates the status file periodically, removes the pending file each time, and fires onDidHeartbeat', async () => {
     const coordinator = h.create({ heartbeatMs: 20 });
     h.coordinator.dispose();
@@ -494,10 +275,12 @@ describe('SessionCoordinator', () => {
   });
 
   // Review round 1 of PR #85 (mutant K02): a window that stops during a periodic update sends no more heartbeats.
+  // Changed setup, plan step 8 PR C: the window closes during the status write of the update (the hook was the start of
+  // the removed local Session Monitor, between the status write and the heartbeats).
   it('does not drive the window heartbeats when the coordinator stops during an update', async () => {
     let ticks = 0;
-    let disposeOnSpawn = false;
-    let spawned = 0;
+    let disposeOnWrite = false;
+    let writes = 0;
     const coordinator: SessionCoordinator = h.create({
       heartbeatMs: 20,
       windowHeartbeats: {
@@ -505,35 +288,23 @@ describe('SessionCoordinator', () => {
           ticks += 1;
         },
       },
-      spawnProcess: () => {
-        spawned += 1;
-        // The window closes while this update runs (between the status write and the heartbeats).
-        if (disposeOnSpawn) coordinator.dispose();
-        return { unref: () => {}, on: () => undefined };
+      windowDockerContext: () => {
+        writes += 1;
+        // The window closes while this update runs.
+        if (disposeOnWrite) coordinator.dispose();
+        return undefined;
       },
     });
     h.coordinator.dispose();
     h.coordinator = coordinator;
     await coordinator.start(ID_A);
     const before = ticks;
-    const spawnedBefore = spawned;
-    disposeOnSpawn = true;
-    h.clock.time += MONITOR_START_GRACE_MS;
-    for (let i = 0; i < 50 && spawned === spawnedBefore; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(spawned).toBeGreaterThan(spawnedBefore);
+    const writesBefore = writes;
+    disposeOnWrite = true;
+    for (let i = 0; i < 50 && writes === writesBefore; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(writes).toBeGreaterThan(writesBefore);
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(ticks).toBe(before);
-  });
-
-  it('checks at each update that a monitor runs', async () => {
-    const coordinator = h.create({ heartbeatMs: 20 });
-    h.coordinator.dispose();
-    h.coordinator = coordinator;
-    await coordinator.start(null);
-    expect(h.spawns).toHaveLength(1);
-    h.clock.time += MONITOR_START_GRACE_MS;
-    await nextHeartbeat(coordinator);
-    expect(h.spawns).toHaveLength(2);
   });
 
   it('setEnvironment writes the status file at once', async () => {
@@ -579,17 +350,9 @@ describe('SessionCoordinator', () => {
     expect(await h.sessionFiles.readReopen()).toBeUndefined();
   });
 
-  it('deactivateSync makes sure that a monitor runs, so that the container stops after the waiting time', async () => {
-    await h.coordinator.start(ID_A);
-    h.clock.time += MONITOR_START_GRACE_MS;
-    h.coordinator.deactivateSync();
-    expect(h.spawns).toHaveLength(2);
-  });
-
   it('deactivateSync does nothing for a window that never started', () => {
     h.coordinator.deactivateSync();
     expect(fs.existsSync(h.paths.sessionFile('window-1'))).toBe(false);
-    expect(h.spawns).toEqual([]);
   });
 
   it('deactivateSync is not overtaken by a status write that is still running', async () => {
@@ -678,5 +441,174 @@ describe('SessionCoordinator', () => {
     fs.writeFileSync(h.paths.sessionsDir, 'not a folder');
     await expect(h.coordinator.start(ID_A)).resolves.toBeUndefined();
     expect(h.logger.lines.some((line) => line.startsWith('warn The window status file could not be written.'))).toBe(true);
+  });
+});
+
+// Plan step 8, PR C (user decision Q1 of 2026-10-02): the window releases the environment it leaves (close, switch).
+describe('SessionCoordinator: the release of the environment the window leaves (plan step 8, PR C, Q1)', () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = createHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('releases the old environment on a switch, with the bounds of a switch, after the new status is written', async () => {
+    await h.coordinator.start(ID_A);
+    let statusAtRelease: WindowStatus | undefined;
+    h.releaseImpl = async () => {
+      statusAtRelease = readStatus(h);
+    };
+    await h.coordinator.setEnvironment(ID_B);
+    await vi.waitFor(() => expect(h.releases).toHaveLength(1));
+    expect(h.releases[0]).toEqual({ environmentId: ID_A, bounds: SWITCH_RELEASE_BOUNDS });
+    expect(statusAtRelease?.environmentId).toBe(ID_B);
+  });
+
+  it('releases the old environment when the window leaves it (no environment) and on a second start with another one', async () => {
+    await h.coordinator.start(ID_A);
+    await h.coordinator.setEnvironment(null);
+    await h.coordinator.start(ID_B);
+    await h.coordinator.start(ID_A);
+    await vi.waitFor(() => expect(h.releases.map((release) => release.environmentId)).toEqual([ID_A, ID_B]));
+  });
+
+  it('releases nothing when the environment stays the same, when there was none, or before start', async () => {
+    await h.coordinator.setEnvironment(ID_A);
+    await h.coordinator.start(ID_A);
+    await h.coordinator.setEnvironment(ID_A);
+    await h.coordinator.start(ID_A);
+    const other = h.create({ windowId: 'window-2' });
+    await other.start(null);
+    await other.setEnvironment(ID_B);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.releases).toEqual([]);
+    other.dispose();
+  });
+
+  it('deactivate writes closing synchronously, then releases the connected environment with the bounds of a close', async () => {
+    await h.coordinator.start(ID_A);
+    let resolveRelease: () => void = () => {};
+    let stateAtRelease: string | undefined;
+    h.releaseImpl = () => {
+      stateAtRelease = readStatus(h)?.state;
+      return new Promise<void>((resolve) => (resolveRelease = resolve));
+    };
+    let done = false;
+    const deactivated = h.coordinator.deactivate().then(() => (done = true));
+    // Before any await: closing and the reopen record are written.
+    expect(readStatus(h)?.state).toBe('closing');
+    expect(stateAtRelease).toBe('closing');
+    expect(h.releases).toEqual([{ environmentId: ID_A, bounds: CLOSE_RELEASE_BOUNDS }]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // deactivate (and so the disposal of the worker channels that waits for it) ends only after the release.
+    expect(done).toBe(false);
+    resolveRelease();
+    await deactivated;
+    expect(done).toBe(true);
+    expect(await h.sessionFiles.readReopen()).toEqual({ environmentId: ID_A, closedAt: iso(T0) });
+  });
+
+  it('deactivate ends after the bound of a close when the release hangs, and a second call releases nothing', async () => {
+    await h.coordinator.start(ID_A);
+    vi.useFakeTimers();
+    h.releaseImpl = () => new Promise(() => {});
+    let done = false;
+    const deactivated = h.coordinator.deactivate().then(() => (done = true));
+    await vi.advanceTimersByTimeAsync(CLOSE_RELEASE_BOUNDS.totalMs - 1);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await deactivated;
+    expect(done).toBe(true);
+    await h.coordinator.deactivate();
+    expect(h.releases).toHaveLength(1);
+  });
+
+  it('deactivate tolerates a release that rejects or throws, and logs it', async () => {
+    await h.coordinator.start(ID_A);
+    h.releaseImpl = () => Promise.reject(new Error('engine gone'));
+    await expect(h.coordinator.deactivate()).resolves.toBeUndefined();
+    expect(h.logger.lines.some((line) => line.includes('engine gone'))).toBe(true);
+    const throwing = h.create({
+      windowId: 'window-3',
+      release: () => {
+        throw new Error('sync failure');
+      },
+    });
+    await throwing.start(ID_B);
+    await expect(throwing.deactivate()).resolves.toBeUndefined();
+    expect(h.logger.lines.some((line) => line.includes('sync failure'))).toBe(true);
+    throwing.dispose();
+  });
+
+  it('deactivate waits for the release of a switch that still runs, and releases no environment for a window without one', async () => {
+    await h.coordinator.start(ID_A);
+    let resolveSwitch: () => void = () => {};
+    h.releaseImpl = () => new Promise<void>((resolve) => (resolveSwitch = resolve));
+    await h.coordinator.setEnvironment(null);
+    await vi.waitFor(() => expect(h.releases).toHaveLength(1));
+    let done = false;
+    const deactivated = h.coordinator.deactivate().then(() => (done = true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(done).toBe(false);
+    resolveSwitch();
+    await deactivated;
+    // Only the release of the switch: the window had no environment when it closed.
+    expect(h.releases.map((release) => release.environmentId)).toEqual([ID_A]);
+  });
+
+  it('deactivate of a window that never started releases nothing', async () => {
+    await h.coordinator.deactivate();
+    expect(h.releases).toEqual([]);
+  });
+});
+
+// Plan step 8, PR C: the cleanup of the removed local Session Monitor moves to the window.
+describe('SessionCoordinator: the cleanup of the storage folder (plan step 8, PR C)', () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = createHarness();
+  });
+
+  const writeStatusFile = (windowId: string, pid: number, at: number, state: WindowStatus['state'] = 'active') =>
+    h.sessionFiles.writeWindowStatus({ windowId, pid, environmentId: ID_B, state, updatedAt: iso(at) });
+
+  it('at activation: removes the status files of other windows whose process ended and that are older than 60 s plus the waiting time', async () => {
+    fs.mkdirSync(h.paths.sessionsDir, { recursive: true });
+    // waitingTimeSeconds is 45 in SETTINGS: the limit is 105 s.
+    await writeStatusFile('dead-old', DEAD_PID, T0 - 105_001, 'closing');
+    await writeStatusFile('dead-fresh', DEAD_PID, T0 - 105_000, 'closing');
+    await writeStatusFile('alive-old', OTHER_PID, T0 - 3_600_000);
+    await h.coordinator.start(ID_A);
+    expect(sessionFileNames(h)).toEqual(['alive-old.json', 'dead-fresh.json', 'window-1.json']);
+    expect(h.logger.lines).toContain('info Removed the status file of the closed window dead-old.');
+  });
+
+  it('at activation: sweeps the storage folder (an outdated pending connection file)', async () => {
+    h.clock.time = T0 - STALE_PENDING_MAX_AGE_MS - 1;
+    await h.sessionFiles.writePending(ID_B, 'window-0');
+    h.clock.time = T0;
+    await h.coordinator.start(ID_A);
+    expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  it('runs again every interval, and not after the window closed', async () => {
+    const coordinator = h.create({ cleanupMs: 20 });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    await writeStatusFile('dead-old', DEAD_PID, T0 - 3_600_000);
+    await vi.waitFor(() => expect(sessionFileNames(h)).toEqual(['window-1.json']), { timeout: 2000 });
+    coordinator.deactivateSync();
+    await writeStatusFile('dead-later', DEAD_PID, T0 - 3_600_000);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(sessionFileNames(h)).toContain('dead-later.json');
+  });
+
+  it('never throws when the status files cannot be read', async () => {
+    fs.mkdirSync(h.root, { recursive: true });
+    fs.writeFileSync(h.paths.sessionsDir, 'not a folder');
+    await expect(h.coordinator.cleanUpStorage()).resolves.toBeUndefined();
   });
 });

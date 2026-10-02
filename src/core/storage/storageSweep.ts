@@ -3,14 +3,16 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Monitor cleanup, user decision 2026-09-29 ("monitor must delete outdated data, e.g. old heartbeats and the like that is
-// not relevant anymore"): the sweep of the global storage folder that the Session Monitor runs at most once per hour of
-// its run time (MonitorLoop). It removes only files that the windows wrote and that no reader uses any more:
+// not relevant anymore"): the sweep of the global storage folder. Plan step 8, PR C: each window runs it at activation
+// and every hour (SessionCoordinator.cleanUpStorage); before, the local Session Monitor ran it. It removes only files that
+// the windows wrote and that no reader uses any more:
 //   R6  pending/<environment id>.json whose createdAt is more than an hour from now (readers ignore it after
 //       PENDING_MAX_AGE_MS, 2 minutes);
 //   R7  disconnect/<environment id>.json whose requestedAt is more than 10 minutes from now (readers ignore it after
 //       DISCONNECT_REQUEST_MAX_AGE_MS, 1 minute);
 //   R8  temporary files of the atomic writers (`.<name>.<pid>.<8 hex>.tmp`, atomicTemporaryPath in atomicJson.ts:
-//       writeJsonAtomic, the cut of monitor.log in FileLogger, the heartbeat of SessionCoordinator and computerId.ts;
+//       writeJsonAtomic, the heartbeat of SessionCoordinator and computerId.ts, and a leftover of the cut of monitor.log
+//       of the removed local Session Monitor;
 //       review round 8 of PR #63, R8-1, and review round 9, A4/B6) whose modification time is more than an hour from now (review
 //       round 2 of PR #63, R2-9: either way, as R6 and R7), in the storage folder, sessions/, pending/, operations/ and
 //       disconnect/ (a write that was killed between the write and the rename).
@@ -26,11 +28,11 @@ export const STALE_PENDING_MAX_AGE_MS = 60 * 60_000;
 export const STALE_DISCONNECT_MAX_AGE_MS = 10 * 60_000;
 /** R8: a temporary file of an atomic writer (atomicTemporaryPath, see ATOMIC_TEMPORARY_FILE) whose modification time is further from now than this is removed. */
 export const STALE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
-/** The Session Monitor sweeps at most this often (of its own run time). */
+/** A window sweeps this often (plan step 8, PR C; before, the local Session Monitor, of its own run time). */
 export const STORAGE_SWEEP_INTERVAL_MS = 60 * 60_000;
 /**
  * The name of a temporary file of atomicTemporaryPath (atomicJson.ts), which all atomic writers of the storage folder use
- * (writeJsonAtomic, FileLogger in monitorLog.ts, SessionCoordinator's heartbeat, computerId.ts).
+ * (writeJsonAtomic, SessionCoordinator's heartbeat, computerId.ts; the log of the local Session Monitor until plan step 8, PR C).
  */
 export const ATOMIC_TEMPORARY_FILE = /^\..+\.\d+\.[0-9a-f]{8}\.tmp$/;
 /** A pending file or a disconnect request larger than this is not read (its modification time counts then). */

@@ -9,12 +9,11 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Clock } from '../ports';
-import type { MonitorSettings, PendingOperation, WindowStatus } from '../types';
+import type { PendingOperation, WindowStatus } from '../types';
 import { StoragePaths } from './paths';
 import {
   DEFAULT_CLAIM_MAX_AGE_MS,
   SessionFiles,
-  isMonitorSettings,
   isPendingConnection,
   isPendingOperation,
   isReopenRecord,
@@ -333,31 +332,6 @@ describe('reopen record', () => {
   });
 });
 
-describe('monitor settings', () => {
-  const settings: MonitorSettings = {
-    waitingTimeSeconds: 30,
-    stopOnClose: true,
-    respectShutdownActionNone: false,
-    updatedAt: '2026-09-24T17:40:15.000Z',
-  };
-
-  it('writes and reads (async and sync)', async () => {
-    await expect(files.readMonitorSettings()).resolves.toBeUndefined();
-    expect(files.readMonitorSettingsSync()).toBeUndefined();
-    await files.writeMonitorSettings(settings);
-    await expect(files.readMonitorSettings()).resolves.toEqual(settings);
-    expect(files.readMonitorSettingsSync()).toEqual(settings);
-  });
-
-  it('ignores invalid settings', async () => {
-    await files.writeMonitorSettings({ ...settings, waitingTimeSeconds: -1 });
-    await expect(files.readMonitorSettings()).resolves.toBeUndefined();
-    expect(files.readMonitorSettingsSync()).toBeUndefined();
-    fs.writeFileSync(paths.monitorSettings, '{');
-    expect(files.readMonitorSettingsSync()).toBeUndefined();
-  });
-});
-
 describe('validators', () => {
   it('check the shapes', () => {
     expect(isWindowStatus(status(WIN_1))).toBe(true);
@@ -379,15 +353,5 @@ describe('validators', () => {
     expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db'] })).toBe(true);
     expect(isReopenRecord({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' })).toBe(true);
     expect(isReopenRecord(null)).toBe(false);
-    // Greenfield, drop migration logic, user decision 2026-09-28 (plan step 8 PR A: remoteStopAfterSeconds is no longer read).
-    expect(isMonitorSettings({ waitingTimeSeconds: 0, stopOnClose: false, respectShutdownActionNone: true, remoteStopAfterSeconds: 600, updatedAt: '2026-09-24T18:02:11Z' })).toBe(true);
-    expect(isMonitorSettings({ waitingTimeSeconds: Number.NaN, stopOnClose: false, respectShutdownActionNone: true, remoteStopAfterSeconds: 600, updatedAt: '2026-09-24T18:02:11Z' })).toBe(false);
-    // Changed expectation, plan step 8 PR A: monitor.json has no remoteStopAfterSeconds anymore (the local Session Monitor
-    // sends no heartbeats; the windows send them with the setting stopAfterMinutes), so `base` without it is valid, and a
-    // field of an older window is ignored (no migration, user decision Q7 of 2026-10-02).
-    const base = { waitingTimeSeconds: 30, stopOnClose: true, respectShutdownActionNone: false, updatedAt: '2026-09-24T18:02:11Z' };
-    expect(isMonitorSettings(base)).toBe(true);
-    expect(isMonitorSettings({ ...base, remoteStopAfterSeconds: 600 })).toBe(true);
-    expect(isMonitorSettings({ ...base, stopOnClose: 'yes' })).toBe(false);
   });
 });

@@ -139,11 +139,12 @@ describe('sweepStorage', () => {
   });
 
   // Review round 8 of PR #63 (R8-1): the cut of monitor.log (FileLogger, monitorLog.ts) names its temporary file as
-  // writeJsonAtomic does, in the storage folder, so one that a killed cut left behind is removed too.
+  // writeJsonAtomic does, in the storage folder, so one that a killed cut left behind is removed too. Plan step 8, PR C:
+  // that monitor is removed; such a leftover of it is still removed, and monitor.log itself stays (no migration, Q7).
   it('R8: removes an old temporary file of the cut of monitor.log in the storage folder', async () => {
     const file = path.join(paths.root, '.monitor.log.1.0123abcd.tmp');
     write(file, 'x', T0 - STALE_TEMPORARY_MAX_AGE_MS - MINUTE);
-    write(paths.monitorLog, 'x', T0 - STALE_TEMPORARY_MAX_AGE_MS - MINUTE);
+    write(path.join(paths.root, 'monitor.log'), 'x', T0 - STALE_TEMPORARY_MAX_AGE_MS - MINUTE);
     expect((await sweepStorage(paths, T0)).temporary).toEqual(['.monitor.log.1.0123abcd.tmp']);
     expect(names(paths.root)).not.toContain('.monitor.log.1.0123abcd.tmp');
     expect(names(paths.root)).toContain('monitor.log');

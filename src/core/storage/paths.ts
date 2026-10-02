@@ -57,16 +57,6 @@ export class StoragePaths {
   readonly disconnectDir: string;
   /** Reopen record. */
   readonly reopen: string;
-  /** Settings for the Session Monitor. */
-  readonly monitorSettings: string;
-  /** Process ID of the running Session Monitor. */
-  readonly monitorLock: string;
-  /** Protocol version of the running Session Monitor, `{ pid, version }` (see MONITOR_PROTOCOL_VERSION). */
-  readonly monitorVersion: string;
-  /** A window's request to an older Session Monitor to exit, `{ pid, requestedAt }`. */
-  readonly monitorExit: string;
-  /** Log file of the Session Monitor. */
-  readonly monitorLog: string;
   /** State of the workspace helper images: base image digests, last check, last use, last cleanup. */
   readonly helperState: string;
   /** Remote Docker hosts (unit 7): the context before the switch, and the rootless sockets (RemoteDockerState). */
@@ -82,11 +72,6 @@ export class StoragePaths {
     this.operationsDir = path.join(root, 'operations');
     this.disconnectDir = path.join(root, DISCONNECT_DIR_NAME);
     this.reopen = path.join(root, 'reopen.json');
-    this.monitorSettings = path.join(root, 'monitor.json');
-    this.monitorLock = path.join(root, 'monitor.lock');
-    this.monitorVersion = path.join(root, 'monitor.version');
-    this.monitorExit = path.join(root, 'monitor.exit');
-    this.monitorLog = path.join(root, 'monitor.log');
     this.helperState = path.join(root, 'helper.json');
     this.remoteDocker = path.join(root, 'remote-docker.json');
     this.computerId = path.join(root, 'computer.id');

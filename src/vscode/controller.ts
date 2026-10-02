@@ -1271,7 +1271,8 @@ export class Controller implements vscode.Disposable {
     if (!isAvailableTo(entry, account)) {
       const repository = this.displayName({ repository: result.environment.repository });
       this.logger.info(`${repository} is not connected: the GitHub account changed while it opened.`);
-      // Without the pending connection file, the Session Monitor stops the container after the waiting time.
+      // No window connects: the Session Monitor container stops it when the heartbeats of the open end (their long limit,
+      // plan step 8 PR C).
       await this.deps.sessionFiles
         .removePending(result.environment.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
@@ -1752,8 +1753,9 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The window leaves its environment: no environment in its status file (the Session Monitor stops the container after
-   * the waiting time), the status bar, then "Close Remote Connection", with `message` for the user.
+   * The window leaves its environment: no environment in its status file (plan step 8, PR C: the coordinator sends its
+   * short release, and the Session Monitor container stops it after the waiting time unless it is kept), the status bar,
+   * then "Close Remote Connection", with `message` for the user.
    * With `left` (an environment that the window must not use), the window does not rely on the close: VS Code lets the
    * user keep the connection (Cancel in the dialog about unsaved files). The token of the owner account leaves the
    * container at once when the account is the reason, and `checkLeftConnection` closes the connection again.
@@ -1905,7 +1907,8 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Sign-in, sign-out, or account change (concept 7.5): a window connected to an environment that the new account may
-   * not use closes its remote connection at once. The Session Monitor stops the container after the waiting time.
+   * not use closes its remote connection at once. The Session Monitor container stops it after the waiting time (the
+   * release of the window, plan step 8 PR C).
    * A window that has left such an environment but kept its connection reloads when the owner account signs in again.
    */
   async onSessionChanged(): Promise<void> {

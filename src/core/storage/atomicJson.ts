@@ -10,8 +10,8 @@ import * as path from 'path';
 
 /**
  * The temporary file of an atomic write of `file`: `.<name>.<pid>.<8 hex>.tmp` in the same folder. Every atomic writer
- * of the global storage folder names its temporary file with it (writeJsonAtomic, FileLogger in monitorLog.ts, the
- * heartbeat of SessionCoordinator, computerId.ts), so that the sweep of the storage folder (storageSweep.ts, R8,
+ * of the global storage folder names its temporary file with it (writeJsonAtomic, the
+ * heartbeat of SessionCoordinator, computerId.ts; before plan step 8, PR C also the log of the local Session Monitor), so that the sweep of the storage folder (storageSweep.ts, R8,
  * ATOMIC_TEMPORARY_FILE) removes one that a killed write left behind (review round 9 of PR #63, A4/B6).
  */
 export function atomicTemporaryPath(file: string): string {

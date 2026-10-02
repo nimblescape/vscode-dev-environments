@@ -19,15 +19,16 @@ vi.mock('../core/docker/dockerCli', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../core/docker/dockerCli')>();
   return { ...actual, findDockerCli: foundDockerCli };
 });
-// The activation test starts no Session Monitor process.
-vi.mock('./sessionCoordinator', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./sessionCoordinator')>();
-  class SessionCoordinatorWithoutMonitor extends actual.SessionCoordinator {
-    constructor(deps: ConstructorParameters<typeof actual.SessionCoordinator>[0]) {
-      super({ ...deps, spawnProcess: () => ({ unref() {}, on: () => undefined }) });
-    }
-  }
-  return { ...actual, SessionCoordinator: SessionCoordinatorWithoutMonitor };
+// Plan step 8, PR C: the local Session Monitor process is removed, so the activation test needs no stub of its start any
+// more; it records every process that the activation starts, to show that none is a Session Monitor.
+const spawned = vi.hoisted(() => [] as string[][]);
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const spawn = ((command: string, args?: readonly string[], ...rest: unknown[]) => {
+    spawned.push([command, ...(Array.isArray(args) ? args.map(String) : [])]);
+    return (actual.spawn as (...all: unknown[]) => unknown)(command, args, ...rest);
+  }) as typeof actual.spawn;
+  return { ...actual, spawn, default: { ...actual, spawn } };
 });
 
 import { DockerContextKeys } from '../core/docker/dockerSetup';
@@ -119,6 +120,17 @@ describe('no message at activation when Docker is missing', () => {
       expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
       expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
       expect(messageCalls()).toBe(0);
+      // Plan step 8, PR C: no local Session Monitor: no process of it, and none of its files in the storage folder.
+      expect(spawned.filter((call) => call.some((part) => part.includes('sessionMonitor')))).toEqual([]);
+      for (const name of ['monitor.json', 'monitor.lock', 'monitor.version', 'monitor.exit', 'monitor.log']) {
+        expect(fs.existsSync(path.join(storage, name))).toBe(false);
+      }
+      // deactivate() writes `closing` at once and resolves (a window without an environment has nothing to release).
+      const { deactivate } = await import('./extension');
+      await deactivate();
+      const statuses = fs.readdirSync(path.join(storage, 'sessions')).filter((name) => name.endsWith('.json'));
+      expect(statuses).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(path.join(storage, 'sessions', statuses[0]), 'utf8'))).toMatchObject({ state: 'closing', environmentId: null });
     } finally {
       for (const subscription of context.subscriptions) {
         try {

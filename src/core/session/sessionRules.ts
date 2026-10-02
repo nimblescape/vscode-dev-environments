@@ -4,7 +4,7 @@
 
 // Plan step 8, PR A: the pure session helpers that the window needs (its heartbeats to the Session Monitor container of
 // each engine, Close and Keep Running, the checks of other windows), moved here from src/monitor (rules.ts, lock.ts),
-// which re-exports them until it is removed (plan step 8, PR C). No `vscode`, no I/O but `process.kill(pid, 0)`.
+// which is removed (plan step 8, PR C). No `vscode`, no I/O but `process.kill(pid, 0)`.
 import { DEFAULT_REMOTE_STOP_AFTER_SECONDS, clampLimitSeconds } from '../remoteMonitor/protocol';
 
 const MAX_PID = 0x7fffffff;
@@ -43,7 +43,7 @@ export interface KeepFlags {
   shutdownActionNone: boolean;
 }
 
-/** What keptWhenClosed needs of the settings (monitor.json or the extension settings). */
+/** What keptWhenClosed needs of the settings (the extension settings). */
 export interface KeepSettings {
   stopOnClose?: boolean;
   respectShutdownActionNone?: boolean;
@@ -55,7 +55,7 @@ export interface KeepSettings {
  * Monitor container does not stop it either when this computer goes offline.
  */
 export function keptWhenClosed(environment: KeepFlags, settings: KeepSettings): boolean {
-  // monitor.json is written by windows; anything but an explicit false keeps the default (stop).
+  // Anything but an explicit false keeps the default (stop).
   if (settings.stopOnClose === false) return true;
   // Keep Running When Closed (user decision 2026-09-26, "go with the proposal for closing"): only the user stops it.
   if (environment.keepRunning) return true;

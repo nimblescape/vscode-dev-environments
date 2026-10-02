@@ -55,11 +55,8 @@ describe('StoragePaths', () => {
     expect(paths.pendingDir).toBe(path.join(root, 'pending'));
     expect(paths.operationsDir).toBe(path.join(root, 'operations'));
     expect(paths.reopen).toBe(path.join(root, 'reopen.json'));
-    expect(paths.monitorSettings).toBe(path.join(root, 'monitor.json'));
-    expect(paths.monitorLock).toBe(path.join(root, 'monitor.lock'));
-    expect(paths.monitorVersion).toBe(path.join(root, 'monitor.version'));
-    expect(paths.monitorExit).toBe(path.join(root, 'monitor.exit'));
-    expect(paths.monitorLog).toBe(path.join(root, 'monitor.log'));
+    // Plan step 8, PR C: the files of the local Session Monitor (monitor.json, .lock, .version, .exit, .log) are gone with it.
+    expect(Object.keys(paths).filter((key) => key.startsWith('monitor'))).toEqual([]);
     expect(paths.helperState).toBe(path.join(root, 'helper.json'));
     expect(paths.sessionFile(WINDOW_ID)).toBe(path.join(root, 'sessions', `${WINDOW_ID}.json`));
     expect(paths.pendingFile(ENV_ID)).toBe(path.join(root, 'pending', `${ENV_ID}.json`));
