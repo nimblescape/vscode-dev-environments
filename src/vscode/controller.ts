@@ -14,7 +14,7 @@ import { operationDockerTarget, outsideOperation, type DockerTargets } from '../
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
-import { Actions, Messages, formatChanges, listSome, recordedStateNote } from '../core/messages';
+import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
 import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
@@ -784,8 +784,10 @@ export class Controller implements vscode.Disposable {
         // releases the environment), but not when that failed or the Session Monitor stopped it by the long limit. When
         // the state is older than the last use of the environment (or none was recorded), the dialog says that later
         // changes are not known. Only a message: Delete runs nothing in the container for it.
+        // Review round 2 of PR #87 (A-R2-2): the last use is the last time a window was seen using it (lastSeenInUse: also
+        // a reload and the start of a release, not only the open pipeline).
         const used = (await this.deps.registry.get(environment.id).catch(() => undefined)) ?? environment;
-        const stateNote = recordedStateNote(summary ?? used.gitSummary, used.lastUsedAt);
+        const stateNote = recordedStateNote(summary ?? used.gitSummary, lastSeenInUse(used));
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.
         // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example

@@ -69,6 +69,12 @@ export interface SessionCoordinatorDeps {
    * release), within `bounds`. Without it: no release (the long limit of the heartbeats applies).
    */
   release?: (environmentId: string, bounds: ReleaseBounds) => Promise<unknown>;
+  /**
+   * Review round 2 of PR #87 (A-R2-2): records that this window was seen using its environment at `at` (an ISO time;
+   * EnvironmentRegistry.markSeenInUse), for Delete's note: on start() when the window is connected (a reload, also a
+   * start that is no open). Not awaited; a failure is logged.
+   */
+  markSeenInUse?: (environmentId: string, at: string) => Promise<unknown>;
 }
 
 /** Minimal `vscode.EventEmitter` replacement, so that this module has no runtime dependency on `vscode`. */
@@ -178,6 +184,7 @@ export class SessionCoordinator implements vscode.Disposable {
       const pending = await this.freshPending(environmentId);
       await this.writeStatus();
       this.tickNow(previous, environmentId);
+      this.markSeen(environmentId);
       this.releaseLeft(previous, environmentId);
       return pending;
     }
@@ -200,6 +207,7 @@ export class SessionCoordinator implements vscode.Disposable {
     // window follows the short release of its previous activation, which must not run out before this window's long
     // heartbeat reaches the monitor. Not awaited; never throws.
     if (!this.stopped && environmentId !== null) void this.deps.windowHeartbeats?.tick();
+    this.markSeen(environmentId);
     await this.cleanUpStorage();
     return pending;
   }
@@ -216,6 +224,19 @@ export class SessionCoordinator implements vscode.Disposable {
     await this.writeStatus();
     this.tickNow(previous, environmentId);
     this.releaseLeft(previous, environmentId);
+  }
+
+  /**
+   * Review round 2 of PR #87 (A-R2-2): the window that starts connected to `environmentId` was seen using it now
+   * (markSeenInUse). Not awaited; never throws.
+   */
+  private markSeen(environmentId: string | null): void {
+    const mark = this.deps.markSeenInUse;
+    if (this.stopped || environmentId === null || mark === undefined) return;
+    const at = new Date(this.clock.now()).toISOString();
+    void Promise.resolve()
+      .then(() => mark(environmentId, at))
+      .catch((error: unknown) => this.logger.info(`The last use of the environment could not be recorded: ${errorMessage(error)}`));
   }
 
   /**

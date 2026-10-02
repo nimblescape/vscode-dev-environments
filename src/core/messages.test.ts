@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { LINUX_ENGINE_START_COMMAND } from './docker/dockerSetup';
-import { Messages, dockerHostReason, recordedStateNote } from './messages';
+import { Messages, dockerHostReason, lastSeenInUse, recordedStateNote } from './messages';
 
 describe('Messages.localEnvNotPassed', () => {
   // The CLI resolves ${localEnv:NAME} in the workspace helper: HOME is /root there, not empty.
@@ -200,5 +200,21 @@ describe('recordedStateNote (review round 1 of PR #87, A-R1-4)', () => {
   it('says that changes since the last open are not known without a valid recorded state', () => {
     expect(recordedStateNote(undefined, used, format)).toBe(` ${Messages.deleteChangesNotRecorded}`);
     expect(recordedStateNote({ recordedAt: 'garbage' }, used, format)).toBe(` ${Messages.deleteChangesNotRecorded}`);
+  });
+});
+
+// Review round 2 of PR #87 (A-R2-2): the last use for Delete's note is the later of the last time a window was seen using
+// the environment and the last open.
+describe('lastSeenInUse (review round 2 of PR #87, A-R2-2)', () => {
+  const early = '2026-10-02T09:00:00.000Z';
+  const late = '2026-10-02T11:00:00.000Z';
+  it('gives the later valid time of lastSeenInUseAt and lastUsedAt, the valid one alone, or nothing', () => {
+    expect(lastSeenInUse({ lastUsedAt: early, lastSeenInUseAt: late })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: late, lastSeenInUseAt: early })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: early })).toBe(early);
+    expect(lastSeenInUse({ lastUsedAt: 'not a time', lastSeenInUseAt: late })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: early, lastSeenInUseAt: 'not a time' })).toBe(early);
+    expect(lastSeenInUse({ lastUsedAt: 'not a time' })).toBeUndefined();
+    expect(lastSeenInUse({})).toBeUndefined();
   });
 });

@@ -745,6 +745,35 @@ describe('EnvironmentRegistry changes', () => {
   });
 });
 
+// Review round 2 of PR #87 (A-R2-2): the last time a window was seen using the environment, for Delete's note.
+describe('EnvironmentRegistry.markSeenInUse (review round 2 of PR #87, A-R2-2)', () => {
+  it('sets lastSeenInUseAt, only forward, and leaves a missing entry and an invalid time alone', async () => {
+    const registry = new EnvironmentRegistry(paths);
+    await registry.add(environment(ID_A, 'o/a'));
+    await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T10:00:00.000Z');
+    // Never back to an earlier time, nor the same one written again.
+    await registry.markSeenInUse(ID_A, '2026-10-02T09:00:00.000Z');
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T10:00:00.000Z');
+    await registry.markSeenInUse(ID_A, '2026-10-02T11:00:00.000Z');
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T11:00:00.000Z');
+    await registry.markSeenInUse(ID_A, 'not a time');
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T11:00:00.000Z');
+    await expect(registry.markSeenInUse('missing', '2026-10-02T12:00:00.000Z')).resolves.toBeUndefined();
+    await expect(registry.list()).resolves.toEqual([{ ...environment(ID_A, 'o/a'), lastSeenInUseAt: '2026-10-02T11:00:00.000Z' }]);
+    // The other fields stay.
+    expect((await registry.get(ID_A))?.lastUsedAt).toBe(environment(ID_A, 'o/a').lastUsedAt);
+  });
+
+  it('replaces an invalid stored time, and a non-string value is dropped when read', async () => {
+    writeRaw({ version: 1, environments: [{ ...environment(ID_A, 'o/a'), lastSeenInUseAt: 'garbage' }, { ...environment(ID_B, 'o/b'), lastSeenInUseAt: 42 }] });
+    const registry = new EnvironmentRegistry(paths);
+    expect((await registry.get(ID_B))?.lastSeenInUseAt).toBeUndefined();
+    await registry.markSeenInUse(ID_A, '2026-10-02T10:00:00.000Z');
+    expect((await registry.get(ID_A))?.lastSeenInUseAt).toBe('2026-10-02T10:00:00.000Z');
+  });
+});
+
 describe('EnvironmentRegistry: additional volumes that a Delete kept (concept 7.14 step 4)', () => {
   it('records the kept volumes with the owner of the removed entry, in the same change as the removal', async () => {
     const registry = new EnvironmentRegistry(paths, fixedClock());

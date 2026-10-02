@@ -150,8 +150,9 @@ export function isRunningState(state: string): boolean {
  *   that still sends holds until someone makes a newer choice;
  * - review round 1 of PR #87 (A-R1-2): when that newest record is a release (the short limit of a window that left the
  *   environment, `release`), it decides only while no record of another source (not itself a release) is still within
- *   its own `limitSeconds`; otherwise the newest record that is no release decides, so a release never shortens the
- *   heartbeats of another computer that still uses the environment.
+ *   its own `limitSeconds`; otherwise the newest of those live records of other sources decides (review round 2 of
+ *   PR #87, A-R2-1: never an expired one), so a release never shortens the heartbeats of another computer that still uses
+ *   the environment.
  * The gap rule: when the time since the previous tick is larger than `gapMs` (the host or the container was paused, the
  * clock was changed), and at the first tick, nothing is stopped for `graceMs`: the computers that still use their
  * environments send heartbeats again first (they retry every tick of their Session Monitor). Records whose environment
@@ -203,12 +204,13 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
       candidates.reduce((best, record) => (record.at > best.at || (record.at === best.at && record.keepRunning && !best.keepRunning) ? record : best));
     let newest = newestOf(records);
     // Review round 1 of PR #87 (A-R1-2): a release decides only while no record of another source is still within its own
-    // limit; otherwise the newest record that is no release decides (a release never shortens the heartbeats of another
-    // computer that still uses the environment).
+    // limit (a release never shortens the heartbeats of another computer that still uses the environment). Review round 2
+    // of PR #87 (A-R2-1): otherwise the newest of those live records of other sources decides, never an expired record
+    // (which would stop the environment at once) nor an older record of the releasing source itself.
     if (newest.release === true) {
       const release = newest;
-      const othersLive = records.some((record) => record.source !== release.source && record.release !== true && now - record.at <= record.limitSeconds * 1000);
-      if (othersLive) newest = newestOf(records.filter((record) => record.release !== true));
+      const othersLive = records.filter((record) => record.source !== release.source && record.release !== true && now - record.at <= record.limitSeconds * 1000);
+      if (othersLive.length > 0) newest = newestOf(othersLive);
     }
     if (newest.keepRunning) {
       kept.push(environmentId);

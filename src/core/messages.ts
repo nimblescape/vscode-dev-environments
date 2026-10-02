@@ -474,6 +474,20 @@ export function formatChanges(summary: { uncommittedFiles: number; unpushedCommi
 }
 
 /**
+ * Review round 2 of PR #87 (A-R2-2): the last time the environment was seen in use, for Delete's note: the later of
+ * `lastSeenInUseAt` (a window that started connected to it, a reload, and the start of each release) and `lastUsedAt`
+ * (the open pipeline), as valid times; the one that is valid when the other is missing or invalid; `undefined` when
+ * neither is.
+ */
+export function lastSeenInUse(environment: { lastUsedAt?: string; lastSeenInUseAt?: string }): string | undefined {
+  const candidates = [environment.lastSeenInUseAt, environment.lastUsedAt].filter(
+    (value): value is string => value !== undefined && Number.isFinite(Date.parse(value)),
+  );
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((best, value) => (Date.parse(value) > Date.parse(best) ? value : best));
+}
+
+/**
  * Review round 1 of PR #87 (A-R1-4): the note of Delete's confirmation when the recorded state of the repository may be
  * out of date: it was recorded before the environment was last used (`lastUsedAt`), or never. Empty when it is at least
  * as new as the last use, or when that time is not known. `format` gives the time for the user (default: the locale of

@@ -19,6 +19,7 @@ import {
   REPAIR_BACKOFF_MS,
   WINDOW_HEARTBEAT_INTERVAL_MS,
   WindowHeartbeats,
+  engineKey,
   repairBackoffMs,
   resolveHeartbeatEngine,
   type HeartbeatEngineSources,
@@ -2114,5 +2115,97 @@ describe('WindowHeartbeats: release paths (review round 1 of PR #87)', () => {
     await h.heartbeats.tick();
     expect(h.sent[0].target).toEqual(LOCAL);
     expect(await h.heartbeats.connectedEngine(h.environments[0])).toEqual(REMOTE);
+  });
+});
+
+// Review round 2 of PR #87: survivors of the mutation run of round 2 (B-R2-3: mutants H03 and H04; B-R2-4: mutant H05).
+describe('WindowHeartbeats: release paths (review round 2 of PR #87)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const settledWithin = <T,>(promise: Promise<T>, ms: number): Promise<T | 'hung'> =>
+    Promise.race([promise, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), ms))]);
+
+  // B-R2-3 (H03, H04): the signal of the release ended before its attempt started (it aborted in a synchronous step of
+  // the release); the attempt is expired at once and the signal of its send aborted, so a following tick counts a failure
+  // and sendFor ends at once, although the send never settles.
+  it('B-R2-3: an attempt whose outer signal is already aborted is expired at once; a tick counts a failure and sendFor ends at once', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(1);
+    h.state.answer = () => new Promise<HeartbeatSendResult>(() => {});
+    const controller = new AbortController();
+    let armed = true;
+    h.deps.sourceId = () => {
+      // The last synchronous step before the attempt: the signal of the release aborts here.
+      if (armed) controller.abort();
+      return SOURCE;
+    };
+    expect(await settledWithin(h.heartbeats.release(ID_A, 210, controller.signal), 1_000)).toMatchObject({ ok: false });
+    armed = false;
+    expect(h.sent).toHaveLength(2);
+    // H04: the signal of the send aborted at once.
+    expect(h.signals[1].aborted).toBe(true);
+    // H03: the hanging call counts as no answer: the tick counts a failure, no new call piles up.
+    h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+    expect(h.logs.some((line) => line.includes('failed; it is tried again') && line.includes(HEARTBEAT_NO_ANSWER))).toBe(true);
+    // And sendFor ends at once.
+    expect(await settledWithin(h.heartbeats.sendFor(ID_A), 1_000)).toEqual({ ok: false, detail: HEARTBEAT_NO_ANSWER });
+  });
+
+  // B-R2-4 (H05): when an expired call that still hangs ends after a newer call of the engine was registered, the newer one
+  // stays registered (only a call removes its own registration), so a release waits for it.
+  it('B-R2-4: an expired call that settles late does not remove the registration of a newer call; a release waits for the newer one', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(1);
+    const settle: Array<(result: HeartbeatSendResult) => void> = [];
+    h.state.answer = () => new Promise<HeartbeatSendResult>((resolve) => settle.push(resolve));
+    // The internals: the two attempts on one engine are registered directly (no public path starts a second call while an
+    // expired one is registered).
+    type Internals = {
+      inFlight: Map<string, { done: Promise<unknown>; expired: boolean }>;
+      seriesOf(target: DockerTarget, now: number): unknown;
+      attempt(key: string, series: unknown, input: HeartbeatInput, environments: Environment[], verified: boolean, outer?: AbortSignal): Promise<HeartbeatSendResult>;
+    };
+    const internals = h.heartbeats as unknown as Internals;
+    const key = engineKey(LOCAL);
+    const series = internals.seriesOf(LOCAL, T0);
+    const input: HeartbeatInput = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID_A, keepRunning: false, seq: T0 }] };
+    const first = internals.attempt(key, series, input, [h.environments[0]], true);
+    await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+    expect(await first).toEqual({ ok: false, missing: false, detail: HEARTBEAT_NO_ANSWER });
+    expect(internals.inFlight.get(key)?.expired).toBe(true);
+    // The second attempt is registered while the first still hangs.
+    const second = internals.attempt(key, series, input, [h.environments[0]], true);
+    const secondEntry = internals.inFlight.get(key);
+    expect(secondEntry?.expired).toBe(false);
+    expect(settle).toHaveLength(2);
+    // The first settles late: the registration of the second stays.
+    settle[0]({ ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(internals.inFlight.get(key)).toBe(secondEntry);
+    // A release waits for the second call: it sends nothing until that one ended.
+    const sentBefore = h.sent.length;
+    let released: unknown;
+    void h.heartbeats.release(ID_A, 210, new AbortController().signal).then((value) => (released = value));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(h.sent).toHaveLength(sentBefore);
+    expect(released).toBeUndefined();
+    h.state.answer = () => ({ ok: true });
+    settle[1]({ ok: true });
+    expect(await second).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(released).toEqual({ ok: true });
+    expect(h.sent).toHaveLength(sentBefore + 1);
+    expect(h.sent.at(-1)?.input.release).toBe(true);
   });
 });

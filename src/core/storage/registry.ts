@@ -193,6 +193,22 @@ export class EnvironmentRegistry {
   }
 
   /**
+   * Review round 2 of PR #87 (A-R2-2): records that a window was seen using the environment `id` at `at` (an ISO time):
+   * sets `lastSeenInUseAt`, but never back to an earlier time. A missing ID is not an error (nothing is written).
+   */
+  async markSeenInUse(id: string, at: string): Promise<void> {
+    const time = Date.parse(at);
+    if (!Number.isFinite(time)) return;
+    await this.update((file) => {
+      const environment = file.environments.find((candidate) => candidate.id === id);
+      if (!environment) return;
+      const previous = environment.lastSeenInUseAt === undefined ? Number.NaN : Date.parse(environment.lastSeenInUseAt);
+      if (Number.isFinite(previous) && previous >= time) return;
+      environment.lastSeenInUseAt = at;
+    });
+  }
+
+  /**
    * Removes the entry `id`; a missing ID is not an error. `volumes.kept`: additional volumes of the entry that its Delete kept; they are recorded with
    * the owner of the entry, besides the records of other owners of the same name (each keeps its data there).
    * `volumes.removed`: volumes that no longer exist; all their records are dropped. One change of the file, so no
@@ -447,6 +463,8 @@ type Check = (value: unknown) => boolean;
 
 const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['gitSummary', isGitSummary],
+  // Review round 2 of PR #87 (A-R2-2).
+  ['lastSeenInUseAt', isString],
   ['buildRecord', isBuildRecord],
   ['busy', isBusyMark],
   ['remoteUser', isString],

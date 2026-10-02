@@ -89,6 +89,12 @@ export interface WindowReleaseDeps {
    * (EnvironmentService.recordGitState on the engine of the window). `signal` aborts at the bound.
    */
   recordGitState: (environment: Environment, signal: AbortSignal) => Promise<unknown>;
+  /**
+   * Review round 2 of PR #87 (A-R2-2): records that this window was seen using the environment at `at` (an ISO time
+   * taken at the start of the release, before the Git step: EnvironmentRegistry.markSeenInUse), for Delete's note. It
+   * runs alongside the rest of the release and is awaited before it ends (within its bound); a failure is logged.
+   */
+  markSeenInUse?: (environment: Environment, at: string) => Promise<unknown>;
   /** The short release (WindowHeartbeats.release). `signal` aborts at the bound. */
   send: (environmentId: string, limitSeconds: number, signal: AbortSignal) => Promise<{ ok: true } | { ok: false; detail: string }>;
   logger: Logger;
@@ -118,13 +124,30 @@ async function within<T>(ms: number, run: (signal: AbortSignal) => Promise<T>, p
   }
 }
 
+/** Review round 2 of PR #87 (A-R2-2): the time left of the bound when the release stops waiting for markSeenInUse. */
+const SEEN_MARGIN_MS = 100;
+
 /** The release of `environmentId` (see the module comment). Never throws; resolves within `bounds.totalMs`. */
 export async function releaseEnvironment(deps: WindowReleaseDeps, environmentId: string, bounds: ReleaseBounds): Promise<ReleaseOutcome> {
   const started = Date.now();
   const outcome = await within(bounds.totalMs, async (signal): Promise<ReleaseOutcome> => {
+    let seen: Promise<void> | undefined;
     try {
       const environment = (await deps.registry.list()).find((candidate) => candidate.id === environmentId);
       if (environment === undefined) return 'unknown';
+      // Review round 2 of PR #87 (A-R2-2): the time this window was last seen using the environment, before the Git step
+      // (so a state recorded by this release is not older than it), for every release (also a kept one).
+      const seenAt = new Date().toISOString();
+      const markSeenInUse = deps.markSeenInUse;
+      seen =
+        markSeenInUse === undefined
+          ? undefined
+          : Promise.resolve()
+              .then(() => markSeenInUse(environment, seenAt))
+              .then(
+                () => undefined,
+                (error: unknown) => deps.logger.info(`The last use of ${environment.repository} could not be recorded: ${errorMessage(error)}`),
+              );
       const settings = deps.settings();
       if (keptWhenClosed(keepFlagsOf(environment), settings)) return 'kept';
       if (await deps.otherWindowUses(environment)) return 'inUse';
@@ -148,6 +171,11 @@ export async function releaseEnvironment(deps: WindowReleaseDeps, environmentId:
     } catch (error) {
       deps.logger.info(`The release of the environment could not be sent (the long limit applies): ${errorMessage(error)}`);
       return 'failed';
+    } finally {
+      // Review round 2 of PR #87 (A-R2-2): never rejects; waited for until shortly before the bound of the release, so a
+      // slow registry never turns the outcome into 'failed'.
+      const pending = seen;
+      if (pending !== undefined) await within(Math.max(0, bounds.totalMs - (Date.now() - started) - SEEN_MARGIN_MS), () => pending);
     }
   });
   return outcome ?? 'failed';

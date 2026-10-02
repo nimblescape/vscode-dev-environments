@@ -89,6 +89,13 @@ export interface Environment {
   containerName: string;
   createdAt: string;
   lastUsedAt: string;
+  /**
+   * Review round 2 of PR #87 (A-R2-2): the last time a window of this computer was seen using the environment, besides
+   * the open pipeline (`lastUsedAt`): a window that starts connected to it (a reload, SessionCoordinator.start) and the
+   * start of each release (before its Git record). Only for the note of Delete's confirmation (recordedStateNote, with
+   * lastSeenInUse). It only moves forward (EnvironmentRegistry.markSeenInUse).
+   */
+  lastSeenInUseAt?: string;
   gitSummary?: GitSummary;
   buildRecord?: BuildRecord;
   busy?: BusyMark;

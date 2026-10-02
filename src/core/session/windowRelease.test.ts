@@ -192,6 +192,82 @@ describe('releaseEnvironment (plan step 8, PR C, Q1 and Q2)', () => {
   });
 });
 
+// Review round 2 of PR #87 (A-R2-2): every release records first that the window was seen using the environment (for
+// Delete's note), before the Git step, so a state that the release records is never older than it.
+describe('releaseEnvironment: the last use (review round 2 of PR #87, A-R2-2)', () => {
+  function withSeen(env: Environment | null = environment()) {
+    const h = harness(env);
+    const seen: string[] = [];
+    let gitAt = Number.NaN;
+    const git = h.deps.recordGitState;
+    h.deps.recordGitState = async (environment, signal) => {
+      gitAt = Date.now();
+      return git(environment, signal);
+    };
+    h.deps.markSeenInUse = async (environment, at) => {
+      h.events.push(`seen ${environment.id}`);
+      seen.push(at);
+    };
+    return { ...h, seen, gitAt: () => gitAt };
+  }
+
+  it('records the last use at the start, before the Git step, with a time not after it', async () => {
+    const h = withSeen();
+    const before = Date.now();
+    expect(await releaseEnvironment(h.deps, ID_A, BOUNDS)).toBe('released');
+    expect(h.events).toEqual([`seen ${ID_A}`, `git ${ID_A}`, `release ${ID_A}`]);
+    expect(h.seen).toHaveLength(1);
+    const at = Date.parse(h.seen[0]);
+    expect(new Date(at).toISOString()).toBe(h.seen[0]);
+    expect(at).toBeGreaterThanOrEqual(before);
+    expect(at).toBeLessThanOrEqual(h.gitAt());
+  });
+
+  it('also for a kept environment and one that another window uses (nothing else is sent), not for one that is gone', async () => {
+    const kept = withSeen(environment({ keepRunning: true }));
+    expect(await releaseEnvironment(kept.deps, ID_A, BOUNDS)).toBe('kept');
+    expect(kept.events).toEqual([`seen ${ID_A}`]);
+    const inUse = withSeen();
+    inUse.state.otherWindow = true;
+    expect(await releaseEnvironment(inUse.deps, ID_A, BOUNDS)).toBe('inUse');
+    expect(inUse.events).toEqual([`seen ${ID_A}`]);
+    const gone = withSeen(null);
+    expect(await releaseEnvironment(gone.deps, ID_A, BOUNDS)).toBe('unknown');
+    expect(gone.events).toEqual([]);
+  });
+
+  it('goes on when the last use cannot be recorded, and logs it', async () => {
+    const h = withSeen();
+    h.deps.markSeenInUse = async () => {
+      throw new Error('registry locked');
+    };
+    expect(await releaseEnvironment(h.deps, ID_A, BOUNDS)).toBe('released');
+    expect(h.events).toEqual([`git ${ID_A}`, `release ${ID_A}`]);
+    expect(h.logs.some((line) => line.includes('last use of acme/api') && line.includes('registry locked'))).toBe(true);
+    // Also when it throws at once (not as a rejected promise).
+    const sync = withSeen();
+    sync.deps.markSeenInUse = () => {
+      throw new Error('registry gone');
+    };
+    expect(await releaseEnvironment(sync.deps, ID_A, BOUNDS)).toBe('released');
+    expect(sync.events).toEqual([`git ${ID_A}`, `release ${ID_A}`]);
+    expect(sync.logs.some((line) => line.includes('last use of acme/api') && line.includes('registry gone'))).toBe(true);
+  });
+
+  it('a hanging record of the last use neither holds the Git step and the release back nor turns the outcome into a failure', async () => {
+    vi.useFakeTimers();
+    const h = withSeen();
+    h.deps.markSeenInUse = () => new Promise(() => {});
+    let outcome: string | undefined;
+    const result = releaseEnvironment(h.deps, ID_A, BOUNDS).then((value) => (outcome = value));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.events).toEqual([`git ${ID_A}`, `release ${ID_A}`]);
+    await vi.advanceTimersByTimeAsync(BOUNDS.totalMs - 1);
+    await result;
+    expect(outcome).toBe('released');
+  });
+});
+
 // Review round 1 of PR #87 (A-R1-2): the windows of one computer share its record of the environment; a release must not
 // shorten it while another window uses the environment.
 describe('otherWindowHoldsEnvironment (review round 1 of PR #87, A-R1-2)', () => {

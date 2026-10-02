@@ -738,3 +738,112 @@ describe('SessionCoordinator: review round 1 of PR #87', () => {
     expect(sessionFileNames(h)).toEqual(['window-1.json']);
   });
 });
+
+// Review round 2 of PR #87: the last use for Delete's note (A-R2-2), and the start tick that never waits for the cleanup
+// of the storage folder (mutation survivor B-R2-2, C02).
+describe('SessionCoordinator: review round 2 of PR #87', () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = createHarness();
+  });
+
+  it('B-R2-2: the first heartbeat of start does not wait for the cleanup of the storage folder (it never ends here)', async () => {
+    let ticks = 0;
+    const coordinator = h.create({
+      heartbeatMs: 60_000,
+      windowHeartbeats: {
+        tick: async () => {
+          ticks += 1;
+        },
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    // cleanUpStorage reads the status files of the other windows; that read never ends.
+    vi.spyOn(h.sessionFiles, 'readWindowStatuses').mockImplementation(() => new Promise(() => {}));
+    let started = false;
+    void coordinator.start(ID_A).then(() => (started = true));
+    await vi.waitFor(() => expect(ticks).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(ticks).toBe(1);
+    // The start itself still waits for the cleanup.
+    expect(started).toBe(false);
+  });
+
+  it('A-R2-2: start records that the window was seen using its environment (a reload), not for no environment, nor after the close', async () => {
+    const seen: Array<{ environmentId: string; at: string }> = [];
+    const coordinator = h.create({
+      heartbeatMs: 60_000,
+      markSeenInUse: async (environmentId, at) => {
+        seen.push({ environmentId, at });
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    await vi.waitFor(() => expect(seen).toEqual([{ environmentId: ID_A, at: iso(T0) }]));
+    // A second start to another environment (as a reload of the folder) records that one.
+    h.clock.time = T0 + 1_000;
+    await coordinator.start(ID_B);
+    await vi.waitFor(() => expect(seen).toEqual([{ environmentId: ID_A, at: iso(T0) }, { environmentId: ID_B, at: iso(T0 + 1_000) }]));
+    // No environment: nothing.
+    await coordinator.start(null);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen).toHaveLength(2);
+    coordinator.deactivateSync();
+    await coordinator.start(ID_A);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen).toHaveLength(2);
+  });
+
+  it('A-R2-2: a window disposed during the first status write of its start records nothing', async () => {
+    const seen: string[] = [];
+    let ticks = 0;
+    const coordinator: SessionCoordinator = h.create({
+      heartbeatMs: 60_000,
+      // Runs within the first status write: the window is disposed there.
+      windowDockerContext: () => {
+        coordinator.dispose();
+        return undefined;
+      },
+      windowHeartbeats: {
+        tick: async () => {
+          ticks += 1;
+        },
+      },
+      markSeenInUse: async (environmentId) => {
+        seen.push(environmentId);
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen).toEqual([]);
+    expect(ticks).toBe(0);
+  });
+
+  it('A-R2-2: a window without an environment at its first start records nothing; a failure is logged and the start goes on', async () => {
+    const calls: string[] = [];
+    const idle = h.create({
+      windowId: 'window-2',
+      markSeenInUse: async (environmentId) => {
+        calls.push(environmentId);
+      },
+    });
+    await idle.start(null);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(calls).toEqual([]);
+    idle.dispose();
+    const failing = h.create({
+      markSeenInUse: async () => {
+        throw new Error('registry locked');
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = failing;
+    await failing.start(ID_A);
+    expect(readStatus(h)?.environmentId).toBe(ID_A);
+    await vi.waitFor(() => expect(h.logger.lines.some((line) => line.includes('last use') && line.includes('registry locked'))).toBe(true));
+  });
+});

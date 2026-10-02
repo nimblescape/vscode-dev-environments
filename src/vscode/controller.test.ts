@@ -4079,4 +4079,26 @@ describe('Delete: a recorded state older than the last use (review round 1 of PR
     await run('delete', row('acme/api', environment()));
     expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(Messages.deleteConfirm('acme/api'));
   });
+
+  // Review round 2 of PR #87, A-R2-2: a reload or a release moves the last use (lastSeenInUseAt), not only the open.
+  it('compares with the last time a window was seen using it (a reload after the last open), not only the open (review round 2 of PR #87, A-R2-2)', async () => {
+    const recorded = { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW - 3_600_000) };
+    // Opened before the state was recorded, but seen in use after it (a reload): later changes are not known.
+    await h.registry.add(environment({ lastUsedAt: iso(NOW - 7_200_000), lastSeenInUseAt: iso(NOW - 600_000), gitSummary: recorded }));
+    h.service.safetyCheck.mockResolvedValue(recorded);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
+      `${Messages.deleteConfirm('acme/api')} ${Messages.deleteChangesUnknownSince(at(NOW - 3_600_000))}`,
+    );
+    // Seen in use last before the state was recorded (the release recorded it): nothing more.
+    fakeVscode.window.showWarningMessage.mockReset();
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.lastSeenInUseAt = iso(NOW - 3_700_000);
+    });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(Messages.deleteConfirm('acme/api'));
+    expect(h.service.delete).not.toHaveBeenCalled();
+  });
 });

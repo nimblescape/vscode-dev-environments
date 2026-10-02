@@ -480,11 +480,15 @@ async function activateExtension(
             await heartbeatPreparation.scope(() => runWithDockerTarget(target, () => service.recordGitState(environment.id, signal)));
           },
           send: (id, limitSeconds, signal) => windowHeartbeats.release(id, limitSeconds, signal),
+          // Review round 2 of PR #87 (A-R2-2): the last use, for Delete's note, at the start of every release.
+          markSeenInUse: (environment, at) => registry.markSeenInUse(environment.id, at),
           logger,
         },
         environmentId,
         bounds,
       ),
+    // Review round 2 of PR #87 (A-R2-2): a window that starts connected (a reload) was seen using its environment.
+    markSeenInUse: (environmentId, at) => registry.markSeenInUse(environmentId, at),
   });
   windowCoordinator = sessionCoordinator;
   coordinator = sessionCoordinator;
