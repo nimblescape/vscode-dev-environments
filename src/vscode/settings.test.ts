@@ -41,27 +41,30 @@ describe('settings (concept section 8)', () => {
       repositoryGroups: [],
       // Unit 14 (setting openInNewWindow, concept 6.2, 8): a new setting with the default false (Start uses this window).
       openInNewWindow: false,
-      // Unit 7, PR 2 (setting remoteStopAfterMinutes): a new setting with the default of 10 minutes.
-      remoteStopAfterMinutes: 10,
+      // Unit 7, PR 2 (setting stopAfterMinutes): a new setting with the default of 10 minutes. Plan step 8 PR A
+      // (Q1): renamed stopAfterMinutes, on every engine, no migration (Q7).
+      stopAfterMinutes: 10,
       // User requests 2026-09-28 (setting remoteImageUpdates); user decision 2026-09-29: empty by default (no image
-      // repositories known to the extension; the image maintenance is off until the user names some).
-      remoteImageUpdates: [],
+      // repositories known to the extension; the image maintenance is off until the user names some). Plan step 8 PR A:
+      // renamed imageUpdates (every engine).
+      imageUpdates: [],
       // User request 2026-09-28 ("in the morning again, at 6:07 CEST"; "in a guided cron style manner"): the schedule of
       // the image maintenance, a cron expression (the daily time 06:07 before).
-      remoteImageUpdateSchedule: '7 6 * * *',
+      // Plan step 8 PR A: renamed imageUpdateSchedule.
+      imageUpdateSchedule: '7 6 * * *',
     });
   });
 
-  // User requests 2026-09-28: the images that the monitor on a remote host keeps up to date.
-  it('reads remoteImageUpdates: strings only; an empty list turns it off; a wrong type gives the default', () => {
-    const read = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdates' ? value : undefined)).remoteImageUpdates;
+  // User requests 2026-09-28: the images that the monitor keeps up to date (plan step 8 PR A: imageUpdates, every engine).
+  it('reads imageUpdates: strings only; an empty list turns it off; a wrong type gives the default', () => {
+    const read = (value: unknown) => normalizeSettings((key) => (key === 'imageUpdates' ? value : undefined)).imageUpdates;
     expect(read(['ghcr.io/acme/base*', 3, null])).toEqual(['ghcr.io/acme/base*']);
     expect(read([])).toEqual([]);
     // User decision 2026-09-29: the default is empty.
     expect(read('ghcr.io/acme/base*')).toEqual([]);
     // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule; an
     // invalid one (also a time HH:MM) gives the default.
-    const schedule = (value: unknown) => normalizeSettings((key) => (key === 'remoteImageUpdateSchedule' ? value : undefined)).remoteImageUpdateSchedule;
+    const schedule = (value: unknown) => normalizeSettings((key) => (key === 'imageUpdateSchedule' ? value : undefined)).imageUpdateSchedule;
     expect(schedule('30 5 * * 1-5')).toBe('30 5 * * 1-5');
     expect(schedule('  30  5 * *   mon-fri ')).toBe('30 5 * * mon-fri');
     expect(schedule('05:30')).toBe('7 6 * * *');
@@ -133,23 +136,24 @@ describe('settings (concept section 8)', () => {
 
   // Unit 7, PR 2: the time limit of a container on a remote Docker host without contact; review round 4 of PR #39 (P1):
   // five minutes to one day.
-  it('clamps remoteStopAfterMinutes to 5..1440 and gives 10 for a value that is no number', () => {
+  // Plan step 8 PR A (Q1): renamed stopAfterMinutes, on every engine.
+  it('clamps stopAfterMinutes to 5..1440 and gives 10 for a value that is no number', () => {
     const settings = (raw: Record<string, unknown>) => normalizeSettings((key) => raw[key]);
-    expect(settings({ remoteStopAfterMinutes: 0 }).remoteStopAfterMinutes).toBe(5);
-    expect(settings({ remoteStopAfterMinutes: 1 }).remoteStopAfterMinutes).toBe(5);
-    expect(settings({ remoteStopAfterMinutes: 4.9 }).remoteStopAfterMinutes).toBe(5);
-    expect(settings({ remoteStopAfterMinutes: 5 }).remoteStopAfterMinutes).toBe(5);
-    expect(settings({ remoteStopAfterMinutes: 30 }).remoteStopAfterMinutes).toBe(30);
-    expect(settings({ remoteStopAfterMinutes: 100_000 }).remoteStopAfterMinutes).toBe(1440);
-    expect(settings({ remoteStopAfterMinutes: '5' }).remoteStopAfterMinutes).toBe(10);
-    expect(settings({ remoteStopAfterMinutes: Number.NaN }).remoteStopAfterMinutes).toBe(10);
+    expect(settings({ stopAfterMinutes: 0 }).stopAfterMinutes).toBe(5);
+    expect(settings({ stopAfterMinutes: 1 }).stopAfterMinutes).toBe(5);
+    expect(settings({ stopAfterMinutes: 4.9 }).stopAfterMinutes).toBe(5);
+    expect(settings({ stopAfterMinutes: 5 }).stopAfterMinutes).toBe(5);
+    expect(settings({ stopAfterMinutes: 30 }).stopAfterMinutes).toBe(30);
+    expect(settings({ stopAfterMinutes: 100_000 }).stopAfterMinutes).toBe(1440);
+    expect(settings({ stopAfterMinutes: '5' }).stopAfterMinutes).toBe(10);
+    expect(settings({ stopAfterMinutes: Number.NaN }).stopAfterMinutes).toBe(10);
     // The same bounds in package.json.
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
       contributes: { configuration: { properties: Record<string, { minimum?: number; maximum?: number; scope?: string }> } };
     };
     // User request 2026-09-29: one value per user and computer (scope application), so a workspace cannot give one
     // window another limit; all windows write the same monitor.json and heartbeats.
-    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.remoteStopAfterMinutes`]).toMatchObject({
+    expect(manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.stopAfterMinutes`]).toMatchObject({
       minimum: 5,
       maximum: 1440,
       scope: 'application',

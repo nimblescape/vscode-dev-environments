@@ -114,6 +114,8 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   dockerHostUnreachable: 'retry',
   dockerEndpointUnsupported: ['showDetails'],
   otherDockerHost: ['showDetails'],
+  // Plan step 8, PR A (Q3): the Session Monitor container could not be started at an open.
+  sessionMonitorFailed: 'retry',
 };
 
 /** Situations that the user can resolve, rather than failures. */

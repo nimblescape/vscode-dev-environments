@@ -354,7 +354,9 @@ describe('RemoteSessionMonitor.ensure', () => {
     };
     const docker = new FakeDocker((args, index) => (index === 0 ? MISSING : args[0] === 'ps' ? result(0) : inspected(true, 'bbbbbbbbbbbb')), conflict);
     expect(await monitor(docker, logger).ensure(TAG, SOCKET)).toBe('failed');
-    expect(logger.lines.join('\n')).toMatch(/warn The Session Monitor on the Docker host could not be started: .*only while this computer is online/);
+    // Changed expectation, plan step 8 PR A: the warning no longer says that the local Session Monitor stops it while this
+    // computer is online (the windows send the heartbeats; an open is refused without the monitor, Q3).
+    expect(logger.lines.join('\n')).toMatch(/warn The Session Monitor on the Docker host could not be started: docker run failed: .*already in use/);
     // Plan step 3: the container of the other window is not removed. PR #69 review round 4, A-R4-2: changed expectation
     // (before: ['inspect', 'run', 'inspect']): the nonce is checked, and the failure cleans up by the nonce (nothing).
     expect(docker.commands()).toEqual(['inspect', 'run', 'ps', 'inspect', 'ps']);

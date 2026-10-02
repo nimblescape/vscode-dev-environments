@@ -12,9 +12,9 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { ContainerAdapter } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { dockerHostOf, isOnDockerHost, remoteContextName } from '../core/docker/dockerHost';
+import { dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
-import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
+import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
@@ -40,13 +40,14 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { stopAfterSeconds } from '../core/session/sessionRules';
+import { WindowHeartbeats } from '../core/session/windowHeartbeats';
 import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
-import { remoteStopAfterSeconds } from '../monitor/rules';
 import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
@@ -60,9 +61,9 @@ import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
-import { remoteMonitorEnsure } from './remoteMonitorEnsure';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
+import { sessionMonitorEnsure } from './sessionMonitorEnsure';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
 import { Sidebar } from './sidebar';
 import { EnvironmentStatusBar } from './statusBar';
@@ -73,9 +74,15 @@ import { REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, type TreeNode } from '.
 const FOCUS_REFRESH_INTERVAL_MS = 15_000;
 /** User requests 2026-09-28: the image list for the monitor of a host is sent at most this often. */
 export const IMAGE_LIST_INTERVAL_MS = 60 * 60_000;
+
+/** The name of an engine in the log and the messages: the remote host, or the local Docker (host ''). */
+function engineName(host: string): string {
+  return host === '' ? 'the local Docker' : host;
+}
 export const ImageListTexts = {
-  signInQuestion: (host: string) =>
-    `To keep all images of the setting "Remote Image Updates" on ${host} up to date, Dev Environments needs to read your GitHub packages.`,
+  // Plan step 8, PR A: the setting is "Image Updates", on every engine.
+  signInQuestion: (engine: string) =>
+    `To keep all images of the setting "Image Updates" on ${engine} up to date, Dev Environments needs to read your GitHub packages.`,
   signIn: 'Sign in',
 } as const;
 
@@ -195,6 +202,11 @@ async function activateExtension(
   // image, then the open), and is refused when that fails, never run directly. Its socket mount is the one of the
   // workspace helper on that engine.
   const channelScriptPath = context.asAbsolutePath(path.join('dist', 'helperChannel.js'));
+  // The source of the socket mount on the host of an engine, for the worker and the Session Monitor container: the
+  // recorded socket of a rootless remote engine, else /var/run/docker.sock there; on the local Docker the socket of its
+  // endpoint.
+  const engineSocket = async (target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>): Promise<string> =>
+    target.kind === 'remote' ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, platform, target.endpoint);
   let channelScript: Promise<string> | undefined;
   const channels = new HelperChannels({
     logger,
@@ -220,10 +232,7 @@ async function activateExtension(
             return channelScript;
           },
           helperTag: async () => helperImageTag(await fs.promises.readFile(helperDockerfile, 'utf8')),
-          socketPath: async (target) =>
-            target.kind === 'remote'
-              ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET)
-              : helperDockerSocket(env, platform, target.endpoint),
+          socketPath: engineSocket,
           // Plan step 5, PR B: the lock files of the environments, in the volume of the Session Monitor of the engine.
           stateVolume: REMOTE_MONITOR_VOLUME,
         },
@@ -238,14 +247,15 @@ async function activateExtension(
       channels.dispose();
     },
   });
-  // Unit 7, PR 2: the Session Monitor container on a remote Docker host. Its script is dist/remoteMonitor.js, read once.
+  // Unit 7, PR 2: the Session Monitor container of a Docker engine (plan step 8, PR A: every engine, local and remote).
+  // Its script is dist/remoteMonitor.js, read once.
   const remoteMonitorScript = context.asAbsolutePath(path.join('dist', 'remoteMonitor.js'));
   let remoteMonitorScriptText: Promise<string> | undefined;
   const remoteMonitor = new RemoteSessionMonitor({
     docker,
     logger,
-    // User requests 2026-09-28: the image maintenance of the monitor (the settings remoteImageUpdates and
-    // remoteImageUpdateSchedule, in the time zone of this computer).
+    // User requests 2026-09-28: the image maintenance of the monitor (the settings imageUpdates and imageUpdateSchedule,
+    // in the time zone of this computer; plan step 8, PR A: on every engine).
     imageMaintenance: () => imageMaintenance(),
     script: () => {
       remoteMonitorScriptText ??= fs.promises.readFile(remoteMonitorScript, 'utf8');
@@ -266,18 +276,18 @@ async function activateExtension(
   // Review round 9 of PR #57 (T2): patterns that are left out (invalid, or beyond the limits) are logged once.
   let warnedPatterns = '';
   const usedImagePrefixes = (): string[] => {
-    const patterns = getSettings().remoteImageUpdates ?? [];
+    const patterns = getSettings().imageUpdates ?? [];
     const prefixes = imagePrefixesOf(patterns);
     const left = patterns.filter((pattern) => !prefixes.includes(pattern.trim().replace(/\*$/, '')));
     if (left.length > 0 && JSON.stringify(left) !== warnedPatterns) {
       warnedPatterns = JSON.stringify(left);
-      logger.warn(`These image patterns of devEnvLauncher.remoteImageUpdates are not used (invalid, Docker Hub, duplicate, or beyond 50 patterns or 4096 characters): ${left.join(', ')}`);
+      logger.warn(`These image patterns of devEnvLauncher.imageUpdates are not used (invalid, Docker Hub, duplicate, or beyond 50 patterns or 4096 characters): ${left.join(', ')}`);
     }
     return prefixes;
   };
   const imageMaintenance = () => ({
     prefixes: usedImagePrefixes(),
-    schedule: getSettings().remoteImageUpdateSchedule ?? DEFAULT_IMAGE_SCHEDULE,
+    schedule: getSettings().imageUpdateSchedule ?? DEFAULT_IMAGE_SCHEDULE,
     // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
     timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
   });
@@ -300,10 +310,10 @@ async function activateExtension(
       return;
     }
     if (repositories.length > MAX_IMAGE_REPOSITORIES) {
-      logger.warn(`GitHub lists ${repositories.length} image repositories for ${prefixes.join(', ')}; the Session Monitor on ${host} gets the first ${MAX_IMAGE_REPOSITORIES}.`);
+      logger.warn(`GitHub lists ${repositories.length} image repositories for ${prefixes.join(', ')}; the Session Monitor on ${engineName(host)} gets the first ${MAX_IMAGE_REPOSITORIES}.`);
       repositories = repositories.slice(0, MAX_IMAGE_REPOSITORIES);
     }
-    logger.info(`The Session Monitor on ${host} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
+    logger.info(`The Session Monitor on ${engineName(host)} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
     if (!(await remoteMonitor.images(repositories))) imageListSentAt.delete(host);
   };
   const sendImageList = async (host: string): Promise<void> => {
@@ -321,10 +331,10 @@ async function activateExtension(
     if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
     const credentials = await auth.getPackagesCredentials({ interactive: false });
     if (!credentials) {
-      logger.info(`The image list for ${host} needs the GitHub sign-in for packages; the Session Monitor there updates only the images that it has.`);
+      logger.info(`The image list for ${engineName(host)} needs the GitHub sign-in for packages; the Session Monitor there updates only the images that it has.`);
       if (!packagesSignInOffered) {
         packagesSignInOffered = true;
-        void vscode.window.showInformationMessage(ImageListTexts.signInQuestion(host), ImageListTexts.signIn).then(async (choice) => {
+        void vscode.window.showInformationMessage(ImageListTexts.signInQuestion(engineName(host)), ImageListTexts.signIn).then(async (choice) => {
           if (choice !== ImageListTexts.signIn) return;
           if (await auth.getPackagesCredentials({ interactive: true })) imageListSentAt.delete(host);
         });
@@ -334,8 +344,48 @@ async function activateExtension(
     imageListSentAt.set(host, Date.now());
     inTarget(() => sendRepositories(host, prefixes, credentials.password));
   };
+  const connection = new ConnectionAdapter(logger);
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
+  const limitSeconds = (): number => stopAfterSeconds(getSettings().stopAfterMinutes);
+  // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
+  // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
+  // worker is made ready first, D1); a missing monitor is started again as the open starts it.
+  const repairSessionMonitor = async (target: DockerTarget): Promise<void> =>
+    runWithDockerTarget(target, async () => {
+      const image = await helper.ensureImagePresent({ onOutput: (text) => logger.output(text) });
+      await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), undefined, image.id);
+    });
+  // Set below (the coordinator makes the ID of this window).
+  let windowCoordinator: SessionCoordinator | undefined;
+  const windowHeartbeats = new WindowHeartbeats({
+    owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
+    connected: () => windowCoordinator?.environmentId ?? null,
+    registry,
+    settings: getSettings,
+    sourceId: computerId,
+    // The engine the window opened the environment on: the current Docker target when the environment is on it (right
+    // after the open it is); else, for a remote host, the context in this window's authority or the one of "Use a Remote
+    // Docker Host…". A local environment while Docker is set elsewhere cannot be reached (logged).
+    engineFor: async (environment) => {
+      const current = await outsideOperation(() => targets.resolve());
+      if (current.kind !== 'unsupported' && isOnDockerHost(environment, current.host)) return current;
+      const host = dockerHostOf(environment);
+      if (host === '') return undefined;
+      const own = connection.currentContainerName() === environment.containerName ? connection.currentDockerContext() : undefined;
+      return { kind: 'remote', host, endpoint: sshEndpoint(host), context: own ?? remoteContextName(host) };
+    },
+    send: async (target, input) => {
+      const result = await runWithDockerTarget(target, () => remoteMonitor.heartbeat(input));
+      return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
+    },
+    repair: repairSessionMonitor,
+    warn: (message) => {
+      void vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => logger.error('Could not show the message.', error));
+    },
+    logger,
+  });
+  context.subscriptions.push({ dispose: () => windowHeartbeats.dispose() });
   // One stored list per GitHub account (concept 6.2).
   const discovery = new DiscoveryService(
     new GitHubApi(nodeHttpsTransport, logger, {
@@ -349,7 +399,6 @@ async function activateExtension(
     { scope: () => getSettings().owners },
   );
   const ui = new VsCodePipelineUi(auth, logger, () => logger.show());
-  const connection = new ConnectionAdapter(logger);
   const sessionCoordinator = new SessionCoordinator({
     paths,
     sessionFiles,
@@ -357,7 +406,9 @@ async function activateExtension(
     monitorScript: context.asAbsolutePath(path.join('dist', 'sessionMonitor.js')),
     settings: getSettings,
     windowDockerContext: () => connection.currentDockerContext(),
+    windowHeartbeats,
   });
+  windowCoordinator = sessionCoordinator;
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
   // Review round 9 (P9-2): without its bundle every analysis fails (as an internal error, which refuses new and changed
@@ -405,19 +456,20 @@ async function activateExtension(
     // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
     // neither local nor SSH is refused by every operation and never read.
     dockerTarget: () => targets.current(),
-    // Unit 7, PR 2: the Session Monitor on a remote host, with the socket that the workspace helper mounts there.
-    remoteMonitor: {
-      ensure: remoteMonitorEnsure(remoteMonitor, (host) => remoteState.rootlessSocket(host)),
-      heartbeat: async (_host, environmentId, keepRunning, seq) => {
+    // Unit 7, PR 2: the Session Monitor of the engine, with the socket that the workspace helper mounts there. Plan step 8,
+    // PR A: on every engine; its calls run in the operation (through its worker where they are plain Docker calls).
+    sessionMonitor: {
+      ensure: sessionMonitorEnsure(remoteMonitor, engineSocket),
+      heartbeat: async (_target, environmentId, keepRunning, seq) => {
         const result = await remoteMonitor.heartbeat({
           source: computerId(),
-          limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
+          limitSeconds: limitSeconds(),
           environments: [{ id: environmentId, keepRunning, seq }],
         });
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },
-      forget: async (_host, environmentId) => remoteMonitor.forget(computerId(), environmentId),
-      images: sendImageList,
+      forget: async (_target, environmentId) => remoteMonitor.forget(computerId(), environmentId),
+      images: async (target) => sendImageList(target.host),
     },
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
@@ -529,16 +581,10 @@ async function activateExtension(
         if (view.visible) await sidebar.refreshStates();
       },
     }),
-    // Unit 7, PR 2: Close and Keep Running tells the Session Monitor on the remote host at once.
-    remoteMonitor: {
-      sendKeepRunning: async (environmentId, seq) => {
-        const result = await remoteMonitor.heartbeat({
-          source: computerId(),
-          limitSeconds: remoteStopAfterSeconds(getSettings().remoteStopAfterMinutes),
-          environments: [{ id: environmentId, keepRunning: true, seq }],
-        });
-        return result.ok ? { ok: true } : { ok: false, detail: result.detail };
-      },
+    // Unit 7, PR 2: Close and Keep Running tells the Session Monitor at once. Plan step 8, PR A: on every engine, and
+    // Keep Running When Closed and Stop When Closed too, through this window's worker of the engine.
+    sessionMonitor: {
+      sendHeartbeat: (environmentId) => windowHeartbeats.sendFor(environmentId),
     },
   });
   context.subscriptions.push(

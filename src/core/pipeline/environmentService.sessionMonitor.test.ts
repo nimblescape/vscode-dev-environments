@@ -2,13 +2,14 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Unit 7, PR 2: the Session Monitor on a remote Docker host from the side of the pipeline (ensured right after the helper
-// image, before the container is created or started; the record of this computer removed at Delete), and the flag of
-// Close and Keep Running (cleared when a window connects, and by Stop).
+// Unit 7, PR 2: the Session Monitor container from the side of the pipeline (ensured right after the helper image, before
+// the container is created or started; the record of this computer removed at Delete), and the flag of Close and Keep
+// Running (cleared when a window connects, and by Stop). Plan step 8, PR A: on every engine, local and remote, and an open
+// is refused when the monitor cannot be ensured (user decision Q3 of 2026-10-02).
 import { afterEach, describe, expect, it } from 'vitest';
 import { abortError } from '../ports';
 import type { DockerTarget } from '../docker/dockerHost';
-import type { EnvironmentRemoteMonitor, RepositoryTarget } from './environmentService';
+import type { EnvironmentSessionMonitor, RepositoryTarget } from './environmentService';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
@@ -38,34 +39,42 @@ function setup(
 ): Setup {
   const calls: string[] = [];
   seqs = [];
-  const remoteMonitor: EnvironmentRemoteMonitor = {
-    ensure: async (host, helperTag, _signal, helperImage) => {
+  const sessionMonitor: EnvironmentSessionMonitor = {
+    ensure: async (target, helperTag, _signal, helperImage) => {
+      const host = engineOf(target);
       // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): the image ID of the helper image of the open.
       calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
       // In the order of the helper calls.
       created.helper.calls.push('remote monitor');
       return behavior.ensure?.();
     },
-    heartbeat: async (host, environmentId, keepRunning, seq) => {
+    heartbeat: async (target, environmentId, keepRunning, seq) => {
+      const host = engineOf(target);
       calls.push(`heartbeat ${host} ${environmentId} ${keepRunning}`);
       seqs.push(seq);
       created.helper.calls.push('first heartbeat');
       return (await behavior.heartbeat?.()) ?? { ok: true };
     },
-    forget: async (host, environmentId) => {
+    forget: async (target, environmentId) => {
+      const host = engineOf(target);
       calls.push(`forget ${host} ${environmentId}`);
       return behavior.forget?.();
     },
   };
-  const created = createHarness({ dockerTarget: async () => target, remoteMonitor });
+  const created = createHarness({ dockerTarget: async () => target, sessionMonitor });
   h = created;
   return { h: created, calls };
+}
+
+/** The engine in the calls: the host, or `local` for the local Docker. */
+function engineOf(target: Pick<DockerTarget, 'kind' | 'host'>): string {
+  return target.kind === 'local' ? 'local' : target.host;
 }
 
 const REMOTE = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' } as const;
 const LOCAL = { kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock' } as const;
 
-describe('the Session Monitor on a remote host in the open pipeline', () => {
+describe('the Session Monitor in the open pipeline', () => {
   it('a first open on a remote host ensures it once, with the helper tag, after the helper image and before up', async () => {
     const { h, calls } = setup(REMOTE);
     const result = await h.service.open(TARGET, { progress: h.progress });
@@ -126,24 +135,45 @@ describe('the Session Monitor on a remote host in the open pipeline', () => {
     expect(h.logger.warnings.some((line) => line.includes('The first heartbeat for') && line.includes('build-box'))).toBe(true);
   });
 
-  it('sends the first heartbeat also when the monitor could not be ensured', async () => {
+  // Changed expectation, plan step 8 PR A (user decision Q3 of 2026-10-02): a monitor that cannot be ensured refuses the
+  // open, so no first heartbeat is sent and nothing is started (before: the heartbeat was sent and the open went on).
+  it('refuses the open of a stopped environment when the monitor could not be ensured, before anything starts', async () => {
     const { h, calls } = setup(REMOTE, { ensure: async () => Promise.reject(new Error('unreachable')) });
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
-    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
-    expect(calls).toContain(`heartbeat build-box ${ENV_ID} false`);
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'sessionMonitorFailed' });
+    expect(calls.filter((call) => call.startsWith('heartbeat'))).toEqual([]);
+    expect(h.helper.calls.some((call) => call.startsWith('up '))).toBe(false);
   });
 
-  it('never on the local Docker', async () => {
+  // Changed expectation, plan step 8 PR A: the local Docker gets the same monitor (before: never on the local Docker).
+  it('a first open on the local Docker ensures it once, then sends the first heartbeat, before up', async () => {
     const { h, calls } = setup(LOCAL);
-    await h.service.open(TARGET, { progress: h.progress });
-    expect(calls).toEqual([]);
+    const result = await h.service.open(TARGET, { progress: h.progress });
+    expect(calls).toEqual([`ensure local devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat local ${result.environment.id} false`]);
+    const order = h.helper.calls;
+    expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
+    expect(order.findIndex((call) => call.startsWith('up '))).toBeGreaterThan(order.indexOf('first heartbeat'));
   });
 
-  it('a failure does not fail the open', async () => {
+  // Changed expectation, plan step 8 PR A (Q3): a failure fails the open, with a message that names the cause.
+  it('a failure refuses the open with the cause', async () => {
     const { h } = setup(REMOTE, { ensure: async () => Promise.reject(new Error('ssh: connect to host build-box: timed out')) });
-    const result = await h.service.open(TARGET, { progress: h.progress });
-    expect(result.environment.dockerHost).toBe('build-box');
+    const error = await h.service.open(TARGET, { progress: h.progress }).then(
+      () => undefined,
+      (failure: unknown) => failure as { code?: string; message?: string; detail?: string },
+    );
+    expect(error?.code).toBe('sessionMonitorFailed');
+    expect(error?.message).toContain('the Session Monitor on the Docker engine could not be started (ssh: connect to host build-box: timed out)');
     expect(h.logger.warnings.some((line) => line.includes('The Session Monitor on build-box could not be started'))).toBe(true);
+    expect(h.helper.calls.some((call) => call.startsWith('up '))).toBe(false);
+  });
+
+  // Plan step 8, PR A (Q3): also on the local Docker, and also a running container is not opened as it is.
+  it('refuses the open on the local Docker, also of a running container', async () => {
+    const { h } = setup(LOCAL, { ensure: async () => Promise.reject(new Error('docker run failed: image not found')) });
+    await seedEnvironment(h, { container: 'running' });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'sessionMonitorFailed' });
+    expect(h.logger.warnings.some((line) => line.includes('The Session Monitor on the local Docker could not be started'))).toBe(true);
   });
 
   it('a cancellation during it cancels the open', async () => {
@@ -176,7 +206,7 @@ describe('Close and Keep Running in the registry', () => {
   });
 });
 
-describe('Delete on a remote host', () => {
+describe('Delete and the record of this computer', () => {
   it('removes the record of this computer on the remote monitor', async () => {
     const { h, calls } = setup(REMOTE);
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
@@ -190,41 +220,44 @@ describe('Delete on a remote host', () => {
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
     await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
     expect(await h.registry.get(ENV_ID)).toBeUndefined();
-    expect(h.logger.warnings.some((line) => line.includes('remove the heartbeat record on the remote host'))).toBe(true);
+    // Changed expectation, plan step 8 PR A: the text names the Session Monitor of any engine.
+    expect(h.logger.warnings.some((line) => line.includes('remove the heartbeat record from the Session Monitor'))).toBe(true);
   });
 
-  it('nothing for an environment of the local Docker', async () => {
+  // Changed expectation, plan step 8 PR A: on the local Docker too (before: nothing for an environment of the local Docker).
+  it('removes the record of this computer on the local Docker too', async () => {
     const { h, calls } = setup(LOCAL);
     await seedEnvironment(h, { container: 'stopped' });
     await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
-    expect(calls.filter((call) => call.startsWith('forget'))).toEqual([]);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+    expect(calls.filter((call) => call.startsWith('forget'))).toEqual([`forget local ${ENV_ID}`]);
   });
 });
 
-// User requests 2026-09-28: the image list for the image maintenance of the monitor, only on a remote host.
+// User requests 2026-09-28: the image list for the image maintenance of the monitor (plan step 8, PR A: on every engine).
 describe('the image list for the Session Monitor in the open pipeline', () => {
   function withImages(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, images: (host: string) => Promise<void>) {
     const calls: string[] = [];
-    const remoteMonitor: EnvironmentRemoteMonitor = {
-      ensure: async (host) => {
-        calls.push(`ensure ${host}`);
+    const sessionMonitor: EnvironmentSessionMonitor = {
+      ensure: async (target) => {
+        calls.push(`ensure ${engineOf(target)}`);
       },
-      heartbeat: async (host) => {
-        calls.push(`heartbeat ${host}`);
+      heartbeat: async (target) => {
+        calls.push(`heartbeat ${engineOf(target)}`);
         return { ok: true };
       },
       forget: async () => {},
-      images: async (host) => {
-        calls.push(`images ${host}`);
-        return images(host);
+      images: async (target) => {
+        calls.push(`images ${engineOf(target)}`);
+        return images(engineOf(target));
       },
     };
-    const created = createHarness({ dockerTarget: async () => target, remoteMonitor });
+    const created = createHarness({ dockerTarget: async () => target, sessionMonitor });
     h = created;
     return { h: created, calls };
   }
 
-  it('sends it after the monitor is ensured and before the first heartbeat, on a remote host only', async () => {
+  it('sends it after the monitor is ensured and before the first heartbeat, on every engine', async () => {
     const remote = withImages(REMOTE, async () => {});
     await seedEnvironment(remote.h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
     await remote.h.service.openEnvironment(ENV_ID, { progress: remote.h.progress });
@@ -232,7 +265,8 @@ describe('the image list for the Session Monitor in the open pipeline', () => {
     const local = withImages(LOCAL, async () => {});
     await seedEnvironment(local.h, { container: 'stopped' });
     await local.h.service.openEnvironment(ENV_ID, { progress: local.h.progress });
-    expect(local.calls).toEqual([]);
+    // Changed expectation, plan step 8 PR A: on the local Docker too (before: nothing there).
+    expect(local.calls).toEqual(['ensure local', 'images local', 'heartbeat local']);
   });
 
   it('a failure is a warning, and the open goes on', async () => {

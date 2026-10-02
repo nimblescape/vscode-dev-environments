@@ -22,8 +22,15 @@ export const ControllerTexts = {
   keepAllRunning: 'The setting "Stop On Close" is off, so all environments keep running when no window uses them.',
   // Close and Keep Running (unit 7, PR 2).
   closeAndKeepRunningNotConnected: 'This window is not connected to an environment.',
+  // Plan step 8, PR A: on every engine; for the local Docker (host '') the Session Monitor there is named.
   closeAndKeepRunningUnreachable: (host: string, minutes: number) =>
-    `The Docker host ${host} cannot be reached. The container would stop after ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} without contact. The window stays open.`,
+    `${host === '' ? 'The Session Monitor of the local Docker' : `The Docker host ${host}`} cannot be reached. The container would stop after ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} without contact. The window stays open.`,
+  /**
+   * Plan step 8, PR A: Keep Running When Closed or Stop When Closed was stored, but the Session Monitor of the engine
+   * could not be told at once (the windows that use the environment tell it at their next heartbeat).
+   */
+  keepRunningNotSent: (repository: string) =>
+    `The Session Monitor on the Docker engine of ${repository} could not be told about this choice yet (see the Dev Environments output). While no window uses ${repository}, it follows its earlier choice.`,
   // Stop, Rebuild, and Delete of an environment that another window uses: that window closes its connection first
   // (concept 6.2 Stop, 7.14).
   otherWindowClosesConnection: (repository: string) =>

@@ -15,10 +15,10 @@ import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 export const SETTINGS_SECTION = 'devEnvLauncher';
 
 /**
- * The default of remoteImageUpdates: none, so the image maintenance is off until the user names image repositories
+ * The default of imageUpdates (before plan step 8, PR A: remoteImageUpdates): none, so the image maintenance is off until the user names image repositories
  * (user decision 2026-09-29: the extension knows no image repositories of its own).
  */
-export const DEFAULT_REMOTE_IMAGE_UPDATES: readonly string[] = [];
+export const DEFAULT_IMAGE_UPDATES: readonly string[] = [];
 
 /** Defaults of concept section 8. */
 export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
@@ -34,18 +34,19 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   hostAccessChecksOff: [],
   repositoryGroups: [],
   openInNewWindow: false,
-  remoteStopAfterMinutes: 10,
-  remoteImageUpdates: [...DEFAULT_REMOTE_IMAGE_UPDATES],
-  remoteImageUpdateSchedule: DEFAULT_IMAGE_SCHEDULE,
+  stopAfterMinutes: 10,
+  imageUpdates: [...DEFAULT_IMAGE_UPDATES],
+  imageUpdateSchedule: DEFAULT_IMAGE_SCHEDULE,
 });
 
 /**
- * Bounds of the setting remoteStopAfterMinutes (unit 7, PR 2): five minutes to one day. Review round 4 of PR #39 (P1): at
+ * Bounds of the setting stopAfterMinutes (unit 7, PR 2; plan step 8, PR A: named remoteStopAfterMinutes before, user
+ * decision Q1 of 2026-10-02, no migration): five minutes to one day. Review round 4 of PR #39 (P1): at
  * least 5 minutes, so that a tick with long stops (Git, SSH) never keeps the heartbeats away that long. The protocol
  * itself accepts 60 seconds (MIN_LIMIT_SECONDS; the Docker test uses it).
  */
-export const MIN_REMOTE_STOP_AFTER_MINUTES = 5;
-export const MAX_REMOTE_STOP_AFTER_MINUTES = 1440;
+export const MIN_STOP_AFTER_MINUTES = 5;
+export const MAX_STOP_AFTER_MINUTES = 1440;
 
 /**
  * Largest refresh interval that a Node.js timer supports (2^31 - 1 ms). A longer delay makes `setInterval` fire every
@@ -55,10 +56,10 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
 
 /**
  * Current settings. Values of a wrong type fall back to the default; waitingTimeSeconds ≥ 0,
- * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES, 5 ≤ remoteStopAfterMinutes ≤ 1440. hostAccessChecksOff is read from the user settings only
+ * 1 ≤ refreshIntervalMinutes ≤ MAX_REFRESH_INTERVAL_MINUTES, 5 ≤ stopAfterMinutes ≤ 1440. hostAccessChecksOff is read from the user settings only
  * (hostAccessChecksOffValue). `repositoryGroups` has the scope `application` in
  * package.json, so VS Code returns only the user setting: a workspace cannot bring its own regular expressions. The same
- * for `openInNewWindow`: a workspace does not decide which window a Start uses, and for `remoteStopAfterMinutes` (user
+ * for `openInNewWindow`: a workspace does not decide which window a Start uses, and for `stopAfterMinutes` (user
  * request 2026-09-29): one limit per user and computer, as every window writes it into monitor.json and heartbeats; the
  * same for `stopOnClose`, `waitingTimeSeconds` and `respectShutdownActionNone` (review round 1 of PR #61), the other
  * values of monitor.json: a repository's workspace settings cannot keep every environment of the computer running.
@@ -149,20 +150,20 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     // The entries are checked where they are used (repositoryGroups.ts), so that each problem can be named.
     repositoryGroups: Array.isArray(repositoryGroups) ? [...(repositoryGroups as unknown[])] : [],
     openInNewWindow: bool('openInNewWindow', DEFAULT_SETTINGS.openInNewWindow ?? false),
-    remoteStopAfterMinutes: number(
-      'remoteStopAfterMinutes',
-      DEFAULT_SETTINGS.remoteStopAfterMinutes ?? 10,
-      MIN_REMOTE_STOP_AFTER_MINUTES,
-      MAX_REMOTE_STOP_AFTER_MINUTES,
+    stopAfterMinutes: number(
+      'stopAfterMinutes',
+      DEFAULT_SETTINGS.stopAfterMinutes ?? 10,
+      MIN_STOP_AFTER_MINUTES,
+      MAX_STOP_AFTER_MINUTES,
     ),
     // The entries are checked where they are used (imagePrefixesOf): an invalid one is left out.
-    remoteImageUpdates: Array.isArray(get('remoteImageUpdates'))
-      ? (get('remoteImageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
-      : [...DEFAULT_REMOTE_IMAGE_UPDATES],
+    imageUpdates: Array.isArray(get('imageUpdates'))
+      ? (get('imageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
+      : [...DEFAULT_IMAGE_UPDATES],
     // User request 2026-09-28 ("in a guided cron style manner"): a cron expression of five fields; invalid: the default.
-    remoteImageUpdateSchedule:
-      typeof get('remoteImageUpdateSchedule') === 'string' && parseCronSchedule(get('remoteImageUpdateSchedule') as string)
-        ? (get('remoteImageUpdateSchedule') as string).trim().split(/\s+/).join(' ')
+    imageUpdateSchedule:
+      typeof get('imageUpdateSchedule') === 'string' && parseCronSchedule(get('imageUpdateSchedule') as string)
+        ? (get('imageUpdateSchedule') as string).trim().split(/\s+/).join(' ')
         : DEFAULT_IMAGE_SCHEDULE,
   };
 }

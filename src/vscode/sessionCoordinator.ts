@@ -3,7 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Session Coordinator (concept 7.2, 7.9, 7.10): the window side of the stop-on-close mechanism. It writes the window
-// status file at activation and every 15 seconds, removes the pending connection file of the connected environment,
+// status file at activation and every 15 seconds (and then drives the window's heartbeats to the Session Monitor
+// container of each engine, plan step 8 PR A), removes the pending connection file of the connected environment,
 // writes monitor.json, starts the Session Monitor process when none runs, and writes `closing` plus the reopen record in
 // deactivate().
 //
@@ -19,15 +20,15 @@ import { atomicTemporaryPath } from '../core/storage/atomicJson';
 import { retryTransient, retryTransientSync, type StoragePaths } from '../core/storage/paths';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
+import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../core/busy';
+import { isProcessAlive } from '../core/session/sessionRules';
 import {
   isMonitorRunning,
-  isProcessAlive,
   MONITOR_PROTOCOL_VERSION,
   readMonitorVersion,
   requestMonitorExit,
   runningMonitor,
 } from '../monitor/lock';
-import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS, remoteStopAfterSeconds } from '../monitor/rules';
 
 /** Interval of the window status file updates (concept 7.9). */
 export const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -68,6 +69,12 @@ export interface SessionCoordinatorDeps {
   execPath?: string;
   /** Default: HEARTBEAT_INTERVAL_MS. */
   heartbeatMs?: number;
+  /**
+   * Plan step 8, PR A: the heartbeats of this window to the Session Monitor container of each engine
+   * (src/core/session/windowHeartbeats.ts), driven by this tick after each status write. Not awaited (a heartbeat over
+   * SSH, or the repair of a missing monitor, must not hold the status file back); it skips a tick while one runs.
+   */
+  windowHeartbeats?: { tick(): Promise<void> };
 }
 
 /** Minimal `vscode.EventEmitter` replacement, so that this module has no runtime dependency on `vscode`. */
@@ -287,7 +294,11 @@ export class SessionCoordinator implements vscode.Disposable {
       try {
         await this.writeStatus();
         this.ensureMonitorRunningSync();
-        if (!this.stopped) this.heartbeatEmitter.fire();
+        if (!this.stopped) {
+          // Plan step 8, PR A: never throws; not awaited.
+          void this.deps.windowHeartbeats?.tick();
+          this.heartbeatEmitter.fire();
+        }
       } finally {
         this.heartbeatRunning = false;
       }
@@ -365,8 +376,6 @@ export class SessionCoordinator implements vscode.Disposable {
         typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_WAITING_TIME_SECONDS,
       stopOnClose: settings.stopOnClose !== false,
       respectShutdownActionNone: settings.respectShutdownActionNone === true,
-      // Unit 7, PR 2: the time limit of the heartbeats to the Session Monitor on a remote Docker host.
-      remoteStopAfterSeconds: remoteStopAfterSeconds(settings.remoteStopAfterMinutes),
       updatedAt: isoTime(this.clock),
     };
   }

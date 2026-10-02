@@ -331,9 +331,6 @@ export function isMonitorSettings(value: unknown): value is MonitorSettings {
     value.waitingTimeSeconds >= 0 &&
     typeof value.stopOnClose === 'boolean' &&
     typeof value.respectShutdownActionNone === 'boolean' &&
-    typeof value.remoteStopAfterSeconds === 'number' &&
-    Number.isFinite(value.remoteStopAfterSeconds) &&
-    value.remoteStopAfterSeconds > 0 &&
     isTime(value.updatedAt)
   );
 }

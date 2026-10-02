@@ -13,15 +13,18 @@
 // writes nothing. Plan step 3 (pipe loading): the container runs the pipe loader and gets the script on its input only;
 // `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
 // replaces the container (review round 1 of PR #69, A-R1-1: with the restart policy kept); a monitor whose first load
-// was cut off is replaced too.
+// was cut off is replaced too. Plan step 8, PR A: a heartbeat of the window (WindowHeartbeats, also sendFor of Close and
+// Keep Running) and Delete's forget through a real worker on the local engine, as extension.ts routes them.
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DockerTargets, runWithDockerTarget } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
+import type { ProcessRunner, RunOptions, RunResult, StartOptions, StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { LOADER_EXIT_CODE, PIPE_LOADER, bundleHash } from '../../src/core/loader/pipeLoader';
 import {
@@ -32,8 +35,11 @@ import {
   remoteMonitorLabelValue,
 } from '../../src/core/remoteMonitor/protocol';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
+import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
+import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, Timings, dockerTestContext } from './harness';
+import { workerLocks } from './workerLocks';
 
 const SOURCE = crypto.randomBytes(16).toString('hex');
 const OTHER_SOURCE = crypto.randomBytes(16).toString('hex');
@@ -52,6 +58,19 @@ async function bundleScript(): Promise<string> {
     logLevel: 'silent',
   });
   return result.outputFiles[0].text;
+}
+
+/** Plan step 8, PR A: records the Docker calls that run directly (not through the worker). */
+class SpyRunner implements ProcessRunner {
+  readonly calls: string[][] = [];
+  constructor(private readonly inner: NodeProcessRunner) {}
+  run(file: string, args: readonly string[], options?: RunOptions): Promise<RunResult> {
+    this.calls.push([...args]);
+    return this.inner.run(file, args, options);
+  }
+  start(file: string, args: readonly string[], options?: StartOptions): StartedProcess {
+    return this.inner.start(file, args, options);
+  }
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 90_000): Promise<void> {
@@ -290,5 +309,75 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(details.State.Running).toBe(true);
     expect(details.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
+  });
+  // Plan step 8, PR A (user decisions Q1 and Q4 of 2026-10-02): the heartbeats of a window go through this window's
+  // worker of the engine (a routed `docker exec` on the monitor container, without `-i`), on the local engine too; so does
+  // the forget of Delete.
+  it('takes a heartbeat of the window and a forget through a real worker on the local engine (plan step 8, PR A)', async () => {
+    expect(['created', 'running', 'started']).toContain(await monitor.ensure(helperTag, socket));
+    await waitUntil(() => running(containerName), 'the monitor');
+    const spy = new SpyRunner(new NodeProcessRunner());
+    const windowDocker = new ContainerAdapter(spy, run.dockerPath, env, log);
+    const targets = new DockerTargets(windowDocker, env, log);
+    const locks = workerLocks({ run, cli, log }, windowDocker, targets, 'remoteMonitor-window', async (target) =>
+      helperDockerSocket(env, process.platform, target.endpoint),
+    );
+    const routed: string[][] = [];
+    windowDocker.setRouter(async (target, args, options) => {
+      routed.push([...args]);
+      return locks.channels.docker(target, args, options);
+    });
+    const windowMonitor = new RemoteSessionMonitor({ docker: windowDocker, logger: log, script: async () => script, containerName, volumeName });
+    const target = await targets.resolve();
+    expect(target.kind).toBe('local');
+    const windowSource = crypto.randomBytes(16).toString('hex');
+    const environment = {
+      id: crypto.randomUUID(),
+      repository: 'devenv-test/window-heartbeat',
+      configPath: '.devcontainer/devcontainer.json',
+      volumeName: 'unused',
+      containerName: 'unused',
+      owner: { id: '1', login: 'devenv-test' },
+      createdAt: new Date().toISOString(),
+    } as Environment;
+    const warnings: string[] = [];
+    const heartbeats = new WindowHeartbeats({
+      owner: () => ({ windowId: 'docker-test-window', pid: process.pid }),
+      connected: () => environment.id,
+      registry: { list: async () => [{ ...environment }] },
+      settings: () => ({ stopOnClose: true, respectShutdownActionNone: false, stopAfterMinutes: 10 }),
+      sourceId: () => windowSource,
+      engineFor: async () => target,
+      send: async (engine, input) => {
+        const result = await runWithDockerTarget(engine, () => windowMonitor.heartbeat(input));
+        return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
+      },
+      repair: async () => {
+        throw new Error('the monitor runs; no repair is expected');
+      },
+      warn: (message) => warnings.push(message),
+      logger: log,
+    });
+    try {
+      await timings.measure('a heartbeat of the window through the worker', () => heartbeats.tick());
+      expect((await monitor.records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: false }]);
+      // Close and Keep Running: one heartbeat with the flag at once.
+      environment.keepRunningOnce = true;
+      expect(await heartbeats.sendFor(environment.id)).toEqual({ ok: true });
+      expect((await monitor.records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: true }]);
+      // Delete: the record of this computer is removed, through the worker too.
+      await runWithDockerTarget(target, () => windowMonitor.forget(windowSource, environment.id));
+      expect((await monitor.records(environment.id))?.records).toEqual([]);
+      expect(warnings).toEqual([]);
+      // All three went through the worker, never directly, and carried no `-i` and no variable.
+      const execs = routed.filter((args) => args[0] === 'exec' && args.includes(containerName));
+      expect(execs.map((args) => args.find((arg) => arg === 'heartbeat' || arg === 'forget'))).toEqual(['heartbeat', 'heartbeat', 'forget']);
+      expect(execs.every((args) => !args.includes('-i') && !args.includes('-e'))).toBe(true);
+      expect(spy.calls.filter((args) => args.includes('exec') && args.includes(containerName))).toEqual([]);
+    } finally {
+      heartbeats.dispose();
+      windowDocker.setRouter(undefined);
+      expect(await locks.dispose()).toEqual([]);
+    }
   });
 });

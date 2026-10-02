@@ -211,7 +211,6 @@ describe('SessionCoordinator', () => {
       stopOnClose: true,
       respectShutdownActionNone: false,
       // Unit 7, PR 2: the time limit of the heartbeats to a remote Session Monitor (the default of 10 minutes).
-      remoteStopAfterSeconds: 600,
       updatedAt: iso(T0),
     });
     expect(h.spawns).toHaveLength(1);
@@ -414,6 +413,35 @@ describe('SessionCoordinator', () => {
     await nextHeartbeat(coordinator);
     expect(readStatus(h)?.updatedAt).toBe(iso(T0 + HEARTBEAT_INTERVAL_MS));
     expect(await h.sessionFiles.readPendings()).toEqual([]);
+  });
+
+  // Plan step 8, PR A: the window's tick drives its heartbeats to the Session Monitor container (not awaited).
+  it('drives the window heartbeats at each periodic update, and not after dispose', async () => {
+    let ticks = 0;
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    const coordinator = h.create({
+      heartbeatMs: 20,
+      windowHeartbeats: {
+        tick: () => {
+          ticks += 1;
+          // A heartbeat that hangs does not hold the status updates back.
+          return blocked;
+        },
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    expect(ticks).toBe(0);
+    await nextHeartbeat(coordinator);
+    await nextHeartbeat(coordinator);
+    expect(ticks).toBeGreaterThanOrEqual(2);
+    coordinator.dispose();
+    const after = ticks;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(ticks).toBe(after);
+    release();
   });
 
   it('checks at each update that a monitor runs', async () => {
