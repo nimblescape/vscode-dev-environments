@@ -1,6 +1,5 @@
 **
 !dist/extension.js
-!dist/sessionMonitor.js
 !dist/groupsPreviewWorker.js
 !dist/configurationAnalysisWorker.js
 !dist/remoteMonitor.js

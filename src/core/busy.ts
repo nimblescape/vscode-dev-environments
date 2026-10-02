@@ -3,27 +3,28 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Liveness of busy marks (concept 7.9 rule 1: "The registry marks the environment as busy"). One rule for the windows
-// (sidebar, environment service) and the Session Monitor, so that they never disagree about a mark.
-import type { BusyMark, MonitorSettings, PendingConnection, WindowStatus } from './types';
+// (sidebar, environment service, their heartbeats), so that they never disagree about a mark. Plan step 8, PR C: the local
+// Session Monitor process that shared these rules (src/monitor) is removed; the rules stay for the windows.
+import type { BusyMark, ExtensionSettings, PendingConnection, WindowStatus } from './types';
 
 /**
  * A window status file whose `updatedAt` is older than this does not make its environment in use (concept 7.9 rule 1).
- * The Session Monitor (src/monitor/rules.ts) and otherWindowUsesEnvironment share it.
+ * otherWindowUsesEnvironment and SessionCoordinator.otherActiveWindows use it.
  */
 export const HEARTBEAT_MAX_AGE_MS = 60_000;
 /** A pending connection file older than this does not make its environment in use (concept 7.9 rule 1). */
 export const PENDING_MAX_AGE_MS = 120_000;
 /**
- * A gap between two ticks of the Session Monitor larger than this means that the computer slept, or that the clock was
- * changed. Review round 5 of PR #68 (risk 2): here since then (src/monitor/rules.ts re-exports it), because the
- * environment service reads the same gap from the status file of its own window (sleepGraceOfWindow).
+ * A gap in the updates of the own status file larger than this means that the computer slept, or that the clock was
+ * changed: the environment service reads it from the status file of its own window (sleepGraceOfWindow; review round 5
+ * of PR #68, risk 2).
  */
 export const SLEEP_GAP_MS = 30_000;
 /** Default of the setting `devEnvLauncher.waitingTimeSeconds` (concept section 8). */
 export const DEFAULT_WAITING_TIME_SECONDS = 30;
 
 /** The waiting time of the settings in milliseconds. A missing, negative, or invalid value gives the default. */
-export function waitingTimeMs(settings: Pick<MonitorSettings, 'waitingTimeSeconds'>): number {
+export function waitingTimeMs(settings: Partial<Pick<ExtensionSettings, 'waitingTimeSeconds'>>): number {
   const seconds: unknown = settings.waitingTimeSeconds;
   // Assumption (V-4): a window reload takes less than the waiting time, so the default of 30 s prevents a stop
   // during a reload.
@@ -59,7 +60,7 @@ export interface BusyMarkLivenessInput {
   windowStatuses?: readonly WindowStatus[];
   /**
    * With `windowStatuses`: the owner window must still have a status file of the process of the mark, but its age does
-   * not matter. For the sleep grace of the Session Monitor (concept 7.9 "Computer sleep"): after a gap, the owner may
+   * not matter. For a sleep grace (concept 7.9 "Computer sleep"): after a gap, the owner may
    * not have written its file since the computer woke up.
    */
   ignoreOwnerStatusAge?: boolean;
@@ -117,7 +118,7 @@ function isFreshTime(time: string, now: number, maxAgeMs: number): boolean {
 
 /**
  * Review round 3 of PR #68 (A-R3-4): what shows that a window other than `ownWindowId` uses the environment
- * `environmentId`, as the Session Monitor's rule 1 counts it (computeInUse, without the sleep grace) and as
+ * `environmentId`, as rule 1 of the former local Session Monitor counted it (without the sleep grace) and as
  * SessionCoordinator.otherActiveWindows filters: a status file of another window that names the environment, in the state
  * `active`, whose process exists, updated at most HEARTBEAT_MAX_AGE_MS ago; or a pending connection file of another window
  * for it, at most PENDING_MAX_AGE_MS old. `undefined`: none (also for files that could not be read).
@@ -143,8 +144,8 @@ export function otherWindowUsesEnvironment(
 }
 
 /**
- * The Session Monitor's rule for the status file of a window whose process exists (src/monitor/rules.ts,
- * isStaleLiveWindow): it is stale (a reused process ID, or a hanging extension host) when it was not updated for
+ * The rule for the status file of a window whose process exists (of the former local Session Monitor; plan step 8,
+ * PR C: the window's cleanup of the status files uses it too): it is stale (a reused process ID, or a hanging extension host) when it was not updated for
  * HEARTBEAT_MAX_AGE_MS plus the waiting time; never during the sleep grace (`grace`). Review round 5 of PR #68 (risk 2):
  * shared with the destructive checks of the environment service (otherWindowMayUseEnvironment).
  */

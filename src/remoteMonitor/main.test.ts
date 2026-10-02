@@ -1714,3 +1714,21 @@ describe('the settings and the schedule of the image maintenance', () => {
     expect(passes).toBe(1);
   });
 });
+
+// Review round 1 of PR #87 (A-R1-2): the record of a release says so; a later plain heartbeat replaces it without the mark.
+describe('monitor.js heartbeat: release records (review round 1 of PR #87, A-R1-2)', () => {
+  it('writes `release: true` into the records of a release, and a plain heartbeat drops it', async () => {
+    const release = { source: SOURCE, limitSeconds: 210, environments: [{ id: A, keepRunning: false, seq: 10 }], release: true };
+    expect(await run(['heartbeat', JSON.stringify(release)])).toEqual({ code: 0, out: '', err: '' });
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0, keepRunning: false, limitSeconds: 210, seq: 10, release: true });
+    expect(await readRecords(heartbeatDir(stateDir))).toEqual([{ source: SOURCE, environmentId: A, at: T0, keepRunning: false, limitSeconds: 210, seq: 10, release: true }]);
+    await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 11 }] })], T0 + 1000);
+    expect(readRecord(SOURCE, A)).toEqual({ at: T0 + 1000, keepRunning: false, limitSeconds: 600, seq: 11 });
+  });
+
+  it('refuses a release with another value than true, and writes nothing', async () => {
+    const heartbeat = { source: SOURCE, limitSeconds: 210, environments: [{ id: A, keepRunning: false, seq: 10 }], release: false };
+    expect((await run(['heartbeat', JSON.stringify(heartbeat)])).code).not.toBe(0);
+    expect(recordFiles()).toEqual([]);
+  });
+});

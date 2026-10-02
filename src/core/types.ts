@@ -89,6 +89,13 @@ export interface Environment {
   containerName: string;
   createdAt: string;
   lastUsedAt: string;
+  /**
+   * Review round 2 of PR #87 (A-R2-2): the last time a window of this computer was seen using the environment, besides
+   * the open pipeline (`lastUsedAt`): a window that starts connected to it (a reload, SessionCoordinator.start) and the
+   * start of each release (before its Git record). Only for the note of Delete's confirmation (recordedStateNote, with
+   * lastSeenInUse). It only moves forward (EnvironmentRegistry.markSeenInUse).
+   */
+  lastSeenInUseAt?: string;
   gitSummary?: GitSummary;
   buildRecord?: BuildRecord;
   busy?: BusyMark;
@@ -323,20 +330,6 @@ export interface PendingOperation {
 export interface ReopenRecord {
   environmentId: string;
   closedAt: string;
-}
-
-/** Content of monitor.json. */
-export interface MonitorSettings {
-  waitingTimeSeconds: number;
-  stopOnClose: boolean;
-  respectShutdownActionNone: boolean;
-  /**
-   * Review round 2 of PR #85, A-R2-3: still written (the setting stopAfterMinutes, in seconds) until plan step 8, PR C,
-   * so a monitor of version 2 reads valid settings while it retires, and when a window that was not reloaded starts one.
-   * Not read by this version.
-   */
-  remoteStopAfterSeconds?: number;
-  updatedAt: string;
 }
 
 /** Settings of concept section 8. */

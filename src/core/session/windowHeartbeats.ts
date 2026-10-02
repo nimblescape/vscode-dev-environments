@@ -42,13 +42,22 @@
 // heartbeat towards the Q4 warning); a lookup that still runs is joined, and once it passed its deadline each tick counts
 // it at once, without a new lookup. The lookups of the environments of a tick run at the same time, so one that hangs
 // never stops the heartbeats of the others.
+//
+// Plan step 8, PR C (user decision Q1 of 2026-10-02): `release` sends the short release of an environment this window
+// leaves (close, switch): one heartbeat with the short limit to the engine the window used it on, within its caller's
+// signal; a lost release leaves the long limit of the last heartbeat (the safe side). Review round 1 of PR #87 (A-R1-2):
+// the release is marked (`release: true`), so the monitor never lets it shorten the live record of another computer.
+// The first heartbeat of a series on an engine, and the first after a change of the settings that decide a keep (stopOnClose, respectShutdownActionNone), also
+// carries `clearOnly` entries for the environments of this computer on that engine that the registry no longer keeps
+// (they replace the full sync of the removed local Session Monitor): the monitor writes such an entry only over a keep of
+// this same computer, so it never overrules another computer or a window that uses the environment.
 // No `vscode`; never throws (except from a `deps` call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { Messages } from '../messages';
 import { systemClock, type Clock, type Logger } from '../ports';
-import { MAX_HEARTBEAT_ENVIRONMENTS, isRemoteEnvironmentId, type HeartbeatInput } from '../remoteMonitor/protocol';
+import { MAX_HEARTBEAT_ENVIRONMENTS, isRemoteEnvironmentId, type HeartbeatEntry, type HeartbeatInput } from '../remoteMonitor/protocol';
 import type { Environment, ExtensionSettings } from '../types';
 import { keepFlagsOf, keptWhenClosed, stopAfterSeconds } from './sessionRules';
 
@@ -136,6 +145,8 @@ interface Series {
   repairFailures: number;
   /** A-R1-4: no repair before this time. */
   repairNotBefore?: number;
+  /** Plan step 8, PR C: the keep settings (keepSettingsKey) of the last heartbeat that carried the clear-only entries. */
+  clearedFor?: string;
 }
 
 /** A-R1-3: the failure streak of a connected environment whose engine cannot be found. */
@@ -157,6 +168,24 @@ interface Group {
   /** A-R2-1: the environments of `entries`. */
   environments: Environment[];
   connected?: Environment;
+  /** Plan step 8, PR C: environments of this computer on the engine that the registry does not keep (clear-only entries). */
+  clears: string[];
+}
+
+/** Plan step 8, PR C: the settings that decide a keep (keptWhenClosed); a change sends the clear-only entries again. */
+function keepSettingsKey(settings: Pick<ExtensionSettings, 'stopOnClose' | 'respectShutdownActionNone'>): string {
+  return JSON.stringify([settings.stopOnClose !== false, settings.respectShutdownActionNone === true]);
+}
+
+/** Plan step 8, PR C: `promise`, or a rejection as soon as `signal` aborts (the work itself is not stopped by this). */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(new Error(HEARTBEAT_NO_ANSWER));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error(HEARTBEAT_NO_ANSWER));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 /** The identity of an engine: its series, its in-flight guard, the wait after failed preparations (A-R3-1). */
@@ -305,6 +334,59 @@ export class WindowHeartbeats {
     }
   }
 
+  /**
+   * Plan step 8, PR C (user decision Q1 of 2026-10-02): the short release of `environmentId`, which this window leaves
+   * (it closes, or switches to another environment): one heartbeat with `limitSeconds` and the keep-running flag of its
+   * entry, to the engine this window used it on as its connected environment (its own Docker context), with the repair
+   * of `send`. Ends when `signal` aborts (then a failure; the long limit of the last heartbeat stays). A later tick that
+   * still uses the environment sends the long limit again at once. Never throws.
+   */
+  async release(environmentId: string, limitSeconds: number, signal: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string }> {
+    try {
+      const seq = this.clock.now();
+      const environment = (await untilAborted(this.deps.registry.list(), signal)).find((candidate) => candidate.id === environmentId);
+      if (environment === undefined) return { ok: false, detail: 'The environment is not in the registry.' };
+      if (!isRemoteEnvironmentId(environment.id)) return { ok: false, detail: 'The environment has an ID that the Session Monitor cannot record.' };
+      const target = await untilAborted(this.engineOf(environment, true), signal);
+      if (target === undefined) return { ok: false, detail: 'The Docker engine of the environment cannot be reached from this window.' };
+      // A-R2-1: only on the engine where the container of the environment is.
+      if (!this.isVerified(environment.id)) {
+        if (!(await untilAborted(this.verify(target, environment), signal))) {
+          return { ok: false, detail: `The container of the environment is not on ${engineName(target)}.` };
+        }
+        this.markVerified(environment.id, target);
+      }
+      const kept = keptWhenClosed(keepFlagsOf(environment), this.deps.settings());
+      // Review round 1 of PR #87 (A-R1-2): marked as a release, so the monitor never lets it shorten the live record of
+      // another computer (rules.ts, decide).
+      const input: HeartbeatInput = { source: this.deps.sourceId(), limitSeconds, environments: [{ id: environment.id, keepRunning: kept, seq }], release: true };
+      const key = engineKey(target);
+      for (let running = this.inFlight.get(key); running !== undefined; running = this.inFlight.get(key)) {
+        if (running.expired) return { ok: false, detail: HEARTBEAT_NO_ANSWER };
+        await untilAborted(running.done.catch(() => undefined), signal);
+      }
+      const series = this.seriesOf(target, seq);
+      const result = await this.attempt(key, series, input, [environment], true, signal);
+      if (!result.ok) return { ok: false, detail: result.detail };
+      series.sent.delete(environment.id);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, detail: errorMessage(error) };
+    }
+  }
+
+  /**
+   * Plan step 8, PR C: the engine this window uses `environment` on as its connected environment (remembered, else looked
+   * up within HEARTBEAT_ATTEMPT_DEADLINE_MS), for the record of its Git state before its release. Never throws.
+   */
+  async connectedEngine(environment: Environment): Promise<DockerTarget | undefined> {
+    try {
+      return await this.engineOf(environment, true);
+    } catch {
+      return undefined;
+    }
+  }
+
   /** No more heartbeats (the window closes). */
   dispose(): void {
     this.disposed = true;
@@ -339,13 +421,25 @@ export class WindowHeartbeats {
       const key = engineKey(target);
       let group = byEngine.get(key);
       if (group === undefined) {
-        group = { target, entries: new Map(), environments: [] };
+        group = { target, entries: new Map(), environments: [], clears: [] };
         byEngine.set(key, group);
       }
       if (group.entries.size >= MAX_HEARTBEAT_ENVIRONMENTS) continue;
       group.entries.set(environment.id, keptWhenClosed(keepFlagsOf(environment), settings));
       group.environments.push(environment);
       if (isConnected) group.connected = environment;
+    }
+    // Plan step 8, PR C: the environments of this computer on each engine that the registry does not keep.
+    for (const group of byEngine.values()) {
+      group.clears = environments
+        .filter(
+          (environment) =>
+            isRemoteEnvironmentId(environment.id) &&
+            !group.entries.has(environment.id) &&
+            isOnDockerHost(environment, group.target.host) &&
+            !keptWhenClosed(keepFlagsOf(environment), settings),
+        )
+        .map((environment) => environment.id);
     }
     return [...byEngine.values()];
   }
@@ -355,7 +449,12 @@ export class WindowHeartbeats {
     if (this.disposed) return;
     const key = engineKey(group.target);
     const series = this.seriesOf(group.target, now);
-    const changed = series.limitSeconds !== limitSeconds || [...group.entries].some(([id, kept]) => series.sent.get(id) !== kept);
+    // Plan step 8, PR C: the clear-only entries go with the first heartbeat of the series, and again after a change of the
+    // keep settings.
+    const clearKey = keepSettingsKey(this.deps.settings());
+    const clearing = series.clearedFor !== clearKey;
+    const changed =
+      clearing || series.limitSeconds !== limitSeconds || [...group.entries].some(([id, kept]) => series.sent.get(id) !== kept);
     const due = series.failures > 0 || series.sentAt === undefined || !(Math.abs(now - series.sentAt) < WINDOW_HEARTBEAT_INTERVAL_MS);
     if (!changed && !due) return;
     // A-R2-1: the connected environment counts on this engine only when its container is there; else the engine of the
@@ -379,11 +478,12 @@ export class WindowHeartbeats {
     const running = this.inFlight.get(key);
     let result: HeartbeatSendResult;
     if (running === undefined) {
-      const input: HeartbeatInput = {
-        source: this.deps.sourceId(),
-        limitSeconds,
-        environments: [...group.entries].map(([id, keepRunning]) => ({ id, keepRunning, seq: now })),
-      };
+      const entries: HeartbeatEntry[] = [...group.entries].map(([id, keepRunning]) => ({ id, keepRunning, seq: now }));
+      if (clearing) {
+        const room = Math.max(0, MAX_HEARTBEAT_ENVIRONMENTS - entries.length);
+        for (const id of group.clears.slice(0, room)) entries.push({ id, keepRunning: false, seq: now, clearOnly: true });
+      }
+      const input: HeartbeatInput = { source: this.deps.sourceId(), limitSeconds, environments: entries };
       result = await this.attempt(key, series, input, group.environments, group.connected !== undefined);
     } else if (running.expired) {
       // A-R1-2: the call of an earlier tick passed its deadline and still hangs: no new call, one more failure.
@@ -399,6 +499,7 @@ export class WindowHeartbeats {
       series.sent = new Map(group.entries);
       series.limitSeconds = limitSeconds;
       series.sentAt = now;
+      if (clearing) series.clearedFor = clearKey;
       for (const id of group.entries.keys()) this.envSentAt.set(id, now);
       return;
     }
@@ -449,30 +550,51 @@ export class WindowHeartbeats {
    * then `signal` aborts and the attempt counts as failed (HEARTBEAT_NO_ANSWER), also when the call does not end. The
    * call stays registered (expired) until it ends, so no second call piles up on that engine.
    */
-  private async attempt(key: string, series: Series, input: HeartbeatInput, environments: Environment[], verified: boolean): Promise<HeartbeatSendResult> {
+  private async attempt(
+    key: string,
+    series: Series,
+    input: HeartbeatInput,
+    environments: Environment[],
+    verified: boolean,
+    outer?: AbortSignal,
+  ): Promise<HeartbeatSendResult> {
     const controller = new AbortController();
+    // Plan step 8, PR C: the signal of a release (its bound) ends the attempt too. Review round 1 of PR #87 (A-R1-3): the
+    // call then counts as expired, like one past its deadline: while it still hangs, each due heartbeat of the engine
+    // counts as a failure (the Q4 warning) and sendFor ends at once, instead of waiting for it without end.
+    let entry: InFlight | undefined;
+    const onOuterAbort = (): void => {
+      if (entry !== undefined) entry.expired = true;
+      controller.abort(new Error(`The heartbeat got ${HEARTBEAT_NO_ANSWER}.`));
+    };
+    if (outer?.aborted) onOuterAbort();
+    else outer?.addEventListener('abort', onOuterAbort, { once: true });
     const call = this.sendWithRepair(series, input, controller.signal, environments, verified);
-    const entry: InFlight = { done: call, expired: false };
-    this.inFlight.set(key, entry);
+    const registered: InFlight = { done: call, expired: outer?.aborted === true };
+    entry = registered;
+    this.inFlight.set(key, registered);
     void call
       .catch(() => undefined)
       .finally(() => {
-        if (this.inFlight.get(key) === entry) this.inFlight.delete(key);
+        if (this.inFlight.get(key) === registered) this.inFlight.delete(key);
       });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<HeartbeatSendResult>((resolve) => {
       timer = setTimeout(() => {
-        entry.expired = true;
+        registered.expired = true;
         controller.abort(new Error(`The heartbeat got ${HEARTBEAT_NO_ANSWER}.`));
         resolve({ ok: false, missing: false, detail: HEARTBEAT_NO_ANSWER });
       }, HEARTBEAT_ATTEMPT_DEADLINE_MS);
     });
     try {
-      return await Promise.race([call, deadline]);
+      const races: Promise<HeartbeatSendResult>[] = [call, deadline];
+      if (outer !== undefined) races.push(untilAborted(new Promise<never>(() => {}), outer));
+      return await Promise.race(races);
     } catch (error) {
       return { ok: false, missing: false, detail: errorMessage(error) };
     } finally {
       clearTimeout(timer);
+      outer?.removeEventListener('abort', onOuterAbort);
     }
   }
 

@@ -14,7 +14,7 @@ import { operationDockerTarget, outsideOperation, type DockerTargets } from '../
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
-import { Actions, Messages, formatChanges, listSome } from '../core/messages';
+import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
 import { removeContainerToken } from '../core/helper/containerToken';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
@@ -780,6 +780,14 @@ export class Controller implements vscode.Disposable {
         // are named with "Delete anyway". Without a summary (nothing recorded, or the volume is missing), the plain
         // confirmation follows at once. Either way the user can delete.
         const changes = summary ? formatChanges(summary) : '';
+        // Review round 1 of PR #87 (A-R1-4): the state is recorded when the dev container runs (here, and when a window
+        // releases the environment), but not when that failed or the Session Monitor stopped it by the long limit. When
+        // the state is older than the last use of the environment (or none was recorded), the dialog says that later
+        // changes are not known. Only a message: Delete runs nothing in the container for it.
+        // Review round 2 of PR #87 (A-R2-2): the last use is the last time a window was seen using it (lastSeenInUse: also
+        // a reload and the start of a release, not only the open pipeline).
+        const used = (await this.deps.registry.get(environment.id).catch(() => undefined)) ?? environment;
+        const stateNote = recordedStateNote(summary ?? used.gitSummary, lastSeenInUse(used));
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.
         // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
@@ -793,7 +801,7 @@ export class Controller implements vscode.Disposable {
         const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
         if (changes !== '') {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteUnsaved(repository, changes)}${repositoryDataText}${otherWindow}`,
+            `${Messages.deleteUnsaved(repository, changes)}${stateNote}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.openEnvironment,
             Actions.deleteAnyway,
@@ -802,7 +810,7 @@ export class Controller implements vscode.Disposable {
           if (choice !== Actions.deleteAnyway) return;
         } else {
           const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteConfirm(repository)}${repositoryDataText}${otherWindow}`,
+            `${Messages.deleteConfirm(repository)}${stateNote}${repositoryDataText}${otherWindow}`,
             { modal: true },
             Actions.delete,
           );
@@ -1233,7 +1241,8 @@ export class Controller implements vscode.Disposable {
    * Last step of the pipeline (concept 7.6): the pending connection file, then the folder URI in this window.
    * A flow does not connect while a newer connecting flow runs in this window, for example the automatic reopen of
    * concept 7.10 after the user selected another environment: the newest request wins, also when the older pipeline
-   * finishes first. The skipped environment's container stops after the waiting time.
+   * finishes first. The skipped environment's container stops after the long limit of the heartbeats of its open
+   * (stopAfterMinutes; review round 1 of PR #87, A-R1-6).
    * Cancel in the progress notification also counts when the pipeline has finished its last step already: the window
    * stays as it is (concept 7.10 #2: "[Cancel] lets the user stay in the empty window").
    *
@@ -1271,7 +1280,8 @@ export class Controller implements vscode.Disposable {
     if (!isAvailableTo(entry, account)) {
       const repository = this.displayName({ repository: result.environment.repository });
       this.logger.info(`${repository} is not connected: the GitHub account changed while it opened.`);
-      // Without the pending connection file, the Session Monitor stops the container after the waiting time.
+      // No window connects: the Session Monitor container stops it when the heartbeats of the open end (their long limit,
+      // plan step 8 PR C).
       await this.deps.sessionFiles
         .removePending(result.environment.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
@@ -1280,7 +1290,8 @@ export class Controller implements vscode.Disposable {
         : new UserFacingError('signInRequired', Messages.signInRequired);
     }
     if (notReady) {
-      // Review round 1 (F2): without the pending connection file, the container stops after the waiting time as usual.
+      // Review round 1 (F2): without the pending connection file, the container stops as usual: after the long limit of the
+      // heartbeats of its open (stopAfterMinutes; review round 1 of PR #87, A-R1-6).
       await this.deps.sessionFiles
         .removePending(result.environment.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
@@ -1752,8 +1763,9 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The window leaves its environment: no environment in its status file (the Session Monitor stops the container after
-   * the waiting time), the status bar, then "Close Remote Connection", with `message` for the user.
+   * The window leaves its environment: no environment in its status file (plan step 8, PR C: the coordinator sends its
+   * short release, and the Session Monitor container stops it after the waiting time unless it is kept), the status bar,
+   * then "Close Remote Connection", with `message` for the user.
    * With `left` (an environment that the window must not use), the window does not rely on the close: VS Code lets the
    * user keep the connection (Cancel in the dialog about unsaved files). The token of the owner account leaves the
    * container at once when the account is the reason, and `checkLeftConnection` closes the connection again.
@@ -1905,7 +1917,8 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Sign-in, sign-out, or account change (concept 7.5): a window connected to an environment that the new account may
-   * not use closes its remote connection at once. The Session Monitor stops the container after the waiting time.
+   * not use closes its remote connection at once. The Session Monitor container stops it after the waiting time (the
+   * release of the window, plan step 8 PR C).
    * A window that has left such an environment but kept its connection reloads when the owner account signs in again.
    */
   async onSessionChanged(): Promise<void> {

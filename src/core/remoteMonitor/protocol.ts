@@ -100,11 +100,17 @@ export interface HeartbeatEntry {
  */
 export const SEQ_ORDER_WINDOW_MS = 60_000;
 
-/** One heartbeat: the computer, its time limit, and the environments it uses or keeps. */
+/**
+ * One heartbeat: the computer, its time limit, and the environments it uses or keeps. `release` (plan step 8, PR C;
+ * review round 1 of PR #87, A-R1-2): the short release of a window that left the environment (windowRelease.ts); its
+ * records carry it, and the monitor lets such a record decide only while no record of another source is still within
+ * its own limit (rules.ts, decide), so a release never shortens the heartbeats of another computer.
+ */
 export interface HeartbeatInput {
   source: string;
   limitSeconds: number;
   environments: HeartbeatEntry[];
+  release?: true;
 }
 
 /**
@@ -116,6 +122,8 @@ export interface HeartbeatRecord {
   keepRunning: boolean;
   limitSeconds: number;
   seq: number;
+  /** Review round 1 of PR #87 (A-R1-2): written by a release (HeartbeatInput.release). */
+  release?: true;
 }
 
 function isSeq(value: unknown): value is number {
@@ -132,8 +140,8 @@ export function clampLimitSeconds(value: number): number {
  * The argument of `monitor.js heartbeat`, checked strictly: a JSON object with exactly `source` (isSourceId),
  * `limitSeconds` (an integer, clamped to MIN_LIMIT_SECONDS..MAX_LIMIT_SECONDS), and `environments` (at most
  * MAX_HEARTBEAT_ENVIRONMENTS objects with exactly `id` (isRemoteEnvironmentId), `keepRunning` (a boolean), and `seq` (a
- * safe non-negative integer), and optionally `clearOnly` (a boolean; true only with keepRunning false)).
- * `undefined` for anything else; then nothing is written.
+ * safe non-negative integer), and optionally `clearOnly` (a boolean; true only with keepRunning false)), and optionally
+ * `release` (only `true`; review round 1 of PR #87, A-R1-2). `undefined` for anything else; then nothing is written.
  */
 export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
   if (text.length > MAX_HEARTBEAT_LENGTH) return undefined;
@@ -143,7 +151,11 @@ export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
   } catch {
     return undefined;
   }
-  if (!isRecord(value) || !hasExactKeys(value, ['source', 'limitSeconds', 'environments'])) return undefined;
+  // Review round 1 of PR #87 (A-R1-2): optionally `release` (true only).
+  if (!isRecord(value)) return undefined;
+  const keys = 'release' in value ? ['source', 'limitSeconds', 'environments', 'release'] : ['source', 'limitSeconds', 'environments'];
+  if (!hasExactKeys(value, keys)) return undefined;
+  if ('release' in value && value.release !== true) return undefined;
   const { source, limitSeconds, environments } = value;
   if (!isSourceId(source) || typeof limitSeconds !== 'number' || !Number.isInteger(limitSeconds)) return undefined;
   if (!Array.isArray(environments) || environments.length > MAX_HEARTBEAT_ENVIRONMENTS) return undefined;
@@ -158,7 +170,9 @@ export function parseHeartbeatInput(text: string): HeartbeatInput | undefined {
     if (entry.clearOnly === true) checkedEntry.clearOnly = true;
     checked.push(checkedEntry);
   }
-  return { source, limitSeconds: clampLimitSeconds(limitSeconds), environments: checked };
+  const input: HeartbeatInput = { source, limitSeconds: clampLimitSeconds(limitSeconds), environments: checked };
+  if (value.release === true) input.release = true;
+  return input;
 }
 
 /** The content of a record file; `undefined` for anything that is not a valid record. */
@@ -170,13 +184,15 @@ export function parseHeartbeatRecord(text: string): HeartbeatRecord | undefined 
     return undefined;
   }
   if (!isRecord(value)) return undefined;
-  const { at, keepRunning, limitSeconds, seq } = value;
+  const { at, keepRunning, limitSeconds, seq, release } = value;
   if (typeof at !== 'number' || !Number.isSafeInteger(at) || at < 0) return undefined;
   if (typeof keepRunning !== 'boolean' || !isSeq(seq)) return undefined;
   if (typeof limitSeconds !== 'number' || !Number.isInteger(limitSeconds) || limitSeconds < MIN_LIMIT_SECONDS || limitSeconds > MAX_LIMIT_SECONDS) {
     return undefined;
   }
-  return { at, keepRunning, limitSeconds, seq };
+  // Review round 1 of PR #87 (A-R1-2): a release record; any other value of `release` is no valid record.
+  if (release !== undefined && release !== true) return undefined;
+  return release === true ? { at, keepRunning, limitSeconds, seq, release: true } : { at, keepRunning, limitSeconds, seq };
 }
 
 /** The file name of the record of `source` for `environmentId`. Throws for an invalid id. */

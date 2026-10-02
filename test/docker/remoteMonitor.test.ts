@@ -17,7 +17,9 @@
 // Keep Running) and Delete's forget through a real worker on the local engine, as extension.ts routes them. Plan step 8,
 // PR B: the restart policy `on-failure` (Q5); an automatic stop waits for the environment lock that a worker holds, and
 // a monitor killed during its stop under the lock leaves no lock held (D2); the monitor exits with 0 when idle and stays
-// exited until ensure starts it (Q5).
+// exited until ensure starts it (Q5). Plan step 8, PR C (Q1, Q2): a window that closes records the Git state and sends
+// its short release through its worker, whose input then ends; the monitor stops the environment after the short limit,
+// and keeps one whose window reloaded within the waiting time.
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as path from 'path';
@@ -39,6 +41,7 @@ import {
 } from '../../src/core/remoteMonitor/protocol';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
 import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
+import { SWITCH_RELEASE_BOUNDS, releaseEnvironment, releaseLimitSeconds } from '../../src/core/session/windowRelease';
 import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
@@ -47,6 +50,15 @@ import { workerLocks } from './workerLocks';
 const SOURCE = crypto.randomBytes(16).toString('hex');
 const OTHER_SOURCE = crypto.randomBytes(16).toString('hex');
 const TICK_MS = 500;
+/**
+ * Plan step 8, PR C: the waiting time of the release test, and the release limit it gives (review round 1 of PR #87,
+ * A-R1-1 (release margin): max(60 s, waiting time) plus RELEASE_MARGIN_SECONDS, computed by releaseLimitSeconds, not
+ * hard-coded).
+ */
+const RELEASE_WAITING_TIME_SECONDS = 30;
+const RELEASE_LIMIT_MS = releaseLimitSeconds(RELEASE_WAITING_TIME_SECONDS) * 1000;
+/** The wait for the stop: the limit, then some ticks of the monitor, the stop itself, and slack for a loaded runner. */
+const RELEASE_STOP_WAIT_MS = RELEASE_LIMIT_MS + 60_000;
 
 /** Bundles the script of the remote monitor as esbuild.mjs does (minified, one file). */
 async function bundleScript(): Promise<string> {
@@ -387,6 +399,124 @@ describe('the Session Monitor container of a remote Docker host', () => {
       heartbeats.dispose();
       windowDocker.setRouter(undefined);
       expect(await locks.dispose()).toEqual([]);
+    }
+  });
+
+  // Plan step 8, PR C (user decisions Q1 and Q2 of 2026-10-02): a window that closes records the Git state, sends its
+  // short release (max(waitingTimeSeconds, 60 s)) through its worker, and its worker's input ends; the monitor stops the
+  // environment after the short limit, not after the long one. A window that reloads within the waiting time sends its
+  // long heartbeats again, so its environment keeps running.
+  it('stops a closed window\'s environment after the short release, and keeps one whose window reloaded in time (plan step 8, PR C)', { timeout: RELEASE_STOP_WAIT_MS + 180_000 }, async () => {
+    // Changed expectations, review round 1 of PR #87, A-R1-1 (release margin): the release limit is
+    // releaseLimitSeconds(waiting time) (210 s by default) instead of 60 s; the test waits for it, and its own timeout
+    // covers the setup, that wait, and the checks after it.
+    expect(['created', 'running', 'started']).toContain(await monitor.ensure(helperTag, socket));
+    await waitUntil(() => running(containerName), 'the monitor');
+    const closedId = crypto.randomUUID();
+    const reloadedId = crypto.randomUUID();
+    const closedName = `devenv-test-monitor-closed-${run.runId}`;
+    const reloadedName = `devenv-test-monitor-reloaded-${run.runId}`;
+    startEnvironmentContainer(closedName, closedId);
+    startEnvironmentContainer(reloadedName, reloadedId);
+    const windowDocker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+    const targets = new DockerTargets(windowDocker, env, log);
+    const locks = workerLocks({ run, cli, log }, windowDocker, targets, 'remoteMonitor-release', async (target) =>
+      helperDockerSocket(env, process.platform, target.endpoint),
+    );
+    windowDocker.setRouter(async (target, args, options) => locks.channels.docker(target, args, options));
+    const windowMonitor = new RemoteSessionMonitor({ docker: windowDocker, logger: log, script: async () => script, containerName, volumeName });
+    const target = await targets.resolve();
+    const windowSource = crypto.randomBytes(16).toString('hex');
+    const environmentOf = (id: string, name: string): Environment =>
+      ({
+        id,
+        repository: `devenv-test/${name}`,
+        configPath: '.devcontainer/devcontainer.json',
+        volumeName: 'unused',
+        containerName: name,
+        owner: { id: '1', login: 'devenv-test' },
+        createdAt: new Date().toISOString(),
+      }) as Environment;
+    const environments = [environmentOf(closedId, closedName), environmentOf(reloadedId, reloadedName)];
+    const settings = { stopOnClose: true, respectShutdownActionNone: false, stopAfterMinutes: 10, waitingTimeSeconds: RELEASE_WAITING_TIME_SECONDS };
+    const windowOf = (connected: string): WindowHeartbeats =>
+      new WindowHeartbeats({
+        owner: () => ({ windowId: `docker-test-${connected}`, pid: process.pid }),
+        connected: () => connected,
+        registry: { list: async () => environments.map((item) => ({ ...item })) },
+        settings: () => settings,
+        sourceId: () => windowSource,
+        engineFor: async () => target,
+        send: async (engine, input, signal) => {
+          const result = await runWithDockerTarget(engine, () => windowMonitor.heartbeat(input, signal));
+          return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
+        },
+        repair: async () => {
+          throw new Error('the monitor runs; no repair is expected');
+        },
+        containerExists: async () => true,
+        warn: (message) => log.warn(message),
+        logger: log,
+      });
+    const events: string[] = [];
+    const release = (heartbeats: WindowHeartbeats, id: string) =>
+      releaseEnvironment(
+        {
+          registry: { list: async () => environments.map((item) => ({ ...item })) },
+          settings: () => settings,
+          otherWindowUses: async () => false,
+          recordGitState: async (environment) => {
+            events.push(`git ${environment.id}`);
+          },
+          send: async (environmentId, limitSeconds, signal) => {
+            events.push(`release ${environmentId}`);
+            return heartbeats.release(environmentId, limitSeconds, signal);
+          },
+          logger: log,
+        },
+        id,
+        SWITCH_RELEASE_BOUNDS,
+      );
+    const closedWindow = windowOf(closedId);
+    const reloadingWindow = windowOf(reloadedId);
+    let workersClosed = false;
+    try {
+      // Both windows use their environments: the long limit.
+      await closedWindow.tick();
+      await reloadingWindow.tick();
+      // Both close: the Git state, then the release, each; their heartbeats end.
+      // Taken before the release is sent: the monitor writes the record (its `at`) after this time.
+      const releaseSentAt = Date.now();
+      expect(await release(closedWindow, closedId)).toBe('released');
+      expect(await release(reloadingWindow, reloadedId)).toBe('released');
+      expect(events).toEqual([`git ${closedId}`, `release ${closedId}`, `git ${reloadedId}`, `release ${reloadedId}`]);
+      closedWindow.dispose();
+      reloadingWindow.dispose();
+      // The reload: a new window of the same computer within the waiting time sends the long limit again.
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      const reloadedWindow = windowOf(reloadedId);
+      await reloadedWindow.tick();
+      reloadedWindow.dispose();
+      // The workers of the closed windows end (their input ends).
+      windowDocker.setRouter(undefined);
+      workersClosed = true;
+      expect(await locks.dispose()).toEqual([]);
+      // Not before the release limit (review round 1 of PR #87, A-R1-1: with the release margin), and long before the long
+      // one (stopAfterMinutes: 10).
+      await timings.measure('stop after the release', () => waitUntil(() => !running(closedName), 'the stop after the release', RELEASE_STOP_WAIT_MS));
+      expect(Date.now() - releaseSentAt).toBeGreaterThanOrEqual(RELEASE_LIMIT_MS - 1_000);
+      expect(RELEASE_LIMIT_MS).toBeLessThan(settings.stopAfterMinutes * 60_000);
+      await new Promise((resolve) => setTimeout(resolve, 20 * TICK_MS));
+      expect(running(reloadedName)).toBe(true);
+      const logs = cli.run(['logs', containerName]).out;
+      expect(logs).toContain(`Stopping the container ${closedName} of ${closedId}`);
+      expect(logs).not.toContain(`Stopping the container ${reloadedName}`);
+    } finally {
+      closedWindow.dispose();
+      reloadingWindow.dispose();
+      windowDocker.setRouter(undefined);
+      if (!workersClosed) await locks.dispose();
+      cli.run(['rm', '-f', closedName, reloadedName]);
     }
   });
 });

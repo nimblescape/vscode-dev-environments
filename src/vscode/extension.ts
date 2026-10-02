@@ -40,9 +40,11 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { ClosingWork } from '../core/session/closingWork';
 import { heartbeatWiring, monitorEnsure } from '../core/session/heartbeatWiring';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
+import { releaseEnvironment } from '../core/session/windowRelease';
 import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
@@ -87,14 +89,22 @@ export const ImageListTexts = {
   signIn: 'Sign in',
 } as const;
 
-/** Kept for deactivate(), which must be synchronous. */
+/** Kept for deactivate(). */
 let coordinator: SessionCoordinator | undefined;
+/**
+ * Plan step 8, PR C: the work of deactivate() (the release of the window's environment, bounded). VS Code disposes the
+ * subscriptions right after it calls deactivate(); review round 1 of PR #87 (B-R1-7 (a)): the worker channels with their
+ * router, the preparation of the heartbeats, and the logger are disposed only after it settled (ClosingWork.deferred),
+ * so the release still has its worker, can open it again, and logs to a live channel.
+ */
+const closingWork = new ClosingWork();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Concept 7.10: the reopen rule measures the age of the reopen record at this time, before any await.
   const activatedAt = systemClock.now();
   const logger = new OutputChannelLogger();
-  context.subscriptions.push(logger);
+  // Review round 1 of PR #87 (B-R1-7 (a)): the release of deactivate() still logs.
+  context.subscriptions.push(closingWork.deferred(logger));
   try {
     await activateExtension(context, logger, activatedAt);
   } catch (error) {
@@ -103,13 +113,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 }
 
-/** Concept 7.9: only the synchronous `closing` write and the reopen record; VS Code gives deactivate() little time. */
-export function deactivate(): void {
-  try {
-    coordinator?.deactivateSync();
-  } catch {
-    // deactivateSync never throws; nothing else may run here.
-  }
+/**
+ * Concept 7.9: the synchronous `closing` write and the reopen record first. Plan step 8, PR C (user decisions Q1 and Q2 of
+ * 2026-10-02): then, best effort and within about 2 seconds (CLOSE_RELEASE_BOUNDS), the recorded state of the repository
+ * and the short release of the window's environment; VS Code gives deactivate() little time, and a lost release leaves
+ * the long limit of the heartbeats.
+ */
+export function deactivate(): Promise<void> | undefined {
+  // Never throws; the disposals of ClosingWork.deferred wait for this promise.
+  return closingWork.begin(() => coordinator?.deactivate());
 }
 
 async function activateExtension(
@@ -218,7 +230,9 @@ async function activateExtension(
     inTarget: runWithDockerTarget,
     onOutput: (text) => logger.output(text),
     operationTarget: operationDockerTarget,
-    subscriptions: context.subscriptions,
+    // Review round 1 of PR #87 (B-R1-7 (a)): the preparation is disposed only after the release of deactivate(), which
+    // may need to open the worker again.
+    subscriptions: closingWork.deferredSubscriptions(context.subscriptions),
   });
   const heartbeatPreparation = heartbeats.preparation;
   // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
@@ -268,12 +282,15 @@ async function activateExtension(
   });
   helperChannels = channels;
   docker.setRouter((target, args, options) => channels.docker(target, args, options));
-  context.subscriptions.push({
-    dispose: () => {
-      docker.setRouter(undefined);
-      channels.dispose();
-    },
-  });
+  // Plan step 8, PR C: after the release of deactivate() (bounded; it never rejects), which needs the worker.
+  context.subscriptions.push(
+    closingWork.deferred({
+      dispose: () => {
+        docker.setRouter(undefined);
+        channels.dispose();
+      },
+    }),
+  );
   // Unit 7, PR 2: the Session Monitor container of a Docker engine (plan step 8, PR A: every engine, local and remote).
   // Its script is dist/remoteMonitor.js, read once.
   const remoteMonitorScript = context.asAbsolutePath(path.join('dist', 'remoteMonitor.js'));
@@ -445,10 +462,33 @@ async function activateExtension(
     paths,
     sessionFiles,
     logger,
-    monitorScript: context.asAbsolutePath(path.join('dist', 'sessionMonitor.js')),
     settings: getSettings,
     windowDockerContext: () => connection.currentDockerContext(),
     windowHeartbeats,
+    // Plan step 8, PR C (user decisions Q1 and Q2 of 2026-10-02): the release of an environment this window leaves.
+    release: (environmentId, bounds) =>
+      releaseEnvironment(
+        {
+          registry,
+          settings: getSettings,
+          // Review round 1 of PR #87 (A-R1-2): status files, pending connection files, and busy marks of other windows.
+          otherWindowUses: (environment) => sessionCoordinator.otherWindowUses(environment),
+          // Q2 (c): in the running dev container as its user, on the engine this window uses it on, through its worker.
+          recordGitState: async (environment, signal) => {
+            const target = await windowHeartbeats.connectedEngine(environment);
+            if (target === undefined) return;
+            await heartbeatPreparation.scope(() => runWithDockerTarget(target, () => service.recordGitState(environment.id, signal)));
+          },
+          send: (id, limitSeconds, signal) => windowHeartbeats.release(id, limitSeconds, signal),
+          // Review round 2 of PR #87 (A-R2-2): the last use, for Delete's note, at the start of every release.
+          markSeenInUse: (environment, at) => registry.markSeenInUse(environment.id, at),
+          logger,
+        },
+        environmentId,
+        bounds,
+      ),
+    // Review round 2 of PR #87 (A-R2-2): a window that starts connected (a reload) was seen using its environment.
+    markSeenInUse: (environmentId, at) => registry.markSeenInUse(environmentId, at),
   });
   windowCoordinator = sessionCoordinator;
   coordinator = sessionCoordinator;
@@ -647,7 +687,7 @@ async function activateExtension(
   const currentEnvironment = containerName
     ? await findWindowEnvironment(containerName, { registry, needsRestore, docker, service, logger })
     : undefined;
-  // Writes the window status file and starts the Session Monitor. Its result is the pending connection file of this
+  // Writes the window status file and cleans up the storage folder (plan step 8, PR C). Its result is the pending connection file of this
   // window's environment, which the first status write removes (role A).
   const started = sessionCoordinator.start(currentEnvironment?.id ?? null);
   controller.setReady(started);
@@ -686,7 +726,6 @@ async function activateExtension(
       if (!sameScope(previous.owners, settings.owners)) {
         background(sidebar.onScopeChanged(), 'load the repository list of the selected organizations');
       }
-      background(sessionCoordinator.writeMonitorSettings(), 'write the settings for the Session Monitor');
       background(sidebar.render(), 'update the sidebar');
       sidebar.restartTimer();
     }),

@@ -244,6 +244,10 @@ export const Messages = {
   opening: (repository: string) => `Opening ${repository}…`,
   deleteConfirm: (repository: string) =>
     `Delete the environment of ${repository}? The container and the files in the environment are removed.`,
+  /** Review round 1 of PR #87 (A-R1-4): the recorded state is older than the last use of the environment. */
+  deleteChangesUnknownSince: (time: string) => `Changes made in the environment after ${time} are not known.`,
+  /** Review round 1 of PR #87 (A-R1-4): no state was recorded since the environment was last used. */
+  deleteChangesNotRecorded: 'Changes made in the environment since it was last opened are not known.',
   deleteUnsaved: (repository: string, changes: string) =>
     `The environment of ${repository} has ${changes}. These changes are lost when you delete the environment.`,
   /**
@@ -467,4 +471,36 @@ export function formatChanges(summary: { uncommittedFiles: number; unpushedCommi
   if (summary.unpushedCommits > 0) parts.push(`${summary.unpushedCommits} unpushed`);
   if (summary.stashes && summary.stashes > 0) parts.push(`${summary.stashes} stashed`);
   return parts.join(' · ');
+}
+
+/**
+ * Review round 2 of PR #87 (A-R2-2): the last time the environment was seen in use, for Delete's note: the later of
+ * `lastSeenInUseAt` (a window that started connected to it, a reload, and the start of each release) and `lastUsedAt`
+ * (the open pipeline), as valid times; the one that is valid when the other is missing or invalid; `undefined` when
+ * neither is.
+ */
+export function lastSeenInUse(environment: { lastUsedAt?: string; lastSeenInUseAt?: string }): string | undefined {
+  const candidates = [environment.lastSeenInUseAt, environment.lastUsedAt].filter(
+    (value): value is string => value !== undefined && Number.isFinite(Date.parse(value)),
+  );
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((best, value) => (Date.parse(value) > Date.parse(best) ? value : best));
+}
+
+/**
+ * Review round 1 of PR #87 (A-R1-4): the note of Delete's confirmation when the recorded state of the repository may be
+ * out of date: it was recorded before the environment was last used (`lastUsedAt`), or never. Empty when it is at least
+ * as new as the last use, or when that time is not known. `format` gives the time for the user (default: the locale of
+ * the process). Starts with a space when not empty.
+ */
+export function recordedStateNote(
+  summary: { recordedAt: string } | undefined,
+  lastUsedAt: string | undefined,
+  format: (isoTime: string) => string = (isoTime) => new Date(isoTime).toLocaleString(),
+): string {
+  const usedAt = lastUsedAt === undefined ? Number.NaN : Date.parse(lastUsedAt);
+  if (!Number.isFinite(usedAt)) return '';
+  const recordedAt = summary === undefined ? Number.NaN : Date.parse(summary.recordedAt);
+  if (summary === undefined || !Number.isFinite(recordedAt)) return ` ${Messages.deleteChangesNotRecorded}`;
+  return recordedAt >= usedAt ? '' : ` ${Messages.deleteChangesUnknownSince(format(summary.recordedAt))}`;
 }

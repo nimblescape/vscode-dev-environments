@@ -168,7 +168,9 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
   it('extension.ts uses the wiring: no preparation, onImageBuilt, prepare or repair of the heartbeats of its own', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', 'vscode', 'extension.ts'), 'utf8');
     expect(source).toContain('heartbeatWiring({');
-    expect(source).toContain('subscriptions: context.subscriptions,');
+    // Changed expectation, review round 1 of PR #87, B-R1-7 (a): the preparation is disposed after the release of
+    // deactivate() (ClosingWork.deferredSubscriptions over context.subscriptions).
+    expect(source).toContain('subscriptions: closingWork.deferredSubscriptions(context.subscriptions),');
     expect(source).toContain('operationTarget: operationDockerTarget,');
     expect(source).toContain('heartbeats.imageBuilt();');
     expect(source).toContain('await heartbeats.prepareWorker(target, signal);');

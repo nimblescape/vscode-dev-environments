@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Environment Registry (concept 7.5): registry.json in the global storage folder.
-// Several VS Code windows and the Session Monitor process change it. Every read-modify-write runs under the lock folder
+// Several VS Code windows change it (plan step 8, PR C: the local Session Monitor process is removed). Every read-modify-write runs under the lock folder
 // registry.lock, and every write is atomic (temporary file, then rename), so a read without the lock sees either the old
 // or the new content (implementation notes 4).
 import * as fs from 'fs';
@@ -77,7 +77,7 @@ export function isEnvironmentOf(
   );
 }
 
-/** The Environment Registry. Used by the windows and by the Session Monitor process. It keeps no cache. */
+/** The Environment Registry. Used by the windows. It keeps no cache. */
 export class EnvironmentRegistry {
   private readonly logger: Logger;
   private readonly lockStaleMs: number;
@@ -150,9 +150,13 @@ export class EnvironmentRegistry {
    * place. The file is written only if the content changed. If the mutator throws, nothing is written.
    * Keep the mutator short: do not call Docker or the network in it, and never call `update` from inside it
    * (the lock is not re-entrant). Throws `RegistryVersionError` for a file of a newer format version.
+   * `onlyIfClean` (review round 3 of PR #87, A-R3-1): when the file is missing, invalid, or has invalid entries or
+   * records (it still needs its restore), neither the mutator runs nor anything is written; resolves with `undefined`.
    */
-  async update<T>(mutator: (file: RegistryFile) => T | Promise<T>): Promise<T> {
-    return withLockFolder(this.paths.registryLock, () => this.updateLocked(mutator), {
+  async update<T>(mutator: (file: RegistryFile) => T | Promise<T>): Promise<T>;
+  async update<T>(mutator: (file: RegistryFile) => T | Promise<T>, options: { onlyIfClean: true }): Promise<T | undefined>;
+  async update<T>(mutator: (file: RegistryFile) => T | Promise<T>, options: { onlyIfClean?: boolean } = {}): Promise<T | undefined> {
+    return withLockFolder(this.paths.registryLock, () => this.updateLocked(mutator, options.onlyIfClean === true), {
       staleMs: this.lockStaleMs,
       timeoutMs: this.lockTimeoutMs,
     });
@@ -190,6 +194,28 @@ export class EnvironmentRegistry {
       await mutator(environment);
       return environment;
     });
+  }
+
+  /**
+   * Review round 2 of PR #87 (A-R2-2): records that a window was seen using the environment `id` at `at` (an ISO time):
+   * sets `lastSeenInUseAt`, but never back to an earlier time. A missing ID is not an error (nothing is written).
+   * Review round 3 of PR #87 (A-R3-1): nothing is written either while the file is not clean (missing, invalid, or with
+   * invalid entries or records): this runs at activation, before the restore check, and a write would drop the lost
+   * entries before they are restored from the volume labels. The mark only serves Delete's note.
+   */
+  async markSeenInUse(id: string, at: string): Promise<void> {
+    const time = Date.parse(at);
+    if (!Number.isFinite(time)) return;
+    await this.update(
+      (file) => {
+        const environment = file.environments.find((candidate) => candidate.id === id);
+        if (!environment) return;
+        const previous = environment.lastSeenInUseAt === undefined ? Number.NaN : Date.parse(environment.lastSeenInUseAt);
+        if (Number.isFinite(previous) && previous >= time) return;
+        environment.lastSeenInUseAt = at;
+      },
+      { onlyIfClean: true },
+    );
   }
 
   /**
@@ -255,9 +281,10 @@ export class EnvironmentRegistry {
     });
   }
 
-  private async updateLocked<T>(mutator: (file: RegistryFile) => T | Promise<T>): Promise<T> {
+  private async updateLocked<T>(mutator: (file: RegistryFile) => T | Promise<T>, onlyIfClean = false): Promise<T | undefined> {
     const parsed = parseRegistry(await readTextFile(this.paths.registry));
     if (parsed.state === 'newer') throw new RegistryVersionError(parsed.version ?? REGISTRY_VERSION);
+    if (onlyIfClean && !isClean(parsed)) return undefined;
     const file = parsed.file;
     const before = JSON.stringify(file);
     const result = await mutator(file);
@@ -398,6 +425,14 @@ interface ParsedRegistry {
   droppedRecords: number;
 }
 
+/**
+ * Review round 3 of PR #87 (A-R3-1): true when a write would lose nothing that a restore needs: the file exists, is
+ * valid, and has no invalid entries nor invalid records of kept volumes.
+ */
+function isClean(parsed: ParsedRegistry): boolean {
+  return parsed.state === 'ok' && parsed.dropped === 0 && parsed.droppedRecords === 0;
+}
+
 function emptyRegistry(): RegistryFile {
   return { version: REGISTRY_VERSION, environments: [] };
 }
@@ -447,6 +482,8 @@ type Check = (value: unknown) => boolean;
 
 const OPTIONAL_FIELDS: ReadonlyArray<readonly [keyof Environment, Check]> = [
   ['gitSummary', isGitSummary],
+  // Review round 2 of PR #87 (A-R2-2).
+  ['lastSeenInUseAt', isString],
   ['buildRecord', isBuildRecord],
   ['busy', isBusyMark],
   ['remoteUser', isString],

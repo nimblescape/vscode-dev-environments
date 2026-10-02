@@ -10,7 +10,7 @@ const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
 
 // Watch mode output for the problem matcher of .vscode/tasks.json: one "[watch] build started" / "[watch] build
-// finished" pair while any of the bundles builds (so the debugger starts only when both are written), and each message
+// finished" pair while any of the bundles builds (so the debugger starts only when all are written), and each message
 // as "✘ [ERROR] <text>" followed by "    <file>:<line>:<column>:" (1-based column).
 let runningBuilds = 0;
 const watchReporter = {
@@ -42,14 +42,13 @@ const shared = {
   // end the problem matcher's build too early.
   logLevel: watch ? 'silent' : 'info',
   plugins: watch ? [watchReporter] : [],
-  // Compile-time constants (src/types/globals.d.ts). Both bundles get them, so that code of src/core that the session
-  // monitor imports later never contains an undefined global.
+  // Compile-time constants (src/types/globals.d.ts). Every bundle gets them, so that code of src/core that a bundle
+  // imports never contains an undefined global.
   define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(devcontainerCliVersion()) },
 };
 
 const outfiles = [
   'dist/extension.js',
-  'dist/sessionMonitor.js',
   'dist/groupsPreviewWorker.js',
   'dist/configurationAnalysisWorker.js',
   'dist/remoteMonitor.js',
@@ -69,23 +68,18 @@ const contexts = await Promise.all([
     outfile: outfiles[0],
     external: ['vscode'],
   }),
-  esbuild.context({
-    ...shared,
-    entryPoints: ['src/monitor/sessionMonitor.ts'],
-    outfile: outfiles[1],
-  }),
   // The worker thread of the repository groups editor: runs the regular expressions of the draft with a time limit.
   esbuild.context({
     ...shared,
     entryPoints: ['src/vscode/groupsPreviewWorker.ts'],
-    outfile: outfiles[2],
+    outfile: outfiles[1],
   }),
   // Review round 8: the worker thread of the host access analysis (configurationAnalysisRunner.ts): analyses the
   // Dockerfiles and the Compose model of a repository with limits of time and memory.
   esbuild.context({
     ...shared,
     entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
-    outfile: outfiles[3],
+    outfile: outfiles[2],
   }),
   // Unit 7, PR 2: the Session Monitor on a remote Docker host. The extension sends it over SSH as the first input line of
   // the pipe loader of its container (plan step 3, src/core/loader/pipeLoader.ts), so it is always minified (less data
@@ -93,7 +87,7 @@ const contexts = await Promise.all([
   esbuild.context({
     ...shared,
     entryPoints: ['src/remoteMonitor/main.ts'],
-    outfile: outfiles[4],
+    outfile: outfiles[3],
     minify: true,
     sourcemap: false,
   }),
@@ -103,7 +97,7 @@ const contexts = await Promise.all([
   esbuild.context({
     ...shared,
     entryPoints: ['src/helperChannel/main.ts'],
-    outfile: outfiles[5],
+    outfile: outfiles[4],
     minify: true,
     sourcemap: false,
   }),

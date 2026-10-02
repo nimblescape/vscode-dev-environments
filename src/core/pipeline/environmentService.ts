@@ -5649,7 +5649,7 @@ export class EnvironmentService {
    * Safety check before Delete (concept 7.14 step 1). User decision 2026-10-02 ("No git needs delete. When we delete the
    * remote, we delete the container with the volumes and everything is gone. we may flag uncommitted changes though, but
    * that does not hinder deletion."): Delete runs no Git in a workspace helper (nor a batch step). The result is the Git
-   * state recorded in the registry (the Session Monitor's polls, and after an open or a stop); when the dev container
+   * state recorded in the registry (after an open or a stop, and by the window before its release: recordGitState); when the dev container
    * runs, it is refreshed first in the container as its user (gitSummaryInContainer, as after a stop) and the new state
    * is recorded. A refresh that fails falls back to the recorded state and never refuses Delete. Starts Docker if needed.
    * `undefined` when the volume is missing (the files of the environment are missing: plain confirmation) or nothing is
@@ -5694,6 +5694,34 @@ export class EnvironmentService {
     }
     if (!container || container.state !== 'running') return undefined;
     return this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
+  }
+
+  /**
+   * Plan step 8, PR C (user decision Q2 (c) of 2026-10-02): the window records the Git state of the environment that it
+   * leaves (it closes, or switches) just before its short release, the way Delete refreshes it: in the running dev
+   * container as its user (gitSummaryInContainer, as `remoteUser`), on the Docker engine of the caller's operation. Nothing
+   * is done when the environment is not in the registry or not on that engine, or its container does not run. Never
+   * starts Docker, takes no lock, and never throws (a failure is logged; the recorded state stays). True when a new state
+   * was recorded.
+   */
+  async recordGitState(environmentId: string, signal?: AbortSignal): Promise<boolean> {
+    try {
+      const env = await this.deps.registry.get(environmentId);
+      if (!env) return false;
+      const target = await this.dockerTarget();
+      if (target.kind === 'unsupported' || !isOnDockerHost(env, target.host)) return false;
+      const container = await this.deps.docker.findContainer(env.id, env.containerName);
+      if (!container || container.state !== 'running' || signal?.aborted) return false;
+      const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
+      if (!summary || signal?.aborted) return false;
+      await this.deps.registry.updateEnvironment(env.id, (entry) => {
+        entry.gitSummary = summary;
+      });
+      return true;
+    } catch (error) {
+      this.logger.info(`The Git state could not be recorded: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   /** Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. */

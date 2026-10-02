@@ -3,13 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Coordination files in the global storage folder (concept 7.9, 7.10, 7.14; implementation notes 4): window status files,
-// pending connection files, pending operations, the reopen record, and the settings for the Session Monitor.
+// pending connection files, pending operations, and the reopen record. Plan step 8, PR C: the settings file of the local
+// Session Monitor (monitor.json) is gone with that monitor; the window reads the settings itself.
 // Every write is atomic. Reads skip files that are missing, unreadable, or invalid.
 import * as fs from 'fs';
 import * as path from 'path';
 import { isoTime, systemClock, type Clock } from '../ports';
 import type {
-  MonitorSettings,
   PendingConnection,
   PendingOperation,
   PendingOperationKind,
@@ -197,22 +197,6 @@ export class SessionFiles {
   async removeReopen(): Promise<void> {
     await retryTransient(() => removeFile(this.paths.reopen));
   }
-
-  // --- Settings for the Session Monitor (monitor.json) -------------------------------------------------------------
-
-  async writeMonitorSettings(settings: MonitorSettings): Promise<void> {
-    await retryTransient(() => writeJsonAtomic(this.paths.monitorSettings, settings));
-  }
-
-  async readMonitorSettings(): Promise<MonitorSettings | undefined> {
-    const value = await readJsonTolerant(this.paths.monitorSettings);
-    return isMonitorSettings(value) ? value : undefined;
-  }
-
-  readMonitorSettingsSync(): MonitorSettings | undefined {
-    const value = readJsonTolerantSync(this.paths.monitorSettings);
-    return isMonitorSettings(value) ? value : undefined;
-  }
 }
 
 /** Reads all `*.json` files of a folder, in name order. Keeps a value only if it is valid and its key matches the file name. */
@@ -323,14 +307,3 @@ export function isReopenRecord(value: unknown): value is ReopenRecord {
   return isRecord(value) && isNonEmptyString(value.environmentId) && isTime(value.closedAt);
 }
 
-export function isMonitorSettings(value: unknown): value is MonitorSettings {
-  return (
-    isRecord(value) &&
-    typeof value.waitingTimeSeconds === 'number' &&
-    Number.isFinite(value.waitingTimeSeconds) &&
-    value.waitingTimeSeconds >= 0 &&
-    typeof value.stopOnClose === 'boolean' &&
-    typeof value.respectShutdownActionNone === 'boolean' &&
-    isTime(value.updatedAt)
-  );
-}

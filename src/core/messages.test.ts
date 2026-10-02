@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { LINUX_ENGINE_START_COMMAND } from './docker/dockerSetup';
-import { Messages, dockerHostReason } from './messages';
+import { Messages, dockerHostReason, lastSeenInUse, recordedStateNote } from './messages';
 
 describe('Messages.localEnvNotPassed', () => {
   // The CLI resolves ${localEnv:NAME} in the workspace helper: HOME is /root there, not empty.
@@ -183,5 +183,38 @@ describe('the question of a switch from Docker Compose to a single container (re
       'Rebuild now switches the environment to a single container: it removes the containers of the other services and the files outside the volumes; named volumes are kept.',
     );
     expect(text).toContain('To use the Docker Compose configuration of the repository, choose Select configuration… in the list of environments.');
+  });
+});
+
+// Review round 1 of PR #87 (A-R1-4).
+describe('recordedStateNote (review round 1 of PR #87, A-R1-4)', () => {
+  const used = '2026-10-02T10:00:00.000Z';
+  const format = (time: string) => `<${time}>`;
+  it('names the time of a state older than the last use; nothing for a newer or equal one, or an unknown last use', () => {
+    expect(recordedStateNote({ recordedAt: '2026-10-02T09:00:00.000Z' }, used, format)).toBe(` ${Messages.deleteChangesUnknownSince('<2026-10-02T09:00:00.000Z>')}`);
+    expect(recordedStateNote({ recordedAt: used }, used, format)).toBe('');
+    expect(recordedStateNote({ recordedAt: '2026-10-02T11:00:00.000Z' }, used, format)).toBe('');
+    expect(recordedStateNote({ recordedAt: '2026-10-02T09:00:00.000Z' }, undefined, format)).toBe('');
+    expect(recordedStateNote({ recordedAt: '2026-10-02T09:00:00.000Z' }, 'not a time', format)).toBe('');
+  });
+  it('says that changes since the last open are not known without a valid recorded state', () => {
+    expect(recordedStateNote(undefined, used, format)).toBe(` ${Messages.deleteChangesNotRecorded}`);
+    expect(recordedStateNote({ recordedAt: 'garbage' }, used, format)).toBe(` ${Messages.deleteChangesNotRecorded}`);
+  });
+});
+
+// Review round 2 of PR #87 (A-R2-2): the last use for Delete's note is the later of the last time a window was seen using
+// the environment and the last open.
+describe('lastSeenInUse (review round 2 of PR #87, A-R2-2)', () => {
+  const early = '2026-10-02T09:00:00.000Z';
+  const late = '2026-10-02T11:00:00.000Z';
+  it('gives the later valid time of lastSeenInUseAt and lastUsedAt, the valid one alone, or nothing', () => {
+    expect(lastSeenInUse({ lastUsedAt: early, lastSeenInUseAt: late })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: late, lastSeenInUseAt: early })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: early })).toBe(early);
+    expect(lastSeenInUse({ lastUsedAt: 'not a time', lastSeenInUseAt: late })).toBe(late);
+    expect(lastSeenInUse({ lastUsedAt: early, lastSeenInUseAt: 'not a time' })).toBe(early);
+    expect(lastSeenInUse({ lastUsedAt: 'not a time' })).toBeUndefined();
+    expect(lastSeenInUse({})).toBeUndefined();
   });
 });

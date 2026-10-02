@@ -4,8 +4,8 @@
 
 // The id of this installation (`computer.id` in the global storage folder; unit 7, PR 2): 128 random bits as 32 hex
 // digits. The heartbeats to the Session Monitor on a remote Docker host name their source with it, so that a shared
-// engine tells the computers apart. It is no secret and not tied to the user. The windows and the local Session Monitor
-// read it; the first reader creates it (`wx`: when two create it at once, both use the file that won).
+// engine tells the computers apart. It is no secret and not tied to the user. The windows read it
+// (before plan step 8, PR C also the local Session Monitor); the first reader creates it (`wx`: when two create it at once, both use the file that won).
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
