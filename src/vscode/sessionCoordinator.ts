@@ -21,7 +21,7 @@ import { retryTransient, retryTransientSync, type StoragePaths } from '../core/s
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings, MonitorSettings, PendingConnection, WindowStatus } from '../core/types';
 import { DEFAULT_WAITING_TIME_SECONDS, HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS } from '../core/busy';
-import { isProcessAlive } from '../core/session/sessionRules';
+import { isProcessAlive, stopAfterSeconds } from '../core/session/sessionRules';
 import {
   isMonitorRunning,
   MONITOR_PROTOCOL_VERSION,
@@ -376,6 +376,10 @@ export class SessionCoordinator implements vscode.Disposable {
         typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_WAITING_TIME_SECONDS,
       stopOnClose: settings.stopOnClose !== false,
       respectShutdownActionNone: settings.respectShutdownActionNone === true,
+      // Review round 2 of PR #85, A-R2-3: kept until plan step 8, PR C. A monitor of version 2 requires it (main's
+      // isMonitorSettings) and else decides with its defaults, stopping kept environments: one whose tick runs while it
+      // retires, or one that a window that was not reloaded starts later. This version does not read it.
+      remoteStopAfterSeconds: stopAfterSeconds(settings.stopAfterMinutes),
       updatedAt: isoTime(this.clock),
     };
   }

@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { ContainerAdapter } from '../core/docker/containerAdapter';
+import { ContainerAdapter, DOCKER_QUERY_TIMEOUT_MS } from '../core/docker/containerAdapter';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
@@ -40,6 +40,7 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { HeartbeatPreparation } from '../core/session/heartbeatPreparation';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { readOrCreateComputerId } from '../core/storage/computerId';
@@ -208,12 +209,20 @@ async function activateExtension(
   const engineSocket = async (target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>): Promise<string> =>
     target.kind === 'remote' ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, platform, target.endpoint);
   let channelScript: Promise<string> | undefined;
+  // Review round 2 of PR #85 (A-R2-2): the preparation that a heartbeat starts (the helper image for the worker, and for
+  // a repair) runs with its own long signal (HELPER_PREBUILD_TIMEOUT_MS, aborted when the window closes); the deadline of
+  // the heartbeat's attempt ends only its wait, so the next attempt joins the build instead of starting it again.
+  const heartbeatPreparation = new HeartbeatPreparation();
+  context.subscriptions.push({ dispose: () => heartbeatPreparation.dispose() });
   const channels = new HelperChannels({
     logger,
     // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image on the engine of the operation, as withEnvironmentLock
-    // ensures it before the lock (only a missing tag is built).
+    // ensures it before the lock (only a missing tag is built). A-R2-2: for a heartbeat, with the long signal.
     prepare: async (target, signal) => {
-      await runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal }));
+      await heartbeatPreparation.prepare(
+        (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
+        signal,
+      );
     },
     // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks that the helper image is present.
     checkPresent: async (target, signal) => {
@@ -351,12 +360,18 @@ async function activateExtension(
   // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
   // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
   // worker is made ready first, D1); a missing monitor is started again as the open starts it.
-  // Review round 1 of PR #85 (A-R1-2): `signal` aborts at the deadline of the heartbeat's attempt.
-  const repairSessionMonitor = async (target: DockerTarget, signal?: AbortSignal): Promise<void> =>
-    runWithDockerTarget(target, async () => {
-      const image = await helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal });
-      await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
-    });
+  // Review round 1 of PR #85 (A-R1-2): `signal` aborts at the deadline of the heartbeat's attempt. Review round 2 of PR
+  // #85 (A-R2-2): it ends only the wait for the helper image, whose build runs with the long signal of the preparation.
+  const repairSessionMonitor = async (target: DockerTarget, signal: AbortSignal): Promise<void> =>
+    heartbeatPreparation.scope(() =>
+      runWithDockerTarget(target, async () => {
+        const image = await heartbeatPreparation.run(
+          (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
+          signal,
+        );
+        await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
+      }),
+    );
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
   const windowHeartbeats = new WindowHeartbeats({
@@ -374,11 +389,27 @@ async function activateExtension(
         current: () => outsideOperation(() => targets.resolve()),
         ofContext: (name) => outsideOperation(() => targets.ofContext(name)),
       }),
+    // A-R2-2: in the scope of a heartbeat, the worker's preparation runs with the long signal (heartbeatPreparation).
     send: async (target, input, signal) => {
-      const result = await runWithDockerTarget(target, () => remoteMonitor.heartbeat(input, signal));
+      const result = await heartbeatPreparation.scope(() => runWithDockerTarget(target, () => remoteMonitor.heartbeat(input, signal)));
       return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
     },
     repair: repairSessionMonitor,
+    // Review round 2 of PR #85 (A-R2-1): the container of the environment (its name in the registry) on that engine, a
+    // routed `docker container inspect`; any failure counts as not there.
+    containerExists: async (target, environment, signal) => {
+      try {
+        const result = await heartbeatPreparation.scope(() =>
+          runWithDockerTarget(target, () =>
+            docker.run(['container', 'inspect', '--format', '{{.Id}}', environment.containerName], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal }),
+          ),
+        );
+        return result.exitCode === 0 && result.stdout.trim() !== '';
+      } catch (error) {
+        logger.info(`The container of ${environment.repository} could not be checked on ${target.kind === 'local' ? 'the local Docker' : target.host}: ${errorMessage(error)}`);
+        return false;
+      }
+    },
     warn: (message) => {
       void vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => logger.error('Could not show the message.', error));
     },

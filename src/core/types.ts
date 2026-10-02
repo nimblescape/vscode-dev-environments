@@ -330,6 +330,12 @@ export interface MonitorSettings {
   waitingTimeSeconds: number;
   stopOnClose: boolean;
   respectShutdownActionNone: boolean;
+  /**
+   * Review round 2 of PR #85, A-R2-3: still written (the setting stopAfterMinutes, in seconds) until plan step 8, PR C,
+   * so a monitor of version 2 reads valid settings while it retires, and when a window that was not reloaded starts one.
+   * Not read by this version.
+   */
+  remoteStopAfterSeconds?: number;
   updatedAt: string;
 }
 

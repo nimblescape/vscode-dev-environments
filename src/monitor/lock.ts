@@ -30,6 +30,8 @@ export const MONITOR_LOCK_STALE_MS = 120_000;
 // Review round 1 of PR #85 (A-R1-1): 3, because monitor.json no longer has remoteStopAfterSeconds and the heartbeats
 // moved to the windows (plan step 8, PR A): a monitor of version 2 would read no settings, decide with its defaults
 // (stop on close after 30 s, also an environment the user keeps), and send heartbeats that compete with the windows'.
+// Review round 2 of PR #85 (A-R2-3): monitor.json keeps remoteStopAfterSeconds until plan step 8, PR C, so a monitor of
+// version 2 still reads valid settings while it retires; the version stays 3 because of its competing heartbeats.
 export const MONITOR_PROTOCOL_VERSION = 3;
 
 /** A lock file without a valid process ID that is younger than this may still be written by its creator. */

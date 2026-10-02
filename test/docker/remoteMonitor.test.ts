@@ -355,6 +355,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
       repair: async () => {
         throw new Error('the monitor runs; no repair is expected');
       },
+      // Review round 2 of PR #85, A-R2-1: the environment of this test has no container; the check of the engine is
+      // covered by the unit tests (windowHeartbeats.test.ts).
+      containerExists: async () => true,
       warn: (message) => warnings.push(message),
       logger: log,
     });

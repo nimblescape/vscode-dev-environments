@@ -29,6 +29,13 @@
 // (`engineFor` with `connected`); when it cannot be found, each tick counts as a failed heartbeat and the Q4 warning
 // fires as for any other failure (A-R1-3). After a failed repair, further repairs of that engine wait REPAIR_BACKOFF_MS
 // (1, 2, then 5 minutes) while the plain heartbeat is still sent; a success resets it (A-R1-4).
+//
+// Review round 2 of PR #85 (A-R2-1): the engine found for the connected environment is trusted only when the
+// environment's container exists on it (`containerExists`, a routed `docker container inspect` of its container name,
+// within HEARTBEAT_ATTEMPT_DEADLINE_MS): else, or when the check fails, the engine counts as not found for that tick (a
+// failed heartbeat towards the Q4 warning) and nothing is sent or repaired for that environment there. A verified engine
+// is kept; after a failed heartbeat it is checked again. A repair (the start of a missing monitor container) happens only
+// on an engine where an environment of the heartbeat has its container (for the busy marks, checked at the repair).
 // No `vscode`; never throws (except from a `deps` call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
@@ -86,6 +93,12 @@ export interface WindowHeartbeatsDeps {
    * `signal` aborts when the attempt passed HEARTBEAT_ATTEMPT_DEADLINE_MS.
    */
   repair: (target: DockerTarget, signal: AbortSignal) => Promise<void>;
+  /**
+   * Review round 2 of PR #85 (A-R2-1): whether the container of `environment` (its containerName in the registry) exists
+   * on the engine `target`; false when it does not or cannot be checked. `signal` aborts at
+   * HEARTBEAT_ATTEMPT_DEADLINE_MS.
+   */
+  containerExists: (target: DockerTarget, environment: Environment, signal: AbortSignal) => Promise<boolean>;
   /** Q4: shows a warning to the user (the vscode layer). */
   warn: (message: string) => void;
   logger: Logger;
@@ -129,6 +142,8 @@ interface InFlight {
 interface Group {
   target: DockerTarget;
   entries: Map<string, boolean>;
+  /** A-R2-1: the environments of `entries`. */
+  environments: Environment[];
   connected?: Environment;
 }
 
@@ -183,7 +198,9 @@ export class WindowHeartbeats {
   private readonly clock: Clock;
   private readonly series = new Map<string, Series>();
   /** Env id → the engine the window uses it on (engineFor), and whether it was asked as the connected environment. */
-  private readonly engines = new Map<string, { target: DockerTarget; connected: boolean }>();
+  private readonly engines = new Map<string, { target: DockerTarget; connected: boolean; verified?: boolean }>();
+  /** A-R2-1: env id and engine key → the check of its container that runs (joined by a later tick). */
+  private readonly verifying = new Map<string, Promise<boolean>>();
   /** Env ids whose engine could not be found (logged once). */
   private readonly unreachable = new Set<string>();
   /** A-R1-3: env id → the failure streak of the connected environment whose engine cannot be found. */
@@ -241,8 +258,17 @@ export class WindowHeartbeats {
       const environment = (await this.deps.registry.list()).find((candidate) => candidate.id === environmentId);
       if (environment === undefined) return { ok: false, detail: 'The environment is not in the registry.' };
       if (!isRemoteEnvironmentId(environment.id)) return { ok: false, detail: 'The environment has an ID that the Session Monitor cannot record.' };
-      const target = await this.engineOf(environment, environment.id === this.deps.connected());
+      const isConnected = environment.id === this.deps.connected();
+      const target = await this.engineOf(environment, isConnected);
       if (target === undefined) return { ok: false, detail: 'The Docker engine of the environment cannot be reached from this window.' };
+      // A-R2-1: the engine of the connected environment is trusted only when its container is there.
+      if (isConnected && !this.isVerified(environment.id)) {
+        if (!(await this.verify(target, environment))) {
+          this.engines.delete(environment.id);
+          return { ok: false, detail: `The container of the environment is not on ${engineName(target)}.` };
+        }
+        this.markVerified(environment.id, target);
+      }
       const settings = this.deps.settings();
       const kept = keptWhenClosed(keepFlagsOf(environment), settings);
       const limitSeconds = stopAfterSeconds(settings.stopAfterMinutes);
@@ -254,7 +280,7 @@ export class WindowHeartbeats {
         await running.done.catch(() => undefined);
       }
       const series = this.seriesOf(target, seq);
-      const result = await this.attempt(key, series, input);
+      const result = await this.attempt(key, series, input, [environment], isConnected && this.isVerified(environment.id));
       if (!result.ok) return { ok: false, detail: result.detail };
       series.sent.set(environment.id, kept);
       this.envSentAt.set(environment.id, seq);
@@ -291,15 +317,17 @@ export class WindowHeartbeats {
         if (isConnected) this.countUnresolved(environment, now, stopAfterSeconds(settings.stopAfterMinutes));
         continue;
       }
-      if (isConnected) this.unresolved.delete(environment.id);
+      // A-R2-1: the streak ends only on an engine where the container of the environment was found.
+      if (isConnected && this.isVerified(environment.id)) this.unresolved.delete(environment.id);
       const key = engineKey(target);
       let group = byEngine.get(key);
       if (group === undefined) {
-        group = { target, entries: new Map() };
+        group = { target, entries: new Map(), environments: [] };
         byEngine.set(key, group);
       }
       if (group.entries.size >= MAX_HEARTBEAT_ENVIRONMENTS) continue;
       group.entries.set(environment.id, keptWhenClosed(keepFlagsOf(environment), settings));
+      group.environments.push(environment);
       if (isConnected) group.connected = environment;
     }
     return [...byEngine.values()];
@@ -313,6 +341,24 @@ export class WindowHeartbeats {
     const changed = series.limitSeconds !== limitSeconds || [...group.entries].some(([id, kept]) => series.sent.get(id) !== kept);
     const due = series.failures > 0 || series.sentAt === undefined || !(Math.abs(now - series.sentAt) < WINDOW_HEARTBEAT_INTERVAL_MS);
     if (!changed && !due) return;
+    // A-R2-1: the connected environment counts on this engine only when its container is there; else the engine of the
+    // environment counts as not found for this tick, and nothing is sent or repaired for it here.
+    const connected = group.connected;
+    if (connected !== undefined && !this.isVerified(connected.id)) {
+      const present = await this.verify(group.target, connected);
+      if (this.disposed) return;
+      if (present) {
+        this.markVerified(connected.id, group.target);
+        this.unresolved.delete(connected.id);
+      } else {
+        this.engines.delete(connected.id);
+        group.entries.delete(connected.id);
+        group.environments = group.environments.filter((environment) => environment.id !== connected.id);
+        group.connected = undefined;
+        this.countUnresolved(connected, now, limitSeconds, `its container ${connected.containerName} is not on ${engineName(group.target)}`);
+        if (group.entries.size === 0) return;
+      }
+    }
     const running = this.inFlight.get(key);
     let result: HeartbeatSendResult;
     if (running === undefined) {
@@ -321,7 +367,7 @@ export class WindowHeartbeats {
         limitSeconds,
         environments: [...group.entries].map(([id, keepRunning]) => ({ id, keepRunning, seq: now })),
       };
-      result = await this.attempt(key, series, input);
+      result = await this.attempt(key, series, input, group.environments, group.connected !== undefined);
     } else if (running.expired) {
       // A-R1-2: the call of an earlier tick passed its deadline and still hangs: no new call, one more failure.
       result = { ok: false, missing: false, detail: HEARTBEAT_NO_ANSWER };
@@ -340,6 +386,11 @@ export class WindowHeartbeats {
       return;
     }
     series.failures += 1;
+    // A-R2-1: after a failed heartbeat, the engine of the connected environment is checked again.
+    if (group.connected !== undefined) {
+      const known = this.engines.get(group.connected.id);
+      if (known !== undefined) known.verified = false;
+    }
     if (series.failures === 1) {
       this.deps.logger.info(`A heartbeat to the Session Monitor on ${engineName(group.target)} failed; it is tried again. ${result.detail}`);
     }
@@ -358,7 +409,7 @@ export class WindowHeartbeats {
    * A-R1-3: the engine of the connected environment cannot be found from this window's Docker context; this counts as a
    * failed heartbeat, and the Q4 warning fires as for any other failure (time left from its last successful heartbeat).
    */
-  private countUnresolved(environment: Environment, now: number, limitSeconds: number): void {
+  private countUnresolved(environment: Environment, now: number, limitSeconds: number, reason?: string): void {
     let streak = this.unresolved.get(environment.id);
     if (streak === undefined) {
       streak = { startedAt: now, failures: 0, warned: false };
@@ -370,7 +421,9 @@ export class WindowHeartbeats {
     const base = this.envSentAt.get(environment.id) ?? streak.startedAt;
     const minutesLeft = Math.max(0, Math.floor((base + limitSeconds * 1000 - now) / 60_000));
     const engine = describeDockerHost(dockerHostOf(environment));
-    this.deps.logger.warn(`${streak.failures} heartbeats in a row for ${environment.repository} failed: the Docker engine of this window (${engine}) cannot be found.`);
+    this.deps.logger.warn(
+      `${streak.failures} heartbeats in a row for ${environment.repository} failed: ${reason ?? `the Docker engine of this window (${engine}) cannot be found`}.`,
+    );
     this.deps.warn(Messages.heartbeatsFailing(environment.repository, engine, minutesLeft));
   }
 
@@ -379,9 +432,9 @@ export class WindowHeartbeats {
    * then `signal` aborts and the attempt counts as failed (HEARTBEAT_NO_ANSWER), also when the call does not end. The
    * call stays registered (expired) until it ends, so no second call piles up on that engine.
    */
-  private async attempt(key: string, series: Series, input: HeartbeatInput): Promise<HeartbeatSendResult> {
+  private async attempt(key: string, series: Series, input: HeartbeatInput, environments: Environment[], verified: boolean): Promise<HeartbeatSendResult> {
     const controller = new AbortController();
-    const call = this.sendWithRepair(series, input, controller.signal);
+    const call = this.sendWithRepair(series, input, controller.signal, environments, verified);
     const entry: InFlight = { done: call, expired: false };
     this.inFlight.set(key, entry);
     void call
@@ -410,7 +463,13 @@ export class WindowHeartbeats {
    * One heartbeat; when the monitor container is missing, it is started again (repair) and the heartbeat is sent once
    * more (user decision Q4 of 2026-10-02, D1). A-R1-4: after a failed repair, the next one waits (REPAIR_BACKOFF_MS).
    */
-  private async sendWithRepair(series: Series, input: HeartbeatInput, signal: AbortSignal): Promise<HeartbeatSendResult> {
+  private async sendWithRepair(
+    series: Series,
+    input: HeartbeatInput,
+    signal: AbortSignal,
+    environments: Environment[],
+    verified: boolean,
+  ): Promise<HeartbeatSendResult> {
     const { target } = series;
     const first = await this.deps.send(target, input, signal);
     if (first.ok) this.resetRepair(series);
@@ -419,6 +478,15 @@ export class WindowHeartbeats {
     if (series.repairNotBefore !== undefined && now < series.repairNotBefore) {
       const seconds = Math.ceil((series.repairNotBefore - now) / 1000);
       return { ok: false, missing: true, detail: `${first.detail} The Session Monitor is started again in ${seconds} seconds at the earliest (its last start failed).` };
+    }
+    // A-R2-1: never a monitor on an engine where no environment of the heartbeat has its container (the connected one was
+    // checked this tick; the busy ones are checked now).
+    if (!verified && !(await this.anyContainerOn(target, environments, signal))) {
+      return {
+        ok: false,
+        missing: true,
+        detail: `${first.detail} The Session Monitor is not started there: no environment of this window has its container on ${engineName(target)}.`,
+      };
     }
     this.deps.logger.info(`The Session Monitor on ${engineName(target)} is missing; it is started again.`);
     try {
@@ -432,6 +500,49 @@ export class WindowHeartbeats {
     }
     this.resetRepair(series);
     return this.deps.send(target, input, signal);
+  }
+
+  /** A-R2-1: whether one of `environments` has its container on `target` (false when that cannot be checked). */
+  private async anyContainerOn(target: DockerTarget, environments: Environment[], signal: AbortSignal): Promise<boolean> {
+    for (const environment of environments) {
+      if (signal.aborted) return false;
+      if (await this.deps.containerExists(target, environment, signal).catch(() => false)) return true;
+    }
+    return false;
+  }
+
+  private isVerified(environmentId: string): boolean {
+    return this.engines.get(environmentId)?.verified === true;
+  }
+
+  /** A-R2-1: the remembered engine of the environment is `target`, and its container is there. */
+  private markVerified(environmentId: string, target: DockerTarget): void {
+    const known = this.engines.get(environmentId);
+    if (known !== undefined && engineKey(known.target) === engineKey(target)) known.verified = true;
+  }
+
+  /**
+   * A-R2-1: whether the container of `environment` is on `target`, within HEARTBEAT_ATTEMPT_DEADLINE_MS (then false, and
+   * its signal aborts). A check that runs is joined.
+   */
+  private verify(target: DockerTarget, environment: Environment): Promise<boolean> {
+    const id = `${environment.id} ${engineKey(target)}`;
+    const running = this.verifying.get(id);
+    if (running !== undefined) return running;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort(new Error(`The check of the container got ${HEARTBEAT_NO_ANSWER}.`));
+        resolve(false);
+      }, HEARTBEAT_ATTEMPT_DEADLINE_MS);
+    });
+    const check: Promise<boolean> = Promise.race([this.deps.containerExists(target, environment, controller.signal).catch(() => false), deadline]).finally(() => {
+      clearTimeout(timer);
+      if (this.verifying.get(id) === check) this.verifying.delete(id);
+    });
+    this.verifying.set(id, check);
+    return check;
   }
 
   private resetRepair(series: Series): void {

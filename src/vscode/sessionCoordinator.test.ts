@@ -212,6 +212,9 @@ describe('SessionCoordinator', () => {
       stopOnClose: true,
       respectShutdownActionNone: false,
       // Unit 7, PR 2: the time limit of the heartbeats to a remote Session Monitor (the default of 10 minutes).
+      // Changed expectation, review round 2 of PR #85, A-R2-3: written again until plan step 8, PR C, for a monitor of
+      // version 2 (the setting stopAfterMinutes, default 10 minutes).
+      remoteStopAfterSeconds: 600,
       updatedAt: iso(T0),
     });
     expect(h.spawns).toHaveLength(1);
@@ -418,6 +421,35 @@ describe('SessionCoordinator', () => {
       stopOnClose: false,
       respectShutdownActionNone: true,
     });
+  });
+
+  // Review round 2 of PR #85, A-R2-3: a monitor of version 2 (main before plan step 8, PR A) requires
+  // remoteStopAfterSeconds in monitor.json; without it, it decides with its defaults and stops kept environments.
+  it('writes remoteStopAfterSeconds from stopAfterMinutes, so a monitor of version 2 reads valid settings', async () => {
+    /** isMonitorSettings of main (the format that a monitor of version 2 reads), copied as it is there. */
+    const isMainMonitorSettings = (value: unknown): boolean => {
+      if (typeof value !== 'object' || value === null) return false;
+      const v = value as Record<string, unknown>;
+      return (
+        typeof v.waitingTimeSeconds === 'number' &&
+        Number.isFinite(v.waitingTimeSeconds) &&
+        v.waitingTimeSeconds >= 0 &&
+        typeof v.stopOnClose === 'boolean' &&
+        typeof v.respectShutdownActionNone === 'boolean' &&
+        typeof v.remoteStopAfterSeconds === 'number' &&
+        Number.isFinite(v.remoteStopAfterSeconds) &&
+        v.remoteStopAfterSeconds > 0 &&
+        typeof v.updatedAt === 'string' &&
+        Number.isFinite(Date.parse(v.updatedAt))
+      );
+    };
+    h.settings = { ...SETTINGS, stopOnClose: false, stopAfterMinutes: 7 };
+    await h.coordinator.writeMonitorSettings();
+    const written: unknown = JSON.parse(fs.readFileSync(h.paths.monitorSettings, 'utf8'));
+    expect(written).toMatchObject({ stopOnClose: false, remoteStopAfterSeconds: 420 });
+    expect(isMainMonitorSettings(written)).toBe(true);
+    // This version reads it too (the field is ignored).
+    expect(await h.sessionFiles.readMonitorSettings()).toMatchObject({ remoteStopAfterSeconds: 420 });
   });
 
   it('updates the status file periodically, removes the pending file each time, and fires onDidHeartbeat', async () => {

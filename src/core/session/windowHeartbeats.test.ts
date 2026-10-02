@@ -5,7 +5,9 @@
 // Plan step 8, PR A: the heartbeats of a window to the Session Monitor container of the engine of each environment that
 // it uses, on every engine (user decisions Q1 and Q4 of 2026-10-02).
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { remoteContextName, type DockerTarget } from '../docker/dockerHost';
+import { describeDockerHost, remoteContextName, type DockerTarget } from '../docker/dockerHost';
+import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
+import { abortError } from '../ports';
 import { Messages } from '../messages';
 import type { HeartbeatInput } from '../remoteMonitor/protocol';
 import type { Environment, ExtensionSettings } from '../types';
@@ -22,6 +24,7 @@ import {
   type HeartbeatSendResult,
   type WindowHeartbeatsDeps,
 } from './windowHeartbeats';
+import { HeartbeatPreparation } from './heartbeatPreparation';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -69,9 +72,12 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
   };
   const state = {
     connected: null as string | null,
-    answer: (_target: DockerTarget): HeartbeatSendResult | Promise<HeartbeatSendResult> => ({ ok: true }),
+    answer: (_target: DockerTarget, _signal?: AbortSignal): HeartbeatSendResult | Promise<HeartbeatSendResult> => ({ ok: true }),
     repair: async (_target: DockerTarget): Promise<void> => {},
+    /** Review round 2 of PR #85, A-R2-1: whether the container of an environment is on an engine (default: yes). */
+    containerExists: (_target: DockerTarget, _environment: Environment): boolean | Promise<boolean> => true,
   };
+  const containerChecks: Array<{ target: DockerTarget; id: string }> = [];
   const deps: WindowHeartbeatsDeps = {
     owner: () => ({ windowId: WINDOW, pid: PID }),
     connected: () => state.connected,
@@ -87,12 +93,16 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
     send: async (target, input, signal) => {
       sent.push({ target, input: structuredClone(input) });
       signals.push(signal);
-      return state.answer(target);
+      return state.answer(target, signal);
     },
     repair: async (target, signal) => {
       repairs.push(target);
       signals.push(signal);
       return state.repair(target);
+    },
+    containerExists: async (target, env) => {
+      containerChecks.push({ target, id: env.id });
+      return state.containerExists(target, env);
     },
     warn: (message) => warnings.push(message),
     logger: {
@@ -104,7 +114,7 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
     clock: { now: () => now.value },
   };
   const heartbeats = new WindowHeartbeats(deps);
-  return { heartbeats, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state };
+  return { heartbeats, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks };
 }
 
 const entriesOf = (item: Sent) => item.input.environments.map(({ id, keepRunning }) => ({ id, keepRunning }));
@@ -198,9 +208,11 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
     h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'build-box', busy: { operation: 'rebuild', since, pid: PID, windowId: WINDOW } }));
     h.state.connected = ID_A;
     await h.heartbeats.tick();
+    // Changed expectation, review round 2 of PR #85, A-R2-1: the engine of the connected environment is first checked for
+    // its container, so its heartbeat now comes after the one of the other engine (the engines run at the same time).
     expect(h.sent.map((item) => [item.target.kind, entriesOf(item)])).toEqual([
-      ['local', [{ id: ID_A, keepRunning: false }]],
       ['remote', [{ id: ID_B, keepRunning: false }]],
+      ['local', [{ id: ID_A, keepRunning: false }]],
     ]);
   });
 
@@ -435,7 +447,9 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
       h.state.answer = (target) => (target.kind === 'remote' ? new Promise<HeartbeatSendResult>(() => {}) : { ok: true });
       void h.heartbeats.tick();
       await vi.advanceTimersByTimeAsync(0);
-      expect(h.sent.map((item) => item.target.kind)).toEqual(['local', 'remote']);
+      // Changed expectation, review round 2 of PR #85, A-R2-1: the connected environment's engine is checked for its
+      // container first, so its heartbeat comes after the one of the other engine.
+      expect(h.sent.map((item) => item.target.kind)).toEqual(['remote', 'local']);
       // Later ticks reach the local engine at its interval while the remote call still runs within its deadline.
       h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
       void h.heartbeats.tick();
@@ -443,7 +457,8 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
       h.now.value = T0 + 2 * WINDOW_HEARTBEAT_INTERVAL_MS;
       void h.heartbeats.tick();
       await vi.advanceTimersByTimeAsync(0);
-      expect(h.sent.map((item) => item.target.kind)).toEqual(['local', 'remote', 'local', 'local']);
+      // Changed expectation, review round 2 of PR #85, A-R2-1 (the order of the first tick, see above).
+      expect(h.sent.map((item) => item.target.kind)).toEqual(['remote', 'local', 'local', 'local']);
       expect(h.warnings).toEqual([]);
       await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
     });
@@ -657,6 +672,219 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
       await h.heartbeats.tick();
       expect(h.repairs).toHaveLength(3);
       expect(h.warnings).toHaveLength(1);
+    });
+  });
+
+  // Review round 2 of PR #85, A-R2-1: the engine found for the connected environment is trusted only when its container
+  // is there; never a repair on an engine where the environments of the heartbeat have no container.
+  describe("the engine has the environment's container (review round 2 of PR #85, A-R2-1)", () => {
+    it('a connected local environment whose container is not on the resolved engine: no heartbeat, no repair, a warning after 2', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      // The resolved engine has no monitor either: a repair there would start one for nothing.
+      h.state.answer = () => ({ ok: false, missing: true, detail: 'No such container' });
+      h.state.containerExists = () => false;
+      await h.heartbeats.tick();
+      expect(h.sent).toEqual([]);
+      expect(h.repairs).toEqual([]);
+      expect(h.warnings).toEqual([]);
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toEqual([]);
+      expect(h.repairs).toEqual([]);
+      // 10 minutes from the start of the streak, 15 seconds passed.
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', describeDockerHost(''), 9)]);
+      expect(h.logs.some((line) => line.includes(`its container devenv-${ID_A} is not on the local Docker`))).toBe(true);
+      // Each tick checks again (the engine is resolved again too); one warning per streak.
+      expect(h.containerChecks).toHaveLength(2);
+      expect(h.engineCalls).toEqual([ID_A, ID_A]);
+      h.now.value = T0 + 30_000;
+      await h.heartbeats.tick();
+      expect(h.warnings).toHaveLength(1);
+    });
+
+    it('a connected environment whose container is there: the heartbeat is sent, and the engine is checked again only after a failure', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(1);
+      expect(h.containerChecks).toEqual([{ target: LOCAL, id: ID_A }]);
+      h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(2);
+      expect(h.containerChecks).toHaveLength(1);
+      // A failed heartbeat: the next tick checks the engine again before it sends.
+      h.state.answer = () => ({ ok: false, missing: false, detail: 'timed out' });
+      h.now.value = T0 + 2 * WINDOW_HEARTBEAT_INTERVAL_MS;
+      await h.heartbeats.tick();
+      expect(h.containerChecks).toHaveLength(1);
+      h.state.answer = () => ({ ok: true });
+      h.now.value = T0 + 2 * WINDOW_HEARTBEAT_INTERVAL_MS + 15_000;
+      await h.heartbeats.tick();
+      expect(h.containerChecks).toHaveLength(2);
+      expect(h.sent).toHaveLength(4);
+      expect(h.warnings).toEqual([]);
+    });
+
+    it('a failed check counts as an absent container', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.containerExists = () => Promise.reject(new Error('Cannot connect to the Docker daemon'));
+      await h.heartbeats.tick();
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toEqual([]);
+      expect(h.warnings).toHaveLength(1);
+    });
+
+    it('still sends for a busy environment on that engine without the connected one', async () => {
+      const h = harness();
+      const since = new Date(T0).toISOString();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', { busy: { operation: 'rebuild', since, pid: PID, windowId: WINDOW } }));
+      h.state.connected = ID_A;
+      h.state.containerExists = (_target, env) => env.id === ID_B;
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_B, keepRunning: false }]]);
+    });
+
+    it('never repairs for a busy environment whose container is not on the engine; repairs when it is', async () => {
+      const h = harness();
+      const since = new Date(T0).toISOString();
+      h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'build-box', busy: { operation: 'rebuild', since, pid: PID, windowId: WINDOW } }));
+      h.state.answer = () => ({ ok: false, missing: true, detail: 'No such container' });
+      h.state.containerExists = () => false;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(1);
+      expect(h.repairs).toEqual([]);
+      expect(h.containerChecks).toEqual([{ target: REMOTE, id: ID_B }]);
+      h.state.containerExists = () => true;
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      expect(h.repairs).toEqual([REMOTE]);
+    });
+
+    it('sendFor of the connected environment sends nothing to an engine without its container', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.containerExists = () => false;
+      expect(await h.heartbeats.sendFor(ID_A)).toEqual({ ok: false, detail: 'The container of the environment is not on the local Docker.' });
+      expect(h.sent).toEqual([]);
+    });
+  });
+
+  // Review round 2 of PR #85, A-R2-2: the deadline of an attempt ends only the heartbeat's wait, not the build of the
+  // helper image that the heartbeat started (HeartbeatPreparation, as extension.ts wires it into the worker's prepare).
+  describe('the preparation outlives the deadline (review round 2 of PR #85, A-R2-2)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** A shared build like WorkspaceHelper's: started once, cancelled only by the signal of the caller that started it. */
+    function sharedBuild() {
+      const build = { count: 0, signal: undefined as AbortSignal | undefined, finish: () => {}, pending: undefined as Promise<void> | undefined };
+      const ensure = (signal: AbortSignal | undefined): Promise<void> => {
+        if (build.pending === undefined) {
+          build.count += 1;
+          build.signal = signal;
+          build.pending = new Promise<void>((resolve, reject) => {
+            build.finish = () => {
+              build.pending = undefined;
+              resolve();
+            };
+            signal?.addEventListener('abort', () => {
+              build.pending = undefined;
+              reject(abortError());
+            });
+          });
+        }
+        return build.pending;
+      };
+      return { build, ensure };
+    }
+
+    it('a build that a heartbeat started survives the deadline, and the next attempt joins it (one build)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      const preparation = new HeartbeatPreparation();
+      const { build, ensure } = sharedBuild();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      // The send makes the worker ready first: its prepare runs in the scope of the heartbeat.
+      h.state.answer = (_target, signal) =>
+        preparation.scope(() => preparation.prepare(ensure, signal)).then((): HeartbeatSendResult => ({ ok: true }));
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await first;
+      expect(h.signals[0].aborted).toBe(true);
+      expect(build.count).toBe(1);
+      expect(build.signal?.aborted).toBe(false);
+      expect(h.logs.some((line) => line.includes(HEARTBEAT_NO_ANSWER))).toBe(true);
+      // The next attempt joins the build that runs.
+      h.now.value = T0 + HEARTBEAT_ATTEMPT_DEADLINE_MS + 15_000;
+      const second = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.sent).toHaveLength(2);
+      expect(build.count).toBe(1);
+      build.finish();
+      await second;
+      expect(build.count).toBe(1);
+      expect(h.logs.some((line) => line.includes('answers again'))).toBe(true);
+      expect(h.warnings).toEqual([]);
+      preparation.dispose();
+    });
+
+    it('the long signal ends after HELPER_PREBUILD_TIMEOUT_MS, and dispose aborts it', async () => {
+      vi.useFakeTimers();
+      const preparation = new HeartbeatPreparation();
+      const signals: AbortSignal[] = [];
+      const work = (signal: AbortSignal): Promise<void> => {
+        signals.push(signal);
+        return new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(abortError())));
+      };
+      const timedOut = preparation.run(work, undefined);
+      timedOut.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(HELPER_PREBUILD_TIMEOUT_MS - 1);
+      expect(signals[0].aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signals[0].aborted).toBe(true);
+      await expect(timedOut).rejects.toThrow('cancelled');
+      // Dispose (the window closes): a preparation that runs is aborted, also when nobody waits for it anymore.
+      const wait = new AbortController();
+      const running = preparation.run(work, wait.signal);
+      running.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      wait.abort();
+      await expect(running).rejects.toThrow('cancelled');
+      expect(signals[1].aborted).toBe(false);
+      preparation.dispose();
+      expect(signals[1].aborted).toBe(true);
+      // After dispose, a new preparation starts aborted.
+      const late = preparation.run(work, undefined);
+      late.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(signals[2].aborted).toBe(true);
+    });
+
+    it('outside the scope of a heartbeat, the preparation gets the signal of its caller', async () => {
+      const preparation = new HeartbeatPreparation();
+      const caller = new AbortController();
+      let given: AbortSignal | undefined;
+      await preparation.prepare(async (signal) => {
+        given = signal;
+      }, caller.signal);
+      expect(given).toBe(caller.signal);
+      await preparation.scope(() =>
+        preparation.prepare(async (signal) => {
+          given = signal;
+        }, caller.signal),
+      );
+      expect(given).not.toBe(caller.signal);
+      preparation.dispose();
     });
   });
 
