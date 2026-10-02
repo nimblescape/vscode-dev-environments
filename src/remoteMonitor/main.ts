@@ -10,7 +10,8 @@
 // run the other subcommands with `docker exec node /opt/devenv/monitor.js …`:
 //   run                          the loop: a tick every 15 s (rules.ts); each automatic stop under the environment lock
 //                                (plan step 8, PR B, D2); exits with 0 after REMOTE_IDLE_EXIT_MS without a running
-//                                environment container while it maintains no images (Q5)
+//                                or created environment container and without a fresh record while it maintains no
+//                                images (Q5; review round 1 of PR #86, A-R1-1)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
@@ -305,7 +306,9 @@ export class RemoteMonitorLoop {
   private lockFailedLogged = new Set<string>();
   /**
    * Plan step 8, PR B (Q5): the monotonic time at which a container with the label nimblescape.devenv.environment-id was
-   * last seen running (or Docker did not answer, which is not known to be idle); the start of the loop at first.
+   * last seen running (or Docker did not answer, which is not known to be idle); the start of the loop at first. Review
+   * round 1 of PR #86, A-R1-1: also when the decision of a tick was `active` (a fresh record, a `created` labelled
+   * container, a keep of an environment whose container has not ended).
    */
   private activeAt: number;
   /**
@@ -324,7 +327,8 @@ export class RemoteMonitorLoop {
 
   /**
    * Plan step 8, PR B (Q5): how long (ms) no container with the label nimblescape.devenv.environment-id ran, as the
-   * finished ticks saw it. A kept environment that runs counts as running.
+   * finished ticks saw it. A kept environment that runs counts as running. Review round 1 of PR #86, A-R1-1: nor was a
+   * tick `active` (decide).
    */
   idleMs(): number {
     return this.monotonic() - this.activeAt;
@@ -371,6 +375,10 @@ export class RemoteMonitorLoop {
       timing: this.deps.timing ?? DEFAULT_REMOTE_TIMING,
     });
     this.state = decision.state;
+    // Review round 1 of PR #86, A-R1-1: a fresh record (a window still sends heartbeats, for example while an open clones
+    // and builds before its container exists), a `created` labelled container, or a keep of an environment whose container
+    // has not ended counts as activity too (decide: `active`).
+    if (decision.active) this.activeAt = this.monotonic();
     if (decision.grace && !this.graceLogged) log('A pause or a start: nothing is stopped until the computers have sent heartbeats again.');
     this.graceLogged = decision.grace;
 
@@ -517,8 +525,11 @@ export function timingFromEnv(env: NodeJS.ProcessEnv): { tickMs: number; timing:
 /**
  * Plan step 8, PR B (user decision Q5 of 2026-10-02): the monitor exits (code 0, so the restart policy `on-failure`
  * leaves it exited) after this time without a running container with the label nimblescape.devenv.environment-id, when
- * it maintains no images. The next open ensures it again (`docker start`), and the heartbeats of a window start it again
- * when it is missing (their repair, Q4).
+ * it maintains no images. Review round 1 of PR #86, A-R1-1: nor a `created` one, a fresh record, or a keep of an
+ * environment whose container has not ended (RemoteDecision.active), so an open whose clone and build take longer than
+ * this keeps it (its window sends heartbeats for its busy mark). The next open ensures it again (`docker start`), and
+ * again right after its container started; the heartbeats of a window start it again when it is missing (their repair,
+ * Q4).
  */
 export const REMOTE_IDLE_EXIT_MS = 5 * 60_000;
 
@@ -905,7 +916,8 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         // removals of the records (each under the lock of the records) end first. The records stay in the volume.
         if (!maintainsImages && loop.idleMs() >= idleExitMs) {
           await loop.removals;
-          log(`No environment container ran for ${Math.round(idleExitMs / 1000)} s and image updates are off; the Session Monitor exits. The next open starts it again.`);
+          // Review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats too.
+          log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and image updates are off; the Session Monitor exits. The next open starts it again.`);
           return 0;
         }
         await sleep(tickMs);

@@ -20,6 +20,8 @@ let h: Harness | undefined;
 let seqs: number[] = [];
 /** The signal of each ensure (review round 1 of PR #85, E10). */
 let ensureSignals: Array<AbortSignal | undefined> = [];
+/** Review round 1 of PR #86, A-R1-1: for each ensure, the number of `up` and run-user-commands before it. */
+let ensureAt: Array<{ ups: number; userCommands: number }> = [];
 
 afterEach(() => {
   h?.cleanup();
@@ -34,7 +36,7 @@ interface Setup {
 function setup(
   target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>,
   behavior: {
-    ensure?: () => Promise<unknown>;
+    ensure?: (index: number) => Promise<unknown>;
     forget?: () => Promise<void>;
     heartbeat?: () => Promise<{ ok: true } | { ok: false; detail: string }>;
   } = {},
@@ -42,15 +44,17 @@ function setup(
   const calls: string[] = [];
   seqs = [];
   ensureSignals = [];
+  ensureAt = [];
   const sessionMonitor: EnvironmentSessionMonitor = {
     ensure: async (target, helperTag, signal, helperImage) => {
       ensureSignals.push(signal);
+      ensureAt.push({ ups: created.helper.ups.length, userCommands: created.helper.userCommandRuns.length });
       const host = engineOf(target);
       // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): the image ID of the helper image of the open.
       calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
       // In the order of the helper calls.
       created.helper.calls.push('remote monitor');
-      return behavior.ensure?.();
+      return behavior.ensure?.(ensureSignals.length - 1);
     },
     heartbeat: async (target, environmentId, keepRunning, seq) => {
       const host = engineOf(target);
@@ -84,12 +88,16 @@ describe('the Session Monitor in the open pipeline', () => {
     const result = await h.service.open(TARGET, { progress: h.progress });
     // Then the first heartbeat of this computer for the new environment, not kept. Changed expectation (review round 3 of
     // PR #64, P2): the monitor runs the image ID that the open pinned for the current tag too; the label keeps the tag.
-    expect(calls).toEqual([`ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat build-box ${result.environment.id} false`]);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container (was:
+    // the ensure and the first heartbeat only).
+    const ensure = `ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    expect(calls).toEqual([ensure, `heartbeat build-box ${result.environment.id} false`, ensure]);
     const order = h.helper.calls;
     expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
     expect(order.indexOf('remote monitor')).toBeLessThan(order.indexOf('first heartbeat'));
     const up = order.findIndex((call) => call.startsWith('up '));
     expect(up).toBeGreaterThan(order.indexOf('first heartbeat'));
+    expect(order.lastIndexOf('remote monitor')).toBeGreaterThan(up);
   });
 
   it('an open of a stopped environment on a remote host ensures it before the container starts', async () => {
@@ -97,7 +105,9 @@ describe('the Session Monitor in the open pipeline', () => {
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
     // Changed expectation (review round 3 of PR #64, P2): the monitor runs the image ID that the open pinned.
-    expect(calls).toEqual([`ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat build-box ${ENV_ID} false`]);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container.
+    const ensure = `ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    expect(calls).toEqual([ensure, `heartbeat build-box ${ENV_ID} false`, ensure]);
     // The stopped container is started with `up` of the Dev Container CLI.
     const up = h.helper.calls.findIndex((call) => call.startsWith('up '));
     expect(up).toBeGreaterThan(h.helper.calls.indexOf('first heartbeat'));
@@ -153,7 +163,9 @@ describe('the Session Monitor in the open pipeline', () => {
   it('a first open on the local Docker ensures it once, then sends the first heartbeat, before up', async () => {
     const { h, calls } = setup(LOCAL);
     const result = await h.service.open(TARGET, { progress: h.progress });
-    expect(calls).toEqual([`ensure local devenv-helper:test image ${h.helper.currentHelperImageId}`, `heartbeat local ${result.environment.id} false`]);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container.
+    const ensure = `ensure local devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    expect(calls).toEqual([ensure, `heartbeat local ${result.environment.id} false`, ensure]);
     const order = h.helper.calls;
     expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
     expect(order.findIndex((call) => call.startsWith('up '))).toBeGreaterThan(order.indexOf('first heartbeat'));
@@ -234,6 +246,92 @@ describe('the Session Monitor in the open pipeline', () => {
   });
 });
 
+// Review round 1 of PR #86, A-R1-1: the monitor may have exited when idle (Q5) during the clone and the build; the open
+// ensures it again right after `up` created or started the container, before the lifecycle commands, once per run. A
+// failure there does not refuse the open (the container runs already): it is logged, and the user is warned.
+describe('the Session Monitor again after the container started (review round 1 of PR #86, A-R1-1)', () => {
+  it('ensures it again after `up` and before the lifecycle commands, with the same image and the signal of the open', async () => {
+    const { h, calls } = setup(REMOTE);
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    const controller = new AbortController();
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal });
+    expect(calls.filter((call) => call.startsWith('ensure'))).toHaveLength(2);
+    expect(ensureAt).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(ensureSignals[1]).toBe(ensureSignals[0]);
+    expect(ensureSignals[1]).toBeDefined();
+  });
+
+  it('a first open (clone, build, create) ensures it again after the container was created', async () => {
+    const { h } = setup(LOCAL);
+    await h.service.open(TARGET, { progress: h.progress });
+    expect(ensureAt).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+  });
+
+  it('a running container that opens as it is: the first ensure only (it ran all along)', async () => {
+    const { h } = setup(LOCAL);
+    await seedEnvironment(h, { container: 'running' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(ensureAt).toEqual([{ ups: 0, userCommands: 0 }]);
+  });
+
+  it('a failure after the start is logged and shown as a warning, and the open goes on', async () => {
+    const { h } = setup(REMOTE, { ensure: async (index) => (index === 1 ? Promise.reject(new Error('ssh: connect to host build-box: timed out')) : undefined) });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(result.environment.id).toBe(ENV_ID);
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(h.logger.warnings.some((line) => line.includes(`The Session Monitor on build-box could not be started again after the container of ${REPO} started`))).toBe(true);
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining('The Session Monitor on the Docker host build-box could not be started after the container of'));
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining('(ssh: connect to host build-box: timed out)'));
+  });
+
+  it('a cancellation in it cancels the open, and is not reported as a failure', async () => {
+    const controller = new AbortController();
+    const { h } = setup(REMOTE, {
+      ensure: async (index) => {
+        if (index !== 1) return;
+        controller.abort();
+        throw abortError();
+      },
+    });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal })).rejects.toMatchObject({ code: 'cancelled' });
+    expect(h.ui.warnings.some((line) => line.includes('could not be started after the container'))).toBe(false);
+  });
+
+  it('a failed `up` that may have left a container running ensures it too, and keeps the error of `up`', async () => {
+    const { h } = setup(REMOTE);
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    h.helper.upError = () => new Error('devcontainer up failed: port is already allocated');
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'startFailed' });
+    expect(ensureAt).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+  });
+
+  // Third verifier: lifecycle commands that fail leave the container running ("It is left running"); the monitor was
+  // ensured before them, so it exists to stop the container after the limit of its record.
+  it('lifecycle commands that cannot run come after it, and a failed second ensure keeps the error of the open', async () => {
+    const { h } = setup(REMOTE, { ensure: async (index) => (index === 1 ? Promise.reject(new Error('unreachable')) : undefined) });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    h.helper.userCommandsError = new Error('devcontainer run-user-commands failed');
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress })).rejects.toMatchObject({ code: 'startFailed' });
+    expect(ensureAt).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining('could not be started after the container of'));
+  });
+});
+
 describe('Close and Keep Running in the registry', () => {
   it('an open clears keepRunningOnce (a window connects again) and keeps keepRunning', async () => {
     const { h } = setup(LOCAL);
@@ -307,12 +405,14 @@ describe('the image list for the Session Monitor in the open pipeline', () => {
     const remote = withImages(REMOTE, async () => {});
     await seedEnvironment(remote.h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
     await remote.h.service.openEnvironment(ENV_ID, { progress: remote.h.progress });
-    expect(remote.calls).toEqual(['ensure build-box', 'images build-box', 'heartbeat build-box']);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: the monitor is ensured again after `up` (no image list then).
+    expect(remote.calls).toEqual(['ensure build-box', 'images build-box', 'heartbeat build-box', 'ensure build-box']);
     const local = withImages(LOCAL, async () => {});
     await seedEnvironment(local.h, { container: 'stopped' });
     await local.h.service.openEnvironment(ENV_ID, { progress: local.h.progress });
     // Changed expectation, plan step 8 PR A: on the local Docker too (before: nothing there).
-    expect(local.calls).toEqual(['ensure local', 'images local', 'heartbeat local']);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: and ensured again after `up`.
+    expect(local.calls).toEqual(['ensure local', 'images local', 'heartbeat local', 'ensure local']);
   });
 
   it('a failure is a warning, and the open goes on', async () => {

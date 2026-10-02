@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -32,7 +33,8 @@ import {
   timingFromEnv,
   type DockerResult,
 } from './main';
-import { REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
+import { lockFilePath, lockFolder } from '../core/helperChannel/protocol';
+import { REMOTE_GAP_MS, REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
 import type { StopLockAttempt } from './stopLock';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -882,6 +884,100 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
       `The lock of ${A} could not be taken; it is not stopped. the lock file could not be opened: ELOOP`,
     ]);
   });
+
+  // Review round 1 of PR #86, B-R1-3 (mutant A20c): an environment that is no longer to be stopped under its lock ends
+  // only its own stop; the next environment of the tick is still stopped, and the removal pass of the tick starts.
+  it('an environment decided again to "no stop" does not end the tick: the next one is stopped, the removals start (review round 1 of PR #86, B-R1-3)', async () => {
+    const OTHER_DEV = 'c'.repeat(64);
+    ps = { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n${OTHER_DEV}\trunning\tdevenv-web\t${B}\t\n`, stderr: '' };
+    writeRecord(SOURCE, B, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    // An old record of an environment without any container: `forget` of the tick.
+    const C = '00000000-0000-4000-8000-00000000000c';
+    writeRecord(SOURCE, C, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    await pastGrace();
+    let first = true;
+    onLocked = () => {
+      if (first) writeRecord(OTHER, A, { at: T0 + REMOTE_GRACE_MS, keepRunning: false, limitSeconds: 600 });
+      first = false;
+    };
+    now = T0 + REMOTE_GRACE_MS;
+    expect(await loop.tick()).toEqual([B]);
+    expect(loop.removals).toBeDefined();
+    await loop.removals;
+    expect(events).toEqual([
+      'ps',
+      `lock ${A}`,
+      `ps label=nimblescape.devenv.environment-id=${A}`,
+      'release',
+      `lock ${B}`,
+      `ps label=nimblescape.devenv.environment-id=${B}`,
+      `stop ${OTHER_DEV}`,
+      'release',
+    ]);
+  });
+
+  // Review round 1 of PR #86, B-R1-5 (mutant A11): the decision under the lock takes the time since the start of the tick
+  // as no pause, so a clock that moved past the gap meanwhile (a long lock, a slow list) does not hold the stop.
+  it('a clock that moved past the gap between the list of the tick and the lock still stops (review round 1 of PR #86, B-R1-5)', async () => {
+    await pastGrace();
+    onLocked = () => (now += 2 * REMOTE_GAP_MS);
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, `stop ${DEV_ID}`, `stop ${DB_ID}`, 'release']);
+  });
+});
+
+// Review round 1 of PR #86, B-R1-1 (mutant A41): `run` without an injected lock takes the lock files of the volume
+// (deps.stateDir, as the workers open them), not a folder of the records; a lock that a worker holds keeps the stop.
+describe('monitor.js run: the lock files of the volume (review round 1 of PR #86, B-R1-1)', () => {
+  const holders: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const holder of holders) {
+      if (holder.exitCode === null && holder.signalCode === null) {
+        try {
+          process.kill(-(holder.pid as number), 'SIGKILL');
+        } catch {
+          // Gone already.
+        }
+      }
+    }
+    holders.length = 0;
+  });
+
+  it('does not stop an environment whose lock file in stateDir another process holds', { timeout: 30_000 }, async () => {
+    fs.mkdirSync(lockFolder(stateDir), { recursive: true, mode: 0o700 });
+    const marker = path.join(stateDir, 'held');
+    const holder = spawn('flock', [lockFilePath(A, stateDir), 'sh', '-c', `touch '${marker}'; exec sleep 60`], { detached: true, stdio: 'ignore' });
+    holders.push(holder);
+    while (!fs.existsSync(marker)) await new Promise((resolve) => setTimeout(resolve, 10));
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    let mono = 0;
+    let ticks = 0;
+    let out = '';
+    const dockerCalls: string[] = [];
+    void main(['run'], {
+      env: {},
+      stateDir,
+      docker: async (args) => {
+        if (args[0] === 'ps') return { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+        dockerCalls.push(`${args[0]} ${args[1]}`);
+        return { code: 0, stdout: '', stderr: '' };
+      },
+      exec: (_file, _args, _options, callback) => callback(null, 'removed\n', ''),
+      monotonic: () => mono,
+      now: () => T0 + mono,
+      sleep: async (ms) => {
+        ticks += 1;
+        mono += ms;
+        // Past the grace of the start (8 ticks), a few ticks that want to stop it; then it waits for ever.
+        if (ticks >= 12) await new Promise(() => {});
+      },
+      out: (text) => (out += text),
+    });
+    await vi.waitFor(() => expect(ticks).toBe(12), { timeout: 20_000 });
+    expect(out).toContain(`${A} is busy with an operation; it is not stopped now and is checked again at the next tick.`);
+    expect(dockerCalls).toEqual([]);
+  });
 });
 
 // Plan step 8, PR B (user decision Q5 of 2026-10-02): `run` ends with 0 after REMOTE_IDLE_EXIT_MS without a running
@@ -956,10 +1052,91 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     const monitor = startRun({ ps: () => listed('') });
     expect(await monitor.result).toBe(0);
-    expect(monitor.mono()).toBeGreaterThanOrEqual(REMOTE_IDLE_EXIT_MS);
-    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
-    expect(monitor.out()).toContain('No environment container ran for 300 s and image updates are off; the Session Monitor exits.');
+    // Changed expectation, review round 1 of PR #86, A-R1-1: the fresh record (10 minutes) counts as activity, so the
+    // idle time starts when it aged past its limit (was: the idle time from the start of the loop).
+    expect(monitor.mono()).toBeGreaterThanOrEqual(10 * MINUTE + REMOTE_IDLE_EXIT_MS);
+    expect(monitor.mono()).toBeLessThan(10 * MINUTE + REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+    // Changed expectation, review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats (was "No environment
+    // container ran for 300 s and image updates are off; …").
+    expect(monitor.out()).toContain('No environment container ran and no heartbeat was fresh for 300 s, and image updates are off; the Session Monitor exits.');
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
+  });
+
+  // Review round 1 of PR #86, A-R1-1: an open writes its first heartbeat, then clones and builds for longer than the idle
+  // time before its container exists; the heartbeats of its window (its busy mark) keep the monitor.
+  it('does not exit without a running container while a record is fresh (review round 1 of PR #86, A-R1-1)', async () => {
+    writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
+    let monitor: Monitor | undefined = undefined;
+    // The window refreshes the record every 30 s (as WindowHeartbeats), here every tick.
+    monitor = startRun({
+      ps: () => {
+        if (monitor !== undefined) writeRecord(SOURCE, A, { at: T0 + monitor.mono(), keepRunning: false, limitSeconds: 600 });
+        return listed('');
+      },
+      maxTicks: 200,
+    });
+    await vi.waitFor(() => expect(monitor!.ticks()).toBe(200));
+    // 200 ticks of 15 s: 50 minutes, ten times the idle time.
+    expect(monitor.mono()).toBeGreaterThanOrEqual(10 * REMOTE_IDLE_EXIT_MS);
+    expect(await pending(monitor.result)).toBe('pending');
+    expect(monitor.out()).not.toContain('exits');
+  });
+
+  it('exits once the record aged past its limit (review round 1 of PR #86, A-R1-1)', async () => {
+    // Aged past its limit (1 minute) at the start: only the idle time counts.
+    writeRecord(SOURCE, A, { at: T0 - 2 * MINUTE, keepRunning: false, limitSeconds: 60 });
+    const monitor = startRun({ ps: () => listed('') });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+    // A record that is fresh at the start keeps it until its limit has passed, then the idle time.
+    writeRecord(SOURCE, B, { at: T0, keepRunning: false, limitSeconds: 120 });
+    const later = startRun({ ps: () => listed('') });
+    expect(await later.result).toBe(0);
+    expect(later.mono()).toBeGreaterThanOrEqual(2 * MINUTE + REMOTE_IDLE_EXIT_MS);
+    expect(later.mono()).toBeLessThan(2 * MINUTE + REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+  });
+
+  it('does not exit while a labelled container is created, not yet running (review round 1 of PR #86, A-R1-1)', async () => {
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+    expect(monitor.mono()).toBeGreaterThan(REMOTE_IDLE_EXIT_MS);
+    expect(await pending(monitor.result)).toBe('pending');
+    expect(monitor.out()).not.toContain('exits');
+  });
+
+  it('does not exit for an old keep while its environment has a container that has not ended (review round 1 of PR #86, A-R1-1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 60 * MINUTE, keepRunning: true, limitSeconds: 60 });
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+    expect(await pending(monitor.result)).toBe('pending');
+    // A running one, too (running counts on its own).
+    const running = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    await vi.waitFor(() => expect(running.ticks()).toBe(100));
+    expect(await pending(running.result)).toBe('pending');
+  });
+
+  it('exits for an old keep whose environment has only ended containers (review round 1 of PR #86, A-R1-1)', async () => {
+    // Keep Running When Closed stays in the records after a Stop: it must not keep the monitor for ever.
+    writeRecord(SOURCE, A, { at: T0 - 60 * MINUTE, keepRunning: true, limitSeconds: 60 });
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\texited\tdevenv-api\t${A}\t\n`) });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+  });
+
+  // Review round 1 of PR #86, A-R1-1 (third verifier): an open that failed after its container started leaves it running
+  // and no window sends heartbeats; the monitor must stop it after the limit of its record, not exit before.
+  it('stops a running container whose record aged past its limit, and exits only after that (review round 1 of PR #86, A-R1-1)', async () => {
+    writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
+    let running = true;
+    const monitor = startRun({
+      ps: () => listed(running ? `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n` : ''),
+      onStop: () => (running = false),
+    });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.events).toEqual([`lock ${A}`, `stop ${DEV_ID}`, 'release', 'exit']);
+    expect(monitor.out()).toContain(`Stopping the container devenv-api of ${A}: no computer sent a heartbeat`);
+    // The stop came after the limit of the record (10 minutes), the exit the idle time after the stop.
+    expect(monitor.mono()).toBeGreaterThanOrEqual(10 * MINUTE + REMOTE_IDLE_EXIT_MS);
   });
 
   it('exits with 0 also when only stopped labelled containers exist', async () => {
@@ -981,6 +1158,29 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
     expect(await pending(monitor.result)).toBe('pending');
     expect(monitor.out()).toContain('The heartbeat records could not be read');
+  });
+
+  // Review round 1 of PR #86, B-R1-2 (mutant A25b): paused and restarting containers count as running.
+  it('does not exit while a labelled container is paused or restarting (review round 1 of PR #86, B-R1-2)', async () => {
+    for (const state of ['paused', 'restarting']) {
+      const monitor = startRun({ ps: () => listed(`${DEV_ID}\t${state}\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+      await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
+      expect(monitor.mono()).toBeGreaterThan(REMOTE_IDLE_EXIT_MS);
+      expect(await pending(monitor.result)).toBe('pending');
+      expect(monitor.out()).not.toContain('exits');
+    }
+  });
+
+  // Review round 1 of PR #86, B-R1-6 (mutants A37, A40): the bounds of DEVENV_MONITOR_IDLE_MS, and `run` uses it.
+  it('takes DEVENV_MONITOR_IDLE_MS from 100 ms on, and `run` exits after it (review round 1 of PR #86, B-R1-6)', async () => {
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '000' })).toBe(REMOTE_IDLE_EXIT_MS);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '099' })).toBe(REMOTE_IDLE_EXIT_MS);
+    expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '100' })).toBe(100);
+    const monitor = startRun({ env: { DEVENV_MONITOR_IDLE_MS: '1000' }, ps: () => listed('') });
+    expect(await monitor.result).toBe(0);
+    // The first tick at 0 ms is not idle long enough; the one after the wait of one tick is.
+    expect(monitor.mono()).toBe(REMOTE_TICK_MS);
+    expect(monitor.out()).toContain('no heartbeat was fresh for 1 s');
   });
 
   it('does not exit while Docker does not answer', async () => {

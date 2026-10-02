@@ -165,4 +165,32 @@ describe.skipIf(process.platform !== 'linux')('stopLocker with real processes (p
     }
     expect(fs.readdirSync(stateDir).sort()).toEqual(['elsewhere', 'locks']);
   });
+
+  // Review round 1 of PR #86, B-R1-4 (mutants L05, L10): a lock path that is no plain file (a FIFO, a folder) fails before
+  // any flock, and the file it opened is closed again.
+  it('a FIFO or a folder at the lock path fails, starts no flock, and leaves no file open (review round 1 of PR #86, B-R1-4)', { timeout: 20_000 }, async () => {
+    fs.mkdirSync(lockFolder(stateDir), { recursive: true, mode: 0o700 });
+    const flocks: number[] = [];
+    const deps: StopLockDeps = {
+      ...stopLockDeps(stateDir),
+      startFlock: (_args, fd) => {
+        flocks.push(fd);
+        return { exited: Promise.resolve({ exitCode: 0 }), kill: () => {} };
+      },
+    };
+    const openFiles = () => fs.readdirSync('/proc/self/fd').length;
+    execFileSync('mkfifo', ['-m', '600', lockFilePath(ID, stateDir)]);
+    const before = openFiles();
+    const fifo = await stopLocker(deps)(ID);
+    expect(fifo).toEqual({ kind: 'failed', detail: `the lock file could not be opened: The lock file of ${ID} is not a plain file.` });
+    expect(openFiles()).toBe(before);
+    expect(flocks).toEqual([]);
+
+    fs.rmSync(lockFilePath(ID, stateDir));
+    fs.mkdirSync(lockFilePath(ID, stateDir), { mode: 0o700 });
+    const folder = await stopLocker(deps)(ID);
+    expect(folder.kind).toBe('failed');
+    expect(openFiles()).toBe(before);
+    expect(flocks).toEqual([]);
+  });
 });
