@@ -1096,20 +1096,29 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     expect(later.mono()).toBeLessThan(2 * MINUTE + REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
   });
 
-  it('does not exit while a labelled container is created, not yet running (review round 1 of PR #86, A-R1-1)', async () => {
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
-    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
-    expect(monitor.mono()).toBeGreaterThan(REMOTE_IDLE_EXIT_MS);
-    expect(await pending(monitor.result)).toBe('pending');
-    expect(monitor.out()).not.toContain('exits');
+  // Changed expectation, review round 2 of PR #86, A-R2-1 (was: it did not exit while a labelled container was created):
+  // a failed start after `up` (or a Compose service whose dependency never becomes healthy) leaves a container `created`
+  // for ever; with only stale records the monitor exits after the idle time.
+  it('exits for a lone created container with only stale records (review round 2 of PR #86, A-R2-1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 2 * MINUTE, keepRunning: false, limitSeconds: 60 });
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`) });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.mono()).toBeGreaterThanOrEqual(REMOTE_IDLE_EXIT_MS);
+    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+    // Without any record too.
+    const bare = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${B}\t\n`) });
+    expect(await bare.result).toBe(0);
+    expect(bare.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
   });
 
-  it('does not exit for an old keep while its environment has a container that has not ended (review round 1 of PR #86, A-R1-1)', async () => {
+  // Changed expectation, review round 2 of PR #86, A-R2-1 (was: an old keep with a created container kept the monitor):
+  // an old keep counts only through a container of it that runs.
+  it('exits for an old keep whose environment has only a created container; a running one keeps it (review round 2 of PR #86, A-R2-1)', async () => {
     writeRecord(SOURCE, A, { at: T0 - 60 * MINUTE, keepRunning: true, limitSeconds: 60 });
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
-    await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
-    expect(await pending(monitor.result)).toBe('pending');
-    // A running one, too (running counts on its own).
+    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`) });
+    expect(await monitor.result).toBe(0);
+    expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
+    // A running one keeps it (running counts on its own).
     const running = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
     await vi.waitFor(() => expect(running.ticks()).toBe(100));
     expect(await pending(running.result)).toBe('pending');
