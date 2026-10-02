@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
 import { CommandError, UserFacingError } from '../errors';
-import { OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { OWNERSHIP_FIX_SCRIPT, gitSummaryCommand } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
@@ -3970,11 +3970,143 @@ describe('delete', () => {
 });
 
 describe('safetyCheck', () => {
-  it('reads the Git state through the helper and records it', async () => {
-    await seedEnvironment(h);
+  // user decision 2026-10-02: Delete runs no Git ("No git needs delete. ... we may flag uncommitted changes though, but
+  // that does not hinder deletion."): the check names the recorded Git state, refreshed in a running dev container.
+  // Changed expectation (was: 'reads the Git state through the helper and records it'): no helper step runs.
+  it('user decision 2026-10-02: returns the recorded Git state without any Git or helper step when the container does not run', async () => {
+    const env = await seedEnvironment(h, { container: 'stopped' });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('user decision 2026-10-02: returns undefined (the plain confirmation) when nothing is recorded and the container does not run', async () => {
+    await seedEnvironment(h, { container: 'stopped', extra: { gitSummary: undefined } });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: returns the recorded Git state when there is no container at all', async () => {
+    const env = await seedEnvironment(h, { container: null });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect(h.helper.calls).toEqual([]);
+    expect(h.docker.execs).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: refreshes the Git state in a running dev container as its user (as after a stop), records and returns it', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
     const summary = await h.service.safetyCheck(ENV_ID, options());
-    expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1 });
-    expect((await entry())?.gitSummary).toMatchObject({ uncommittedFiles: 2, unpushedCommits: 1 });
+    expect(summary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    const container = h.docker.containersOf(ENV_ID)[0];
+    expect(h.docker.execs).toHaveLength(1);
+    expect(h.docker.execs[0]).toMatchObject({ container: container.id, user: 'vscode' });
+    expect(h.docker.execs[0].command).toEqual(gitSummaryCommand('/workspaces/api'));
+    expect((await entry())?.gitSummary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    // No helper step, and the container keeps running.
+    expect(h.helper.calls).toEqual([]);
+    expect(container.state).toBe('running');
+  });
+
+  // Review round 6 of PR #84 (B-R6-2): the refresh's exec gets the operation's signal and the time limit of the Git
+  // execs (GIT_EXEC_TIMEOUT_MS, 30 s), so a hanging Git in the container never holds Delete up.
+  it('review round 6 of PR #84 (B-R6-2): the refresh runs with the signal of the Delete and a time limit of 30 s', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    const exec = vi.spyOn(h.docker, 'exec');
+    const controller = new AbortController();
+    await h.service.safetyCheck(ENV_ID, options({ signal: controller.signal }));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][2]).toMatchObject({ user: 'vscode', timeoutMs: 30_000 });
+    expect(exec.mock.calls[0][2]?.signal).toBe(controller.signal);
+  });
+
+  it('review round 6 of PR #84 (B-R6-2): a cancel while the refresh hangs ends it promptly as cancelled', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    const controller = new AbortController();
+    let execStarted!: () => void;
+    const started = new Promise<void>((resolve) => (execStarted = resolve));
+    // An exec that ends only when its signal aborts (as the process runner kills the process).
+    h.docker.exec = (_container, _command, execOptions = {}) =>
+      new Promise((_resolve, reject) => {
+        execStarted();
+        execOptions.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    const check = h.service.safetyCheck(ENV_ID, options({ signal: controller.signal }));
+    await started;
+    controller.abort();
+    let timer: NodeJS.Timeout | undefined;
+    const tooLate = new Promise<'hangs'>((resolve) => (timer = setTimeout(() => resolve('hangs'), 2_000)));
+    const outcome = await Promise.race([rejection(check), tooLate]);
+    clearTimeout(timer);
+    expect(outcome).not.toBe('hangs');
+    expect((outcome as UserFacingError).code).toBe('cancelled');
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  // Review round 6 of PR #84 (B-R6-4): the refresh looks for the dev container by the environment and its container name
+  // (as Stop), so the container of another service of a Docker Compose environment is never taken for it.
+  it('review round 6 of PR #84 (B-R6-4): the refresh looks for the container by the environment id and its container name', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    const findContainer = vi.spyOn(h.docker, 'findContainer');
+    await h.service.safetyCheck(ENV_ID, options());
+    expect(findContainer).toHaveBeenCalledWith(ENV_ID, env.containerName);
+    expect(env.containerName).toEqual(expect.any(String));
+  });
+
+  // Review round 6 of PR #84 (B-R6-3): the refreshed state is recorded quietly; a registry that cannot be written still
+  // gives the refreshed state (Delete is never refused for it), with a warning in the log.
+  it('review round 6 of PR #84 (B-R6-3): a refreshed state that cannot be recorded is still returned, with a warning', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
+    vi.spyOn(h.registry, 'updateEnvironment').mockRejectedValueOnce(new Error('the registry is locked'));
+    const summary = await h.service.safetyCheck(ENV_ID, options());
+    expect(summary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
+    expect(h.logger.warnings.some((w) => w.includes('Could not record the Git state') && w.includes('the registry is locked'))).toBe(true);
+  });
+
+  it('user decision 2026-10-02: a refresh that fails falls back to the recorded state, which stays recorded', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    for (const result of [{ exitCode: 127, stderr: 'Git is not installed.' }, { exitCode: 128, stderr: 'fatal: not a git repository' }, { stdout: 'garbage\n' }]) {
+      h.docker.execHandler = () => result;
+      expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+      expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+    }
+    expect(h.helper.calls).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: a refresh that fails with nothing recorded gives undefined (the plain confirmation), never a refusal', async () => {
+    await seedEnvironment(h, { container: 'running', extra: { gitSummary: undefined } });
+    h.docker.execHandler = () => ({ exitCode: 1, stderr: 'container is not running' });
+    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
+  });
+
+  it('user decision 2026-10-02: a refresh whose exec throws, or a container that cannot be found, falls back to the recorded state', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.docker.exec = async () => {
+      throw new Error('docker exec failed');
+    };
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    h.docker.findContainer = async () => {
+      throw new Error('docker inspect failed');
+    };
+    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  it('user decision 2026-10-02: a cancel during the refresh rejects as cancelled and records nothing', async () => {
+    const env = await seedEnvironment(h, { container: 'running' });
+    const controller = new AbortController();
+    h.docker.execHandler = () => {
+      controller.abort();
+      return { stdout: gitExecOutput('feature-z', [5, 6, 2]) };
+    };
+    const error = await rejection(h.service.safetyCheck(ENV_ID, options({ signal: controller.signal })));
+    expect(error.code).toBe('cancelled');
+    expect((await entry())?.gitSummary).toEqual(env.gitSummary);
   });
 
   it('returns undefined when the volume is missing, without creating one', async () => {
@@ -3982,18 +4114,6 @@ describe('safetyCheck', () => {
     expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
     expect(h.helper.calls).toEqual([]);
     expect(h.docker.volumes.size).toBe(0);
-  });
-
-  it('returns the last recorded state when Git cannot read the repository, so known changes are still named', async () => {
-    const env = await seedEnvironment(h);
-    h.helper.gitSummaryResult = new CommandError('git summary', 2, '', "sh: cd: can't cd to /workspaces/api");
-    expect(await h.service.safetyCheck(ENV_ID, options())).toEqual(env.gitSummary);
-  });
-
-  it('returns undefined when Git cannot read the repository and no state is recorded', async () => {
-    await seedEnvironment(h, { extra: { gitSummary: undefined } });
-    h.helper.gitSummaryResult = new CommandError('git summary', 2, '', "sh: cd: can't cd to /workspaces/api");
-    expect(await h.service.safetyCheck(ENV_ID, options())).toBeUndefined();
   });
 
   it('starts Docker when needed', async () => {

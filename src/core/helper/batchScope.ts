@@ -13,7 +13,7 @@
 //   before the lock is released; also before the volume is removed (closeSession).
 // - User decision D1 of 2026-09-30: a step without a batch kind, a step for another volume, a lock without `batch`, or a
 //   session that cannot be opened refuse the operation (BatchHelperUnavailableError, code helperFailed, with the cause).
-//   Nothing ever falls back to the per-step `docker run`. User decision of 2026-10-01 (D1): the refusal is never taken
+//   Nothing ever falls back to a `docker run` of its own (plan step 7 removed that per-step path). User decision of 2026-10-01 (D1): the refusal is never taken
 //   for the helperFailed of the rule of 2026-09-29, so a running, current container is not opened as it is.
 // - The helper ends itself after 15 minutes without a step (PR B), while the lock stays held during a question to the
 //   user (Q3). A session that ended between two steps (lost, closed, or idle) is replaced once by a new one under the

@@ -101,6 +101,14 @@ describe('parseGitSummaryOutput', () => {
 });
 
 describe('commands', () => {
+  // Review round 6 of PR #84 (B-R6-5): Git runs without the hooks of the repository configuration and without optional
+  // locks (no refresh of .git/index by `git status`), so the summary never writes to the repository.
+  it('review round 6 of PR #84 (B-R6-5): runs Git without hooks and without optional locks', () => {
+    expect(GIT_SUMMARY_SCRIPT).toContain('-c core.hooksPath=/dev/null');
+    expect(GIT_SUMMARY_SCRIPT).toMatch(/^GIT_OPTIONAL_LOCKS=0$/m);
+    expect(GIT_SUMMARY_SCRIPT).toMatch(/^export GIT_OPTIONAL_LOCKS$/m);
+  });
+
   it('passes the folder as a positional parameter', () => {
     expect(gitSummaryCommand('/workspaces/it\'s "api"')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/it\'s "api"']);
     expect(ownershipFixCommand('/workspaces/api', 'vscode')).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/api', 'vscode']);
@@ -351,6 +359,28 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     const result = runSummary(repo);
     expect(result.status).toBe(0);
     expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('review round 6 of PR #84 (B-R6-5): leaves .git/index unchanged when its stat data is stale (no optional locks)', () => {
+    const repo = tempDir();
+    git(repo, 'init', '-q', '-b', 'main', '.');
+    const file = path.join(repo, 'a.txt');
+    fs.writeFileSync(file, 'a\n');
+    git(repo, 'add', 'a.txt');
+    git(repo, 'commit', '-q', '-m', 'first');
+    // Same content, a new modification time: a plain `git status` would refresh the stat data in the index.
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(file, later, later);
+    const index = path.join(repo, '.git', 'index');
+    const before = fs.readFileSync(index);
+    const beforeTime = fs.statSync(index).mtimeMs;
+
+    const result = runSummary(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0 });
+    expect(fs.readFileSync(index).equals(before)).toBe(true);
+    expect(fs.statSync(index).mtimeMs).toBe(beforeTime);
+    expect(fs.existsSync(path.join(repo, '.git', 'index.lock'))).toBe(false);
   });
 
   it('fails with a message for a folder that is not a repository', () => {
@@ -961,4 +991,270 @@ describe.skipIf(!canBindMount)('review round 3 of PR #81: the ownership fix with
     // Before (find without -xdev): the file of root in the tmpfs got the user.
     expect(fixAndStat(repo, 'mount -t tmpfs devenv "$2/mnt" && touch "$2/mnt/f" || exit 1', [repo, path.join(repo, 'mnt/f')])).toEqual([String(nobody), '0']);
   });
+});
+
+describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs Git in the C locale', () => {
+  it('hardening (LC_ALL): the script exports LC_ALL=C and LANG=C at its start, before any other command', () => {
+    const lines = GIT_SUMMARY_SCRIPT.split('\n');
+    expect(lines[0]).toBe('set -eu');
+    expect(lines[1]).toBe('export LC_ALL=C LANG=C');
+    // Set in the script itself, never as an argument or through `-e`: the command is the script and its parameters.
+    // user decision 2026-10-02: Delete runs no Git (the script has one mode, the poll mode; no `complete` argument).
+    expect(gitSummaryCommand('/workspaces/api')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
+  });
+
+  it('hardening (LC_ALL): every Git call of the script sees LC_ALL=C and LANG=C, whatever locale the caller has', () => {
+    const root = tempDir();
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    const log = path.join(root, 'log');
+    // A stub of git that records its locale variables, and exits 0 without output.
+    fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s %s\\n' "\${LC_ALL-unset}" "\${LANG-unset}" >> '${log}'\n`, { mode: 0o755 });
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(repo);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: also the complete mode).
+    const [file, ...args] = gitSummaryCommand(repo);
+    const result = spawnSync(file, args, {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
+    });
+    expect(result.status).toBe(0);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const call of calls) expect(call).toBe('C C');
+  });
+});
+
+/** Whether every folder above `folder` can be passed by other users (for a run as another uid). */
+function passableForOthers(folder: string): boolean {
+  for (let dir = path.dirname(folder); ; dir = path.dirname(dir)) {
+    if ((fs.statSync(dir).mode & 0o001) === 0) return false;
+    if (dir === path.dirname(dir)) return true;
+  }
+}
+
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+const hasSetpriv = hasProgram('setpriv', ['--version']);
+
+/**
+ * Review round 1 of PR #84, A-R1-2: the real script as another user (uid 1000) who owns the repository, as `docker
+ * exec` runs it in the dev container as `remoteUser` (needs root, setpriv and Git). User decision 2026-10-02: Delete runs
+ * no Git, so only the poll mode of the script is left; its counts are tested here.
+ */
+describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the repository owner (review round 1 of PR #84, A-R1-2)', () => {
+  function ownerRepo(): string | undefined {
+    const base = fs.mkdtempSync(path.join(fs.existsSync('/var/tmp') ? '/var/tmp' : os.tmpdir(), 'devenv-owner-'));
+    tempDirs.push(base);
+    fs.chmodSync(base, 0o755);
+    if (!passableForOthers(base)) return undefined;
+    const repo = path.join(base, 'repo');
+    git(base, 'init', '-q', '-b', 'main', repo);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    git(repo, 'add', 'a.txt');
+    git(repo, 'commit', '-q', '-m', 'first');
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  function runAsOwner(repo: string): { status: number | null; stdout: string; stderr: string } {
+    const [file, ...args] = gitSummaryCommand(repo);
+    const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  /**
+   * Review round 2 of PR #84, A-R2-1: the repository of the reproduction: 1 unpushed commit on `feature` (main is on
+   * origin/main), and 2 stashes; the owner reads `main / 0 / 1 / 2`.
+   */
+  function stashRepo(): string | undefined {
+    const repo = ownerRepo();
+    if (repo === undefined) return undefined;
+    // The repository is the owner's already (ownerRepo); root's Git needs safe.directory for it.
+    const sgit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', ...args);
+    sgit(repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    sgit(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    sgit(repo, 'add', 'b.txt');
+    sgit(repo, 'commit', '-q', '-m', 'second');
+    sgit(repo, 'checkout', '-q', 'main');
+    for (const line of ['x', 'y']) {
+      fs.appendFileSync(path.join(repo, 'a.txt'), `${line}\n`);
+      sgit(repo, 'stash', '-q');
+    }
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  it('review round 2 of PR #84, A-R2-1: the baseline reads main / 0 / 1 / 2', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 2 });
+  });
+
+  /**
+   * Review round 2 of PR #84, B-R2-1: a repository of the owner with 2 commits on main, and `origin/main` at the first.
+   */
+  function remoteTrackingRepo(): string | undefined {
+    const repo = ownerRepo();
+    if (repo === undefined) return undefined;
+    const sgit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', ...args);
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    sgit(repo, 'add', 'b.txt');
+    sgit(repo, 'commit', '-q', '-m', 'second');
+    sgit(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD~1');
+    spawnSync('chown', ['-R', '1000:1000', repo]);
+    return repo;
+  }
+
+  it('review round 2 of PR #84, B-R2-1: a healthy repository with a remote-tracking ref counts its unpushed commit', () => {
+    const repo = remoteTrackingRepo();
+    if (repo === undefined) return;
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
+  });
+
+  /** Review round 3 of PR #84: Git as root on a repository of the owner (safe.directory), then the owner gets it back. */
+  const rootGit = (cwd: string, ...args: string[]) => git(cwd, '-c', 'safe.directory=*', '-c', 'protocol.file.allow=always', ...args);
+  const giveToOwner = (folder: string) => spawnSync('chown', ['-R', '1000:1000', folder]);
+
+  for (const unborn of [false, true]) {
+    // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
+    it(`review round 4 of PR #84, A-R4-1: a commit that only a tag reaches is not counted as unpushed (${unborn ? 'unborn HEAD' : 'HEAD with commits'})`, () => {
+      const repo = remoteTrackingRepo();
+      if (repo === undefined) return;
+      rootGit(repo, 'checkout', '-q', '--detach');
+      fs.writeFileSync(path.join(repo, 't.txt'), 't\n');
+      rootGit(repo, 'add', 't.txt');
+      rootGit(repo, 'commit', '-q', '-m', 'tagged');
+      rootGit(repo, 'tag', 'v1');
+      rootGit(repo, 'checkout', '-q', unborn ? '--orphan' : 'main', ...(unborn ? ['fresh'] : []));
+      if (unborn) rootGit(repo, 'rm', '-q', '-r', '--cached', '.');
+      if (unborn) for (const file of ['a.txt', 'b.txt', 't.txt']) fs.rmSync(path.join(repo, file), { force: true });
+      giveToOwner(repo);
+      // user decision 2026-10-02: Delete runs no Git (the poll mode; before: the complete mode of Delete's check).
+      const result = runAsOwner(repo);
+      expect(result.status).toBe(0);
+      // review round 4 of PR #84, A-R4-1: tags fetched by the clone made untouched clones show unpushed commits; tag-only commits are out of scope
+      // main has 1 commit that origin/main lacks; the commit that only the tag reaches is not counted.
+      expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
+    });
+  }
+
+  it('review round 4 of PR #84, A-R4-1: a fresh clone of an upstream whose tag sits on a deleted branch reports 0 unpushed commits', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const upstream = repo;
+    rootGit(upstream, 'checkout', '-q', '-b', 'release');
+    fs.writeFileSync(path.join(upstream, 'r.txt'), 'r\n');
+    rootGit(upstream, 'add', 'r.txt');
+    rootGit(upstream, 'commit', '-q', '-m', 'release');
+    rootGit(upstream, 'tag', 'v1');
+    rootGit(upstream, 'checkout', '-q', 'main');
+    rootGit(upstream, 'branch', '-q', '-D', 'release');
+    // The upstream belongs to root, so that root's clone reads it (safe.directory does not reach upload-pack).
+    spawnSync('chown', ['-R', '0:0', upstream]);
+    const clone = path.join(path.dirname(upstream), 'clone');
+    rootGit(path.dirname(upstream), 'clone', '-q', upstream, clone);
+    // The clone has the tag (and so the commit of the deleted branch), but no remote branch contains it.
+    expect(rootGit(clone, 'tag', '--list').trim()).toBe('v1');
+    giveToOwner(clone);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(clone);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 });
+  });
+
+  it('review round 4 of PR #84, A-R4-2: a stash whose reflog was expired still counts as 1 stash; after `git stash clear` 0', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    rootGit(repo, 'reflog', 'expire', '--expire=now', '--all');
+    giveToOwner(repo);
+    // Git's own listing shows no stash any more, while refs/stash still names one.
+    expect(rootGit(repo, 'stash', 'list')).toBe('');
+    expect(rootGit(repo, 'rev-parse', '-q', '--verify', 'refs/stash').trim()).not.toBe('');
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 1 });
+    rootGit(repo, 'stash', 'clear');
+    giveToOwner(repo);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const cleared = runAsOwner(repo);
+    expect(cleared.status).toBe(0);
+    expect(parseGitSummaryOutput(cleared.stdout, RECORDED_AT)).toMatchObject({ stashes: 0 });
+  });
+
+  it('review round 3 of PR #84, B-R3-1: a stash whose object is deleted makes `git stash list` fail: the script exits non-zero', () => {
+    const repo = stashRepo();
+    if (repo === undefined) return;
+    const id = rootGit(repo, 'rev-parse', 'refs/stash').trim();
+    const object = path.join(repo, '.git', 'objects', id.slice(0, 2), id.slice(2));
+    expect(fs.existsSync(object)).toBe(true);
+    fs.rmSync(object);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe('');
+  });
+
+  it('review round 5 of PR #84: log.showSignature and gpg.program of the repository configuration do not run a program', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    const out = path.join(path.dirname(repo), 'out');
+    fs.mkdirSync(out);
+    spawnSync('chown', ['1000:1000', out]);
+    const ran = path.join(out, 'ran');
+    const stub = path.join(path.dirname(repo), 'fake-gpg');
+    fs.writeFileSync(stub, `#!/bin/sh\nid -u >> '${ran}'\nexit 1\n`, { mode: 0o755 });
+    fs.chmodSync(stub, 0o755);
+    // A stash commit with a signature header (never verified: the stub fails), named by refs/stash and its reflog.
+    const tree = rootGit(repo, 'rev-parse', 'HEAD^{tree}').trim();
+    const parent = rootGit(repo, 'rev-parse', 'HEAD').trim();
+    const commit = `tree ${tree}\nparent ${parent}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\nWIP on main\n`;
+    const hashed = spawnSync('git', ['-c', 'safe.directory=*', 'hash-object', '-t', 'commit', '-w', '--stdin'], {
+      cwd: repo,
+      input: commit,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    });
+    expect(hashed.status).toBe(0);
+    rootGit(repo, 'update-ref', '--create-reflog', '-m', 'WIP on main', 'refs/stash', hashed.stdout.trim());
+    rootGit(repo, 'config', 'log.showSignature', 'true');
+    rootGit(repo, 'config', 'gpg.program', stub);
+    giveToOwner(repo);
+    // The setup is live: Git's own `git stash list` runs the stub.
+    rootGit(repo, 'stash', 'list');
+    expect(fs.existsSync(ran)).toBe(true);
+    fs.rmSync(ran);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: 'main', stashes: 1 });
+    expect(fs.existsSync(ran)).toBe(false);
+  });
+
+  it('review round 5 of PR #84, B-R5-1: a commit on a detached HEAD that no branch holds counts as unpushed, with an empty branch', () => {
+    const repo = ownerRepo();
+    if (repo === undefined) return;
+    rootGit(repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    rootGit(repo, 'checkout', '-q', '--detach');
+    fs.writeFileSync(path.join(repo, 'd.txt'), 'd\n');
+    rootGit(repo, 'add', 'd.txt');
+    rootGit(repo, 'commit', '-q', '-m', 'detached');
+    giveToOwner(repo);
+    // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: both modes).
+    const result = runAsOwner(repo);
+    expect(result.status).toBe(0);
+    expect(result.stdout.split('\n')[0]).toBe('');
+    expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
+  });
+
 });

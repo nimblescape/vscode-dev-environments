@@ -8,6 +8,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { detectConfigurations } from '../discovery/detect';
+// user decision 2026-10-02: Delete runs no Git: GIT_SUMMARY_SCRIPT no longer runs in the workspace helper, so scripts.ts
+// does not re-export it; its syntax is still checked here (it runs in the dev container).
+import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
 import {
   BUILD_SCRIPT,
   CLONE_SCRIPT,
@@ -18,7 +21,6 @@ import {
   COMPOSE_MODEL_SCRIPT,
   CREDENTIAL_HELPER,
   GIT_FILES_SCRIPT,
-  GIT_SUMMARY_SCRIPT,
   LIST_CONFIGS_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   OVERRIDE_FOLDER,

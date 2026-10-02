@@ -45,7 +45,7 @@ import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, Timings, dockerTestContext, fakeAuth, registryClient, registryTransport } from './harness';
+import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, Timings, dockerTestContext, fakeAuth, registryClient, registryTransport, runInVolume } from './harness';
 
 const ALIAS = 'devenv-test-remote';
 const REPOSITORY = 'devenv-test/remote';
@@ -294,7 +294,8 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
           });
           const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
           await docker.createVolume(volumeName, { [LABEL_ENVIRONMENT_ID]: environmentId, [LABEL_REPOSITORY]: REPOSITORY, [TEST_RUN_LABEL]: run.runId });
-          const seeded = await helper.run(volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile], { docker: false, network: false });
+          // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+          const seeded = await runInVolume(docker, volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile]);
           expect(seeded.exitCode, seeded.stderr).toBe(0);
           const now = isoTime(systemClock);
           await registry.add({

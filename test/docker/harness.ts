@@ -8,12 +8,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { beforeEach, inject } from 'vitest';
+import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { findExecutable } from '../../src/core/docker/dockerCli';
+import { helperImageTag } from '../../src/core/helper/helperImage';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/core/imageCheck/credentials';
 import type { CheckOutcome, ConfigReferences, ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { RegistryClient } from '../../src/core/imageCheck/registryClient';
 import type { ProgressStep } from '../../src/core/messages';
+import { LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../../src/core/names';
 import { errorDetail } from '../../src/core/pipeline/pipelineRules';
 import {
   abortError,
@@ -23,11 +26,25 @@ import {
   type PipelineUi,
   type ProcessRunner,
   type ProgressReporter,
+  type RunResult,
 } from '../../src/core/ports';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
+
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path of WorkspaceHelper (and WorkspaceHelper.run) is removed. A
+ * command of a test (the seed of a volume, or a check of what it holds) in a plain container of the helper image (its
+ * tag; the caller has ensured it) on `volume` at /workspaces, as root, without the Docker socket and without network,
+ * through `docker` (so with its Docker context). It is the arrangement of a test, never a step of the extension; it
+ * carries the label of the helper runs and is removed when it ends (`--rm`).
+ */
+export function runInVolume(docker: Pick<ContainerAdapter, 'run'>, volume: string, command: readonly string[], input?: string): Promise<RunResult> {
+  const tag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
+  const args = ['run', '--rm', '-i', '--pull', 'never', '--label', `${LABEL_HELPER_RUN}=true`, '--network', 'none', '--mount', `type=volume,source=${volume},target=${WORKSPACES_ROOT}`, tag, ...command];
+  return docker.run(args, { input });
+}
 
 /** Token for the helper runs. The tests clone only public repositories, so Git never sends it. */
 export const DUMMY_TOKEN = 'dummy-token-of-the-docker-tests';

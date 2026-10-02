@@ -72,6 +72,7 @@ import {
   registryClient,
   registryDigest,
   registryTransport,
+  runInVolume,
   timedChecker,
   type CheckRecord,
 } from './harness';
@@ -339,10 +340,8 @@ describe('open pipeline on a seeded environment', () => {
       [LABEL_REPOSITORY]: REPOSITORY,
       [TEST_RUN_LABEL]: run.runId,
     });
-    const seeded = await helper.run(volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile], {
-      docker: false,
-      network: false,
-    });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({
@@ -889,7 +888,8 @@ describe('open pipeline on a seeded environment', () => {
     const config = JSON.stringify({ name: 'Refused', build: { dockerfile: 'Dockerfile' }, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`], ...extra });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: 'devenv-test/refused', [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/refused', config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/refused', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository: 'devenv-test/refused', configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -925,7 +925,8 @@ describe('open pipeline on a seeded environment', () => {
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/compose-volume', config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/compose-volume', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -955,7 +956,8 @@ describe('open pipeline on a seeded environment', () => {
     // A base image that the user had stays; one that this test pulled goes at the end.
     const pulledHere = !readBaseline(run).images.some((image) => image.tags.map(familiarName).includes(familiarName(OLD_GIT_BASE_IMAGE)));
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/old-git', config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/old-git', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -999,7 +1001,8 @@ describe('open pipeline on a seeded environment', () => {
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/no-rights', config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/no-rights', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -1041,7 +1044,8 @@ describe('open pipeline on a seeded environment', () => {
     const config = JSON.stringify({ name: repository, build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, ...runArgs] });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', ...dockerfileLines, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', `/workspaces/${repository.split('/')[1]}`, config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', `/workspaces/${repository.split('/')[1]}`, config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -1105,7 +1109,8 @@ describe('open pipeline on a seeded environment', () => {
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
-    const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/privileged', config, dockerfile], { docker: false, network: false });
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/privileged', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
@@ -1150,7 +1155,8 @@ describe('open pipeline on a seeded environment', () => {
       const now = isoTime(systemClock);
       for (const { account, id, name } of entries) {
         await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: account.id, [TEST_RUN_LABEL]: run.runId });
-        const seeded = await helper.run(name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/shared', config, dockerfile], { docker: false, network: false });
+        // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
+        const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/shared', config, dockerfile]);
         expect(seeded.exitCode, seeded.stderr).toBe(0);
         // The registry keeps one environment per repository and account, so both entries are added.
         await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: account });
@@ -1185,10 +1191,44 @@ describe('open pipeline on a seeded environment', () => {
     }
   });
 
+  it('plan step 7: the listing of the configuration picker runs in exactly one batch helper under the lock and leaves none', async () => {
+    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
+    expect(await online.listConfigurations(environmentId, { progress: new RecordingProgress() })).toEqual([CONFIG_PATH]);
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    expect(helperContainers()).toEqual([]);
+  });
+
+  it('user decision 2026-10-02: the safety check of a volume without the repository folder runs no batch helper and gives the recorded state', async () => {
+    const repository = 'devenv-test/empty';
+    const id = newEnvironmentId();
+    const name = resourceName(repository, id);
+    const recorded = { branch: 'old', uncommittedFiles: 3, unpushedCommits: 2, stashes: 1, recordedAt: '2026-09-20T10:00:00.000Z' };
+    try {
+      await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+      const now = isoTime(systemClock);
+      await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
+      // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: one batch helper, its
+      // step as nobody): no container runs, so the check gives the recorded state without any helper or lock.
+      expect(await online.safetyCheck(id, { progress: new RecordingProgress() })).toEqual(recorded);
+      expect(locks.batches.get(id) ?? []).toHaveLength(0);
+      expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_RUN}=true`, '--filter', `volume=${name}`])).toEqual([]);
+    } finally {
+      await registry.remove(id);
+      cli.run(['volume', 'rm', name]);
+    }
+  });
+
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {
     const progress = new RecordingProgress();
+    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
     const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
+    // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: the Git summary in exactly
+    // one batch helper under the lock): the check opens no batch helper; it names the recorded state, refreshed in the
+    // dev container when it runs. Its counts are those of before (the untracked file, the one commit without a remote).
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
+    expect((await registry.get(environmentId))?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
+    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(0);
+    expect(helperContainers()).toEqual([]);
 
     await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));
     expect(containersOfEnvironment()).toEqual([]);

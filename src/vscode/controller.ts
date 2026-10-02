@@ -773,7 +773,10 @@ export class Controller implements vscode.Disposable {
         const otherWindow = (await this.connectedInOtherWindow(environment.id))
           ? ` ${ControllerTexts.otherWindowClosesConnection(repository)}`
           : '';
-        // Without a summary (the volume is missing), the confirmation follows at once.
+        // User decision 2026-10-02 ("No git needs delete. ... we may flag uncommitted changes though, but that does not
+        // hinder deletion."): the summary is the recorded Git state (refreshed when the dev container runs); changes in it
+        // are named with "Delete anyway". Without a summary (nothing recorded, or the volume is missing), the plain
+        // confirmation follows at once. Either way the user can delete.
         const changes = summary ? formatChanges(summary) : '';
         // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
         // confirmation names them, as the question about the data volumes of the services (D-19) names those.

@@ -15,9 +15,11 @@ import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import type { DockerTarget } from '../../src/core/docker/dockerHost';
 import type { DockerTargets } from '../../src/core/docker/dockerTargets';
 import type { HeldEnvironmentLock } from '../../src/core/docker/environmentLock';
+import { runWithBatchScope } from '../../src/core/helper/batchScope';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
+import type { Logger } from '../../src/core/ports';
 import { TEST_RUN_LABEL } from './dockerRun';
 import { HELPER_DOCKERFILE, testStateVolume, type DockerTestContext } from './harness';
 
@@ -114,4 +116,18 @@ export function workerLocks(
       return leftovers();
     },
   };
+}
+
+/**
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed, so a volume step of WorkspaceHelper runs only
+ * in the batch scope of an operation. Runs `fn` as an operation does: under the lock of `lockId` (a storage ID) taken
+ * through `locks` (10 s, D3), in the batch scope of `volume`; its batch helper is closed and the lock released at the end.
+ */
+export async function inBatchScope<T>(locks: WorkerLocks, lockId: string, volume: string, logger: Logger, fn: () => Promise<T>): Promise<T> {
+  const lock = await locks.take(lockId, 10, undefined);
+  try {
+    return await runWithBatchScope(lock, volume, logger, fn);
+  } finally {
+    await lock.release();
+  }
 }

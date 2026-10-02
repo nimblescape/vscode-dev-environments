@@ -32,9 +32,13 @@ const ID = 'env-1';
 
 describe('batchStepCommand (plan step 6, PR B)', () => {
   it('knows exactly the twelve kinds of the plan', () => {
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, gitSummary is no kind any more (was in plan step
+    // 7: thirteen kinds with gitSummary, Delete's check), and the batch helper refuses it as unknown.
     expect([...BATCH_STEP_KINDS].sort()).toEqual(
       ['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up'],
     );
+    expect(isBatchStepKind('gitSummary')).toBe(false);
+    expect(() => batchStepCommand('gitSummary', { repository: REPO })).toThrow(BatchStepError);
     expect(isBatchStepKind('clone')).toBe(true);
     expect(isBatchStepKind('docker')).toBe(false);
     expect(isBatchStepKind('toString')).toBe(false);
@@ -64,6 +68,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       env: { COMPOSE_PROJECT_NAME: 'p1' },
       git: false,
       owner: FOLDER,
+      // Review round 1 of PR #84, A-R1-1: added expectation: only the Compose steps close CONFIG_FOLDER for the step.
+      closeConfigFolder: true,
     });
     expect(batchStepCommand('composeHash', { repository: REPO, model: '{}', project: 'p1' })).toEqual({
       command: composeHashCommand(COMPOSE_MODEL_PATH, 'p1'),
@@ -71,6 +77,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       env: { COMPOSE_PROJECT_NAME: 'p1' },
       git: false,
       owner: FOLDER,
+      // Review round 1 of PR #84, A-R1-1: added expectation: only the Compose steps close CONFIG_FOLDER for the step.
+      closeConfigFolder: true,
     });
     // User decision of 2026-10-01: Compose reads as the repository owner, so composeHash without its repository, or
     // with one outside /workspaces, is refused.
@@ -102,6 +110,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       };
       return batchStepCommand(kind, samples[kind]).owner !== undefined;
     });
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, no gitSummary step runs as the owner (was in plan
+    // step 7: gitSummary too).
     expect(owners).toEqual(['readFiles', 'listConfigs', 'composeModel', 'composeHash', 'createFolders']);
     expect(batchStepCommand('clone', { repository: REPO }).git).toBe(true);
   });

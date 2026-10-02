@@ -45,7 +45,6 @@ import type {
   Environment,
   ExtensionSettings,
   GitHubAccount,
-  GitSummary,
 } from '../types';
 import {
   EnvironmentService,
@@ -593,7 +592,6 @@ export class FakeHelper implements EnvironmentHelper {
    * `lifecycleCommandFailure`).
    */
   lifecycleFailureReport: 'error' | 'result' = 'error';
-  gitSummaryResult: GitSummary | Error = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: '2026-09-24T15:40:00.000Z' };
   /** Named volumes that a container created by `up` mounts besides the workspace volume. */
   containerVolumes: string[] = [];
   /**
@@ -1100,13 +1098,6 @@ export class FakeHelper implements EnvironmentHelper {
       remoteUser: this.remoteUser,
       remoteWorkspaceFolder: String(p.override.workspaceFolder),
     };
-  }
-
-  async gitSummary(p: { volumeName: string }): Promise<GitSummary> {
-    this.mount(p.volumeName);
-    this.calls.push('gitSummary');
-    if (this.gitSummaryResult instanceof Error) throw this.gitSummaryResult;
-    return { ...this.gitSummaryResult };
   }
 
   /** Review round 15 (K3): each fixConfigOwnership (the fix of the internal folder in a helper container). */

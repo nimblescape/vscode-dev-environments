@@ -94,6 +94,7 @@ describe('prepareBatchHelper (plan step 6, PR B)', () => {
     });
     await expect(operations.listConfigs({ repository: 'octo/hello' }, context())).rejects.toMatchObject({ code: 'unsafe' });
     await expect(operations.listConfigs({ repository: '../x' }, context())).rejects.toMatchObject({ code: 'invalid' });
+    // user decision 2026-10-02: Delete runs no Git: changed expectation, no operation gitSummary (was in plan step 7).
     expect(Object.keys(operations).sort()).toEqual(['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up']);
     expect(new OperationError('x', 'y').code).toBe('x');
   });

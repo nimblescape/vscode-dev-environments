@@ -2,22 +2,34 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>`,
-// either in the workspace helper or with `docker exec` in a dev container. Values arrive as positional parameters.
+// Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>` and
+// `docker exec` in a running dev container. Values arrive as positional parameters.
 import type { GitSummary } from '../types';
 
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
  * commits on HEAD or on any local branch that no remote-tracking branch contains, and the number of stashes. `$1` is the
  * repository folder. The unpushed commits include those of every local branch (concept 7.5, 7.14 step 1): the volume
- * keeps them, and Delete removes them.
+ * keeps them, and Delete removes them. Commits that only the reflog or a tag still reaches are not counted (review round
+ * 4 of PR #84, A-R4-1: a clone fetches every tag of the upstream).
+ *
+ * The script runs in the running dev container as its user (`remoteUser`): the polls of the Session Monitor, and after
+ * an open or a stop (and, user decision 2026-10-02, before Delete's confirmation when the container runs). Delete runs no
+ * Git anywhere else (user decision 2026-10-02: "No git needs delete."): no workspace helper runs this script.
  *
  * Git runs without hooks, without an fsmonitor, and without optional locks, so that it runs no hook and never writes to
  * `.git` as another user. It still runs other programs that the repository configuration names (for example the clean
- * filter of a filter driver in `git status`). So the workspace helper runs this script without the Docker socket, without
- * the cache volume, and without network (WorkspaceHelper.gitSummary): it is no trust boundary against the repository.
+ * filter of a filter driver in `git status`): it is no trust boundary against the repository. Review round 5 of PR #84:
+ * with `log.showSignature=false` too (with it set in the repository configuration, `git stash list` ran the program of
+ * `gpg.program`). Review round 2 of PR #84: in the C locale (`LC_ALL=C`, `LANG=C`, set in the script itself), so that
+ * Git's messages are never translated; the counts are line counts, and paths pass through as bytes.
+ *
+ * Review round 4 of PR #84, A-R4-2: a stash that `refs/stash` still names while its reflog is empty (`git reflog expire
+ * --expire=now --all`, a packed `refs/stash` without a reflog, or a reftable repository) is listed by no `git stash
+ * list`; it counts as 1 stash then.
  */
 export const GIT_SUMMARY_SCRIPT = `set -eu
+export LC_ALL=C LANG=C
 cd "$1"
 if ! command -v git >/dev/null 2>&1; then
   echo 'Git is not installed.' >&2
@@ -26,7 +38,7 @@ fi
 GIT_OPTIONAL_LOCKS=0
 export GIT_OPTIONAL_LOCKS
 g() {
-  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false "$@"
 }
 count_lines() {
   if [ -z "$1" ]; then
@@ -43,6 +55,9 @@ else
   unpushed=$(g rev-list --count --branches --not --remotes 2>/dev/null) || unpushed=0
 fi
 stashes=$(g stash list)
+if [ -z "$stashes" ] && g rev-parse -q --verify refs/stash >/dev/null 2>&1; then
+  stashes='(stash without reflog)'
+fi
 printf '%s\\n%s\\n%s\\n%s\\n' "$branch" "$(count_lines "$status")" "$unpushed" "$(count_lines "$stashes")"
 `;
 

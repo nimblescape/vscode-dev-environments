@@ -304,7 +304,6 @@ export type EnvironmentHelper = Pick<
   | 'build'
   | 'up'
   | 'runUserCommands'
-  | 'gitSummary'
   | 'prepareGit'
   | 'createRepositoryFolders'
   | 'fixConfigOwnership'
@@ -5628,10 +5627,14 @@ export class EnvironmentService {
   }
 
   /**
-   * Safety check before Delete (concept 7.14 step 1), through the workspace helper on the volume. Starts Docker if needed.
-   * `undefined` when the volume is missing. When Git cannot read the repository, the last recorded state (or
-   * `undefined`), so that known changes are still named (FR-09) and a broken clone can still be deleted.
-   * A new result is recorded in the registry.
+   * Safety check before Delete (concept 7.14 step 1). User decision 2026-10-02 ("No git needs delete. When we delete the
+   * remote, we delete the container with the volumes and everything is gone. we may flag uncommitted changes though, but
+   * that does not hinder deletion."): Delete runs no Git in a workspace helper (nor a batch step). The result is the Git
+   * state recorded in the registry (the Session Monitor's polls, and after an open or a stop); when the dev container
+   * runs, it is refreshed first in the container as its user (gitSummaryInContainer, as after a stop) and the new state
+   * is recorded. A refresh that fails falls back to the recorded state and never refuses Delete. Starts Docker if needed.
+   * `undefined` when the volume is missing (the files of the environment are missing: plain confirmation) or nothing is
+   * recorded. A cancel stays a cancel.
    */
   async safetyCheck(environmentId: string, options: OperationOptions): Promise<GitSummary | undefined> {
     const env = await this.deps.registry.get(environmentId);
@@ -5642,23 +5645,36 @@ export class EnvironmentService {
       await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       if (!(await this.deps.docker.volumeExists(env.volumeName))) return undefined;
-      let summary: GitSummary;
-      try {
-        summary = await this.deps.helper.gitSummary({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
-      } catch (error) {
-        if (this.isCancellation(error, options.signal) || isUserFacingError(error)) throw error;
-        this.logger.warn(`The Git state of ${env.repository} could not be read: ${errorDetail(error)}`);
-        return env.gitSummary;
-      }
+      const refreshed = await this.gitSummaryBeforeDelete(env, options.signal);
+      this.throwIfCancelled(options.signal);
+      if (refreshed === undefined) return env.gitSummary;
       await this.quietly('record the Git state', () =>
         this.deps.registry.updateEnvironment(env.id, (entry) => {
-          entry.gitSummary = summary;
+          entry.gitSummary = refreshed;
         }),
       );
-      return summary;
+      return refreshed;
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }
+  }
+
+  /**
+   * User decision 2026-10-02: the Git state from the running dev container before Delete's confirmation (the path of
+   * Stop, gitSummaryInContainer, as `remoteUser`), or `undefined` when the container does not run or the refresh fails
+   * (Delete then names the recorded state). No lock: it only reads in the container, and must never hold Delete up.
+   */
+  private async gitSummaryBeforeDelete(env: Environment, signal: AbortSignal | undefined): Promise<GitSummary | undefined> {
+    let container: ContainerInfo | undefined;
+    try {
+      container = await this.deps.docker.findContainer(env.id, env.containerName);
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      this.logger.info(`The container of ${env.repository} could not be found: ${errorMessage(error)}. The recorded Git state is used.`);
+      return undefined;
+    }
+    if (!container || container.state !== 'running') return undefined;
+    return this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
   }
 
   /** Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. */
@@ -5757,7 +5773,15 @@ export class EnvironmentService {
       await this.requireOwnAccount(env, true);
       await this.startDocker(steps, options.signal);
       await this.requireVolume(env);
-      return await this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
+      // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): the listing of the picker runs as the step
+      // listConfigs of the batch helper of the volume (as the owner of the repository) under the lock of the environment,
+      // released before the picker is shown (D1: refused when either cannot be had; D3: busy after 10 s).
+      return await this.withEnvironmentLock(
+        env,
+        options.signal,
+        () => this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal }),
+        { batchVolume: env.volumeName },
+      );
     } catch (error) {
       throw this.toUserError(error, options.signal);
     }

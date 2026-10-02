@@ -4,8 +4,8 @@
 
 // Plan step 6, PR B: the batch helper (src/core/helperChannel/batch.ts), a second ChannelServer in the helper container
 // of one operation, loaded by the worker with the same script (main.ts, startBatchHelper). Its operations are the fixed
-// step kinds of src/core/helper/batchSteps.ts: each step builds its command from the builders of the per-step runs and
-// never runs a command line that it was sent. The steps run one at a time, each in a process group of its own; its time
+// step kinds of src/core/helper/batchSteps.ts: each step builds its command from the builders that WorkspaceHelper uses
+// too and never runs a command line that it was sent (plan step 7: the only path of the volume steps). The steps run one at a time, each in a process group of its own; its time
 // limit or its cancel ends that group alone (SIGTERM, then SIGKILL), and the session stays usable.
 //
 // Isolation in the one container (Q2 of 2026-10-01). The helper runs as root. The socket lies in BATCH_SOCKET_FOLDER,
@@ -21,7 +21,8 @@
 // Docker Compose read steps (composeModel, composeHash), and by the agreed extension of the same day readFiles,
 // listConfigs and createFolders, run as the user that owns the repository folder (its uid:gid,
 // read with lstat at step time; as root when root owns it), with HOME=/nonexistent. CONFIG_FOLDER is root's and 0700
-// during the step (it belongs to that user otherwise); OVERRIDE_FOLDER is new, empty and that user's for the step, and
+// during the Compose steps (it belongs to that user otherwise; review round 1 of PR #84, A-R1-1: only those steps,
+// closeConfigFolder); OVERRIDE_FOLDER is new, empty and that user's for the step, and
 // is removed after it. After the step every process of that user is killed (not when it is root); its files elsewhere
 // are legitimate and stay (no walk).
 import { spawn } from 'child_process';
@@ -207,21 +208,28 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
   const privilege = uid === 0 ? undefined : privilegeArgs(uid, gid);
   const restores: Array<() => void> = [];
   try {
-    // CONFIG_FOLDER belongs to the owner of the repository (GIT_FILES_SCRIPT): for the step it is root's and 0700, so
-    // that Compose (which follows `env_file` and `include` of the repository) cannot read it. For a root owner this
-    // protects nothing (accepted, docs/implementation-notes.md §17).
+    // CONFIG_FOLDER belongs to the owner of the repository (GIT_FILES_SCRIPT): for a step that follows references in
+    // repository files (closeConfigFolder: Compose follows `env_file` and `include`) it is root's and 0700, so that the
+    // step cannot read it. For a root owner this protects nothing (accepted, docs/implementation-notes.md §17).
     const config = lstatOrUndefined(deps, CONFIG_FOLDER);
     if (config?.isDirectory()) {
       // Review round 5 of PR #82 (A-R5-2): root:root 0700 is only what a killed step left (GIT_FILES_SCRIPT leaves 0755):
       // it goes back to the owner of a real repository folder, with 0755.
       const cutOff = config.uid === 0 && config.gid === 0 && (config.mode & 0o7777) === 0o700 && real;
       const back = cutOff ? { uid: repository.uid, gid: repository.gid, mode: 0o755 } : { uid: config.uid, gid: config.gid, mode: config.mode & 0o7777 };
-      restores.push(() => {
+      if (step.closeConfigFolder === true) {
+        restores.push(() => {
+          deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
+          deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
+        });
+        deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
+        deps.fs.chownSync(CONFIG_FOLDER, 0, 0);
+      } else if (cutOff) {
+        // Review round 1 of PR #84, A-R1-1: the other owner steps leave CONFIG_FOLDER open (a running dev container
+        // reads its Git configuration there during the step); only the leftover of a killed step is repaired, at once.
         deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
         deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
-      });
-      deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
-      deps.fs.chownSync(CONFIG_FOLDER, 0, 0);
+      }
     }
     // Review rounds 1 and 3 of PR #82 (B-R1-5, B-R3-2): the step starts without the files that root steps before it
     // left below OVERRIDE_FOLDER. The folder is new, empty, the owner's and 0700 (the Compose hash writes its model
