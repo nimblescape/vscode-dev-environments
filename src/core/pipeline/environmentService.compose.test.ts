@@ -46,7 +46,7 @@ import {
 } from '../names';
 import type { ContainerInfo } from '../docker/containerAdapter';
 import type { BuildRecord, ContainerState, Environment, WindowStatus } from '../types';
-import { PipelineTexts, type RepositoryTarget } from './environmentService';
+import { PipelineTexts, type EnvironmentSessionMonitor, type RepositoryTarget } from './environmentService';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -576,6 +576,110 @@ describe('first open of a Docker Compose configuration', () => {
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('startFailed');
     expect(error.detail).toContain(`not ${PROJECT}`);
+  });
+});
+
+// Review round 2 of PR #86 (B-R2-1, B-R2-2): the Session Monitor again after `up` of Docker Compose started the dev
+// container (review round 1 of PR #86, A-R1-1), as in runUp: once per run, after `up` and before the lifecycle commands.
+describe('the Session Monitor again after `up` of Docker Compose (review round 2 of PR #86)', () => {
+  interface Ensure {
+    tag: string;
+    image: string | undefined;
+    signal: AbortSignal | undefined;
+    ups: number;
+    userCommands: number;
+  }
+
+  /** A harness with a Session Monitor on the local Docker; `fail` decides the outcome of the ensure with that index. */
+  function withSessionMonitor(fail: (index: number) => Promise<void> = async () => undefined): Ensure[] {
+    h.cleanup();
+    const ensures: Ensure[] = [];
+    const sessionMonitor: EnvironmentSessionMonitor = {
+      ensure: async (_target, tag, signal, image) => {
+        ensures.push({ tag, image, signal, ups: h.helper.ups.length, userCommands: h.helper.userCommandRuns.length });
+        return fail(ensures.length - 1);
+      },
+      heartbeat: async () => ({ ok: true }),
+      forget: async () => undefined,
+    };
+    h = createHarness({
+      newEnvironmentId: () => ENV_ID,
+      dockerTarget: async () => ({ kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock' }),
+      sessionMonitor,
+    });
+    useCompose(h);
+    return ensures;
+  }
+
+  it('ensures it again after `up` and before the lifecycle commands, with the same image and signal, once (B-R2-1 a)', async () => {
+    const ensures = withSessionMonitor();
+    await seedCompose();
+    const controller = new AbortController();
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal });
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
+    expect(ensures.map(({ ups, userCommands }) => ({ ups, userCommands }))).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(ensures[1].tag).toBe(ensures[0].tag);
+    expect(ensures[1].image).toBe(ensures[0].image);
+    expect(ensures[1].image).toBeDefined();
+    expect(ensures[1].signal).toBe(ensures[0].signal);
+    expect(ensures[1].signal).toBeDefined();
+  });
+
+  it('a first open (model, build, up) ensures it again after `up` created the containers', async () => {
+    const ensures = withSessionMonitor();
+    await h.service.open(TARGET, options());
+    expect(ensures.map(({ ups, userCommands }) => ({ ups, userCommands }))).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+  });
+
+  it('a failed `up` ensures it too, and keeps the error of `up` (B-R2-1 b)', async () => {
+    const ensures = withSessionMonitor();
+    await seedCompose();
+    h.helper.upError = () => new Error('compose up failed: port is already allocated');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('port is already allocated');
+    expect(ensures.map(({ ups, userCommands }) => ({ ups, userCommands }))).toEqual([
+      { ups: 0, userCommands: 0 },
+      { ups: 1, userCommands: 0 },
+    ]);
+  });
+
+  it('a cancelled `up` does not ensure it again (B-R2-1 c, B-R2-2 ii)', async () => {
+    const ensures = withSessionMonitor();
+    await seedCompose();
+    const controller = new AbortController();
+    h.helper.upError = () => {
+      controller.abort();
+      return abortError();
+    };
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal }));
+    expect(error.code).toBe('cancelled');
+    expect(ensures.map(({ ups, userCommands }) => ({ ups, userCommands }))).toEqual([{ ups: 0, userCommands: 0 }]);
+  });
+
+  it('a failed `up` keeps its error when the second ensure rejects with an AbortError (B-R2-2 i)', async () => {
+    const ensures = withSessionMonitor(async (index) => (index === 1 ? Promise.reject(abortError()) : undefined));
+    await seedCompose();
+    h.helper.upError = () => new Error('compose up failed: port is already allocated');
+    const error = await rejection(h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: new AbortController().signal }));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('port is already allocated');
+    expect(ensures).toHaveLength(2);
+  });
+
+  it('a failure of the second ensure is a warning, and the open goes on', async () => {
+    withSessionMonitor(async (index) => (index === 1 ? Promise.reject(new Error('docker run failed')) : undefined));
+    await seedCompose();
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining(`The Session Monitor on the local Docker could not be started after the container of ${REPO}`));
   });
 });
 

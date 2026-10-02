@@ -33,8 +33,11 @@ interface Setup {
   calls: string[];
 }
 
+type Target = Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>;
+
 function setup(
-  target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>,
+  /** Review round 2 of PR #86: or a function, for a target that changes during the open (its calls read `h.helper`). */
+  target: Target | ((helper: Harness['helper']) => Target),
   behavior: {
     ensure?: (index: number) => Promise<unknown>;
     forget?: () => Promise<void>;
@@ -69,7 +72,7 @@ function setup(
       return behavior.forget?.();
     },
   };
-  const created = createHarness({ dockerTarget: async () => target, sessionMonitor });
+  const created = createHarness({ dockerTarget: async () => (typeof target === 'function' ? target(created.helper) : target), sessionMonitor });
   h = created;
   return { h: created, calls };
 }
@@ -329,6 +332,88 @@ describe('the Session Monitor again after the container started (review round 1 
       { ups: 1, userCommands: 0 },
     ]);
     expect(h.ui.warnings).toContainEqual(expect.stringContaining('could not be started after the container of'));
+  });
+});
+
+// Review round 2 of PR #86 (B-R2-2, B-R2-4, B-R2-5, code note): the failure paths of the second ensure of runUp.
+describe('the Session Monitor again after the container started: failure paths (review round 2 of PR #86)', () => {
+  /** True once the helper ran `up`. */
+  const afterUp = (helper: Harness['helper']) => helper.calls.some((call) => call.startsWith('up '));
+  const UNSUPPORTED = { kind: 'unsupported', host: 'tcp://x', endpoint: 'tcp://x' } as const;
+
+  // A cancellation of the open's signal itself ends any open as cancelled (toUserError); here the second ensure rejects
+  // with an AbortError while the signal of the open is not aborted, which must not replace the error of `up`.
+  it('a failed `up` keeps its error when the second ensure rejects with an AbortError (B-R2-2)', async () => {
+    const controller = new AbortController();
+    const { h } = setup(REMOTE, { ensure: async (index) => (index === 1 ? Promise.reject(abortError()) : undefined) });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    h.helper.upError = () => new Error('devcontainer up failed: port is already allocated');
+    const error = await h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal }).then(
+      () => undefined,
+      (failure: unknown) => failure as { code?: string; detail?: string },
+    );
+    expect(error?.code).toBe('startFailed');
+    expect(error?.detail).toContain('port is already allocated');
+    expect(ensureAt).toHaveLength(2);
+  });
+
+  it('a cancelled `up` does not ensure it again: the first ensure only (B-R2-2)', async () => {
+    const controller = new AbortController();
+    const { h } = setup(REMOTE);
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    h.helper.upError = () => {
+      controller.abort();
+      return abortError();
+    };
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal })).rejects.toMatchObject({ code: 'cancelled' });
+    expect(ensureAt).toEqual([{ ups: 0, userCommands: 0 }]);
+  });
+
+  it('never ensures it after `up` when the first ensure did not run (B-R2-4)', async () => {
+    // The target reads as unsupported only while the first ensure would run (after the helper image, before `up`).
+    const { h, calls } = setup((helper) => (helper.calls.includes('ensureImage') && !afterUp(helper) ? UNSUPPORTED : LOCAL));
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.ups).toHaveLength(1);
+    expect(calls.filter((call) => call.startsWith('ensure'))).toEqual([]);
+  });
+
+  it('does not ensure it after `up` on a target that is neither local nor remote (B-R2-4)', async () => {
+    const { h, calls } = setup((helper) => (afterUp(helper) ? UNSUPPORTED : LOCAL));
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.helper.ups).toHaveLength(1);
+    expect(calls.filter((call) => call.startsWith('ensure'))).toHaveLength(1);
+    expect(h.ui.warnings.some((line) => line.includes('could not be started after the container'))).toBe(false);
+  });
+
+  it('a failure on the local Docker names the local Docker, not a Docker host (B-R2-5)', async () => {
+    const { h } = setup(LOCAL, { ensure: async (index) => (index === 1 ? Promise.reject(new Error('docker run failed')) : undefined) });
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining(`The Session Monitor on the local Docker could not be started after the container of ${REPO}`));
+    expect(h.ui.warnings.some((line) => line.includes('Docker host '))).toBe(false);
+    expect(h.logger.warnings.some((line) => line.includes(`The Session Monitor on the local Docker could not be started again after the container of ${REPO}`))).toBe(true);
+  });
+
+  it('a target that cannot be read after `up` is a warning, and the open goes on (code note)', async () => {
+    let thrown = false;
+    const { h, calls } = setup((helper) => {
+      if (afterUp(helper) && !thrown) {
+        thrown = true;
+        throw new Error('docker context inspect failed');
+      }
+      return LOCAL;
+    });
+    await seedEnvironment(h, { container: 'stopped' });
+    const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(result.environment.id).toBe(ENV_ID);
+    expect(thrown).toBe(true);
+    expect(calls.filter((call) => call.startsWith('ensure'))).toHaveLength(1);
+    expect(h.helper.userCommandRuns).toHaveLength(1);
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining('The Session Monitor on the Docker engine could not be started after the container of'));
+    expect(h.ui.warnings).toContainEqual(expect.stringContaining('(docker context inspect failed)'));
+    expect(h.logger.warnings.some((line) => line.includes('The Session Monitor on the Docker engine could not be started again'))).toBe(true);
   });
 });
 

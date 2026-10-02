@@ -6204,16 +6204,19 @@ export class EnvironmentService {
     const image = ctx.helperImage;
     if (!sessionMonitor || !ctx.sessionMonitorEnsured || ctx.sessionMonitorEnsuredAfterStart || image === undefined) return;
     ctx.sessionMonitorEnsuredAfterStart = true;
-    const target = await this.dockerTarget();
-    if (target.kind !== 'remote' && target.kind !== 'local') return;
-    const engine = target.kind === 'local' ? 'the local Docker' : target.host;
+    // Review round 2 of PR #86: the target is read inside the try, so that a failure to read it is a warning too, never
+    // the refusal of an open whose container runs already. `undefined` while the engine is not known.
+    let engine: string | undefined;
     try {
+      const target = await this.dockerTarget();
+      if (target.kind !== 'remote' && target.kind !== 'local') return;
+      engine = target.kind === 'local' ? 'the local Docker' : target.host;
       await sessionMonitor.ensure(target, image.tag, ctx.signal, image.id);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
       const cause = errorMessage(error);
       this.logger.warn(
-        `The Session Monitor on ${engine} could not be started again after the container of ${ctx.env.repository} started; the heartbeats of the window try again: ${cause}`,
+        `The Session Monitor on ${engine ?? 'the Docker engine'} could not be started again after the container of ${ctx.env.repository} started; the heartbeats of the window try again: ${cause}`,
       );
       this.deps.ui.warn(Messages.sessionMonitorAfterStartFailed(ctx.env.repository, engine, cause));
     }
