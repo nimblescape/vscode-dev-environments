@@ -18,6 +18,8 @@ const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', conf
 let h: Harness | undefined;
 /** The seq of each first heartbeat (review round 2 of PR #39, L1). */
 let seqs: number[] = [];
+/** The signal of each ensure (review round 1 of PR #85, E10). */
+let ensureSignals: Array<AbortSignal | undefined> = [];
 
 afterEach(() => {
   h?.cleanup();
@@ -39,8 +41,10 @@ function setup(
 ): Setup {
   const calls: string[] = [];
   seqs = [];
+  ensureSignals = [];
   const sessionMonitor: EnvironmentSessionMonitor = {
-    ensure: async (target, helperTag, _signal, helperImage) => {
+    ensure: async (target, helperTag, signal, helperImage) => {
+      ensureSignals.push(signal);
       const host = engineOf(target);
       // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): the image ID of the helper image of the open.
       calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
@@ -185,6 +189,48 @@ describe('the Session Monitor in the open pipeline', () => {
       },
     });
     await expect(h.service.open(TARGET, { progress: h.progress, signal: controller.signal })).rejects.toMatchObject({ code: 'cancelled' });
+  });
+
+  // Review round 1 of PR #85 (mutants E06, E10): the ensure gets the signal of the open, and a cancellation in it is a
+  // cancellation, never the refusal of a monitor that could not be started.
+  it('passes the signal of the open to the ensure; a cancellation in it is not reported as a refusal', async () => {
+    const controller = new AbortController();
+    const { h } = setup(REMOTE, {
+      ensure: async () => {
+        controller.abort();
+        throw abortError();
+      },
+    });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await expect(h.service.openEnvironment(ENV_ID, { progress: h.progress, signal: controller.signal })).rejects.not.toMatchObject({ code: 'sessionMonitorFailed' });
+    expect(ensureSignals).toHaveLength(1);
+    expect(ensureSignals[0]?.aborted).toBe(true);
+    expect(h.logger.warnings.some((line) => line.includes('could not be started'))).toBe(false);
+  });
+
+  // Review round 1 of PR #85 (mutants E12, E17): the first heartbeat takes the flags of the entry as it is now (read
+  // again), with seq = the time before that read.
+  it('the first heartbeat reads the entry again (a flag set meanwhile counts), with seq taken before the read', async () => {
+    const readAt: number[] = [];
+    const { h, calls } = setup(REMOTE, {
+      ensure: async () => {
+        // Another window sets Keep Running When Closed while this open runs.
+        await h.registry.updateEnvironment(ENV_ID, (entry) => {
+          entry.keepRunning = true;
+        });
+        const get = h.registry.get.bind(h.registry);
+        h.registry.get = async (id: string) => {
+          readAt.push(h.clock.now());
+          return get(id);
+        };
+      },
+    });
+    await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } });
+    await h.service.openEnvironment(ENV_ID, { progress: h.progress });
+    expect(calls).toContain(`heartbeat build-box ${ENV_ID} true`);
+    expect(seqs).toHaveLength(1);
+    expect(readAt.length).toBeGreaterThan(0);
+    expect(seqs[0]).toBeLessThan(readAt[0]);
   });
 });
 

@@ -1171,6 +1171,8 @@ describe('Keep Running When Closed and Stop When Closed (unit 26)', () => {
     expect((await h.registry.get(ENV_ID))?.keepRunning).toBe(true);
     expect(warningMessages()).toContain(ControllerTexts.keepRunningNotSent('acme/api'));
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('No such container'));
+    // Review round 1 of PR #85 (mutant C03): no message of success after the warning.
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.keptRunning('acme/api'));
   });
 
   it('offers exactly one of the two commands in the context menu, by the flag of the row, and both with a picker in the Command Palette', () => {

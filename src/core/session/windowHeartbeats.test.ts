@@ -25,6 +25,9 @@ import {
   type WindowHeartbeatsDeps,
 } from './windowHeartbeats';
 import { HeartbeatPreparation } from './heartbeatPreparation';
+import { BUSY_MARK_MAX_AGE_MS } from '../busy';
+import { errorMessage } from '../errors';
+import { MAX_HEARTBEAT_ENVIRONMENTS } from '../remoteMonitor/protocol';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -76,17 +79,29 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
     repair: async (_target: DockerTarget): Promise<void> => {},
     /** Review round 2 of PR #85, A-R2-1: whether the container of an environment is on an engine (default: yes). */
     containerExists: (_target: DockerTarget, _environment: Environment): boolean | Promise<boolean> => true,
+    /** Review round 3 of PR #85: runs at each read of the registry (an advancing clock). */
+    onList: () => {},
+    /** Review round 3 of PR #85 (B-R3-6): replaces the answer of engineFor. */
+    lookUp: undefined as ((environment: Environment, use: { connected: boolean }) => Promise<DockerTarget | undefined>) | undefined,
   };
   const containerChecks: Array<{ target: DockerTarget; id: string }> = [];
+  /** Review round 3 of PR #85 (W75): the signals of the checks of a container. */
+  const checkSignals: AbortSignal[] = [];
   const deps: WindowHeartbeatsDeps = {
     owner: () => ({ windowId: WINDOW, pid: PID }),
     connected: () => state.connected,
-    registry: { list: async () => environments.map((item) => structuredClone(item)) },
+    registry: {
+      list: async () => {
+        state.onList();
+        return environments.map((item) => structuredClone(item));
+      },
+    },
     settings: () => settings,
     sourceId: () => SOURCE,
     engineFor: async (env, use) => {
       engineCalls.push(env.id);
       engineRoles.push(use.connected);
+      if (state.lookUp !== undefined) return state.lookUp(env, use);
       if (options.engines && env.id in options.engines) return options.engines[env.id];
       return env.dockerHost === 'build-box' ? REMOTE : LOCAL;
     },
@@ -100,8 +115,9 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
       signals.push(signal);
       return state.repair(target);
     },
-    containerExists: async (target, env) => {
+    containerExists: async (target, env, signal) => {
       containerChecks.push({ target, id: env.id });
+      checkSignals.push(signal);
       return state.containerExists(target, env);
     },
     warn: (message) => warnings.push(message),
@@ -114,7 +130,7 @@ function harness(options: { engines?: Record<string, DockerTarget | undefined> }
     clock: { now: () => now.value },
   };
   const heartbeats = new WindowHeartbeats(deps);
-  return { heartbeats, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks };
+  return { heartbeats, now, environments, sent, warnings, logs, repairs, engineCalls, engineRoles, signals, settings, state, containerChecks, checkSignals };
 }
 
 const entriesOf = (item: Sent) => item.input.environments.map(({ id, keepRunning }) => ({ id, keepRunning }));
@@ -895,5 +911,510 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
     h.heartbeats.dispose();
     await h.heartbeats.tick();
     expect(h.sent).toEqual([]);
+  });
+});
+
+// Review rounds 1 and 3 of PR #85: the rules of the heartbeats that the mutation tests of these rounds found untested.
+describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR #85)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Lets the pending promise callbacks run (without fake timers). */
+  const settle = async (until: () => boolean): Promise<void> => {
+    for (let i = 0; i < 200 && !until(); i += 1) await Promise.resolve();
+  };
+  const DESKTOP: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///home/me/.docker/desktop/docker.sock', context: 'desktop-linux' };
+  const busyMark = (extra: Partial<{ since: string; pid: number; windowId: string }> = {}) => ({
+    busy: { operation: 'update' as const, since: new Date(T0).toISOString(), pid: PID, windowId: WINDOW, ...extra },
+  });
+  const failed = (detail = 'timed out'): HeartbeatSendResult => ({ ok: false, missing: false, detail });
+  const missingMonitor: HeartbeatSendResult = { ok: false, missing: true, detail: 'No such container: devenv-session-monitor' };
+
+  describe('round 3', () => {
+    it('sendFor fails at once for a call of a tick that passed its deadline, and sends nothing (W95)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.answer = () => new Promise<HeartbeatSendResult>(() => {});
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await first;
+      let answer: unknown;
+      void h.heartbeats.sendFor(ID_A).then((value) => (answer = value));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(answer).toEqual({ ok: false, detail: HEARTBEAT_NO_ANSWER });
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it('a check of the container past the deadline: no heartbeat, no repair, its signal aborted, a failure (W73, W75)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.answer = () => missingMonitor;
+      h.state.containerExists = () => new Promise<boolean>(() => {});
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS - 1);
+      expect(h.checkSignals[0].aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await first;
+      // W75: the inspect is ended at the deadline, not left running.
+      expect(h.checkSignals[0].aborted).toBe(true);
+      expect(h.sent).toEqual([]);
+      expect(h.repairs).toEqual([]);
+      h.now.value = T0 + HEARTBEAT_ATTEMPT_DEADLINE_MS + 15_000;
+      const second = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await second;
+      expect(h.sent).toEqual([]);
+      expect(h.repairs).toEqual([]);
+      expect(h.warnings).toHaveLength(1);
+    });
+
+    it('an unverified connected environment and a busy one on its engine, both without their container: no repair (W64)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', busyMark()));
+      h.state.connected = ID_A;
+      h.state.answer = () => missingMonitor;
+      h.state.containerExists = () => false;
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_B, keepRunning: false }]]);
+      expect(h.repairs).toEqual([]);
+    });
+
+    it('sendFor of an environment this window does not show, without its container on the engine: no repair (W99)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api', busyMark()));
+      h.state.answer = () => missingMonitor;
+      h.state.containerExists = () => false;
+      expect(await h.heartbeats.sendFor(ID_A)).toMatchObject({ ok: false });
+      expect(h.sent).toHaveLength(1);
+      expect(h.repairs).toEqual([]);
+    });
+
+    it('a check of the container that rejects at the repair: no repair (W90)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api', busyMark()));
+      h.state.answer = () => missingMonitor;
+      h.state.containerExists = () => Promise.reject(new Error('Cannot connect to the Docker daemon'));
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(1);
+      expect(h.repairs).toEqual([]);
+    });
+
+    it('a slow heartbeat (60 s) within its deadline is no failure: one send, no warning at the ticks while it runs (W21)', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.answer = () => new Promise<HeartbeatSendResult>((resolve) => setTimeout(() => resolve({ ok: true }), 60_000));
+      const first = h.heartbeats.tick();
+      for (const t of [15_000, 30_000, 45_000]) {
+        await vi.advanceTimersByTimeAsync(15_000);
+        h.now.value = T0 + t;
+        await h.heartbeats.tick();
+      }
+      expect(h.sent).toHaveLength(1);
+      expect(h.warnings).toEqual([]);
+      expect(h.logs.filter((line) => line.includes('failed'))).toEqual([]);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await first;
+      expect(h.warnings).toEqual([]);
+    });
+
+    it('sends a heartbeat when the clock was set back by an hour (W26)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      h.now.value = T0 - 60 * 60_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(2);
+    });
+
+    it('fail, succeed, fail: no warning, and nothing is sent 15 s after the success (W31)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      h.state.answer = () => failed();
+      h.now.value = T0 + 30_000;
+      await h.heartbeats.tick();
+      h.state.answer = () => ({ ok: true });
+      h.now.value = T0 + 45_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(3);
+      h.state.answer = () => failed();
+      h.now.value = T0 + 60_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(3);
+      h.now.value = T0 + 75_000;
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(4);
+      expect(h.warnings).toEqual([]);
+    });
+
+    it('re-resolves and re-checks the engine of an environment that the window used again on another engine (W101, W41)', async () => {
+      const engines: Record<string, DockerTarget | undefined> = { [ID_A]: LOCAL };
+      const h = harness({ engines });
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      h.state.connected = null;
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      engines[ID_A] = DESKTOP;
+      h.state.connected = ID_A;
+      h.now.value = T0 + 30_000;
+      await h.heartbeats.tick();
+      expect(h.engineCalls).toEqual([ID_A, ID_A]);
+      expect(h.containerChecks.map((check) => check.target)).toEqual([LOCAL, DESKTOP]);
+      expect(h.sent.map((item) => item.target)).toEqual([LOCAL, DESKTOP]);
+    });
+
+    it('a check of an engine marks only that engine, not the one remembered meanwhile (W69)', async () => {
+      const engines: Record<string, DockerTarget | undefined> = { [ID_A]: LOCAL };
+      const h = harness({ engines });
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      const checks = new Map<string, (present: boolean) => void>();
+      h.state.containerExists = (target) => new Promise<boolean>((resolve) => checks.set(target.context ?? '', resolve));
+      const first = h.heartbeats.tick();
+      await settle(() => checks.has('default'));
+      // The window leaves the environment and shows it again on another engine while the first check still runs.
+      h.state.connected = null;
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      engines[ID_A] = DESKTOP;
+      h.state.connected = ID_A;
+      h.now.value = T0 + 30_000;
+      const third = h.heartbeats.tick();
+      await settle(() => checks.has('desktop-linux'));
+      checks.get('default')?.(true);
+      await first;
+      // The engine DESKTOP is not checked yet: sendFor joins its check and sends nothing before it.
+      const flag = h.heartbeats.sendFor(ID_A);
+      await settle(() => false);
+      expect(h.sent.filter((item) => item.target.context === 'desktop-linux')).toEqual([]);
+      checks.get('desktop-linux')?.(false);
+      await third;
+      expect(await flag).toMatchObject({ ok: false });
+      expect(h.sent.filter((item) => item.target.context === 'desktop-linux')).toEqual([]);
+    });
+
+    it('warns again for a new streak of an unresolved engine after the window left the environment (W50)', async () => {
+      const h = harness({ engines: { [ID_A]: undefined } });
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      expect(h.warnings).toHaveLength(1);
+      h.state.connected = null;
+      h.now.value = T0 + 30_000;
+      await h.heartbeats.tick();
+      h.state.connected = ID_A;
+      h.now.value = T0 + 45_000;
+      await h.heartbeats.tick();
+      h.now.value = T0 + 60_000;
+      await h.heartbeats.tick();
+      expect(h.warnings).toHaveLength(2);
+    });
+
+    it('takes the time left from the limit of the last successful heartbeat (W38)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      h.settings.stopAfterMinutes = 30;
+      h.state.answer = () => failed();
+      h.now.value = T0 + 15_000;
+      await h.heartbeats.tick();
+      h.now.value = T0 + 30_000;
+      await h.heartbeats.tick();
+      // The monitor holds the limit of 10 minutes from T0: 9 minutes 30 seconds are left (not 29 minutes).
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 9)]);
+    });
+
+    it('resolveHeartbeatEngine: a remote environment this window is busy with, the current target local: the context of its host (E07)', async () => {
+      const value: HeartbeatEngineSources = { windowContext: () => undefined, current: async () => LOCAL, ofContext: async () => undefined };
+      expect(await resolveHeartbeatEngine(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: false }, value)).toEqual({
+        kind: 'remote',
+        host: 'build-box',
+        endpoint: 'ssh://build-box',
+        context: remoteContextName('build-box'),
+      });
+    });
+
+    it('resolveHeartbeatEngine: the context `default` on a remote engine is no engine for a local environment (E09)', async () => {
+      const value: HeartbeatEngineSources = { windowContext: () => undefined, current: async () => REMOTE, ofContext: async () => REMOTE };
+      expect(await resolveHeartbeatEngine(environment(ID_A, 'acme/api'), { connected: true }, value)).toBeUndefined();
+    });
+  });
+
+  // Review round 3 of PR #85 (B-R3-6): the lookup of an engine is bounded and never stops the other heartbeats.
+  describe('the lookup of the engine is bounded (review round 3 of PR #85, B-R3-6)', () => {
+    it('a lookup past the deadline counts as an engine not found; the others are sent at once; no second lookup piles up', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'build-box', ...busyMark() }));
+      h.state.connected = ID_A;
+      h.state.lookUp = async (env) => (env.id === ID_A ? new Promise<DockerTarget | undefined>(() => {}) : REMOTE);
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      await first;
+      expect(h.sent.map((item) => [item.target, entriesOf(item)])).toEqual([[REMOTE, [{ id: ID_B, keepRunning: false }]]]);
+      expect(h.warnings).toEqual([]);
+      expect(h.logs.some((line) => line.includes(`The Docker engine of acme/api could not be found: ${HEARTBEAT_NO_ANSWER}`))).toBe(true);
+      // The lookup still hangs: the next tick counts it at once as a failure (the warning), without a new lookup.
+      h.now.value = T0 + HEARTBEAT_ATTEMPT_DEADLINE_MS + 15_000;
+      await h.heartbeats.tick();
+      expect(h.engineCalls.filter((id) => id === ID_A)).toHaveLength(1);
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 7)]);
+    });
+
+    it('lookups that hang run at the same time: the heartbeat of another engine waits one deadline, not one per lookup', async () => {
+      vi.useFakeTimers();
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'build-box', ...busyMark() }));
+      h.environments.push(environment('8d2e3f40-0000-4000-8000-000000000003', 'acme/lib', busyMark()));
+      h.state.connected = ID_A;
+      h.state.lookUp = async (env) => (env.id === ID_A || env.id === ID_B ? new Promise<DockerTarget | undefined>(() => {}) : LOCAL);
+      const first = h.heartbeats.tick();
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: '8d2e3f40-0000-4000-8000-000000000003', keepRunning: false }]]);
+      await first;
+    });
+
+    it('a lookup that throws counts as an engine not found and stops no other heartbeat', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.environments.push(environment(ID_B, 'acme/web', busyMark()));
+      h.state.connected = ID_A;
+      h.state.lookUp = async (env) => {
+        if (env.id === ID_A) throw new Error('docker context inspect crashed');
+        return LOCAL;
+      };
+      await h.heartbeats.tick();
+      h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_B, keepRunning: false }], [{ id: ID_B, keepRunning: false }]]);
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 9)]);
+      expect(h.logs.some((line) => line.includes('docker context inspect crashed'))).toBe(true);
+      // A lookup that ended is asked again at the next tick.
+      expect(h.engineCalls.filter((id) => id === ID_A)).toHaveLength(2);
+    });
+
+    it('sendFor with a lookup that throws gives a failure, never a rejection', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.lookUp = async () => {
+        throw new Error('boom');
+      };
+      expect(await h.heartbeats.sendFor(ID_A)).toEqual({ ok: false, detail: 'The Docker engine of the environment cannot be reached from this window.' });
+      expect(h.sent).toEqual([]);
+    });
+  });
+
+  // Review round 3 of PR #85 (A-R3-1): a failed build of the helper image for a heartbeat backs off per engine.
+  describe('the preparation of a heartbeat backs off per engine (review round 3 of PR #85, A-R3-1)', () => {
+    function preparedHarness() {
+      const h = harness();
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => h.now.value });
+      const builds: number[] = [];
+      const build = { fails: true };
+      h.state.answer = (target, signal) =>
+        preparation
+          .scope(() =>
+            preparation.prepare(
+              async () => {
+                builds.push(h.now.value - T0);
+                if (build.fails) throw new Error('docker build failed: no space left on device');
+              },
+              signal,
+              target,
+            ),
+          )
+          .then(
+            (): HeartbeatSendResult => ({ ok: true }),
+            (error: unknown): HeartbeatSendResult => failed(`the helper image could not be prepared: ${errorMessage(error)}`),
+          );
+      return { h, preparation, builds, build };
+    }
+
+    it('builds again only after 1, 2, then 5 minutes; each heartbeat in the wait fails at once and counts (Q4); a success resets', async () => {
+      const { h, preparation, builds, build } = preparedHarness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      let ticks = 0;
+      for (let t = 0; t < 480_000; t += 15_000) {
+        h.now.value = T0 + t;
+        await h.heartbeats.tick();
+        ticks += 1;
+      }
+      // A send at each tick (each fails), a build at 0, 1 minute later, 2 minutes after that, then after 5 minutes.
+      expect(h.sent).toHaveLength(ticks);
+      expect(builds).toEqual([0, 60_000, 180_000]);
+      expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 9)]);
+      expect(h.logs.some((line) => line.includes('prepared again in'))).toBe(true);
+      build.fails = false;
+      h.now.value = T0 + 480_000;
+      await h.heartbeats.tick();
+      expect(builds).toEqual([0, 60_000, 180_000, 480_000]);
+      expect(h.logs.some((line) => line.includes('answers again'))).toBe(true);
+      // The success reset the wait: the next failure builds at once, then waits 1 minute again.
+      build.fails = true;
+      h.now.value = T0 + 480_000 + WINDOW_HEARTBEAT_INTERVAL_MS;
+      await h.heartbeats.tick();
+      h.now.value = T0 + 480_000 + WINDOW_HEARTBEAT_INTERVAL_MS + 15_000;
+      await h.heartbeats.tick();
+      expect(builds).toEqual([0, 60_000, 180_000, 480_000, 510_000]);
+      for (let t = 540_000; t <= 570_000; t += 15_000) {
+        h.now.value = T0 + t;
+        await h.heartbeats.tick();
+      }
+      expect(builds).toEqual([0, 60_000, 180_000, 480_000, 510_000, 570_000]);
+      preparation.dispose();
+    });
+
+    it('waits per engine, and never for the preparation of an operation (outside the scope of a heartbeat)', async () => {
+      const now = { value: T0 };
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => now.value });
+      let builds = 0;
+      const failing = async (): Promise<void> => {
+        builds += 1;
+        throw new Error('build failed');
+      };
+      await expect(preparation.scope(() => preparation.prepare(failing, undefined, LOCAL))).rejects.toThrow('build failed');
+      await expect(preparation.scope(() => preparation.prepare(failing, undefined, LOCAL))).rejects.toThrow('prepared again in 60 seconds');
+      expect(builds).toBe(1);
+      // Another engine has its own wait; an operation of the user (no heartbeat scope) never waits.
+      await expect(preparation.scope(() => preparation.prepare(failing, undefined, REMOTE))).rejects.toThrow('build failed');
+      await expect(preparation.prepare(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      expect(builds).toBe(3);
+      // The build of a repair (run) shares the wait of its engine.
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('prepared again');
+      now.value = T0 + 60_000;
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('build failed');
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('prepared again in 120 seconds');
+      expect(builds).toBe(4);
+      preparation.dispose();
+    });
+
+    it('preparations that fail together count once', async () => {
+      const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
+      const failing = async (): Promise<void> => {
+        await Promise.resolve();
+        throw new Error('build failed');
+      };
+      await Promise.allSettled([preparation.run(failing, undefined, LOCAL), preparation.run(failing, undefined, LOCAL)]);
+      await expect(preparation.run(failing, undefined, LOCAL)).rejects.toThrow('prepared again in 60 seconds');
+      preparation.dispose();
+    });
+
+    it('removes its dispose listener when the work ends: a later dispose does not abort the signal of a finished work (P11)', async () => {
+      const preparation = new HeartbeatPreparation();
+      let given: AbortSignal | undefined;
+      await preparation.run(async (signal) => {
+        given = signal;
+      }, undefined);
+      preparation.dispose();
+      expect(given?.aborted).toBe(false);
+    });
+  });
+
+  describe('round 1', () => {
+    it('two remote engines: one series each, each heartbeat with only its own environment (W43)', async () => {
+      const OTHER_BOX: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: remoteContextName('other-box') };
+      const h = harness({ engines: { [ID_B]: OTHER_BOX } });
+      h.environments.push(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
+      h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'other-box', ...busyMark() }));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      expect(h.sent.map((item) => [item.target.host, entriesOf(item)])).toEqual([
+        ['other-box', [{ id: ID_B, keepRunning: false }]],
+        ['build-box', [{ id: ID_A, keepRunning: false }]],
+      ]);
+    });
+
+    it('two contexts of the same host are two engines (W42)', async () => {
+      const MY_BOX: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://me@build-box', context: 'my-box' };
+      const h = harness({ engines: { [ID_A]: MY_BOX } });
+      h.environments.push(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
+      h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'build-box', ...busyMark() }));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      expect(h.sent.map((item) => [item.target.context, entriesOf(item)])).toEqual([
+        [REMOTE.context, [{ id: ID_B, keepRunning: false }]],
+        ['my-box', [{ id: ID_A, keepRunning: false }]],
+      ]);
+    });
+
+    it('the tick sends keepRunningOnce as kept (W11)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api', { keepRunningOnce: true }));
+      h.state.connected = ID_A;
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: true }]]);
+    });
+
+    it('sendFor sends keepRunning false without a keep flag, and false again after Keep Running is removed (W46)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      await h.heartbeats.sendFor(ID_A);
+      h.environments[0].keepRunning = true;
+      await h.heartbeats.sendFor(ID_A);
+      h.environments[0].keepRunning = undefined;
+      await h.heartbeats.sendFor(ID_A);
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: false }], [{ id: ID_A, keepRunning: true }], [{ id: ID_A, keepRunning: false }]]);
+    });
+
+    it('leaves out an ID that the monitor cannot record, in the tick (W07) and in sendFor (W45)', async () => {
+      const h = harness();
+      h.environments.push(environment('legacy-1', 'acme/old', busyMark()));
+      h.environments.push(environment(ID_A, 'acme/api', busyMark()));
+      await h.heartbeats.tick();
+      expect(h.sent.map(entriesOf)).toEqual([[{ id: ID_A, keepRunning: false }]]);
+      expect(await h.heartbeats.sendFor('legacy-1')).toEqual({ ok: false, detail: 'The environment has an ID that the Session Monitor cannot record.' });
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it(`sends at most ${MAX_HEARTBEAT_ENVIRONMENTS} environments to one engine (W08, W09)`, async () => {
+      const h = harness();
+      for (let i = 0; i <= MAX_HEARTBEAT_ENVIRONMENTS; i += 1) {
+        h.environments.push(environment(`${i.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`, `acme/r${i}`, busyMark()));
+      }
+      await h.heartbeats.tick();
+      expect(h.sent).toHaveLength(1);
+      expect(h.sent[0].input.environments).toHaveLength(MAX_HEARTBEAT_ENVIRONMENTS);
+    });
+
+    it('takes seq before the registry is read, in the tick (W19) and in sendFor (W51)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api'));
+      h.state.connected = ID_A;
+      h.state.onList = () => {
+        h.now.value += 1_000;
+      };
+      await h.heartbeats.tick();
+      expect(h.sent[0].input.environments[0].seq).toBe(T0);
+      const before = h.now.value;
+      await h.heartbeats.sendFor(ID_A);
+      expect(h.sent[1].input.environments[0].seq).toBe(before);
+    });
+
+    it('a busy mark of another process, of another window, or from beyond its life in the future does not count (W03, W04, W06)', async () => {
+      const h = harness();
+      h.environments.push(environment(ID_A, 'acme/api', busyMark({ pid: PID + 1 })));
+      h.environments.push(environment(ID_B, 'acme/web', busyMark({ windowId: 'window-2' })));
+      h.environments.push(environment('8d2e3f40-0000-4000-8000-000000000003', 'acme/lib', busyMark({ since: new Date(T0 + BUSY_MARK_MAX_AGE_MS + 60_000).toISOString() })));
+      await h.heartbeats.tick();
+      expect(h.sent).toEqual([]);
+    });
   });
 });

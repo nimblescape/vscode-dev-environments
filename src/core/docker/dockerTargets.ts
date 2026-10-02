@@ -134,10 +134,11 @@ export class DockerTargets {
    * context cannot be read (logged). Does not change `last` and tells no listener. Never throws.
    */
   async ofContext(name: string): Promise<DockerTarget | undefined> {
-    if (!this.docker.isInstalled() || !CONTEXT_NAME.test(name)) return undefined;
-    const dockerHost = envValue(this.env, 'DOCKER_HOST', this.platform)?.trim();
-    if (dockerHost) return dockerTargetOf(dockerHost, undefined);
+    // Review round 3 of PR #85 (B-R3-6): never throws, also not from the check of the CLI or of DOCKER_HOST.
     try {
+      if (!CONTEXT_NAME.test(name) || !this.docker.isInstalled()) return undefined;
+      const dockerHost = envValue(this.env, 'DOCKER_HOST', this.platform)?.trim();
+      if (dockerHost) return dockerTargetOf(dockerHost, undefined);
       const result = await this.docker.run(['context', 'inspect', '--format', '{{json .}}', name], { timeoutMs: CONTEXT_INSPECT_TIMEOUT_MS });
       const parsed = result.exitCode === 0 ? parseContextInspect(result.stdout) : undefined;
       if (parsed) return dockerTargetOf(parsed.endpoint, parsed.name);

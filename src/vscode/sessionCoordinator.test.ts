@@ -493,6 +493,38 @@ describe('SessionCoordinator', () => {
     release();
   });
 
+  // Review round 1 of PR #85 (mutant K02): a window that stops during a periodic update sends no more heartbeats.
+  it('does not drive the window heartbeats when the coordinator stops during an update', async () => {
+    let ticks = 0;
+    let disposeOnSpawn = false;
+    let spawned = 0;
+    const coordinator: SessionCoordinator = h.create({
+      heartbeatMs: 20,
+      windowHeartbeats: {
+        tick: async () => {
+          ticks += 1;
+        },
+      },
+      spawnProcess: () => {
+        spawned += 1;
+        // The window closes while this update runs (between the status write and the heartbeats).
+        if (disposeOnSpawn) coordinator.dispose();
+        return { unref: () => {}, on: () => undefined };
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    await coordinator.start(ID_A);
+    const before = ticks;
+    const spawnedBefore = spawned;
+    disposeOnSpawn = true;
+    h.clock.time += MONITOR_START_GRACE_MS;
+    for (let i = 0; i < 50 && spawned === spawnedBefore; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(spawned).toBeGreaterThan(spawnedBefore);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(ticks).toBe(before);
+  });
+
   it('checks at each update that a monitor runs', async () => {
     const coordinator = h.create({ heartbeatMs: 20 });
     h.coordinator.dispose();

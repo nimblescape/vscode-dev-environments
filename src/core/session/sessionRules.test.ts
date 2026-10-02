@@ -35,6 +35,13 @@ describe('sessionRules (plan step 8, PR A)', () => {
     expect(monitorKeptWhenClosed({ id: 'x', busy: false, keepRunning: false, shutdownActionNone: true }, monitorSettings)).toBe(true);
   });
 
+  // Review round 1 of PR #85 (mutants R05, R08): a flag or setting that is not set is never a keep.
+  it('keepFlagsOf of an entry without flags is all false; respectShutdownActionNone unset does not respect it', () => {
+    expect(keepFlagsOf({})).toEqual({ keepRunning: false, shutdownActionNone: false });
+    expect(keptWhenClosed({ keepRunning: false, shutdownActionNone: true }, { stopOnClose: true })).toBe(false);
+    expect(keptWhenClosed({ keepRunning: false, shutdownActionNone: true }, { stopOnClose: true, respectShutdownActionNone: undefined })).toBe(false);
+  });
+
   it('isProcessAlive: this process lives, invalid IDs do not; the monitor re-exports it', () => {
     expect(isProcessAlive(process.pid)).toBe(true);
     expect(isProcessAlive(0)).toBe(false);

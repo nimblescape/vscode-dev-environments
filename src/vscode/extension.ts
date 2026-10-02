@@ -212,6 +212,8 @@ async function activateExtension(
   // Review round 2 of PR #85 (A-R2-2): the preparation that a heartbeat starts (the helper image for the worker, and for
   // a repair) runs with its own long signal (HELPER_PREBUILD_TIMEOUT_MS, aborted when the window closes); the deadline of
   // the heartbeat's attempt ends only its wait, so the next attempt joins the build instead of starting it again.
+  // Review round 3 of PR #85 (A-R3-1): after a failed build for a heartbeat, the next one on that engine waits 1, 2, then
+  // 5 minutes (REPAIR_BACKOFF_MS); a heartbeat within the wait fails at once and counts towards the Q4 warning.
   const heartbeatPreparation = new HeartbeatPreparation();
   context.subscriptions.push({ dispose: () => heartbeatPreparation.dispose() });
   const channels = new HelperChannels({
@@ -222,6 +224,8 @@ async function activateExtension(
       await heartbeatPreparation.prepare(
         (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
         signal,
+        // Review round 3 of PR #85 (A-R3-1): for a heartbeat, no new build on this engine within the wait after a failed one.
+        target,
       );
     },
     // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks that the helper image is present.
@@ -368,6 +372,8 @@ async function activateExtension(
         const image = await heartbeatPreparation.run(
           (preparing) => runWithDockerTarget(target, () => helper.ensureImagePresent({ onOutput: (text) => logger.output(text), signal: preparing })),
           signal,
+          // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat.
+          target,
         );
         await remoteMonitor.ensureOrThrow(image.tag, await engineSocket(target), signal, image.id);
       }),

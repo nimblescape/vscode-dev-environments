@@ -464,6 +464,22 @@ describe('MonitorLoop.tick', () => {
     expect(h.docker.count('stop')).toBe(0);
   });
 
+  // Review round 1 of PR #85 (mutant U02): Close and Keep Running (keepRunningOnce) after the decision keeps it as well.
+  it('does not stop when the environment becomes kept by Close and Keep Running after the decision', async () => {
+    await closedWindowScenario(h);
+    await runUntil(h, T0 + WAITING_MS);
+    h.docker.listHook = async () => {
+      await h.registry.updateEnvironment(ID_A, (environment) => {
+        environment.keepRunningOnce = true;
+      });
+    };
+    const result = await step(h);
+    expect(result.decision?.stop).toEqual([ID_A]);
+    expect(result.stopped).toEqual([]);
+    expect(h.docker.count('stop')).toBe(0);
+    expect(h.logger.lines).toContain('info acme/api keeps running when closed. Its container is not stopped.');
+  });
+
   it('does not stop when a window connects while the Git state is read', async () => {
     await closedWindowScenario(h);
     await runUntil(h, T0 + WAITING_MS);

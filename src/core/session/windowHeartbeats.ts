@@ -36,6 +36,12 @@
 // failed heartbeat towards the Q4 warning) and nothing is sent or repaired for that environment there. A verified engine
 // is kept; after a failed heartbeat it is checked again. A repair (the start of a missing monitor container) happens only
 // on an engine where an environment of the heartbeat has its container (for the busy marks, checked at the repair).
+//
+// Review round 3 of PR #85 (B-R3-6): `engineFor` is bounded like an attempt: a lookup that throws, or still runs after
+// HEARTBEAT_ATTEMPT_DEADLINE_MS, counts as an engine that cannot be found (for the connected environment, a failed
+// heartbeat towards the Q4 warning); a lookup that still runs is joined, and once it passed its deadline each tick counts
+// it at once, without a new lookup. The lookups of the environments of a tick run at the same time, so one that hangs
+// never stops the heartbeats of the others.
 // No `vscode`; never throws (except from a `deps` call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
@@ -147,7 +153,8 @@ interface Group {
   connected?: Environment;
 }
 
-function engineKey(target: DockerTarget): string {
+/** The identity of an engine: its series, its in-flight guard, the wait after failed preparations (A-R3-1). */
+export function engineKey(target: DockerTarget): string {
   return JSON.stringify([target.kind, target.host, target.context ?? null, target.endpoint]);
 }
 
@@ -209,6 +216,8 @@ export class WindowHeartbeats {
   private readonly envSentAt = new Map<string, number>();
   /** A-R1-2: engine key → the call that runs on it. */
   private readonly inFlight = new Map<string, InFlight>();
+  /** B-R3-6: env id and role → the lookup of its engine (engineFor) that runs. */
+  private readonly resolving = new Map<string, { done: Promise<DockerTarget | undefined>; expired: boolean }>();
   /** The environments and engines of a tick are being read (the sends of a tick then run per engine). */
   private collecting = false;
   private disposed = false;
@@ -308,11 +317,13 @@ export class WindowHeartbeats {
     for (const id of [...this.unresolved.keys()]) if (id !== connected) this.unresolved.delete(id);
     const settings = this.deps.settings();
     const byEngine = new Map<string, Group>();
-    for (const environment of used) {
-      // An id that the monitor cannot record (not of newEnvironmentId) is left out.
-      if (!isRemoteEnvironmentId(environment.id)) continue;
+    // An id that the monitor cannot record (not of newEnvironmentId) is left out.
+    const recordable = used.filter((environment) => isRemoteEnvironmentId(environment.id));
+    // B-R3-6: the engines are looked up at the same time, each within its deadline.
+    const targets = await Promise.all(recordable.map((environment) => this.engineOf(environment, environment.id === connected)));
+    for (const [index, environment] of recordable.entries()) {
       const isConnected = environment.id === connected;
-      const target = await this.engineOf(environment, isConnected);
+      const target = targets[index];
       if (target === undefined) {
         if (isConnected) this.countUnresolved(environment, now, stopAfterSeconds(settings.stopAfterMinutes));
         continue;
@@ -563,7 +574,7 @@ export class WindowHeartbeats {
   private async engineOf(environment: Environment, connected: boolean): Promise<DockerTarget | undefined> {
     const known = this.engines.get(environment.id);
     if (known !== undefined && known.connected === connected) return known.target;
-    const target = await this.deps.engineFor(environment, { connected });
+    const target = await this.lookUpEngine(environment, connected);
     if (target === undefined || (target.kind !== 'local' && target.kind !== 'remote')) {
       if (!this.unreachable.has(environment.id)) {
         this.unreachable.add(environment.id);
@@ -574,6 +585,48 @@ export class WindowHeartbeats {
     this.unreachable.delete(environment.id);
     this.engines.set(environment.id, { target, connected });
     return target;
+  }
+
+  /**
+   * B-R3-6: `engineFor`, within HEARTBEAT_ATTEMPT_DEADLINE_MS; undefined when it throws or passed the deadline. A lookup
+   * that runs is joined; once it passed its deadline, undefined at once (no second lookup piles up).
+   */
+  private async lookUpEngine(environment: Environment, connected: boolean): Promise<DockerTarget | undefined> {
+    const id = `${environment.id} ${connected}`;
+    let entry = this.resolving.get(id);
+    if (entry?.expired) return undefined;
+    if (entry === undefined) {
+      let started: Promise<DockerTarget | undefined>;
+      try {
+        started = Promise.resolve(this.deps.engineFor(environment, { connected }));
+      } catch (error) {
+        started = Promise.reject(error);
+      }
+      const done = started.catch((error: unknown) => {
+        this.deps.logger.warn(`The Docker engine of ${environment.repository} could not be found: ${errorMessage(error)}`);
+        return undefined;
+      });
+      const registered = { done, expired: false };
+      entry = registered;
+      this.resolving.set(id, registered);
+      void done.finally(() => {
+        if (this.resolving.get(id) === registered) this.resolving.delete(id);
+      });
+    }
+    const running = entry;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        running.expired = true;
+        this.deps.logger.warn(`The Docker engine of ${environment.repository} could not be found: ${HEARTBEAT_NO_ANSWER}.`);
+        resolve(undefined);
+      }, HEARTBEAT_ATTEMPT_DEADLINE_MS);
+    });
+    try {
+      return await Promise.race([running.done, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private seriesOf(target: DockerTarget, now: number): Series {
