@@ -12,7 +12,10 @@
 //   - when the window leaves its environment (setEnvironment to another one or none, a second start) and when it closes
 //     (deactivate), the short release of the environment it leaves (user decisions Q1 and Q2 of 2026-10-02:
 //     src/core/session/windowRelease.ts, which records the Git state first), bounded; deactivate() waits for it, within
-//     CLOSE_RELEASE_BOUNDS, after the synchronous `closing` write;
+//     CLOSE_RELEASE_BOUNDS, after the synchronous `closing` write; nothing while another window of this computer uses it
+//     (otherWindowUses; review round 1 of PR #87, A-R1-2);
+//   - review round 1 of PR #87 (A-R1-1): the first heartbeat of an environment right after its first status write (at
+//     start, and when the window changes to another environment), not after the first interval;
 //   - at activation and every hour, the sweep of the storage folder (sweepStorage) and the removal of the status files of
 //     other windows whose process ended (cleanUpStorage).
 //
@@ -25,12 +28,12 @@ import { HEARTBEAT_MAX_AGE_MS, PENDING_MAX_AGE_MS, waitingTimeMs } from '../core
 import { errorMessage } from '../core/errors';
 import { isoTime, systemClock, type Clock, type Logger } from '../core/ports';
 import { isProcessAlive } from '../core/session/sessionRules';
-import { CLOSE_RELEASE_BOUNDS, SWITCH_RELEASE_BOUNDS, type ReleaseBounds } from '../core/session/windowRelease';
+import { CLOSE_RELEASE_BOUNDS, SWITCH_RELEASE_BOUNDS, otherWindowHoldsEnvironment, type ReleaseBounds } from '../core/session/windowRelease';
 import { atomicTemporaryPath } from '../core/storage/atomicJson';
 import { retryTransient, retryTransientSync, type StoragePaths } from '../core/storage/paths';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import { STORAGE_SWEEP_INTERVAL_MS, sweepStorage } from '../core/storage/storageSweep';
-import type { ExtensionSettings, PendingConnection, WindowStatus } from '../core/types';
+import type { Environment, ExtensionSettings, PendingConnection, WindowStatus } from '../core/types';
 
 /** Interval of the window status file updates (concept 7.9). */
 export const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -174,6 +177,7 @@ export class SessionCoordinator implements vscode.Disposable {
       this.currentEnvironmentId = environmentId;
       const pending = await this.freshPending(environmentId);
       await this.writeStatus();
+      this.tickNow(previous, environmentId);
       this.releaseLeft(previous, environmentId);
       return pending;
     }
@@ -192,6 +196,10 @@ export class SessionCoordinator implements vscode.Disposable {
     this.cleanupTimer = setInterval(() => void this.cleanUpStorage(), this.cleanupMs);
     this.cleanupTimer.unref?.();
     await this.writeStatus();
+    // Review round 1 of PR #87 (A-R1-1): the first heartbeat at once, not after the first interval: a reload of this
+    // window follows the short release of its previous activation, which must not run out before this window's long
+    // heartbeat reaches the monitor. Not awaited; never throws.
+    if (!this.stopped && environmentId !== null) void this.deps.windowHeartbeats?.tick();
     await this.cleanUpStorage();
     return pending;
   }
@@ -206,7 +214,17 @@ export class SessionCoordinator implements vscode.Disposable {
     this.currentEnvironmentId = environmentId;
     if (!this.started) return;
     await this.writeStatus();
+    this.tickNow(previous, environmentId);
     this.releaseLeft(previous, environmentId);
+  }
+
+  /**
+   * Review round 1 of PR #87 (A-R1-1): after a change to another environment, its first heartbeat at once (it may have
+   * been released a moment ago, by this window or by a reload of it). Not awaited; never throws.
+   */
+  private tickNow(previous: string | null, next: string | null): void {
+    if (this.stopped || next === null || next === previous) return;
+    void this.deps.windowHeartbeats?.tick();
   }
 
   /**
@@ -228,6 +246,22 @@ export class SessionCoordinator implements vscode.Disposable {
       if (!Number.isFinite(updatedAt) || Math.abs(now - updatedAt) > HEARTBEAT_MAX_AGE_MS) return false;
       return this.isAlive(status.pid);
     });
+  }
+
+  /**
+   * Review round 1 of PR #87 (A-R1-2): whether another window of this computer uses `environment`, so this window must
+   * not release it (otherWindowHoldsEnvironment: a status file, a fresh pending connection file, or a live busy mark of
+   * another window). True when the files cannot be read (not known: nothing is released, the long limit stays). Never
+   * throws.
+   */
+  async otherWindowUses(environment: Environment): Promise<boolean> {
+    try {
+      const [windowStatuses, pendings] = await Promise.all([this.sessionFiles.readWindowStatuses(), this.sessionFiles.readPendings()]);
+      return otherWindowHoldsEnvironment(environment, this.windowId, { now: this.clock.now(), isAlive: this.isAlive, windowStatuses, pendings });
+    } catch (error) {
+      this.logger.warn(`It is not known whether another window uses ${environment.repository}; it is not released. ${errorMessage(error)}`);
+      return true;
+    }
   }
 
   /**

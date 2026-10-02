@@ -11,7 +11,7 @@ import type { Logger } from '../core/ports';
 import { StoragePaths } from '../core/storage/paths';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import { ATOMIC_TEMPORARY_FILE, STALE_PENDING_MAX_AGE_MS } from '../core/storage/storageSweep';
-import type { ExtensionSettings, WindowStatus } from '../core/types';
+import type { Environment, ExtensionSettings, WindowStatus } from '../core/types';
 import { CLOSE_RELEASE_BOUNDS, SWITCH_RELEASE_BOUNDS, type ReleaseBounds } from '../core/session/windowRelease';
 import { HEARTBEAT_INTERVAL_MS, SessionCoordinator, type SessionCoordinatorDeps } from './sessionCoordinator';
 
@@ -263,10 +263,11 @@ describe('SessionCoordinator', () => {
     h.coordinator.dispose();
     h.coordinator = coordinator;
     await coordinator.start(ID_A);
-    expect(ticks).toBe(0);
+    // Changed expectation, review round 1 of PR #87, A-R1-1: the first heartbeat goes at once after the first status write.
+    expect(ticks).toBe(1);
     await nextHeartbeat(coordinator);
     await nextHeartbeat(coordinator);
-    expect(ticks).toBeGreaterThanOrEqual(2);
+    expect(ticks).toBeGreaterThanOrEqual(3);
     coordinator.dispose();
     const after = ticks;
     await new Promise((resolve) => setTimeout(resolve, 60));
@@ -610,5 +611,130 @@ describe('SessionCoordinator: the cleanup of the storage folder (plan step 8, PR
     fs.mkdirSync(h.root, { recursive: true });
     fs.writeFileSync(h.paths.sessionsDir, 'not a folder');
     await expect(h.coordinator.cleanUpStorage()).resolves.toBeUndefined();
+  });
+});
+
+// Review round 1 of PR #87: the first heartbeat at once (A-R1-1), the other windows that hold an environment (A-R1-2),
+// and the bounds and failures of the close (mutants C07 and C24).
+describe('SessionCoordinator: review round 1 of PR #87', () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = createHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function withTicks(): { ticks: () => number } {
+    let ticks = 0;
+    const coordinator = h.create({
+      heartbeatMs: 60_000,
+      windowHeartbeats: {
+        tick: async () => {
+          ticks += 1;
+        },
+      },
+    });
+    h.coordinator.dispose();
+    h.coordinator = coordinator;
+    return { ticks: () => ticks };
+  }
+
+  it('A-R1-1: start sends the first heartbeat right after the first status write, not after the first interval', async () => {
+    const counter = withTicks();
+    let statusAtTick: WindowStatus | undefined;
+    const coordinator = h.create({
+      heartbeatMs: 60_000,
+      windowHeartbeats: {
+        tick: async () => {
+          statusAtTick = readStatus(h);
+        },
+      },
+    });
+    await coordinator.start(ID_A);
+    expect(statusAtTick?.environmentId).toBe(ID_A);
+    coordinator.dispose();
+    // A window without an environment has nothing to send.
+    await h.coordinator.start(null);
+    expect(counter.ticks()).toBe(0);
+  });
+
+  it('A-R1-1: setEnvironment and a second start to another environment send its heartbeat at once; none for no environment or the same one', async () => {
+    const counter = withTicks();
+    await h.coordinator.start(ID_A);
+    expect(counter.ticks()).toBe(1);
+    await h.coordinator.setEnvironment(ID_B);
+    expect(counter.ticks()).toBe(2);
+    await h.coordinator.setEnvironment(ID_B);
+    await h.coordinator.setEnvironment(null);
+    expect(counter.ticks()).toBe(2);
+    await h.coordinator.start(ID_A);
+    expect(counter.ticks()).toBe(3);
+    await h.coordinator.start(ID_A);
+    expect(counter.ticks()).toBe(3);
+    // Not after the window closed.
+    h.coordinator.deactivateSync();
+    await h.coordinator.setEnvironment(ID_B);
+    expect(counter.ticks()).toBe(3);
+  });
+
+  it('A-R1-2: otherWindowUses counts a status file, a fresh pending connection file, and a live busy mark of another window', async () => {
+    await h.coordinator.start(null);
+    const env = (extra: Partial<Environment> = {}): Environment => ({ id: ID_B, repository: 'acme/web', ...extra }) as Environment;
+    expect(await h.coordinator.otherWindowUses(env())).toBe(false);
+    // A pending connection file of another window.
+    await h.sessionFiles.writePending(ID_B, 'window-2');
+    expect(await h.coordinator.otherWindowUses(env())).toBe(true);
+    await h.sessionFiles.removePending(ID_B);
+    // A status file of another live window.
+    await h.sessionFiles.writeWindowStatus({ windowId: 'window-2', pid: OTHER_PID, environmentId: ID_B, state: 'active', updatedAt: iso(T0) });
+    expect(await h.coordinator.otherWindowUses(env())).toBe(true);
+    // A live busy mark of another window (its status file names another environment).
+    await h.sessionFiles.writeWindowStatus({ windowId: 'window-2', pid: OTHER_PID, environmentId: null, state: 'active', updatedAt: iso(T0) });
+    expect(await h.coordinator.otherWindowUses(env())).toBe(false);
+    expect(await h.coordinator.otherWindowUses(env({ busy: { operation: 'rebuild', since: iso(T0), pid: OTHER_PID, windowId: 'window-2' } }))).toBe(true);
+    // Not a busy mark of this window.
+    expect(await h.coordinator.otherWindowUses(env({ busy: { operation: 'rebuild', since: iso(T0), pid: OWN_PID, windowId: 'window-1' } }))).toBe(false);
+  });
+
+  it('A-R1-2: otherWindowUses says yes when the files cannot be read (nothing is released), and logs it', async () => {
+    await h.coordinator.start(null);
+    h.sessionFiles.readPendings = async () => {
+      throw new Error('pending unreadable');
+    };
+    expect(await h.coordinator.otherWindowUses({ id: ID_B, repository: 'acme/web' } as Environment)).toBe(true);
+    expect(h.logger.lines.some((line) => line.startsWith('warn') && line.includes('pending unreadable'))).toBe(true);
+  });
+
+  // B-R1-3 (mutant C07): the bound of a close holds also for a switch release that still runs (its own bound is longer).
+  it('B-R1-3: deactivate ends after the bound of a close also while the release of a switch hangs', async () => {
+    await h.coordinator.start(ID_A);
+    h.releaseImpl = () => new Promise(() => {});
+    await h.coordinator.setEnvironment(ID_B);
+    await vi.waitFor(() => expect(h.releases).toHaveLength(1));
+    vi.useFakeTimers();
+    let done = false;
+    const deactivated = h.coordinator.deactivate().then(() => (done = true));
+    expect(h.releases.map((release) => release.bounds)).toEqual([SWITCH_RELEASE_BOUNDS, CLOSE_RELEASE_BOUNDS]);
+    await vi.advanceTimersByTimeAsync(CLOSE_RELEASE_BOUNDS.totalMs - 1);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await deactivated;
+    expect(done).toBe(true);
+    expect(CLOSE_RELEASE_BOUNDS.totalMs).toBeLessThan(SWITCH_RELEASE_BOUNDS.totalMs);
+  });
+
+  // B-R1-5 (mutant C24): a failed sweep is logged, start() still resolves, and the status files are still cleaned up.
+  it('B-R1-5: a failed sweep of the storage folder does not reject start(); it is logged and the status cleanup still runs', async () => {
+    fs.mkdirSync(h.paths.sessionsDir, { recursive: true });
+    await h.sessionFiles.writeWindowStatus({ windowId: 'dead-old', pid: DEAD_PID, environmentId: ID_B, state: 'closing', updatedAt: iso(T0 - 3_600_000) });
+    Object.defineProperty(h.paths, 'disconnectDir', {
+      get: () => {
+        throw new Error('sweep broken');
+      },
+    });
+    await expect(h.coordinator.start(ID_A)).resolves.toBeUndefined();
+    expect(h.logger.lines).toContain('warn The storage folder could not be cleaned up. sweep broken');
+    expect(sessionFileNames(h)).toEqual(['window-1.json']);
   });
 });

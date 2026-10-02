@@ -266,3 +266,24 @@ describe('the pattern of devEnvLauncher.imageUpdates', () => {
     }
   });
 });
+
+// Review round 1 of PR #87 (A-R1-2): a release is marked in the heartbeat and in its records.
+describe('release heartbeats and records (review round 1 of PR #87, A-R1-2)', () => {
+  const valid = { source: SOURCE, limitSeconds: 210, environments: [{ id: ID, keepRunning: false, seq: 1 }] };
+
+  it('accepts `release: true` and keeps it; refuses any other value', () => {
+    expect(parseHeartbeatInput(input({ ...valid, release: true }))).toEqual({ ...valid, release: true });
+    expect(parseHeartbeatInput(input(valid))).toEqual(valid);
+    expect(parseHeartbeatInput(input(valid))).not.toHaveProperty('release');
+    for (const release of [false, 'true', 1, null]) expect(parseHeartbeatInput(input({ ...valid, release })), String(release)).toBeUndefined();
+    expect(parseHeartbeatInput(input({ ...valid, release: true, extra: 1 }))).toBeUndefined();
+  });
+
+  it('parses a release record, and refuses a record with another value of `release`', () => {
+    const plain = { at: 1000, keepRunning: false, limitSeconds: 210, seq: 7 };
+    expect(parseHeartbeatRecord(input({ ...plain, release: true }))).toEqual({ ...plain, release: true });
+    expect(parseHeartbeatRecord(input(plain))).toEqual(plain);
+    expect(parseHeartbeatRecord(input({ ...plain, release: false }))).toBeUndefined();
+    expect(parseHeartbeatRecord(input({ ...plain, release: 'yes' }))).toBeUndefined();
+  });
+});

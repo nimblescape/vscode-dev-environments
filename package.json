@@ -593,7 +593,7 @@
           "scope": "application",
           "default": 30,
           "minimum": 0,
-          "description": "Waiting time in seconds before a stop after a window closed or left its environment; the Session Monitor container waits at least 60 seconds. It prevents a stop during a window reload."
+          "description": "Waiting time in seconds before a stop after a window closed or left its environment; the Session Monitor container waits at least 60 seconds, plus a margin of 150 seconds for the first heartbeat of a reloaded window. It prevents a stop during a window reload."
         },
         "devEnvLauncher.stopAfterMinutes": {
           "type": "number",

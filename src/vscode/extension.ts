@@ -40,6 +40,7 @@ import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
+import { ClosingWork } from '../core/session/closingWork';
 import { heartbeatWiring, monitorEnsure } from '../core/session/heartbeatWiring';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
@@ -92,16 +93,18 @@ export const ImageListTexts = {
 let coordinator: SessionCoordinator | undefined;
 /**
  * Plan step 8, PR C: the work of deactivate() (the release of the window's environment, bounded). VS Code disposes the
- * subscriptions right after it calls deactivate(); the worker channels wait for this first, so the release still has its
- * worker (the release before channels.dispose()).
+ * subscriptions right after it calls deactivate(); review round 1 of PR #87 (B-R1-7 (a)): the worker channels with their
+ * router, the preparation of the heartbeats, and the logger are disposed only after it settled (ClosingWork.deferred),
+ * so the release still has its worker, can open it again, and logs to a live channel.
  */
-let closingWork: Promise<void> | undefined;
+const closingWork = new ClosingWork();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Concept 7.10: the reopen rule measures the age of the reopen record at this time, before any await.
   const activatedAt = systemClock.now();
   const logger = new OutputChannelLogger();
-  context.subscriptions.push(logger);
+  // Review round 1 of PR #87 (B-R1-7 (a)): the release of deactivate() still logs.
+  context.subscriptions.push(closingWork.deferred(logger));
   try {
     await activateExtension(context, logger, activatedAt);
   } catch (error) {
@@ -117,13 +120,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  * the long limit of the heartbeats.
  */
 export function deactivate(): Promise<void> | undefined {
-  try {
-    closingWork = coordinator?.deactivate();
-  } catch {
-    // deactivate never throws.
-    closingWork = undefined;
-  }
-  return closingWork;
+  // Never throws; the disposals of ClosingWork.deferred wait for this promise.
+  return closingWork.begin(() => coordinator?.deactivate());
 }
 
 async function activateExtension(
@@ -232,7 +230,9 @@ async function activateExtension(
     inTarget: runWithDockerTarget,
     onOutput: (text) => logger.output(text),
     operationTarget: operationDockerTarget,
-    subscriptions: context.subscriptions,
+    // Review round 1 of PR #87 (B-R1-7 (a)): the preparation is disposed only after the release of deactivate(), which
+    // may need to open the worker again.
+    subscriptions: closingWork.deferredSubscriptions(context.subscriptions),
   });
   const heartbeatPreparation = heartbeats.preparation;
   // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
@@ -282,17 +282,15 @@ async function activateExtension(
   });
   helperChannels = channels;
   docker.setRouter((target, args, options) => channels.docker(target, args, options));
-  context.subscriptions.push({
-    dispose: () => {
-      // Plan step 8, PR C: after the release of deactivate() (bounded; it never rejects), which needs the worker.
-      const close = (): void => {
+  // Plan step 8, PR C: after the release of deactivate() (bounded; it never rejects), which needs the worker.
+  context.subscriptions.push(
+    closingWork.deferred({
+      dispose: () => {
         docker.setRouter(undefined);
         channels.dispose();
-      };
-      if (closingWork === undefined) close();
-      else void closingWork.finally(close);
-    },
-  });
+      },
+    }),
+  );
   // Unit 7, PR 2: the Session Monitor container of a Docker engine (plan step 8, PR A: every engine, local and remote).
   // Its script is dist/remoteMonitor.js, read once.
   const remoteMonitorScript = context.asAbsolutePath(path.join('dist', 'remoteMonitor.js'));
@@ -473,7 +471,8 @@ async function activateExtension(
         {
           registry,
           settings: getSettings,
-          otherWindowUses: async (id) => (await sessionCoordinator.otherActiveWindows()).some((status) => status.environmentId === id),
+          // Review round 1 of PR #87 (A-R1-2): status files, pending connection files, and busy marks of other windows.
+          otherWindowUses: (environment) => sessionCoordinator.otherWindowUses(environment),
           // Q2 (c): in the running dev container as its user, on the engine this window uses it on, through its worker.
           recordGitState: async (environment, signal) => {
             const target = await windowHeartbeats.connectedEngine(environment);

@@ -45,8 +45,9 @@
 //
 // Plan step 8, PR C (user decision Q1 of 2026-10-02): `release` sends the short release of an environment this window
 // leaves (close, switch): one heartbeat with the short limit to the engine the window used it on, within its caller's
-// signal; a lost release leaves the long limit of the last heartbeat (the safe side). The first heartbeat of a series on an
-// engine, and the first after a change of the settings that decide a keep (stopOnClose, respectShutdownActionNone), also
+// signal; a lost release leaves the long limit of the last heartbeat (the safe side). Review round 1 of PR #87 (A-R1-2):
+// the release is marked (`release: true`), so the monitor never lets it shorten the live record of another computer.
+// The first heartbeat of a series on an engine, and the first after a change of the settings that decide a keep (stopOnClose, respectShutdownActionNone), also
 // carries `clearOnly` entries for the environments of this computer on that engine that the registry no longer keeps
 // (they replace the full sync of the removed local Session Monitor): the monitor writes such an entry only over a keep of
 // this same computer, so it never overrules another computer or a window that uses the environment.
@@ -356,7 +357,9 @@ export class WindowHeartbeats {
         this.markVerified(environment.id, target);
       }
       const kept = keptWhenClosed(keepFlagsOf(environment), this.deps.settings());
-      const input: HeartbeatInput = { source: this.deps.sourceId(), limitSeconds, environments: [{ id: environment.id, keepRunning: kept, seq }] };
+      // Review round 1 of PR #87 (A-R1-2): marked as a release, so the monitor never lets it shorten the live record of
+      // another computer (rules.ts, decide).
+      const input: HeartbeatInput = { source: this.deps.sourceId(), limitSeconds, environments: [{ id: environment.id, keepRunning: kept, seq }], release: true };
       const key = engineKey(target);
       for (let running = this.inFlight.get(key); running !== undefined; running = this.inFlight.get(key)) {
         if (running.expired) return { ok: false, detail: HEARTBEAT_NO_ANSWER };
@@ -556,22 +559,29 @@ export class WindowHeartbeats {
     outer?: AbortSignal,
   ): Promise<HeartbeatSendResult> {
     const controller = new AbortController();
-    // Plan step 8, PR C: the signal of a release (its bound) ends the attempt too.
-    const onOuterAbort = (): void => controller.abort(new Error(`The heartbeat got ${HEARTBEAT_NO_ANSWER}.`));
+    // Plan step 8, PR C: the signal of a release (its bound) ends the attempt too. Review round 1 of PR #87 (A-R1-3): the
+    // call then counts as expired, like one past its deadline: while it still hangs, each due heartbeat of the engine
+    // counts as a failure (the Q4 warning) and sendFor ends at once, instead of waiting for it without end.
+    let entry: InFlight | undefined;
+    const onOuterAbort = (): void => {
+      if (entry !== undefined) entry.expired = true;
+      controller.abort(new Error(`The heartbeat got ${HEARTBEAT_NO_ANSWER}.`));
+    };
     if (outer?.aborted) onOuterAbort();
     else outer?.addEventListener('abort', onOuterAbort, { once: true });
     const call = this.sendWithRepair(series, input, controller.signal, environments, verified);
-    const entry: InFlight = { done: call, expired: false };
-    this.inFlight.set(key, entry);
+    const registered: InFlight = { done: call, expired: outer?.aborted === true };
+    entry = registered;
+    this.inFlight.set(key, registered);
     void call
       .catch(() => undefined)
       .finally(() => {
-        if (this.inFlight.get(key) === entry) this.inFlight.delete(key);
+        if (this.inFlight.get(key) === registered) this.inFlight.delete(key);
       });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<HeartbeatSendResult>((resolve) => {
       timer = setTimeout(() => {
-        entry.expired = true;
+        registered.expired = true;
         controller.abort(new Error(`The heartbeat got ${HEARTBEAT_NO_ANSWER}.`));
         resolve({ ok: false, missing: false, detail: HEARTBEAT_NO_ANSWER });
       }, HEARTBEAT_ATTEMPT_DEADLINE_MS);

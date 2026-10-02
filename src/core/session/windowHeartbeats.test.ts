@@ -28,7 +28,7 @@ import {
 import { HeartbeatPreparation } from './heartbeatPreparation';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { errorMessage } from '../errors';
-import { MAX_HEARTBEAT_ENVIRONMENTS } from '../remoteMonitor/protocol';
+import { MAX_HEARTBEAT_ENVIRONMENTS, parseHeartbeatInput } from '../remoteMonitor/protocol';
 
 const ID_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const ID_B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -1904,7 +1904,8 @@ describe('WindowHeartbeats.release (plan step 8, PR C, Q1)', () => {
     expect(await h.heartbeats.release(ID_A, 60, new AbortController().signal)).toEqual({ ok: true });
     expect(h.sent).toHaveLength(2);
     expect(h.sent[1].target).toEqual(REMOTE);
-    expect(h.sent[1].input).toEqual({ source: SOURCE, limitSeconds: 60, environments: [{ id: ID_A, keepRunning: false, seq: T0 + 5_000 }] });
+    // Changed expectation, review round 1 of PR #87, A-R1-2: the release is marked as such.
+    expect(h.sent[1].input).toEqual({ source: SOURCE, limitSeconds: 60, environments: [{ id: ID_A, keepRunning: false, seq: T0 + 5_000 }], release: true });
     // The engine is asked as the connected environment, and only once (it was remembered).
     expect(h.engineRoles).toEqual([true]);
   });
@@ -2029,5 +2030,89 @@ describe('WindowHeartbeats: clear-only entries for environments that are no long
     await h.heartbeats.tick();
     expect(h.sent[0].input.environments).toHaveLength(MAX_HEARTBEAT_ENVIRONMENTS);
     expect(entriesOf(h.sent[0])).toEqual([{ id: ID_A, keepRunning: false }]);
+  });
+});
+
+// Review round 1 of PR #87: the release paths and the rules that mutants showed untested.
+describe('WindowHeartbeats: release paths (review round 1 of PR #87)', () => {
+  const ID_C = '8d2e3f40-0000-4000-8000-000000000003';
+
+  // A-R1-3: a release whose bound ended the race while its call still hangs leaves that call expired, so the window's
+  // heartbeats count it as a failure (the Q4 warning) and sendFor ends at once, instead of waiting without end.
+  it('A-R1-3: after a release that its signal ended, a hanging call counts as no answer for the ticks and for sendFor', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(1);
+    // The next call never ends and ignores its signal.
+    h.state.answer = () => new Promise<HeartbeatSendResult>(() => {});
+    const controller = new AbortController();
+    const released = h.heartbeats.release(ID_A, 210, controller.signal);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(2));
+    controller.abort();
+    expect(await released).toMatchObject({ ok: false });
+    h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS;
+    await h.heartbeats.tick();
+    h.now.value = T0 + WINDOW_HEARTBEAT_INTERVAL_MS + 15_000;
+    await h.heartbeats.tick();
+    // No new call piles up on the engine, and the failures count: the Q4 warning comes.
+    expect(h.sent).toHaveLength(2);
+    expect(h.warnings).toHaveLength(1);
+    expect(h.logs.some((line) => line.includes(HEARTBEAT_NO_ANSWER))).toBe(true);
+    // Close and Keep Running does not hang behind it.
+    await expect(h.heartbeats.sendFor(ID_A)).resolves.toEqual({ ok: false, detail: HEARTBEAT_NO_ANSWER });
+  });
+
+  // B-R1-1 (mutant H14): stopOnClose is part of the keep settings.
+  it('B-R1-1: turning stopOnClose on sends the clear-only entries again at once, and only once', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.environments.push(environment(ID_B, 'acme/web'));
+    h.settings.stopOnClose = false;
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    // With stopOnClose off every environment is kept: nothing to clear.
+    expect(clearsOf(h.sent[0])).toEqual([]);
+    h.settings.stopOnClose = true;
+    h.now.value = T0 + 5_000;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+    expect(clearsOf(h.sent[1])).toEqual([ID_B]);
+    h.now.value = T0 + 10_000;
+    await h.heartbeats.tick();
+    expect(h.sent).toHaveLength(2);
+  });
+
+  // B-R1-2 (mutant H12): an id that the monitor cannot record never goes into a heartbeat, not even as a clear-only entry.
+  it('B-R1-2: an environment with an id that is no UUID gets no clear-only entry, and the heartbeat stays valid', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api'));
+    h.environments.push(environment('legacy-environment', 'acme/old'));
+    h.environments.push(environment(ID_C, 'acme/lib'));
+    h.state.connected = ID_A;
+    await h.heartbeats.tick();
+    expect(clearsOf(h.sent[0])).toEqual([ID_C]);
+    expect(parseHeartbeatInput(JSON.stringify(h.sent[0].input))).toBeDefined();
+  });
+
+  // B-R1-4 (mutant H02): the release carries the keep-running flag of the entry.
+  it('B-R1-4: the release of a kept environment says keepRunning', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api', { keepRunning: true }));
+    expect(await h.heartbeats.release(ID_A, 210, new AbortController().signal)).toEqual({ ok: true });
+    expect(h.sent[0].input.environments).toEqual([{ id: ID_A, keepRunning: true, seq: T0 }]);
+    expect(h.sent[0].input.release).toBe(true);
+  });
+
+  // B-R1-6 (mutant H24): connectedEngine asks for the engine of the connected role, also when the window knows the
+  // environment in another role (busy with it).
+  it('B-R1-6: connectedEngine gives the engine of the connected role when the roles have different engines', async () => {
+    const h = harness();
+    h.environments.push(environment(ID_A, 'acme/api', { busy: { operation: 'rebuild', since: new Date(T0).toISOString(), pid: PID, windowId: WINDOW } }));
+    h.state.lookUp = async (_environment, use) => (use.connected ? REMOTE : LOCAL);
+    await h.heartbeats.tick();
+    expect(h.sent[0].target).toEqual(LOCAL);
+    expect(await h.heartbeats.connectedEngine(h.environments[0])).toEqual(REMOTE);
   });
 });

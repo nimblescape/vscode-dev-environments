@@ -472,3 +472,51 @@ describe('decide: active (review round 1 of PR #86, A-R1-1)', () => {
     expect(later.active).toBe(false);
   });
 });
+
+// Review round 1 of PR #87 (A-R1-2): a release (the short limit of a window that left the environment) never shortens the
+// live record of another computer.
+describe('decide: release records (review round 1 of PR #87, A-R1-2)', () => {
+  const stopped = (records: RemoteRecord[], now = T0) => decide({ now, containers: [container(A)], records, state: running({}, now) }).stop.map((stop) => stop.environmentId);
+
+  it('a release decides alone: the environment stops after its short limit', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    expect(stopped([release])).toEqual([A]);
+    expect(stopped([{ ...release, at: T0 - 3 * MINUTE }])).toEqual([]);
+  });
+
+  it('a release does not decide while a record of another computer is still within its own limit: that record decides', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    // Computer OTHER sent its long heartbeat 8 minutes ago (limit 10 minutes): it still uses the environment.
+    const other = record(A, T0 - 8 * MINUTE, { source: OTHER, limitSeconds: 600 });
+    expect(stopped([release, other])).toEqual([]);
+    // Once that record ran out, the release decides again (it is the newest).
+    expect(stopped([release, other], T0 + 3 * MINUTE)).toEqual([A]);
+  });
+
+  it('the newest record that is no release decides then, also a keep of another computer that still sends', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    const keep = record(A, T0 - 5 * MINUTE, { source: OTHER, keepRunning: true, limitSeconds: 600 });
+    const decision = decide({ now: T0, containers: [container(A)], records: [release, keep], state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.kept).toEqual([A]);
+  });
+
+  it('an old record of another computer (beyond its limit) does not hold a release back, not even an old keep', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    expect(stopped([release, record(A, T0 - 30 * MINUTE, { source: OTHER, limitSeconds: 600 })])).toEqual([A]);
+    expect(stopped([release, record(A, T0 - 30 * MINUTE, { source: OTHER, keepRunning: true, limitSeconds: 600 })])).toEqual([A]);
+  });
+
+  it('a release of another computer does not hold a release back, and a newer plain record decides as before', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    const otherRelease = record(A, T0 - 5 * MINUTE, { source: OTHER, limitSeconds: 210, release: true });
+    expect(stopped([release, otherRelease])).toEqual([A]);
+    // Also while the release of the other computer is still within its own limit: the newest release decides.
+    const shortRelease = record(A, T0 - 2 * MINUTE, { limitSeconds: 60, release: true });
+    expect(stopped([shortRelease, record(A, T0 - 3 * MINUTE, { source: OTHER, limitSeconds: 210, release: true })])).toEqual([A]);
+    // A newer plain heartbeat of another computer decides as it always did.
+    expect(stopped([release, record(A, T0 - 1 * MINUTE, { source: OTHER, limitSeconds: 600 })])).toEqual([]);
+    // A live record of another environment does not hold it back.
+    expect(stopped([release, record(B, T0, { limitSeconds: 600 })])).toEqual([A]);
+  });
+});

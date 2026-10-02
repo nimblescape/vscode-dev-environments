@@ -4028,3 +4028,55 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     expect(start).not.toHaveBeenCalled();
   });
 });
+
+// Review round 1 of PR #87 (A-R1-4): the recorded state may be older than the last use of the environment (its release
+// was lost, or the Session Monitor stopped it by the long limit); Delete's confirmation says that later changes are not
+// known. Only a message: nothing more runs for it.
+describe('Delete: a recorded state older than the last use (review round 1 of PR #87, A-R1-4)', () => {
+  const at = (ms: number) => new Date(ms).toLocaleString();
+
+  it('names the time of the recorded state when the environment was used after it (the container did not run)', async () => {
+    const env = environment({
+      lastUsedAt: iso(NOW - 600_000),
+      gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW - 3_600_000) },
+    });
+    await h.registry.add(env);
+    h.service.safetyCheck.mockResolvedValue(env.gitSummary);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
+    await run('delete', row('acme/api', env));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0]).toEqual([
+      `${Messages.deleteConfirm('acme/api')} ${Messages.deleteChangesUnknownSince(at(NOW - 3_600_000))}`,
+      { modal: true },
+      Actions.delete,
+    ]);
+    expect(h.service.delete).toHaveBeenCalled();
+  });
+
+  it('also with recorded changes, and without any recorded state since the last open', async () => {
+    const old = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW - 3_600_000) };
+    await h.registry.add(environment({ lastUsedAt: iso(NOW - 600_000), gitSummary: old }));
+    h.service.safetyCheck.mockResolvedValue(old);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(
+      `${Messages.deleteUnsaved('acme/api', '2 uncommitted')} ${Messages.deleteChangesUnknownSince(at(NOW - 3_600_000))}`,
+    );
+    // Nothing recorded at all (safetyCheck has nothing, nor has the registry).
+    fakeVscode.window.showWarningMessage.mockReset();
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      delete entry.gitSummary;
+    });
+    h.service.safetyCheck.mockResolvedValue(undefined);
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(`${Messages.deleteConfirm('acme/api')} ${Messages.deleteChangesNotRecorded}`);
+  });
+
+  it('says nothing more for a state recorded at or after the last use (a running container was checked just now)', async () => {
+    await h.registry.add(environment({ lastUsedAt: iso(NOW - 600_000) }));
+    h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment()));
+    expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(Messages.deleteConfirm('acme/api'));
+  });
+});

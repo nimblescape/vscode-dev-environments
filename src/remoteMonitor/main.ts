@@ -156,7 +156,9 @@ export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: nu
       continue;
     }
     const temp = path.join(dir, `.${name}.${process.pid}.tmp`);
-    const record = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
+    // Review round 1 of PR #87 (A-R1-2): the record of a release says so (rules.ts, decide).
+    const record: HeartbeatRecord = { at: now, keepRunning: environment.keepRunning, limitSeconds: input.limitSeconds, seq: environment.seq };
+    if (input.release === true) record.release = true;
     try {
       await fs.promises.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
       await fs.promises.rename(temp, file);

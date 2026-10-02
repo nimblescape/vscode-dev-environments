@@ -5,10 +5,13 @@
 // Plan step 8, PR C: the release of an environment that a window leaves (user decisions Q1 and Q2 of 2026-10-02).
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_LIMIT_SECONDS, MIN_LIMIT_SECONDS } from '../remoteMonitor/protocol';
-import type { Environment, ExtensionSettings } from '../types';
+import type { Environment, ExtensionSettings, PendingConnection, WindowStatus } from '../types';
+import { HEARTBEAT_ATTEMPT_DEADLINE_MS, WINDOW_HEARTBEAT_INTERVAL_MS } from './windowHeartbeats';
 import {
   CLOSE_RELEASE_BOUNDS,
+  RELEASE_MARGIN_SECONDS,
   SWITCH_RELEASE_BOUNDS,
+  otherWindowHoldsEnvironment,
   releaseEnvironment,
   releaseLimitSeconds,
   type ReleaseBounds,
@@ -76,17 +79,26 @@ afterEach(() => {
 });
 
 describe('releaseLimitSeconds (plan step 8, PR C, Q1)', () => {
-  it('is the waiting time, at least 60 s and at most a day; an invalid value gives the default waiting time (30 s → 60 s)', () => {
-    expect(releaseLimitSeconds(30)).toBe(MIN_LIMIT_SECONDS);
-    expect(releaseLimitSeconds(0)).toBe(60);
-    expect(releaseLimitSeconds(60)).toBe(60);
-    expect(releaseLimitSeconds(61)).toBe(61);
-    expect(releaseLimitSeconds(90.2)).toBe(91);
-    expect(releaseLimitSeconds(600)).toBe(600);
+  // Changed expectations, review round 1 of PR #87, A-R1-1: plus RELEASE_MARGIN_SECONDS (one heartbeat interval and one
+  // attempt of a heartbeat), so a window that comes back has the time to send its first long heartbeat.
+  it('is the waiting time, at least 60 s, plus the margin, and at most a day; an invalid value gives the default waiting time (30 s → 60 s)', () => {
+    const M = RELEASE_MARGIN_SECONDS;
+    expect(M).toBe((WINDOW_HEARTBEAT_INTERVAL_MS + HEARTBEAT_ATTEMPT_DEADLINE_MS) / 1000);
+    expect(releaseLimitSeconds(30)).toBe(MIN_LIMIT_SECONDS + M);
+    expect(releaseLimitSeconds(0)).toBe(60 + M);
+    expect(releaseLimitSeconds(60)).toBe(60 + M);
+    expect(releaseLimitSeconds(61)).toBe(61 + M);
+    expect(releaseLimitSeconds(90.2)).toBe(91 + M);
+    expect(releaseLimitSeconds(600)).toBe(600 + M);
+    expect(releaseLimitSeconds(MAX_LIMIT_SECONDS - M - 1)).toBe(MAX_LIMIT_SECONDS - 1);
     expect(releaseLimitSeconds(1e9)).toBe(MAX_LIMIT_SECONDS);
-    expect(releaseLimitSeconds(undefined)).toBe(60);
-    expect(releaseLimitSeconds(Number.NaN)).toBe(60);
-    expect(releaseLimitSeconds(-5)).toBe(60);
+    expect(releaseLimitSeconds(undefined)).toBe(60 + M);
+    expect(releaseLimitSeconds(Number.NaN)).toBe(60 + M);
+    expect(releaseLimitSeconds(-5)).toBe(60 + M);
+  });
+
+  it('review round 1 of PR #87, A-R1-1: the release outlasts a reload whose first heartbeat takes a whole attempt and one retry', () => {
+    expect(releaseLimitSeconds(30) * 1000).toBeGreaterThanOrEqual(60_000 + HEARTBEAT_ATTEMPT_DEADLINE_MS + WINDOW_HEARTBEAT_INTERVAL_MS);
   });
 
   it('the bounds of a close are about 2 s, the Git state within them', () => {
@@ -97,12 +109,13 @@ describe('releaseLimitSeconds (plan step 8, PR C, Q1)', () => {
 });
 
 describe('releaseEnvironment (plan step 8, PR C, Q1 and Q2)', () => {
-  it('records the Git state first (Q2 (c)), then sends the release with max(waiting time, 60 s)', async () => {
+  it('records the Git state first (Q2 (c)), then sends the release with max(waiting time, 60 s) plus the margin', async () => {
     const h = harness();
     h.settings.waitingTimeSeconds = 120;
     expect(await releaseEnvironment(h.deps, ID_A, BOUNDS)).toBe('released');
     expect(h.events).toEqual([`git ${ID_A}`, `release ${ID_A}`]);
-    expect(h.sends[0].limitSeconds).toBe(120);
+    // Changed expectation, review round 1 of PR #87, A-R1-1: plus RELEASE_MARGIN_SECONDS.
+    expect(h.sends[0].limitSeconds).toBe(120 + RELEASE_MARGIN_SECONDS);
     expect(h.logs.some((line) => line.includes('Released acme/api'))).toBe(true);
   });
 
@@ -176,5 +189,66 @@ describe('releaseEnvironment (plan step 8, PR C, Q1 and Q2)', () => {
       throw new Error('unreadable');
     };
     expect(await releaseEnvironment(h.deps, ID_A, BOUNDS)).toBe('failed');
+  });
+});
+
+// Review round 1 of PR #87 (A-R1-2): the windows of one computer share its record of the environment; a release must not
+// shorten it while another window uses the environment.
+describe('otherWindowHoldsEnvironment (review round 1 of PR #87, A-R1-2)', () => {
+  const NOW = Date.parse('2026-10-02T12:00:00.000Z');
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const alive = (pid: number) => pid === 11 || pid === 22;
+  const status = (windowId: string, pid: number, extra: Partial<WindowStatus> = {}): WindowStatus => ({
+    windowId,
+    pid,
+    environmentId: null,
+    state: 'active',
+    updatedAt: iso(NOW - 5_000),
+    ...extra,
+  });
+
+  it('a status file of another live window that shows the environment', () => {
+    const input = { now: NOW, isAlive: alive, windowStatuses: [status('own', 11), status('other', 22, { environmentId: ID_A })] };
+    expect(otherWindowHoldsEnvironment(environment(), 'own', input)).toBe(true);
+    // Not the own one, not a closing one, not one of an ended process.
+    expect(otherWindowHoldsEnvironment(environment(), 'other', input)).toBe(false);
+    expect(otherWindowHoldsEnvironment(environment(), 'own', { ...input, windowStatuses: [status('other', 22, { environmentId: ID_A, state: 'closing' })] })).toBe(false);
+    expect(otherWindowHoldsEnvironment(environment(), 'own', { ...input, windowStatuses: [status('other', 33, { environmentId: ID_A })] })).toBe(false);
+  });
+
+  it('a fresh pending connection file of another window (it opens the environment)', () => {
+    const pending = (windowId: string, at: number): PendingConnection => ({ environmentId: ID_A, windowId, createdAt: iso(at) });
+    const input = { now: NOW, isAlive: alive, windowStatuses: [], pendings: [pending('other', NOW - 10_000)] };
+    expect(otherWindowHoldsEnvironment(environment(), 'own', input)).toBe(true);
+    expect(otherWindowHoldsEnvironment(environment(), 'own', { ...input, pendings: [pending('own', NOW - 10_000)] })).toBe(false);
+    expect(otherWindowHoldsEnvironment(environment(), 'own', { ...input, pendings: [pending('other', NOW - 10 * 60_000)] })).toBe(false);
+  });
+
+  it('a live busy mark of another window (an open or a rebuild runs there), not the own one nor one that ended', () => {
+    const busy = (windowId: string, pid: number, since = NOW - 60_000) => environment({ busy: { operation: 'rebuild', since: iso(since), pid, windowId } });
+    const windowStatuses = [status('own', 11), status('other', 22)];
+    const input = { now: NOW, isAlive: alive, windowStatuses };
+    expect(otherWindowHoldsEnvironment(busy('other', 22), 'own', input)).toBe(true);
+    expect(otherWindowHoldsEnvironment(busy('own', 11), 'own', input)).toBe(false);
+    // Its process ended, it ended (since = the epoch), or its window has no recent status file.
+    expect(otherWindowHoldsEnvironment(busy('other', 33), 'own', input)).toBe(false);
+    expect(otherWindowHoldsEnvironment(busy('other', 22, 0), 'own', input)).toBe(false);
+    expect(otherWindowHoldsEnvironment(busy('other', 22), 'own', { ...input, windowStatuses: [status('own', 11)] })).toBe(false);
+  });
+
+  it('nothing else', () => {
+    expect(otherWindowHoldsEnvironment(environment(), 'own', { now: NOW, isAlive: alive })).toBe(false);
+  });
+
+  it('releaseEnvironment asks with the environment from the registry, and sends nothing while another window holds it', async () => {
+    const h = harness(environment({ busy: { operation: 'rebuild', since: iso(NOW), pid: 22, windowId: 'other' } }));
+    const asked: Environment[] = [];
+    h.deps.otherWindowUses = async (env) => {
+      asked.push(env);
+      return env.busy?.windowId === 'other';
+    };
+    expect(await releaseEnvironment(h.deps, ID_A, BOUNDS)).toBe('inUse');
+    expect(asked.map((env) => env.id)).toEqual([ID_A]);
+    expect(h.events).toEqual([]);
   });
 });
