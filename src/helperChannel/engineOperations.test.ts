@@ -74,6 +74,10 @@ describe('protocol of pull and startContainers (plan step 10A)', () => {
       { reference: 'alpine:1', identityToken: true },
       { reference: 'alpine:1', identityToken: true, username: 'u', serveraddress: 's' },
       { reference: 'alpine:1', identityToken: 'yes', serveraddress: 's' },
+      // Review round 1 of PR #89 (B-R1-10): the server of an identity token is checked too.
+      { reference: 'alpine:1', identityToken: true, serveraddress: '' },
+      { reference: 'alpine:1', identityToken: true, serveraddress: 'a b' },
+      { reference: 'alpine:1', identityToken: true, serveraddress: 'x'.repeat(513) },
       { reference: '' },
       { reference: '-x:1' },
       { reference: 'a b:1' },
@@ -92,7 +96,8 @@ describe('protocol of pull and startContainers (plan step 10A)', () => {
   it('parseStartContainersParams takes 1 to 64 full container IDs', () => {
     const id = 'a'.repeat(64);
     expect(parseStartContainersParams({ ids: [id] })).toEqual({ ids: [id] });
-    for (const value of [{ ids: [] }, { ids: ['abc'] }, { ids: [id.toUpperCase()] }, { ids: Array(65).fill(id) }, { ids: [id], x: 1 }, {}]) {
+    // Review round 1 of PR #89 (B-R1-11): only full IDs (64 hex digits).
+    for (const value of [{ ids: ['a'.repeat(12)] }, { ids: ['a'.repeat(63)] }, { ids: [] }, { ids: ['abc'] }, { ids: [id.toUpperCase()] }, { ids: Array(65).fill(id) }, { ids: [id], x: 1 }, {}]) {
       expect(parseStartContainersParams(value), JSON.stringify(value)).toBeUndefined();
     }
   });
@@ -122,6 +127,12 @@ describe('pull (plan step 10A)', () => {
     expect(requests[0].path).not.toContain('s3cret');
     expect(logs.join('\n')).not.toContain('s3cret');
     expect(logs[0]).toBe('pull ghcr.io/o/i:1 (with the credentials for ghcr.io)');
+  });
+
+  // Review round 1 of PR #89 (B-R1-12): the last line of the stream counts also without a final line feed.
+  it('fails with an error in the last line of the stream, also without a final line feed', async () => {
+    const { engine } = fakeEngine(() => ({ status: 200, chunks: ['{"status":"x"}\n{"errorDetail":{"message":"denied"}}'] }));
+    await expect(pullOperation(engine)({ reference: 'alpine:1' }, context().context)).rejects.toMatchObject({ code: 'failed', message: expect.stringContaining('denied') });
   });
 
   // Review round 1 of PR #89 (A-R1-1): the engine decodes the header with Go's base64.URLEncoding, which needs the padding.

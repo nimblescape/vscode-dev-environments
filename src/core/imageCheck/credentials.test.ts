@@ -114,6 +114,17 @@ describe('DockerCredentialStore', () => {
     expect(await store().getForPull('ghcr.io')).toEqual({ username: 'octocat', password: 'pw' });
   });
 
+  // Review round 1 of PR #89 (B-R1-9): a helper that cannot run is a warning and no credentials, never a failed pull.
+  it('getForPull gives no credentials and a warning when the helper cannot run', async () => {
+    writeConfig({ credsStore: 'desktop' });
+    const warnings: string[] = [];
+    const runner = fakeRunner(() => new Error('spawn EACCES'));
+    const logger = { info: () => {}, warn: (text: string) => warnings.push(text), error: () => {}, output: () => {} };
+    expect(await store(runner, { logger }).getForPull('ghcr.io')).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('could not be read');
+  });
+
   it('calls credHelpers[server] with the server on standard input', async () => {
     writeConfig({ credHelpers: { 'gcr.io': 'gcloud' }, credsStore: 'desktop' });
     const runner = fakeRunner(() => ({ stdout: JSON.stringify({ ServerURL: 'gcr.io', Username: 'oauth2', Secret: 's3' }) }));

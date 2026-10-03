@@ -702,6 +702,15 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
     expect(start).toMatchObject({ op: 'startContainers', params: { ids: ['b'.repeat(64)] } });
     fake.answer({ t: 'result', id: start.id, ok: true, value: {} });
     await starting;
+    // Review round 1 of PR #89 (B-R1-8): they take the places of the calls under locks, not the shared ones.
+    const ops = () => fake.messages().filter((message): message is Extract<ClientMessage, { t: 'op' }> => message.t === 'op');
+    const before = ops().length;
+    const pulls = Array.from({ length: MAX_CONCURRENT_LOCKED_OPERATIONS }, (_, index) => lock.pull!(`img${index}:1`, {}).catch(() => undefined));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ops()).toHaveLength(before + MAX_CONCURRENT_LOCKED_OPERATIONS);
+    await expect(lock.startContainers!(['c'.repeat(64)], {})).rejects.toMatchObject({ code: 'unsendable' });
+    channel.close();
+    await Promise.all(pulls);
   });
 
   it('release waits until the worker let go of the lock', async () => {

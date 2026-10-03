@@ -167,6 +167,85 @@ describe('ContainerAdapter.pullImage through the worker (plan step 10A)', () => 
   });
 });
 
+// Review round 1 of PR #89, mutation review (B-R1-1 to B-R1-6).
+describe('ContainerAdapter: the worker routes in detail (review round 1 of PR #89)', () => {
+  function lockWith(parts: Partial<HeldEnvironmentLock>, lost?: string): HeldEnvironmentLock {
+    return { environmentId: 'e', lost: new Promise(() => {}), docker: async () => ok(), release: async () => {}, ...parts, ...(lost ? { lost: Promise.resolve(lost) } : {}) };
+  }
+
+  it('B-R1-1: refuses a login to an unprotected engine also through the lock, and sends no stored credentials there', async () => {
+    const { docker, lookups } = setup({ stored: { username: 'me', password: 'stored' } });
+    const pulls: { reference: string; options: ChannelPullOptions }[] = [];
+    const lock = lockWith({ pull: async (reference, options) => void pulls.push({ reference, options }) });
+    const thrown = await runWithDockerTarget(PLAIN_TCP, () =>
+      runWithEnvironmentLock(lock, () => docker.pullImage('ghcr.io/o/i:1', { credentials: { registry: 'ghcr.io', username: 'u', password: 'gho_token' } })),
+    ).catch((e: unknown) => e);
+    expect((thrown as UserFacingError).code).toBe('unencryptedDockerConnection');
+    expect(pulls).toEqual([]);
+    await runWithDockerTarget(PLAIN_TCP, () => runWithEnvironmentLock(lock, () => docker.pullImage('alpine:1')));
+    expect(pulls[0].options.credentials).toBeUndefined();
+    expect(lookups).toEqual([]);
+  });
+
+  it('B-R1-2: nothing is sent under a lost lock', async () => {
+    const { docker } = setup();
+    let sent = 0;
+    const lock = lockWith({ pull: async () => void sent++, startContainers: async () => void sent++ }, 'gone');
+    await runWithEnvironmentLock(lock, async () => {
+      await Promise.resolve();
+      await expect(docker.pullImage('alpine:1')).rejects.toThrow(/was lost \(gone\)/);
+      await expect(docker.startContainer(ID)).rejects.toThrow(/was lost \(gone\)/);
+    });
+    expect(sent).toBe(0);
+  });
+
+  it('B-R1-3: `closed` did not run; a cancel during a failure is an AbortError', async () => {
+    const { docker } = setup({ failWith: new HelperChannelError('closed', 'closed') });
+    await expect(runWithDockerTarget(REMOTE, () => docker.pullImage('alpine:1'))).rejects.toThrow(/did not run/);
+    const controller = new AbortController();
+    const lost = setup({ failWith: new HelperChannelError('lost', 'gone') });
+    lost.docker.setWorkerEngine({
+      pull: async () => {
+        controller.abort();
+        throw new HelperChannelError('lost', 'gone');
+      },
+      startContainers: async () => {},
+    });
+    await expect(runWithDockerTarget(REMOTE, () => lost.docker.pullImage('alpine:1', { signal: controller.signal }))).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('B-R1-4: a lock without the operations refuses with "did not run", and nothing runs directly', async () => {
+    const { docker, runner } = setup();
+    await runWithEnvironmentLock(lockWith({}), async () => {
+      await expect(docker.pullImage('alpine:1')).rejects.toThrow(/did not run/);
+      await expect(docker.startContainer(ID)).rejects.toThrow(/did not run/);
+    });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('B-R1-5: the time limit and the signal of startContainer reach the worker and the lock', async () => {
+    const seen: unknown[] = [];
+    const { docker } = setup();
+    docker.setWorkerEngine({ pull: async () => {}, startContainers: async (_target, _ids, options) => void seen.push(options) });
+    const signal = new AbortController().signal;
+    await runWithDockerTarget(REMOTE, () => docker.startContainer(ID, { timeoutMs: 1_000, signal }));
+    await runWithEnvironmentLock(lockWith({ startContainers: async (_ids, options) => void seen.push(options) }), () => docker.startContainer(ID, { timeoutMs: 2_000, signal }));
+    expect(seen).toEqual([
+      { timeoutMs: 1_000, signal },
+      { timeoutMs: 2_000, signal },
+    ]);
+  });
+
+  it('B-R1-6: Docker Hub credentials go with the server https://index.docker.io/v1/', async () => {
+    const stored = setup({ stored: { username: '<token>', password: 'refresh' } });
+    await runWithDockerTarget(REMOTE, () => stored.docker.pullImage('alpine:1'));
+    expect(stored.pulls[0].options.credentials).toEqual({ identityToken: 'refresh', serveraddress: 'https://index.docker.io/v1/' });
+    const login = setup();
+    await runWithDockerTarget(REMOTE, () => login.docker.pullImage('alpine:1', { credentials: { registry: 'docker.io', username: 'u', password: 'p4ss' } }));
+    expect(login.pulls[0].options.credentials).toEqual({ username: 'u', password: 'p4ss', serveraddress: 'https://index.docker.io/v1/' });
+  });
+});
+
 describe('ContainerAdapter.startContainer (plan step 10A)', () => {
   it('starts through the worker of the operation, through the lock, or directly outside an operation', async () => {
     const { docker, runner, starts } = setup();
