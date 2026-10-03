@@ -102,9 +102,17 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     });
   });
 
-  afterAll(() => {
+  const workerContainers = () => cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${runLabel}`, '--format', '{{.Names}}']);
+
+  afterAll(async () => {
     channels?.dispose();
+    // The worker ends by the end of its input and `--rm` removes it; removing it at the same time fails ("removal of
+    // container … is already in progress", found by the CI of PR #91), so wait for that first, as workerRefresh does.
+    const deadline = Date.now() + 60_000;
+    while (workerContainers().length > 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
+    const leftovers = workerContainers();
     removeRunObjects(cli, run.runId);
+    expect(leftovers).toEqual([]);
   });
 
   /** A running dev container of a new environment with the tmpfs of the token and a token in it; `args` add rights. */
@@ -132,7 +140,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     expect(value).toEqual({ outcome: 'removed', container: cli.container(name)!.Id.slice(0, 12) });
     expect(requests).toEqual([]);
     expect(cli.ok(['exec', '-u', 'root', name, 'ls', '-A', TOKEN_FOLDER])).toBe('');
-    expect(cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${runLabel}`, '--format', '{{.Names}}'])).toHaveLength(1);
+    expect(workerContainers()).toHaveLength(1);
   });
 
   it('answers notRunning for an environment without a running dev container', async () => {
