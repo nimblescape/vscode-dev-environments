@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: MIT
-/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
-const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
@@ -47,6 +45,9 @@ import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { composeAccessReport, type ComposeAccessInput } from '../policy';
 import { WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
+
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
