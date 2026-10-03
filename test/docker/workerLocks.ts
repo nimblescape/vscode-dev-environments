@@ -101,6 +101,9 @@ export function workerLocks(
         environmentId: lock.environmentId,
         lost: lock.lost,
         docker: (args, options) => lock.docker(args, options),
+        // Plan step 10A: the operations over the Engine API of the worker that holds the lock.
+        pull: (reference, options) => lock.pull!(reference, options),
+        startContainers: (ids, options) => lock.startContainers!(ids, options),
         release: () => lock.release(),
         batch: async (p, batchSignal) => {
           const session = await lock.batch!(p, batchSignal);

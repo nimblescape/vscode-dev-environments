@@ -134,6 +134,9 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
           routed.push([...args]);
           return result;
         },
+        // Plan step 10A: the operations over the Engine API of the worker that holds the lock.
+        pull: (reference, options) => lock.pull!(reference, options),
+        startContainers: (ids, options) => lock.startContainers!(ids, options),
       };
     },
   });
