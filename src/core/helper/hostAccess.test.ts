@@ -1400,6 +1400,9 @@ describe('foreignNetworkItem and runArgsNetworks', () => {
     ['named like the own project', `${OWN_PROJECT}_default`, undefined, false],
     ['labelled for another environment', 'backend', { labels: { 'com.docker.compose.project': OTHER }, environments: [] }, true],
     ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT }, environments: [ID] }, false],
+    // Review round 7 of PR #88 (B-R7-1): the project label is compared without regard to case, as the name.
+    ['labelled for the own project in upper case', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT.toUpperCase() }, environments: [] }, false],
+    ['labelled for another environment in upper case', 'backend', { labels: { 'com.docker.compose.project': OTHER.toUpperCase() }, environments: [] }, true],
     ['labelled for a project of another program', 'backend', { labels: { 'com.docker.compose.project': 'shop' }, environments: [] }, false],
     ['labelled for a project of a repository named devenv-…', 'backend', { labels: { 'com.docker.compose.project': 'devenv-tools' }, environments: [] }, false],
     ['with a container of another environment', 'shared', { labels: {}, environments: [ID, 'e0000002-0000-4000-8000-000000000002'] }, true],
