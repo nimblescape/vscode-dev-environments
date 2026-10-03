@@ -1064,7 +1064,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
 
   // Review round 1 of PR #86, A-R1-1: an open writes its first heartbeat, then clones and builds for longer than the idle
   // time before its container exists; the heartbeats of its window (its busy mark) keep the monitor.
-  it('does not exit without a running container while a record is fresh (review round 1 of PR #86, A-R1-1)', async () => {
+  it('does not exit without a running container while a record is fresh (review round 1 of PR #86, A-R1-1)', { timeout: 90_000 }, async () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     let monitor: Monitor | undefined = undefined;
     // The window refreshes the record every 30 s (as WindowHeartbeats), here every tick.
@@ -1075,7 +1075,9 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
       },
       maxTicks: 200,
     });
-    await vi.waitFor(() => expect(monitor!.ticks()).toBe(200));
+    // CI of PR #88: 200 ticks write 200 records, which took longer than the default 1 s of waitFor on a slow runner (58
+    // ticks); its monitor then kept the record fresh for the next test. The wait, not the expectation, is longer.
+    await vi.waitFor(() => expect(monitor!.ticks()).toBe(200), { timeout: 60_000, interval: 20 });
     // 200 ticks of 15 s: 50 minutes, ten times the idle time.
     expect(monitor.mono()).toBeGreaterThanOrEqual(10 * REMOTE_IDLE_EXIT_MS);
     expect(await pending(monitor.result)).toBe('pending');
