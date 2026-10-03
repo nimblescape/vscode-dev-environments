@@ -114,6 +114,11 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     expect(await flow(engine, { records: records({ remoteUser: 'vscode' }), log: (line) => lines.push(line) })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
     expect(execs.map((exec) => exec.options.user)).toEqual(['root', 'vscode']);
     expect(lines).toEqual([`The removal as root failed in the container ${CONTAINER}: Operation not permitted`]);
+    // Review round 2 of plan step 11B1 (B-R2-4): the second try has the same time limit and cancel as the first.
+    const controller = new AbortController();
+    const second = fakeEngine([container()], (user) => (user === 'root' ? ok(1, 'no') : ok()));
+    await flow(second.engine, { records: records({ remoteUser: 'vscode' }), signal: controller.signal });
+    expect(second.execs[1].options).toMatchObject({ user: 'vscode', timeoutMs: TOKEN_REMOVE_TIMEOUT_MS, signal: controller.signal });
   });
 
   it('reads the record only for the second try, and a record that cannot be read never stops the first (review round 1, A-R1-7)', async () => {
@@ -189,5 +194,13 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     await flow(engine);
     expect(execs[0].container).toBe('a'.repeat(64));
   });
-});
 
+  it('takes the reason from stdout when stderr is empty, and both tries fit in the time limit of the extension (review round 2, B-R2-10, B-R2-11)', async () => {
+    const { engine } = fakeEngine([container()], () => ({ exitCode: 1, stdout: '  said on stdout \n', stderr: '', timedOut: false }));
+    await expect(flow(engine)).rejects.toThrow(/^said on stdout$/);
+    const exact = fakeEngine([container()], () => ok(1, 'y'.repeat(1000)));
+    expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
+    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts).
+    expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(60_000);
+  });
+});

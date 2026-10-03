@@ -12,7 +12,10 @@ import type { ExtensionSettings } from '../core/types';
 import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
-import type { HostSide } from '../core/worker/hostSide';
+import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
+import { hostSideHandler } from '../core/worker/hostSideHandler';
+import type { HelperChannels } from '../core/helperChannel/helperChannels';
+import type { DockerTarget } from '../core/docker/dockerHost';
 
 export interface HostSideDeps {
   registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
@@ -94,4 +97,22 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       },
     },
   };
+}
+
+/**
+ * Plan step 11B1: runs the flow `op` in the worker of the current engine; the HostSide of this computer answers its
+ * requests, and only those that the operation may send (FLOW_REQUESTS; review round 2 of 11B1, B-R1-1: one place, tested).
+ */
+export function extensionFlow(
+  channels: Pick<HelperChannels, 'flow'>,
+  current: () => Promise<DockerTarget>,
+  host: HostSide,
+  logger: Logger,
+): (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown> {
+  return async (op, params, options) =>
+    channels.flow(await current(), op, params, {
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : []),
+    });
 }

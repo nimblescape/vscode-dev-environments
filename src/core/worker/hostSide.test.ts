@@ -153,7 +153,10 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
   });
 
   it('gives undefined when this computer has no secret', async () => {
-    const { worker, secrets } = wired();
+    const { worker, secrets, handler, signal } = wired();
+    // Review round 2 of plan step 11B1 (B-R2-18): nothing but `given: false`.
+    expect(await handler('secret', { call: 'token', args: [] }, signal)).toStrictEqual({ value: { given: false } });
+    expect(await handler('secret', { call: 'registry', args: ['ghcr.io'] }, signal)).toStrictEqual({ value: { given: false } });
     expect(await worker.secrets.token()).toBeUndefined();
     expect(await worker.secrets.registry('ghcr.io')).toBeUndefined();
     expect(secrets).toEqual({});
@@ -205,6 +208,11 @@ describe('the handler of the requests on the side of the extension (plan step 11
       ['record', { call: 'remove', args: ['e1', { removed: [1] }] }],
       ['record', { call: 'remove', args: ['e1', 'x'] }],
       ['question', { call: 'message', args: ['registrySignIn', 'not a host/at all'] }],
+      // Review round 2 of plan step 11B1 (B-R2-18).
+      ['record', { call: 'add', args: [{ owner: { id: 'a1' } }] }],
+      ...['a:b:c', '.x', 'x:123456', 'x.', ''].map((registry) => ['question', { call: 'message', args: ['registrySignIn', registry] }] as const),
+      ['question', { call: 'recreateContainer', args: ['acme/app', null] }],
+      ['secret', { call: 'registry', args: [42] }],
     ] as const) {
       const thrown = await handler(kind, payload, signal).catch((error: unknown) => error);
       expect((thrown as HelperOperationError).code, JSON.stringify(payload)).toBe('invalid');
@@ -325,5 +333,24 @@ describe('the handler of the requests on the side of the extension (plan step 11
     const worker = workerHostSide(ask, () => undefined);
     await worker.secrets.token();
     expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  it('the worker side: what a missing or odd answer becomes (review round 2, B-R2-19)', async () => {
+    const answers = new Map<string, unknown>();
+    const worker = workerHostSide(async (request) => answers.get(`${request.kind} ${request.call}`) ?? null, () => undefined);
+    expect(await worker.records.get('nope')).toBeUndefined();
+    expect(await worker.records.list()).toEqual([]);
+    expect(await worker.state.windowStatuses()).toEqual([]);
+    expect(await worker.state.processAlive(1)).toBe(false);
+    answers.set('local processAlive', 'true');
+    expect(await worker.state.processAlive(1)).toBe(false);
+    // A login whose password the operation does not hold is no login; without its server the asked one.
+    answers.set('secret registry', { given: true, username: 'octo' });
+    expect(await worker.secrets.registry('ghcr.io')).toBeUndefined();
+    const held = workerHostSide(async () => ({ given: true, username: 'octo' }), (name) => (name === SECRET_REGISTRY ? 'pw' : undefined));
+    expect(await held.secrets.registry('ghcr.io')).toEqual({ username: 'octo', serveraddress: 'ghcr.io', password: 'pw' });
+    const notGiven = workerHostSide(async () => ({ given: 'yes' }), () => 'pw');
+    expect(await notGiven.secrets.registry('ghcr.io')).toBeUndefined();
+    expect(await notGiven.secrets.token()).toBeUndefined();
   });
 });

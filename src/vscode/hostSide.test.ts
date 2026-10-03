@@ -8,7 +8,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
-import { extensionHostSide, type HostSideDeps } from './hostSide';
+import { OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
+import type { OperationOptions } from '../core/helperChannel/helperChannel';
+import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
 
 function deps(overrides: Partial<HostSideDeps> = {}) {
   const environment = { id: 'e1', repository: 'acme/app', lastUsedAt: 'old' } as unknown as Environment;
@@ -92,5 +94,29 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     await host.questions.message('registrySignIn', 'ghcr.io');
     expect([ui.info.mock.calls, ui.warn.mock.calls, ui.registrySignIn.mock.calls]).toEqual([[['i']], [['w']], [['ghcr.io']]]);
     await expect(host.connect.connect({ environmentId: 'e1', container: 'c1', folder: '/workspaces/app' })).rejects.toThrow('connects no environment');
+  });
+
+  it('runs a flow in the worker of the current engine, answering only the requests of its operation (review round 2, B-R2-1, B-R2-2)', async () => {
+    const { all, auth } = deps();
+    const target = { kind: 'local', host: 'local', endpoint: 'unix:///var/run/docker.sock' } as const;
+    const sent: { target: unknown; op: string; params: unknown; options: OperationOptions }[] = [];
+    const channels = {
+      flow: vi.fn(async (given: unknown, op: string, params: unknown, options: OperationOptions = {}) => (sent.push({ target: given, op, params, options }), { outcome: 'notRunning' })),
+    };
+    const flow = extensionFlow(channels as never, async () => target as never, extensionHostSide(all), silentLogger);
+    const signal = new AbortController().signal;
+    expect(await flow(OP_TOKEN_REMOVE, { environmentId: 'e1' }, { signal, timeoutMs: 60_000 })).toEqual({ outcome: 'notRunning' });
+    expect(sent[0]).toMatchObject({ target, op: OP_TOKEN_REMOVE, params: { environmentId: 'e1' }, options: { signal, timeoutMs: 60_000 } });
+    const onAsk = sent[0].options.onAsk!;
+    const open = new AbortController().signal;
+    await expect(onAsk('secret', { call: 'token', args: [] }, open)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(onAsk('record', { call: 'remove', args: ['e1'] }, open)).rejects.toMatchObject({ code: 'invalid' });
+    expect(auth.getToken).not.toHaveBeenCalled();
+    expect(await onAsk('record', { call: 'get', args: ['e1'] }, open)).toMatchObject({ value: { id: 'e1' } });
+    // An operation without requests, also one named like a member of every object.
+    for (const op of ['unknownFlow', 'constructor', 'toString']) {
+      await flow(op, {}, {});
+      await expect(sent.at(-1)!.options.onAsk!('record', { call: 'get', args: ['e1'] }, open)).rejects.toMatchObject({ code: 'invalid' });
+    }
   });
 });

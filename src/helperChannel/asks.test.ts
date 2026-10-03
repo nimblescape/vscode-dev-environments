@@ -702,6 +702,19 @@ describe('the tokenRemove operation (plan step 11B1)', () => {
     expect(logs).toEqual([`The removal as root failed in the container ${CONTAINER}: exit code 1.`, `The GitHub token was removed from the container ${CONTAINER}.`]);
   });
 
+  it('passes the cancel of the operation to every call to the engine (review round 2, B-R2-5)', async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    const base_ = engineOf(true);
+    const engine = {
+      ...base_,
+      containers: async (label: string, signal?: AbortSignal) => (signals.push(signal), base_.containers(label)),
+      exec: async (c: string, cmd: readonly string[], options: { signal?: AbortSignal } = {}) => (signals.push(options.signal), base_.exec(c, cmd)),
+    };
+    const { context } = recording(async () => null);
+    await tokenRemoveOperation(() => engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context);
+    expect(signals).toEqual([context.signal, context.signal]);
+  });
+
   it('builds the port of the engine with the context of the operation', async () => {
     const seen: OperationContext[] = [];
     const { context } = recording(async () => null);
@@ -754,6 +767,8 @@ describe('the checks of tokenRemove (plan step 11B1)', () => {
       null,
       { outcome: 'maybe' },
       { outcome: 'removed', container: 'c0ffee' },
+      // Review round 2 of plan step 11B1 (B-R2-20): exactly twelve.
+      { outcome: 'removed', container: 'c0ffeec0ffeec' },
       { outcome: 'removed', container: 'C0FFEEC0FFEE' },
       { outcome: 'removed', container: 1 },
       { outcome: 'removed', extra: 1 },
