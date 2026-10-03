@@ -1171,10 +1171,18 @@ describe('ContainerAdapter: the labels of images (imageLabelsOf, labelImage)', (
     expect(isAbortError(thrown)).toBe(true);
   });
 
-  /** A Docker CLI where `image` has the ID `ids[0]` before the build and `ids[1]` after it. */
-  function labelling(ids: [string | undefined, string | undefined], answers: { build?: RunResult; rm?: RunResult } = {}) {
+  /**
+   * A Docker CLI where `image` has the ID `ids[0]` before the build and `ids[1]` after it; `previous`: the tags and
+   * digests that the previous image (ids[0]) still has after the build (review of PR #88: default none).
+   */
+  function labelling(
+    ids: [string | undefined, string | undefined],
+    answers: { build?: RunResult; rm?: RunResult } = {},
+    previous: { repoTags: string[]; repoDigests: string[] } = { repoTags: [], repoDigests: [] },
+  ) {
     let built = false;
     return adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'inspect' && call.args[3]?.startsWith('{"repoTags"')) return ok(`${JSON.stringify(previous)}\n`);
       if (call.args[0] === 'image' && call.args[1] === 'inspect') {
         const id = built ? ids[1] : ids[0];
         return id === undefined ? fail(`Error response from daemon: No such image: ${call.args[call.args.length - 1]}`) : ok(`${JSON.stringify(id)}\n`);
@@ -1189,13 +1197,15 @@ describe('ContainerAdapter: the labels of images (imageLabelsOf, labelImage)', (
     });
   }
 
-  it('labelImage builds `FROM <image>` from standard input with the labels, and removes the previous image', async () => {
+  it('labelImage builds `FROM <image>` from standard input with the labels, and removes the previous image when nothing names it', async () => {
     const { docker, runner } = labelling([idA, idB]);
     await docker.labelImage('devenv-acme-api-brave-noether:3', { 'nimblescape.devenv.environment-id': 'e1', 'a.b': 'x=y z' });
     expect(runner.calls.map((call) => call.args)).toEqual([
       ['image', 'inspect', '--format', '{{json .Id}}', 'devenv-acme-api-brave-noether:3'],
       ['build', '--quiet', '-t', 'devenv-acme-api-brave-noether:3', '--label', 'nimblescape.devenv.environment-id=e1', '--label', 'a.b=x=y z', '-'],
       ['image', 'inspect', '--format', '{{json .Id}}', 'devenv-acme-api-brave-noether:3'],
+      // Review of PR #88 (CI docker job): only a previous image without tags and digests is removed.
+      ['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', idA],
       ['image', 'rm', idA],
     ]);
     expect(runner.calls[1].options.input).toBe('FROM devenv-acme-api-brave-noether:3\n');
@@ -1211,6 +1221,15 @@ describe('ContainerAdapter: the labels of images (imageLabelsOf, labelImage)', (
     const { docker, runner } = labelling([idA, idB], { rm: fail('Error response from daemon: permission denied') });
     await expect(docker.labelImage('img:1', { a: 'b' })).resolves.toBeUndefined();
     expect(runner.calls.at(-1)?.args).toEqual(['image', 'rm', idA]);
+  });
+
+  it.each([
+    ['another tag (the image that Docker Compose built for the service)', { repoTags: ['devenv-acme-api-brave-noether-app:latest'], repoDigests: [] }],
+    ['a digest (the base image of an image-only configuration)', { repoTags: [], repoDigests: ['mcr.microsoft.com/devcontainers/base@sha256:abc'] }],
+  ])('labelImage keeps the previous image when it still has %s (review of PR #88)', async (_name, names) => {
+    const { docker, runner } = labelling([idA, idB], {}, names);
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.some((call) => call.args[0] === 'image' && call.args[1] === 'rm')).toBe(false);
   });
 
   it('labelImage refuses a missing image without a build', async () => {

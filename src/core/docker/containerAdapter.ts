@@ -1134,18 +1134,24 @@ export class ContainerAdapter {
    * User decisions 2026-10-03: gives the local image `image` the labels `labels` (the environment ID, its repository and
    * owner, and its build record): `docker build --quiet -t <image> --label k=v… -` with only `FROM <image>` on standard
    * input, a build of metadata without a new layer and without the network (its base is the local image). Docker moves
-   * the tag only when the build succeeds. The previous image under the tag is removed after that when nothing else uses
-   * it (best effort). Throws CommandError when the build fails.
+   * the tag only when the build succeeds. The previous image under the tag is removed after that only when it has no
+   * other tag or digest left (best effort; review of PR #88: never another name's image). Throws CommandError when the build fails.
    */
   async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
     const previous = await this.imageId(image);
     if (previous === undefined) throw new CommandError(commandText(['image', 'inspect', image]), 1, '', `The image ${image} does not exist.`);
     await this.runChecked(['build', '--quiet', '-t', image, ...labelArgs(labels, '--label'), '-'], { input: `FROM ${image}\n`, signal });
     const now = await this.imageId(image);
-    if (now !== undefined && now !== previous) {
-      await this.removeImage(previous).catch((error: unknown) => {
-        this.logger.info(`The image ${previous} before the labels of ${image} was not removed: ${errorMessage(error)}`);
-      });
+    if (now === undefined || now === previous) return;
+    // Only an image that nothing names any more: `docker image rm <ID>` of an image with one other tag removes that tag
+    // too (for example `<project>-<service>` that Docker Compose built, or the base image of an image-only configuration
+    // that the Dev Container CLI only tagged).
+    try {
+      const names = await this.imageNames(previous);
+      if (names === undefined || names.repoTags.length > 0 || names.repoDigests.length > 0) return;
+      await this.removeImage(previous);
+    } catch (error) {
+      this.logger.info(`The image ${previous} before the labels of ${image} was not removed: ${errorMessage(error)}`);
     }
   }
 
