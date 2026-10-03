@@ -22,11 +22,19 @@ import {
   isCleanupLabel,
   parseClientMessage,
   refusedOperationId,
+  isAskKind,
+  MAX_OPEN_ASKS,
+  MAX_MASKED_SECRETS,
+  MAX_SECRETS,
+  type AnswerRequest,
+  type AskKind,
+  type Secrets,
   type OperationFailure,
   type OperationRequest,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
-import { StreamRedactor, redact } from '../core/helperChannel/protocol';
+import { StreamRedactor, redact, redactValue } from '../core/helperChannel/protocol';
+import { abortError } from '../core/ports';
 
 // Plan step 6, PR B: moved to protocol.ts (the extension masks the output of a batch step too).
 export { StreamRedactor, redact };
@@ -101,8 +109,20 @@ export interface ContextDockerOptions {
 /** What an operation can do. Every Docker call ends when the operation is cancelled. */
 export interface OperationContext {
   readonly signal: AbortSignal;
-  /** The secret of the request (the GitHub token), if any. Only ever input of a process. */
-  readonly secret: string | undefined;
+  /**
+   * Plan step 11A: the named secrets of the request (SECRET_TOKEN, SECRET_REGISTRY, …), with those that the answers of its
+   * requests added. Only ever input of a process or the header of a request to the engine; each is masked in all that
+   * the operation sends back.
+   */
+  readonly secrets: Secrets;
+  /** Plan step 11A: true when the operation has no secret at all. */
+  hasNoSecret(): boolean;
+  /**
+   * Plan step 11A: a request to the extension (AskKind) that the operation waits for: resolves with the value of the
+   * answer (its secrets join `secrets`); rejects with OperationError (the answer's failure, or `unsupported` when the
+   * extension has no handler), or with an AbortError when the operation ends.
+   */
+  ask(kind: AskKind, payload: unknown): Promise<unknown>;
   progress(step: string, detail?: string): void;
   /** A line of the log of the extension. */
   log(text: string, level?: 'info' | 'warn'): void;
@@ -153,8 +173,20 @@ interface Running {
   timeoutTimer?: ReturnType<typeof setTimeout>;
   /** Resolves when the result was sent. */
   finished: Promise<void>;
-  /** The output of the operation, with its secret masked (also when a chunk splits it). */
+  /** The output of the operation, with its secrets masked (also when a chunk splits one). */
   redactors: Record<'stdout' | 'stderr', StreamRedactor>;
+  /** Plan step 11A: the secrets of the request and of the answers to its requests, by name. */
+  secrets: Record<string, string>;
+  /**
+   * Review round 1 of plan step 11A (A-R1-2): every value that the operation ever held, masked until its end, also when
+   * an answer gave its name a new value.
+   */
+  masked: string[];
+  /** Review round 1 of plan step 11A (A-R1-6): no new request once the operation ended. */
+  asksClosed: boolean;
+  /** Plan step 11A: the open requests to the extension, by their number. */
+  asks: Map<number, { resolve(value: unknown): void; reject(error: unknown): void }>;
+  nextAsk: number;
 }
 
 /** The logic of the script: one instance per process. */
@@ -308,7 +340,68 @@ export class ChannelServer {
         this.touchIdle();
         this.startOperation(message);
         return;
+      case 'answer':
+        this.answer(message);
+        return;
     }
+  }
+
+  /**
+   * Plan step 11A: sends the request `kind` of the operation `run` to the extension and waits for its answer. At most
+   * MAX_OPEN_ASKS at a time; the payload is masked as everything that the script sends.
+   */
+  private ask(run: Running, kind: AskKind, payload: unknown): Promise<unknown> {
+    if (run.asksClosed || run.controller.signal.aborted || !this.running.has(run.request.id)) return Promise.reject(abortError());
+    if (!isAskKind(kind)) return Promise.reject(new OperationError('invalid', `There is no request ${String(kind)}.`));
+    if (run.asks.size >= MAX_OPEN_ASKS) return Promise.reject(new OperationError('invalid', 'Too many open requests to the extension.'));
+    const ask = run.nextAsk++;
+    // Review round 1 of plan step 11A (A-R1-1, A-R1-4): masked value by value before it is encoded.
+    let message: ServerMessage;
+    try {
+      message = { t: 'ask', id: run.request.id, ask, kind, payload: redactValue(payload ?? null, run.masked) ?? null };
+      if (encodeMessage(message).length - 1 > MAX_SERVER_LINE) return Promise.reject(new OperationError('invalid', 'The request to the extension is too large.'));
+    } catch {
+      return Promise.reject(new OperationError('invalid', 'The request to the extension cannot be sent.'));
+    }
+    return new Promise<unknown>((resolve, reject) => {
+      run.asks.set(ask, { resolve, reject });
+      this.send(message);
+    });
+  }
+
+  /** Plan step 11A: the answer of the extension to a request of a running operation (others are ignored). */
+  private answer(message: AnswerRequest): void {
+    const run = this.running.get(message.id);
+    const pending = run?.asks.get(message.ask);
+    if (run === undefined || pending === undefined) return;
+    run.asks.delete(message.ask);
+    if (!message.ok) {
+      pending.reject(new OperationError(message.error.code, message.error.message));
+      return;
+    }
+    if (message.secrets !== undefined) {
+      const merged = { ...run.secrets, ...message.secrets };
+      if (Object.keys(merged).length > MAX_SECRETS) {
+        pending.reject(new OperationError('invalid', 'The answer brings more secrets than an operation can hold.'));
+        return;
+      }
+      // Review round 2 of plan step 11A (A-R2-4): every value stays masked, at most MAX_MASKED_SECRETS of them.
+      const added = [...new Set(Object.values(message.secrets))].filter((value) => !run.masked.includes(value));
+      if (run.masked.length + added.length > MAX_MASKED_SECRETS) {
+        pending.reject(new OperationError('invalid', 'The answer brings more secrets than an operation can mask.'));
+        return;
+      }
+      Object.assign(run.secrets, message.secrets);
+      run.masked.push(...added);
+    }
+    pending.resolve(message.value);
+  }
+
+  /** Plan step 11A: the open requests of an operation that ends are rejected with an AbortError. */
+  private endAsks(run: Running): void {
+    run.asksClosed = true;
+    for (const pending of run.asks.values()) pending.reject(abortError());
+    run.asks.clear();
   }
 
   private fail(id: number, error: OperationFailure, cancelled: boolean, timedOut: boolean): void {
@@ -327,7 +420,9 @@ export class ChannelServer {
     }
     let resolveFinished!: () => void;
     const id = request.id;
-    const secret = request.secret;
+    const secrets: Record<string, string> = { ...request.secrets };
+    const masked = Object.values(secrets);
+    const values = () => masked;
     const run: Running = {
       request,
       controller: new AbortController(),
@@ -336,7 +431,12 @@ export class ChannelServer {
       cancelled: false,
       timedOut: false,
       finished: new Promise<void>((resolve) => (resolveFinished = resolve)),
-      redactors: { stdout: new StreamRedactor(secret, this.sendOutput(id, 'stdout')), stderr: new StreamRedactor(secret, this.sendOutput(id, 'stderr')) },
+      redactors: { stdout: new StreamRedactor(values, this.sendOutput(id, 'stdout')), stderr: new StreamRedactor(values, this.sendOutput(id, 'stderr')) },
+      secrets,
+      masked,
+      asksClosed: false,
+      asks: new Map(),
+      nextAsk: 1,
     };
     this.running.set(request.id, run);
     if (request.timeoutMs !== undefined) run.timeoutTimer = setTimeout(() => this.cancel(run, true), request.timeoutMs);
@@ -352,11 +452,12 @@ export class ChannelServer {
           // Review round 1 of PR #89 (A-R1-4): the message may carry text of the engine or a registry: masked too.
           error:
             error instanceof OperationError
-              ? { code: error.code, message: redact(error.message, request.secret) }
-              : { code: 'failed', message: redact(messageOf(error), request.secret) },
+              ? { code: error.code, message: redact(error.message, masked) }
+              : { code: 'failed', message: redact(messageOf(error), masked) },
         };
       }
       if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+      this.endAsks(run);
       // Its Docker calls may still run when the handler did not wait for them: end them.
       await this.endChildren(run);
       run.redactors.stdout.flush();
@@ -370,7 +471,16 @@ export class ChannelServer {
         const message = run.timedOut ? 'The operation did not end in time.' : 'The operation was cancelled.';
         this.fail(request.id, { code: run.timedOut ? 'timeout' : 'cancelled', message }, run.cancelled, run.timedOut);
       } else if (outcome.ok) {
-        this.send({ t: 'result', id: request.id, ok: true, value: outcome.value });
+        // Review round 1 of plan step 11A (pre-existing gap): the value of a result is masked too.
+        let value: unknown;
+        try {
+          value = redactValue(outcome.value, masked);
+        } catch {
+          this.fail(request.id, { code: 'invalid', message: 'The result of the operation cannot be sent.' }, false, false);
+          resolveFinished();
+          return;
+        }
+        this.send({ t: 'result', id: request.id, ok: true, value });
       } else {
         this.fail(request.id, outcome.error, false, false);
       }
@@ -380,10 +490,14 @@ export class ChannelServer {
 
   private contextOf(run: Running): OperationContext {
     const id = run.request.id;
-    const mask = (text: string) => redact(text, run.request.secret);
+    const mask = (text: string) => redact(text, run.masked);
     return {
       signal: run.controller.signal,
-      secret: run.request.secret,
+      get secrets(): Secrets {
+        return { ...run.secrets };
+      },
+      hasNoSecret: () => Object.keys(run.secrets).length === 0,
+      ask: (kind, payload) => this.ask(run, kind, payload),
       progress: (step, detail) =>
         this.send(
           detail === undefined ? { t: 'progress', id, step: clip(mask(step)) } : { t: 'progress', id, step: clip(mask(step)), detail: clip(mask(detail)) },
@@ -402,8 +516,8 @@ export class ChannelServer {
     let tooLarge = false;
     let child: ServerChild;
     const id = run.request.id;
-    const secret = run.request.secret;
-    const log = (text: string, level: 'info' | 'warn' = 'info') => this.send({ t: 'log', id, level, text: clip(redact(text, secret)) });
+    const secret = () => run.masked;
+    const log = (text: string, level: 'info' | 'warn' = 'info') => this.send({ t: 'log', id, level, text: clip(redact(text, secret())) });
     // Review round 2 (B1): each streamed call has its own redactors, so its end flushes only its own held-back text.
     const streamed = options.stream === true
       ? { stdout: new StreamRedactor(secret, this.sendOutput(id, 'stdout')), stderr: new StreamRedactor(secret, this.sendOutput(id, 'stderr')) }
@@ -487,6 +601,7 @@ export class ChannelServer {
     else run.cancelled = true;
     if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
     run.controller.abort();
+    this.endAsks(run);
     for (const child of run.children) this.terminate(child);
   }
 

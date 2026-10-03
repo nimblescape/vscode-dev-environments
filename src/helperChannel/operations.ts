@@ -10,6 +10,7 @@ import { ContainerAdapter } from '../core/docker/containerAdapter';
 import {
   ENGINE_IDENTITY_ARGS,
   OP_DOCKER,
+  SECRET_TOKEN,
   OP_LOCK,
   OP_PROBE,
   OP_PULL,
@@ -40,8 +41,10 @@ export const dockerOperation: OperationHandler = async (params, context) => {
   if (checked === undefined) throw new OperationError('invalid', 'The parameters of the docker operation are invalid.');
   let input = checked.input;
   if (checked.inputIsSecret === true) {
-    if (context.secret === undefined) throw new OperationError('invalid', 'The docker operation expects a secret.');
-    input = context.secret;
+    // Plan step 11A: the secret input of a call is the GitHub token (the token write into the dev container).
+    const token = context.secrets[SECRET_TOKEN];
+    if (token === undefined) throw new OperationError('invalid', 'The docker operation expects a secret.');
+    input = token;
   }
   const result = await context.docker(checked.args, {
     input,
@@ -139,7 +142,7 @@ function contextLogger(context: OperationContext): Logger {
 export const refreshOperation: OperationHandler = async (params, context) => {
   const checked = parseRefreshParams(params);
   if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');
-  if (context.secret !== undefined) throw new OperationError('invalid', 'The refresh operation takes no secret.');
+  if (!context.hasNoSecret()) throw new OperationError('invalid', 'The refresh operation takes no secret.');
   context.progress('refresh');
   const docker = new ContainerAdapter(contextRunner(context), 'docker', {}, contextLogger(context), 'linux');
   const value: RefreshValue = refreshValue(await readEnvironmentStates(docker, checked.environments));

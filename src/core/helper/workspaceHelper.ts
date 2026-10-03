@@ -9,6 +9,7 @@
 // Dev Container CLI get the Docker socket, so the CLI builds and starts dev containers with the Docker engine; the clone
 // runs as an unprivileged Git user and the read steps as the owner of the repository, without the socket: Git runs
 // programs that the repository configuration names (for example filter drivers).
+import { SECRET_TOKEN } from '../helperChannel/protocol';
 import * as crypto from 'crypto';
 import { DOCKER_QUERY_TIMEOUT_MS, type ContainerAdapter } from '../docker/containerAdapter';
 import { runPreparingWorker } from '../docker/workerPreparation';
@@ -1301,7 +1302,8 @@ export class WorkspaceHelper {
         kind: batch.kind,
         params,
         options: {
-          secret: batch.secret,
+          // Plan step 11A: the token is the named secret SECRET_TOKEN of the step.
+          ...(batch.secret === undefined ? {} : { secrets: { [SECRET_TOKEN]: batch.secret } }),
           signal: options.signal,
           timeoutMs: options.timeoutMs,
           onOutput: (stream, text) => (stream === 'stdout' ? options.onStdout : options.onStderr)?.(text),

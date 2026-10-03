@@ -76,7 +76,7 @@ export function batchOperation(deps: BatchDeps): OperationHandler {
   return async (params, context) => {
     const p = parseBatchParams(params);
     if (p === undefined) throw new OperationError('invalid', 'The parameters of the batch operation are invalid.');
-    if (context.secret !== undefined) throw new OperationError('invalid', 'The batch operation takes no secret.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The batch operation takes no secret.');
     if (deps.sessions.has(p.session)) throw new OperationError('invalid', 'The batch session exists already.');
     if (deps.sessions.size >= MAX_CONCURRENT_BATCHES) throw new OperationError('busy', 'The worker holds too many batch helpers.');
     // Taken at once, so that two batches that start together count against the cap.
@@ -183,7 +183,8 @@ export function batchStepOperation(deps: BatchDeps): OperationHandler {
     entry.step = context;
     try {
       const value = await entry.channel.operation(p.kind, stepParams, {
-        secret: context.secret,
+        // Plan step 11A: the named secrets of the step go on as they are.
+        ...(context.hasNoSecret() ? {} : { secrets: context.secrets }),
         timeoutMs: p.timeoutMs,
         signal: context.signal,
         onProgress: (step, detail) => context.progress(step, detail),
@@ -207,7 +208,7 @@ export function batchChunkOperation(deps: BatchDeps): OperationHandler {
   return async (params, context) => {
     const p = parseBatchChunkParams(params);
     if (p === undefined) throw new OperationError('invalid', 'The parameters of the batch input are invalid.');
-    if (context.secret !== undefined) throw new OperationError('invalid', 'A batch input takes no secret.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'A batch input takes no secret.');
     const entry = sessionOf(deps, p.session);
     if (entry.inputSize + p.data.length > MAX_BATCH_INPUT_CHARACTERS) throw new OperationError('tooLarge', 'The inputs of the batch session are too large.');
     entry.inputs.set(p.input, (entry.inputs.get(p.input) ?? '') + p.data);

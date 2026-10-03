@@ -5,7 +5,7 @@
 // Plan step 10A (decision of 2026-10-03, "every remote action is a worker operation"): the operations of the worker that
 // talk to the Docker Engine API itself (engineApi.ts), without a `docker` process and without a container: `pull` and
 // `startContainers` (protocol.ts).
-import { parsePullParams, parseStartContainersParams } from '../core/helperChannel/protocol';
+import { SECRET_REGISTRY, parsePullParams, parseStartContainersParams } from '../core/helperChannel/protocol';
 import type { EngineApi } from './engineApi';
 import { engineErrorMessage } from './engineApi';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -45,16 +45,19 @@ export function pullOperation(engine: EngineApi): OperationHandler {
   return async (params, context: OperationContext) => {
     const checked = parsePullParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the pull operation are invalid.');
-    if ((context.secret === undefined) !== (checked.serveraddress === undefined)) {
+    // Plan step 11A: the registry password or identity token is the secret SECRET_REGISTRY, and the only one.
+    const password = context.secrets[SECRET_REGISTRY];
+    if (Object.keys(context.secrets).some((name) => name !== SECRET_REGISTRY)) throw new OperationError('invalid', 'The pull operation takes no secret but the registry login.');
+    if ((password === undefined) !== (checked.serveraddress === undefined)) {
       throw new OperationError('invalid', 'The pull operation takes a secret exactly with a server (and a user or an identity token).');
     }
     context.log(`pull ${checked.reference}${checked.serveraddress !== undefined ? ` (with the credentials for ${checked.serveraddress})` : ''}`);
     const headers: Record<string, string> = {};
-    if (checked.serveraddress !== undefined && context.secret !== undefined) {
+    if (checked.serveraddress !== undefined && password !== undefined) {
       headers['X-Registry-Auth'] = registryAuthHeader(
         checked.identityToken === true
-          ? { identitytoken: context.secret, serveraddress: checked.serveraddress }
-          : { username: checked.username ?? '', password: context.secret, serveraddress: checked.serveraddress },
+          ? { identitytoken: password, serveraddress: checked.serveraddress }
+          : { username: checked.username ?? '', password, serveraddress: checked.serveraddress },
       );
     }
     let pending = '';
@@ -112,7 +115,7 @@ export function startContainersOperation(engine: EngineApi): OperationHandler {
   return async (params, context: OperationContext) => {
     const checked = parseStartContainersParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the startContainers operation are invalid.');
-    if (context.secret !== undefined) throw new OperationError('invalid', 'The startContainers operation takes no secret.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The startContainers operation takes no secret.');
     for (const id of checked.ids) {
       context.log(`start ${id.slice(0, 12)}`);
       const answer = await engine({ method: 'POST', path: `/containers/${id}/start`, signal: context.signal });

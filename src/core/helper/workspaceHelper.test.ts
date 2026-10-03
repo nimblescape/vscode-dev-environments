@@ -218,7 +218,7 @@ class BridgeLock implements HeldEnvironmentLock {
         const signal = options.signal !== undefined ? AbortSignal.any([options.signal, limit.signal]) : limit.signal;
         try {
           return await docker.run(['run', ...env, p.image, ...step.command], {
-            input: step.secret === 'stdin' ? options.secret : step.input,
+            input: step.secret === 'stdin' ? options.secrets?.token : step.input,
             signal,
             onStdout: (text) => options.onOutput?.('stdout', text),
             onStderr: (text) => options.onOutput?.('stderr', text),

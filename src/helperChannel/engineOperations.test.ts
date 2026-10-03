@@ -12,13 +12,15 @@ import { parsePullParams, parseStartContainersParams, pullReference } from '../c
 import { engineApi, engineErrorMessage, MAX_ENGINE_ANSWER_CHARACTERS, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
 import { pullLine, pullOperation, registryAuthHeader, startContainersOperation } from './engineOperations';
 import { OperationError, type OperationContext } from './server';
+import { contextSecrets } from './operationContext.testkit';
 
 function context(secret?: string, signal: AbortSignal = new AbortController().signal) {
   const logs: string[] = [];
   const out: string[] = [];
   const value: OperationContext = {
     signal,
-    secret,
+    // Plan step 11A: the registry login is the named secret `registry`.
+    ...contextSecrets(secret === undefined ? {} : { registry: secret }),
     progress: () => {},
     log: (text) => logs.push(text),
     output: (_stream, text) => out.push(text),
@@ -161,6 +163,15 @@ describe('pull (plan step 10A)', () => {
     expect(error).toBeInstanceOf(OperationError);
     expect((error as OperationError).code).toBe('failed');
     expect((error as Error).message).toMatch(/pull access denied for nope$/);
+  });
+
+  // Plan step 11A: the pull takes only the named secret `registry`.
+  it('refuses a secret of another name, and sends nothing', async () => {
+    const { engine, requests } = fakeEngine(() => ({ status: 200 }));
+    const ctx = context().context;
+    const withToken = { ...ctx, ...contextSecrets({ token: 'tok-1234', registry: 'reg-5678' }) };
+    await expect(pullOperation(engine)({ reference: 'ghcr.io/o/i:1', username: 'u', serveraddress: 'ghcr.io' }, withToken)).rejects.toMatchObject({ code: 'invalid' });
+    expect(requests).toEqual([]);
   });
 
   it('refuses invalid parameters and a secret without a user (or a user without a secret), and sends nothing', async () => {

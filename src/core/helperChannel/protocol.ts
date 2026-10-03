@@ -35,9 +35,10 @@ export { LABEL_HELPER_CHANNEL };
 
 /**
  * The version of the messages. The extension closes a channel whose script answers with another one. Plan step 6, PR B:
- * 2 (the batch helper: `batch`, `batchStep`, `batchChunk`); no migration (decision 2026-09-29, "Versions").
+ * 2 (the batch helper: `batch`, `batchStep`, `batchChunk`); no migration (decision 2026-09-29, "Versions"). Plan step
+ * 11A: 3 (named secrets, and the requests of the worker: `ask` and `answer`).
  */
-export const CHANNEL_PROTOCOL_VERSION = 2;
+export const CHANNEL_PROTOCOL_VERSION = 3;
 /** Where the loader writes the script (the file system of the container). */
 export const CHANNEL_SCRIPT_PATH = '/opt/devenv/channel.js';
 /** The function of the script that the loader starts (src/helperChannel/main.ts). */
@@ -81,6 +82,16 @@ export const MAX_SERVER_LINE = 4 * 1024 * 1024;
 export const OUTPUT_CHUNK_CHARACTERS = 16 * 1024;
 /** The longest secret of an operation (the GitHub token). */
 export const MAX_SECRET_LENGTH = 4 * 1024;
+/** Plan step 11A: the most named secrets of one operation (with those of its answers). */
+export const MAX_SECRETS = 8;
+/** Review round 2 of plan step 11A (A-R2-4): the most values that one operation masks (also the old values of a name). */
+export const MAX_MASKED_SECRETS = 4 * MAX_SECRETS;
+/**
+ * Plan step 11A: the names of the secrets. `token`: the GitHub token (the clone, the token write into the dev container,
+ * and every step whose output may hold it); `registry`: the password or identity token of a registry (a pull).
+ */
+export const SECRET_TOKEN = 'token';
+export const SECRET_REGISTRY = 'registry';
 /** Review round 1 (S6): the shortest secret; a shorter one could not be masked, so it is refused. */
 export const MIN_SECRET_LENGTH = 4;
 /** The largest time limit of an operation (one day). */
@@ -100,19 +111,33 @@ export interface PingRequest {
 }
 
 /**
+ * Named secrets of an operation (plan step 11A; before: one `secret`): name (isSecretName) → value (isSecret).
+ */
+export type Secrets = Readonly<Record<string, string>>;
+
+/**
  * An operation: the script runs all its steps and answers with one `result`. `params`: checked by the operation.
- * `secret` (the GitHub token): kept apart from `params`, so that no log of the parameters can contain it; it never
- * becomes an argument or a variable of a process in the script, only input of one. `timeoutMs`: the operation is
- * cancelled after it.
+ * `secrets` (for example the GitHub token as SECRET_TOKEN): kept apart from `params`, so that no log of the parameters
+ * can contain them; a secret never becomes an argument or a variable of a process in the script, only input of one or
+ * the header of a request to the engine, and every one is masked in all that the script sends back. `timeoutMs`: the
+ * operation is cancelled after it.
  */
 export interface OperationRequest {
   t: 'op';
   id: number;
   op: string;
   params: unknown;
-  secret?: string;
+  secrets?: Secrets;
   timeoutMs?: number;
 }
+
+/**
+ * Plan step 11A: the answer of the extension to the request `ask` of the operation `id`: its value, and secrets that the
+ * operation gets from then on (masked like those of the request); or a failure.
+ */
+export type AnswerRequest =
+  | { t: 'answer'; id: number; ask: number; ok: true; value: unknown; secrets?: Secrets }
+  | { t: 'answer'; id: number; ask: number; ok: false; error: OperationFailure };
 
 /** Cancels the operation `id`. The script answers with its `result`. */
 export interface CancelRequest {
@@ -120,7 +145,7 @@ export interface CancelRequest {
   id: number;
 }
 
-export type ClientMessage = HelloRequest | PingRequest | OperationRequest | CancelRequest;
+export type ClientMessage = HelloRequest | PingRequest | OperationRequest | CancelRequest | AnswerRequest;
 
 export interface HelloAnswer {
   t: 'hello';
@@ -184,38 +209,114 @@ export interface CancelledAnswer {
   id: number;
 }
 
-export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswer | OutputAnswer | ResultAnswer | CancelledAnswer;
+/**
+ * Plan step 11A (decision of 2026-10-03, the worker is the deputy): a request of the operation `id` to the extension,
+ * which answers it with `answer` (number `ask`, counted per operation). ASK_KINDS: `question` (a question to the user),
+ * `local` (state on the user's computer), `record` (a change of the local records), `secret` (a secret that only the
+ * user's computer has), `connect` (the data that the window needs to connect). `payload`: checked by the extension.
+ */
+export interface AskAnswer {
+  t: 'ask';
+  id: number;
+  ask: number;
+  kind: AskKind;
+  payload: unknown;
+}
+
+export const ASK_KINDS = ['question', 'local', 'record', 'secret', 'connect'] as const;
+export type AskKind = (typeof ASK_KINDS)[number];
+/** Plan step 11A: the most open requests of one operation. */
+export const MAX_OPEN_ASKS = 16;
+
+export function isAskKind(value: unknown): value is AskKind {
+  return typeof value === 'string' && (ASK_KINDS as readonly string[]).includes(value);
+}
+
+export type ServerMessage = HelloAnswer | PongAnswer | ProgressAnswer | LogAnswer | OutputAnswer | ResultAnswer | CancelledAnswer | AskAnswer;
 
 // Plan step 6, PR B: moved here from src/helperChannel/server.ts (the extension masks the output of a batch step too).
-/** The secret (at least 4 characters) replaced by `***`. */
-export function redact(text: string, secret: string | undefined): string {
-  return secret !== undefined && secret.length >= 4 ? text.split(secret).join('***') : text;
+// Plan step 11A: every secret of an operation (named secrets, also those of its answers).
+/** The values to mask: those of at least MIN_SECRET_LENGTH characters, longest first (a secret inside another one). */
+function maskable(secrets: Iterable<string>): string[] {
+  return [...new Set([...secrets].filter((secret) => secret.length >= MIN_SECRET_LENGTH))].sort((a, b) => b.length - a.length);
+}
+
+/** Every secret of `secrets` (values; at least MIN_SECRET_LENGTH characters) replaced by `***`. */
+export function redact(text: string, secrets: Iterable<string> | string | undefined): string {
+  if (secrets === undefined) return text;
+  let masked = text;
+  for (const secret of maskable(typeof secrets === 'string' ? [secrets] : secrets)) masked = masked.split(secret).join('***');
+  return masked;
 }
 
 /**
- * Passes a stream on with the secret masked, also when a chunk splits it: the last characters (shorter than the secret)
- * wait for the next chunk; flush passes them on.
+ * Review round 1 of plan step 11A (A-R1-1): every string and key of a JSON value with the secrets masked, before it is
+ * encoded (in the encoded text a secret with `"` or `\\` would no longer match). Throws for a value that JSON cannot
+ * hold (a cycle, a BigInt, a function).
+ */
+export function redactValue(value: unknown, secrets: Iterable<string>): unknown {
+  const list = maskable(secrets);
+  const seen = new Set<object>();
+  const walk = (raw: unknown, key = ''): unknown => {
+    // Review round 2 of plan step 11A (A-R2-1): as JSON.stringify, an object with toJSON sends what toJSON returns.
+    const json =
+      typeof raw === 'object' && raw !== null && typeof (raw as { toJSON?: unknown }).toJSON === 'function' ? (raw as { toJSON(key: string): unknown }).toJSON(key) : raw;
+    // Review round 3 of plan step 11A (A-R3-2): as JSON.stringify, a boxed string, number or boolean is its primitive.
+    const item = json instanceof String || json instanceof Number || json instanceof Boolean ? json.valueOf() : json;
+    if (typeof item === 'string') return list.length === 0 ? item : redact(item, list);
+    if (item === null || typeof item === 'number' || typeof item === 'boolean') return item;
+    if (item === undefined) return undefined;
+    if (typeof item !== 'object') throw new TypeError(`A ${typeof item} cannot be sent.`);
+    if (seen.has(item)) throw new TypeError('A value with a cycle cannot be sent.');
+    seen.add(item);
+    let result: unknown;
+    if (Array.isArray(item)) {
+      result = item.map((entry, index) => walk(entry, String(index)) ?? null);
+    } else {
+      const entries = Object.entries(item as Record<string, unknown>)
+        .map(([name, entry]) => [list.length === 0 ? name : redact(name, list), walk(entry, name)] as const)
+        .filter(([, entry]) => entry !== undefined);
+      // Review round 2 of plan step 11A (A-R2-2): two keys that mask to the same text would lose one value.
+      if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new TypeError('Two keys are the same once their secrets are masked.');
+      result = Object.fromEntries(entries);
+    }
+    seen.delete(item);
+    return result;
+  };
+  return walk(value);
+}
+
+/**
+ * Passes a stream on with the secrets masked, also when a chunk splits one: the last characters that could be the start
+ * of a secret wait for the next chunk; flush passes them on. `secrets` is read at each piece, so a secret that an answer
+ * added later (plan step 11A) is masked from then on.
  */
 export class StreamRedactor {
   private buffer = '';
+  private readonly secrets: () => Iterable<string>;
 
   constructor(
-    private readonly secret: string | undefined,
+    secrets: Iterable<string> | string | undefined | (() => Iterable<string>),
     private readonly forward: (text: string) => void,
-  ) {}
+  ) {
+    this.secrets = typeof secrets === 'function' ? secrets : () => (secrets === undefined ? [] : typeof secrets === 'string' ? [secrets] : secrets);
+  }
 
   push(text: string): void {
     if (text === '') return;
-    if (this.secret === undefined || this.secret.length < 4) {
-      this.forward(text);
+    const secrets = maskable(this.secrets());
+    if (secrets.length === 0) {
+      const pending = this.buffer + text;
+      this.buffer = '';
+      this.forward(pending);
       return;
     }
-    const masked = redact(this.buffer + text, this.secret);
-    const keep = this.secret.length - 1;
-    // Keep a tail that could be the start of the secret.
+    const masked = redact(this.buffer + text, secrets);
+    // Keep the longest tail that could be the start of a secret.
     let cut = masked.length;
-    for (let length = Math.min(keep, masked.length); length > 0; length--) {
-      if (this.secret.startsWith(masked.slice(masked.length - length))) {
+    for (let length = Math.min(secrets[0].length - 1, masked.length); length > 0; length--) {
+      const tail = masked.slice(masked.length - length);
+      if (secrets.some((secret) => secret.length > length && secret.startsWith(tail))) {
         cut = masked.length - length;
         break;
       }
@@ -258,6 +359,24 @@ export function isOperationName(value: unknown): value is string {
 /** A secret that the channel can carry: MIN_SECRET_LENGTH..MAX_SECRET_LENGTH characters. */
 export function isSecret(value: unknown): value is string {
   return typeof value === 'string' && value.length >= MIN_SECRET_LENGTH && value.length <= MAX_SECRET_LENGTH;
+}
+
+/** Plan step 11A: the name of a secret: lower camel case. */
+export function isSecretName(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z][a-zA-Z0-9]{0,31}$/.test(value);
+}
+
+/** Plan step 11A: named secrets that the channel can carry: 1..MAX_SECRETS names (isSecretName) with values (isSecret). */
+export function parseSecrets(value: unknown): Secrets | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > MAX_SECRETS) return undefined;
+  const secrets: Record<string, string> = {};
+  for (const [name, secret] of entries) {
+    if (!isSecretName(name) || !isSecret(secret)) return undefined;
+    secrets[name] = secret;
+  }
+  return secrets;
 }
 
 /**
@@ -310,16 +429,30 @@ export function parseClientMessage(line: string): ClientMessage | undefined {
     case 'cancel':
       return hasOnlyKeys(value, ['t', 'id']) && isId(value.id) ? { t: 'cancel', id: value.id } : undefined;
     case 'op': {
-      if (!hasOnlyKeys(value, ['t', 'id', 'op', 'params'], ['secret', 'timeoutMs']) || !isId(value.id) || !isOperationName(value.op)) {
+      if (!hasOnlyKeys(value, ['t', 'id', 'op', 'params'], ['secrets', 'timeoutMs']) || !isId(value.id) || !isOperationName(value.op)) {
         return undefined;
       }
-      const { secret, timeoutMs } = value;
-      if (secret !== undefined && !isSecret(secret)) return undefined;
+      const { timeoutMs } = value;
+      const secrets = value.secrets === undefined ? undefined : parseSecrets(value.secrets);
+      if (value.secrets !== undefined && secrets === undefined) return undefined;
       if (timeoutMs !== undefined && (!isId(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPERATION_TIMEOUT_MS)) return undefined;
       const request: OperationRequest = { t: 'op', id: value.id, op: value.op, params: value.params };
-      if (secret !== undefined) request.secret = secret as string;
+      if (secrets !== undefined) request.secrets = secrets;
       if (timeoutMs !== undefined) request.timeoutMs = timeoutMs as number;
       return request;
+    }
+    case 'answer': {
+      if (!isId(value.id) || !isId(value.ask)) return undefined;
+      if (value.ok === true) {
+        if (!hasOnlyKeys(value, ['t', 'id', 'ask', 'ok'], ['value', 'secrets'])) return undefined;
+        const secrets = value.secrets === undefined ? undefined : parseSecrets(value.secrets);
+        if (value.secrets !== undefined && secrets === undefined) return undefined;
+        const answer: AnswerRequest = { t: 'answer', id: value.id, ask: value.ask, ok: true, value: value.value };
+        if (secrets !== undefined) answer.secrets = secrets;
+        return answer;
+      }
+      if (value.ok !== false || !hasOnlyKeys(value, ['t', 'id', 'ask', 'ok', 'error']) || !isFailure(value.error)) return undefined;
+      return { t: 'answer', id: value.id, ask: value.ask, ok: false, error: { code: value.error.code, message: value.error.message } };
     }
     default:
       return undefined;
@@ -375,6 +508,10 @@ export function parseServerMessage(line: string): ServerMessage | undefined {
         (value.stream === 'stdout' || value.stream === 'stderr') &&
         typeof value.data === 'string'
         ? { t: 'out', id: value.id, stream: value.stream, data: value.data }
+        : undefined;
+    case 'ask':
+      return hasOnlyKeys(value, ['t', 'id', 'ask', 'kind'], ['payload']) && isId(value.id) && isId(value.ask) && isAskKind(value.kind)
+        ? { t: 'ask', id: value.id, ask: value.ask, kind: value.kind, payload: value.payload }
         : undefined;
     case 'result': {
       if (!isId(value.id)) return undefined;

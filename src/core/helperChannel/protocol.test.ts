@@ -54,12 +54,13 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(parseClientMessage('{"t":"hello","protocol":1}')).toEqual({ t: 'hello', protocol: 1 });
     expect(parseClientMessage('{"t":"ping","n":3}')).toEqual({ t: 'ping', n: 3 });
     expect(parseClientMessage('{"t":"cancel","id":2}')).toEqual({ t: 'cancel', id: 2 });
-    expect(parseClientMessage('{"t":"op","id":1,"op":"docker","params":{"args":["ps"]},"secret":"s3cr","timeoutMs":5}')).toEqual({
+    // Plan step 11A: changed expectation (before: one `secret`): named secrets.
+    expect(parseClientMessage('{"t":"op","id":1,"op":"docker","params":{"args":["ps"]},"secrets":{"token":"s3cr"},"timeoutMs":5}')).toEqual({
       t: 'op',
       id: 1,
       op: 'docker',
       params: { args: ['ps'] },
-      secret: 's3cr',
+      secrets: { token: 's3cr' },
       timeoutMs: 5,
     });
     for (const line of [
@@ -155,13 +156,14 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
 
   it('channelLabelValue names the protocol, the script and the loader', () => {
     // Plan step 6, PR B: changed expectation (protocol version 2, before 1).
-    expect(channelLabelValue('a')).toMatch(/^2-[0-9a-f]{12}$/);
+    // Plan step 11A: changed expectation (the protocol is 3 now).
+    expect(channelLabelValue('a')).toMatch(/^3-[0-9a-f]{12}$/);
     expect(channelLabelValue('a')).not.toBe(channelLabelValue('b'));
     // Plan step 3 (pipe loading, user decision 2026-09-29): the loader is part of the label (a new loader, a new version).
     const hash = createHash('sha256').update('a', 'utf8').update('\n', 'utf8').update(PIPE_LOADER, 'utf8').digest('hex');
     // Plan step 6, PR B: changed expectations (protocol version 2, before 1).
-    expect(channelLabelValue('a')).toBe(`2-${hash.slice(0, 12)}`);
-    expect(channelLabelValue('a')).not.toBe(`2-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
+    expect(channelLabelValue('a')).toBe(`3-${hash.slice(0, 12)}`);
+    expect(channelLabelValue('a')).not.toBe(`3-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
   });
 
   it('checks the parameters and values of docker and probe', () => {
