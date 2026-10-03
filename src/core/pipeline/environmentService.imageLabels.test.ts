@@ -902,3 +902,50 @@ describe('review round 4 of PR #88 (B-R4-3): a workspace volume that is missing 
     expect(h.helper.calls).not.toContain('listConfigurations');
   });
 });
+
+describe('review round 5 of PR #88 (A-R5-1): Clone again when Docker cannot say whose its new volume is', () => {
+  /** `docker volume inspect` fails once, at its call number `failing` (1-based). */
+  function inspectFailsAt(failing: number): void {
+    const inspect = h.docker.inspectVolumes.bind(h.docker);
+    let calls = 0;
+    h.docker.inspectVolumes = async (names: readonly string[]) => {
+      calls++;
+      if (calls === failing) throw new Error('Cannot connect to the Docker daemon (transient)');
+      return inspect(names);
+    };
+  }
+
+  it('removes its new volume when the check after the create fails, and the next open clones again', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    // 1: the ownership read of the open (missing); 2: requireOwnVolume after createVolume (fails once).
+    inspectFailsAt(2);
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.volumes.has(NAME)).toBe(false);
+    const clones = h.helper.clones.length;
+    await h.service.open(TARGET, options());
+    expect(h.helper.clones.length).toBe(clones + 1);
+  });
+
+  it('keeps the create mark (ended) when whose the volume is cannot be read after a failed clone', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    // 1: the ownership read of the open; 2: requireOwnVolume (own); 3: the read after the failed clone (fails once).
+    inspectFailsAt(3);
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect((await h.registry.get(ENV_ID))?.busy?.operation).toBe('create');
+  });
+
+  it('keeps the create mark (ended) when its own new volume cannot be removed after a failed clone', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    h.docker.removeVolume = async () => {
+      throw new Error('volume is in use');
+    };
+    await rejection(h.service.open(TARGET, options()));
+    expect((await h.registry.get(ENV_ID))?.busy?.operation).toBe('create');
+  });
+});

@@ -1562,16 +1562,34 @@ export class EnvironmentService {
     await this.markBusy(ctx, 'create');
     ctx.steps.step('downloadingRepository');
     await this.deps.docker.createVolume(env.volumeName, volumeLabels(env));
-    // Review round 4 of PR #88 (A-R4-1): as the first open, never a volume of the name that another environment created
-    // meanwhile (`docker volume create` takes it as it is), and that volume is never removed.
-    await this.requireOwnVolume(env);
     try {
+      // Review round 4 of PR #88 (A-R4-1): as the first open, never a volume of the name that another environment created
+      // meanwhile (`docker volume create` takes it as it is), and that volume is never removed.
+      await this.requireOwnVolume(env);
       await this.prepareHelper(ctx);
       await this.clone(ctx, ctx.session.token, defaultBranch);
     } catch (error) {
       // The new volume is empty: remove it, so the files count as missing again (only while it is still its own).
-      if ((await this.workspaceVolumeOwnership(env)) === 'own') {
-        await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
+      // Review round 5 of PR #88 (A-R5-1): when whose it is cannot be read, or its removal fails, the `create` mark stays
+      // (as ended), so the next open reads it again and completes the clone (resumeInterruptedClone).
+      const ownership = await this.workspaceVolumeOwnership(env);
+      let removed = ownership !== 'own' && ownership !== 'unreadable';
+      if (ownership === 'own') {
+        removed = await this.removeVolumeWithRetry(env.volumeName).then(
+          () => true,
+          (removal: unknown) => {
+            this.logger.warn(`Could not remove the volume ${env.volumeName}: ${errorMessage(removal)}`);
+            return false;
+          },
+        );
+      }
+      if (!removed) {
+        ctx.busy = false;
+        await this.quietly('keep the create mark as ended', () =>
+          this.deps.registry.updateEnvironment(env.id, (entry) => {
+            if (entry.busy && this.isOwnMark(entry.busy)) entry.busy = endedMark(entry.busy);
+          }),
+        );
       }
       throw error;
     }
