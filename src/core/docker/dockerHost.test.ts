@@ -322,3 +322,22 @@ describe('review round 3 of PR #88 (B-R3-9): the context name of a host name tha
     expect(remoteContextNames('dev_box!')[0]).toBe('dev_box');
   });
 });
+
+// Review round 4 of PR #88 (B-R4-4, mutant RC2): only a name of one character gets the prefix; a name of two characters
+// is a valid Docker context name as it is.
+describe('review round 4 of PR #88 (B-R4-4): the context name of a host name of two characters', () => {
+  it('keeps a name of two characters without the prefix', () => {
+    expect(remoteContextNames('db')[0]).toBe('db');
+    expect(remoteContextNames('user@db:2222')[0]).toBe('db');
+  });
+});
+
+// Review round 4 of PR #88 (B-R4-5, mutant X1): a description that shares only a part of the prefix (for example a context
+// of the user described as "Dev Environments staging") is not one that Dev Environments wrote.
+describe('review round 4 of PR #88 (B-R4-5): isOwnContextDescription needs the whole prefix', () => {
+  it('is false for a description that shares only a part of the prefix', () => {
+    expect(isOwnContextDescription('Dev Environments staging')).toBe(false);
+    expect(isOwnContextDescription('Dev Environments: remote')).toBe(false);
+    expect(isOwnContextDescription(ownContextDescription('h'))).toBe(true);
+  });
+});

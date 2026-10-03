@@ -924,4 +924,31 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     h.docker.volumes.set('web-cache', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
     await refused(image);
   });
+
+  // Review round 4 of PR #88 (B-R4-6, mutant X12): the registry names the owner of a name; the labels of a volume (which
+  // anyone who can use the engine can write) never override it. A volume labelled with the ID and the repository of an
+  // environment of the account, but with another owner, leaves its image the account's own.
+  it('B-R4-6: keeps the owner of a name from the registry over the owner label of a volume', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
+    const own = environmentImageName(WEB, OTHER_ID, 1);
+    // A second reference names the image of an environment that the registry does not know (of this account by its
+    // volume), so the check reads the owners of the volumes.
+    const copy = environmentImageName(WEB, remote, 1);
+    h.docker.images.add(copy);
+    h.docker.imageIds.set(copy, `sha256:${'e'.repeat(64)}`);
+    h.docker.volumes.set('web-remote', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_REPOSITORY]: WEB, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // A volume of another name with the ID and the repository of the environment of the account, and another owner.
+    h.docker.volumes.set('web-forged', { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: WEB, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    let ownerLists = 0;
+    const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
+    h.docker.listEnvironmentVolumes = async () => {
+      if (new Error().stack?.includes('hostEnvironmentImageIds')) ownerLists++;
+      return listEnvironmentVolumes();
+    };
+    h.helper.config = { image: own, build: { options: ['--build-context', `copy=docker-image://${copy}`] } };
+    await h.service.open(TARGET, options());
+    expect(ownerLists).toBeGreaterThan(0);
+    expect(h.helper.builds).toHaveLength(1);
+  });
 });

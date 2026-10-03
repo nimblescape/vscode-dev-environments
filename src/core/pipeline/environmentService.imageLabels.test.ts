@@ -834,3 +834,71 @@ describe('review round 4 of PR #88 (A-R4-1, A-R4-2): Clone again and Select conf
     expect(h.helper.calls).not.toContain('listConfigurations');
   });
 });
+
+describe('review round 4 of PR #88 (B-R4-1, B-R4-2): Delete when the volume of the name is another environment\'s', () => {
+  const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+
+  // Review round 4 of PR #88 (B-R4-1, mutant D5): with colliding names, the container of the name is the other
+  // environment's dev container: Delete neither stops nor removes it.
+  it('B-R4-1: never stops or removes the running container of the name that is another environment\'s', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.volumes.set(NAME, theirs);
+    const theirContainer = h.docker.addContainer({ environmentId: OTHER_ID, name: NAME, state: 'running', image: 'their-image:1' });
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(h.docker.containerByRef(theirContainer.id)).toMatchObject({ name: NAME, state: 'running' });
+    expect(h.docker.log).not.toContain(`rm ${NAME}`);
+    expect(h.docker.log.filter((line) => line.startsWith('stop '))).toEqual([]);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+  });
+
+  // Review round 4 of PR #88 (B-R4-2, mutant D7): with colliding names, the Compose project of the name is the other
+  // environment's: Delete of an entry with a Compose build record keeps its networks (the Delete twin of B-R3-2).
+  it('B-R4-2: never removes the Compose project of the name (its networks) that is another environment\'s', async () => {
+    const project = composeProjectName(REPO, ENV_ID);
+    await seedEnvironment(h, {
+      container: null,
+      record: { compose: { service: 'app', images: [`${project}-app`], serviceImages: [], version: '2.40.3', inputsHash: 'inputs-1' } },
+    });
+    h.docker.volumes.set(NAME, theirs);
+    h.docker.networks.set(`${project}_default`, { [COMPOSE_PROJECT_LABEL]: project });
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(h.docker.networks.has(`${project}_default`)).toBe(true);
+    expect(h.docker.log.filter((line) => line.startsWith('network rm'))).toEqual([]);
+    expect(h.docker.volumes.get(NAME)).toEqual(theirs);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+  });
+});
+
+// Review round 4 of PR #88 (B-R4-3, mutant R2): requireOwnVolume refuses a volume that is missing right after
+// `docker volume create` (removed concurrently, or created on another context): a helper run on it would create an empty
+// volume without labels (concept 7.5). Adapted to 8b75419: also Clone again and Select configuration.
+describe('review round 4 of PR #88 (B-R4-3): a workspace volume that is missing where its own is required', () => {
+  it('B-R4-3: a first open whose volume is missing after the create clones nothing', async () => {
+    vi.spyOn(h.docker, 'createVolume').mockResolvedValue(undefined);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain('belongs to another environment');
+    expect(h.helper.calls.filter((call) => call.startsWith('clone') || call.startsWith('up'))).toEqual([]);
+    expect(h.helper.clones).toEqual([]);
+  });
+
+  it('B-R4-3: Clone again whose volume is missing after the create clones nothing', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    vi.spyOn(h.docker, 'createVolume').mockResolvedValue(undefined);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.clones).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+  });
+
+  it('B-R4-3: Select configuration lists nothing of a volume that is gone when the lock is held', async () => {
+    await seedEnvironment(h, { container: null });
+    // The volume existed at the check before the lock (requireVolume), and is gone under the lock.
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(true);
+    h.docker.volumes.delete(NAME);
+    const listed = await h.service.listConfigurations(ENV_ID, options()).catch(() => 'refused');
+    expect(listed).toBe('refused');
+    expect(h.helper.calls).not.toContain('listConfigurations');
+  });
+});
