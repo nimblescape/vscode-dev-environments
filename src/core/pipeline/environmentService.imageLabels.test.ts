@@ -794,3 +794,43 @@ describe('review round 3 of PR #88: the gaps of the mutation review (B-R3-1 to B
     expect(ups()).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${OWN} --remove-existing-container`]);
   });
 });
+
+describe('review round 4 of PR #88 (A-R4-1, A-R4-2): Clone again and Select configuration on a volume of the name', () => {
+  const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+
+  /** The question about the missing files is open while another environment of the same pair creates the volume. */
+  function foreignVolumeWhileAsking(): void {
+    const ask = h.ui.filesMissing.bind(h.ui);
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.ui.filesMissing = async (repository: string) => {
+      h.docker.volumes.set(NAME, { ...theirs });
+      return ask(repository);
+    };
+  }
+
+  it('A-R4-1: Clone again never clones into or starts on a volume of its name that another environment created meanwhile', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    foreignVolumeWhileAsking();
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.clones.filter((clone) => clone.volumeName === NAME)).toEqual([]);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+    expect(h.docker.volumes.get(NAME)).toEqual(theirs);
+  });
+
+  it('A-R4-1: a failed Clone again removes its own new volume, so the files count as missing again', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.volumes.has(NAME)).toBe(false);
+  });
+
+  it('A-R4-2: Select configuration never lists the configurations of a volume of its name that is another environment\'s', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.volumes.set(NAME, { ...theirs });
+    const listed = await h.service.listConfigurations(ENV_ID, options()).catch(() => 'refused');
+    expect(listed).toBe('refused');
+    expect(h.helper.calls).not.toContain('listConfigurations');
+  });
+});

@@ -1562,12 +1562,17 @@ export class EnvironmentService {
     await this.markBusy(ctx, 'create');
     ctx.steps.step('downloadingRepository');
     await this.deps.docker.createVolume(env.volumeName, volumeLabels(env));
+    // Review round 4 of PR #88 (A-R4-1): as the first open, never a volume of the name that another environment created
+    // meanwhile (`docker volume create` takes it as it is), and that volume is never removed.
+    await this.requireOwnVolume(env);
     try {
       await this.prepareHelper(ctx);
       await this.clone(ctx, ctx.session.token, defaultBranch);
     } catch (error) {
-      // The new volume is empty: remove it, so the files count as missing again.
-      await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
+      // The new volume is empty: remove it, so the files count as missing again (only while it is still its own).
+      if ((await this.workspaceVolumeOwnership(env)) === 'own') {
+        await this.quietly(`remove the volume ${env.volumeName}`, () => this.removeVolumeWithRetry(env.volumeName));
+      }
       throw error;
     }
     ctx.cloned = true;
@@ -5970,7 +5975,11 @@ export class EnvironmentService {
       return await this.withEnvironmentLock(
         env,
         options.signal,
-        () => this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal }),
+        async () => {
+          // Review round 4 of PR #88 (A-R4-2): never the configurations of a volume of the name that is not its own.
+          await this.requireOwnVolume(env);
+          return this.deps.helper.listConfigurations({ volumeName: env.volumeName, repository: env.repository, signal: options.signal });
+        },
         { batchVolume: env.volumeName },
       );
     } catch (error) {

@@ -394,13 +394,15 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     h.ui.filesMissingAnswer = 'cloneAgain';
     await h.service.open(TARGET, openOptions());
     expect(lockedIds).toEqual([ENV_ID]);
-    expect(openEvents().slice(0, 6)).toEqual([
+    expect(openEvents().slice(0, 7)).toEqual([
       'ensureImage',
       `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
       'busy=none',
       // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
       'docker volume inspect (locked)',
       'docker volume create (locked)',
+      // Review round 4 of PR #88 (A-R4-1): changed expectation, and whose the new volume is before the clone.
+      'docker volume inspect (locked)',
       'clone (locked)',
     ]);
     expect(openEvents()).toContain('up (locked)');
