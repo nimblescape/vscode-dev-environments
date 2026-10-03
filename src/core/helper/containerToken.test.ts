@@ -3,7 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Unit 15: the token of the owner account only in the memory of the dev container (TOKEN_WRITE_SCRIPT,
-// TOKEN_REMOVE_SCRIPT, writeContainerToken, removeContainerToken).
+// TOKEN_REMOVE_SCRIPT, writeContainerToken). Plan step 11B1 runs TOKEN_REMOVE_SCRIPT as a flow of the worker
+// (src/core/worker/tokenRemoveFlow.ts), so the removal through `docker exec` and its tests are gone with it.
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -15,8 +16,6 @@ import {
   TOKEN_REMOVE_SCRIPT,
   TOKEN_TMPFS_SUPER_OPTIONS,
   TOKEN_WRITE_SCRIPT,
-  removeContainerToken,
-  tokenRemoveCommand,
   tokenWriteCommand,
   writeContainerToken,
   type ContainerExec,
@@ -53,7 +52,6 @@ describe('the names of unit 15', () => {
 
   it('commands: the scripts with their arguments, never the token', () => {
     expect(tokenWriteCommand('dev', 'octo')).toEqual(['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', 'dev', 'octo']);
-    expect(tokenRemoveCommand()).toEqual(['sh', '-c', TOKEN_REMOVE_SCRIPT, 'sh']);
   });
 });
 
@@ -722,24 +720,3 @@ describe('writeContainerToken', () => {
   });
 });
 
-describe('removeContainerToken', () => {
-  it('runs the removal as root', async () => {
-    const exec = vi.fn<ContainerExec>(async () => execResult());
-    await removeContainerToken(exec, { container: 'c1', user: 'dev', timeoutMs: 30_000 });
-    expect(exec.mock.calls).toEqual([['c1', tokenRemoveCommand(), { user: 'root', timeoutMs: 30_000, signal: undefined }]]);
-  });
-
-  it('runs it again as the remote user when root may not (for example --cap-drop ALL), and fails when both fail', async () => {
-    const exec = vi.fn<ContainerExec>(async (_c, _command, options) => execResult(options.user === 'root' ? { exitCode: 1, stderr: 'github-token could not be removed.' } : {}));
-    await removeContainerToken(exec, { container: 'c1', user: 'dev' });
-    expect(exec.mock.calls.map((call) => call[2].user)).toEqual(['root', 'dev']);
-
-    const failing = vi.fn<ContainerExec>(async () => execResult({ exitCode: 1, stderr: 'github-token could not be removed.' }));
-    await expect(removeContainerToken(failing, { container: 'c1', user: 'dev' })).rejects.toThrow(/As dev: github-token could not be removed/);
-    for (const user of [undefined, 'root']) {
-      const once = vi.fn<ContainerExec>(async () => execResult({ exitCode: 1, stderr: 'x' }));
-      await expect(removeContainerToken(once, { container: 'c1', user })).rejects.toThrow('x');
-      expect(once).toHaveBeenCalledTimes(1);
-    }
-  });
-});

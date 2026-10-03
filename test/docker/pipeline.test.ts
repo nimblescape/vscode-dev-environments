@@ -31,7 +31,6 @@ import {
 } from '../../src/core/helper/containerGit';
 import { devContainersSettings } from '../../src/core/devContainers';
 import { Messages } from '../../src/core/messages';
-import { removeContainerToken } from '../../src/core/helper/containerToken';
 import {
   CONTAINER_VERSION,
   GH_CONFIG_FOLDER,
@@ -55,6 +54,8 @@ import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
+import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
+import { cliEngine } from './cliEngine';
 import { workerLocks } from './workerLocks';
 import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
 import {
@@ -218,6 +219,10 @@ describe('open pipeline on a seeded environment', () => {
   const online = service(registryTransport, 'online');
   const offline = service(offlineTransport, 'offline', offlineHelper.helper);
   const hanging = service(hangingTransport, 'hanging', hangingHelper.helper);
+
+  // Plan step 11B1: the removal of the token is a flow of the worker (Controller.removeGitToken sends the operation);
+  // here it runs against the real engine through the port of the tests.
+  const removeToken = (id: string, name: string) => removeTokenFlow({ environmentId: id, containerName: name, engine: cliEngine(cli), records: { get: (one) => registry.get(one) } });
 
   const environmentId = newEnvironmentId();
   const volumeName = resourceName(REPOSITORY, environmentId);
@@ -654,7 +659,7 @@ describe('open pipeline on a seeded environment', () => {
     // As the controller does it (Controller.removeGitToken).
     const container = cli.container(containerName);
     expect(container?.State.Running).toBe(true);
-    await removeContainerToken((c, command, options) => docker.exec(c, command, options), { container: container!.Id, user: REMOTE_USER, timeoutMs: 30_000 });
+    expect(await removeToken(environmentId, containerName)).toEqual({ outcome: 'removed', container: container!.Id.slice(0, 12) });
     expect(execIn('root', `ls -A ${TOKEN_FOLDER}`)).toBe('');
     expect(execIn('root', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} /workspaces || true`)).toBe('');
     const github = credentialFill('github.com');
@@ -1044,7 +1049,7 @@ describe('open pipeline on a seeded environment', () => {
    * Review of unit 15: an environment of the base image of the tests with `runArgs`, opened once; `check` runs while the
    * container runs. Everything is removed at the end (also the anonymous volumes of the container).
    */
-  async function withEnvironment(repository: string, runArgs: string[], check: (name: string) => Promise<void>, dockerfileLines: string[] = []): Promise<void> {
+  async function withEnvironment(repository: string, runArgs: string[], check: (name: string, id: string) => Promise<void>, dockerfileLines: string[] = []): Promise<void> {
     const id = newEnvironmentId();
     const name = resourceName(repository, id);
     const config = JSON.stringify({ name: repository, build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, ...runArgs] });
@@ -1058,7 +1063,7 @@ describe('open pipeline on a seeded environment', () => {
     try {
       await timings.measure(`first open of ${repository}`, () => online.openEnvironment(id, { progress: new RecordingProgress() }));
       expect(cli.container(name)?.State.Running).toBe(true);
-      await check(name);
+      await check(name, id);
     } finally {
       await registry.remove(id);
       cli.run(['rm', '-f', '-v', name]);
@@ -1084,20 +1089,18 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('review of unit 15 (P1): with --cap-drop DAC_OVERRIDE and a user other than root, the token is written, a second open works, a sign-out removes it', async () => {
-    await withEnvironment('devenv-test/no-dac-override', ['--cap-drop', 'DAC_OVERRIDE'], async (name) => {
+    await withEnvironment('devenv-test/no-dac-override', ['--cap-drop', 'DAC_OVERRIDE'], async (name, id) => {
       const asUser = (script: string) => cli.run(['exec', '-u', REMOTE_USER, name, 'sh', '-c', script]);
       expect(asUser(`cat ${GITHUB_TOKEN_FILE}`).out).toBe(DUMMY_TOKEN);
       // What the user may do in its folder, then a second open (the container runs).
       expect(asUser(`cd ${TOKEN_FOLDER} && mkdir -p x/y && ln -s / l && chmod 000 x/y x gh && chmod 000 ${TOKEN_FOLDER}`).code).toBe(0);
-      const id = (await registry.list()).find((entry) => entry.containerName === name)?.id;
-      expect(id).toBeDefined();
       const events = ui.events.length;
-      await online.openEnvironment(id!, { progress: new RecordingProgress() });
+      await online.openEnvironment(id, { progress: new RecordingProgress() });
       expect(ui.since(events).some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(false);
       expect(asUser(`cat ${GITHUB_TOKEN_FILE}`).out).toBe(DUMMY_TOKEN);
       expect(asUser(`cat ${GH_HOSTS_FILE}`).out).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
       // A sign-out, as the controller does it.
-      await removeContainerToken((c, command, options) => docker.exec(c, command, options), { container: name, user: REMOTE_USER, timeoutMs: 30_000 });
+      await removeToken(id, name);
       expect(cli.run(['exec', '-u', 'root', name, 'ls', '-A', TOKEN_FOLDER]).out).toBe('');
       expect(cli.run(['exec', '-u', 'root', name, 'sh', '-c', `grep -rl '${DUMMY_TOKEN}' ${TOKEN_FOLDER} || true`]).out).toBe('');
     });

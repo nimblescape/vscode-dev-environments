@@ -14,7 +14,7 @@ import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
-import { tokenRemoveCommand } from '../core/helper/containerToken';
+import { OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
 import { StoragePaths } from '../core/storage/paths';
@@ -98,10 +98,12 @@ function repositoryInfo(nameWithOwner: string, overrides: Partial<RepositoryInfo
  * The container of the environment as `docker.findContainer` gives it; `version` is its label
  * nimblescape.devenv.container-version.
  */
-/** The runs of TOKEN_REMOVE_SCRIPT in the dev container (the removal of the token, concept 7.5). */
+/**
+ * Plan step 11B1: changed (before: the runs of TOKEN_REMOVE_SCRIPT through docker.exec): the token removal is a flow of
+ * the worker, so the controller sends the operation `tokenRemove` (concept 7.5).
+ */
 function tokenRemovals(): number {
-  const command = JSON.stringify(tokenRemoveCommand());
-  return h.docker.exec.mock.calls.filter((call) => JSON.stringify(call[1]) === command).length;
+  return h.flow.mock.calls.filter((call) => call[0] === OP_TOKEN_REMOVE).length;
 }
 
 function containerInfo(version: string | undefined): ContainerInfo {
@@ -150,6 +152,8 @@ async function settle(condition: () => boolean, what: string): Promise<void> {
 }
 
 interface Harness {
+  /** Plan step 11B1: the flows that the controller sends to the worker (the token removal). */
+  flow: ReturnType<typeof vi.fn>;
   root: string;
   paths: StoragePaths;
   registry: EnvironmentRegistry;
@@ -334,6 +338,7 @@ function createHarness(
     showConnectionLost: vi.fn(),
   };
   const settings = { ...SETTINGS };
+  const flow = vi.fn(async (op: string, _params: unknown): Promise<unknown> => (op === OP_TOKEN_REMOVE ? { outcome: 'removed', container: 'c0ffeec0ffee' } : {}));
   const deps = {
     logger,
     registry,
@@ -341,6 +346,9 @@ function createHarness(
     sessionFiles,
     disconnectRequests,
     docker,
+    // Plan step 11B1: the flows that run in the worker (the token removal); the flow itself is tested in
+    // src/core/worker/tokenRemoveFlow.test.ts.
+    flow,
     service,
     discovery,
     auth,
@@ -393,6 +401,7 @@ function createHarness(
     controller,
     commands,
     docker,
+    flow,
     service,
     connection,
     coordinator,
@@ -2422,7 +2431,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith('c0ffee', tokenRemoveCommand(), expect.objectContaining({ user: 'root' }));
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
   });
 
@@ -2445,7 +2454,7 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith('c0ffee', tokenRemoveCommand(), expect.objectContaining({ user: 'root' }));
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
   });
 
   it('role A: without a sign-in, the window closes its connection', async () => {
@@ -2523,11 +2532,12 @@ describe('Accounts (concept 7.5)', () => {
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     await h.controller.onSessionChanged();
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.docker.exec).toHaveBeenCalledWith('c0ffee', tokenRemoveCommand(), expect.objectContaining({ user: 'root' }));
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
   });
 
   // Greenfield (user decision 2026-09-27): the token is only in the memory of the dev container; there is no removal
-  // from the volume any more.
+  // from the volume any more. Plan step 11B1: changed, the removal is a flow of the worker (the flow itself:
+  // src/core/worker/tokenRemoveFlow.test.ts); the controller sends it and logs what it answered.
   describe('the removal of the token from the running container (concept 7.5)', () => {
     const VOLUME = 'devenv-acme-api-volume';
 
@@ -2535,50 +2545,42 @@ describe('Accounts (concept 7.5)', () => {
       const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME });
       await h.registry.add(env);
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-      const logged = () =>
-        [...h.logger.info.mock.calls, ...h.logger.warn.mock.calls].some((call) => /GitHub token|holds no GitHub token/.test(String(call[0])));
-      await settle(logged, 'the removal of the token');
+      await settle(() => tokenRemovals() > 0, 'the removal of the token');
     }
 
-    // unit 15: changed expectation, the token is removed from the memory of the running dev container (as root,
-    // TOKEN_REMOVE_SCRIPT).
-    it('removes it from the memory of the running container, with a time limit', async () => {
+    it('sends the flow to the worker of the engine, with the environment and the container', async () => {
       await takeTokenOut();
-      expect(h.docker.exec).toHaveBeenCalledTimes(1);
-      expect(h.docker.exec).toHaveBeenCalledWith('c0ffee', tokenRemoveCommand(), { user: 'root', timeoutMs: 30_000, signal: undefined });
-      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
+      expect(h.flow).toHaveBeenCalledTimes(1);
+      expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: ENV_ID, containerName: CONTAINER }, {});
+      expect(h.docker.exec).not.toHaveBeenCalled();
       expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
     });
 
-    it('runs nothing in a stopped container (its memory holds no token)', async () => {
-      h.docker.containerState.mockResolvedValue('stopped');
-      h.docker.findContainer.mockResolvedValue({ ...containerInfo(String(CONTAINER_VERSION)), state: 'stopped', rawState: 'exited' });
-      await takeTokenOut();
-      expect(h.docker.exec).not.toHaveBeenCalled();
-      expect(h.logger.info).toHaveBeenCalledWith(`The container ${CONTAINER} does not run: its memory holds no GitHub token.`);
-    });
-
-    it('unit 15: removes it as the remote user of the entry when root may not (for example --cap-drop ALL)', async () => {
-      h.docker.exec.mockImplementation(async (_container: string, _command: string[], options: { user?: string }) =>
-        options.user === 'root'
-          ? { exitCode: 1, stdout: '', stderr: '/run/devenv/github-token could not be removed.', timedOut: false }
-          : { exitCode: 0, stdout: '', stderr: '', timedOut: false },
-      );
-      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME, remoteUser: 'vscode' });
-      await h.registry.add(env);
-      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-      await settle(() => tokenRemovals() >= 2, 'the removal of the token');
-      await settle(() => h.logger.info.mock.calls.some((call) => String(call[0]).includes('GitHub token was removed')), 'the log line');
-      expect(h.docker.exec.mock.calls.map((call) => (call[2] as { user?: string }).user)).toEqual(['root', 'vscode']);
-      expect(h.logger.info).toHaveBeenCalledWith(`The GitHub token was removed from the container ${CONTAINER}.`);
-    });
-
-    it('unit 15: warns when the token cannot be removed from the container', async () => {
-      h.docker.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: '/run/devenv/github-token could not be removed.', timedOut: false });
+    it('warns when the flow fails, and when it answers with an invalid value', async () => {
+      h.flow.mockRejectedValueOnce(new Error('/run/devenv/github-token could not be removed.'));
       await takeTokenOut();
       expect(h.logger.warn).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`^The GitHub token could not be removed from the container ${CONTAINER}: .*github-token could not be removed`)),
       );
+      recreateHarness({});
+      h.flow.mockResolvedValueOnce({ outcome: 'maybe' });
+      await takeTokenOut();
+      expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('answered the token removal with an invalid value'));
+    });
+
+    it('runs no flow on another Docker host', async () => {
+      recreateHarness({
+        dockerTargets: {
+          current: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }),
+          resolve: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }),
+          withOperation: async (_target: unknown, run: () => Promise<unknown>) => run(),
+        } as unknown as NonNullable<Parameters<typeof createHarness>[0]>['dockerTargets'],
+      });
+      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME });
+      await h.registry.add(env);
+      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+      await settle(() => h.logger.info.mock.calls.some((call) => String(call[0]).includes('is on another Docker host')), 'the log line');
+      expect(h.flow).not.toHaveBeenCalled();
     });
   });
 

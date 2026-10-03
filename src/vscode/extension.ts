@@ -60,6 +60,9 @@ import { DockerHostIndicator } from './dockerHostIndicator';
 import { DockerSetup } from './dockerSetup';
 import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
+import { isProcessAlive } from '../core/session/sessionRules';
+import { extensionHostSide } from './hostSide';
+import { hostSideHandler } from '../core/worker/hostSideHandler';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
@@ -648,6 +651,26 @@ async function activateExtension(
     sessionFiles,
     disconnectRequests,
     docker,
+    // Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): a flow runs in the worker of the current engine,
+    // and the HostSide of this computer answers its requests (hostSideHandler).
+    flow: async (op, params, options) =>
+      channels.flow(await targets.current(), op, params, {
+        signal: options.signal,
+        onAsk: hostSideHandler(
+          extensionHostSide({
+            registry,
+            sessionFiles,
+            ui,
+            auth,
+            credentials,
+            settings: getSettings,
+            windowId: sessionCoordinator.windowId,
+            isProcessAlive: (pid: number) => isProcessAlive(pid),
+            logger,
+          }),
+          logger,
+        ),
+      }),
     service,
     discovery,
     auth,

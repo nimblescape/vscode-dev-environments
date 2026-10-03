@@ -25,8 +25,10 @@ import {
 import { batchChunkOperation, type BatchDeps } from './batch';
 import { batchHelperOperations } from './batchHelper';
 import { contextSecrets } from './operationContext.testkit';
+import type { DockerEngine } from '../core/worker/dockerEngine';
+import { tokenRemoveOperation } from './flowOperations';
 import { dockerOperation } from './operations';
-import { ChannelServer, OperationError, type OperationHandler, type ServerChild } from './server';
+import { ChannelServer, OperationError, type OperationContext, type OperationHandler, type ServerChild } from './server';
 
 function setup(operations: Record<string, OperationHandler>) {
   const messages: ServerMessage[] = [];
@@ -636,5 +638,83 @@ describe('named secrets and requests: review round 2 (plan step 11A)', () => {
     }
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toMatchObject({ ok: true, value: { codes: [...Array(31).fill(null), 'invalid'], tokenKept: true, registryAdded: true } });
+  });
+});
+
+// Plan step 11B1: the operation that runs the first flow in the worker, with its requests to the extension.
+describe('the tokenRemove operation (plan step 11B1)', () => {
+  const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+  const CONTAINER = 'devenv-acme-api-brave-noether';
+  const base = {
+    signal: new AbortController().signal,
+    progress: () => {},
+    log: () => {},
+    output: () => {},
+    docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+  };
+
+  function engineOf(running: boolean): DockerEngine {
+    const container = {
+      id: 'c'.repeat(64),
+      name: CONTAINER,
+      state: running ? ('running' as const) : ('stopped' as const),
+      rawState: running ? 'running' : 'exited',
+      labels: { 'nimblescape.devenv.environment-id': ENVIRONMENT_ID },
+      image: 'img:1',
+    };
+    return {
+      container: async () => container,
+      containers: async () => (running ? [container] : []),
+      exec: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+      stop: async () => {},
+      start: async () => {},
+    };
+  }
+
+  it('asks the extension for the record of the environment and answers with what it did', async () => {
+    const asks: { kind: string; payload: unknown }[] = [];
+    const context = {
+      ...base,
+      ...contextSecrets(),
+      ask: async (kind: string, payload: unknown) => {
+        asks.push({ kind, payload });
+        return { id: ENVIRONMENT_ID, remoteUser: 'dev' };
+      },
+    } as unknown as OperationContext;
+    const value = await tokenRemoveOperation(engineOf(true))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context);
+    expect(value).toEqual({ outcome: 'removed', container: 'c'.repeat(12) });
+    expect(asks).toEqual([{ kind: 'record', payload: { call: 'get', args: [ENVIRONMENT_ID] } }]);
+  });
+
+  it('answers `notRunning` when no container of the environment runs', async () => {
+    const context = { ...base, ...contextSecrets(), ask: async () => null } as unknown as OperationContext;
+    expect(await tokenRemoveOperation(engineOf(false))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).toEqual({ outcome: 'notRunning' });
+  });
+
+  it('refuses invalid parameters and any secret', async () => {
+    const context = { ...base, ...contextSecrets(), ask: async () => null } as unknown as OperationContext;
+    const engine = engineOf(true);
+    // 'a b' and '../x' are no storage ID (src/core/storage/paths.ts), '../x' no container name; a key too many is refused too.
+    for (const params of [
+      {},
+      { environmentId: 'a b', containerName: CONTAINER },
+      { environmentId: '../x', containerName: CONTAINER },
+      { environmentId: ENVIRONMENT_ID },
+      { environmentId: ENVIRONMENT_ID, containerName: '../x' },
+      { environmentId: ENVIRONMENT_ID, containerName: CONTAINER, user: 'root' },
+    ]) {
+      await expect(tokenRemoveOperation(engine)(params, context)).rejects.toMatchObject({ code: 'invalid' });
+    }
+    const withSecret = { ...base, ...contextSecrets({ token: 'abcd1234' }), ask: async () => null } as unknown as OperationContext;
+    await expect(tokenRemoveOperation(engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, withSecret)).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  it('fails with the reason when the token could still be there', async () => {
+    const engine = { ...engineOf(true), exec: async () => ({ exitCode: 1, stdout: '', stderr: 'root may not', timedOut: false }) };
+    const context = { ...base, ...contextSecrets(), ask: async () => null } as unknown as OperationContext;
+    await expect(tokenRemoveOperation(engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).rejects.toMatchObject({
+      code: 'failed',
+      message: 'root may not',
+    });
   });
 });

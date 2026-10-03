@@ -15,6 +15,7 @@ import {
   OP_PROBE,
   OP_PULL,
   OP_START_CONTAINERS,
+  OP_TOKEN_REMOVE,
   OP_REFRESH,
   OP_SWEEP,
   engineIdentity,
@@ -31,6 +32,8 @@ import { abortError, type Logger, type ProcessRunner } from '../core/ports';
 import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/batch';
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation } from './batch';
 import { engineApi } from './engineApi';
+import { dockerEngine } from './engineClient';
+import { tokenRemoveOperation } from './flowOperations';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -152,6 +155,9 @@ export const refreshOperation: OperationHandler = async (params, context) => {
 /** Plan step 10A: the Engine API of the worker's engine, over its socket. */
 const ENGINE = engineApi();
 
+/** Plan step 11B1: the port of the engine for the flows that run in the worker (section 0 of the plan). */
+const DOCKER = dockerEngine(ENGINE);
+
 /** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
 const BATCH = batchDeps();
 
@@ -169,4 +175,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   // Plan step 10A (decision of 2026-10-03): operations over the Engine API of the worker's engine (engineOperations.ts).
   [OP_PULL]: pullOperation(ENGINE),
   [OP_START_CONTAINERS]: startContainersOperation(ENGINE),
+  // Plan step 11B1: the flows that run in the worker (flowOperations.ts).
+  [OP_TOKEN_REMOVE]: tokenRemoveOperation(DOCKER),
 };

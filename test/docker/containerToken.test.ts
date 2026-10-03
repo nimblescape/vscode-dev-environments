@@ -10,13 +10,18 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { removeContainerToken, writeContainerToken, type ContainerExec } from '../../src/core/helper/containerToken';
-import { GITHUB_TOKEN_FILE, TOKEN_FOLDER, TOKEN_TMPFS } from '../../src/core/names';
+import { writeContainerToken, type ContainerExec } from '../../src/core/helper/containerToken';
+import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS } from '../../src/core/names';
+import type { Environment } from '../../src/core/types';
+import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
+import { cliEngine } from './cliEngine';
 import { DUMMY_TOKEN, dockerTestContext } from './harness';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL } from './dockerRun';
 
 /** The remote user of the containers: a numeric user without an entry in /etc/passwd (the scripts take it as it is). */
 const USER = '1000';
+/** The environment that the containers of this file belong to (the flow of the removal finds them by its label). */
+const ENVIRONMENT_ID = 'devenv-test-token-environment';
 
 describe('the token in the memory of a real container (review of unit 15)', () => {
   const { run, cli } = dockerTestContext('containerToken');
@@ -39,7 +44,24 @@ describe('the token in the memory of a real container (review of unit 15)', () =
   function start(args: string[]): string {
     const name = `devenv-test-token-${crypto.randomBytes(4).toString('hex')}`;
     created.containers.push(name);
-    cli.ok(['run', '-d', '--name', name, '--network', 'none', '--label', `${TEST_RUN_LABEL}=${run.runId}`, ...args, '--tmpfs', TOKEN_TMPFS, TEST_BASE_IMAGE, 'sleep', '600']);
+    cli.ok([
+      'run',
+      '-d',
+      '--name',
+      name,
+      '--network',
+      'none',
+      '--label',
+      `${TEST_RUN_LABEL}=${run.runId}`,
+      '--label',
+      `${LABEL_ENVIRONMENT_ID}=${ENVIRONMENT_ID}`,
+      ...args,
+      '--tmpfs',
+      TOKEN_TMPFS,
+      TEST_BASE_IMAGE,
+      'sleep',
+      '600',
+    ]);
     return name;
   }
 
@@ -57,7 +79,15 @@ describe('the token in the memory of a real container (review of unit 15)', () =
   }
 
   const write = (container: string) => writeContainerToken(exec, { container, user: USER, token: DUMMY_TOKEN, login: 'devenv-test', timeoutMs: 30_000 });
-  const remove = (container: string) => removeContainerToken(exec, { container, user: USER, timeoutMs: 30_000 });
+  // Plan step 11B1: the removal is a flow of the worker; here it runs against the real engine through the port of the tests.
+  const engine = cliEngine(cli);
+  const remove = (container: string) =>
+    removeTokenFlow({
+      environmentId: ENVIRONMENT_ID,
+      containerName: container,
+      engine,
+      records: { get: async () => ({ id: ENVIRONMENT_ID, remoteUser: USER }) as Environment },
+    });
 
   it.each<[string, string[]]>([
     ['--cap-drop DAC_OVERRIDE', ['--cap-drop', 'DAC_OVERRIDE']],
@@ -76,7 +106,8 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     expect(cli.ok(['exec', '--privileged', '-u', 'root', container, 'ls', '-A', TOKEN_FOLDER]).split('\n').sort()).toEqual(['gh', 'github-token']);
     // A sign-out.
     cli.ok(['exec', '-u', USER, container, 'sh', '-c', `cd ${TOKEN_FOLDER} && mkdir -p x/y && chmod 000 x/y x gh && chmod 000 ${TOKEN_FOLDER}`]);
-    await remove(container);
+    // Plan step 11B1: the flow reports the container that it emptied (its short ID).
+    expect(await remove(container)).toEqual({ outcome: 'removed', container: cli.container(container)!.Id.slice(0, 12) });
     expect(tokenFiles(container)).toEqual([]);
     expect(cli.run(['exec', '--privileged', '-u', 'root', container, 'ls', '-A', TOKEN_FOLDER]).out).toBe('');
   });

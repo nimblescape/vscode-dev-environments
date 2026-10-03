@@ -965,3 +965,37 @@ export function parseStartContainersParams(value: unknown): StartContainersParam
   if (!ids.every((id) => typeof id === 'string' && /^[0-9a-f]{64}$/.test(id))) return undefined;
   return { ids: [...(ids as string[])] };
 }
+
+/**
+ * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): `tokenRemove`, the first flow that runs in the
+ * worker. It empties the token folder of the dev container of an environment (concept section 9) and asks the extension
+ * for the record of the environment (its remote user). Parameters TokenRemoveParams, value TokenRemoveValue; no secret.
+ */
+export const OP_TOKEN_REMOVE = 'tokenRemove';
+
+export interface TokenRemoveParams {
+  environmentId: string;
+  containerName: string;
+}
+
+export interface TokenRemoveValue {
+  outcome: 'removed' | 'notRunning';
+  container?: string;
+}
+
+/** The strict check of TokenRemoveParams (both sides). */
+export function parseTokenRemoveParams(value: unknown): TokenRemoveParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'containerName'])) return undefined;
+  const { environmentId, containerName } = value;
+  if (!isStorageId(environmentId) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
+  return { environmentId, containerName };
+}
+
+/** The check of TokenRemoveValue (the extension). */
+export function parseTokenRemoveValue(value: unknown): TokenRemoveValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome'], ['container'])) return undefined;
+  const { outcome, container } = value;
+  if (outcome !== 'removed' && outcome !== 'notRunning') return undefined;
+  if (container !== undefined && (typeof container !== 'string' || !/^[0-9a-f]{12}$/.test(container))) return undefined;
+  return container === undefined ? { outcome } : { outcome, container };
+}

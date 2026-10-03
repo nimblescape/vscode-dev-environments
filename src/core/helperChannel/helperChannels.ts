@@ -409,6 +409,14 @@ export class HelperChannels {
     await this.withChannel(target, options.signal, (channel) => channel.startContainers(ids, options));
   }
 
+  /**
+   * Plan step 11B1: a flow in the worker of `target` (HelperChannel.flow). Made ready and sent once more after `closed`
+   * as docker(); never the way without the worker.
+   */
+  async flow(target: DockerTarget, op: string, params: unknown, options: Parameters<HelperChannel['flow']>[2] = {}): Promise<unknown> {
+    return this.withChannel(target, options.signal, (channel) => channel.flow(op, params, options));
+  }
+
   /** Plan step 10A: `call` with the channel of `target` (ready), once more through a new channel when it was `closed`. */
   private async withChannel<T>(target: DockerTarget, signal: AbortSignal | undefined, call: (channel: HelperChannel) => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
