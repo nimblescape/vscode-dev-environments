@@ -349,8 +349,11 @@ export class ChannelServer {
       } catch (error) {
         outcome = {
           ok: false,
+          // Review round 1 of PR #89 (A-R1-4): the message may carry text of the engine or a registry: masked too.
           error:
-            error instanceof OperationError ? { code: error.code, message: error.message } : { code: 'failed', message: messageOf(error) },
+            error instanceof OperationError
+              ? { code: error.code, message: redact(error.message, request.secret) }
+              : { code: 'failed', message: redact(messageOf(error), request.secret) },
         };
       }
       if (run.timeoutTimer) clearTimeout(run.timeoutTimer);

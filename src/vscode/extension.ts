@@ -161,7 +161,7 @@ async function activateExtension(
       adapterOptions.onDaemonStatus?.(running);
     },
     // Plan step 10A: a pull through the worker sends the credentials that Docker stored here (the store comes below).
-    storedCredentials: (registry, signal) => credentials.get(registry, signal),
+    storedCredentials: (registry, signal) => credentials.getForPull(registry, signal),
   });
   // Unit 7: the Docker host is the current Docker context, read at the start of each operation.
   const targets = new DockerTargets(docker, env, logger, platform);

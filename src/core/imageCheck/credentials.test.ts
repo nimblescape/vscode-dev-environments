@@ -102,6 +102,18 @@ describe('DockerCredentialStore', () => {
     expect(await store().get('myregistry.azurecr.io')).toBeUndefined();
   });
 
+  // Review round 1 of PR #89 (A-R1-3): for a pull through the worker, an identity token is kept (as the Docker CLI sends it).
+  it('getForPull keeps identity tokens of an auth entry and of a helper; get still ignores them', async () => {
+    writeConfig({ auths: { 'myregistry.azurecr.io': { auth: base64('<token>:x'), identitytoken: 'refresh' } } });
+    expect(await store().getForPull('myregistry.azurecr.io')).toEqual({ username: '<token>', password: 'refresh' });
+    writeConfig({ credsStore: 'desktop' });
+    const runner = fakeRunner(() => ({ stdout: JSON.stringify({ Username: '<token>', Secret: 'refresh-2' }) }));
+    expect(await store(runner).getForPull('myregistry.azurecr.io')).toEqual({ username: '<token>', password: 'refresh-2' });
+    expect(await store(runner).get('myregistry.azurecr.io')).toBeUndefined();
+    writeConfig({ auths: { 'ghcr.io': { auth: base64('octocat:pw') } } });
+    expect(await store().getForPull('ghcr.io')).toEqual({ username: 'octocat', password: 'pw' });
+  });
+
   it('calls credHelpers[server] with the server on standard input', async () => {
     writeConfig({ credHelpers: { 'gcr.io': 'gcloud' }, credsStore: 'desktop' });
     const runner = fakeRunner(() => ({ stdout: JSON.stringify({ ServerURL: 'gcr.io', Username: 'oauth2', Secret: 's3' }) }));

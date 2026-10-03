@@ -753,6 +753,26 @@ export interface PullParams {
   /** With a secret: the user of the registry, and its server (`https://index.docker.io/v1/` for Docker Hub). */
   username?: string;
   serveraddress?: string;
+  /**
+   * Review round 1 of PR #89 (A-R1-3): the secret is an identity token of `docker login` (sent as `identitytoken`, with
+   * `serveraddress` and without `username`).
+   */
+  identityToken?: true;
+}
+
+/** A tag (as the Docker reference grammar has it) and a digest. */
+const PULL_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const PULL_DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,}$/;
+
+/**
+ * Review round 1 of PR #89 (A-R1-2): true when `reference` ends in a valid digest (`@<digest>`) or a valid tag after its
+ * last `/`. An empty tag (`node:`) is none: the engine would take it for "pull every tag".
+ */
+function hasTagOrDigest(reference: string): boolean {
+  const at = reference.indexOf('@');
+  if (at >= 0) return PULL_DIGEST.test(reference.slice(at + 1));
+  const colon = reference.lastIndexOf(':');
+  return colon > reference.lastIndexOf('/') && PULL_TAG.test(reference.slice(colon + 1));
 }
 
 /** `reference` with the tag `latest` when it has neither a tag nor a digest (the default of `docker pull`). */
@@ -764,12 +784,20 @@ export function pullReference(reference: string): string {
 
 /** The strict check of PullParams (both sides). */
 export function parsePullParams(value: unknown): PullParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['reference'], ['username', 'serveraddress'])) return undefined;
+  if (!isRecord(value) || !hasOnlyKeys(value, ['reference'], ['username', 'serveraddress', 'identityToken'])) return undefined;
   const { reference, username, serveraddress } = value;
   if (typeof reference !== 'string' || reference.length === 0 || reference.length > MAX_PULL_REFERENCE_LENGTH) return undefined;
-  if (/[\s\0]/.test(reference) || reference.startsWith('-') || pullReference(reference) !== reference) return undefined;
-  if ((username === undefined) !== (serveraddress === undefined)) return undefined;
+  if (/[\s\0]/.test(reference) || reference.startsWith('-') || !hasTagOrDigest(reference)) return undefined;
+  const { identityToken } = value;
+  if (identityToken !== undefined && (identityToken !== true || username !== undefined || typeof serveraddress !== 'string')) return undefined;
+  if (identityToken === undefined && (username === undefined) !== (serveraddress === undefined)) return undefined;
   const params: PullParams = { reference };
+  if (identityToken === true && typeof serveraddress === 'string') {
+    if (serveraddress.length === 0 || serveraddress.length > 512 || /[\s\0]/.test(serveraddress)) return undefined;
+    params.serveraddress = serveraddress;
+    params.identityToken = true;
+    return params;
+  }
   if (username !== undefined) {
     if (typeof username !== 'string' || username.length === 0 || username.length > 256 || /[\0\n\r]/.test(username)) return undefined;
     if (typeof serveraddress !== 'string' || serveraddress.length === 0 || serveraddress.length > 512 || /[\s\0]/.test(serveraddress)) return undefined;

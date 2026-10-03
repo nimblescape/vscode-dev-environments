@@ -36,6 +36,7 @@ import { heldEnvironmentLock, type HeldEnvironmentLock } from './environmentLock
 import { preparingWorker, runPreparingWorker } from './workerPreparation';
 import { HelperChannelError, HelperOperationError, type ChannelPullOptions } from '../helperChannel/helperChannel';
 import { pullReference } from '../helperChannel/protocol';
+import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 
 // Plan step 5, PR A: the classification moved to dockerRouting.ts.
@@ -221,7 +222,7 @@ export interface ContainerAdapterOptions {
   sshDropRetryDelayMs?: number;
   /**
    * Plan step 10A (decision of 2026-10-03): the registry credentials that Docker has stored on this computer
-   * (DockerCredentialStore). A pull through the worker sends them as the secret of the operation, as the Docker CLI on
+   * (DockerCredentialStore.getForPull: an identity token as `{ username: '<token>', password: <token> }`). A pull through the worker sends them as the secret of the operation, as the Docker CLI on
    * this computer sent them to the engine before (the worker has no credentials of its own).
    */
   storedCredentials?: (registry: string, signal?: AbortSignal) => Promise<Credentials | undefined>;
@@ -1556,7 +1557,13 @@ export class ContainerAdapter {
       const registry = parseImageReference(pulled)?.registry;
       const stored = registry === undefined ? undefined : await this.storedCredentials(registry, signal);
       if (signal?.aborted) throw abortError();
-      if (stored !== undefined && registry !== undefined) credentials = { username: stored.username, password: stored.password, serveraddress: credentialServerName(registry) };
+      if (stored !== undefined && registry !== undefined) {
+        // Review round 1 of PR #89 (A-R1-3): an identity token of `docker login` goes as such (IDENTITY_TOKEN_USER).
+        credentials =
+          stored.username === IDENTITY_TOKEN_USER
+            ? { identityToken: stored.password, serveraddress: credentialServerName(registry) }
+            : { username: stored.username, password: stored.password, serveraddress: credentialServerName(registry) };
+      }
     }
     this.logger.info(`Pulling image ${pulled} through the worker${credentials !== undefined ? ` with the credentials for ${credentials.serveraddress}` : ''}.`);
     const options: ChannelPullOptions = { signal, onOutput, ...(credentials !== undefined ? { credentials } : {}) };

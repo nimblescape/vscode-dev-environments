@@ -38,7 +38,7 @@ export interface DockerCredentialStoreOptions {
 }
 
 /** Identity tokens (OAuth refresh tokens of `docker login`) have this user name. They are not used. */
-const IDENTITY_TOKEN_USER = '<token>';
+export const IDENTITY_TOKEN_USER = '<token>';
 const HELPER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const MAX_HELPER_CALLS = 3;
 
@@ -75,12 +75,28 @@ export class DockerCredentialStore {
     }
   }
 
+  /**
+   * Plan step 10A, review round 1 of PR #89 (A-R1-3): like `get`, for a pull through the worker, but an identity token
+   * (the OAuth refresh token of `docker login`) is kept, as `{ username: '<token>', password: <token> }`
+   * (IDENTITY_TOKEN_USER): the Docker CLI on this computer sent it to the engine as `identitytoken` before.
+   */
+  async getForPull(registry: string, signal?: AbortSignal): Promise<Credentials | undefined> {
+    try {
+      return await this.lookup(registry, signal, true);
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.logger.warn(`Registry credentials for ${registryDisplayName(registry)} could not be read: ${errorMessage(error)}`);
+      }
+      return undefined;
+    }
+  }
+
   /** The store as a `CredentialsProvider` for the RegistryClient. */
   provider(): CredentialsProvider {
     return (registry, signal) => this.get(registry, signal);
   }
 
-  private async lookup(registry: string, signal: AbortSignal | undefined): Promise<Credentials | undefined> {
+  private async lookup(registry: string, signal: AbortSignal | undefined, keepIdentityToken = false): Promise<Credentials | undefined> {
     const config = await this.readConfig();
     if (!config) return undefined;
 
@@ -97,12 +113,12 @@ export class DockerCredentialStore {
     if (helper) {
       const servers = unique([server, ...authKeys]).slice(0, MAX_HELPER_CALLS);
       for (const candidate of servers) {
-        const credentials = await this.fromHelper(helper, candidate, signal);
+        const credentials = await this.fromHelper(helper, candidate, signal, keepIdentityToken);
         if (credentials) return credentials;
       }
     }
     for (const key of authKeys) {
-      const credentials = fromAuthEntry(auths[key]);
+      const credentials = fromAuthEntry(auths[key], keepIdentityToken);
       if (credentials) return credentials;
     }
     return undefined;
@@ -136,7 +152,7 @@ export class DockerCredentialStore {
   }
 
   /** `docker-credential-<helper> get` with the server name on standard input. */
-  private async fromHelper(helper: string, server: string, signal: AbortSignal | undefined): Promise<Credentials | undefined> {
+  private async fromHelper(helper: string, server: string, signal: AbortSignal | undefined, keepIdentityToken = false): Promise<Credentials | undefined> {
     if (!HELPER_NAME.test(helper)) {
       this.logger.warn(`Ignoring the Docker credential helper name "${helper}".`);
       return undefined;
@@ -162,7 +178,7 @@ export class DockerCredentialStore {
       return undefined;
     }
     if (!isRecord(parsed)) return undefined;
-    return credentials(parsed.Username, parsed.Secret);
+    return credentials(parsed.Username, parsed.Secret, keepIdentityToken);
   }
 }
 
@@ -185,8 +201,9 @@ export function withGitHubPackagesFallback(
   };
 }
 
-function fromAuthEntry(entry: AuthEntry | undefined): Credentials | undefined {
+function fromAuthEntry(entry: AuthEntry | undefined, keepIdentityToken = false): Credentials | undefined {
   if (!isRecord(entry)) return undefined;
+  if (keepIdentityToken && typeof entry.identitytoken === 'string' && entry.identitytoken !== '') return { username: IDENTITY_TOKEN_USER, password: entry.identitytoken };
   if (typeof entry.auth === 'string' && entry.auth !== '') {
     const decoded = Buffer.from(entry.auth, 'base64').toString('utf8');
     const colon = decoded.indexOf(':');
@@ -195,9 +212,9 @@ function fromAuthEntry(entry: AuthEntry | undefined): Credentials | undefined {
   return credentials(entry.username, entry.password);
 }
 
-function credentials(username: unknown, password: unknown): Credentials | undefined {
+function credentials(username: unknown, password: unknown, keepIdentityToken = false): Credentials | undefined {
   if (typeof username !== 'string' || typeof password !== 'string') return undefined;
-  if (username === '' || password === '' || username === IDENTITY_TOKEN_USER) return undefined;
+  if (username === '' || password === '' || (username === IDENTITY_TOKEN_USER && !keepIdentityToken)) return undefined;
   return { username, password };
 }
 

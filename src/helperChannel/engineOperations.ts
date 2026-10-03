@@ -10,9 +10,14 @@ import type { EngineApi } from './engineApi';
 import { engineErrorMessage } from './engineApi';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
-/** The value of the header X-Registry-Auth: the credentials as JSON in URL-safe Base64, as the Docker CLI sends them. */
-export function registryAuthHeader(username: string, password: string, serveraddress: string): string {
-  return Buffer.from(JSON.stringify({ username, password, serveraddress }), 'utf8').toString('base64url');
+/**
+ * The value of the header X-Registry-Auth: the credentials as JSON in URL-safe Base64 **with** its padding, as the
+ * Docker CLI sends them (Go's base64.URLEncoding). Review round 1 of PR #89 (A-R1-1): the engine decodes it strictly and
+ * ignores a header it cannot decode, so Node's `base64url` (without `=`) made it pull anonymously in 2 of 3 cases.
+ * `identitytoken`: an identity token of `docker login` instead of a user and password (A-R1-3).
+ */
+export function registryAuthHeader(credentials: { username: string; password: string; serveraddress: string } | { identitytoken: string; serveraddress: string }): string {
+  return Buffer.from(JSON.stringify(credentials), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
 interface PullMessage {
@@ -40,13 +45,17 @@ export function pullOperation(engine: EngineApi): OperationHandler {
   return async (params, context: OperationContext) => {
     const checked = parsePullParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the pull operation are invalid.');
-    if ((context.secret === undefined) !== (checked.username === undefined)) {
-      throw new OperationError('invalid', 'The pull operation takes a secret exactly with a user and a server.');
+    if ((context.secret === undefined) !== (checked.serveraddress === undefined)) {
+      throw new OperationError('invalid', 'The pull operation takes a secret exactly with a server (and a user or an identity token).');
     }
-    context.log(`pull ${checked.reference}${checked.username !== undefined ? ` (with the credentials for ${checked.serveraddress})` : ''}`);
+    context.log(`pull ${checked.reference}${checked.serveraddress !== undefined ? ` (with the credentials for ${checked.serveraddress})` : ''}`);
     const headers: Record<string, string> = {};
-    if (checked.username !== undefined && checked.serveraddress !== undefined && context.secret !== undefined) {
-      headers['X-Registry-Auth'] = registryAuthHeader(checked.username, context.secret, checked.serveraddress);
+    if (checked.serveraddress !== undefined && context.secret !== undefined) {
+      headers['X-Registry-Auth'] = registryAuthHeader(
+        checked.identityToken === true
+          ? { identitytoken: context.secret, serveraddress: checked.serveraddress }
+          : { username: checked.username ?? '', password: context.secret, serveraddress: checked.serveraddress },
+      );
     }
     let pending = '';
     // The start of the answer, for the message of an error answer (its body is one JSON object, not a stream).

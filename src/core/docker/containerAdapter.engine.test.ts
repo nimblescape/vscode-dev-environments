@@ -87,6 +87,13 @@ describe('ContainerAdapter.pullImage through the worker (plan step 10A)', () => 
     expect(lookups).toEqual([]);
   });
 
+  // Review round 1 of PR #89 (A-R1-3): a stored identity token goes as such.
+  it('sends a stored identity token as an identity token', async () => {
+    const { docker, pulls } = setup({ stored: { username: '<token>', password: 'refresh-token' } });
+    await runWithDockerTarget(REMOTE, () => docker.pullImage('myregistry.azurecr.io/team/app:1'));
+    expect(pulls[0].options.credentials).toEqual({ identityToken: 'refresh-token', serveraddress: 'myregistry.azurecr.io' });
+  });
+
   it('pulls without credentials when none are stored', async () => {
     const { docker, pulls } = setup();
     await runWithDockerTarget(REMOTE, () => docker.pullImage('alpine:3.20'));

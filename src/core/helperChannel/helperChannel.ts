@@ -151,7 +151,8 @@ export interface ChannelDockerOptions
  * registry login; its password is the secret of the operation (masked, only in the header of the request to the engine).
  */
 export interface ChannelPullOptions extends Pick<OperationOptions, 'signal' | 'reserved'> {
-  credentials?: { username: string; password: string; serveraddress: string };
+  /** Review round 1 of PR #89 (A-R1-3): or an identity token of `docker login` (sent as `identitytoken`). */
+  credentials?: { username: string; password: string; serveraddress: string } | { identityToken: string; serveraddress: string };
   /** The progress of the download, line by line (default: the log). */
   onOutput?: (text: string) => void;
 }
@@ -675,15 +676,17 @@ export class HelperChannel {
    */
   async pull(reference: string, options: ChannelPullOptions = {}): Promise<void> {
     const params: Record<string, unknown> = { reference };
-    if (options.credentials !== undefined) {
-      params.username = options.credentials.username;
-      params.serveraddress = options.credentials.serveraddress;
+    const login = options.credentials;
+    if (login !== undefined) {
+      if ('identityToken' in login) params.identityToken = true;
+      else params.username = login.username;
+      params.serveraddress = login.serveraddress;
     }
     if (parsePullParams(params) === undefined) throw new HelperChannelError('unsendable', `The pull of ${reference} cannot be sent through the helper channel.`);
     if (!this.operations.includes(OP_PULL)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_PULL}.`);
     const onOutput = options.onOutput;
     await this.operation(OP_PULL, params, {
-      secret: options.credentials?.password,
+      secret: login === undefined ? undefined : 'identityToken' in login ? login.identityToken : login.password,
       signal: options.signal,
       reserved: options.reserved,
       ...(onOutput !== undefined ? { onOutput: (_stream: 'stdout' | 'stderr', text: string) => onOutput(text) } : {}),

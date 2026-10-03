@@ -58,8 +58,22 @@ describe('protocol of pull and startContainers (plan step 10A)', () => {
   it('parsePullParams takes a reference with a tag or a digest, and a user only with its server', () => {
     expect(parsePullParams({ reference: 'alpine:3.20' })).toEqual({ reference: 'alpine:3.20' });
     expect(parsePullParams({ reference: 'ghcr.io/o/i:1', username: 'u', serveraddress: 'ghcr.io' })).toEqual({ reference: 'ghcr.io/o/i:1', username: 'u', serveraddress: 'ghcr.io' });
+    expect(parsePullParams({ reference: 'r.example:5000/o/i@sha256:' + 'a'.repeat(64), serveraddress: 'r.example:5000', identityToken: true })).toEqual({
+      reference: 'r.example:5000/o/i@sha256:' + 'a'.repeat(64),
+      serveraddress: 'r.example:5000',
+      identityToken: true,
+    });
     for (const value of [
       { reference: 'alpine' },
+      // Review round 1 of PR #89 (A-R1-2): an empty tag or digest (the engine would pull every tag).
+      { reference: 'node:' },
+      { reference: 'ghcr.io/o/i:' },
+      { reference: 'alpine@' },
+      { reference: 'alpine@sha256:xyz' },
+      { reference: 'alpine:bad*tag' },
+      { reference: 'alpine:1', identityToken: true },
+      { reference: 'alpine:1', identityToken: true, username: 'u', serveraddress: 's' },
+      { reference: 'alpine:1', identityToken: 'yes', serveraddress: 's' },
       { reference: '' },
       { reference: '-x:1' },
       { reference: 'a b:1' },
@@ -103,11 +117,29 @@ describe('pull (plan step 10A)', () => {
     const { context: ctx, logs } = context('s3cret-password');
     await pullOperation(engine)({ reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, ctx);
     const header = requests[0].headers?.['X-Registry-Auth'];
-    expect(header).toBe(registryAuthHeader('octo', 's3cret-password', 'ghcr.io'));
+    expect(header).toBe(registryAuthHeader({ username: 'octo', password: 's3cret-password', serveraddress: 'ghcr.io' }));
     expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ username: 'octo', password: 's3cret-password', serveraddress: 'ghcr.io' });
     expect(requests[0].path).not.toContain('s3cret');
     expect(logs.join('\n')).not.toContain('s3cret');
     expect(logs[0]).toBe('pull ghcr.io/o/i:1 (with the credentials for ghcr.io)');
+  });
+
+  // Review round 1 of PR #89 (A-R1-1): the engine decodes the header with Go's base64.URLEncoding, which needs the padding.
+  it('registryAuthHeader is URL-safe Base64 with its padding, for every length', () => {
+    for (const password of ['p', 'pa', 'pas', 'pass+/?~']) {
+      const header = registryAuthHeader({ username: 'u', password, serveraddress: 'ghcr.io' });
+      const json = JSON.stringify({ username: 'u', password, serveraddress: 'ghcr.io' });
+      expect(header).toBe(Buffer.from(json, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_'));
+      expect(header.length % 4).toBe(0);
+      expect(header).toMatch(/^[A-Za-z0-9_-]+={0,2}$/);
+    }
+  });
+
+  // Review round 1 of PR #89 (A-R1-3): an identity token of `docker login` goes as `identitytoken`.
+  it('sends an identity token as identitytoken with the server, without a user', async () => {
+    const { engine, requests } = fakeEngine(() => ({ status: 200, chunks: LINES }));
+    await pullOperation(engine)({ reference: 'reg.example/o/i:1', serveraddress: 'reg.example', identityToken: true }, context('refresh-token-1').context);
+    expect(JSON.parse(Buffer.from(requests[0].headers!['X-Registry-Auth'], 'base64url').toString('utf8'))).toEqual({ identitytoken: 'refresh-token-1', serveraddress: 'reg.example' });
   });
 
   it('fails with the error of the stream, and with the message of an error answer', async () => {
@@ -126,6 +158,7 @@ describe('pull (plan step 10A)', () => {
       [{ reference: 'alpine' }, undefined],
       [{ reference: 'alpine:1' }, 'password'],
       [{ reference: 'alpine:1', username: 'u', serveraddress: 's' }, undefined],
+      [{ reference: 'alpine:1', serveraddress: 's', identityToken: true }, undefined],
     ] as const) {
       const error = await pullOperation(engine)(params, context(secret).context).catch((e: unknown) => e);
       expect((error as OperationError).code).toBe('invalid');

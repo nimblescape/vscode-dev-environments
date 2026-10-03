@@ -26,6 +26,7 @@ import {
   CLEANUP_SECOND_PASS_MS,
   ChannelServer,
   LATE_CANCEL_WINDOW_MS,
+  OperationError,
   MAX_LOG_TEXT,
   MAX_CONTEXT_STDERR_CHARACTERS,
   MAX_CONTEXT_STDOUT_CHARACTERS,
@@ -207,6 +208,27 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       .map((message) => (message as { data: string }).data)
       .join('');
     expect(stdout).toBe('echo *** done\n');
+  });
+
+  // Review round 1 of PR #89 (A-R1-4): the message of a failed operation can carry text of the engine or a registry.
+  it('masks the secret in the error message of a failed operation', async () => {
+    const secret = 'registry-PASSWORD-9';
+    const { send, of } = setup({
+      operations: {
+        fails: async () => {
+          throw new OperationError('failed', `the registry said: bad credentials ${secret}`);
+        },
+        throws: async () => {
+          throw new Error(`raw ${secret}`);
+        },
+      },
+    });
+    send({ t: 'op', id: 1, op: 'fails', params: null, secret });
+    send({ t: 'op', id: 2, op: 'throws', params: null, secret });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(JSON.stringify([...of(1), ...of(2)])).not.toContain(secret);
+    expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { code: 'failed', message: 'the registry said: bad credentials ***' } });
+    expect(of(2).at(-1)).toMatchObject({ t: 'result', ok: false, error: { code: 'failed', message: 'raw ***' } });
   });
 
   it('refuses a docker operation that expects a secret without one', async () => {

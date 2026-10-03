@@ -536,6 +536,19 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       expect(output).toEqual(['1: Pulling from o/i\n']);
     });
 
+    // Review round 1 of PR #89 (A-R1-3): an identity token travels as the secret, flagged in the parameters.
+    it('sends an identity token as the secret with identityToken and the server, without a user', async () => {
+      const { channel, fake } = await openWithEngineOps();
+      const pulling = channel.pull('r.example/o/i:1', { credentials: { identityToken: 'refresh-token', serveraddress: 'r.example' } });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'pull', params: { reference: 'r.example/o/i:1', identityToken: true, serveraddress: 'r.example' }, secret: 'refresh-token' });
+      expect(op.params).not.toHaveProperty('username');
+      fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
+      await pulling;
+      await expect(channel.pull('node:')).rejects.toMatchObject({ code: 'unsendable' });
+    });
+
     it('refuses a reference without a tag, a short password, and a worker without the operation, sending nothing', async () => {
       const { channel, fake } = await openWithEngineOps();
       const before = fake.messages().length;
