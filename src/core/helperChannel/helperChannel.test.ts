@@ -630,6 +630,40 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
     expect(released).toBe(true);
   });
 
+  // Live check of 2026-10-03: changed log line (before: `warn … lock#n: failed: cancelled after … s.` at each release).
+  it('logs the release of a held lock as info `released`; a cancel by the caller before it is held stays a warning', async () => {
+    const fake = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ ...HELLO, ops: ['docker', 'lock', 'probe'] } as ServerMessage);
+    const channel = await opening;
+    const locking = channel.lock(ID, 10);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'progress', id: op.id, step: LOCK_HELD_STEP });
+    const lock = await locking;
+    const releasing = lock.release();
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+    await releasing;
+    expect(lines.filter((line) => line.text.includes(`lock#${op.id}:`) && /after/.test(line.text))).toEqual([
+      { level: 'info', text: `[build-box] lock#${op.id}: released after 0.0 s.` },
+    ]);
+    // A cancel of the caller while the lock is still awaited is no release.
+    const controller = new AbortController();
+    const waiting = channel.lock(ID, 10, controller.signal).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const second = lastOp(fake);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'result', id: second.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+    await waiting;
+    expect(lines.filter((line) => line.text.includes(`lock#${second.id}:`) && /after/.test(line.text))).toEqual([
+      { level: 'warn', text: `[build-box] lock#${second.id}: failed: cancelled after 0.0 s.` },
+    ]);
+  });
+
   it('lost resolves when the worker is lost while the lock is held, and not after a release', async () => {
     const first = await held();
     let reason: string | undefined;

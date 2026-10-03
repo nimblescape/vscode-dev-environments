@@ -31,6 +31,7 @@ import {
   MAX_CONTEXT_STDOUT_CHARACTERS,
   StreamRedactor,
   commandLine,
+  MAX_LOGGED_SCRIPT_LENGTH,
   redact,
   type ContextDockerResult,
   type OperationHandler,
@@ -648,6 +649,19 @@ describe('the helpers of the server', () => {
 
   it('commandLine quotes arguments with spaces or quotes', () => {
     expect(commandLine(['ps', '--format', '{{json .}}', '', 'a"b'])).toBe('docker ps --format "{{json .}}" "" "a\\"b"');
+  });
+
+  // Live check of 2026-10-03: a long script is `<script>` in the log line, as in the batch helper.
+  it('commandLine shows a script of more than one line or more than MAX_LOGGED_SCRIPT_LENGTH characters as <script>', () => {
+    const long = 'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH + 1);
+    expect(commandLine(['exec', '-i', 'c', 'sh', '-c', 'set -eu\necho hi', 'sh', 'dev'])).toBe('docker exec -i c sh -c <script> sh dev');
+    expect(commandLine(['run', 'img', 'node', '-e', long, '/opt/x.js'])).toBe('docker run img node -e <script> /opt/x.js');
+    expect(commandLine(['exec', 'c', '/bin/sh', '-c', long])).toBe('docker exec c /bin/sh -c <script>');
+    // A short one-line script stays, and so does a long argument that is no script.
+    expect(commandLine(['exec', 'c', 'sh', '-c', 'echo hi'])).toBe('docker exec c sh -c "echo hi"');
+    expect(commandLine(['exec', 'c', 'cat', long])).toBe(`docker exec c cat ${long}`);
+    expect(commandLine(['exec', '-e', long, 'c', 'true'])).toBe(`docker exec -e ${long} c true`);
+    expect(commandLine(['run', 'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH)])).toBe(`docker run ${'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH)}`);
   });
 });
 

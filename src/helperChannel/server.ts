@@ -591,7 +591,23 @@ function messageOf(error: unknown): string {
 
 /** A command for the log: `docker` and its arguments, an argument with a space or a quote as JSON. */
 export function commandLine(args: readonly string[]): string {
-  return ['docker', ...args.map((arg) => (arg === '' || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(' ');
+  return ['docker', ...args.map((arg, i) => (isLongScript(args, i) ? '<script>' : arg === '' || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(' ');
+}
+
+/** Live check of 2026-10-03: the log line of a call shows a script that is longer than this (or has more than one line) as `<script>`. */
+export const MAX_LOGGED_SCRIPT_LENGTH = 200;
+
+/**
+ * Live check of 2026-10-03: whether `args[i]` is the script of `sh -c <script>` or `node -e <script>` with more than one
+ * line or more than MAX_LOGGED_SCRIPT_LENGTH characters (the token write, the pipe loader), which the log line shows as
+ * `<script>`, as the batch helper does. Only the log line; the call gets the script.
+ */
+function isLongScript(args: readonly string[], i: number): boolean {
+  if (i < 2) return false;
+  const program = args[i - 2];
+  const flag = args[i - 1];
+  const script = (flag === '-c' && /(^|\/)sh$/.test(program)) || (flag === '-e' && /(^|\/)node$/.test(program));
+  return script && (args[i].includes('\n') || args[i].length > MAX_LOGGED_SCRIPT_LENGTH);
 }
 
 /** Review round 2 (C1): a text of a log or progress message, cut to MAX_LOG_TEXT characters. */
