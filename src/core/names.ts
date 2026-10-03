@@ -4,6 +4,7 @@
 
 // Names and labels (implementation notes 5).
 import * as crypto from 'crypto';
+import { namePair, trailingPair } from './namePairs';
 import { LABEL_MONITOR_CREATE, LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
 
 /**
@@ -225,49 +226,52 @@ export function splitRepository(repository: string): { owner: string; name: stri
 
 const MAX_NAME_LENGTH = 63;
 
-function sanitize(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9_.-]+/g, '-');
-}
-
 /**
- * Name of the workspace volume and of the container: `devenv-<owner>-<repository>-<short id>`, lower case,
- * only `[a-z0-9_.-]`, at most 63 characters.
+ * Name of everything of an environment (user decisions 2026-10-03): the workspace volume, the dev container, the
+ * repository of the environment image, and the Docker Compose project (so also the names that Compose derives from it):
+ * `devenv-<owner>-<repository>-<adjective>-<scientist>`, with the pair of the environment ID (namePair). Lower case,
+ * every run of other characters than `[a-z0-9]` as one `-` (an image repository and a Compose project allow no `.` or
+ * `_` next to each other), at most 63 characters: a long `<owner>-<repository>` is shortened, the pair is always kept.
+ * The full environment ID is only in the labels.
  */
 export function resourceName(repository: string, environmentId: string): string {
   const { owner, name } = splitRepository(repository);
   const prefix = 'devenv-';
-  const suffix = `-${sanitize(shortId(environmentId))}`;
-  let middle = sanitize(`${owner}-${name}`);
+  const suffix = `-${namePair(environmentId)}`;
+  let middle = `${owner}-${name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '');
   const room = MAX_NAME_LENGTH - prefix.length - suffix.length;
   if (middle.length > room) middle = middle.slice(0, room);
-  middle = middle.replace(/[-_.]+$/, '');
-  return `${prefix}${middle}${suffix}`;
+  middle = middle.replace(/-+$/, '');
+  return `${prefix}${middle === '' ? 'x' : middle}${suffix}`;
 }
 
 /**
- * Name of the workspace volume of an environment, as resourceName builds it: `devenv-<owner>-<repository>-<short id>`, with
- * the first 8 hexadecimal characters of the environment ID at the end. Other volumes whose name starts with `devenv-` (for
- * example `devenv-tools-node_modules` of a repository `devenv-tools`) are volumes of the repository.
+ * Whether `name` has the shape of a name of an environment (resourceName): `devenv-<…>-<adjective>-<scientist>`, in any
+ * case. Other names that start with `devenv-` (for example `devenv-tools-node_modules` of a repository `devenv-tools`)
+ * are names of the repository.
  */
-export const ENVIRONMENT_VOLUME_PATTERN = /^devenv-[a-z0-9_.-]*-[0-9a-f]{8}$/i;
+export function isEnvironmentResourceName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return /^devenv-[a-z0-9-]+$/.test(lower) && trailingPair(lower) !== undefined;
+}
 
-/** Repository part of the environment image name: `devenv-<short id>`. */
-export function environmentImageRepository(environmentId: string): string {
-  return `devenv-${sanitize(shortId(environmentId))}`;
+/** Repository part of the environment image name: resourceName. */
+export function environmentImageRepository(repository: string, environmentId: string): string {
+  return resourceName(repository, environmentId);
 }
 
 /**
- * Compose project of an environment: `devenv-<short id>`, the same as environmentImageRepository. Stable for the life of
- * the environment (the Dev Container CLI finds the dev container again only by the project and the service) and unique
- * among the environments (short IDs are unique among the entries and the volumes).
+ * Compose project of an environment: resourceName. Stable for the life of the environment (the Dev Container CLI finds
+ * the dev container again only by the project and the service) and unique among the environments on a Docker engine
+ * (unusedEnvironmentId).
  */
-export function composeProjectName(environmentId: string): string {
-  return environmentImageRepository(environmentId);
+export function composeProjectName(repository: string, environmentId: string): string {
+  return resourceName(repository, environmentId);
 }
 
-/** Environment image: `devenv-<short id>:<build number>`. */
-export function environmentImageName(environmentId: string, buildNumber: number): string {
-  return `${environmentImageRepository(environmentId)}:${buildNumber}`;
+/** Environment image: `<resourceName>:<build number>`. */
+export function environmentImageName(repository: string, environmentId: string, buildNumber: number): string {
+  return `${environmentImageRepository(repository, environmentId)}:${buildNumber}`;
 }
 
 /** Folder of the repository in the workspace volume, for example `/workspaces/api`. */

@@ -4,13 +4,12 @@
 
 // "Dev Environments: Use a Remote Docker Host…" and "Dev Environments: Use the Local Docker" (unit 7, user decisions
 // 2026-09-27). The remote host is the current Docker context: the command tests the host over SSH without questions,
-// asks once (modal), remembers the context that was current, then uses the context of that host (`devenv-remote-<hash>`,
+// asks once (modal), remembers the context that was current, then uses the context of that host (named after the host,
 // created with `ssh://<alias-or-address>` when missing, never changed afterwards). Nothing else is written: no setting,
 // no DOCKER_HOST, no setting of the Dev Containers extension. One Docker host at a time.
 import * as vscode from 'vscode';
 import {
   describeDockerHost,
-  isOwnRemoteContext,
   parseSshAddress,
   type DockerTarget,
   type SshAddressProblem,
@@ -22,6 +21,7 @@ import {
   recordRootlessSocket,
   testRemoteDockerHost,
   useContext,
+  isOwnContext,
   useRemoteContext,
   type RemoteDockerCli,
   type SshLoginCache,
@@ -63,7 +63,7 @@ export const RemoteDockerTexts = {
   testing: (host: string) => `Testing the connection to ${host}…`,
   confirm: (host: string) => `All Docker tools on this computer will use ${host} until you switch back.`,
   confirmDetail:
-    'Dev Environments sets a Docker context of this host ("devenv-remote-…"). Docker, Docker Compose, and the Dev Containers extension follow it. Use "Dev Environments: Use the Local Docker" to switch back.',
+    'Dev Environments sets a Docker context named after this host. Docker, Docker Compose, and the Dev Containers extension follow it. Use "Dev Environments: Use the Local Docker" to switch back.',
   confirmLocal: 'All Docker tools on this computer will use the local Docker again.',
   useHost: (host: string) => `Use ${host}`,
   useLocal: 'Use the Local Docker',
@@ -250,7 +250,7 @@ export class RemoteDockerCommands {
     if (!(await this.confirm('switchToRemote', RemoteDockerTexts.confirm(host), { detail: RemoteDockerTexts.confirmDetail }, button))) return false;
     const current = await this.deps.targets.resolve();
     // The context to go back to; not one of ours (a switch from one remote host to another keeps the first one).
-    if (current.context !== undefined && !isOwnRemoteContext(current.context)) {
+    if (current.context !== undefined && !(await isOwnContext(this.deps.docker, current.context))) {
       await this.deps.state.setPreviousContext(current.context);
     }
     const name = await useRemoteContext(this.deps.docker, host);

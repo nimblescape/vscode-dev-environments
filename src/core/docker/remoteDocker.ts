@@ -30,10 +30,11 @@ import {
   RUNTIME_DIR_COMMAND,
   classifyDockerEndpoint,
   dockerHostProblem,
-  isOwnRemoteContext,
+  isOwnContextDescription,
+  ownContextDescription,
   isRootlessEngine,
   parseContextInspect,
-  remoteContextName,
+  remoteContextNames,
   rootlessSocketPath,
   sshCommandArgs,
   sshEndpoint,
@@ -355,15 +356,43 @@ function contextCommandError(args: readonly string[], result: RunResult): Error 
   return new Error(`docker context ${args.join(' ')} failed: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
 }
 
-/** The names of the Docker contexts (`docker context ls --format '{{.Name}}'`). */
-export async function listContexts(docker: RemoteDockerCli): Promise<string[]> {
-  const args = ['ls', '--format', '{{.Name}}'];
+/** A Docker context as `docker context ls` lists it. */
+export interface ContextInfo {
+  name: string;
+  description: string;
+  /** The endpoint of its Docker, for example `ssh://htldvm`; empty when not listed. */
+  endpoint: string;
+}
+
+/** The contexts of the Docker CLI (`docker context ls --format '{{json .}}'`, one object per line). */
+export async function listContextInfos(docker: RemoteDockerCli): Promise<ContextInfo[]> {
+  const args = ['ls', '--format', '{{json .}}'];
   const result = await contextCommand(docker, args);
   if (result.exitCode !== 0) throw contextCommandError(args, result);
-  return result.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(/\s*\*$/, ''))
-    .filter((line) => line !== '');
+  const contexts: ContextInfo[] = [];
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (line.trim() === '') continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      throw new Error(`docker context ${args.join(' ')} printed a line that is not JSON: ${line.trim().slice(0, 200)}`);
+    }
+    if (typeof value !== 'object' || value === null) continue;
+    const record = value as Record<string, unknown>;
+    if (typeof record.Name !== 'string' || record.Name === '') continue;
+    contexts.push({
+      name: record.Name,
+      description: typeof record.Description === 'string' ? record.Description : '',
+      endpoint: typeof record.DockerEndpoint === 'string' ? record.DockerEndpoint : '',
+    });
+  }
+  return contexts;
+}
+
+/** The names of the Docker contexts (listContextInfos). */
+export async function listContexts(docker: RemoteDockerCli): Promise<string[]> {
+  return (await listContextInfos(docker)).map((context) => context.name);
 }
 
 /**
@@ -378,26 +407,59 @@ export async function contextEndpoint(docker: RemoteDockerCli, name: string): Pr
 }
 
 /**
- * Makes the context of `host` (remoteContextName: one per host) the current context (`docker context use`); creates it
- * with `ssh://<host>` first when it does not exist (`docker context create`). An existing context is never changed
- * (review, C1): an operation of another window that runs on it keeps its host. One of our names that points elsewhere
- * is refused. Returns the name of the context.
+ * The context of `host` among `contexts`, by remoteContextNames: the first name whose context points to `ssh://<host>`
+ * (one that the user made with that name and endpoint is taken as it is). `free`: the first name that no context has,
+ * when no name points to the host. Neither: every name is taken by a context that points elsewhere.
  */
-export async function useRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
-  const name = remoteContextName(host);
+export function remoteContextChoice(host: string, contexts: readonly ContextInfo[]): { existing?: string; free?: string } {
   const endpoint = sshEndpoint(host);
-  if ((await listContexts(docker)).includes(name)) {
-    const existing = await contextEndpoint(docker, name);
-    if (existing !== endpoint) {
-      throw new Error(`The Docker context ${name} points to ${existing ?? 'an endpoint that cannot be read'}, not to ${endpoint}. Remove it (docker context rm ${name}) and try again.`);
+  let free: string | undefined;
+  for (const name of remoteContextNames(host)) {
+    const context = contexts.find((candidate) => candidate.name === name);
+    if (context === undefined) {
+      free ??= name;
+      continue;
     }
-  } else {
-    const args = ['create', name, '--description', `Dev Environments: remote Docker host ${host}`, '--docker', `host=${endpoint}`];
-    const written = await contextCommand(docker, args);
-    if (written.exitCode !== 0) throw contextCommandError(args, written);
+    if (context.endpoint === endpoint) return { existing: name };
   }
+  return free === undefined ? {} : { free };
+}
+
+/** The name of the existing context of `host` (remoteContextChoice), undefined when there is none. */
+export async function findRemoteContext(docker: RemoteDockerCli, host: string): Promise<string | undefined> {
+  return remoteContextChoice(host, await listContextInfos(docker)).existing;
+}
+
+/**
+ * The context of `host` (remoteContextChoice; user decisions 2026-10-03: named after the alias of the SSH config or the
+ * host name, with the pair of the host only on a clash): the existing one, else a new one with `ssh://<host>` and the
+ * description of Dev Environments (`docker context create`). An existing context is never changed (review, C1): an
+ * operation of another window that runs on it keeps its host. Throws when every name is taken by a context that points
+ * elsewhere. Returns the name of the context.
+ */
+export async function ensureRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
+  const choice = remoteContextChoice(host, await listContextInfos(docker));
+  if (choice.existing !== undefined) return choice.existing;
+  if (choice.free === undefined) {
+    const names = remoteContextNames(host);
+    throw new Error(`The Docker contexts ${names.join(' and ')} exist and point elsewhere than ${sshEndpoint(host)}. Remove or rename one of them (docker context rm <name>) and try again.`);
+  }
+  const args = ['create', choice.free, '--description', ownContextDescription(host), '--docker', `host=${sshEndpoint(host)}`];
+  const written = await contextCommand(docker, args);
+  if (written.exitCode !== 0) throw contextCommandError(args, written);
+  return choice.free;
+}
+
+/** Makes the context of `host` (ensureRemoteContext) the current context (`docker context use`). Returns its name. */
+export async function useRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
+  const name = await ensureRemoteContext(docker, host);
   await useContext(docker, name);
   return name;
+}
+
+/** Whether the context `name` is one that Dev Environments created (its description, isOwnContextDescription). */
+export async function isOwnContext(docker: RemoteDockerCli, name: string): Promise<boolean> {
+  return isOwnContextDescription((await listContextInfos(docker)).find((context) => context.name === name)?.description);
 }
 
 /** `docker context use <name>`. */
@@ -411,8 +473,9 @@ export async function useContext(docker: RemoteDockerCli, name: string): Promise
  * The context for "Use the Local Docker" by name: the remembered one (for example Docker Desktop's `desktop-linux`) when
  * it still exists and is not ours, else `default`. chooseLocalContext also checks where it points.
  */
-export function localContextChoice(remembered: string | undefined, existing: readonly string[]): string {
-  if (remembered !== undefined && !isOwnRemoteContext(remembered) && existing.includes(remembered)) return remembered;
+export function localContextChoice(remembered: string | undefined, existing: readonly ContextInfo[]): string {
+  const context = existing.find((candidate) => candidate.name === remembered);
+  if (context !== undefined && !isOwnContextDescription(context.description)) return context.name;
   return DEFAULT_CONTEXT_NAME;
 }
 
@@ -422,7 +485,7 @@ export function localContextChoice(remembered: string | undefined, existing: rea
  * `ssh://…` of the user) gives `default` (review, C2).
  */
 export async function chooseLocalContext(docker: RemoteDockerCli, remembered: string | undefined, logger?: Logger): Promise<string> {
-  const name = localContextChoice(remembered, await listContexts(docker));
+  const name = localContextChoice(remembered, await listContextInfos(docker));
   if (name === DEFAULT_CONTEXT_NAME) return name;
   const endpoint = await contextEndpoint(docker, name);
   if (endpoint !== undefined && classifyDockerEndpoint(endpoint).kind === 'local') return name;

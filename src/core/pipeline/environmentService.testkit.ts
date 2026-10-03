@@ -340,6 +340,11 @@ export class FakeDocker implements EnvironmentDocker {
     return this.volumes.has(name);
   }
 
+  async containerState(nameOrId: string): Promise<ContainerState> {
+    const container = this.containers.get(nameOrId) ?? [...this.containers.values()].find((c) => c.name === nameOrId);
+    return container?.state ?? 'missing';
+  }
+
   async createVolume(name: string, labels: Record<string, string>): Promise<void> {
     this.log.push(`volume create ${name}`);
     if (!this.volumes.has(name)) this.volumes.set(name, { ...labels });
@@ -1394,7 +1399,7 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
       ? undefined
       : {
           builtAt: '2026-09-20T10:00:00.000Z',
-          environmentImage: environmentImageName(id, 1),
+          environmentImage: environmentImageName(repository, id, 1),
           buildNumber: 1,
           configPath: DEFAULT_CONFIG_PATH,
           configHash: configHash(DEFAULT_CONFIG_TEXT),
@@ -1428,7 +1433,7 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
   }
   const state = options.container === undefined ? 'stopped' : options.container;
   if (state !== null) {
-    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(id, 1), labels: options.containerLabels });
+    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(repository, id, 1), labels: options.containerLabels });
   }
   return environment;
 }

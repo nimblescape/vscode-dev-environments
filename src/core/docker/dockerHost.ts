@@ -6,25 +6,37 @@
 // Docker, Docker Compose, the Dev Container CLI, the Dev Containers extension, and this extension all follow it by
 // themselves. This module holds the pure rules: which endpoint counts as local, remote (ssh://), or not supported; the
 // Docker host of an environment; the check of an SSH address; the plain reasons of a failed connection. No `vscode`.
-import { createHash } from 'crypto';
+import { namePair } from '../namePairs';
 import type { Environment } from '../types';
 
 /**
- * The start of the names of the Docker contexts that "Use a Remote Docker Host…" creates: one context per host,
- * `devenv-remote-<the first 8 hex digits of sha256(host)>` (remoteContextName). Review, C1: one context for all hosts,
- * updated at each switch, moved the running operations of other windows (which name their context in DOCKER_CONTEXT) to
- * the new host; a context of a host is never changed after its creation.
+ * The description of the Docker contexts that "Use a Remote Docker Host…" creates (`docker context create --description`):
+ * it marks a context as one of Dev Environments (isOwnContextDescription), whatever its name.
  */
-export const REMOTE_CONTEXT_PREFIX = 'devenv-remote';
+export const OWN_CONTEXT_DESCRIPTION_PREFIX = 'Dev Environments: remote Docker host ';
 
-/** The Docker context of the remote host `host` (an alias or an address, as recorded): `devenv-remote-1a2b3c4d`. */
-export function remoteContextName(host: string): string {
-  return `${REMOTE_CONTEXT_PREFIX}-${createHash('sha256').update(host, 'utf8').digest('hex').slice(0, 8)}`;
+/** The description of the context of `host` (OWN_CONTEXT_DESCRIPTION_PREFIX). */
+export function ownContextDescription(host: string): string {
+  return `${OWN_CONTEXT_DESCRIPTION_PREFIX}${host}`;
 }
 
-/** True for a context that Dev Environments created (remoteContextName). */
-export function isOwnRemoteContext(name: string | undefined): boolean {
-  return name !== undefined && /^devenv-remote-[0-9a-f]{8}$/.test(name);
+/** True for the description of a context that Dev Environments created (ownContextDescription). */
+export function isOwnContextDescription(description: string | undefined): boolean {
+  return description !== undefined && description.startsWith(OWN_CONTEXT_DESCRIPTION_PREFIX);
+}
+
+/**
+ * The names that the Docker context of the remote host `host` (an alias or an address, as recorded) may get, in this
+ * order (user decisions 2026-10-03): the alias of the SSH config, or the host name of an address (without the user and
+ * the port), for example `htldvm`; on a clash with a context of that name that points elsewhere, the name with the pair
+ * of the host (namePair), for example `htldvm-brave-noether`. Docker allows only `[a-zA-Z0-9_.+-]`, starting with a
+ * letter or digit, in the name of a context: every run of other characters becomes `-`.
+ */
+export function remoteContextNames(host: string): [string, string] {
+  const target = sshTargetOf(host)?.host ?? host;
+  const base = target.replace(/[^a-zA-Z0-9_.+-]+/g, '-').replace(/^[^a-zA-Z0-9]+/, '').replace(/-+$/, '');
+  const name = base === '' || base === DEFAULT_CONTEXT_NAME ? 'remote' : base;
+  return [name, `${name}-${namePair(host)}`];
 }
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */
 export const DEFAULT_CONTEXT_NAME = 'default';

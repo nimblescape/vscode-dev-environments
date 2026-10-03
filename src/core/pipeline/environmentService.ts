@@ -99,9 +99,9 @@ import {
   newEnvironmentId,
   repositoryFolder,
   resourceName,
-  shortId,
   splitRepository,
 } from '../names';
+import { namePair } from '../namePairs';
 import { isAvailableTo, ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
 import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
@@ -116,13 +116,13 @@ import {
   foreignVolumeName,
   hostAccessChecks,
   environmentImageIds,
-  environmentImageShortId,
+  environmentImageNames,
   imageNamedBy,
   imageLabelItems,
   imageReferencesToInspect,
   inspectedImageItems,
   otherAccountImageItems,
-  unknownEnvironmentShortIds,
+  hasUnknownEnvironmentNames,
   volumeOwners,
   isOwnVolume,
   isRefused,
@@ -258,6 +258,7 @@ export type EnvironmentDocker = Pick<
   | 'isRunning'
   | 'runChecked'
   | 'findContainer'
+  | 'containerState'
   | 'listEnvironmentContainers'
   | 'removeContainer'
   | 'renameContainer'
@@ -521,8 +522,8 @@ const CONTAINER_CHECK_COMMAND: readonly string[] = ['/bin/sh', '-c', 'exit 0'];
 // A helper container that a cancel removes can hold the volume for a moment.
 const VOLUME_REMOVE_ATTEMPTS = 3;
 const VOLUME_REMOVE_DELAY_MS = 1_000;
-// Random IDs whose short ID is in use are very rare; a few attempts are enough.
-const ENVIRONMENT_ID_ATTEMPTS = 5;
+// About 15,000 pairs (namePair): an ID whose pair is in use on the engine is rare; a few attempts are enough.
+const ENVIRONMENT_ID_ATTEMPTS = 20;
 
 /** devcontainer.json and its Dockerfile, read from the volume. */
 type ConfigFiles = NonNullable<Awaited<ReturnType<EnvironmentHelper['readConfigFiles']>>>;
@@ -1601,7 +1602,7 @@ export class EnvironmentService {
     // Review round 4 of PR #68 (A-R4-1): the mark as this run read it (Step 9 and opensAsItIs read it again).
     ctx.lifecycleMarkRead = ctx.env.lifecycleIncomplete;
     const container = await docker.findContainer(ctx.env.id, ctx.env.containerName);
-    ctx.composeContainer = container !== undefined && isComposeContainer(container.labels, composeProjectName(ctx.env.id));
+    ctx.composeContainer = container !== undefined && isComposeContainer(container.labels, composeProjectName(ctx.env.repository, ctx.env.id));
     const record = ctx.env.buildRecord;
     const imagePresent = record !== undefined && (await docker.imageExists(record.environmentImage));
     this.logger.info(
@@ -2000,7 +2001,7 @@ export class EnvironmentService {
     const { helper } = this.deps;
     const env = ctx.env;
     const { configPath, files } = p;
-    const project = composeProjectName(env.id);
+    const project = composeProjectName(env.repository, env.id);
     await this.requireVolume(env);
     // Review round 19 (D19-1): with the project name in the environment of the CLI, as for the merged read below: the
     // CLI resolves `${localEnv:COMPOSE_PROJECT_NAME}` of devcontainer.json (for example in `mounts`) with it, and the
@@ -2253,10 +2254,10 @@ export class EnvironmentService {
     const missing = new Set(
       named.filter((entry) => !unanswered.has(entry.reference) && imageNamedBy(entry.reference, images) === undefined).map((entry) => entry.reference),
     );
-    const missingShortIds = [...missing].map(environmentImageShortId).filter((short): short is string => short !== undefined);
+    const missingNamed = [...missing].filter((reference) => environmentImageNames(reference).length > 0);
     const read =
-      images.length > 0 || missingShortIds.length > 0
-        ? await this.hostEnvironmentImageIds(env, images, missingShortIds, signal)
+      images.length > 0 || missingNamed.length > 0
+        ? await this.hostEnvironmentImageIds(env, images, missingNamed, signal)
         : { ids: { own: new Set<string>(), others: new Set<string>() } };
     const ids = read.ids;
     const foreign = ids === undefined ? [] : otherAccountImageItems(named, images, ids, missing);
@@ -2281,13 +2282,13 @@ export class EnvironmentService {
 
   /**
    * User decision 2026-09-28: the IDs of the images of the environments on the Docker host of `env`
-   * (EnvironmentImageIds, environmentImageIds): the images that Docker lists as `devenv-<short id>:<build>` and
-   * `devenv-<short id>-<service>`, whichever computer built them (so also an older build that is still there, a new one
-   * before its build record, and one that a Delete could not remove), split by the owner account of the short ID: the
-   * registry entries on the host (and `env` itself), else the owner label of the volumes of that environment on the
-   * host (one `docker volume ls`, only when an image that a reference found, `found`, or a reference without a local
-   * image, `missingShortIds`, has a short ID that the registry does not know: an environment that another computer
-   * created on a shared host, or an image left behind). An image of no known owner, or of volumes with different owner
+   * (EnvironmentImageIds, environmentImageIds): the images that Docker lists under a name of an environment (user
+   * decisions 2026-10-03: `<name>:<build>` and `<name>-<service>`, environmentImageNames), whichever computer built them
+   * (so also an older build that is still there, a new one before its build record, and one that a Delete could not
+   * remove), split by the owner account of the environment of the name: the registry entries on the host (and `env`
+   * itself), else the labels of the volumes of that environment on the host (one `docker volume ls`, only when an image
+   * that a reference found, `found`, or a reference without a local image, `missingNamed`, has names of which the
+   * registry knows none: an environment that another computer created on a shared host, or an image left behind). An image of no known owner, or of volumes with different owner
    * labels, counts as another account's. One `docker image ls` on each check whose references found a local image or
    * name an environment image that Docker found missing. `unread`: Docker could not answer (the reason of dockerCheckItem;
    * the caller fails the check, as for a reference: AnalysisFailedError); a cancellation is thrown.
@@ -2295,7 +2296,7 @@ export class EnvironmentService {
   private async hostEnvironmentImageIds(
     env: Environment,
     found: readonly InspectedImage[],
-    missingShortIds: readonly string[],
+    missingNamed: readonly string[],
     signal?: AbortSignal,
   ): Promise<{ ids?: EnvironmentImageIds; unread?: string }> {
     const unread = (what: string, reason: string, error: unknown): { unread: string } => {
@@ -2315,10 +2316,10 @@ export class EnvironmentService {
     }
     this.throwIfCancelled(signal);
     const owners = new Map<string, string>();
-    for (const entry of environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env))) owners.set(shortId(entry.id).toLowerCase(), entry.owner.id);
-    owners.set(shortId(env.id).toLowerCase(), env.owner.id);
+    for (const entry of environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env))) owners.set(resourceName(entry.repository, entry.id).toLowerCase(), entry.owner.id);
+    owners.set(resourceName(env.repository, env.id).toLowerCase(), env.owner.id);
     const foundIds = new Set(found.map((image) => image.id.toLowerCase()));
-    if (unknownEnvironmentShortIds(images, owners, foundIds).length > 0 || missingShortIds.some((short) => !owners.has(short))) {
+    if (hasUnknownEnvironmentNames(images, missingNamed, owners, foundIds)) {
       let volumes: VolumeInfo[];
       try {
         volumes = await this.deps.docker.listEnvironmentVolumes(signal);
@@ -2326,7 +2327,7 @@ export class EnvironmentService {
         return unread('volumes of the environments', ENVIRONMENT_OWNERS_UNREAD, error);
       }
       this.throwIfCancelled(signal);
-      for (const [short, owner] of volumeOwners(volumes)) if (!owners.has(short)) owners.set(short, owner);
+      for (const [name, owner] of volumeOwners(volumes)) if (!owners.has(name)) owners.set(name, owner);
     }
     return { ids: environmentImageIds(images, owners, env.owner.id) };
   }
@@ -2629,7 +2630,7 @@ export class EnvironmentService {
 
     ctx.steps.step('preparing');
     const buildNumber = await this.nextBuildNumber(env);
-    const imageName = environmentImageName(env.id, buildNumber);
+    const imageName = environmentImageName(env.repository, env.id, buildNumber);
     await this.updateEntry(ctx, (entry) => {
       entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);
     });
@@ -3565,7 +3566,7 @@ export class EnvironmentService {
   private isComposeEnvironment(env: Environment, record: BuildRecord | undefined, container: ContainerInfo | undefined): boolean {
     // Review round 4 of PR #68 (A-R4-2): the key decides the kind (hasComposeRecord), not the validity of its fields.
     if (hasComposeRecord(record)) return true;
-    return container !== undefined && isComposeContainer(container.labels, composeProjectName(env.id));
+    return container !== undefined && isComposeContainer(container.labels, composeProjectName(env.repository, env.id));
   }
 
   /**
@@ -3679,7 +3680,7 @@ export class EnvironmentService {
       // Compose): they go (`docker rm -f`, their volumes stay), and the single container starts as usual; a rebuild would
       // not help when the configuration cannot be used.
       const dev = await this.deps.docker.findContainer(env.id, env.containerName);
-      const single = dev !== undefined && dev.labels[LABEL_COMPOSE_SERVICE] === undefined && !isComposeContainer(dev.labels, composeProjectName(env.id));
+      const single = dev !== undefined && dev.labels[LABEL_COMPOSE_SERVICE] === undefined && !isComposeContainer(dev.labels, composeProjectName(env.repository, env.id));
       if (!single) {
         // The caller reports it as startFailed.
         throw new Error(
@@ -3959,7 +3960,7 @@ export class EnvironmentService {
 
   /** The containers with the ID label of the environment and, with `compose`, those of its Docker Compose project, once each. */
   private async upContainers(env: Environment, compose: boolean): Promise<ContainerInfo[]> {
-    const all = [...(await this.environmentContainers(env.id)), ...(compose ? await this.deps.docker.listProjectContainers(composeProjectName(env.id)) : [])];
+    const all = [...(await this.environmentContainers(env.id)), ...(compose ? await this.deps.docker.listProjectContainers(composeProjectName(env.repository, env.id)) : [])];
     const seen = new Set<string>();
     return all.filter((container) => {
       if (seen.has(container.id)) return false;
@@ -4842,7 +4843,7 @@ export class EnvironmentService {
   ): Promise<HostAccessInput> {
     // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables). Review round 18 (D18-1): the
     // runs of Docker Compose (composeMounts) get COMPOSE_PROJECT_NAME with the project name of the environment.
-    const composeEnv: Record<string, string> = input.composeMounts === true ? { COMPOSE_PROJECT_NAME: composeProjectName(env.id) } : {};
+    const composeEnv: Record<string, string> = input.composeMounts === true ? { COMPOSE_PROJECT_NAME: composeProjectName(env.repository, env.id) } : {};
     const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository, composeEnv) };
     const file = await this.deps.registry.read();
     const otherOwner = (owner: GitHubAccount) => owner.id !== env.owner.id;
@@ -5564,7 +5565,7 @@ export class EnvironmentService {
    * environment or without one; never a container of another environment, and never a single container.
    */
   private async composeContainers(env: Environment): Promise<ContainerInfo[]> {
-    const project = composeProjectName(env.id);
+    const project = composeProjectName(env.repository, env.id);
     const containers = [...(await this.environmentContainers(env.id)), ...(await this.deps.docker.listProjectContainers(project))];
     const seen = new Set<string>();
     const result: ContainerInfo[] = [];
@@ -5587,7 +5588,7 @@ export class EnvironmentService {
    * no container of the project uses them. A network that cannot be removed is logged.
    */
   private async removeComposeNetworks(env: Environment): Promise<void> {
-    for (const network of await this.deps.docker.listProjectNetworks(composeProjectName(env.id))) {
+    for (const network of await this.deps.docker.listProjectNetworks(composeProjectName(env.repository, env.id))) {
       try {
         await this.deps.docker.removeNetwork(network);
       } catch (error) {
@@ -5775,7 +5776,7 @@ export class EnvironmentService {
         if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
         await docker.removeContainer(env.containerName);
         // Docker Compose: the other containers, the networks, and the built images of the project too.
-        const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)));
+        const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)));
         if (compose) await this.removeComposeProject(env, false);
         await this.removeEnvironmentImages(env, undefined, env.buildRecord);
         // Step 4: the workspace volume; additional volumes only when the user confirmed it.
@@ -5808,7 +5809,7 @@ export class EnvironmentService {
    * Docker Compose (true); `undefined` without either.
    */
   private async containersUseCompose(env: Environment, container: ContainerInfo | undefined): Promise<boolean | undefined> {
-    if (container !== undefined) return isComposeContainer(container.labels, composeProjectName(env.id));
+    if (container !== undefined) return isComposeContainer(container.labels, composeProjectName(env.repository, env.id));
     return (await this.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
   }
 
@@ -6096,16 +6097,22 @@ export class EnvironmentService {
   }
 
   /**
-   * A new environment ID (implementation notes 5). The names of an environment end in its short ID (the first 8
-   * characters), so an ID is not used when an entry of the registry has its short ID, or when its volume exists:
-   * `docker volume create` would take the existing volume, and a failed first open would remove it.
+   * A new environment ID (implementation notes 5). User decisions 2026-10-03: the names of an environment end in the pair
+   * of its ID (namePair), and the pair is unique on the Docker engine: an ID is not used when an entry of the registry or
+   * a volume of an environment on the engine (nimblescape.devenv.environment-id) has its pair, or when its volume or its
+   * container exists (`docker volume create` would take the existing volume, and a failed first open would remove it).
    */
   private async unusedEnvironmentId(repository: string): Promise<string> {
-    const used = new Set((await this.deps.registry.list()).map((environment) => shortId(environment.id).toLowerCase()));
+    const known = [
+      ...(await this.deps.registry.list()).map((environment) => environment.id),
+      ...(await this.deps.docker.listEnvironmentVolumes()).map((volume) => volume.labels[LABEL_ENVIRONMENT_ID]).filter((id): id is string => id !== undefined),
+    ];
+    const used = new Set(known.map(namePair));
     const create = this.deps.newEnvironmentId ?? newEnvironmentId;
     for (let attempt = 1; ; attempt++) {
       const id = create();
-      if (!used.has(shortId(id).toLowerCase()) && !(await this.deps.docker.volumeExists(resourceName(repository, id)))) return id;
+      const name = resourceName(repository, id);
+      if (!used.has(namePair(id)) && !(await this.deps.docker.volumeExists(name)) && (await this.deps.docker.containerState(name)) === 'missing') return id;
       if (attempt >= ENVIRONMENT_ID_ATTEMPTS) throw new Error(`No unused environment ID was found for ${repository}.`);
     }
   }
@@ -6311,7 +6318,7 @@ export class EnvironmentService {
   }
 
   private async nextBuildNumber(env: Environment): Promise<number> {
-    const repository = environmentImageRepository(env.id);
+    const repository = environmentImageRepository(env.repository, env.id);
     let tags: string[] = [];
     try {
       tags = await this.deps.docker.listImageTags(repository);
@@ -6333,7 +6340,7 @@ export class EnvironmentService {
     oldRecord: BuildRecord | undefined,
     keepCompose: readonly string[] = [],
   ): Promise<void> {
-    const repository = environmentImageRepository(env.id);
+    const repository = environmentImageRepository(env.repository, env.id);
     const images = new Set<string>();
     try {
       for (const tag of await this.deps.docker.listImageTags(repository)) images.add(tag);
@@ -6559,7 +6566,7 @@ export class EnvironmentService {
    */
   private async removeComposeProject(env: Environment, quiet: boolean): Promise<void> {
     const { docker } = this.deps;
-    const project = composeProjectName(env.id);
+    const project = composeProjectName(env.repository, env.id);
     const run = (what: string, fn: () => Promise<unknown>): Promise<unknown> => (quiet ? this.quietly(what, fn) : fn());
     await run('remove the containers of the Docker Compose project', async () => {
       for (const container of await docker.listProjectContainers(project)) {
@@ -6594,7 +6601,7 @@ export class EnvironmentService {
         await docker.removeContainer(container.id);
       }
       await docker.removeContainer(env.containerName);
-      if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.id)))) await this.removeComposeProject(env, true);
+      if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)))) await this.removeComposeProject(env, true);
     });
     await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
     try {
