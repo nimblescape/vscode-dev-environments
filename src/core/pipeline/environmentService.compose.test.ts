@@ -569,6 +569,19 @@ describe('first open of a Docker Compose configuration', () => {
     });
   });
 
+  // Review round 3 of PR #88 (B-R3-8, mutants P8 and P10): the build record is allowed on the environment image only; a
+  // side service image with this environment's own labels and a build record is refused (the round-1 rule, A-R1-3).
+  it('refuses the build record on the image of a side service with the own labels of the environment (review round 3 of PR #88, B-R3-8)', async () => {
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageConfigs.set(DB_IMAGE, {
+      Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id, [LABEL_BUILD_RECORD]: '{}' },
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain(`label ${LABEL_BUILD_RECORD} of the image ${DB_IMAGE}`);
+    expect(error.message).not.toContain(`label ${LABEL_ENVIRONMENT_ID} of the image ${DB_IMAGE}`);
+    expect(h.helper.ups).toEqual([]);
+  });
+
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
     h.docker.images.add(DB_IMAGE);
     h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'nimblescape.devenv.compose-service': 'x' } });

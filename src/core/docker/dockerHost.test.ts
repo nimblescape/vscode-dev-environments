@@ -314,3 +314,11 @@ describe('review round 3 of PR #88 (A-R3-2): the context names of a host are val
     expect(remoteContextNames('user@b')[0]).toBe('remote-b');
   });
 });
+
+// Review round 3 of PR #88 (B-R3-9, mutant D2): the run of other characters at the end of the host name is trimmed, not
+// left as a trailing `-`.
+describe('review round 3 of PR #88 (B-R3-9): the context name of a host name that ends in other characters', () => {
+  it('has no trailing dash', () => {
+    expect(remoteContextNames('dev_box!')[0]).toBe('dev_box');
+  });
+});

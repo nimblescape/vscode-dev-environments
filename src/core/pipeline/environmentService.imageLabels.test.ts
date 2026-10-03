@@ -18,9 +18,11 @@ import {
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  composeProjectName,
   environmentImageName,
   resourceName,
 } from '../names';
+import type { ContainerInfo } from '../docker/containerAdapter';
 import type { BuildRecord } from '../types';
 import type { RepositoryTarget } from './environmentService';
 import {
@@ -40,7 +42,7 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { COMPOSE_CONTAINER_NUMBER_LABEL, COMPOSE_PROJECT_LABEL, DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
@@ -643,5 +645,152 @@ describe('review round 3 of PR #88: a failed first open and a volume of its name
     expect(error.code).toBe('startFailed');
     expect(h.docker.volumes.get(name)).toEqual({});
     expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+});
+
+describe('review round 3 of PR #88: the gaps of the mutation review (B-R3-1 to B-R3-7)', () => {
+  const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
+  const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+
+  function ups(): string[] {
+    return h.helper.calls.filter((call) => call.startsWith('up'));
+  }
+
+  /** A first open of the new environment FREE whose name is free when it is chosen; returns the name of its resources. */
+  function firstOpenOfFree(): string {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    vi.spyOn(h.docker, 'containerState').mockResolvedValue('missing');
+    return resourceName(REPO, FREE);
+  }
+
+  // Review round 3 of PR #88 (B-R3-1, mutant F5; B-R3-3, mutants F10 and F11; B-R3-4, mutant F12): when the labels of
+  // the volume cannot be read after a failed clone, nothing of the name is removed (the container, the images), only what
+  // carries the environment ID; the entry keeps its create mark as ended, and the pending connection file goes.
+  it('B-R3-1, B-R3-3, B-R3-4: a failed first open whose volume labels cannot be read removes only what carries its ID', async () => {
+    const name = firstOpenOfFree();
+    h.helper.cloneError = new Error('clone failed');
+    const theirContainer = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'running', image: 'their-image:1' });
+    const ownLeftover = h.docker.addContainer({ environmentId: FREE, name: 'leftover', state: 'stopped', image: 'their-image:1' });
+    const image = `${name}:1`;
+    h.docker.images.add(image);
+    h.docker.imageConfigs.set(image, { User: '', Labels: theirs });
+    const removePending = vi.spyOn(h.sessionFiles, 'removePending');
+    const inspect = h.docker.inspectVolumes.bind(h.docker);
+    let calls = 0;
+    h.docker.inspectVolumes = async (names) => {
+      // The check after the create reads them; the cleanup after the failed clone cannot.
+      if (calls++ > 0) throw new Error('timeout');
+      return inspect(names);
+    };
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect(h.docker.containerByRef(theirContainer.id)).toMatchObject({ name, state: 'running' });
+    expect(h.docker.log).not.toContain(`rm ${name}`);
+    expect(h.docker.images.has(image)).toBe(true);
+    expect(h.docker.log).toContain(`rm ${ownLeftover.id}`);
+    expect(h.docker.containerByRef(ownLeftover.id)).toBeUndefined();
+    expect(h.logger.warnings.some((line) => line.includes(`The labels of the volume ${name} could not be read`))).toBe(true);
+    expect(h.logger.warnings.some((line) => line.includes(`Nothing of the name ${name} is removed`))).toBe(true);
+    const [entry] = await h.registry.list();
+    expect(entry?.id).toBe(FREE);
+    expect(entry.busy?.operation).toBe('create');
+    expect(entry.busy?.since).toBe(new Date(0).toISOString());
+    expect(removePending).toHaveBeenCalledWith(FREE);
+  });
+
+  // Review round 3 of PR #88 (B-R3-2, mutant F7; B-R3-4, mutant F12): the volume of the name is another environment's:
+  // a container with this environment's ID is still removed, but the Compose project of the name (the same project name
+  // as the other environment's) is not, so its networks stay.
+  it('B-R3-2, B-R3-4: a failed first open whose volume is another environment\'s removes its own containers, not the Compose project', async () => {
+    const name = firstOpenOfFree();
+    const project = composeProjectName(REPO, FREE);
+    h.docker.volumes.set(name, theirs);
+    const ownLeftover = h.docker.addContainer({
+      environmentId: FREE,
+      name: `${project}-db-1`,
+      state: 'stopped',
+      image: 'postgres:16',
+      labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [COMPOSE_PROJECT_LABEL]: project, [COMPOSE_CONTAINER_NUMBER_LABEL]: '1' },
+    });
+    h.docker.networks.set(`${project}_default`, { [COMPOSE_PROJECT_LABEL]: project });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.docker.containerByRef(ownLeftover.id)).toBeUndefined();
+    expect(h.docker.networks.has(`${project}_default`)).toBe(true);
+    expect(h.docker.log.filter((line) => line.startsWith('network rm'))).toEqual([]);
+    expect(h.docker.volumes.get(name)).toEqual(theirs);
+  });
+
+  // Review round 3 of PR #88 (B-R3-5, mutant V4 adapted to workspaceVolumeOwnership): a first open whose volume labels
+  // cannot be read after the create never clones into it.
+  it('B-R3-5: a first open whose volume labels cannot be read after the create clones nothing', async () => {
+    const name = firstOpenOfFree();
+    h.docker.inspectVolumes = async () => {
+      throw new Error('timeout');
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toContain(`The labels of the volume ${name} could not be read.`);
+    expect(h.helper.calls.filter((call) => call.startsWith('clone'))).toEqual([]);
+  });
+
+  // Review round 3 of PR #88 (B-R3-5 follow-up, A-R3-1): an existing environment whose volume labels cannot be read is
+  // not opened (openExisting with `unreadable`).
+  it('B-R3-5: an existing environment whose volume labels cannot be read is not opened', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.inspectVolumes = async () => {
+      throw new Error('timeout');
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up') || call.startsWith('clone'))).toEqual([]);
+  });
+
+  // Review round 3 of PR #88 (B-R3-5 follow-up, A-R3-1): Delete of an existing environment whose volume of the name has
+  // no labels removes nothing of the name (the volume, the images), only the entry.
+  it('B-R3-5: Delete keeps a volume of the name without labels, and the images of the name', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.volumes.set(NAME, {});
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(h.docker.volumes.get(NAME)).toEqual({});
+    expect(h.docker.images.has(IMAGE_1)).toBe(true);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+  });
+
+  /**
+   * A failed update (`up` of IMAGE_2 fails before the CLI removed anything); `change` alters the surviving container then.
+   * IMAGE_1 names another image now (so the open builds), and the container's own image is kept:1, so the previous
+   * image is that image's ID, OWN (as B-R2-5).
+   */
+  const OWN = `sha256:image-of-${IMAGE_1}`;
+  async function failedUpdate(change: (survivor: ContainerInfo) => ContainerInfo): Promise<void> {
+    await seedEnvironment(h, { container: 'stopped' });
+    h.docker.images.add('kept:1');
+    h.docker.imageIds.set('kept:1', OWN);
+    h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (image) => {
+      if (image !== IMAGE_2) return undefined;
+      const [survivor] = h.docker.containersOf(ENV_ID);
+      h.docker.containers.set(survivor.id, change(survivor));
+      return new DevcontainerCommandError('devcontainer up', 1, '', 'invalid override');
+    };
+    await h.service.open(TARGET, options()).catch(() => undefined);
+  }
+
+  // Review round 3 of PR #88 (B-R3-6, mutant K3): a survivor whose image differs from the previous image by its name and
+  // its ID (half created from the new image) is replaced, not started again.
+  it('B-R3-6: a failed update replaces a survivor created from another image', async () => {
+    await failedUpdate((survivor) => ({ ...survivor, image: IMAGE_2, imageId: `sha256:${'8'.repeat(64)}` }));
+    expect(ups()).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${OWN} --remove-existing-container`]);
+    expect(h.logger.infos.some((line) => line.includes(`created again from the previous environment image ${OWN}`))).toBe(true);
+  });
+
+  // Review round 3 of PR #88 (B-R3-7, mutant K4): an outdated survivor (an older container version) is created again,
+  // although its image is the previous image.
+  it('B-R3-7: a failed update creates an outdated survivor again', async () => {
+    await failedUpdate((survivor) => ({ ...survivor, labels: { ...survivor.labels, [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) } }));
+    expect(ups()).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${OWN} --remove-existing-container`]);
   });
 });
