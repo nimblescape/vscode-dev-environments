@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import { dockerTargetOf, remoteContextName } from '../core/docker/dockerHost';
+import { dockerTargetOf, ownContextDescription, remoteContextNames } from '../core/docker/dockerHost';
 import { runWithDockerTarget } from '../core/docker/dockerTargets';
 import { ENGINE_INFO_FORMAT } from '../core/docker/remoteDocker';
 import { Messages, dockerHostReason } from '../core/messages';
@@ -31,6 +31,8 @@ class FakeCli {
     ['default', 'unix:///var/run/docker.sock'],
     ['desktop-linux', 'unix:///home/me/.docker/desktop/docker.sock'],
   ]);
+  /** The descriptions of the contexts (`--description` of `context create`); ours name the host (ownContextDescription). */
+  descriptions = new Map<string, string>();
   current = 'desktop-linux';
   hosts = new Map<string, RunResult>();
 
@@ -43,11 +45,17 @@ class FakeCli {
     if (args[0] !== 'context') return ok();
     switch (args[1]) {
       case 'ls':
-        return ok(`${[...this.contexts.keys()].join('\n')}\n`);
+        // User decisions 2026-10-03: `docker context ls --format '{{json .}}'` (listContextInfos; before: `{{.Name}}`).
+        return ok(
+          [...this.contexts].map(([name, endpoint]) => `${JSON.stringify({ Name: name, Description: this.descriptions.get(name) ?? '', DockerEndpoint: endpoint })}\n`).join(''),
+        );
       case 'create':
-      case 'update':
+      case 'update': {
         this.contexts.set(args[2], args[args.length - 1].replace(/^host=/, ''));
+        const description = args.indexOf('--description');
+        if (description > 0) this.descriptions.set(args[2], args[description + 1]);
         return ok();
+      }
       case 'use':
         if (!this.contexts.has(args[2])) return fail(`context "${args[2]}" does not exist`);
         this.current = args[2];
@@ -69,8 +77,9 @@ class FakeCli {
 
 /** The ssh check before the Docker calls (review, C3): `ssh … -- <host> true`. */
 const isSshCheck = (args: readonly string[]): boolean => args[args.length - 1] === 'true';
-const BUILD_BOX = remoteContextName('build-box');
-const GPU = remoteContextName('gpu');
+// User decisions 2026-10-03: the context of a host is named after its alias (before: remoteContextName, devenv-remote-<hash>).
+const BUILD_BOX = remoteContextNames('build-box')[0];
+const GPU = remoteContextNames('gpu')[0];
 
 const engineInfo = (rootless = false): RunResult =>
   ok(JSON.stringify({ version: '28.1.0', securityOptions: rootless ? ['name=rootless'] : ['name=seccomp,profile=builtin'] }));
@@ -211,7 +220,8 @@ describe('Use a Remote Docker Host…', () => {
   });
 
   it('takes a typed SSH address after validation, and never changes an existing context (review, C1)', async () => {
-    cli.contexts.set(remoteContextName('old-box'), 'ssh://old');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    cli.contexts.set(remoteContextNames('old-box')[0], 'ssh://old');
     cli.hosts.set('me@192.0.2.10:2222', engineInfo());
     answer(RemoteDockerTexts.enterAddress);
     window.showInputBox.mockImplementation(async (options: { validateInput: (value: string) => string | undefined }) => {
@@ -222,7 +232,8 @@ describe('Use a Remote Docker Host…', () => {
     });
     await commands.useRemoteHost();
     // review, C1: the context of this host is created; the context of another host stays as it is (before: updated).
-    const name = remoteContextName('me@192.0.2.10:2222');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    const name = remoteContextNames('me@192.0.2.10:2222')[0];
     expect(cli.changes[0]).toEqual([
       'context',
       'create',
@@ -232,7 +243,8 @@ describe('Use a Remote Docker Host…', () => {
       '--docker',
       'host=ssh://me@192.0.2.10:2222',
     ]);
-    expect(cli.contexts.get(remoteContextName('old-box'))).toBe('ssh://old');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    expect(cli.contexts.get(remoteContextNames('old-box')[0])).toBe('ssh://old');
     expect(cli.current).toBe(name);
   });
 
@@ -282,6 +294,50 @@ describe('Use a Remote Docker Host…', () => {
     await commands.useRemoteHost();
     expect(cli.current).toBe(BUILD_BOX);
     expect(cli.changes.filter((change) => change[1] !== 'use').map((change) => change[2])).toEqual([BUILD_BOX, GPU]);
+  });
+
+  // User decisions 2026-10-03: the context is named after the alias; the pair of the host only on a clash.
+  it('names the context after the alias, and takes the name with the pair when a context of the user has the name', async () => {
+    expect(BUILD_BOX).toBe('build-box');
+    cli.contexts.set('build-box', 'ssh://me@elsewhere');
+    cli.descriptions.set('build-box', 'my own box');
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    const pair = remoteContextNames('build-box')[1];
+    expect(cli.changes).toEqual([
+      ['context', 'create', pair, '--description', ownContextDescription('build-box'), '--docker', 'host=ssh://build-box'],
+      ['context', 'use', pair],
+    ]);
+    expect(cli.contexts.get('build-box')).toBe('ssh://me@elsewhere');
+  });
+
+  it('uses a context of the user that points to the host as it is; a switch away from it keeps the remembered local context', async () => {
+    cli.contexts.set('build-box', 'ssh://build-box');
+    cli.descriptions.set('build-box', 'my own box');
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    expect(cli.changes).toEqual([['context', 'use', 'build-box']]);
+    expect(await state.previousContext()).toBe('desktop-linux');
+    // User decisions 2026-10-03: only a context of the local Docker is remembered to go back to; build-box points to a
+    // remote host, so the switch away from it keeps desktop-linux.
+    answer('gpu');
+    await commands.useRemoteHost();
+    expect(await state.previousContext()).toBe('desktop-linux');
+    expect(cli.current).toBe('gpu');
+  });
+
+  it('refuses when both names of the host point elsewhere, and changes nothing', async () => {
+    const [name, pair] = remoteContextNames('build-box');
+    cli.contexts.set(name, 'ssh://one');
+    cli.contexts.set(pair, 'ssh://two');
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost().catch(() => undefined);
+    expect(cli.changes).toEqual([]);
+    expect(cli.current).toBe('desktop-linux');
   });
 
   it('checks the SSH login first (BatchMode) and does not ask Docker when it fails (review, C3)', async () => {
@@ -356,7 +412,8 @@ describe('Choose the Docker Host… (the choice of the first row)', () => {
   // Review round 3 of the sidebar host (G2): a host entered as an SSH address is no alias of the SSH config; it is the
   // first entry then, marked, and choosing it says that it is the current host already.
   it('marks a current host that was entered as an SSH address', async () => {
-    const typed = remoteContextName('me@box:2222');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    const typed = remoteContextNames('me@box:2222')[0];
     cli.contexts.set(typed, 'ssh://me@box:2222');
     cli.current = typed;
     await commands.chooseDockerHost();
@@ -502,9 +559,21 @@ describe('Use the Local Docker', () => {
     expect(window.showWarningMessage).toHaveBeenCalledWith(RemoteDockerTexts.notLocal('default', 'tcp://10.0.0.5:2375'), 'Show details');
   });
 
+  // User decisions 2026-10-03: a context of ours is known by its description, whatever its name; never the way back.
+  it('uses the context default when the remembered context is one of ours', async () => {
+    cli.contexts.set('box', 'unix:///var/run/docker.sock');
+    cli.descriptions.set('box', ownContextDescription('box'));
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await state.setPreviousContext('box');
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+  });
+
   it('uses the context default when none is remembered (or it is gone)', async () => {
-    cli.contexts.set(remoteContextName('box'), 'ssh://box');
-    cli.current = remoteContextName('box');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    cli.contexts.set(remoteContextNames('box')[0], 'ssh://box');
+    cli.current = remoteContextNames('box')[0];
     await state.setPreviousContext('removed-context');
     await commands.useLocalDocker();
     expect(cli.current).toBe('default');
@@ -532,11 +601,12 @@ describe('the mismatch of a restored window (offerSwitchBack)', () => {
   });
 
   it('switches back to the local Docker for a local environment', async () => {
-    cli.contexts.set(remoteContextName('box'), 'ssh://box');
-    cli.current = remoteContextName('box');
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    cli.contexts.set(remoteContextNames('box')[0], 'ssh://box');
+    cli.current = remoteContextNames('box')[0];
     await state.setPreviousContext('desktop-linux');
     window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
-    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', remoteContextName('box')))).resolves.toBe(true);
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', remoteContextNames('box')[0]))).resolves.toBe(true);
     expect(window.showWarningMessage.mock.calls[0][0]).toBe(
       'This environment is on the local Docker, but Docker is set to box. Use the local Docker again?',
     );

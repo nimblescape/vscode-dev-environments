@@ -47,8 +47,13 @@ export interface ContainerInfo {
   /** `State.Status` of `docker inspect`, for example `exited`. */
   rawState: string;
   labels: Record<string, string>;
-  /** Image reference that the container was created from (`Config.Image`), for example `devenv-3f2a9c1e:2`. */
+  /** Image reference that the container was created from (`Config.Image`), for example `devenv-acme-api-brave-noether:2`. */
   image: string;
+  /**
+   * Review round 1 of PR #88 (A-R1-1): the full ID of the image that the container was created from (`Image` of `docker
+   * inspect`); `image` is only a name, which may name another image by now.
+   */
+  imageId?: string;
   /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
   volumes?: string[];
   /**
@@ -329,6 +334,7 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
     rawState: state.Status,
     labels: toLabels(isRecord(config) ? config.Labels : undefined),
     image,
+    ...(typeof value.Image === 'string' && value.Image !== '' ? { imageId: value.Image } : {}),
     volumes: mountedVolumes(value.Mounts),
     volumeSubpaths: volumeSubpathMounts([
       ...(Array.isArray(value.Mounts) ? value.Mounts : []),
@@ -420,7 +426,7 @@ export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths, mountTargets } = container;
+  const { id, name, state, rawState, labels, image, imageId, volumes, volumeSubpaths, mountTargets } = container;
   return {
     id,
     name,
@@ -428,6 +434,8 @@ function publicInfo(container: InspectedContainer): ContainerInfo {
     rawState,
     labels,
     image,
+    // Review round 2 of PR #88 (B-R2-1): the ID of the container's image (containerImage, A-R1-1).
+    ...(imageId !== undefined ? { imageId } : {}),
     ...(volumes && volumes.length > 0 ? { volumes } : {}),
     ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
     ...(mountTargets && mountTargets.length > 0 ? { mountTargets } : {}),
@@ -889,8 +897,10 @@ export class ContainerAdapter {
 
   /**
    * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
-   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
-   * nimblescape.devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, only the images whose label
+   * nimblescape.devenv.environment-id names that environment (review round 1, D3; user decisions 2026-10-03: every image
+   * that Compose builds for an environment carries it, so an image without it, perhaps of another environment whose name
+   * starts with `<project>-`, is left out too). Throws CommandError.
    */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
@@ -910,7 +920,7 @@ export class ContainerAdapter {
         const config = isRecord(item) ? item.Config : undefined;
         const owner = toLabels(isRecord(config) ? config.Labels : undefined)[LABEL_ENVIRONMENT_ID];
         const tags = isRecord(item) && Array.isArray(item.RepoTags) ? item.RepoTags.filter((tag): tag is string => typeof tag === 'string') : [];
-        if (owner !== undefined && owner !== environmentId) for (const tag of tags) foreign.add(tag);
+        if (owner !== environmentId) for (const tag of tags) foreign.add(tag);
       });
     }
     return sorted.filter((image) => !foreign.has(image));
@@ -1095,6 +1105,65 @@ export class ContainerAdapter {
   }
 
   /**
+   * The labels of the local images `references` (one `docker image inspect`), by their full IDs; an image that does not
+   * exist is left out (the call fails for every reference then, so they are asked one by one). Throws CommandError when
+   * Docker cannot answer, or an AbortError when `signal` aborts.
+   */
+  async imageLabelsOf(references: readonly string[], signal?: AbortSignal): Promise<Map<string, Record<string, string>>> {
+    const labels = new Map<string, Record<string, string>>();
+    if (references.length === 0) return labels;
+    const format = '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}';
+    const read = async (batch: readonly string[]): Promise<RunResult> => {
+      const result = await this.run(['image', 'inspect', '--format', format, ...batch], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+      if (signal?.aborted) throw abortError();
+      return result;
+    };
+    const take = (stdout: string): void => {
+      for (const item of parseJsonLines(stdout)) {
+        if (!isRecord(item) || typeof item.id !== 'string' || item.id === '') continue;
+        labels.set(item.id.toLowerCase(), toLabels(item.labels));
+      }
+    };
+    const all = await read(references);
+    if (all.exitCode === 0) {
+      take(all.stdout);
+      return labels;
+    }
+    for (const reference of references) {
+      const args = ['image', 'inspect', '--format', format, reference];
+      const one = await read([reference]);
+      if (one.exitCode === 0) take(one.stdout);
+      else if (!this.isMissing(one, 'image')) throw this.commandError(args, one);
+    }
+    return labels;
+  }
+
+  /**
+   * User decisions 2026-10-03: gives the local image `image` the labels `labels` (the environment ID, its repository and
+   * owner, and its build record): `docker build --quiet -t <image> --label k=v… -` with only `FROM <image>` on standard
+   * input, a build of metadata without a new layer and without the network (its base is the local image). Docker moves
+   * the tag only when the build succeeds. The previous image under the tag is removed after that only when it has no
+   * other tag or digest left (best effort; review of PR #88: never another name's image). Throws CommandError when the build fails.
+   */
+  async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
+    const previous = await this.imageId(image);
+    if (previous === undefined) throw new CommandError(commandText(['image', 'inspect', image]), 1, '', `The image ${image} does not exist.`);
+    await this.runChecked(['build', '--quiet', '-t', image, ...labelArgs(labels, '--label'), '-'], { input: `FROM ${image}\n`, signal });
+    const now = await this.imageId(image);
+    if (now === undefined || now === previous) return;
+    // Only an image that nothing names any more: `docker image rm <ID>` of an image with one other tag removes that tag
+    // too (for example `<project>-<service>` that Docker Compose built, or the base image of an image-only configuration
+    // that the Dev Container CLI only tagged).
+    try {
+      const names = await this.imageNames(previous);
+      if (names === undefined || names.repoTags.length > 0 || names.repoDigests.length > 0) return;
+      await this.removeImage(previous);
+    } catch (error) {
+      this.logger.info(`The image ${previous} before the labels of ${image} was not removed: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
    * The names of the local image that `reference` names (`RepoTags` and `RepoDigests` of `docker image inspect`), or
    * `undefined` if it does not exist (review round 2, S2-05: whether Docker took the reference for an image ID,
    * resolvedByImageId). Throws CommandError for other errors.
@@ -1237,8 +1306,8 @@ export class ContainerAdapter {
   /**
    * User decision 2026-09-28: the named images of the Docker host whose repository starts with `devenv-` (`docker image
    * ls --filter reference=devenv-*`), each image once with its full ID and its references `repository:tag`: the
-   * environment images `devenv-<short id>:<build>` and the images that Docker Compose built for an environment
-   * (`devenv-<short id>-<service>`), whichever computer built them. Throws CommandError, or an AbortError when `signal`
+   * environment images `<environment name>:<build>` and the images that Docker Compose built for an environment
+   * (`<environment name>-<service>`; resourceName), whichever computer built them. Throws CommandError, or an AbortError when `signal`
    * aborts.
    */
   async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {

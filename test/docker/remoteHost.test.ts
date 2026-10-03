@@ -6,8 +6,8 @@
 // is an SSH server in a container (test/docker/sshd: Alpine with openssh-server and the Docker CLI, key authentication
 // only) whose Docker socket is the socket of the engine of the runner. A test SSH config names it; a wrapper `ssh` first on
 // PATH adds `-F <config>`, so the Docker CLI's ssh uses it and the SSH config of the user is not touched. The context of
-// the host (`devenv-remote-<hash>`, `ssh://devenv-test-remote`) is created in a Docker configuration folder of this file
-// only.
+// the host (user decisions 2026-10-03: named after the SSH alias, `devenv-test-remote`, with `ssh://devenv-test-remote` and
+// the description of Dev Environments) is created in a Docker configuration folder of this file only.
 // Checked: the test of a host and the plain reasons of its failures (unknown host key, login failed, unreachable), the
 // context switch and the detection of the remote mode, the open pipeline of a seeded environment through the context
 // (every Docker call goes through SSH: the SSH server logs each connection), the containers and volumes on the engine
@@ -19,10 +19,19 @@ import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { findExecutable } from '../../src/core/docker/dockerCli';
-import { remoteContextName } from '../../src/core/docker/dockerHost';
+import { ownContextDescription, remoteContextNames } from '../../src/core/docker/dockerHost';
 import { ensureDockerRunning } from '../../src/core/docker/dockerStart';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { startDockerFor, testRemoteDockerHost, useContext, useRemoteContext, type SshCheckDeps } from '../../src/core/docker/remoteDocker';
+import {
+  findRemoteContext,
+  isOwnContext,
+  listContextInfos,
+  startDockerFor,
+  testRemoteDockerHost,
+  useContext,
+  useRemoteContext,
+  type SshCheckDeps,
+} from '../../src/core/docker/remoteDocker';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
@@ -45,7 +54,20 @@ import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, Timings, dockerTestContext, fakeAuth, registryClient, registryTransport, runInVolume } from './harness';
+import {
+  DUMMY_TOKEN,
+  FakeUi,
+  HELPER_DOCKERFILE,
+  RecordingProgress,
+  TEST_ACCOUNT,
+  Timings,
+  dockerTestContext,
+  expectLabelledEnvironmentImage,
+  fakeAuth,
+  registryClient,
+  registryTransport,
+  runInVolume,
+} from './harness';
 
 const ALIAS = 'devenv-test-remote';
 const REPOSITORY = 'devenv-test/remote';
@@ -216,11 +238,24 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
 
   it('switches the context to ssh://<alias>: the remote mode follows it, and back', async () => {
     await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local', host: '' });
-    await useRemoteContext(docker, ALIAS);
-    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}`, context: remoteContextName(ALIAS) });
+    // User decisions 2026-10-03: the context is named after the SSH alias (the first of remoteContextNames, free in the
+    // Docker configuration of this file) and marked as one of Dev Environments by its description.
+    const context = await useRemoteContext(docker, ALIAS);
+    expect(context).toBe(ALIAS);
+    expect(remoteContextNames(ALIAS)[0]).toBe(ALIAS);
+    await expect(findRemoteContext(docker, ALIAS)).resolves.toBe(ALIAS);
+    await expect(isOwnContext(docker, ALIAS)).resolves.toBe(true);
+    expect((await listContextInfos(docker)).find((info) => info.name === ALIAS)).toEqual({
+      name: ALIAS,
+      description: ownContextDescription(ALIAS),
+      endpoint: `ssh://${ALIAS}`,
+    });
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}`, context: ALIAS });
     await useContext(docker, 'default');
     await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local' });
-    await useRemoteContext(docker, ALIAS);
+    // User decisions 2026-10-03: the existing context is taken again, no second one is created.
+    await expect(useRemoteContext(docker, ALIAS)).resolves.toBe(ALIAS);
+    expect((await listContextInfos(docker)).filter((info) => info.endpoint === `ssh://${ALIAS}`).map((info) => info.name)).toEqual([ALIAS]);
   });
 
   it('opens a seeded environment through the context: containers, volumes, and the token on the engine reached through SSH', async () => {
@@ -330,6 +365,9 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
     // The registry records the Docker host; the environment is of that host only.
     expect((await registry.get(environmentId))?.dockerHost).toBe(ALIAS);
+    // User decisions 2026-10-03: the image built through SSH carries the labels of the environment and its build record;
+    // the record pins its ID.
+    expectLabelledEnvironmentImage(localCli, await registry.get(environmentId));
 
     // Back on the local Docker, the environment of the remote host is never acted on.
     await useContext(docker, 'default');

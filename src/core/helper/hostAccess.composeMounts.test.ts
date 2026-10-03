@@ -8,11 +8,15 @@
 // (the type is dropped, nothing is quoted or escaped). The policy checks that reading too (HostAccessInput.composeMounts).
 import { readFileSync } from 'fs';
 import { describe, expect, it } from 'vitest';
-import { CONFIG_FOLDER } from '../names';
+import { CONFIG_FOLDER, resourceName } from '../names';
 import { helperCliVariables } from './cliVariables';
 import { hostAccessReport, type HostAccessInput } from '../policy';
 
-const OWN = 'devenv-api-12345678';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 
 // A copy of the functions `lQ` (with its table `cj`) and `nW` of the Dev Container CLI 0.89.0
 // (node_modules/@devcontainers/cli/dist/spec-node/devContainersSpecCLI.js): how the CLI reads a `mounts` text for Docker
@@ -146,8 +150,8 @@ describe('review round 15 (K1, K2): Compose `mounts` as the Dev Container CLI wr
   });
 
   it('applies the rules of volume names to the source that the CLI writes', () => {
-    expect(report('metadata', 'type=volume,src=devenv-other-87654321,dst=/data', false).hostAccess).toEqual([
-      'volume devenv-other-87654321 of another environment',
+    expect(report('metadata', `type=volume,src=${OTHER},dst=/data`, false).hostAccess).toEqual([
+      `volume ${OTHER} of another environment`,
     ]);
     expect(report('metadata', 'type=volume,src=vscode,dst=/data').hostAccess).toEqual(['volume vscode of the Dev Containers extension']);
   });

@@ -33,6 +33,7 @@ import {
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
   LABEL_ENVIRONMENT_ID,
+  LABEL_BUILD_RECORD,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   LABEL_VOLUME,
@@ -74,9 +75,11 @@ import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../policy';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const PROJECT = composeProjectName(ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
-const IMAGE_2 = environmentImageName(ENV_ID, 2);
+const PROJECT = composeProjectName(REPO, ENV_ID);
+/** The Compose project of the environment OTHER_ID of acme/web. */
+const OTHER_PROJECT = composeProjectName('acme/web', OTHER_ID);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
+const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
 const FOLDER = '/workspaces/api';
 const DB_IMAGE = 'postgres:16';
 const DB_DIGEST = `sha256:${'d'.repeat(64)}`;
@@ -398,7 +401,7 @@ describe('first open of a Docker Compose configuration', () => {
   });
 
   it('refuses a service image that is an image of an environment of another account, whatever the switch says (user decision 2026-09-28)', async () => {
-    const theirs = environmentImageName(OTHER_ID, 1);
+    const theirs = environmentImageName('acme/web', OTHER_ID, 1);
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false });
     h.docker.images.add(BASE_IMAGE);
     h.docker.images.add(DB_IMAGE);
@@ -448,7 +451,8 @@ describe('first open of a Docker Compose configuration', () => {
         m.services.db.networks = { default: null, backend: null };
       }),
     );
-    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    // User decisions 2026-10-03: the project of another environment is composeProjectName (no short ID).
+    h.docker.networks.set('backend', { 'com.docker.compose.project': OTHER_PROJECT });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('network backend of another environment'));
     expect(h.helper.builds).toEqual([]);
@@ -457,7 +461,7 @@ describe('first open of a Docker Compose configuration', () => {
 
   it('refuses an external network that a container of another environment uses (review round 1, S2)', async () => {
     useCompose(h, output((m) => (m.networks = { ...m.networks, shared: { name: 'shared', external: true } })));
-    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/other', OTHER_ID), state: 'running', image: 'x' });
     h.docker.networks.set('shared', {});
     h.docker.networkContainers.set('shared', [other.id]);
     const error = await rejection(h.service.open(TARGET, options()));
@@ -467,8 +471,9 @@ describe('first open of a Docker Compose configuration', () => {
 
   it('refuses a network of another environment that network_mode names by a prefix of its ID (review round 2, S2-04)', async () => {
     useCompose(h, output((m) => (m.services.db.network_mode = 'f00dbabe')));
-    h.docker.networks.set('devenv-7c1d2e3f_default', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
-    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    // User decisions 2026-10-03: the project of another environment is composeProjectName (no short ID).
+    h.docker.networks.set(`${OTHER_PROJECT}_default`, { 'com.docker.compose.project': OTHER_PROJECT });
+    h.docker.networkIds.set(`${OTHER_PROJECT}_default`, `f00dbabe${'0'.repeat(56)}`);
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('service db: network f00dbabe of another environment'));
     expect(h.helper.builds).toEqual([]);
@@ -496,11 +501,13 @@ describe('first open of a Docker Compose configuration', () => {
   it('allows a side service built FROM the image of another environment (review round 1, S4)', async () => {
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
-      dockerfiles: { db: 'FROM index.docker.io/library/devenv-7c1d2e3f:3\n' },
+      dockerfiles: { db: `FROM index.docker.io/library/${environmentImageName('acme/web', OTHER_ID, 3)}\n` },
     });
-    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment`.
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment`. User decisions 2026-10-03: the image is named environmentImageName.
     // The fake Docker has no build of Compose: the image that Compose builds for the service.
-    h.docker.images.add('devenv-3f2a9c1e-db');
+    // User decisions 2026-10-03: named after the project (composeProjectName), with the ID label of the environment.
+    h.docker.images.add(`${PROJECT}-db`);
+    h.docker.imageConfigs.set(`${PROJECT}-db`, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
   });
@@ -508,7 +515,7 @@ describe('first open of a Docker Compose configuration', () => {
   it('refuses the image of a side service that Docker would find by the prefix of its ID (review round 2, S2-05)', async () => {
     useCompose(h, output((m) => (m.services.db.image = 'a1b2c3')));
     h.docker.images.add('a1b2c3');
-    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.unsupportedOptions('service db: image a1b2c3 (an image ID; name the image)'));
     expect(h.helper.builds).toEqual([]);
@@ -519,6 +526,60 @@ describe('first open of a Docker Compose configuration', () => {
     h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'com.docker.compose.project': 'app', 'com.docker.compose.service': 'db' } });
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
+  });
+
+  describe('the image of another environment as the image of a side service (review round 1 of PR #88, A-R1-7)', () => {
+    const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web', [LABEL_OWNER_ID]: ACCOUNT.id };
+
+    it('uses one of an environment of the same account (user decision 2026-09-28)', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: theirs });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+
+    it('refuses one of an environment of another account, and the build record on it', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, owner: OTHER_ACCOUNT });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id } });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toContain(`label ${LABEL_ENVIRONMENT_ID} of the image ${DB_IMAGE}`);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('uses the environment image of an environment of the same account, with its build record (review round 2, A-R2-3)', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      // Changed expectation (A-R2-3): every environment image carries the label of its build record (before: refused).
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_BUILD_RECORD]: '{}' } });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+
+    // Review round 2 of PR #88 (B-R2-12, mutant P6): with several environments of the account, the image is checked
+    // against the one whose ID it carries, not against the first environment of the account.
+    it('uses the image of the second of several environments of the same account (review round 2 of PR #88, B-R2-12)', async () => {
+      await seedEnvironment(h, { id: '9a9a9a9a-0000-4000-8000-000000000009', repository: 'acme/tools', container: null });
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_BUILD_RECORD]: '{}' } });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+  });
+
+  // Review round 3 of PR #88 (B-R3-8, mutants P8 and P10): the build record is allowed on the environment image only; a
+  // side service image with this environment's own labels and a build record is refused (the round-1 rule, A-R1-3).
+  it('refuses the build record on the image of a side service with the own labels of the environment (review round 3 of PR #88, B-R3-8)', async () => {
+    h.docker.images.add(DB_IMAGE);
+    h.docker.imageConfigs.set(DB_IMAGE, {
+      Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id, [LABEL_BUILD_RECORD]: '{}' },
+    });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toContain(`label ${LABEL_BUILD_RECORD} of the image ${DB_IMAGE}`);
+    expect(error.message).not.toContain(`label ${LABEL_ENVIRONMENT_ID} of the image ${DB_IMAGE}`);
+    expect(h.helper.ups).toEqual([]);
   });
 
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
@@ -1388,10 +1449,15 @@ describe('Delete of a Docker Compose environment', () => {
     h.docker.volumes.set(`${PROJECT}_cache`, volumeLabelsOf(VOLUME_KIND_COMPOSE));
     h.docker.volumes.set('shared-tools', volumeLabelsOf(VOLUME_KIND_ADDITIONAL));
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
-    h.docker.networks.set('devenv-7c1d2e3f_default', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
-    h.docker.images.add(`${PROJECT}-app`);
-    h.docker.images.add(`${PROJECT}-worker:latest`);
-    h.docker.images.add('devenv-7c1d2e3f-app');
+    // User decisions 2026-10-03: the project of another environment is named composeProjectName (no short ID).
+    h.docker.networks.set(`${OTHER_PROJECT}_default`, { 'com.docker.compose.project': OTHER_PROJECT });
+    // User decisions 2026-10-03: the images that Compose built for the environment carry its ID label (build.labels);
+    // listProjectImages keeps only those.
+    for (const built of [`${PROJECT}-app`, `${PROJECT}-worker:latest`]) {
+      h.docker.images.add(built);
+      h.docker.imageConfigs.set(built, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    }
+    h.docker.images.add(`${OTHER_PROJECT}-app`);
     // A one-off container of `docker compose run`: the label of the project, not the one of the environment.
     const oneOff = h.docker.addContainer({ environmentId: 'x', name: `${PROJECT}-db-run-1`, state: 'stopped', image: DB_IMAGE, labels: COMPOSE_LABELS });
     delete oneOff.labels[LABEL_ENVIRONMENT_ID];
@@ -1441,8 +1507,8 @@ describe('Delete of a Docker Compose environment', () => {
     // The data of the services and the other volumes stay; so does everything of another environment.
     expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
     expect(h.docker.volumes.has('shared-tools')).toBe(true);
-    expect(h.docker.networks.has('devenv-7c1d2e3f_default')).toBe(true);
-    expect(h.docker.images.has('devenv-7c1d2e3f-app')).toBe(true);
+    expect(h.docker.networks.has(`${OTHER_PROJECT}_default`)).toBe(true);
+    expect(h.docker.images.has(`${OTHER_PROJECT}-app`)).toBe(true);
     expect(await h.registry.list()).toEqual([]);
     // The containers go before the networks, which Docker removes only when no container uses them.
     expect(h.docker.log.indexOf(`network rm ${PROJECT}_default`)).toBeGreaterThan(h.docker.log.indexOf(`rm ${oneOff}`));
@@ -1451,7 +1517,7 @@ describe('Delete of a Docker Compose environment', () => {
   it('keeps a container of another environment that has the label of the project (review round 1, D3)', async () => {
     await seedForDelete();
     // For example a single container of another environment whose image has the label of this project.
-    const foreign = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x', labels: { ...COMPOSE_LABELS } });
+    const foreign = h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/other', OTHER_ID), state: 'running', image: 'x', labels: { ...COMPOSE_LABELS } });
     h.docker.images.add(`${PROJECT}-tool`);
     h.docker.imageConfigs.set(`${PROJECT}-tool`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
     await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
@@ -1459,6 +1525,33 @@ describe('Delete of a Docker Compose environment', () => {
     expect(h.docker.log).not.toContain(`rm ${foreign.id}`);
     expect(h.docker.images.has(`${PROJECT}-tool`)).toBe(true);
     expect(h.docker.images.has(`${PROJECT}-app`)).toBe(false);
+  });
+
+  // Review round 2 of PR #88 (B-R2-3, mutant O3): Delete removes a recorded image of the project (BuildRecord.compose)
+  // only when it carries the ID of this environment (ownComposeImages in removeComposeProject).
+  it('keeps a recorded image of the project that carries the ID of another environment (review round 2 of PR #88, B-R2-3)', async () => {
+    await seedForDelete();
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-worker:latest`)).toBe(false);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  // Review round 2 of PR #88 (B-R2-3, mutant O4): a recorded image whose labels cannot be read is kept.
+  it('keeps a recorded image of the project whose labels cannot be read (review round 2 of PR #88, B-R2-3)', async () => {
+    await seedForDelete();
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    const imageLabels = h.docker.imageLabels.bind(h.docker);
+    h.docker.imageLabels = async (reference: string) => {
+      if (reference === `${PROJECT}-app`) throw new CommandError(`docker image inspect ${reference}`, 1, '', 'timeout');
+      return imageLabels(reference);
+    };
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-worker:latest`)).toBe(false);
   });
 
   it('removes the volumes of the project that the user ticked', async () => {
@@ -1483,6 +1576,8 @@ describe('a failed first open of a Docker Compose configuration', () => {
   it('removes the containers, the networks, and the images of the project', async () => {
     h.helper.onBuild = () => {
       h.docker.images.add(`${PROJECT}-app`);
+      // User decisions 2026-10-03: Compose builds it with the ID label of the environment (build.labels).
+      h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     };
     h.helper.composeProjectNameResult = 'api_devcontainer';
     await rejection(h.service.open(TARGET, options()));
@@ -1500,6 +1595,8 @@ describe('a Docker Compose environment whose configuration became a single conta
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
     h.docker.images.add(`${PROJECT}-app`);
+    // Review round 1 of PR #88 (A-R1-2): as Compose builds it (build.labels), so that the rebuild removes it.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
   });
 
@@ -1781,6 +1878,14 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
     expect(h.docker.images.has(`${PROJECT}-app`)).toBe(false);
     expect((await h.registry.get(ENV_ID))?.buildRecord?.compose).toBeUndefined();
+  });
+
+  it('keeps a recorded image of the project that carries the ID of another environment (review round 1 of PR #88, A-R1-2)', async () => {
+    // The name `<project>-app` can also be the name of an image of another environment whose name starts with `<project>-`.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
   });
 });
 
@@ -2924,7 +3029,7 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
       }),
     );
     h.docker.images.add('a1b2c3');
-    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toContain('image a1b2c3 (an image ID; name the image)');
   });
@@ -2940,7 +3045,7 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
       }),
     );
     h.docker.images.add('3f2a1b9c');
-    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     h.docker.uninspectableImages.add('a1b2');
     const error = await rejection(h.service.open(TARGET, options()));
     // Before: the batch failed for foo/Bar ("invalid reference format"), and no reference of it was checked.
@@ -3134,7 +3239,7 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
       }),
     );
     h.docker.images.add('3f2a1b9c');
-    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     h.docker.images.add('cafe');
     h.docker.images.add(DB_IMAGE);
     h.docker.imageIds.set(DB_IMAGE, `sha256:cafe${'0'.repeat(60)}`);
@@ -3219,6 +3324,8 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     await record([PGDATA]);
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
     h.docker.images.add(`${PROJECT}-app`);
+    // Review round 1 of PR #88 (A-R1-2): as Compose builds it (build.labels), so that the rebuild removes it.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
     h.ui.configurationChangedAnswer = 'rebuildNow';
     await h.service.openEnvironment(ENV_ID, options());
@@ -3851,7 +3958,8 @@ describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev s
       expect(files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
       expect(Object.keys(files ?? {}).filter((file) => file.endsWith('.dockerignore'))).toEqual([]);
       const written = JSON.parse(files?.[COMPOSE_MODEL_PATH] ?? 'null') as ComposeModel;
-      expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
+      // User decisions 2026-10-03: every service with `build` gets the ID label of the environment (build.labels).
+      expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE, labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     }
   });
 });
@@ -5220,5 +5328,23 @@ describe('review round 4 of PR #68', () => {
     expect(error.code).toBe('helperFailed');
     // Before: "Its dev container was created", which the listing could not tell.
     expect(error.detail).toContain('The configuration now uses Docker Compose. Its dev container was created or started, but its lifecycle commands could not run.');
+  });
+});
+
+// Review round 2 of PR #88 (B-R2-7, mutant O5): after a rebuild, the images that Compose built under the same names as
+// before (`<project>-<service>`, the images of the new build record, with this environment's ID) are not removed.
+describe('review round 2 of PR #88 (B-R2-7): a rebuild keeps the images of the project that it just built', () => {
+  it('does not remove `<project>-app` that the old and the new build record name', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST } } });
+    h.docker.images.add(`${PROJECT}-app`);
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.images).toEqual([`${PROJECT}-app`]);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    // The old environment image goes, as after every update.
+    expect(h.docker.images.has(IMAGE_1)).toBe(false);
   });
 });

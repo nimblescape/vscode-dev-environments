@@ -187,11 +187,15 @@ export class FakeDocker implements EnvironmentDocker {
     this.networks.delete(name);
   }
 
+  /**
+   * As ContainerAdapter.listProjectImages. User decisions 2026-10-03: with `environmentId`, only the images whose label
+   * nimblescape.devenv.environment-id is that ID (an unlabelled `<project>-*` image is left out too).
+   */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const owner = (image: string): string | undefined => this.imageConfigs.get(image)?.Labels?.[LABEL_ENVIRONMENT_ID];
     return [...this.images]
       .filter((image) => image.startsWith(`${project}-`))
-      .filter((image) => environmentId === undefined || owner(image) === undefined || owner(image) === environmentId)
+      .filter((image) => environmentId === undefined || owner(image) === environmentId)
       .sort();
   }
 
@@ -206,8 +210,10 @@ export class FakeDocker implements EnvironmentDocker {
   async runChecked(args: readonly string[]): Promise<string> {
     if (args[0] === 'image' && args[1] === 'inspect') {
       const reference = args[args.length - 1];
-      if (!this.images.has(reference)) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
-      return `${JSON.stringify(this.imageConfigs.get(reference) ?? { User: '', Labels: {} })}\n`;
+      // Review round 1 of PR #88 (A-R1-1): also by the ID of an image, as Docker resolves it.
+      const name = this.imageNamed(reference);
+      if (name === undefined) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
+      return `${JSON.stringify(this.imageConfigs.get(name) ?? { User: '', Labels: {} })}\n`;
     }
     if (args[0] === 'run') {
       const index = args.indexOf('--mount') + 2;
@@ -340,6 +346,11 @@ export class FakeDocker implements EnvironmentDocker {
     return this.volumes.has(name);
   }
 
+  async containerState(nameOrId: string): Promise<ContainerState> {
+    const container = this.containers.get(nameOrId) ?? [...this.containers.values()].find((c) => c.name === nameOrId);
+    return container?.state ?? 'missing';
+  }
+
   async createVolume(name: string, labels: Record<string, string>): Promise<void> {
     this.log.push(`volume create ${name}`);
     if (!this.volumes.has(name)) this.volumes.set(name, { ...labels });
@@ -410,12 +421,48 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   async imageExists(reference: string): Promise<boolean> {
-    return this.images.has(reference);
+    // Review round 2 of PR #88 (B-R2-4): also by the ID of an image, as `docker image inspect` resolves it (imageId).
+    return this.imageNamed(reference) !== undefined;
   }
 
   async imageId(reference: string): Promise<string | undefined> {
-    if (!this.images.has(reference)) return undefined;
-    return this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
+    // Review round 1 of PR #88 (A-R1-1): also by the ID of an image, as Docker resolves it.
+    const name = this.imageNamed(reference);
+    if (name === undefined) return undefined;
+    return this.imageIds.get(name) ?? `sha256:image-of-${name}`;
+  }
+
+  /** The name of the image `reference` (a name, or the ID of one), undefined when none. */
+  private imageNamed(reference: string): string | undefined {
+    if (this.images.has(reference)) return reference;
+    return [...this.images].find((name) => (this.imageIds.get(name) ?? `sha256:image-of-${name}`) === reference);
+  }
+
+  async imageLabels(reference: string): Promise<Record<string, string> | undefined> {
+    const name = this.imageNamed(reference);
+    return name === undefined ? undefined : { ...(this.imageConfigs.get(name)?.Labels ?? {}) };
+  }
+
+  async imageLabelsOf(references: readonly string[]): Promise<Map<string, Record<string, string>>> {
+    const labels = new Map<string, Record<string, string>>();
+    for (const reference of references) {
+      const name = this.imageNamed(reference);
+      if (name !== undefined) labels.set((this.imageIds.get(name) ?? `sha256:image-of-${name}`).toLowerCase(), { ...(this.imageConfigs.get(name)?.Labels ?? {}) });
+    }
+    return labels;
+  }
+
+  /** The labels that labelImage gave each image, by name (the fake keeps the ID of the image). */
+  readonly labelled = new Map<string, Record<string, string>>();
+  /** labelImage fails with this error, when set. */
+  labelImageError: Error | undefined;
+
+  async labelImage(image: string, labels: Record<string, string>): Promise<void> {
+    if (this.labelImageError) throw this.labelImageError;
+    if (!this.images.has(image)) throw new Error(`The image ${image} does not exist.`);
+    this.labelled.set(image, { ...labels });
+    const config = this.imageConfigs.get(image) ?? { User: '' };
+    this.imageConfigs.set(image, { ...config, Labels: { ...(config.Labels ?? {}), ...labels } });
   }
 
   async removeImage(reference: string): Promise<boolean> {
@@ -481,6 +528,8 @@ export class FakeDocker implements EnvironmentDocker {
       rawState: p.state === 'running' ? 'running' : 'exited',
       labels: { ...(p.labels ?? { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION) }), [LABEL_ENVIRONMENT_ID]: p.environmentId },
       image: p.image,
+      // Review round 1 of PR #88 (A-R1-1): as Docker records it, the ID of the image at the creation of the container.
+      ...(this.images.has(p.image) ? { imageId: this.imageIds.get(p.image) ?? `sha256:image-of-${p.image}` } : {}),
       ...(p.volumeSubpaths !== undefined ? { volumeSubpaths: p.volumeSubpaths } : {}),
     };
     this.containers.set(id, container);
@@ -1394,7 +1443,8 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
       ? undefined
       : {
           builtAt: '2026-09-20T10:00:00.000Z',
-          environmentImage: environmentImageName(id, 1),
+          environmentImage: environmentImageName(repository, id, 1),
+          imageId: `sha256:image-of-${environmentImageName(repository, id, 1)}`,
           buildNumber: 1,
           configPath: DEFAULT_CONFIG_PATH,
           configHash: configHash(DEFAULT_CONFIG_TEXT),
@@ -1428,7 +1478,7 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
   }
   const state = options.container === undefined ? 'stopped' : options.container;
   if (state !== null) {
-    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(id, 1), labels: options.containerLabels });
+    h.docker.addContainer({ environmentId: id, name, state, image: record?.environmentImage ?? environmentImageName(repository, id, 1), labels: options.containerLabels });
   }
   return environment;
 }

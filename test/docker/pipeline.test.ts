@@ -65,6 +65,7 @@ import {
   RecordingProgress,
   Timings,
   dockerTestContext,
+  expectLabelledEnvironmentImage,
   fakeAuth,
   hangingTransport,
   inConceptOrder,
@@ -221,7 +222,8 @@ describe('open pipeline on a seeded environment', () => {
   const environmentId = newEnvironmentId();
   const volumeName = resourceName(REPOSITORY, environmentId);
   const containerName = volumeName;
-  const imageRepository = environmentImageRepository(environmentId);
+  // User decisions 2026-10-03: the image repository is the name of the environment (resourceName), so it takes the repository.
+  const imageRepository = environmentImageRepository(REPOSITORY, environmentId);
 
   function execIn(user: string, script: string): string {
     const result = cli.run(['exec', '-u', user, containerName, 'sh', '-c', script]);
@@ -414,6 +416,8 @@ describe('open pipeline on a seeded environment', () => {
       features: {},
     });
     expect(entry?.buildRecord?.configHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    // User decisions 2026-10-03: the image carries the labels of the environment and its build record; the record pins its ID.
+    expectLabelledEnvironmentImage(cli, entry);
     expect(entry?.remoteUser).toBe(REMOTE_USER);
     // The full Git summary after the first creation; no remote, so the commit counts as unpushed.
     expect(entry?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
@@ -738,6 +742,8 @@ describe('open pipeline on a seeded environment', () => {
       images: { [TEST_BASE_IMAGE]: await registryDigest(digestChecker, TEST_BASE_IMAGE) },
     });
     expect(Date.parse(entry?.buildRecord?.builtAt ?? '')).toBeGreaterThanOrEqual(started - 1000);
+    // User decisions 2026-10-03: the new image is labelled too, and the record pins its ID.
+    expectLabelledEnvironmentImage(cli, entry);
     expect(entry?.busy).toBeUndefined();
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);
     expect(ui.since(events)).toEqual([]);
@@ -899,7 +905,7 @@ describe('open pipeline on a seeded environment', () => {
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain(item);
       expect(progress.steps).not.toContain('preparing');
-      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])).toEqual([]);
+      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository('devenv-test/refused', id)])).toEqual([]);
       expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${id}`])).toEqual([]);
       // NFR-07: the environment keeps its volume.
       expect(cli.volume(name)).toBeDefined();
@@ -936,7 +942,7 @@ describe('open pipeline on a seeded environment', () => {
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain(`volume ${composeVolume} of the Docker Compose project devenv-test`);
       expect(progress.steps).not.toContain('preparing');
-      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])).toEqual([]);
+      expect(cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])).toEqual([]);
       expect(cli.lines(['ps', '-a', '-q', '--filter', `volume=${composeVolume}`])).toEqual([]);
       expect(cli.volume(name)).toBeDefined();
       expect(cli.volume(composeVolume)).toBeDefined();
@@ -982,7 +988,7 @@ describe('open pipeline on a seeded environment', () => {
     } finally {
       await registry.remove(id);
       cli.run(['rm', '-f', name]);
-      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])) cli.run(['image', 'rm', '-f', image]);
       cli.run(['volume', 'rm', name]);
       if (pulledHere) cli.run(['image', 'rm', OLD_GIT_BASE_IMAGE]);
     }
@@ -1029,7 +1035,7 @@ describe('open pipeline on a seeded environment', () => {
     } finally {
       await registry.remove(id);
       cli.run(['rm', '-f', name]);
-      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])) cli.run(['image', 'rm', '-f', image]);
       cli.run(['volume', 'rm', name]);
     }
   });
@@ -1056,7 +1062,7 @@ describe('open pipeline on a seeded environment', () => {
     } finally {
       await registry.remove(id);
       cli.run(['rm', '-f', '-v', name]);
-      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])) cli.run(['image', 'rm', '-f', image]);
       cli.run(['volume', 'rm', name]);
     }
   }
@@ -1135,7 +1141,7 @@ describe('open pipeline on a seeded environment', () => {
       settings.hostAccessChecksOff = [];
       await registry.remove(id);
       cli.run(['rm', '-f', name]);
-      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(id)])) cli.run(['image', 'rm', '-f', image]);
+      for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])) cli.run(['image', 'rm', '-f', image]);
       cli.run(['volume', 'rm', name]);
     }
   });
@@ -1184,7 +1190,7 @@ describe('open pipeline on a seeded environment', () => {
       }
       // By reference, not by ID: the two builds are identical, so both tags can name one image ID.
       for (const { id } of entries) {
-        for (const reference of cli.lines(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', environmentImageRepository(id)])) {
+        for (const reference of cli.lines(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', environmentImageRepository(repository, id)])) {
           cli.run(['image', 'rm', reference]);
         }
       }

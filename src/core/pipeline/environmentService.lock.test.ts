@@ -315,6 +315,12 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       events.push(`docker volume exists${lockedSuffix(name)}`);
       return volumeExists(name);
     };
+    // Review round 3 of PR #88 (A-R3-1): the read of whose the workspace volume is (workspaceVolumeOwnership).
+    const inspectVolumes = h.docker.inspectVolumes.bind(h.docker);
+    h.docker.inspectVolumes = async (names) => {
+      if (names.length === 1 && names[0].startsWith('devenv-')) events.push(`docker volume inspect${lockedSuffix(names[0])}`);
+      return inspectVolumes(names);
+    };
     const createVolume = h.docker.createVolume.bind(h.docker);
     h.docker.createVolume = async (name, labels) => {
       events.push(`docker volume create${holdsEnvironmentLock(labels[LABEL_ENVIRONMENT_ID]) ? ' (locked)' : ''}`);
@@ -353,7 +359,8 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     };
     await h.service.open(TARGET, openOptions());
     expect(h.dockerStarts).toBe(1);
-    expect(openEvents().slice(0, 5)).toEqual(['busy wait', 'ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker volume exists (locked)']);
+    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
+    expect(openEvents().slice(0, 5)).toEqual(['busy wait', 'ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker volume inspect (locked)']);
     expect(openEvents()).toContain('up (locked)');
     expect(openEvents()).not.toContain('up');
     expect(openEvents().at(-1)).toBe('release');
@@ -387,12 +394,15 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     h.ui.filesMissingAnswer = 'cloneAgain';
     await h.service.open(TARGET, openOptions());
     expect(lockedIds).toEqual([ENV_ID]);
-    expect(openEvents().slice(0, 6)).toEqual([
+    expect(openEvents().slice(0, 7)).toEqual([
       'ensureImage',
       `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
       'busy=none',
-      'docker volume exists (locked)',
+      // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
+      'docker volume inspect (locked)',
       'docker volume create (locked)',
+      // Review round 4 of PR #88 (A-R4-1): changed expectation, and whose the new volume is before the clone.
+      'docker volume inspect (locked)',
       'clone (locked)',
     ]);
     expect(openEvents()).toContain('up (locked)');
@@ -418,7 +428,8 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     const staleCreate = { operation: 'create' as const, since: '2026-09-24T15:00:00.000Z', pid: 999, windowId: 'window-old' };
     await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
     await h.service.open(TARGET, openOptions());
-    expect(openEvents().slice(0, 5)).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create', 'docker volume exists (locked)', 'clone (locked)']);
+    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
+    expect(openEvents().slice(0, 5)).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create', 'docker volume inspect (locked)', 'clone (locked)']);
     expect(openEvents()).toContain('up (locked)');
     expect(openEvents().at(-1)).toBe('release');
   });
@@ -478,12 +489,14 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       const [id] = lockedIds;
       expect(lockedIds).toEqual([id]);
       expect((await h.registry.list()).map((entry) => entry.id)).toEqual([id]);
-      expect(openEvents().slice(0, 6)).toEqual([
+      expect(openEvents().slice(0, 7)).toEqual([
         FREE_NAME_CHECK,
         'ensureImage',
         `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
         'busy=create',
         'docker volume create (locked)',
+        // Review round 2 of PR #88 (A-R2-2): changed expectation, the labels of the new volume are read (requireOwnVolume).
+        'docker volume inspect (locked)',
         'clone (locked)',
       ]);
       expect(openEvents()).toContain('up (locked)');
@@ -537,7 +550,11 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
         `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
         'busy=create',
         'docker volume create (locked)',
+        // Review rounds 2 and 1 of PR #88 (A-R2-2, A-R1-4): changed expectation, the labels of the volume are read after its
+        // creation and before its removal, both under the lock.
+        'docker volume inspect (locked)',
         'clone (locked)',
+        'docker volume inspect (locked)',
         'docker volume rm (locked)',
         'release',
       ]);
@@ -573,6 +590,27 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       expect(openEvents()).toContain('up (locked)');
       expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
     });
+  });
+
+  // Review round 5 of PR #88 (B-R5-2, mutant L2): the listing of Select configuration reads whose the volume is under
+  // the lock (A-R4-2), so the volume cannot change between the check and the listing of the helper.
+  it('B-R5-2: Select configuration reads whose the volume is under the lock, before the listing of the helper', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const listConfigurations = h.helper.listConfigurations.bind(h.helper);
+    h.helper.listConfigurations = async (p) => {
+      events.push(`listConfigurations${lockedSuffix(p.volumeName)}`);
+      return listConfigurations(p);
+    };
+    await h.service.listConfigurations(ENV_ID, openOptions());
+    const listing = openEvents().filter((event) => !event.startsWith('docker volume exists'));
+    const lock = listing.indexOf(`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`);
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(listing.slice(lock + 1).filter((event) => event.startsWith('docker volume inspect') || event.startsWith('listConfigurations'))).toEqual([
+      'docker volume inspect (locked)',
+      'listConfigurations (locked)',
+    ]);
+    expect(listing.filter((event) => event === 'docker volume inspect')).toEqual([]);
+    expect(lockedIds).toEqual([ENV_ID]);
   });
 });
 

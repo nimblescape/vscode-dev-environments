@@ -10,6 +10,7 @@
 // the operation and is never repeated; the session is closed on success, failure and cancel. Plan step 7 (user decision
 // of 2026-10-01): outside a scope a volume step throws an internal error and runs nothing (the per-step run is removed).
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
@@ -20,8 +21,12 @@ import { COMPOSE_MODEL_PATH } from './compose';
 import { currentBatchScope, runWithBatchScope } from './batchScope';
 import { WorkspaceHelper, type HelperDeps, type HelperDocker, type HelperImageUse } from './workspaceHelper';
 
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const PROJECT = composeProjectName('acme/app', NAME_ID);
+
 const TOKEN = 'gho_0123456789abcdefSECRET';
-const VOLUME = 'devenv-acme-app-3f2a9c1e';
+const VOLUME = resourceName('acme/app', NAME_ID);
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const IMAGE: HelperImageUse = { tag: 'devenv-helper:abc', id: `sha256:${'a'.repeat(64)}` };
 
@@ -174,7 +179,7 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       await helper.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', image: IMAGE });
       await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE });
       await helper.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: ENVIRONMENT_ID, merged: false, env: { COMPOSE_PROJECT_NAME: 'p', DOCKER_HOST: 'tcp://x' }, image: IMAGE });
-      await helper.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:1', image: IMAGE });
+      await helper.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:1`, image: IMAGE });
       await helper.composeModel({ volumeName: VOLUME, repository: 'acme/app', files: [`${folder}/compose.yml`], project: 'p', image: IMAGE });
       await helper.composeServiceHashes({ volumeName: VOLUME, repository: 'acme/app', model: '{}', project: 'p', image: IMAGE });
       await helper.createRepositoryFolders({ volumeName: VOLUME, repository: 'acme/app', folders: [`${folder}/data`], image: IMAGE });
@@ -531,7 +536,7 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const controller = new AbortController();
     await runWithBatchScope(lock, VOLUME, silentLogger, async () => {
       await helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE, signal: controller.signal });
-      await helper.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:1', image: IMAGE, signal: controller.signal }).catch(() => undefined);
+      await helper.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:1`, image: IMAGE, signal: controller.signal }).catch(() => undefined);
     });
     expect(lock.openSignals).toEqual([controller.signal]);
     expect(lock.steps.map((step) => step.options.signal)).toEqual([controller.signal, controller.signal]);
@@ -590,8 +595,8 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       ['readFiles', (h) => h.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/a/devcontainer.json', dockerfile: 'Dockerfile.dev', image: IMAGE })],
       ['listConfigs', (h) => h.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })],
       ['readConfiguration', (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: E, merged: true, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:7', env, image: IMAGE })],
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-3f2a9c1e:7', override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
       ['composeModel', (h) => h.composeModel({ volumeName: VOLUME, repository: 'acme/app', files: ['/workspaces/app/compose.yml'], project: 'p', image: IMAGE })],
       ['composeHash', (h) => h.composeServiceHashes({ volumeName: VOLUME, repository: 'acme/app', model: '{"a":1}', project: 'p', image: IMAGE })],
       ['createFolders', (h) => h.createRepositoryFolders({ volumeName: VOLUME, repository: 'acme/app', folders: ['/workspaces/app/data'], image: IMAGE })],
@@ -662,8 +667,8 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const files = { [COMPOSE_MODEL_PATH]: '{}' };
     const env = { COMPOSE_PROJECT_NAME: 'p' };
     const calls: Array<[BatchStepKind, (helper: WorkspaceHelper) => Promise<unknown>]> = [
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: 'devenv-3f2a9c1e:7', env, image: IMAGE })],
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: 'devenv-3f2a9c1e:7', override, files, env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: `${PROJECT}:7`, env, image: IMAGE })],
+      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath, imageName: `${PROJECT}:7`, override, files, env, image: IMAGE })],
       ['readConfiguration', (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath, environmentId: ENVIRONMENT_ID, merged: true, override, files, env, image: IMAGE })],
     ];
     for (const [kind, call] of calls) {

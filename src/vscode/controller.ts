@@ -9,7 +9,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost, remoteContextName } from '../core/docker/dockerHost';
+import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
+import { ensureRemoteContext } from '../core/docker/remoteDocker';
 import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
@@ -2372,7 +2373,7 @@ export class Controller implements vscode.Disposable {
    *   DOCKER_HOST decides);
    * - outside an operation, the one in the authority of this window when it shows the same container;
    * - the current context, when that is on the environment's host (read outside any operation);
-   * - else the one that "Use a Remote Docker Host…" creates for the host.
+   * - else the one that "Use a Remote Docker Host…" creates for the host (ensureRemoteContext: created when missing).
    */
   private async windowArgs(
     environment: Environment,
@@ -2394,7 +2395,7 @@ export class Controller implements vscode.Disposable {
       const current = await outsideOperation(() => targets.resolve());
       if (isOnDockerHost(environment, current.host)) return withContext(current.context);
     }
-    return withContext(remoteContextName(host));
+    return withContext(await ensureRemoteContext(this.deps.docker, host));
   }
 
   /**

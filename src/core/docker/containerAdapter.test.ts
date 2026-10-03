@@ -21,7 +21,7 @@ import {
   type ImageInspection,
 } from './containerAdapter';
 import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
-import { dockerTargetOf, remoteContextName } from './dockerHost';
+import { dockerTargetOf, remoteContextNames } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
 interface Call {
@@ -284,6 +284,52 @@ describe('containers', () => {
       rawState: 'exited',
       labels: { 'nimblescape.devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
       image: 'devenv-3f2a9c1e:1',
+      // Review round 2 of PR #88 (B-R2-1): changed expectation, the ID of the image (`Image`) is passed on.
+      imageId: 'sha256:abc',
+    });
+  });
+
+  // Review round 2 of PR #88 (B-R2-1): the ID of the container's image (`Image` of `docker container inspect`) is read
+  // into ContainerInfo.imageId next to its name (`Config.Image`); an empty or missing `Image` gives no imageId.
+  describe('review round 2 of PR #88 (B-R2-1): imageId from `Image` of docker container inspect', () => {
+    const imageId = `sha256:${'abc'.repeat(21)}d`;
+    const inspected = (image: unknown): Record<string, unknown> => {
+      const json: Record<string, unknown> = {
+        Id: 'c1',
+        Created: '2026-09-24T10:00:00.000000000Z',
+        Path: '/bin/sh',
+        Name: '/devenv-acme-api-3f2a9c1e',
+        State: { Status: 'running', Running: true, Pid: 42 },
+        Image: image,
+        HostConfig: { NetworkMode: 'bridge' },
+        Mounts: [],
+        Config: { Image: 'devenv-acme-api-brave-noether:2', Labels: { 'nimblescape.devenv.environment-id': 'env-1' } },
+      };
+      if (image === undefined) delete json.Image;
+      return json;
+    };
+    const reading = (image: unknown) =>
+      adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['c1'])) : ok(inspectOutput([inspected(image)]))));
+
+    it.each([
+      ['findContainer', (docker: ContainerAdapter) => docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')],
+      ['listEnvironmentContainers', async (docker: ContainerAdapter) => (await docker.listEnvironmentContainers())[0]],
+      ['listProjectContainers', async (docker: ContainerAdapter) => (await docker.listProjectContainers('devenv-3f2a9c1e'))[0]],
+    ])('%s reads `Image` into imageId and `Config.Image` into image', async (_name, read) => {
+      const info = await read(reading(imageId).docker);
+      expect(info?.imageId).toBe(imageId);
+      expect(info?.image).toBe('devenv-acme-api-brave-noether:2');
+    });
+
+    it.each([
+      ['an empty', ''],
+      ['no', undefined],
+      ['a non-string', 7],
+    ])('findContainer gives no imageId for %s `Image`', async (_name, image) => {
+      const info = await reading(image).docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e');
+      expect(info?.id).toBe('c1');
+      expect(info?.image).toBe('devenv-acme-api-brave-noether:2');
+      expect(info).not.toHaveProperty('imageId');
     });
   });
 
@@ -369,7 +415,8 @@ describe('containers', () => {
       );
     });
     const list = await docker.listEnvironmentContainers();
-    expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1' }]);
+    // Review round 2 of PR #88 (B-R2-1): changed expectation, with the ID of the image (`Image`).
+    expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1', imageId: 'sha256:abc' }]);
   });
 
   it('reads the named volumes that a container mounts', async () => {
@@ -1124,6 +1171,160 @@ describe('images', () => {
   });
 });
 
+// User decisions 2026-10-03: the labels of the environment images (their build record), read in a batch and given after
+// the build.
+describe('ContainerAdapter: the labels of images (imageLabelsOf, labelImage)', () => {
+  const FORMAT = '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}';
+  const idA = `sha256:${'A'.repeat(64)}`;
+  const idB = `sha256:${'b'.repeat(64)}`;
+  const line = (id: string, labels: Record<string, string> | null): string => `${JSON.stringify({ id, labels })}\n`;
+
+  it('imageLabelsOf reads the labels of all references with one inspect, by their lower-case full IDs', async () => {
+    const { docker, runner } = adapter(() => ok(`${line(idA, { x: 'y', n: 1 } as unknown as Record<string, string>)}${line(idB, null)}not json\n`));
+    const labels = await docker.imageLabelsOf(['a:1', 'b:1']);
+    expect([...labels.entries()]).toEqual([
+      [idA.toLowerCase(), { x: 'y' }],
+      [idB, {}],
+    ]);
+    expect(runner.calls.map((call) => call.args)).toEqual([['image', 'inspect', '--format', FORMAT, 'a:1', 'b:1']]);
+  });
+
+  it('imageLabelsOf asks nothing for no references', async () => {
+    const { docker, runner } = adapter(() => ok());
+    expect((await docker.imageLabelsOf([])).size).toBe(0);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('imageLabelsOf leaves out a missing image: after the failed batch it asks one by one', async () => {
+    const { docker, runner } = adapter((call) => {
+      const refs = call.args.slice(4);
+      if (refs.includes('gone:1')) return fail('Error response from daemon: No such image: gone:1', 1, refs.length > 1 ? line(idB, { k: 'v' }) : '');
+      return ok(line(idB, { k: 'v' }));
+    });
+    const labels = await docker.imageLabelsOf(['b:1', 'gone:1']);
+    expect([...labels.entries()]).toEqual([[idB, { k: 'v' }]]);
+    expect(runner.calls.map((call) => call.args.slice(4))).toEqual([['b:1', 'gone:1'], ['b:1'], ['gone:1']]);
+  });
+
+  it('imageLabelsOf throws CommandError when Docker cannot answer, and an AbortError on abort', async () => {
+    const down = adapter(() => fail('Cannot connect to the Docker daemon'));
+    await expect(down.docker.imageLabelsOf(['a:1'])).rejects.toBeInstanceOf(CommandError);
+    const controller = new AbortController();
+    const aborting = adapter(() => {
+      controller.abort();
+      return ok(line(idB, {}));
+    });
+    const thrown = await aborting.docker.imageLabelsOf(['a:1'], controller.signal).catch((e: unknown) => e);
+    expect(isAbortError(thrown)).toBe(true);
+  });
+
+  /**
+   * A Docker CLI where `image` has the ID `ids[0]` before the build and `ids[1]` after it; `previous`: the tags and
+   * digests that the previous image (ids[0]) still has after the build (review of PR #88: default none).
+   */
+  function labelling(
+    ids: [string | undefined, string | undefined],
+    answers: { build?: RunResult; rm?: RunResult } = {},
+    previous: { repoTags: string[]; repoDigests: string[] } = { repoTags: [], repoDigests: [] },
+  ) {
+    let built = false;
+    return adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'inspect' && call.args[3]?.startsWith('{"repoTags"')) return ok(`${JSON.stringify(previous)}\n`);
+      if (call.args[0] === 'image' && call.args[1] === 'inspect') {
+        const id = built ? ids[1] : ids[0];
+        return id === undefined ? fail(`Error response from daemon: No such image: ${call.args[call.args.length - 1]}`) : ok(`${JSON.stringify(id)}\n`);
+      }
+      if (call.args[0] === 'build') {
+        const result = answers.build ?? ok(`${ids[1]}\n`);
+        built = result.exitCode === 0;
+        return result;
+      }
+      if (call.args[0] === 'image' && call.args[1] === 'rm') return answers.rm ?? ok();
+      return fail('unexpected');
+    });
+  }
+
+  it('labelImage builds `FROM <image>` from standard input with the labels, and removes the previous image when nothing names it', async () => {
+    const { docker, runner } = labelling([idA, idB]);
+    await docker.labelImage('devenv-acme-api-brave-noether:3', { 'nimblescape.devenv.environment-id': 'e1', 'a.b': 'x=y z' });
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['image', 'inspect', '--format', '{{json .Id}}', 'devenv-acme-api-brave-noether:3'],
+      ['build', '--quiet', '-t', 'devenv-acme-api-brave-noether:3', '--label', 'nimblescape.devenv.environment-id=e1', '--label', 'a.b=x=y z', '-'],
+      ['image', 'inspect', '--format', '{{json .Id}}', 'devenv-acme-api-brave-noether:3'],
+      // Review of PR #88 (CI docker job): only a previous image without tags and digests is removed.
+      ['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', idA],
+      ['image', 'rm', idA],
+    ]);
+    expect(runner.calls[1].options.input).toBe('FROM devenv-acme-api-brave-noether:3\n');
+  });
+
+  it('labelImage removes nothing when the ID stays the same (the labels were there already)', async () => {
+    const { docker, runner } = labelling([idA, idA]);
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.map((call) => call.args[0] === 'image' ? `${call.args[0]} ${call.args[1]}` : call.args[0])).toEqual(['image inspect', 'build', 'image inspect']);
+  });
+
+  it('labelImage keeps going when the previous image cannot be removed (best effort)', async () => {
+    const { docker, runner } = labelling([idA, idB], { rm: fail('Error response from daemon: permission denied') });
+    await expect(docker.labelImage('img:1', { a: 'b' })).resolves.toBeUndefined();
+    expect(runner.calls.at(-1)?.args).toEqual(['image', 'rm', idA]);
+  });
+
+  it.each([
+    ['another tag (the image that Docker Compose built for the service)', { repoTags: ['devenv-acme-api-brave-noether-app:latest'], repoDigests: [] }],
+    ['a digest (the base image of an image-only configuration)', { repoTags: [], repoDigests: ['mcr.microsoft.com/devcontainers/base@sha256:abc'] }],
+  ])('labelImage keeps the previous image when it still has %s (review of PR #88)', async (_name, names) => {
+    const { docker, runner } = labelling([idA, idB], {}, names);
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.some((call) => call.args[0] === 'image' && call.args[1] === 'rm')).toBe(false);
+  });
+
+  // Review round 2 of PR #88 (B-R2-10, mutant L4): the tag is gone after the build: the previous image is not touched.
+  it('labelImage removes nothing when the tag is gone after the build (review round 2 of PR #88, B-R2-10)', async () => {
+    const { docker, runner } = labelling([idA, undefined]);
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['image', 'inspect', '--format', '{{json .Id}}', 'img:1'],
+      ['build', '--quiet', '-t', 'img:1', '--label', 'a=b', '-'],
+      ['image', 'inspect', '--format', '{{json .Id}}', 'img:1'],
+    ]);
+  });
+
+  // Review round 2 of PR #88 (B-R2-10, mutant L5): the previous image is reported missing by its names: no `image rm`.
+  it('labelImage removes nothing when the previous image is gone before its names are read (review round 2 of PR #88, B-R2-10)', async () => {
+    let built = false;
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'inspect' && call.args[3]?.startsWith('{"repoTags"')) {
+        return fail(`Error response from daemon: No such image: ${call.args[4]}`);
+      }
+      if (call.args[0] === 'image' && call.args[1] === 'inspect') return ok(`${JSON.stringify(built ? idB : idA)}\n`);
+      if (call.args[0] === 'build') {
+        built = true;
+        return ok(`${idB}\n`);
+      }
+      if (call.args[0] === 'image' && call.args[1] === 'rm') return ok();
+      return fail('unexpected');
+    });
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.at(-1)?.args).toEqual(['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', idA]);
+    expect(runner.calls.some((call) => call.args[0] === 'image' && call.args[1] === 'rm')).toBe(false);
+  });
+
+  it('labelImage refuses a missing image without a build', async () => {
+    const { docker, runner } = labelling([undefined, undefined]);
+    const thrown = await docker.labelImage('gone:1', { a: 'b' }).catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(CommandError);
+    expect((thrown as CommandError).message).toContain('The image gone:1 does not exist.');
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['image']);
+  });
+
+  it('labelImage throws CommandError when the build fails, and removes nothing', async () => {
+    const { docker, runner } = labelling([idA, idB], { build: fail('failed to solve') });
+    await expect(docker.labelImage('img:1', { a: 'b' })).rejects.toBeInstanceOf(CommandError);
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['image', 'build']);
+  });
+});
+
 describe('ContainerAdapter: a Docker CLI that is installed later', () => {
   function setup(found: Array<string | undefined>) {
     let now = 1_000_000;
@@ -1575,8 +1776,26 @@ describe('ContainerAdapter: the objects of a Docker Compose project', () => {
         ]),
       );
     });
-    expect(await docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual(['devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-tool:latest']);
+    // User decisions 2026-10-03: with an environment ID, only the images with that ID in their label are kept; the
+    // unlabelled `-tool` image is left out too (before: kept).
+    expect(await docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual(['devenv-3f2a9c1e-app:latest']);
     expect(runner.calls[1].args).toEqual(['image', 'inspect', 'devenv-3f2a9c1e-app:latest', 'devenv-3f2a9c1e-db:latest', 'devenv-3f2a9c1e-tool:latest']);
+  });
+
+  // User decisions 2026-10-03: an image of the project without the label of an environment is left out when an
+  // environment ID is given, and kept (without any inspect) when none is given.
+  it('leaves out an unlabelled image of the project only when an environment ID is given', async () => {
+    const lines = [{ Repository: 'devenv-3f2a9c1e-x', Tag: 'latest' }].map((line) => JSON.stringify(line));
+    const handler: Handler = (call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'ls') return ok(`${lines.join('\n')}\n`);
+      return ok(inspectOutput([{ RepoTags: ['devenv-3f2a9c1e-x:latest'], Config: { Labels: { 'com.docker.compose.project': 'devenv-3f2a9c1e' } } }]));
+    };
+    const withId = adapter(handler);
+    expect(await withId.docker.listProjectImages('devenv-3f2a9c1e', 'env-1')).toEqual([]);
+    expect(withId.runner.calls.map((call) => call.args[1])).toEqual(['ls', 'inspect']);
+    const withoutId = adapter(handler);
+    expect(await withoutId.docker.listProjectImages('devenv-3f2a9c1e')).toEqual(['devenv-3f2a9c1e-x:latest']);
+    expect(withoutId.runner.calls.map((call) => call.args[1])).toEqual(['ls']);
   });
 });
 
@@ -1684,6 +1903,7 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
   });
 
   it('isReadOnlyDockerCall: only commands that read, also after global options', () => {
+    // User decisions 2026-10-03: contexts are named after the host, for example htldvm.
     for (const args of [
       ['info'],
       ['version', '--format', '{{json .Server.APIVersion}}'],
@@ -1699,7 +1919,7 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
       ['context', 'inspect'],
       ['system', 'df'],
       ['-H', 'ssh://build-box', 'info'],
-      ['--context', 'devenv-remote-26f8567f', 'image', 'inspect', 'img'],
+      ['--context', 'htldvm', 'image', 'inspect', 'img'],
     ]) {
       expect(isReadOnlyDockerCall(args), args.join(' ')).toBe(true);
     }
@@ -1712,7 +1932,7 @@ describe('ContainerAdapter: an SSH server that closes the connection before the 
       ['image', 'prune', '-f'],
       ['volume', 'create', 'ls'],
       ['network', 'rm', 'inspect'],
-      ['context', 'use', 'devenv-remote-26f8567f'],
+      ['context', 'use', 'htldvm'],
       ['compose', 'ps'],
       ['buildx', 'build', '.'],
       ['logs', 'x'],
@@ -1741,10 +1961,11 @@ describe('ContainerAdapter.start (user request 2026-09-28: the helper channel)',
       },
     };
     const docker = new ContainerAdapter(runner, '/usr/bin/docker', { PATH: '/usr/bin', DOCKER_CONTEXT: 'desktop-linux' }, silentLogger, 'linux');
-    const target = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+    // User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
+    const target = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
     expect(await runWithDockerTarget(target, async () => docker.start(['run', '-i', 'img']))).toBe(fakeStarted);
     expect(starts[0]).toMatchObject({ file: '/usr/bin/docker', args: ['run', '-i', 'img'] });
-    expect(starts[0].env?.DOCKER_CONTEXT).toBe(remoteContextName('build-box'));
+    expect(starts[0].env?.DOCKER_CONTEXT).toBe(remoteContextNames('build-box')[0]);
     expect(starts[0].env?.DOCKER_HOST).toBeUndefined();
     const withoutStart = new ContainerAdapter({ run: runner.run }, '/usr/bin/docker', {}, silentLogger, 'linux');
     expect(withoutStart.start(['ps'])).toBeUndefined();

@@ -9,11 +9,12 @@ import { CommandError } from '../errors';
 import { HelperChannelError } from '../helperChannel/helperChannel';
 import { abortError, silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { ContainerAdapter } from './containerAdapter';
-import { dockerTargetOf, remoteContextName } from './dockerHost';
+import { dockerTargetOf, remoteContextNames } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 import { heldEnvironmentLock, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from './environmentLock';
 
-const REMOTE = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+// User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
+const REMOTE = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 
 function ok(stdout = ''): RunResult {
   return { exitCode: 0, stdout, stderr: '', timedOut: false };

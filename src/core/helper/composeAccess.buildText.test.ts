@@ -9,10 +9,14 @@
 import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { ComposeModel } from './compose';
 import { composeAccessReport, type ComposeAccessInput, type HostAccessReport } from '../policy';
 
-const PROJECT = 'devenv-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
 const REPO = '/workspaces/api';
 const NONE: HostAccessReport = { hostAccess: [], unsupported: [] };
 const DOCKERFILE = 'FROM mcr.microsoft.com/devcontainers/base:ubuntu AS base\nRUN true\n';
@@ -34,7 +38,7 @@ function report(build: Record<string, unknown>, dockerfile = DOCKERFILE, checksO
     devService: 'app',
     project: PROJECT,
     repositoryFolder: REPO,
-    ownVolume: 'devenv-acme-api-3f2a9c1e',
+    ownVolume: OWN,
     engineApiVersion: '1.47',
     dockerfiles: { [service]: dockerfile },
   };
@@ -161,7 +165,7 @@ describe('review round 17 (P17-2): multi-line build arguments, and the stage nam
       devService: 'app',
       project: PROJECT,
       repositoryFolder: REPO,
-      ownVolume: 'devenv-acme-api-3f2a9c1e',
+      ownVolume: OWN,
       engineApiVersion: '1.47',
       dockerfiles: { app: dockerfile },
     };

@@ -53,7 +53,7 @@
 // this same computer, so it never overrules another computer or a window that uses the environment.
 // No `vscode`; never throws (except from a `deps` call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
-import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, remoteContextName, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
+import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { Messages } from '../messages';
 import { systemClock, type Clock, type Logger } from '../ports';
@@ -210,6 +210,8 @@ export interface HeartbeatEngineSources {
   current: () => Promise<DockerTarget>;
   /** The target of a named Docker context (DockerTargets.ofContext); undefined when it cannot be read. */
   ofContext: (name: string) => Promise<DockerTarget | undefined>;
+  /** The existing Docker context of an SSH host (findRemoteContext); undefined when there is none or it fails. */
+  remoteContext: (host: string) => Promise<string | undefined>;
 }
 
 /**
@@ -218,7 +220,7 @@ export interface HeartbeatEngineSources {
  * the global current context when the window has its own (another window may have switched that to another host);
  * undefined when that context is not on the host of the environment. A window without its own context takes the
  * current target when it is on the host of the environment, else for an SSH host the context of "Use a Remote Docker
- * Host…" and for the local Docker the context `default`. An environment this window is only busy with (an operation
+ * Host…" (undefined when it cannot be had) and for the local Docker the context `default`. An environment this window is only busy with (an operation
  * runs on it) takes the current target when it is on its host, else for an SSH host that context; else undefined.
  */
 export async function resolveHeartbeatEngine(environment: Environment, use: { connected: boolean }, sources: HeartbeatEngineSources): Promise<DockerTarget | undefined> {
@@ -230,7 +232,10 @@ export async function resolveHeartbeatEngine(environment: Environment, use: { co
   }
   const current = await sources.current();
   if (current.kind !== 'unsupported' && isOnDockerHost(environment, current.host)) return current;
-  if (host !== '') return { kind: 'remote', host, endpoint: sshEndpoint(host), context: remoteContextName(host) };
+  if (host !== '') {
+    const context = await sources.remoteContext(host);
+    return context === undefined ? undefined : { kind: 'remote', host, endpoint: sshEndpoint(host), context };
+  }
   if (!use.connected) return undefined;
   const local = await sources.ofContext(DEFAULT_CONTEXT_NAME);
   return local?.kind === 'local' ? local : undefined;

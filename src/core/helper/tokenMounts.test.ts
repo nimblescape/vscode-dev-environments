@@ -6,6 +6,7 @@
 // token (/run/devenv) by its other name /var/run/devenv, or bring it to the computer with a shared mount propagation.
 // The real protection is the check of the write in the container (containerToken.test.ts); these give a clear message.
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { ComposeModel } from './compose';
 import {
   decideServiceMount,
@@ -22,8 +23,10 @@ import {
   type HostAccessInput,
 } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
-const PROJECT = 'devenv-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+const PROJECT = composeProjectName('acme/api', ID);
 const REPO = '/workspaces/api';
 const INTERNAL = "mounts into the extension's internal folder are not supported";
 

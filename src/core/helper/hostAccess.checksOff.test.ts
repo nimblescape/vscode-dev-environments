@@ -8,7 +8,7 @@
 // of the extension, items whose class is not clear, and options that the policy does not support).
 import { describe, expect, it } from 'vitest';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
-import { CONTAINER_CONFIG_UNKNOWN_LABEL, CONTAINER_VERSION_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL } from '../names';
+import { CONTAINER_CONFIG_UNKNOWN_LABEL, CONTAINER_VERSION_LABEL, HOST_ACCESS_UNRESTRICTED_LABEL, resourceName } from '../names';
 import { runAnalysisJob } from './configurationAnalysis';
 import { buildOverrideConfig } from './devcontainerCli';
 import {
@@ -23,8 +23,11 @@ import {
   type HostAccessInput,
 } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
 const ENVIRONMENT = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+// User decisions 2026-10-03: one name per environment (resourceName); a single container's own project is its volume name.
+const OWN = resourceName('acme/api', ENVIRONMENT.id);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 
 /** Input with a repository configuration (and more parts of the input). */
 function input(config: Record<string, unknown>, more: Partial<HostAccessInput> = {}): HostAccessInput {
@@ -140,10 +143,10 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['build --build-context with an OCI layout of the computer', input(build('--build-context', 'src=oci-layout:///Users/x/layout')), 'build option --build-context=src=oci-layout:///Users/x/layout', 'computer'],
 
   // Account separation.
-  ['the workspace volume of another environment', input(mount('source=devenv-acme-web-11111111,target=/w,type=volume')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
+  ['the workspace volume of another environment', input(mount(`source=${OTHER},target=/w,type=volume`)), `volume ${OTHER} of another environment`, 'protected'],
   ['a volume of an environment of another account (registry)', input(mount('source=data,target=/d'), { foreignVolumes: ['data'] }), 'volume data of another environment', 'protected'],
   ['a volume with the labels of another environment', input(mount('source=data,target=/d'), { volumeLabels: { data: { 'nimblescape.devenv.environment-id': 'other', 'nimblescape.devenv.owner-id': '2002' } } }), 'volume data of another environment', 'protected'],
-  ['-v with the volume of another environment', input(run('-v', 'devenv-acme-web-11111111:/w')), 'volume devenv-acme-web-11111111 of another environment', 'protected'],
+  ['-v with the volume of another environment', input(run('-v', `${OTHER}:/w`)), `volume ${OTHER} of another environment`, 'protected'],
   ['the cache volume of the workspace helper', input(mount('source=devenv-helper-cache,target=/c,type=volume')), 'volume devenv-helper-cache of the workspace helper', 'protected'],
   // Review round 1 of PR #39 (R1): the heartbeat records of the Session Monitor on a remote Docker host.
   ['the volume of the remote Session Monitor', input(mount('source=devenv-session-monitor,target=/s,type=volume')), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
@@ -197,12 +200,12 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   // below.)
   ['an image ID', input({ image: `sha256:${'c'.repeat(64)}` }), `image sha256:${'c'.repeat(64)} (an image ID; name the image)`, 'unsupported'],
   // Review round 1 (S3): the Compose network of another environment, by its name (also the long form) or its labels.
-  ['the Compose network of another environment', input(run('--network', 'devenv-11111111_default')), 'network devenv-11111111_default of another environment', 'protected'],
-  ['the long form of the network of another environment', input(run('--network=name=devenv-11111111_default,alias=x')), 'network devenv-11111111_default of another environment', 'protected'],
-  ['a network labelled for another environment', input(run('--net', 'backend'), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'network backend of another environment', 'protected'],
+  ['the Compose network of another environment', input(run('--network', `${OTHER}_default`)), `network ${OTHER}_default of another environment`, 'protected'],
+  ['the long form of the network of another environment', input(run(`--network=name=${OTHER}_default,alias=x`)), `network ${OTHER}_default of another environment`, 'protected'],
+  ['a network labelled for another environment', input(run('--net', 'backend'), { networks: { backend: { labels: { 'com.docker.compose.project': OTHER }, environments: [] } } }), 'network backend of another environment', 'protected'],
   ['a network with a container of another environment', input(run('--network', 'shared'), { networks: { shared: { labels: {}, environments: ['e0000002-0000-4000-8000-000000000002'] } } }), 'network shared of another environment', 'protected'],
   // Review round 1 (D3): Docker Compose finds and removes containers by these labels.
-  ['a label of Docker Compose', input(run('--label', 'com.docker.compose.project=devenv-e0000001')), 'label com.docker.compose.project', 'unsupported'],
+  ['a label of Docker Compose', input(run('--label', `com.docker.compose.project=${OWN}`)), 'label com.docker.compose.project', 'unsupported'],
 ];
 
 describe('the switch of the host access checks: the class of every refused item', () => {
@@ -256,10 +259,10 @@ describe('the switch of the host access checks: the class of every refused item'
 
 describe('review round 1: what stays allowed', () => {
   it('allows a build context and a Dockerfile in the repository, and the networks of the environment itself', () => {
-    const config = { build: { dockerfile: 'Dockerfile', context: '..' }, runArgs: ['--network', 'devenv-e0000001_default', '--network', 'mine'] };
+    const config = { build: { dockerfile: 'Dockerfile', context: '..' }, runArgs: ['--network', `${OWN}_default`, '--network', 'mine'] };
     const checked = input(config, {
       ...HELPER_PATHS,
-      networks: { mine: { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ENVIRONMENT.id] } },
+      networks: { mine: { labels: { 'com.docker.compose.project': OWN }, environments: [ENVIRONMENT.id] } },
     });
     expect(hostAccessReport(checked)).toEqual({ hostAccess: [], unsupported: [] });
     // Dockerfile refusals removed (user decision 2026-09-27): the Dockerfile goes to the analysis job only, for the update check.
@@ -270,10 +273,10 @@ describe('review round 1: what stays allowed', () => {
 
   it('allows FROM the image of another environment (the Dockerfile is not checked)', () => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-11111111:2 of another environment` (protected).
-    const analysis = single('ARG B\nFROM ${B}\n', { args: { B: 'devenv-11111111:2' } });
+    const analysis = single('ARG B\nFROM ${B}\n', { args: { B: `${OTHER}:2` } });
     expect(analysis.report).toEqual(ALLOWED);
     expect(analysis.imageReferences).toEqual([]);
-    expect(analysis.references.images).toEqual(['devenv-11111111:2']);
+    expect(analysis.references.images).toEqual([`${OTHER}:2`]);
   });
 
   it('allows images named devenv-…, and still asks Docker about them (User decision 2026-09-28)', () => {
@@ -282,9 +285,9 @@ describe('review round 1: what stays allowed', () => {
     // docker.io/devenv-11111111:2 of another environment` (protected). The pipeline refuses an image of the
     // environments of another account by its ID (otherAccountImageItems).
     const cases: Array<[Record<string, unknown>, string]> = [
-      [{ image: 'devenv-11111111:2' }, 'devenv-11111111:2'],
-      [{ image: 'index.docker.io/library/devenv-11111111:2' }, 'index.docker.io/library/devenv-11111111:2'],
-      [build('--build-context', 'base=docker-image://docker.io/devenv-11111111:2'), 'docker.io/devenv-11111111:2'],
+      [{ image: `${OTHER}:2` }, `${OTHER}:2`],
+      [{ image: `index.docker.io/library/${OTHER}:2` }, `index.docker.io/library/${OTHER}:2`],
+      [build('--build-context', `base=docker-image://docker.io/${OTHER}:2`), `docker.io/${OTHER}:2`],
     ];
     for (const [config, reference] of cases) {
       const checked = input(config);
@@ -312,7 +315,7 @@ describe('the override configuration with the checks off', () => {
   });
 
   it('adds the label nimblescape.devenv.host-access=unrestricted and keeps appPort as the configuration writes it', () => {
-    const common = { environmentImage: 'devenv-3f2a9c1e:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['-p', '80'] };
+    const common = { environmentImage: `${OWN}:1`, volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['-p', '80'] };
     const on = buildOverrideConfig({ ...common, appPort: [3000, '0.0.0.0:5000:5000'] as Array<number | string> });
     // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
     const cleared = ['--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
@@ -356,13 +359,13 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
     expect(classes(checked)).toEqual(['protected: build option --build-context=x=/proc/self/root/devenv-cache']);
   });
 
-  const STAGES = 'ARG BASE=alpine\nFROM ${BASE} AS a\nFROM devenv-abcd1234:2 AS b\n';
+  const STAGES = `ARG BASE=alpine\nFROM \${BASE} AS a\nFROM ${OTHER}:2 AS b\n`;
   it.each<[string, string, string[], Record<string, unknown>]>([
-    ['--build-arg K=V', STAGES, ['--build-arg', 'BASE=devenv-abcd1234:1'], {}],
-    ['--build-arg=K=V', STAGES, ['--build-arg=BASE=devenv-abcd1234:1'], { args: { BASE: 'alpine' } }],
+    ['--build-arg K=V', STAGES, ['--build-arg', `BASE=${OTHER}:1`], {}],
+    ['--build-arg=K=V', STAGES, [`--build-arg=BASE=${OTHER}:1`], { args: { BASE: 'alpine' } }],
     ['--target over build.target', STAGES, ['--target', 'b'], { target: 'a' }],
-    ['BUILDKIT_SYNTAX of build.args', STAGES, [], { args: { BUILDKIT_SYNTAX: 'devenv-abcd1234:3' } }],
-    ['BUILDKIT_SYNTAX of build.options', STAGES, ['--build-arg', 'BUILDKIT_SYNTAX=docker.io/devenv-abcd1234:3'], {}],
+    ['BUILDKIT_SYNTAX of build.args', STAGES, [], { args: { BUILDKIT_SYNTAX: `${OTHER}:3` } }],
+    ['BUILDKIT_SYNTAX of build.options', STAGES, ['--build-arg', `BUILDKIT_SYNTAX=docker.io/${OTHER}:3`], {}],
   ])('allows the Dockerfile with %s (S3-2)', (_name, text, options, more) => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, the images of the Dockerfile were refused (protected).
     expectAllowed(text, { ...more, options });
@@ -393,13 +396,13 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
   it('reads build.args and build.options for the FROM images of the update check (S3-2)', () => {
     const text = 'ARG BASE=alpine\nFROM ${BASE}\n';
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-abcd1234:1 of another environment`.
-    expectAllowed(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'OTHER=1'] });
-    expectAllowed(text, { args: { BASE: 'devenv-abcd1234:1' }, options: ['--build-arg', 'BASE=alpine:3.22'] });
+    expectAllowed(text, { args: { BASE: `${OTHER}:1` }, options: ['--build-arg', 'OTHER=1'] });
+    expectAllowed(text, { args: { BASE: `${OTHER}:1` }, options: ['--build-arg', 'BASE=alpine:3.22'] });
     expect(single(text, { args: { BASE: 'alpine:3.21' } }).references.images).toEqual(['alpine:3.21']);
   });
 
   it('allows the images of every stage, whatever the target (S3-3)', () => {
-    for (const text of ['FROM alpine AS a\nCOPY --from=b /x /y\nFROM devenv-abcd1234:1 AS b\n', 'FROM alpine AS a\nRUN --mount=from=b,target=/m ls\nFROM devenv-abcd1234:1 AS b\n']) {
+    for (const text of [`FROM alpine AS a\nCOPY --from=b /x /y\nFROM ${OTHER}:1 AS b\n`, `FROM alpine AS a\nRUN --mount=from=b,target=/m ls\nFROM ${OTHER}:1 AS b\n`]) {
       // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-abcd1234:1 of another environment`.
       expectAllowed(text, { target: 'a' });
       expect(single(text, { target: 'a' }).references.images).toEqual(['alpine']);
@@ -408,8 +411,8 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
 
   it.each([
     'FROM devenv${TARGETVARIANT}-abcd1234:1\n',
-    'FROM ${TARGETVARIANT}devenv-abcd1234:1\n',
-    'FROM alpine\nCOPY --from=${NOPE}devenv-abcd1234:1 / /x\n',
+    `FROM \${TARGETVARIANT}${OTHER}:1\n`,
+    `FROM alpine\nCOPY --from=\${NOPE}${OTHER}:1 / /x\n`,
     'FROM alpine\nRUN --mount=from=${NOPE}DevEnv-abcd1234:1,target=/m ls\n',
   ])('allows the unresolved reference in %j that holds devenv (S3-4)', (text) => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… of another environment (a variable that is not resolved)`.
@@ -418,11 +421,11 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
   });
 
   it.each([
-    'FROM alpine\nRUN --mount="from=devenv-abcd1234:1,target=/x" ls\n',
-    'FROM alpine\nRUN --mount=type=bind,"from=devenv-abcd1234:1" ls\n',
-    "FROM alpine\nRUN --mount='type=bind, from=devenv-abcd1234:1' ls\n",
-    'FROM alpine\nRUN --network=none --mount=type=bind,from=devenv-abcd1234:1 ls\n',
-    'FROM alpine\nRUN --mount=type=bind,\\"from=devenv-abcd1234:1\\" ls\n',
+    `FROM alpine\nRUN --mount="from=${OTHER}:1,target=/x" ls\n`,
+    `FROM alpine\nRUN --mount=type=bind,"from=${OTHER}:1" ls\n`,
+    `FROM alpine\nRUN --mount='type=bind, from=${OTHER}:1' ls\n`,
+    `FROM alpine\nRUN --network=none --mount=type=bind,from=${OTHER}:1 ls\n`,
+    `FROM alpine\nRUN --mount=type=bind,\\"from=${OTHER}:1\\" ls\n`,
   ])('allows the quoted flags of %j (S3-5)', (text) => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, `RUN --mount image devenv-abcd1234:1 of another environment`.
     expectAllowed(text);
@@ -431,7 +434,7 @@ describe('review round 3 of unit 6 (S3-1 to S3-6)', () => {
 
   it('allows a quoted COPY --from of another environment (S3-5)', () => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, `COPY --from image devenv-abcd1234:1 of another environment`.
-    expectAllowed('FROM alpine\nCOPY --from="devenv-abcd1234:1" /a /b\n');
+    expectAllowed(`FROM alpine\nCOPY --from="${OTHER}:1" /a /b\n`);
   });
 
   it.each([
@@ -469,7 +472,7 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
     [['--build-arg=BASE']],
   ])('refuses --build-arg without a value in %j, whatever the switch says (S4-1)', (options) => {
     // buildx drops the argument when the helper has no variable BASE: the default of the ARG (devenv-…) applies.
-    const checked = dockerfile('ARG BASE=devenv-abcd1234:1\nFROM $BASE\n', { args: { BASE: 'alpine' }, options });
+    const checked = dockerfile(`ARG BASE=${OTHER}:1\nFROM $BASE\n`, { args: { BASE: 'alpine' }, options });
     expect(classes(checked)).toContain(WITHOUT_VALUE('BASE'));
     expect(hostAccessReport(checked, false).unsupported).toContain(WITHOUT_VALUE('BASE').replace('unsupported: ', ''));
   });
@@ -499,19 +502,19 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   });
 
   it.each([
-    'ARG A=devenv-abcd1234:1x\nFROM ${A%x}\n',
-    'ARG A=devenv-abcd1234:1xyx\nFROM ${A%%x*}\n',
-    'ARG A=xdevenv-abcd1234:1\nFROM ${A#x}\n',
-    'ARG A=a/b/devenv-abcd1234:1\nFROM ${A##*/}\n',
+    `ARG A=${OTHER}:1x\nFROM \${A%x}\n`,
+    `ARG A=${OTHER}:1xyx\nFROM \${A%%x*}\n`,
+    `ARG A=x${OTHER}:1\nFROM \${A#x}\n`,
+    `ARG A=a/b/${OTHER}:1\nFROM \${A##*/}\n`,
     'ARG A=zzzenv-abcd1234:1\nFROM ${A/zzz/dev}\n',
     'ARG A=zenv-abcd1234:1\nFROM ${A//z/dev}\n',
-    'ARG A=devenv-abcd1234:1?\nFROM ${A%\\?}\n',
-    'FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%x} / /x\n',
-    'FROM alpine\nARG A=devenv-abcd1234:1x\nRUN --mount=from=${A%x},target=/x ls\n',
-    'FROM alpine\nENV A=devenv-abcd1234:1x\nCOPY --from=${A%?} / /x\n',
-    'ARG A=devenv-abcd1234:1x\nARG B=${A%x}\nFROM $B\n',
-    'ARG A=devenv-abcd1234:1[x]\nFROM ${A%[x]}\n',
-    'ARG A=devenv-abcd1234:1x\nFROM ${A%[x]}\n',
+    `ARG A=${OTHER}:1?\nFROM \${A%\\?}\n`,
+    `FROM alpine\nARG A=${OTHER}:1x\nCOPY --from=\${A%x} / /x\n`,
+    `FROM alpine\nARG A=${OTHER}:1x\nRUN --mount=from=\${A%x},target=/x ls\n`,
+    `FROM alpine\nENV A=${OTHER}:1x\nCOPY --from=\${A%?} / /x\n`,
+    `ARG A=${OTHER}:1x\nARG B=\${A%x}\nFROM $B\n`,
+    `ARG A=${OTHER}:1[x]\nFROM \${A%[x]}\n`,
+    `ARG A=${OTHER}:1x\nFROM \${A%[x]}\n`,
   ])('allows the pattern operator in %j, and the update check skips it (S4-3)', (text) => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, evaluated and refused as `… of another environment`.
     expectAllowed(text);
@@ -519,7 +522,7 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   });
 
   it('allows a pattern operator that gives another image, and the update check skips it (S4-3)', () => {
-    for (const text of ['ARG V=3.22.1\nFROM alpine:${V%.*}\n', 'ARG A=devenv-abcd1234:1\nFROM ${A#devenv-abcd1234:1}alpine\n', 'ARG A=abcd1234:1\nFROM ${A#abcd1234:1}alpine\n']) {
+    for (const text of ['ARG V=3.22.1\nFROM alpine:${V%.*}\n', `ARG A=${OTHER}:1\nFROM \${A#${OTHER}:1}alpine\n`, 'ARG A=abcd1234:1\nFROM ${A#abcd1234:1}alpine\n']) {
       expectAllowed(text);
       // Dockerfile refusals removed (user decision 2026-09-27): the pattern forms are not evaluated.
       expect(single(text).references.images).toEqual([]);
@@ -529,9 +532,9 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
   it.each([
     'FROM alpine:${TARGETARCH%64}\n',
     'FROM alpine\nCOPY --from=${NOPE#x} / /x\n',
-    'ARG A=devenv-abcd1234:1\nFROM ${A:1:3}\n',
-    'FROM alpine\nARG A=devenv-abcd1234:1x\nCOPY --from=${A%${NOPE}} / /x\n',
-    'ARG A=devenv-abcd1234:1x\nARG B=${A/x}\nFROM $B\n',
+    `ARG A=${OTHER}:1\nFROM \${A:1:3}\n`,
+    `FROM alpine\nARG A=${OTHER}:1x\nCOPY --from=\${A%\${NOPE}} / /x\n`,
+    `ARG A=${OTHER}:1x\nARG B=\${A/x}\nFROM $B\n`,
     'ARG A=alpine\nFROM ${A:1:3}\n',
     'ARG A=alpine\nFROM ${A/p/\\$0}\n',
     'ARG A=alpine\nFROM ${A%\\x}\n',
@@ -602,8 +605,8 @@ describe('review round 4 of unit 6 (S4-1 to S4-6)', () => {
     'FROM index.docker.io/x/devenv${TARGETVARIANT}\n',
     'FROM example/devenv-base:${TARGETARCH}\n',
     'FROM localhost/devenv-base:${TARGETARCH}\n',
-    'FROM ${TARGETVARIANT}ghcr.io/devenv-abcd1234:1\n',
-    'FROM ghcr.io${TARGETVARIANT}/devenv-abcd1234:1\n',
+    `FROM \${TARGETVARIANT}ghcr.io/${OTHER}:1\n`,
+    `FROM ghcr.io\${TARGETVARIANT}/${OTHER}:1\n`,
   ])('allows %j, and the update check reads it with a platform build argument (S4-6)', (text) => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… of another environment (a variable that is not resolved)`.
     expectAllowed(text);
@@ -643,7 +646,7 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
     ['FROM dev$$env-abcd1234:1\n', ['devenv-abcd1234:1']],
     ['FROM dev${1}env-abcd1234:1\n', ['devenv-abcd1234:1']],
     ['FROM dev$é\\env-abcd1234:1\n', ['devenv-abcd1234:1']],
-    ['ARG é=devenv-abcd1234:1\nFROM $é\n', ['devenv-abcd1234:1']],
+    [`ARG é=${OTHER}:1\nFROM $é\n`, [`${OTHER}:1`]],
     ['FROM alpine\nCOPY --from=dev$1env-abcd1234:1 / /x\n', ['alpine']],
     ['FROM alpine\nCOPY --from=dev$@env-abcd1234:1 / /x\n', ['alpine']],
     ['FROM alpine\nENV X=dev$é\\env-abcd1234:1\nCOPY --from=$X / /x\n', ['alpine']],
@@ -684,11 +687,11 @@ describe('review round 5 of unit 6 (S5-1 to S5-3, P5-2, D5-2)', () => {
   });
 
   it.each([
-    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1'] }, ['alpine']],
-    ['ARG A=alpine\nFROM $A\n', { A: ['devenv-abcd1234:1', 'x'] }, ['alpine']],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: null }, []],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: 1 }, ['devenv-abcd1234:1']],
-    ['ARG A\nFROM ${A:+devenv-abcd1234:1}\n', { A: false }, ['devenv-abcd1234:1']],
+    ['ARG A=alpine\nFROM $A\n', { A: [`${OTHER}:1`] }, ['alpine']],
+    ['ARG A=alpine\nFROM $A\n', { A: [`${OTHER}:1`, 'x'] }, ['alpine']],
+    [`ARG A\nFROM \${A:+${OTHER}:1}\n`, { A: null }, []],
+    [`ARG A\nFROM \${A:+${OTHER}:1}\n`, { A: 1 }, [`${OTHER}:1`]],
+    [`ARG A\nFROM \${A:+${OTHER}:1}\n`, { A: false }, [`${OTHER}:1`]],
     ['FROM alpine\n', { BUILDKIT_SYNTAX: ['evil/fe'] }, ['alpine']],
     ['FROM alpine\n', { BUILDKIT_SYNTAX: null }, ['alpine']],
   ])('allows the value of build.args in %j: %j (S5-2)', (text, args, images) => {

@@ -8,11 +8,15 @@ import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
-  ENVIRONMENT_VOLUME_PATTERN,
   EXTENSION_LABEL_KEYS,
   HELPER_CACHE_VOLUME,
+  LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
   LABEL_PREFIX,
+  LABEL_REPOSITORY,
   TOKEN_TMPFS,
+  composeProjectName,
+  isEnvironmentResourceName,
   newEnvironmentId,
   resourceName,
 } from '../names';
@@ -30,13 +34,14 @@ import {
   hostAccessProblems,
   hostAccessReport,
   imageLabelItems,
+  environmentImageClass,
   environmentImageIds,
-  environmentImageShortId,
+  environmentImageNames,
+  hasUnknownEnvironment,
   imageNamedBy,
   isOtherEnvironmentImageName,
   imageReferenceFinding,
   otherAccountImageItems,
-  unknownEnvironmentShortIds,
   volumeOwners,
   resolveNetworkReference,
   resolvedByImageId,
@@ -64,7 +69,11 @@ import {
   type HostAccessReport,
 } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 
 /** Problems of a repository configuration alone. */
 function configProblems(config: Record<string, unknown>): string[] {
@@ -87,7 +96,7 @@ describe('host access policy: mounts (concept section 9 "Host access")', () => {
     ['a Windows path without type', 'source=C:\\Users\\x,target=/x', ['bind mount C:\\Users\\x']],
     ['a path as the source of a volume', 'source=/Users/x,target=/x,type=volume', ['bind mount /Users/x']],
     ['a quoted source with a comma', 'type=bind,"source=/Users/a,b",target=/x', ['bind mount /Users/a,b']],
-    ['a volume of another environment', 'source=devenv-acme-web-11111111,target=/x,type=volume', ['volume devenv-acme-web-11111111 of another environment']],
+    ['a volume of another environment', `source=${OTHER},target=/x,type=volume`, [`volume ${OTHER} of another environment`]],
     // Volumes of the repository whose name starts with `devenv-`, for example `${localWorkspaceFolderBasename}-node_modules`
     // of a repository devenv-tools: not named like the workspace volume of an environment.
     ['a volume of the repository that starts with devenv-', 'source=devenv-tools-node_modules,target=/x,type=volume', []],
@@ -137,8 +146,8 @@ describe('host access policy: runArgs', () => {
     ['the network, also host', ['--network', 'host', '--net=bridge', '--network=corp'], []],
     [
       'the network of another container',
-      ['--network', 'container:devenv-acme-web-11111111', '--net=container:db'],
-      ['network of another container (container:devenv-acme-web-11111111)', 'network of another container (container:db)'],
+      ['--network', `container:${OTHER}`, '--net=container:db'],
+      [`network of another container (container:${OTHER})`, 'network of another container (container:db)'],
     ],
     ['--mount with a line break', ['--mount', 'type=bind,src=/,dst=/host\n,type=volume,src=v'], ['mount "type=bind,src=/,dst=/host\\n,type=volume,src=v"']],
     ['DNS and hosts', ['--add-host', 'host.docker.internal:host-gateway', '--dns=1.1.1.1', '--dns-search', 'corp', '--dns-option=ndots:1'], []],
@@ -172,7 +181,7 @@ describe('host access policy: runArgs', () => {
     ['a bind mount with --volume=', ['--volume=/var/run/docker.sock:/var/run/docker.sock'], ['bind mount /var/run/docker.sock']],
     ['a bind mount with -v and a relative path', ['-v', './data:/data'], ['bind mount ./data']],
     ['a bind mount with a Windows path', ['-v', 'C:\\data:/data'], ['bind mount C:\\data']],
-    ['a volume of another environment with -v', ['-v', 'devenv-acme-web-11111111:/x'], ['volume devenv-acme-web-11111111 of another environment']],
+    ['a volume of another environment with -v', ['-v', `${OTHER}:/x`], [`volume ${OTHER} of another environment`]],
     ['--mount with type=bind', ['--mount', 'type=bind,source=/etc,target=/host-etc'], ['bind mount /etc']],
     ['--mount= with a volume of the helper', ['--mount=type=volume,source=devenv-helper-cache,target=/c'], ['volume devenv-helper-cache of the workspace helper']],
     ['devices and GPUs', ['--device', '/dev/fuse', '--device-cgroup-rule=c 1:* rwm', '--gpus', 'all'], ['--device=/dev/fuse', '--device-cgroup-rule=c 1:* rwm', '--gpus=all']],
@@ -723,14 +732,16 @@ describe('volumes of other environments', () => {
   it.each(['acme/api', 'Acme/My.Repo_Name', 'a/b', 'devenv/x', `${'a'.repeat(40)}/${'b'.repeat(40)}`, 'o/name-with--dashes---'])(
     'recognizes the workspace volume of an environment of %s',
     (repository) => {
-      for (let i = 0; i < 20; i++) expect(ENVIRONMENT_VOLUME_PATTERN.test(resourceName(repository, newEnvironmentId()))).toBe(true);
+      for (let i = 0; i < 20; i++) expect(isEnvironmentResourceName(resourceName(repository, newEnvironmentId()))).toBe(true);
     },
   );
 
-  it.each(['devenv-tools-node_modules', 'devenv-cache', HELPER_CACHE_VOLUME, 'devenv-acme-api', 'cache-3f2a9c1e', 'devenv-acme-api-3f2a9c1', 'devenv-acme-api-3f2a9c1ez'])(
+  // User decisions 2026-10-03: isEnvironmentResourceName replaces ENVIRONMENT_VOLUME_PATTERN; the former names with a
+  // short ID (devenv-acme-api-3f2a9c1e) are no names of an environment any more.
+  it.each(['devenv-tools-node_modules', 'devenv-cache', HELPER_CACHE_VOLUME, 'devenv-acme-api', 'cache-3f2a9c1e', 'devenv-acme-api-3f2a9c1', 'devenv-acme-api-3f2a9c1ez', 'devenv-acme-api-3f2a9c1e', 'cache-tidy-berners'])(
     'does not take %s for one',
     (volume) => {
-      expect(ENVIRONMENT_VOLUME_PATTERN.test(volume)).toBe(false);
+      expect(isEnvironmentResourceName(volume)).toBe(false);
     },
   );
 
@@ -738,8 +749,8 @@ describe('volumes of other environments', () => {
     const long = resourceName(`${'a'.repeat(40)}/${'b'.repeat(40)}`, '0a1b2c3d-0000-4000-8000-000000000000');
     expect(long).toHaveLength(63);
     expect(configProblems({ mounts: [`source=${long},target=/x,type=volume`] })).toEqual([`volume ${long} of another environment`]);
-    expect(configProblems({ runArgs: ['-v', 'devenv-acme-web-11111111:/x', '-v', `${HELPER_CACHE_VOLUME}:/c`] })).toEqual([
-      'volume devenv-acme-web-11111111 of another environment',
+    expect(configProblems({ runArgs: ['-v', `${OTHER}:/x`, '-v', `${HELPER_CACHE_VOLUME}:/c`] })).toEqual([
+      `volume ${OTHER} of another environment`,
       `volume ${HELPER_CACHE_VOLUME} of the workspace helper`,
     ]);
     // The own volume is allowed, also for a repository whose name starts with devenv-.
@@ -933,7 +944,7 @@ describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, c
   it.each<[string, Record<string, string>, string | undefined]>([
     ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop' }, 'the Docker Compose project shop'],
     // The volumes of the Compose project of an environment carry both: the environment label decides (spec u6).
-    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': 'devenv-11111111', 'nimblescape.devenv.environment-id': 'x' }, 'another environment'],
+    ['a volume of an environment that Docker Compose labeled too', { 'com.docker.compose.project': OTHER, 'nimblescape.devenv.environment-id': 'x' }, 'another environment'],
     ['a volume of an environment', { 'nimblescape.devenv.environment-id': 'x' }, 'another environment'],
     ['no labels', {}, undefined],
   ])('volumeLabelOwner: %s', (_name, labels, expected) => {
@@ -1132,11 +1143,11 @@ describe('isHelperPath', () => {
 
 describe('imageReferenceFinding and localImageRepository', () => {
   it.each([
-    ['devenv-11111111:2', 'devenv-11111111'],
-    ['docker.io/devenv-11111111:2', 'devenv-11111111'],
-    ['docker.io/library/devenv-11111111', 'devenv-11111111'],
-    ['index.docker.io/library/devenv-11111111:2', 'devenv-11111111'],
-    ['registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64), 'devenv-11111111-db'],
+    [`${OTHER}:2`, OTHER],
+    [`docker.io/${OTHER}:2`, OTHER],
+    [`docker.io/library/${OTHER}`, OTHER],
+    [`index.docker.io/library/${OTHER}:2`, OTHER],
+    [`registry-1.docker.io/${OTHER}-db@sha256:` + 'a'.repeat(64), `${OTHER}-db`],
     ['ghcr.io/acme/devenv-tools:1', 'ghcr.io/acme/devenv-tools'],
     ['localhost:5000/devenv-x', 'localhost:5000/devenv-x'],
     ['postgres:16', 'postgres'],
@@ -1148,7 +1159,7 @@ describe('imageReferenceFinding and localImageRepository', () => {
     // User decision 2026-09-28: changed expectation (it was protected, `… of another environment`), a name is not
     // refused by its form; the pipeline refuses an image of the environments of another account by its ID
     // (otherAccountImageItems).
-    ['devenv-11111111:2', undefined],
+    [`${OTHER}:2`, undefined],
     ['Docker.io/Library/devenv-1', undefined],
     [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
     ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
@@ -1163,95 +1174,214 @@ describe('imageReferenceFinding and localImageRepository', () => {
 });
 
 describe('otherAccountImageItems (user decision 2026-09-28)', () => {
-  const THEIRS = { id: `sha256:${'a'.repeat(64)}`, repoTags: ['devenv-11111111:2'], repoDigests: [] };
+  // User decisions 2026-10-03: images are named after resourceName (before: devenv-<short id>).
+  const MINE_ID = '22222222-2222-4222-8222-222222222222';
+  const THEIR_ID = '11111111-2222-4333-8444-555555555555';
+  const UNKNOWN_ID = '33333333-3333-4333-8333-333333333333';
+  /** An environment of the account (1001). */
+  const MINE = resourceName('acme/api', MINE_ID);
+  /** An environment of another account (2002): OTHER. */
+  const THEIRS_NAME = resourceName('acme/web', THEIR_ID);
+  /** An environment that no registry entry or volume knows. */
+  const UNKNOWN = resourceName('acme/db', UNKNOWN_ID);
+  const OWNERS = {
+    byName: new Map([
+      [MINE, '1001'],
+      [THEIRS_NAME, '2002'],
+    ]),
+    byId: new Map([
+      [MINE_ID, '1001'],
+      [THEIR_ID, '2002'],
+    ]),
+  };
+  const THEIRS = { id: `sha256:${'a'.repeat(64)}`, repoTags: [`${THEIRS_NAME}:2`], repoDigests: [] };
   const COPY = { id: THEIRS.id, repoTags: ['mine:1'], repoDigests: [] };
-  const OURS = { id: `sha256:${'b'.repeat(64)}`, repoTags: ['devenv-22222222:1'], repoDigests: [] };
+  const OURS = { id: `sha256:${'b'.repeat(64)}`, repoTags: [`${MINE}:1`], repoDigests: [] };
   const named = (reference: string, what = 'image') => [{ reference, what }];
 
   it('gives the image of a reference by its name, also written with the registry of Docker Hub, never by an ID prefix', () => {
-    expect(imageNamedBy('devenv-11111111:2', [OURS, THEIRS])).toBe(THEIRS);
-    expect(imageNamedBy('docker.io/library/devenv-11111111:2', [THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy(`${THEIRS_NAME}:2`, [OURS, THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy(`docker.io/library/${THEIRS_NAME}:2`, [THEIRS])).toBe(THEIRS);
     expect(imageNamedBy('aaaaaaaa', [THEIRS])).toBeUndefined();
     expect(imageNamedBy('Not A Reference', [THEIRS])).toBeUndefined();
   });
 
-  it.each([
-    ['devenv-1a2b3c4d:2', '1a2b3c4d'],
-    ['devenv-1a2b3c4d-db:latest', '1a2b3c4d'],
-    ['docker.io/library/devenv-1a2b3c4d:2', '1a2b3c4d'],
-    ['index.docker.io/devenv-1a2b3c4d-app', '1a2b3c4d'],
-    ['devenv-tools:1', undefined],
-    ['devenv-1a2b3c4:1', undefined],
-    ['ghcr.io/acme/devenv-1a2b3c4d:1', undefined],
-    ['postgres:16', undefined],
-  ])('gives the short ID of the environment of %s: %s', (reference, expected) => {
-    expect(environmentImageShortId(reference)).toBe(expected);
+  // User decisions 2026-10-03: environmentImageNames replaces environmentImageShortId (deleted with the short ID).
+  it.each<[string, string[]]>([
+    [`${THEIRS_NAME}:2`, [THEIRS_NAME]],
+    [`${THEIRS_NAME}-db:latest`, [THEIRS_NAME]],
+    [`${THEIRS_NAME}-my-worker`, [THEIRS_NAME]],
+    [`docker.io/library/${THEIRS_NAME}:2`, [THEIRS_NAME]],
+    [`index.docker.io/${THEIRS_NAME}-app`, [THEIRS_NAME]],
+    [`registry-1.docker.io/${THEIRS_NAME}-db@sha256:${'a'.repeat(64)}`, [THEIRS_NAME]],
+    [`ghcr.io/acme/${THEIRS_NAME}:1`, []],
+    ['devenv-tools:1', []],
+    ['devenv-tools-node:1', []],
+    // A former name with a short ID (user decisions 2026-10-03).
+    ['devenv-11111111:2', []],
+    ['postgres:16', []],
+  ])('gives the names of the environments that %s may be an image of: %j', (reference, expected) => {
+    expect(environmentImageNames(reference)).toEqual(expected);
   });
 
-  it('splits the images of the environments by the owner of their short ID; an unknown owner counts as another account', () => {
-    const images = [
-      { id: 'sha256:A', tags: ['devenv-11111111:2', 'devenv-11111111:3'] },
-      { id: 'sha256:B', tags: ['devenv-22222222-db:latest'] },
-      { id: 'sha256:C', tags: ['devenv-33333333:1'] },
-      { id: 'sha256:D', tags: ['devenv-tools:1'] },
-    ];
-    const owners = new Map([
-      ['11111111', '2002'],
-      ['22222222', '1001'],
-    ]);
-    expect(environmentImageIds(images, owners, '1001')).toEqual({
-      own: new Set(['sha256:b']),
-      others: new Set(['sha256:a', 'sha256:c']),
-      ownShortIds: new Set(['22222222']),
+  it('gives every start of the repository that is named like an environment, for a service whose name has a -', () => {
+    // A service `x-happy-turing` of the project THEIRS_NAME: both starts have the shape of a name of an environment.
+    expect(environmentImageNames(`${THEIRS_NAME}-x-happy-turing:1`)).toEqual([THEIRS_NAME, `${THEIRS_NAME}-x-happy-turing`]);
+  });
+
+  it('reads a name in upper case (not a valid reference) in lower case', () => {
+    expect(environmentImageNames(`${THEIRS_NAME.toUpperCase()}:2`)).toEqual([THEIRS_NAME]);
+    expect(environmentImageNames(`docker.io/library/${THEIRS_NAME.toUpperCase()}-DB`)).toEqual([THEIRS_NAME]);
+  });
+
+  // Review round 5 of PR #88 (B-R5-3, mutant I1): an image of a Docker Hub user whose name has the shape
+  // `<name of an environment>-…` is no environment image (its repository has a `/`): no names, and not refused.
+  it('B-R5-3: gives no names for an image of a Docker Hub user named like an environment, and does not refuse it', () => {
+    expect(environmentImageNames(`${THEIRS_NAME}-web/tool:1`)).toEqual([]);
+    expect(environmentImageNames(`docker.io/${THEIRS_NAME}/tool:1`)).toEqual([]);
+    const ids = environmentImageIds([], OWNERS, '1001');
+    expect(isOtherEnvironmentImageName(`${THEIRS_NAME}-web/tool:1`, ids)).toBe(false);
+    expect(hasUnknownEnvironment([], [`${UNKNOWN}-web/tool:1`], OWNERS)).toBe(false);
+  });
+
+  it.each<[string, string[], 'none' | 'own' | 'other']>([
+    ['no names', [], 'none'],
+    ['an environment of the account', [MINE], 'own'],
+    ['an environment of another account', [THEIRS_NAME], 'other'],
+    ['an environment of no known owner', [UNKNOWN], 'other'],
+    ['a name of no environment next to one of the account', [MINE, `${MINE}-x-happy-turing`], 'own'],
+    ['an environment of another account next to one of the account', [MINE, THEIRS_NAME], 'other'],
+  ])('environmentImageClass: %s', (_name, names, expected) => {
+    expect(environmentImageClass(names, new Set([MINE]), new Set([THEIRS_NAME]))).toBe(expected);
+  });
+
+  const IMAGES = [
+    // By the names (no label).
+    { id: 'sha256:A', tags: [`${THEIRS_NAME}:2`, `${THEIRS_NAME}:3`] },
+    { id: 'sha256:B', tags: [`${MINE}-db:latest`] },
+    { id: 'sha256:C', tags: [`${UNKNOWN}:1`] },
+    { id: 'sha256:D', tags: ['devenv-tools:1'] },
+    // By the label nimblescape.devenv.environment-id.
+    { id: 'sha256:E', tags: ['mine:1'], environmentId: MINE_ID },
+    { id: 'sha256:F', tags: [`${MINE}:9`], environmentId: THEIR_ID },
+    { id: 'sha256:G', tags: ['x:1'], environmentId: '44444444-4444-4444-8444-444444444444' },
+    { id: 'sha256:H', tags: [`${THEIRS_NAME}:5`], environmentId: MINE_ID },
+  ];
+
+  it('environmentImageIds: the label decides, an unknown ID counts as another account, a name of another account overrides an own label', () => {
+    expect(environmentImageIds(IMAGES, OWNERS, '1001')).toEqual({
+      own: new Set(['sha256:b', 'sha256:e']),
+      others: new Set(['sha256:a', 'sha256:c', 'sha256:f', 'sha256:g', 'sha256:h']),
+      ownNames: new Set([MINE]),
+      otherNames: new Set([THEIRS_NAME]),
     });
-    expect(unknownEnvironmentShortIds(images, owners)).toEqual(['33333333']);
+    // For the other account: F has its label, but a name of an environment of 1001 (now another account) overrides it.
+    expect(environmentImageIds(IMAGES, OWNERS, '2002')).toMatchObject({
+      own: new Set(['sha256:a']),
+      others: new Set(['sha256:b', 'sha256:c', 'sha256:e', 'sha256:f', 'sha256:g', 'sha256:h']),
+    });
+  });
+
+  it('hasUnknownEnvironment (replaces unknownEnvironmentShortIds): an image or reference of an environment that no owner knows', () => {
+    expect(hasUnknownEnvironment(IMAGES, [], OWNERS)).toBe(true);
     // Only of the images that the references found.
-    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:a']))).toEqual([]);
-    expect(unknownEnvironmentShortIds(images, owners, new Set(['sha256:c']))).toEqual(['33333333']);
+    expect(hasUnknownEnvironment(IMAGES, [], OWNERS, new Set(['sha256:a', 'sha256:b', 'sha256:d', 'sha256:e', 'sha256:f', 'sha256:h']))).toBe(false);
+    expect(hasUnknownEnvironment(IMAGES, [], OWNERS, new Set(['sha256:c']))).toBe(true);
+    expect(hasUnknownEnvironment(IMAGES, [], OWNERS, new Set(['sha256:g']))).toBe(true);
+    // A known label decides, whatever the names.
+    expect(hasUnknownEnvironment([{ id: 'sha256:I', tags: [`${UNKNOWN}:1`], environmentId: MINE_ID }], [], OWNERS)).toBe(false);
+    // The references of a configuration without a local image.
+    expect(hasUnknownEnvironment([], [`${UNKNOWN}:1`], OWNERS)).toBe(true);
+    expect(hasUnknownEnvironment([], [`${THEIRS_NAME}:1`, `${MINE}-db`, 'postgres:16', 'devenv-tools:1'], OWNERS)).toBe(false);
+    expect(hasUnknownEnvironment([], [], OWNERS)).toBe(false);
   });
 
   it('refuses a name of an environment image without a local image unless the environment is the account\'s (review round 3, S1)', () => {
-    const ids = { own: new Set<string>(), others: new Set<string>(), ownShortIds: new Set(['22222222']) };
-    expect(isOtherEnvironmentImageName('devenv-11111111:4', ids)).toBe(true);
-    expect(isOtherEnvironmentImageName('docker.io/library/devenv-11111111-db', ids)).toBe(true);
-    expect(isOtherEnvironmentImageName('devenv-22222222:4', ids)).toBe(false);
+    // User decisions 2026-10-03: changed data, the names of the environments by owner (before: ownShortIds).
+    const ids = environmentImageIds([], OWNERS, '1001');
+    expect(ids.ownNames).toEqual(new Set([MINE]));
+    expect(ids.otherNames).toEqual(new Set([THEIRS_NAME]));
+    expect(isOtherEnvironmentImageName(`${THEIRS_NAME}:4`, ids)).toBe(true);
+    expect(isOtherEnvironmentImageName(`docker.io/library/${THEIRS_NAME}-db`, ids)).toBe(true);
+    expect(isOtherEnvironmentImageName(`${UNKNOWN}:4`, ids)).toBe(true);
+    expect(isOtherEnvironmentImageName(`${MINE}:4`, ids)).toBe(false);
+    expect(isOtherEnvironmentImageName(`${MINE}-x-happy-turing`, ids)).toBe(false);
     expect(isOtherEnvironmentImageName('devenv-tools:1', ids)).toBe(false);
-    const missing = new Set(['devenv-11111111:4', 'devenv-22222222:4']);
-    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, missing)).toEqual(['image devenv-11111111:4 (an image of an environment of another GitHub account)']);
-    expect(otherAccountImageItems(named('devenv-22222222:4'), [], ids, missing)).toEqual([]);
+    expect(isOtherEnvironmentImageName('postgres:16', ids)).toBe(false);
+    // Without the names, every environment counts as of no known owner.
+    expect(isOtherEnvironmentImageName(`${MINE}:4`, { own: new Set(), others: new Set() })).toBe(true);
+    const missing = new Set([`${THEIRS_NAME}:4`, `${MINE}:4`]);
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:4`), [], ids, missing)).toEqual([`image ${THEIRS_NAME}:4 (an image of an environment of another GitHub account)`]);
+    expect(otherAccountImageItems(named(`${MINE}:4`), [], ids, missing)).toEqual([]);
     // Review round 5 (U1): a reference that Docker could not inspect (not in `missing`) is not decided by its name.
-    expect(otherAccountImageItems(named('devenv-11111111:4'), [], ids, new Set())).toEqual([]);
-    expect(environmentImageIds([], new Map([['22222222', '1001'], ['11111111', '2002']]), '1001').ownShortIds).toEqual(new Set(['22222222']));
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:4`), [], ids, new Set())).toEqual([]);
   });
 
-  it('names the owner of each environment by the labels of its volumes, none when they differ', () => {
-    const volume = (id: string, owner?: string) => ({ labels: { 'nimblescape.devenv.environment-id': id, ...(owner ? { 'nimblescape.devenv.owner-id': owner } : {}) } });
+  it('names the owner of each environment by the labels of its volumes, by name and by ID, none when they differ', () => {
+    // User decisions 2026-10-03: changed expectation, {byName, byId} (before: a map of short IDs).
+    const volume = (id: string, repository?: string, owner?: string) => ({
+      labels: {
+        'nimblescape.devenv.environment-id': id,
+        ...(repository ? { 'nimblescape.devenv.repository': repository } : {}),
+        ...(owner ? { 'nimblescape.devenv.owner-id': owner } : {}),
+      },
+    });
+    const ID1 = '11111111-0000-4000-8000-000000000001';
+    const ID2 = '22222222-0000-4000-8000-000000000002';
+    const ID3 = '33333333-0000-4000-8000-000000000003';
+    const ID4 = '44444444-0000-4000-8000-000000000004';
+    const ID5 = '55555555-0000-4000-8000-000000000005';
     expect(
       volumeOwners([
-        volume('11111111-0000-4000-8000-000000000001', '1001'),
-        volume('11111111-0000-4000-8000-000000000001', '1001'),
-        volume('22222222-0000-4000-8000-000000000002', '1001'),
-        volume('22222222-0000-4000-8000-000000000002', '2002'),
-        volume('22222222-0000-4000-8000-000000000002', '1001'),
-        volume('33333333-0000-4000-8000-000000000003'),
+        volume(ID1, 'acme/api', '1001'),
+        volume(ID1, 'acme/api', '1001'),
+        // Conflicting owners: left out by name and by ID.
+        volume(ID2, 'acme/web', '1001'),
+        volume(ID2, 'acme/web', '2002'),
+        volume(ID2, 'acme/web', '1001'),
+        // No owner.
+        volume(ID3, 'acme/db'),
+        // No repository, or one that is no repository: by ID only.
+        volume(ID4, undefined, '2002'),
+        volume(ID5, 'noslash', '2002'),
         { labels: {} },
       ]),
-    ).toEqual(new Map([['11111111', '1001']]));
+    ).toEqual({
+      byName: new Map([[resourceName('acme/api', ID1), '1001']]),
+      byId: new Map([
+        [ID1, '1001'],
+        [ID4, '2002'],
+        [ID5, '2002'],
+      ]),
+    });
+    // The name is in lower case.
+    expect(volumeOwners([volume(ID1, 'Acme/API', '1001')]).byName).toEqual(new Map([[resourceName('acme/api', ID1), '1001']]));
+  });
+
+  // Review round 5 of PR #88 (B-R5-4, mutant I7): a volume with the ID label but no owner label (made by hand, or an
+  // older one) says nothing about the owner of the ID: the owner that another volume names stays, in either order.
+  it('B-R5-4: keeps the owner of an ID by ID when another volume of the ID carries no owner label', () => {
+    const ID = '11111111-0000-4000-8000-000000000001';
+    const withOwner = { labels: { [LABEL_ENVIRONMENT_ID]: ID, [LABEL_OWNER_ID]: '1001', [LABEL_REPOSITORY]: 'acme/api' } };
+    const withoutOwner = { labels: { [LABEL_ENVIRONMENT_ID]: ID } };
+    expect(volumeOwners([withOwner, withoutOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner, withOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner]).byId.has(ID)).toBe(false);
   });
 
   it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
-    ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
+    ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, [`image ${THEIRS_NAME}:2 (an image of an environment of another GitHub account)`]],
     ['an image of another account that is also the account\'s own (the same build)', [THEIRS], { own: [THEIRS.id], others: [THEIRS.id] }, []],
     // Review round 3 (S1): changed data (the image of the account is named by the reference; before, the reference named
     // no image of the list, so the row did not test the image of the account).
-    ['an image of the account', [{ ...OURS, repoTags: ['devenv-11111111:2'] }], { own: [OURS.id], others: [THEIRS.id] }, []],
-    ['no image of an environment', [{ id: 'sha256:c', repoTags: ['devenv-11111111:2'], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
+    ['an image of the account', [{ ...OURS, repoTags: [`${THEIRS_NAME}:2`] }], { own: [OURS.id], others: [THEIRS.id] }, []],
+    ['no image of an environment', [{ id: 'sha256:c', repoTags: [`${THEIRS_NAME}:2`], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
     // Review round 3 (S1): changed expectation (it was allowed), the name of an image of an environment of no known
     // owner that is not there is refused by its name (isOtherEnvironmentImageName).
-    ['a missing image', [], { own: [], others: [THEIRS.id] }, ['image devenv-11111111:2 (an image of an environment of another GitHub account)']],
+    ['a missing image', [], { own: [], others: [THEIRS.id] }, [`image ${THEIRS_NAME}:2 (an image of an environment of another GitHub account)`]],
   ])('%s', (_name, images, ids, expected) => {
-    const missing = new Set(images.length === 0 ? ['devenv-11111111:2'] : []);
-    expect(otherAccountImageItems(named('devenv-11111111:2'), images, { own: new Set(ids.own), others: new Set(ids.others) }, missing)).toEqual(expected);
+    const missing = new Set(images.length === 0 ? [`${THEIRS_NAME}:2`] : []);
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:2`), images, { own: new Set(ids.own), others: new Set(ids.others) }, missing)).toEqual(expected);
   });
 
   it('refuses a copy under another name by its ID, with the name of the setting', () => {
@@ -1263,16 +1393,27 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
 
 describe('foreignNetworkItem and runArgsNetworks', () => {
   const ID = 'e0000001-0000-4000-8000-000000000001';
+  // User decisions 2026-10-03: foreignNetworkItem takes the own project (resourceName; before: devenv-<short id>).
+  const OWN_PROJECT = composeProjectName('acme/api', ID);
   it.each([
-    ['named like the project of another environment', 'devenv-11111111_default', undefined, true],
-    ['named like the own project', 'devenv-e0000001_default', undefined, false],
-    ['labelled for another environment', 'backend', { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] }, true],
-    ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': 'devenv-e0000001' }, environments: [ID] }, false],
+    ['named like the project of another environment', `${OTHER}_default`, undefined, true],
+    ['named like the own project', `${OWN_PROJECT}_default`, undefined, false],
+    ['labelled for another environment', 'backend', { labels: { 'com.docker.compose.project': OTHER }, environments: [] }, true],
+    ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT }, environments: [ID] }, false],
+    // Review round 7 of PR #88 (B-R7-1): the project label is compared without regard to case, as the name.
+    ['labelled for the own project in upper case', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT.toUpperCase() }, environments: [] }, false],
+    ['labelled for another environment in upper case', 'backend', { labels: { 'com.docker.compose.project': OTHER.toUpperCase() }, environments: [] }, true],
     ['labelled for a project of another program', 'backend', { labels: { 'com.docker.compose.project': 'shop' }, environments: [] }, false],
+    ['labelled for a project of a repository named devenv-…', 'backend', { labels: { 'com.docker.compose.project': 'devenv-tools' }, environments: [] }, false],
     ['with a container of another environment', 'shared', { labels: {}, environments: [ID, 'e0000002-0000-4000-8000-000000000002'] }, true],
     ['without anything of another environment', 'shared', { labels: {}, environments: [] }, false],
   ])('%s', (_name, network, state, foreign) => {
-    expect(foreignNetworkItem(network, state, ID) !== undefined).toBe(foreign);
+    expect(foreignNetworkItem(network, state, ID, OWN_PROJECT) !== undefined).toBe(foreign);
+  });
+
+  it('takes every environment name for another one without the own project', () => {
+    expect(foreignNetworkItem(`${OWN_PROJECT}_default`, undefined, ID)).toBe(`network ${OWN_PROJECT}_default of another environment`);
+    expect(foreignNetworkItem(`${OWN_PROJECT.toUpperCase()}_default`, undefined, ID, OWN_PROJECT)).toBeUndefined();
   });
 
   it('names the networks of runArgs, not the modes of Docker', () => {
@@ -1330,12 +1471,12 @@ describe('the Dockerfile of a single container (review round 2, S2-01)', () => {
 describe('the images that the Dockerfile of a single container names (review round 2, S2-02)', () => {
   it('allows the images of other environments in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
     const dockerfileText = [
-      '# syntax=docker.io/library/devenv-11111111:9',
+      `# syntax=docker.io/library/${OTHER}:9`,
       'FROM alpine AS base',
-      'FROM devenv-22222222${TARGETVARIANT}',
+      `FROM ${OTHER}\${TARGETVARIANT}`,
       'COPY --from=base /a /a',
-      'COPY --from=devenv-33333333:1 /b /b',
-      'RUN --mount=type=cache,from=devenv-44444444,target=/c true',
+      `COPY --from=${OTHER}:1 /b /b`,
+      `RUN --mount=type=cache,from=${OTHER},target=/c true`,
       'COPY --from=$IMAGE /d /d',
     ].join('\n');
     const config = { build: { dockerfile: 'Dockerfile' } };
@@ -1390,8 +1531,10 @@ describe('resolveNetworkReference (review round 2, S2-04)', () => {
 describe('foreignNetworkItem (review round 2, S2-04 and P2-2)', () => {
   const ID = '3f2a9c1e-0000-4000-8000-000000000000';
   it('checks the name of the network that a reference resolves to', () => {
-    expect(foreignNetworkItem('f00dbabe', { name: 'devenv-11111111_default', labels: {}, environments: [] }, ID)).toBe('network f00dbabe of another environment');
-    expect(foreignNetworkItem('f00dbabe', { name: 'devenv-3f2a9c1e_default', labels: {}, environments: [] }, ID)).toBeUndefined();
+    // User decisions 2026-10-03: the own project is passed (resourceName; before: devenv-<short id> of ID).
+    const project = composeProjectName('acme/api', ID);
+    expect(foreignNetworkItem('f00dbabe', { name: `${OTHER}_default`, labels: {}, environments: [] }, ID, project)).toBe('network f00dbabe of another environment');
+    expect(foreignNetworkItem('f00dbabe', { name: `${project}_default`, labels: {}, environments: [] }, ID, project)).toBeUndefined();
   });
 
   it('allows a container of an environment of the same owner, and no other', () => {
@@ -1400,10 +1543,10 @@ describe('foreignNetworkItem (review round 2, S2-04 and P2-2)', () => {
     expect(foreignNetworkItem('devnet', { labels: {}, environments: [other, 'x'], sameOwnerEnvironments: [other] }, ID)).toBe('network devnet of another environment');
     expect(foreignNetworkItem('devnet', { labels: {}, environments: [other] }, ID)).toBe('network devnet of another environment');
     // The project network of another environment stays refused, also of the same owner.
-    expect(foreignNetworkItem('devenv-11111111_default', { labels: {}, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
-      'network devenv-11111111_default of another environment',
+    expect(foreignNetworkItem(`${OTHER}_default`, { labels: {}, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
+      `network ${OTHER}_default of another environment`,
     );
-    expect(foreignNetworkItem('backend', { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
+    expect(foreignNetworkItem('backend', { labels: { 'com.docker.compose.project': OTHER }, environments: [other], sameOwnerEnvironments: [other] }, ID)).toBe(
       'network backend of another environment',
     );
   });
@@ -1413,7 +1556,7 @@ describe('imageLabelItems', () => {
   it('allows the labels of another tool with the prefix devenv. (user report 2026-09-27)', () => {
     // Before: "label devenv.fingerprint of the image devenv-af605cdd:2, label devenv.inputs of the image
     // devenv-af605cdd:2".
-    expect(imageLabelItems('devenv-af605cdd:2', { 'devenv.fingerprint': 'f', 'devenv.inputs': 'i', 'devcontainer.metadata': '[]' })).toEqual([]);
+    expect(imageLabelItems(`${OWN}:2`, { 'devenv.fingerprint': 'f', 'devenv.inputs': 'i', 'devcontainer.metadata': '[]' })).toEqual([]);
     expect(imageLabelItems('x', { 'devenv.environment-id': 'e', 'devenv.compose-service': 'db' })).toEqual([]);
   });
 
@@ -1425,21 +1568,68 @@ describe('imageLabelItems', () => {
   it('names the labels by which the extension and the CLI find containers, except devcontainer.metadata', () => {
     // Review round 2 (D2-1): changed expectation, the label com.docker.compose.project of an image is no longer refused.
     expect(
-      imageLabelItems('devenv-e0000001:2', {
+      imageLabelItems(`${OWN}:2`, {
         'devcontainer.metadata': '[]',
         'org.opencontainers.image.title': 'x',
         'nimblescape.devenv.compose-service': 'x',
         'devcontainer.local_folder': '/x',
-        'com.docker.compose.project': 'devenv-11111111',
+        'com.docker.compose.project': OTHER,
       }),
-    ).toEqual(['label nimblescape.devenv.compose-service of the image devenv-e0000001:2', 'label devcontainer.local_folder of the image devenv-e0000001:2']);
+    ).toEqual([`label nimblescape.devenv.compose-service of the image ${OWN}:2`, `label devcontainer.local_folder of the image ${OWN}:2`]);
+  });
+
+  describe('the labels that the extension gives the images of the environment (user decisions 2026-10-03)', () => {
+    // Review round 1 of PR #88 (A-R1-3): the build record only on the environment image (environmentImage).
+    const OWN_ENV = { id: '3f2a9c1e-0000-4000-8000-000000000000', repository: 'acme/api', ownerId: '1001', environmentImage: true };
+    const LABELS = {
+      'nimblescape.devenv.environment-id': OWN_ENV.id,
+      'nimblescape.devenv.repository': OWN_ENV.repository,
+      'nimblescape.devenv.owner-id': OWN_ENV.ownerId,
+      'nimblescape.devenv.build-record': '{"buildNumber":1}',
+    };
+
+    it('allows them with the values of the own environment, the build record with any value', () => {
+      expect(imageLabelItems(`${OWN}:2`, LABELS, OWN_ENV)).toEqual([]);
+      expect(imageLabelItems(`${OWN}:2`, { ...LABELS, 'nimblescape.devenv.build-record': 'anything' }, OWN_ENV)).toEqual([]);
+      expect(imageLabelItems(`${OWN}-db`, { 'nimblescape.devenv.environment-id': OWN_ENV.id }, OWN_ENV)).toEqual([]);
+    });
+
+    it('refuses the build record on any image but the environment image (review round 1 of PR #88, A-R1-3)', () => {
+      const service = { ...OWN_ENV, environmentImage: false };
+      expect(imageLabelItems('base:1', { 'nimblescape.devenv.build-record': '{"forged":true}' }, service)).toEqual(['label nimblescape.devenv.build-record of the image base:1']);
+      expect(imageLabelItems('base:1', { 'nimblescape.devenv.environment-id': OWN_ENV.id }, service)).toEqual([]);
+    });
+
+    it.each<[string, Record<string, string>]>([
+      ['another environment ID', { 'nimblescape.devenv.environment-id': '11111111-2222-4333-8444-555555555555' }],
+      ['another repository', { 'nimblescape.devenv.repository': 'acme/web' }],
+      ['another owner', { 'nimblescape.devenv.owner-id': '2002' }],
+    ])('refuses them with %s', (_name, changed) => {
+      const key = Object.keys(changed)[0];
+      expect(imageLabelItems('x', { ...LABELS, ...changed }, OWN_ENV)).toEqual([`label ${key} of the image x`]);
+    });
+
+    it('refuses them without the own environment', () => {
+      expect(imageLabelItems('x', LABELS)).toEqual([
+        'label nimblescape.devenv.environment-id of the image x',
+        'label nimblescape.devenv.repository of the image x',
+        'label nimblescape.devenv.owner-id of the image x',
+        'label nimblescape.devenv.build-record of the image x',
+      ]);
+    });
+
+    it('still refuses the other labels of the extension, also with the values of the own environment', () => {
+      expect(
+        imageLabelItems('x', { ...LABELS, 'nimblescape.devenv.compose-service': 'db', 'nimblescape.devenv.volume': OWN_ENV.id, 'nimblescape.devenv.host-access': 'unrestricted' }, OWN_ENV),
+      ).toEqual(['label nimblescape.devenv.compose-service of the image x', 'label nimblescape.devenv.volume of the image x', 'label nimblescape.devenv.host-access of the image x']);
+    });
   });
 
   it('allows the labels of Docker Compose of any project (review round 2, D2-1)', () => {
     // Changed expectation (D2-1): an image that Compose built for another project (inherited through FROM) is usable; a
     // single container gets the labels empty in its override configuration, and Compose sets its own on its containers.
-    const built = { 'com.docker.compose.project': 'devenv-e0000001', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
-    expect(imageLabelItems('devenv-e0000001-app', built)).toEqual([]);
+    const built = { 'com.docker.compose.project': OWN, 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(imageLabelItems(`${OWN}-app`, built)).toEqual([]);
     expect(imageLabelItems('x', { 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'shop' })).toEqual([]);
     expect(imageLabelItems('x', { 'nimblescape.devenv.host-access': 'unrestricted', 'com.docker.compose.project': 'shop' })).toEqual([
       'label nimblescape.devenv.host-access of the image x',
@@ -1496,7 +1686,7 @@ describe('imageIdResolvedReferences (review round 9, S9-3)', () => {
   const PG = { id: `sha256:${'e'.repeat(64)}`, repoTags: ['postgres:16'], repoDigests: [`postgres@sha256:${'f'.repeat(64)}`] };
 
   it('takes the name first, then a prefix of the ID or a digest that is the ID, as Docker resolves them', () => {
-    const found = [PG, { id: ID, repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] }];
+    const found = [PG, { id: ID, repoTags: [`${OTHER}-db:latest`], repoDigests: [] }];
     expect(
       imageIdResolvedReferences(
         ['postgres:16', `postgres@sha256:${'f'.repeat(64)}`, 'a1b2c3', 'sha256:a1b2c3', `other@${ID}`, 'missing:1', 'eeee', 'fff'],
@@ -1608,7 +1798,7 @@ describe('volumeFlagTarget (review round 14, S14-1)', () => {
 // the resolved values (./cliVariables.ts), in the image metadata, the configuration, and the merged configuration.
 describe('host access policy: variables of the Dev Container CLI in mounts (hotfix M1)', () => {
   const variables = helperCliVariables('acme/api');
-  const FOREIGN = 'volume devenv-other-abcdef12 of another environment';
+  const FOREIGN = `volume ${OTHER} of another environment`;
   const HELPER_CACHE = `volume ${HELPER_CACHE_VOLUME} of the workspace helper`;
   type Where = 'metadata' | 'config' | 'merged';
   const input = (where: Where, mounts: unknown[], withVariables = true): HostAccessInput => {
@@ -1623,12 +1813,12 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
 
   describe.each<Where>(['metadata', 'config', 'merged'])('in the %s', (where) => {
     it.each<[string, unknown, string]>([
-      ['a default of an unset ${localEnv:…} that names a volume of another environment', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', FOREIGN],
+      ['a default of an unset ${localEnv:…} that names a volume of another environment', `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`, FOREIGN],
       ['a default of an unset ${env:…} that names the cache volume of the helper', 'source=${env:NOPE:devenv-helper-cache},target=/c,type=volume', HELPER_CACHE],
-      ['the object form', { source: '${localEnv:NOPE:devenv-other-abcdef12}', target: '/x', type: 'volume' }, FOREIGN],
+      ['the object form', { source: `\${localEnv:NOPE:${OTHER}}`, target: '/x', type: 'volume' }, FOREIGN],
       ['the object form of the helper cache', { type: 'volume', source: '${env:NOPE:devenv-helper-cache}', target: '/c' }, HELPER_CACHE],
-      ['a name of another environment built from the basename (repository api)', 'source=devenv-${localWorkspaceFolderBasename}-abcdef12,target=/x,type=volume', 'volume devenv-api-abcdef12 of another environment'],
-      ['a default without a type', 'src=${localEnv:NOPE:devenv-other-abcdef12},dst=/x', FOREIGN],
+      ['a name of another environment built from the basename (repository api)', 'source=devenv-${localWorkspaceFolderBasename}-tidy-berners,target=/x,type=volume', 'volume devenv-api-tidy-berners of another environment'],
+      ['a default without a type', `src=\${localEnv:NOPE:${OTHER}},dst=/x`, FOREIGN],
     ])('refuses %s, with the checks on and off', (_name, mount, item) => {
       for (const checksOn of [true, false]) {
         expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
@@ -1638,16 +1828,16 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
     it.each<[string, unknown, string, string?]>([
       ['a variable of the helper process in a volume name', 'source=${localEnv:HOSTNAME},target=/x,type=volume', '${localEnv:HOSTNAME}'],
       // hotfix review 1, N4: HOME is known in the helper (/root), so TERM, which may be set.
-      ['a variable of the helper process with a default', 'source=${env:TERM:devenv-other-abcdef12},target=/x,type=volume', '${env:TERM:devenv-other-abcdef12}'],
+      ['a variable of the helper process with a default', `source=\${env:TERM:${OTHER}},target=/x,type=volume`, `\${env:TERM:${OTHER}}`],
       ['a variable of the helper process in a target', 'source=cache,target=${localEnv:PATH},type=volume', '${localEnv:PATH}'],
       ['a variable of the helper process in the object form', { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' }, '${localEnv:HOSTNAME}'],
       ['a variable of the helper process without a type', 'source=${localEnv:HOSTNAME},target=/x', '${localEnv:HOSTNAME}'],
       ['${containerEnv:…}, which the CLI leaves for a new container', 'source=${containerEnv:VOLUME},target=/x,type=volume', '${containerEnv:VOLUME}'],
       [
         'a variable left by a default (named in the resolved text)',
-        'source=${localEnv:NOPE:$}{localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume',
-        '${localEnv:NOPE:devenv-other-abcdef12}',
-        'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume',
+        `source=\${localEnv:NOPE:$}{localEnv:NOPE:${OTHER}},target=/x,type=volume`,
+        `\${localEnv:NOPE:${OTHER}}`,
+        `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`,
       ],
       ['${env} without a name (the CLI stops)', 'source=${env},target=/x,type=volume', '${env}'],
       // hotfix review 1, N4: HOME is known in the helper (/root), so PWD, which may be set.
@@ -1706,8 +1896,8 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
     });
 
     it('names the resolved volumes, for the labels and for the check of existing volumes', () => {
-      const mounts = ['source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', { source: '${env:NOPE:shared}', target: '/s', type: 'volume' }];
-      expect(mountedVolumeNames(input(where, mounts))).toEqual(['devenv-other-abcdef12', 'shared']);
+      const mounts = [`source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`, { source: '${env:NOPE:shared}', target: '/s', type: 'volume' }];
+      expect(mountedVolumeNames(input(where, mounts))).toEqual([OTHER, 'shared']);
       // An existing volume of another program, by the resolved name.
       const labelled = { ...input(where, [mounts[1]]), volumeLabels: { shared: { 'com.docker.compose.project': 'db' } } };
       expect(hostAccessProblems(labelled)).toEqual(['volume shared of the Docker Compose project db']);
@@ -1717,9 +1907,9 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
   });
 
   it.each<[string, string[], string[]]>([
-    ['--mount with a default', ['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume'], [FOREIGN]],
+    ['--mount with a default', ['--mount', `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`], [FOREIGN]],
     ['-v with a default', ['-v', '${env:NOPE:devenv-helper-cache}:/c'], [HELPER_CACHE]],
-    ['--volume= with the basename', ['--volume=devenv-${localWorkspaceFolderBasename}-abcdef12:/x'], ['volume devenv-api-abcdef12 of another environment']],
+    ['--volume= with the basename', ['--volume=devenv-${localWorkspaceFolderBasename}-tidy-berners:/x'], ['volume devenv-api-tidy-berners of another environment']],
   ])('refuses %s in runArgs, with the checks on and off', (_name, raw, items) => {
     // hotfix review 1: the runArgs as read-configuration returns them (substituted once).
     const runArgs = substituteCliVariables(raw, variables);
@@ -1747,10 +1937,10 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
     // As read-configuration returns it, the bind mount is access to the computer.
     expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } })).toEqual(['bind mount /root/.ssh']);
     expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } }, false)).toEqual([]);
-    expect(runArgsProblems(['--mount', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x'], OWN)).toEqual([
-      'runArgs "source=${localEnv:NOPE:devenv-other-abcdef12},target=/x" uses ${localEnv:NOPE:devenv-other-abcdef12}, which cannot be checked',
+    expect(runArgsProblems(['--mount', `source=\${localEnv:NOPE:${OTHER}},target=/x`], OWN)).toEqual([
+      `runArgs "source=\${localEnv:NOPE:${OTHER}},target=/x" uses \${localEnv:NOPE:${OTHER}}, which cannot be checked`,
     ]);
-    expect(runArgsProblems(['--mount', 'source=devenv-other-abcdef12,target=/x'], OWN)).toEqual([FOREIGN]);
+    expect(runArgsProblems(['--mount', `source=${OTHER},target=/x`], OWN)).toEqual([FOREIGN]);
   });
 
   it('checks the other properties of the metadata as the CLI resolves them', () => {
@@ -1759,7 +1949,7 @@ describe('host access policy: variables of the Dev Container CLI in mounts (hotf
   });
 
   it('keeps the own workspace volume and names built from the basename that are not named like an environment', () => {
-    const own = helperCliVariables('acme/devenv-acme-api-3f2a9c1e');
+    const own = helperCliVariables(`acme/${OWN}`);
     expect(hostAccessProblems({ ownVolume: OWN, variables: own, metadata: [{ mounts: ['source=${localWorkspaceFolderBasename},target=/o,type=volume'] }] })).toEqual([]);
     expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts: ['source=devenv-${localWorkspaceFolderBasename}-cache,target=/c,type=volume'] }] })).toEqual([]);
   });
@@ -1804,7 +1994,7 @@ describe('host access policy: names of variables (hotfix GH)', () => {
 // `up`. The findings N1 to N6 of the review, with the vectors of the reviewers and verifiers.
 describe('host access policy: what the Dev Container CLI substitutes again at up (hotfix review 1)', () => {
   const variables = helperCliVariables('acme/api');
-  const FOREIGN_NAME = 'devenv-other-abcdef12';
+  const FOREIGN_NAME = OTHER;
   // The process of the CLI in the helper: `docker run -i` without `-t` (no TERM), no OLDPWD, `_`, or proxy variables.
   const HELPER_PROCESS = { HOME: '/root', PATH: '/usr/local/bin:/usr/bin:/bin', HOSTNAME: '0123456789ab', NODE_VERSION: '24.1.0', YARN_VERSION: '1.22.22' };
   /** What read-configuration returns: the configuration substituted once by the CLI in the helper (T1). */

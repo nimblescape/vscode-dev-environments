@@ -529,7 +529,7 @@ function networkModeProblems(value: unknown, ctx: ServiceContext): Problem[] {
     return ctx.services.has(target) && target !== ctx.name ? [] : [access(`network of another container (${mode})`)];
   }
   // The network of another environment (by its name, its labels, or its containers): account separation.
-  const foreign = isOtherEnvironmentProjectName(mode, ctx.input.project) || foreignNetworkItem(mode, ctx.input.networks?.[mode], ctx.input.environment?.id) !== undefined;
+  const foreign = isOtherEnvironmentProjectName(mode, ctx.input.project) || foreignNetworkItem(mode, ctx.input.networks?.[mode], ctx.input.environment?.id, ctx.input.project) !== undefined;
   return foreign ? [guarded(`network ${mode} of another environment`)] : [];
 }
 
@@ -969,7 +969,7 @@ function topLevelNetworkProblems(input: ComposeAccessInput): Problem[] {
     const at = `network ${key}: `;
     const name = names.get(key) ?? key;
     // A network of another environment (by its name, its labels, or its containers): account separation.
-    if (isOtherEnvironmentProjectName(name, input.project) || foreignNetworkItem(name, input.networks?.[name], input.environment?.id) !== undefined) {
+    if (isOtherEnvironmentProjectName(name, input.project) || foreignNetworkItem(name, input.networks?.[name], input.environment?.id, input.project) !== undefined) {
       problems.push(guarded(`network ${name} of another environment`));
     }
     if (!isUnset(network.driver) && String(network.driver) !== 'bridge') problems.push(access(`${at}driver ${String(network.driver)}`));

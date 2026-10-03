@@ -6,6 +6,7 @@
 // same model are allowed; what reaches the GitHub token (the workspace volume and the processes of the dev container) or
 // other containers stays refused whatever the switch of the host access checks says.
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { ComposeModel } from './compose';
 import {
   composeAccessClassification,
@@ -17,8 +18,11 @@ import {
 } from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 const INTERNAL = "mounts into the extension's internal folder are not supported";
 
@@ -92,7 +96,7 @@ describe('review round 22, H22-2: volumes_from', () => {
   });
 
   it('refuses the volumes of any container whatever the switch says', () => {
-    for (const entry of ['container:devenv-acme-web-11111111', 'container:postgres:ro', 'container:x:rw']) {
+    for (const entry of [`container:${OTHER}`, 'container:postgres:ro', 'container:x:rw']) {
       expect(classes(set('db', { volumes_from: [entry] }))).toEqual([{ item: `service db: volumes_from ${entry} (the volumes of another container)`, class: 'protected' }]);
     }
   });
@@ -268,7 +272,7 @@ describe('review round 22, H22-6: ipc and pid of another service', () => {
   });
 
   it('refuses pid container: and --pid container: whatever the switch says', () => {
-    expect(classes(set('db', { pid: 'container:devenv-acme-web-11111111' }))).toEqual([{ item: 'service db: pid container:devenv-acme-web-11111111', class: 'protected' }]);
+    expect(classes(set('db', { pid: `container:${OTHER}` }))).toEqual([{ item: `service db: pid container:${OTHER}`, class: 'protected' }]);
     expect(hostAccessClassification({ config: { runArgs: ['--pid', 'container:x'] }, ownVolume: OWN })).toEqual([{ item: '--pid=container:x', class: 'protected' }]);
     expect(hostAccessClassification({ config: { runArgs: ['--pid=host'] }, ownVolume: OWN })).toEqual([{ item: '--pid=host', class: 'computer' }]);
   });

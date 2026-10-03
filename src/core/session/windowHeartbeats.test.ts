@@ -5,7 +5,7 @@
 // Plan step 8, PR A: the heartbeats of a window to the Session Monitor container of the engine of each environment that
 // it uses, on every engine (user decisions Q1 and Q4 of 2026-10-02).
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { describeDockerHost, remoteContextName, type DockerTarget } from '../docker/dockerHost';
+import { describeDockerHost, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import { abortError, isAbortError } from '../ports';
 import { Messages } from '../messages';
@@ -528,8 +528,11 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
   // Review round 1 of PR #85, A-R1-3: the engine of the connected environment is the one of this window's own context.
   describe("the engine of the window's own context (review round 1 of PR #85, A-R1-3)", () => {
     const DESKTOP: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///home/me/.docker/desktop/docker.sock', context: 'desktop-linux' };
-    function sources(options: { own?: string; current: DockerTarget; contexts: Record<string, DockerTarget | undefined> }) {
+    // User decisions 2026-10-03: the context of a host comes from ensureRemoteContext (remoteContext; before:
+    // remoteContextName); `remote` answers per host, by default the first name of remoteContextNames.
+    function sources(options: { own?: string; current: DockerTarget; contexts: Record<string, DockerTarget | undefined>; remote?: Record<string, string | undefined> }) {
       const asked: string[] = [];
+      const remoteAsked: string[] = [];
       const value: HeartbeatEngineSources = {
         windowContext: () => options.own,
         current: async () => options.current,
@@ -537,8 +540,12 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
           asked.push(name);
           return options.contexts[name];
         },
+        remoteContext: async (host) => {
+          remoteAsked.push(host);
+          return options.remote === undefined ? remoteContextNames(host)[0] : options.remote[host];
+        },
       };
-      return { value, asked };
+      return { value, asked, remoteAsked };
     }
 
     it("uses the window's own context for a connected local environment, even when the global context is remote", async () => {
@@ -576,8 +583,33 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
         kind: 'remote',
         host: 'build-box',
         endpoint: 'ssh://build-box',
-        context: remoteContextName('build-box'),
+        // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+        context: remoteContextNames('build-box')[0],
       });
+      expect(s.remoteAsked).toEqual([]);
+      expect(t.remoteAsked).toEqual(['build-box']);
+    });
+
+    // User decisions 2026-10-03: the context of the host as ensureRemoteContext gives it (for example the name with the
+    // pair of the host on a clash); no engine when it cannot be had.
+    it('a remote environment without its own context: the context that remoteContext gives, none when it gives none', async () => {
+      const remote = environment(ID_A, 'acme/api', { dockerHost: 'me@build-box:2222' });
+      const pair = remoteContextNames('me@build-box:2222')[1];
+      const s = sources({ current: LOCAL, contexts: {}, remote: { 'me@build-box:2222': pair } });
+      expect(await resolveHeartbeatEngine(remote, { connected: true }, s.value)).toEqual({
+        kind: 'remote',
+        host: 'me@build-box:2222',
+        endpoint: 'ssh://me@build-box:2222',
+        context: pair,
+      });
+      const t = sources({ current: LOCAL, contexts: {}, remote: {} });
+      expect(await resolveHeartbeatEngine(remote, { connected: true }, t.value)).toBeUndefined();
+      expect(await resolveHeartbeatEngine(remote, { connected: false }, t.value)).toBeUndefined();
+      expect(t.remoteAsked).toEqual(['me@build-box:2222', 'me@build-box:2222']);
+      // A local environment never asks for the context of a host.
+      const u = sources({ current: REMOTE, contexts: { default: LOCAL }, remote: {} });
+      expect(await resolveHeartbeatEngine(environment(ID_B, 'acme/web'), { connected: true }, u.value)).toEqual(LOCAL);
+      expect(u.remoteAsked).toEqual([]);
     });
 
     it('an environment this window is only busy with: the target of the operation on its host, not the context of the window', async () => {
@@ -1147,17 +1179,31 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
     });
 
     it('resolveHeartbeatEngine: a remote environment this window is busy with, the current target local: the context of its host (E07)', async () => {
-      const value: HeartbeatEngineSources = { windowContext: () => undefined, current: async () => LOCAL, ofContext: async () => undefined };
+      // User decisions 2026-10-03: the context of the host from ensureRemoteContext (remoteContext).
+      const value: HeartbeatEngineSources = {
+        windowContext: () => undefined,
+        current: async () => LOCAL,
+        ofContext: async () => undefined,
+        remoteContext: async (host) => remoteContextNames(host)[0],
+      };
       expect(await resolveHeartbeatEngine(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: false }, value)).toEqual({
         kind: 'remote',
         host: 'build-box',
         endpoint: 'ssh://build-box',
-        context: remoteContextName('build-box'),
+        // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+        context: remoteContextNames('build-box')[0],
       });
     });
 
     it('resolveHeartbeatEngine: the context `default` on a remote engine is no engine for a local environment (E09)', async () => {
-      const value: HeartbeatEngineSources = { windowContext: () => undefined, current: async () => REMOTE, ofContext: async () => REMOTE };
+      const value: HeartbeatEngineSources = {
+        windowContext: () => undefined,
+        current: async () => REMOTE,
+        ofContext: async () => REMOTE,
+        remoteContext: async () => {
+          throw new Error('a local environment asks for no context of a host');
+        },
+      };
       expect(await resolveHeartbeatEngine(environment(ID_A, 'acme/api'), { connected: true }, value)).toBeUndefined();
     });
   });
@@ -1344,7 +1390,8 @@ describe('WindowHeartbeats rules found by mutation (review rounds 1 and 3 of PR 
 
   describe('round 1', () => {
     it('two remote engines: one series each, each heartbeat with only its own environment (W43)', async () => {
-      const OTHER_BOX: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: remoteContextName('other-box') };
+      // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+      const OTHER_BOX: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: remoteContextNames('other-box')[0] };
       const h = harness({ engines: { [ID_B]: OTHER_BOX } });
       h.environments.push(environment(ID_A, 'acme/api', { dockerHost: 'build-box' }));
       h.environments.push(environment(ID_B, 'acme/web', { dockerHost: 'other-box', ...busyMark() }));

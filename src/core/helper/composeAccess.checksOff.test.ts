@@ -8,6 +8,7 @@
 // for the repository; `protected` (account separation, the GitHub token and the owner account, items whose class is not
 // clear) and `unsupported` stay refused whatever the switch says.
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { ComposeModel } from './compose';
 import {
   composeAccessClassification,
@@ -20,8 +21,11 @@ import {
 } from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 
 function model(): ComposeModel {
@@ -102,14 +106,14 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['a network driver', input((m) => (m.networks = { lan: { driver: 'macvlan' } })), 'network lan: driver macvlan', 'computer'],
   ['a volume of another program', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'com.docker.compose.project': 'shop' } } }), `volume ${PROJECT}_pgdata of the Docker Compose project shop`, 'computer'],
   // Account separation, the GitHub token, the owner account, and items whose class is not clear.
-  ['a volume of another environment by its project name', input((m) => (m.volumes = { pgdata: { name: 'devenv-11111111_pgdata' } })), 'volume devenv-11111111_pgdata of another environment', 'protected'],
+  ['a volume of another environment by its project name', input((m) => (m.volumes = { pgdata: { name: `${OTHER}_pgdata` } })), `volume ${OTHER}_pgdata of another environment`, 'protected'],
   ['a volume of another environment by its labels', input(() => undefined, { volumeLabels: { [`${PROJECT}_pgdata`]: { 'nimblescape.devenv.environment-id': 'other' } } }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['a volume of an environment of another account', input(() => undefined, { foreignVolumes: [`${PROJECT}_pgdata`] }), `volume ${PROJECT}_pgdata of another environment`, 'protected'],
   ['the cache volume of the workspace helper', input((m) => (m.volumes = { pgdata: { name: 'devenv-helper-cache' } })), 'volume devenv-helper-cache of the workspace helper', 'protected'],
   // Review round 1 of PR #39 (R1).
   ['the volume of the remote Session Monitor', input((m) => (m.volumes = { pgdata: { name: 'devenv-session-monitor' } })), 'volume devenv-session-monitor of the Session Monitor', 'protected'],
-  ['a network of another environment', input((m) => (m.networks = { other: { name: 'devenv-11111111_default', external: true } })), 'network devenv-11111111_default of another environment', 'protected'],
-  ['network_mode of another environment', input(service('db', { network_mode: 'devenv-11111111_default' })), 'service db: network devenv-11111111_default of another environment', 'protected'],
+  ['a network of another environment', input((m) => (m.networks = { other: { name: `${OTHER}_default`, external: true } })), `network ${OTHER}_default of another environment`, 'protected'],
+  ['network_mode of another environment', input(service('db', { network_mode: `${OTHER}_default` })), `service db: network ${OTHER}_default of another environment`, 'protected'],
   // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
   ['the workspace volume in a side service', input(service('db', { volumes: [{ type: 'bind', source: '/workspaces', target: '/w' }] })), 'service db: bind mount /workspaces → /w (the workspace volume, with the repository and the Git configuration of the environment)', 'protected'],
   ['a link out of the repository', input(service('db', { volumes: [{ type: 'bind', source: `${REPO}/d`, target: '/d' }] }), { realPaths: { [`${REPO}/d`]: '/workspaces/.devenv+' } }), `service db: bind mount ${REPO}/d → /d (a link to /workspaces/.devenv+, outside of the repository)`, 'protected'],
@@ -156,9 +160,9 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['the file of a build secret in the cache volume', input((m) => { m.services.db = { ...m.services.db, build: { context: REPO, secrets: ['npm'] } }; m.secrets = { npm: { file: '/devenv-cache/npmrc' } }; }), 'service db: build secret npm file /devenv-cache/npmrc', 'protected'],
   ['build ssh (the agent)', input(service('db', { build: { context: REPO, ssh: ['default'] } })), 'service db: build ssh', 'computer'],
   // Review round 1, S2: a network of another environment under a name of its own, found by its labels or containers.
-  ['a named network of another project', input((m) => (m.networks = { backend: { name: 'backend' } }), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'network backend of another environment', 'protected'],
+  ['a named network of another project', input((m) => (m.networks = { backend: { name: 'backend' } }), { networks: { backend: { labels: { 'com.docker.compose.project': OTHER }, environments: [] } } }), 'network backend of another environment', 'protected'],
   ['an external network with a container of another environment', input((m) => (m.networks = { shared: { name: 'shared', external: true } }), { networks: { shared: { labels: {}, environments: ['11111111-0000-4000-8000-000000000000'] } } }), 'network shared of another environment', 'protected'],
-  ['network_mode of a network of another project', input(service('db', { network_mode: 'backend' }), { networks: { backend: { labels: { 'com.docker.compose.project': 'devenv-11111111' }, environments: [] } } }), 'service db: network backend of another environment', 'protected'],
+  ['network_mode of a network of another project', input(service('db', { network_mode: 'backend' }), { networks: { backend: { labels: { 'com.docker.compose.project': OTHER }, environments: [] } } }), 'service db: network backend of another environment', 'protected'],
   // Not supported, whatever the switch says.
   // Review round 7, P7-1: changed expectation, `restart: always` is rewritten, not refused; stop_grace_period 1m is.
   // Review round 8: changed expectation, a stop_grace_period over 20 s is capped; one that cannot be read is refused.
@@ -226,19 +230,19 @@ describe('the Dockerfiles of the services are not checked', () => {
   const ALLOWED = { hostAccess: [], unsupported: [] };
   it.each<[string, ComposeAccessInput]>([
     ['a local build whose Dockerfile could not be read', input(service('db', { build: { context: REPO } }), { dockerfiles: {} })],
-    ['FROM the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM docker.io/devenv-11111111:2 AS base\nFROM base\n' } })],
-    ['FROM the image of another environment through a build argument', input(service('db', { build: { context: REPO, args: { BASE: 'devenv-11111111:2' } } }), { dockerfiles: { db: 'ARG BASE=alpine\nFROM $BASE\n' } })],
-    ['FROM the image of another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'FROM devenv-11111111:2' } }), { dockerfiles: { db: 'FROM devenv-11111111:2' } })],
-    ['COPY --from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111:2 /a /a\n' } })],
-    ['RUN --mount from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM alpine\nRUN --mount=type=bind,from=docker.io/devenv-11111111,target=/a true\n' } })],
-    ['the syntax directive with the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=devenv-11111111:1\nFROM alpine\n' } })],
+    ['FROM the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `FROM docker.io/${OTHER}:2 AS base\nFROM base\n` } })],
+    ['FROM the image of another environment through a build argument', input(service('db', { build: { context: REPO, args: { BASE: `${OTHER}:2` } } }), { dockerfiles: { db: 'ARG BASE=alpine\nFROM $BASE\n' } })],
+    ['FROM the image of another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: `FROM ${OTHER}:2` } }), { dockerfiles: { db: `FROM ${OTHER}:2` } })],
+    ['COPY --from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `FROM alpine\nCOPY --from=${OTHER}:2 /a /a\n` } })],
+    ['RUN --mount from the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `FROM alpine\nRUN --mount=type=bind,from=docker.io/${OTHER},target=/a true\n` } })],
+    ['the syntax directive with the image of another environment', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `# syntax=${OTHER}:1\nFROM alpine\n` } })],
     ['a custom frontend in the syntax directive', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: '# syntax=docker.io/attacker/frontend:1\nFROM alpine\n' } })],
     ['a custom frontend in BUILDKIT_SYNTAX', input(service('db', { build: { context: REPO, args: { BUILDKIT_SYNTAX: 'ghcr.io/x/frontend' } } }), { dockerfiles: { db: 'FROM alpine\n' } })],
-    ['FROM another environment behind a pattern operator', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'ARG A=devenv-11111111:1x\nFROM ${A%x}\n' } })],
-    ['FROM another environment by the default of an argument without a value', input(service('db', { build: { context: REPO, args: { BASE: null } } }), { dockerfiles: { db: 'ARG BASE=devenv-11111111:1\nFROM $BASE\n' } })],
-    ['FROM another environment with a variable that is not resolved', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: 'FROM devenv-11111111${TARGETVARIANT}\n' } })],
-    ['COPY --from another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'x' } }), { dockerfiles: { db: 'FROM alpine\nCOPY --from=devenv-11111111 /a /a' } })],
-    ['FROM the image of another environment for the dev service', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: { app: 'FROM devenv-11111111:2\n' } })],
+    ['FROM another environment behind a pattern operator', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `ARG A=${OTHER}:1x\nFROM \${A%x}\n` } })],
+    ['FROM another environment by the default of an argument without a value', input(service('db', { build: { context: REPO, args: { BASE: null } } }), { dockerfiles: { db: `ARG BASE=${OTHER}:1\nFROM $BASE\n` } })],
+    ['FROM another environment with a variable that is not resolved', input(service('db', { build: { context: REPO } }), { dockerfiles: { db: `FROM ${OTHER}\${TARGETVARIANT}\n` } })],
+    ['COPY --from another environment in dockerfile_inline', input(service('db', { build: { context: REPO, dockerfile_inline: 'x' } }), { dockerfiles: { db: `FROM alpine\nCOPY --from=${OTHER} /a /a` } })],
+    ['FROM the image of another environment for the dev service', input(service('app', { image: undefined, build: { context: REPO } }), { dockerfiles: { app: `FROM ${OTHER}:2\n` } })],
   ])('allows %s', (_name, checked) => {
     // Dockerfile refusals removed (user decision 2026-09-27).
     expect(composeAccessClassification(checked)).toEqual([]);
@@ -254,10 +258,10 @@ describe('the Dockerfiles of the services are not checked', () => {
 describe('images named devenv-… are not refused by their name', () => {
   const ALLOWED = { hostAccess: [], unsupported: [] };
   it.each<[string, ComposeAccessInput, string]>([
-    ['devenv-11111111:3', input(service('db', { image: 'devenv-11111111:3' })), 'devenv-11111111:3'],
-    ['index.docker.io/library/devenv-11111111:3', input(service('db', { image: 'index.docker.io/library/devenv-11111111:3' })), 'index.docker.io/library/devenv-11111111:3'],
-    ['registry-1.docker.io/devenv-11111111-db@sha256:…', input(service('db', { image: 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64) })), 'registry-1.docker.io/devenv-11111111-db@sha256:' + 'a'.repeat(64)],
-    ['an additional context docker-image://devenv-11111111:2', input(service('db', { build: { context: REPO, additional_contexts: { base: 'docker-image://devenv-11111111:2' } } })), 'devenv-11111111:2'],
+    [`${OTHER}:3`, input(service('db', { image: `${OTHER}:3` })), `${OTHER}:3`],
+    [`index.docker.io/library/${OTHER}:3`, input(service('db', { image: `index.docker.io/library/${OTHER}:3` })), `index.docker.io/library/${OTHER}:3`],
+    [`registry-1.docker.io/${OTHER}-db@sha256:…`, input(service('db', { image: `registry-1.docker.io/${OTHER}-db@sha256:` + 'a'.repeat(64) })), `registry-1.docker.io/${OTHER}-db@sha256:` + 'a'.repeat(64)],
+    [`an additional context docker-image://${OTHER}:2`, input(service('db', { build: { context: REPO, additional_contexts: { base: `docker-image://${OTHER}:2` } } })), `${OTHER}:2`],
   ])('allows %s', (_name, checked, reference) => {
     expect(composeAccessClassification(checked)).toEqual([]);
     expect(composeAccessReport(checked)).toEqual(ALLOWED);

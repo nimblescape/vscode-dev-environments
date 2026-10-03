@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { beforeEach, inject } from 'vitest';
+import { beforeEach, expect, inject } from 'vitest';
 import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { findExecutable } from '../../src/core/docker/dockerCli';
 import { helperImageTag } from '../../src/core/helper/helperImage';
@@ -16,7 +16,7 @@ import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/cor
 import type { CheckOutcome, ConfigReferences, ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { RegistryClient } from '../../src/core/imageCheck/registryClient';
 import type { ProgressStep } from '../../src/core/messages';
-import { LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../../src/core/names';
+import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_HELPER_RUN, LABEL_OWNER_ID, LABEL_REPOSITORY, WORKSPACES_ROOT } from '../../src/core/names';
 import { errorDetail } from '../../src/core/pipeline/pipelineRules';
 import {
   abortError,
@@ -28,6 +28,7 @@ import {
   type ProgressReporter,
   type RunResult,
 } from '../../src/core/ports';
+import type { Environment } from '../../src/core/types';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
@@ -44,6 +45,22 @@ export function runInVolume(docker: Pick<ContainerAdapter, 'run'>, volume: strin
   const tag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
   const args = ['run', '--rm', '-i', '--pull', 'never', '--label', `${LABEL_HELPER_RUN}=true`, '--network', 'none', '--mount', `type=volume,source=${volume},target=${WORKSPACES_ROOT}`, tag, ...command];
   return docker.run(args, { input });
+}
+
+/**
+ * User decisions 2026-10-03: the environment image of `entry` (its build record) carries the labels of the environment
+ * (environment ID, repository, owner) and its build record as JSON, and the record pins the ID of that image (`docker
+ * image inspect -f {{.Id}}`). Returns the labels of the image.
+ */
+export function expectLabelledEnvironmentImage(cli: DockerCli, entry: Environment | undefined): Record<string, string> {
+  const record = entry?.buildRecord;
+  expect(record).toBeDefined();
+  const image = record!.environmentImage;
+  const labels = cli.image(image)?.Config.Labels ?? {};
+  expect(labels).toMatchObject({ [LABEL_ENVIRONMENT_ID]: entry!.id, [LABEL_REPOSITORY]: entry!.repository, [LABEL_OWNER_ID]: entry!.owner.id });
+  expect(JSON.parse(labels[LABEL_BUILD_RECORD] ?? '{}')).toMatchObject({ environmentImage: image, buildNumber: record!.buildNumber, configPath: record!.configPath });
+  expect(record!.imageId).toBe(cli.ok(['image', 'inspect', '-f', '{{.Id}}', image]));
+  return labels;
 }
 
 /** Token for the helper runs. The tests clone only public repositories, so Git never sends it. */

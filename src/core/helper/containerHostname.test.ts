@@ -3,11 +3,15 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { TOKEN_TMPFS, containerHostname } from '../names';
+import { TOKEN_TMPFS, containerHostname, resourceName } from '../names';
 import { buildOverrideConfig } from './devcontainerCli';
 import { runArgsDecideHostname } from '../policy';
 
-const base = { environmentImage: 'i:1', volumeName: 'devenv-acme-api-3f2a9c1e', repositoryName: 'module-oop', containerName: 'devenv-acme-api-3f2a9c1e' };
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const OWN = resourceName('acme/api', NAME_ID);
+
+const base = { environmentImage: 'i:1', volumeName: OWN, repositoryName: 'module-oop', containerName: OWN };
 
 function hostnameOf(runArgs: string[]): string | undefined {
   const args = buildOverrideConfig({ ...base, runArgs }).runArgs as string[];

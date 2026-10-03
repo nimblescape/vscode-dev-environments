@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
 import { helperCliVariables, substituteCliVariables } from '../helper/cliVariables';
+import { namePair } from '../namePairs';
 import { Messages } from '../messages';
 import {
   CONTAINER_CONFIG_UNKNOWN,
@@ -29,6 +30,7 @@ import {
   ENV_ID,
   FEATURE,
   FEATURE_DIGEST,
+  OTHER_ID,
   REPO,
   checked,
   createHarness,
@@ -44,8 +46,10 @@ import { GITHUB_CLI_ACCOUNT_REASON, hostAccessProblems, runArgsProblems } from '
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
-const IMAGE_2 = environmentImageName(ENV_ID, 2);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
+const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
+/** User decisions 2026-10-03: the workspace volume of another environment (resourceName; the short ID is gone). */
+const OTHER_VOLUME = resourceName('acme/other', OTHER_ID);
 const UNRESTRICTED_LABELS = { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED };
 const PRIVILEGED_WITH_SOCKET = {
   image: BASE_IMAGE,
@@ -178,7 +182,8 @@ describe('host access checks off for the repository', () => {
     ['initializeCommand', { initializeCommand: 'docker ps' }, Messages.hostAccess('initializeCommand')],
     ['the cache volume of the workspace helper', { mounts: ['source=devenv-helper-cache,target=/c,type=volume'] }, Messages.hostAccess('volume devenv-helper-cache of the workspace helper')],
     ['the volume of the remote Session Monitor', { mounts: ['source=devenv-session-monitor,target=/s,type=volume'] }, Messages.hostAccess('volume devenv-session-monitor of the Session Monitor')],
-    ['the workspace volume of another environment', { mounts: ['source=devenv-acme-web-11111111,target=/w,type=volume'] }, Messages.hostAccess('volume devenv-acme-web-11111111 of another environment')],
+    // User decisions 2026-10-03: a name of another environment is resourceName (it was devenv-acme-web-11111111).
+    ['the workspace volume of another environment', { mounts: [`source=${resourceName('acme/web', OTHER_ID)},target=/w,type=volume`] }, Messages.hostAccess(`volume ${resourceName('acme/web', OTHER_ID)} of another environment`)],
     ['a label of Dev Environments', { runArgs: ['--label', 'nimblescape.devenv.environment-id=x'] }, Messages.unsupportedOptions('label nimblescape.devenv.environment-id')],
     ['an unknown flag', { runArgs: ['--pull=always', '--privileged'] }, Messages.unsupportedOptions('--pull')],
     ['--restart always', { runArgs: ['--restart=always'] }, Messages.unsupportedOptions('--restart=always')],
@@ -353,7 +358,7 @@ describe('a refused update and the switch (concept 7.7)', () => {
     h.docker.containersOf(ENV_ID)[0].state = 'stopped';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.builds).toHaveLength(2);
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(ENV_ID, 3));
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(REPO, ENV_ID, 3));
     expect(await refusedUpdate()).toBeUndefined();
     expect(h.docker.containersOf(ENV_ID)[0].labels[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
   });
@@ -391,11 +396,17 @@ function readConfiguration<T>(raw: T): T {
 }
 
 describe('variables of the Dev Container CLI in the image metadata (hotfix M1)', () => {
+  // User decisions 2026-10-03: the names of other environments are resourceName (they were devenv-other-abcdef12 and
+  // devenv-api-abcdef12): OTHER_VOLUME, and the name of OTHER_ID in this repository built from the basename.
   const VECTORS: Array<[string, string | { source: string; target: string; type: string }, string]> = [
-    ['a default of an unset ${localEnv:…}', 'source=${localEnv:NOPE:devenv-other-abcdef12},target=/x,type=volume', 'volume devenv-other-abcdef12 of another environment'],
+    ['a default of an unset ${localEnv:…}', `source=\${localEnv:NOPE:${OTHER_VOLUME}},target=/x,type=volume`, `volume ${OTHER_VOLUME} of another environment`],
     ['a default of an unset ${env:…}', 'source=${env:NOPE:devenv-helper-cache},target=/c,type=volume', 'volume devenv-helper-cache of the workspace helper'],
-    ['the object form', { source: '${localEnv:NOPE:devenv-other-abcdef12}', target: '/x', type: 'volume' }, 'volume devenv-other-abcdef12 of another environment'],
-    ['a name built from the basename', 'source=devenv-${localWorkspaceFolderBasename}-abcdef12,target=/x,type=volume', 'volume devenv-api-abcdef12 of another environment'],
+    ['the object form', { source: `\${localEnv:NOPE:${OTHER_VOLUME}}`, target: '/x', type: 'volume' }, `volume ${OTHER_VOLUME} of another environment`],
+    [
+      'a name built from the basename',
+      `source=devenv-acme-\${localWorkspaceFolderBasename}-${namePair(OTHER_ID)},target=/x,type=volume`,
+      `volume ${resourceName(REPO, OTHER_ID)} of another environment`,
+    ],
   ];
 
   describe.each<[string, boolean]>([

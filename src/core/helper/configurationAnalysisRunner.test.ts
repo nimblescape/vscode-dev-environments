@@ -11,6 +11,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Worker } from 'worker_threads';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import type { ComposeModel } from './compose';
 import { helperCliVariables, mayBeSetInHelper } from './cliVariables';
 import {
@@ -27,8 +28,11 @@ import type { ComposeAccessInput } from '../policy';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 const REFUSED = { hostAccess: [], unsupported: [ANALYSIS_FAILED_ITEM] };
 
@@ -142,7 +146,7 @@ describe('WorkerConfigurationAnalyzer', () => {
     const dockerfile = 'ARG VARIANT=3.12\nFROM mcr.microsoft.com/devcontainers/python:${VARIANT} AS base\nCOPY --from=base / /\nFROM base\n';
     const jobs: AnalysisJob[] = [
       singleJob(dockerfile, { build: { dockerfile: 'Dockerfile', args: { VARIANT: '3.11' } }, features: { 'ghcr.io/devcontainers/features/node:1': {} } }),
-      singleJob('FROM devenv-11111111:1\n'),
+      singleJob(`FROM ${OTHER}:1\n`),
       { kind: 'hostAccess', checksOn: true, input: { config: { runArgs: ['--privileged', '-p', '3000:3000'], mounts: ['type=bind,source=/,target=/host'] }, ownVolume: OWN } },
       { kind: 'hostAccess', checksOn: false, input: { config: { runArgs: ['--privileged'] }, ownVolume: OWN } },
       {
@@ -155,7 +159,7 @@ describe('WorkerConfigurationAnalyzer', () => {
             services: {
               app: { build: { context: REPO, dockerfile: 'Dockerfile' }, volumes: [{ type: 'bind', source: '/workspaces', target: '/workspaces' }] },
               db: { image: 'postgres:16', restart: 'unless-stopped', volumes: [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data' }] },
-              cache: { image: 'devenv-22222222:1', privileged: true },
+              cache: { image: `${OTHER}:1`, privileged: true },
             },
             volumes: { pgdata: { name: `${PROJECT}_pgdata` } },
           },

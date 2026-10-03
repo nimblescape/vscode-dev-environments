@@ -5,11 +5,12 @@
 import { describe, expect, it } from 'vitest';
 import type { RunOptions, RunResult } from '../ports';
 import { attachDiagnostics } from './attachDiagnostics';
-import { dockerTargetOf, remoteContextName } from './dockerHost';
+import { dockerTargetOf, remoteContextNames } from './dockerHost';
 import { operationDockerTarget, runWithDockerTarget } from './dockerTargets';
 
 const NAME = 'devenv-acme-api-a1b2c3d4';
-const CONTEXT = remoteContextName('build-box');
+// User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
+const CONTEXT = remoteContextNames('build-box')[0];
 
 function ok(stdout: string): RunResult {
   return { exitCode: 0, stdout, stderr: '', timedOut: false };
@@ -33,7 +34,7 @@ describe('attachDiagnostics (user request 2026-09-28)', () => {
   it('reports the variables, the current context, and both inspects of a remote environment', async () => {
     const docker = fakeDocker((args) => {
       const text = args.join(' ');
-      if (text === 'context show') return ok('devenv-remote-5709ff28\n');
+      if (text === 'context show') return ok('machines\n');
       if (text.startsWith('context inspect')) return ok('ssh://machines\n');
       if (text.startsWith('--context')) return ok('abc123 running\n');
       return { exitCode: 1, stdout: '', stderr: `Error: No such container: /${NAME}\n`, timedOut: false };
@@ -41,7 +42,7 @@ describe('attachDiagnostics (user request 2026-09-28)', () => {
     const lines = await attachDiagnostics(docker, { DOCKER_CONTEXT: 'x' }, NAME, CONTEXT, 'linux');
     expect(lines).toEqual([
       'DOCKER_HOST: not set; DOCKER_CONTEXT: x.',
-      'Current Docker context: devenv-remote-5709ff28, endpoint ssh://machines.',
+      'Current Docker context: machines, endpoint ssh://machines.',
       `Docker context of the environment: ${CONTEXT}.`,
       `Inspect of ${NAME} without a context (as the first call of Dev Containers): failed (exit code 1): Error: No such container: /${NAME}.`,
       `Inspect of ${NAME} with the context ${CONTEXT}: abc123 running.`,

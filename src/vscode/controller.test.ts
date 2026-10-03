@@ -21,7 +21,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import { availableEnvironments } from '../core/ownership';
-import { dockerTargetOf, remoteContextName, type DockerTarget } from '../core/docker/dockerHost';
+import { dockerTargetOf, ownContextDescription, remoteContextNames, type DockerTarget } from '../core/docker/dockerHost';
 import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { silentLogger } from '../core/ports';
 import type { Environment, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
@@ -3522,7 +3522,8 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     h.auth.getAccount.mockResolvedValue(ACCOUNT);
     await h.controller.onSessionChanged();
-    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', remoteContextName('build-box'));
+    // User decisions 2026-10-03: the context named after the host (before: remoteContextName).
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', remoteContextNames('build-box')[0]);
   });
 
   // Review of the attach context (A1): outside an operation, the context comes from this window's own authority, then
@@ -3559,7 +3560,52 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     h.auth.getAccount.mockResolvedValue(ACCOUNT);
     await h.controller.onSessionChanged();
-    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', remoteContextName('build-box'));
+    // User decisions 2026-10-03: named after the host (`build-box`), created by ensureRemoteContext when missing.
+    expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'build-box');
+    const calls = h.docker.run.mock.calls.map(([args]) => (args as string[]).join(' '));
+    expect(calls).toContain('context ls --format {{json .}}');
+    expect(calls).toContain(`context create build-box --description ${ownContextDescription('build-box')} --docker host=ssh://build-box`);
+  });
+
+  // User decisions 2026-10-03: the fallback of windowArgs is ensureRemoteContext with the Docker of the controller.
+  describe('the context of the window from ensureRemoteContext (user decisions 2026-10-03)', () => {
+    /** The answers of `docker context ls --format {{json .}}` for `contexts`; every other call succeeds. */
+    function contextsAre(contexts: Array<{ Name: string; Description?: string; DockerEndpoint: string }>): void {
+      h.docker.run.mockImplementation(async (args: readonly string[]) => ({
+        exitCode: 0,
+        stdout: args[0] === 'context' && args[1] === 'ls' ? contexts.map((context) => `${JSON.stringify(context)}\n`).join('') : '',
+        stderr: '',
+        timedOut: false,
+      }));
+    }
+
+    async function reopen(): Promise<string[]> {
+      const env = remoteEnvironment();
+      await h.registry.add(env);
+      h.connection.currentContainerName.mockReturnValue(env.containerName);
+      await connectHere(env);
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      await h.controller.onSessionChanged();
+      await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+      h.auth.getAccount.mockResolvedValue(ACCOUNT);
+      await h.controller.onSessionChanged();
+      return h.docker.run.mock.calls.map(([args]) => (args as string[]).join(' ')).filter((call) => call.startsWith('context create'));
+    }
+
+    it('uses a context of the user that points to the host as it is', async () => {
+      recreateHarness({ leaveCheckMs: 100 });
+      contextsAre([{ Name: 'default', DockerEndpoint: 'unix:///var/run/docker.sock' }, { Name: 'build-box', Description: 'mine', DockerEndpoint: 'ssh://build-box' }]);
+      expect(await reopen()).toEqual([]);
+      expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', 'build-box');
+    });
+
+    it('creates the name with the pair of the host when a context with the name points elsewhere', async () => {
+      recreateHarness({ leaveCheckMs: 100 });
+      contextsAre([{ Name: 'build-box', Description: 'mine', DockerEndpoint: 'ssh://me@elsewhere' }]);
+      const pair = remoteContextNames('build-box')[1];
+      expect(await reopen()).toEqual([`context create ${pair} --description ${ownContextDescription('build-box')} --docker host=ssh://build-box`]);
+      expect(h.connection.open).toHaveBeenCalledWith('devenv-acme-api-a1b2c3d4', '/workspaces/api', pair);
+    });
   });
 
   it('a restored window of another host asks "Use <host> again?"; declined, it runs nothing and closes its connection', async () => {

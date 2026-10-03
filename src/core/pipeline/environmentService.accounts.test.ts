@@ -9,6 +9,7 @@ import { UserFacingError } from '../errors';
 import { dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, environmentImageRepository, resourceName } from '../names';
+import { namePair } from '../namePairs';
 import { availableEnvironments } from '../ownership';
 import { otherAccountImageItem } from '../policy';
 import type { Environment, GitHubAccount } from '../types';
@@ -378,7 +379,7 @@ describe('a lost registry: the named volumes without labels that the container o
   /** The registry is lost; the volume and the container of OTHER_ACCOUNT's environment are still there. */
   function lostRegistry(mounted: string[]): void {
     h.docker.volumes.set(WORKSPACE, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
-    const container = h.docker.addContainer({ environmentId: OTHER_ID, name: WORKSPACE, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name: WORKSPACE, state: 'stopped', image: environmentImageName(REPO, OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [WORKSPACE, ...mounted] });
   }
 
@@ -422,17 +423,54 @@ describe('a lost registry: the named volumes without labels that the container o
 });
 
 describe('the ID of a new environment (implementation notes 5)', () => {
-  // The short ID (the first 8 characters) of ENV_ID, and a free one.
-  const TAKEN = '3f2a9c1e-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  // User decisions 2026-10-03: the short ID is gone from the names; an ID is in use when its name pair (namePair) is
+  // the pair of an ID of the registry or of a labelled volume, or when its volume or container exists.
+  /** An ID other than `id` with the same name pair (found by trying IDs one by one). */
+  function samePairAs(id: string, prefix = '3f2a9c1e-0000-4000-8000-'): string {
+    for (let n = 0; ; n++) {
+      const candidate = `${prefix}${n.toString(16).padStart(12, '0')}`;
+      if (candidate !== id && namePair(candidate) === namePair(id)) return candidate;
+    }
+  }
+  const TAKEN = samePairAs(ENV_ID);
   const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
 
-  it('is not one whose short ID an environment of the registry has (its images and names would be shared)', async () => {
+  it('uses IDs with the same name pair and one with another pair', () => {
+    expect(namePair(TAKEN)).toBe(namePair(ENV_ID));
+    expect(namePair(FREE)).not.toBe(namePair(ENV_ID));
+  });
+
+  it('is not one whose name pair an environment of the registry has (its names would be shared)', async () => {
     const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
     recreate({ newEnvironmentId: ids });
     await seedEnvironment(h, { repository: 'acme/web' });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).toBe(FREE);
     expect(ids).toHaveBeenCalledTimes(2);
+  });
+
+  it('is not one whose name pair the ID of a labelled volume on the engine has (an environment of another computer)', async () => {
+    const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
+    recreate({ newEnvironmentId: ids });
+    // An additional volume of an environment that the registry does not know.
+    h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).toBe(FREE);
+    expect(ids).toHaveBeenCalledTimes(2);
+  });
+
+  it('never removes a volume of its name that another environment created meanwhile (review round 1 of PR #88, A-R1-4)', async () => {
+    recreate({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    // Another first open on the engine created the volume of the same name between the check and the create.
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+    h.docker.volumes.set(name, theirs);
+    h.helper.cloneError = new Error('clone failed');
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect(h.docker.volumes.get(name)).toEqual(theirs);
+    // Review round 3 of PR #88: changed expectation, the text of workspaceVolumeOwnership (before: "belongs to another environment").
+    expect(h.logger.warnings.some((line) => line.includes(`carries the environment ID ${OTHER_ID}, not ${FREE}`))).toBe(true);
   });
 
   it('is not one whose volume exists, and that volume is never touched', async () => {
@@ -448,13 +486,26 @@ describe('the ID of a new environment (implementation notes 5)', () => {
     expect(h.docker.log).not.toContain(`volume rm ${existing}`);
   });
 
+  it('is not one whose container exists, and that container is never touched', async () => {
+    const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
+    recreate({ newEnvironmentId: ids });
+    const existing = resourceName(REPO, TAKEN);
+    const container = h.docker.addContainer({ environmentId: 'made-by-hand', name: existing, state: 'stopped', image: 'x' });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).toBe(FREE);
+    expect(ids).toHaveBeenCalledTimes(2);
+    expect(h.docker.containerByRef(container.id)).toBeDefined();
+    expect(h.docker.log).not.toContain(`rm ${container.id}`);
+  });
+
   it('gives up after a few IDs in use, before anything is created', async () => {
     const ids = vi.fn(() => TAKEN);
     recreate({ newEnvironmentId: ids });
     await seedEnvironment(h, { repository: 'acme/web' });
     await expect(h.service.open(TARGET, options())).rejects.toThrow(/No unused environment ID was found/);
     expect(ids.mock.calls.length).toBeGreaterThan(1);
-    expect(ids.mock.calls.length).toBeLessThanOrEqual(10);
+    // User decisions 2026-10-03: at most 20 attempts (it was 10).
+    expect(ids.mock.calls.length).toBeLessThanOrEqual(20);
     expect((await h.registry.list()).map((entry) => entry.repository)).toEqual(['acme/web']);
     expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
   });
@@ -547,7 +598,7 @@ describe('a named volume that the environments of one account share (concept sec
 
 describe('images of the environments of other accounts (user decision 2026-09-28)', () => {
   /** The environment image of the environment of OTHER_ACCOUNT (ENV_ID, REPO), and an ID of its own. */
-  const THEIRS = environmentImageName(ENV_ID, 1);
+  const THEIRS = environmentImageName(REPO, ENV_ID, 1);
   const ID = `sha256:${'a'.repeat(64)}`;
   const WEB = 'acme/web';
 
@@ -591,7 +642,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
       [0, `sha256:${'b'.repeat(64)}`],
       [2, `sha256:${'c'.repeat(64)}`],
     ] as const) {
-      const image = environmentImageName(ENV_ID, build);
+      const image = environmentImageName(REPO, ENV_ID, build);
       h.docker.images.add(image);
       h.docker.imageIds.set(image, id);
       await refused(image);
@@ -599,7 +650,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
   });
 
   it('refuses an image that Docker Compose built for that environment, also before its build record', async () => {
-    const built = `${environmentImageRepository(ENV_ID)}-db`;
+    const built = `${environmentImageRepository(REPO, ENV_ID)}-db`;
     h.docker.images.add(built);
     h.docker.imageIds.set(built, `sha256:${'d'.repeat(64)}`);
     await refused(built);
@@ -607,7 +658,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('refuses the images of an environment that another computer created on the host, by the owner label of its volume', async () => {
     const remote = '5e6f7a8b-0000-4000-8000-000000000005';
-    const image = environmentImageName(remote, 4);
+    const image = environmentImageName(WEB, remote, 4);
     h.docker.images.add(image);
     h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
     // An additional volume of that environment (no repository label): the open does not restore an entry from it, so
@@ -618,20 +669,49 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('allows the images of an environment of the same account that another computer created on the host', async () => {
     const remote = '5e6f7a8b-0000-4000-8000-000000000005';
-    const image = environmentImageName(remote, 4);
+    const image = environmentImageName(WEB, remote, 4);
     h.docker.images.add(image);
     h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
     // An additional volume of that environment (no repository label): the open does not restore an entry from it, so
     // only the owner label of the volume names the owner.
     h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // User decisions 2026-10-03: the name of the image no longer holds the ID (it holds the repository, which that volume
+    // does not name); the label nimblescape.devenv.environment-id that the extension gives its images links it.
+    h.docker.imageConfigs.set(image, { Labels: { [LABEL_ENVIRONMENT_ID]: remote } });
     h.helper.config = { image };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses an image labelled with the ID of an environment of another account, also under an unrelated name (user decisions 2026-10-03)', async () => {
+    h.docker.images.add('tools:1');
+    h.docker.imageIds.set('tools:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageRepoNames.set('tools:1', { repoTags: ['tools:1', 'devenv-copy:1'], repoDigests: [] });
+    // The environment ENV_ID of OTHER_ACCOUNT (registry); the image is listed under a devenv- name of no environment.
+    h.docker.imageConfigs.set('tools:1', { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    h.docker.images.add('devenv-copy:1');
+    h.docker.imageIds.set('devenv-copy:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageConfigs.set('devenv-copy:1', { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    await refused('tools:1');
+  });
+
+  it('allows an image labelled with the ID of an environment of the account (user decisions 2026-10-03)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false, image: false });
+    h.docker.images.add('tools:1');
+    h.docker.imageIds.set('tools:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageRepoNames.set('tools:1', { repoTags: ['tools:1', 'devenv-copy:1'], repoDigests: [] });
+    h.docker.imageConfigs.set('tools:1', { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.docker.images.add('devenv-copy:1');
+    h.docker.imageIds.set('devenv-copy:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageConfigs.set('devenv-copy:1', { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.helper.config = { image: 'tools:1' };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
   });
 
   it('refuses an image of an environment of no known owner (left behind by a Delete, or of another computer without a volume)', async () => {
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
-    const image = environmentImageName(gone, 2);
+    const image = environmentImageName(WEB, gone, 2);
     h.docker.images.add(image);
     h.docker.imageIds.set(image, `sha256:${'9'.repeat(64)}`);
     await refused(image);
@@ -639,14 +719,14 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('allows the image of an environment of the same account', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
-    h.helper.config = { image: environmentImageName(OTHER_ID, 1) };
+    h.helper.config = { image: environmentImageName(WEB, OTHER_ID, 1) };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
   });
 
   it('allows an image with the ID of an image of the same account: the same configuration builds the same image', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
-    h.docker.imageIds.set(environmentImageName(OTHER_ID, 1), ID);
+    h.docker.imageIds.set(environmentImageName(WEB, OTHER_ID, 1), ID);
     h.helper.config = { image: THEIRS };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
@@ -669,10 +749,21 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.helper.builds).toEqual([]);
   });
 
+  it('fails the check when Docker cannot read the labels of the images of the environments (review round 1 of PR #88, B-R1-1)', async () => {
+    // The labels decide whose image it is (user decisions 2026-10-03): without them the check fails, never by name only.
+    h.docker.imageLabelsOf = async () => {
+      throw new Error('Cannot connect to the Docker daemon');
+    };
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the images of the environments on the Docker host could not be read')));
+    expect(h.helper.builds).toEqual([]);
+  });
+
   it('fails the check when Docker cannot list the volumes that name the owner of an image', async () => {
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
-    h.docker.images.add(environmentImageName(gone, 2));
-    h.docker.imageIds.set(environmentImageName(gone, 2), ID);
+    h.docker.images.add(environmentImageName(WEB, gone, 2));
+    h.docker.imageIds.set(environmentImageName(WEB, gone, 2), ID);
     // Only the list right after the list of the images fails (the open lists the volumes for other reasons too).
     const listEnvironmentImages = h.docker.listEnvironmentImages.bind(h.docker);
     const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
@@ -717,8 +808,8 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('passes a cancellation during the list of the volumes that name the owners on as a cancellation (review round 3, S2)', async () => {
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
-    h.docker.images.add(environmentImageName(gone, 2));
-    h.docker.imageIds.set(environmentImageName(gone, 2), ID);
+    h.docker.images.add(environmentImageName(WEB, gone, 2));
+    h.docker.imageIds.set(environmentImageName(WEB, gone, 2), ID);
     const controller = new AbortController();
     const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
     h.docker.listEnvironmentVolumes = async () => {
@@ -734,15 +825,15 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('refuses the name of an image of an environment of another account or of no known owner that is not there yet (review round 3, S1)', async () => {
     // The next build of the environment of the other account: no registry has the name; only that build could make it.
-    await refused(environmentImageName(ENV_ID, 2));
-    await refused(`${environmentImageRepository(ENV_ID)}-db`);
-    await refused(environmentImageName('9a8b7c6d-0000-4000-8000-000000000009', 1));
+    await refused(environmentImageName(REPO, ENV_ID, 2));
+    await refused(`${environmentImageRepository(REPO, ENV_ID)}-db`);
+    await refused(environmentImageName(WEB, '9a8b7c6d-0000-4000-8000-000000000009', 1));
   });
 
   it('fails the check, not refuses by the name, when Docker could not inspect a reference (review round 4, T1, T2)', async () => {
     // By its ID the image would be allowed: an environment of the account has the same image.
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
-    h.docker.imageIds.set(environmentImageName(OTHER_ID, 1), ID);
+    h.docker.imageIds.set(environmentImageName(WEB, OTHER_ID, 1), ID);
     h.docker.transientImages = new Set([THEIRS]);
     h.helper.config = { image: THEIRS };
     const error = await rejection(h.service.open(TARGET, options()));
@@ -753,7 +844,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('does not refuse the name of an image of an environment of the same account that is not there', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false, image: false });
-    h.helper.config = { image: environmentImageName(OTHER_ID, 5) };
+    h.helper.config = { image: environmentImageName(WEB, OTHER_ID, 5) };
     const error = await h.service.open(TARGET, options()).then(
       () => undefined,
       (caught: unknown) => caught as UserFacingError,
@@ -775,7 +866,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.docker.imageInspections.every((references) => !references.includes(THEIRS))).toBe(true);
     // Review round 6 (V1): a missing name of an environment image (review round 3, S1) is decided with the list too.
     const lists = h.docker.environmentImageLists;
-    h.helper.config = { image: environmentImageName(ENV_ID, 9) };
+    h.helper.config = { image: environmentImageName(REPO, ENV_ID, 9) };
     await rejection(h.service.open(TARGET, options()));
     expect(h.docker.environmentImageLists).toBe(lists + 1);
   });
@@ -794,22 +885,22 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(ownerLists).toBe(0);
     // An image left behind by a Delete that no reference names: no volume list either.
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
-    h.docker.images.add(environmentImageName(gone, 2));
-    h.docker.imageIds.set(environmentImageName(gone, 2), `sha256:${'9'.repeat(64)}`);
+    h.docker.images.add(environmentImageName(WEB, gone, 2));
+    h.docker.imageIds.set(environmentImageName(WEB, gone, 2), `sha256:${'9'.repeat(64)}`);
     h.docker.images.add(BASE_IMAGE);
     h.helper.config = { image: BASE_IMAGE };
     await h.service.open(TARGET, options());
     expect(ownerLists).toBe(0);
     // A reference that names it: one list.
-    h.helper.config = { image: environmentImageName(gone, 2) };
+    h.helper.config = { image: environmentImageName(WEB, gone, 2) };
     await rejection(h.service.open(TARGET, options()));
     expect(ownerLists).toBe(1);
     // Review round 6 (V2): a missing name of an environment image of no known owner: one list.
-    h.helper.config = { image: environmentImageName('1b2c3d4e-0000-4000-8000-000000000011', 1) };
+    h.helper.config = { image: environmentImageName(WEB, '1b2c3d4e-0000-4000-8000-000000000011', 1) };
     await rejection(h.service.open(TARGET, options()));
     expect(ownerLists).toBe(2);
     // A missing name of the environment of the other account, which the registry knows: none.
-    h.helper.config = { image: environmentImageName(ENV_ID, 9) };
+    h.helper.config = { image: environmentImageName(REPO, ENV_ID, 9) };
     await rejection(h.service.open(TARGET, options()));
     expect(ownerLists).toBe(2);
   });
@@ -818,7 +909,7 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     const remote = '5e6f7a8b-0000-4000-8000-000000000005';
     // An environment of this account with that ID on another host; here, its image has no known owner.
     await seedEnvironment(h, { id: remote, repository: WEB, container: null, volume: false, image: false, extra: { dockerHost: 'ssh://build-box' } });
-    const image = environmentImageName(remote, 4);
+    const image = environmentImageName(WEB, remote, 4);
     h.docker.images.add(image);
     h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
     await refused(image);
@@ -826,11 +917,38 @@ describe('images of the environments of other accounts (user decision 2026-09-28
 
   it('counts an image as another account\'s when the volumes of its environment carry different owners', async () => {
     const remote = '5e6f7a8b-0000-4000-8000-000000000005';
-    const image = environmentImageName(remote, 4);
+    const image = environmentImageName(WEB, remote, 4);
     h.docker.images.add(image);
     h.docker.imageIds.set(image, `sha256:${'f'.repeat(64)}`);
     h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set('web-cache', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
     await refused(image);
+  });
+
+  // Review round 4 of PR #88 (B-R4-6, mutant X12): the registry names the owner of a name; the labels of a volume (which
+  // anyone who can use the engine can write) never override it. A volume labelled with the ID and the repository of an
+  // environment of the account, but with another owner, leaves its image the account's own.
+  it('B-R4-6: keeps the owner of a name from the registry over the owner label of a volume', async () => {
+    const remote = '5e6f7a8b-0000-4000-8000-000000000005';
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false });
+    const own = environmentImageName(WEB, OTHER_ID, 1);
+    // A second reference names the image of an environment that the registry does not know (of this account by its
+    // volume), so the check reads the owners of the volumes.
+    const copy = environmentImageName(WEB, remote, 1);
+    h.docker.images.add(copy);
+    h.docker.imageIds.set(copy, `sha256:${'e'.repeat(64)}`);
+    h.docker.volumes.set('web-remote', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_REPOSITORY]: WEB, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // A volume of another name with the ID and the repository of the environment of the account, and another owner.
+    h.docker.volumes.set('web-forged', { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: WEB, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    let ownerLists = 0;
+    const listEnvironmentVolumes = h.docker.listEnvironmentVolumes.bind(h.docker);
+    h.docker.listEnvironmentVolumes = async () => {
+      if (new Error().stack?.includes('hostEnvironmentImageIds')) ownerLists++;
+      return listEnvironmentVolumes();
+    };
+    h.helper.config = { image: own, build: { options: ['--build-context', `copy=docker-image://${copy}`] } };
+    await h.service.open(TARGET, options());
+    expect(ownerLists).toBeGreaterThan(0);
+    expect(h.helper.builds).toHaveLength(1);
   });
 });

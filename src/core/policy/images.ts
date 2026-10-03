@@ -8,7 +8,7 @@
 // references (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, shortId } from '../names';
+import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, isEnvironmentResourceName, resourceName } from '../names';
 import type { HostAccessFinding } from './report';
 import { isReservedLabel } from './rules';
 
@@ -205,13 +205,51 @@ export function imageInvalidReferenceItem(reference: string, what = 'image'): st
  * image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
  * containers that it creates; the override configuration of a single container sets them empty
  * (COMPOSE_CLEARED_LABELS), so that such an image does not make `docker compose -p <project> down` remove the dev
- * container.
+ * container. `own`: the environment whose image it is; its own labels are allowed (isOwnImageLabel).
  */
-export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
-  return Object.keys(labels)
-    .map((key) => key.trim())
-    .filter((key) => key !== 'devcontainer.metadata' && isReservedLabel(key))
-    .map((key) => `label ${key} of the image ${image}`);
+export function imageLabelItems(
+  image: string,
+  labels: Readonly<Record<string, string>>,
+  own?: OwnImageLabels,
+): string[] {
+  return Object.entries(labels)
+    .map(([key, value]) => [key.trim(), value] as const)
+    .filter(([key, value]) => key !== 'devcontainer.metadata' && isReservedLabel(key) && !isOwnImageLabel(key, value, own))
+    .map(([key]) => `label ${key} of the image ${image}`);
+}
+
+/** The environment whose own image labels imageLabelItems allows. */
+export interface OwnImageLabels {
+  id: string;
+  repository: string;
+  ownerId: string;
+  /**
+   * Review round 1 of PR #88 (A-R1-3): the checked image is the environment image, which the extension labels with its
+   * build record after each build; on any other image the label of the build record is refused.
+   */
+  environmentImage?: boolean;
+}
+
+/**
+ * User decisions 2026-10-03: the labels that the extension gives the images of the environment `own` (imageRecordLabels
+ * of the environment image, and nimblescape.devenv.environment-id of the images that Compose builds for it), with the
+ * values of `own`; the build record with any value, only on the environment image (the extension writes it after each
+ * build). A container created from such an image carries the same ID, repository, and owner as the environment.
+ */
+function isOwnImageLabel(key: string, value: string, own: OwnImageLabels | undefined): boolean {
+  if (own === undefined) return false;
+  switch (key) {
+    case LABEL_ENVIRONMENT_ID:
+      return value === own.id;
+    case LABEL_REPOSITORY:
+      return value === own.repository;
+    case LABEL_OWNER_ID:
+      return value === own.ownerId;
+    case LABEL_BUILD_RECORD:
+      return own.environmentImage === true;
+    default:
+      return false;
+  }
 }
 
 /**
@@ -270,7 +308,7 @@ export interface InspectedImage {
 
 /**
  * The IDs of the images of the environments on one Docker host (the environment images and the images that Docker
- * Compose built for them, environmentImageShortId), split by owner: `own`, of the environments of the account of the
+ * Compose built for them, environmentImageNames), split by owner: `own`, of the environments of the account of the
  * checked environment (also of the checked environment itself); `others`, of the environments of other accounts and of
  * environments whose owner is not known (built from another computer and without a volume here, or left behind by a
  * Delete).
@@ -278,8 +316,12 @@ export interface InspectedImage {
 export interface EnvironmentImageIds {
   own: ReadonlySet<string>;
   others: ReadonlySet<string>;
-  /** The short IDs of the environments of the account of the checked environment (for a name without a local image). */
-  ownShortIds?: ReadonlySet<string>;
+  /**
+   * The names of the environments by owner (resourceName, in lower case): of the account of the checked environment, and
+   * of other accounts (for a name without a local image, isOtherEnvironmentImageName).
+   */
+  ownNames?: ReadonlySet<string>;
+  otherNames?: ReadonlySet<string>;
 }
 
 /**
@@ -293,72 +335,125 @@ export function imageNamedBy(reference: string, images: readonly InspectedImage[
 }
 
 /**
- * The short ID of the environment whose image `reference` names: `devenv-<short id>:<build>` (environmentImageName) or
- * `devenv-<short id>-<service>` (composeServiceImage), also written with Docker Hub's registry or `library/`
- * (localImageRepository). `undefined` for any other name.
+ * User decisions 2026-10-03: the names of the environments (resourceName, in lower case) whose image `reference` may be,
+ * by its repository (also written with Docker Hub's registry or `library/`, localImageRepository): the environment image
+ * `<name>:<build>` (environmentImageName) and the image `<name>-<service>` that Docker Compose built for a service of the
+ * project `<name>` (composeServiceImage). A service name may contain `-`, so each start of the repository up to a `-`
+ * that has the shape of a name of an environment (isEnvironmentResourceName) counts; only the environments known on the
+ * host decide which one it is (environmentImageClass). Empty for any other name.
  */
-export function environmentImageShortId(reference: string): string | undefined {
-  return /^devenv-([0-9a-f]{8})(?:-[^/]+)?$/.exec(localImageRepository(reference))?.[1];
+export function environmentImageNames(reference: string): string[] {
+  const repository = localImageRepository(reference).toLowerCase();
+  if (!repository.startsWith('devenv-') || repository.includes('/')) return [];
+  const names: string[] = [];
+  for (let end = repository.indexOf('-'); end !== -1; end = repository.indexOf('-', end + 1)) {
+    const prefix = repository.slice(0, end);
+    if (isEnvironmentResourceName(prefix)) names.push(prefix);
+  }
+  if (isEnvironmentResourceName(repository)) names.push(repository);
+  return names;
 }
 
 /**
- * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag`), by the
- * owner account of each short ID (`owners`: of the registry entries, and of the labels of the volumes of the host) and
- * the account `accountId`. An image with a short ID of no known owner counts as another account's.
+ * Whose image the names `names` (environmentImageNames of one reference) say it is, by the names of the environments of
+ * the account (`own`) and of other accounts (`other`): `none` without names; `other` when one of them is an environment
+ * of another account, or none of them is a known environment (an image of no known owner counts as another account's);
+ * else `own`. A name with the shape of a name of an environment that no environment has is left aside when another one
+ * is the account's own (for example a service `x-happy-turing` of the account's own project).
+ */
+export function environmentImageClass(names: readonly string[], own: ReadonlySet<string>, other: ReadonlySet<string>): 'none' | 'own' | 'other' {
+  if (names.length === 0) return 'none';
+  if (names.some((name) => other.has(name))) return 'other';
+  return names.some((name) => own.has(name)) ? 'own' : 'other';
+}
+
+/** The owner accounts of the environments on a host: by name (resourceName, in lower case) and by environment ID. */
+export interface EnvironmentOwners {
+  byName: ReadonlyMap<string, string>;
+  byId: ReadonlyMap<string, string>;
+}
+
+/**
+ * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag` and the
+ * label nimblescape.devenv.environment-id that the extension gives the images it builds, `environmentId`), by the
+ * owner accounts of the environments (`owners`: of the registry entries, and of the labels of the volumes of the host)
+ * and the account `accountId`. User decisions 2026-10-03: an image with the label belongs to the environment of that ID
+ * (an ID of no known owner counts as another account's), unless one of its names is the name of a known environment of
+ * another account; an image without it is decided by its names (environmentImageClass).
  */
 export function environmentImageIds(
-  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
-  owners: ReadonlyMap<string, string>,
+  images: ReadonlyArray<{ id: string; tags: readonly string[]; environmentId?: string }>,
+  owners: EnvironmentOwners,
   accountId: string,
 ): EnvironmentImageIds {
+  const ownNames = new Set([...owners.byName].filter(([, owner]) => owner === accountId).map(([name]) => name));
+  const otherNames = new Set([...owners.byName].filter(([, owner]) => owner !== accountId).map(([name]) => name));
   const own = new Set<string>();
   const others = new Set<string>();
   for (const image of images) {
-    for (const tag of image.tags) {
-      const short = environmentImageShortId(tag);
-      if (short === undefined) continue;
-      (owners.get(short) === accountId ? own : others).add(image.id.toLowerCase());
+    const names = image.tags.map(environmentImageNames);
+    let kinds: Array<'none' | 'own' | 'other'>;
+    if (image.environmentId !== undefined) {
+      const byLabel = owners.byId.get(image.environmentId) === accountId ? 'own' : 'other';
+      kinds = [names.some((list) => list.some((name) => otherNames.has(name))) ? 'other' : byLabel];
+    } else {
+      kinds = names.map((list) => environmentImageClass(list, ownNames, otherNames));
     }
+    for (const kind of kinds) if (kind !== 'none') (kind === 'own' ? own : others).add(image.id.toLowerCase());
   }
-  const ownShortIds = new Set([...owners].filter(([, owner]) => owner === accountId).map(([short]) => short));
-  return { own, others, ownShortIds };
+  return { own, others, ownNames, otherNames };
 }
 
 /**
- * The short IDs of `images` (environmentImageShortId) that `owners` does not know; with `ids`, only of the images with
- * one of these IDs (the images that the references of a configuration found).
+ * Whether a reference of `images` (with `ids`, only of the images with one of these IDs: the images that the references
+ * of a configuration found) or of `references` belongs to an environment that `owners` does not know: an image with an
+ * environment ID of no known owner, or names of environments (environmentImageNames) of which none is known. Then the
+ * owners of the volumes of the host are read too.
  */
-export function unknownEnvironmentShortIds(
-  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
-  owners: ReadonlyMap<string, string>,
+export function hasUnknownEnvironment(
+  images: ReadonlyArray<{ id: string; tags: readonly string[]; environmentId?: string }>,
+  references: readonly string[],
+  owners: EnvironmentOwners,
   ids?: ReadonlySet<string>,
-): string[] {
-  const unknown = new Set<string>();
-  for (const image of images) {
-    if (ids !== undefined && !ids.has(image.id.toLowerCase())) continue;
-    for (const tag of image.tags) {
-      const short = environmentImageShortId(tag);
-      if (short !== undefined && !owners.has(short)) unknown.add(short);
-    }
-  }
-  return [...unknown];
+): boolean {
+  const unknown = (reference: string): boolean => {
+    const names = environmentImageNames(reference);
+    return names.length > 0 && !names.some((name) => owners.byName.has(name));
+  };
+  if (references.some(unknown)) return true;
+  return images.some(
+    (image) =>
+      (ids === undefined || ids.has(image.id.toLowerCase())) &&
+      (image.environmentId !== undefined ? !owners.byId.has(image.environmentId) : image.tags.some(unknown)),
+  );
 }
 
 /**
- * The owner account of each environment short ID by the labels of `volumes` (nimblescape.devenv.environment-id and
- * nimblescape.devenv.owner-id). A short ID whose volumes carry different owners is left out: its images count as
- * another account's (environmentImageIds).
+ * The owner account of each environment name (resourceName, in lower case) and of each environment ID by the labels of
+ * `volumes` (nimblescape.devenv.environment-id, nimblescape.devenv.repository, and nimblescape.devenv.owner-id). A name
+ * or ID whose volumes carry different owners is left out: its images count as another account's.
  */
-export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): Map<string, string> {
+export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): { byName: Map<string, string>; byId: Map<string, string> } {
   const owners = new Map<string, string | undefined>();
+  const ids = new Map<string, string | undefined>();
   for (const volume of volumes) {
+    const labelledId = volume.labels[LABEL_ENVIRONMENT_ID];
+    const labelledOwner = volume.labels[LABEL_OWNER_ID];
+    if (labelledId && labelledOwner) ids.set(labelledId, ids.has(labelledId) && ids.get(labelledId) !== labelledOwner ? undefined : labelledOwner);
     const id = volume.labels[LABEL_ENVIRONMENT_ID];
+    const repository = volume.labels[LABEL_REPOSITORY];
     const owner = volume.labels[LABEL_OWNER_ID];
-    if (!id || !owner) continue;
-    const short = shortId(id).toLowerCase();
-    owners.set(short, owners.has(short) && owners.get(short) !== owner ? undefined : owner);
+    if (!id || !owner || !repository || !repository.includes('/')) continue;
+    let name: string;
+    try {
+      name = resourceName(repository, id).toLowerCase();
+    } catch {
+      continue;
+    }
+    owners.set(name, owners.has(name) && owners.get(name) !== owner ? undefined : owner);
   }
-  return new Map([...owners].filter((entry): entry is [string, string] => entry[1] !== undefined));
+  const known = (map: Map<string, string | undefined>): Map<string, string> => new Map([...map].filter((entry): entry is [string, string] => entry[1] !== undefined));
+  return { byName: known(owners), byId: known(ids) };
 }
 
 /** The item of an image reference that names an image of the environments of another account (protected). */
@@ -397,10 +492,9 @@ export function otherAccountImageItems(
 
 /**
  * Review round 3 (S1): whether `reference`, which names no local image, is the name of an image of an environment of
- * another account or of no known owner (environmentImageShortId; `ids.ownShortIds`). No registry has such a name, so it
+ * another account or of no known owner (environmentImageClass of its environmentImageNames; `ids.ownNames`, `ids.otherNames`). No registry has such a name, so it
  * has no use but to catch that environment's next build between the check and the start.
  */
 export function isOtherEnvironmentImageName(reference: string, ids: EnvironmentImageIds): boolean {
-  const short = environmentImageShortId(reference);
-  return short !== undefined && !(ids.ownShortIds?.has(short) ?? false);
+  return environmentImageClass(environmentImageNames(reference), ids.ownNames ?? new Set(), ids.otherNames ?? new Set()) === 'other';
 }

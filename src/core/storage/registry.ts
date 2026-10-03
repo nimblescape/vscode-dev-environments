@@ -541,11 +541,12 @@ function isGitSummary(value: unknown): value is GitSummary {
   );
 }
 
-function isBuildRecord(value: unknown): value is BuildRecord {
+export function isBuildRecord(value: unknown): value is BuildRecord {
   return (
     isRecord(value) &&
     isString(value.builtAt) &&
     isNonEmptyString(value.environmentImage) &&
+    (value.imageId === undefined || isNonEmptyString(value.imageId)) &&
     isCount(value.buildNumber) &&
     isString(value.configPath) &&
     isString(value.configHash) &&

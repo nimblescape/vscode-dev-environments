@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CONFIG_FOLDER, GIT_CONFIG_FILE, TOKEN_FOLDER } from '../names';
+import { CONFIG_FOLDER, GIT_CONFIG_FILE, TOKEN_FOLDER, resourceName } from '../names';
 import {
   CONTAINER_CREDENTIAL_HELPER,
   GIT_CREDENTIALS_CONFIG_FILE,
@@ -22,6 +22,10 @@ import {
   remoteEnvironment,
 } from './containerGit';
 import { GITHUB_CLI_ACCOUNT_VARIABLES, hostAccessProblems, isContainerGitVariable, isGitHubCliAccountVariable } from '../policy';
+
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const OWN = resourceName('acme/api', NAME_ID);
 
 const hasGit = !spawnSync('git', ['--version'], { stdio: 'ignore' }).error;
 /** Optional: the path of an old Git (for example 2.30.2) that the credential tests run with too. */
@@ -144,7 +148,7 @@ describe('variables of container-only Git, which a configuration may not set (co
     ['', false, false],
   ])('%j: container-only Git %s, refused by the policy %s', (name, expected, refused) => {
     expect(isContainerGitVariable(name)).toBe(expected);
-    expect(hostAccessProblems({ config: { containerEnv: { [name]: 'x' } }, ownVolume: 'devenv-acme-api-3f2a9c1e' })).toHaveLength(refused ? 1 : 0);
+    expect(hostAccessProblems({ config: { containerEnv: { [name]: 'x' } }, ownVolume: OWN })).toHaveLength(refused ? 1 : 0);
   });
 
   it('covers every variable that the override configuration sets', () => {

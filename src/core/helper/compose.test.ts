@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { CONTAINER_VERSION, TOKEN_TMPFS, composeProjectName, environmentImageRepository } from '../names';
+import { CONTAINER_VERSION, TOKEN_TMPFS, composeProjectName, environmentImageRepository, resourceName } from '../names';
 import {
   COMPOSE_BUILD_CONTEXT,
   COMPOSE_DEV_DOCKERFILE,
@@ -43,8 +43,12 @@ import {
 } from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName), so the project, the volume, and the container
+// share it (devenv-acme-api-wise-stallman).
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** The Compose project of an environment of another repository and ID. */
+const OTHER_PROJECT = composeProjectName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 const DEV_DOCKERFILE = 'FROM mcr.microsoft.com/devcontainers/base:bookworm\n';
 
@@ -93,14 +97,15 @@ describe('review round 22, H22-7', () => {
   it('has no parameter dollarEscaped of the rewrite any more (the written texts are always escaped)', () => {
     // @ts-expect-error review round 22, H22-7: ComposeRewriteParams.dollarEscaped is removed (tsc fails if it comes back).
     const p: ComposeRewriteParams = { ...params(), dollarEscaped: true };
-    expect(composeUpModel(templateModel(), { ...p, image: 'devenv-3f2a9c1e:7' }).model.name).toBe(PROJECT);
+    expect(composeUpModel(templateModel(), { ...p, image: `${PROJECT}:7` }).model.name).toBe(PROJECT);
   });
 });
 
 describe('names', () => {
-  it('the project of an environment is devenv-<short id>, the repository part of the environment image', () => {
-    expect(composeProjectName(ID)).toBe(PROJECT);
-    expect(composeProjectName(ID)).toBe(environmentImageRepository(ID));
+  it('the project of an environment is its resourceName, the repository part of the environment image', () => {
+    // User decisions 2026-10-03: composeProjectName(repository, id) = resourceName (before: devenv-<short id>).
+    expect(composeProjectName('acme/api', ID)).toBe('devenv-acme-api-wise-stallman');
+    expect(composeProjectName('acme/api', ID)).toBe(environmentImageRepository('acme/api', ID));
   });
 
   it.each<[string, string]>([
@@ -113,10 +118,17 @@ describe('names', () => {
   });
 
   it.each<[string, boolean]>([
-    ['devenv-11111111_default', true],
-    ['DEVENV-11111111_data', true],
+    // User decisions 2026-10-03: the prefix before the first `_` is the name of another environment (before: devenv-<8 hex>).
+    [`${OTHER_PROJECT}_default`, true],
+    [`${OTHER_PROJECT.toUpperCase()}_data`, true],
+    [`${composeProjectName('acme/api', '11111111-2222-4333-8444-555555555555')}_default`, true],
+    // Review round 1 of PR #88 (B-R1-2): a key with `_` of its own; the project is what comes before the first `_`.
+    [`${OTHER_PROJECT}_my_data`, true],
+    [`${PROJECT}_my_data`, false],
     [`${PROJECT}_default`, false],
+    [`${PROJECT.toUpperCase()}_default`, false],
     ['devenv-tools_default', false],
+    ['devenv-11111111_default', false],
     ['frontend', false],
   ])('isOtherEnvironmentProjectName(%s)', (name, expected) => {
     expect(isOtherEnvironmentProjectName(name, PROJECT)).toBe(expected);
@@ -391,7 +403,7 @@ describe('decideServiceMount (D-6, D-11)', () => {
 
 describe('composeUpModel', () => {
   const up = (model: ComposeModel, overrides: Partial<ComposeRewriteParams> = {}) =>
-    composeUpModel(model, { ...params(overrides), image: 'devenv-3f2a9c1e:7' });
+    composeUpModel(model, { ...params(overrides), image: `${PROJECT}:7` });
 
   it('rewrites the template model as the implementation notes show it', () => {
     const { model, rewrites } = up(templateModel());
@@ -399,7 +411,7 @@ describe('composeUpModel', () => {
       name: PROJECT,
       services: {
         app: {
-          image: 'devenv-3f2a9c1e:7',
+          image: `${PROJECT}:7`,
           pull_policy: 'never',
           container_name: OWN,
           command: ['sleep', 'infinity'],
@@ -424,7 +436,8 @@ describe('composeUpModel', () => {
           networks: { default: null },
         },
       },
-      networks: { default: { name: `${PROJECT}_default` } },
+      // User decisions 2026-10-03: changed expectation, every network that Compose creates carries the environment ID.
+      networks: { default: { name: `${PROJECT}_default`, labels: { 'nimblescape.devenv.environment-id': ID } } },
       volumes: {
         pgdata: { name: `${PROJECT}_pgdata`, external: true },
         [WORKSPACE_VOLUME_KEY]: { name: OWN, external: true },
@@ -436,7 +449,7 @@ describe('composeUpModel', () => {
       { item: 'service db: port 5432:5432', reason: 'published on 127.0.0.1 only' },
       // Review round 7, P7-1: changed expectation, the rewrite of `restart` is logged.
       { item: 'service db: restart unless-stopped', reason: 'Dev Environments starts the containers itself (no)' },
-      { item: 'service app: build', reason: 'the environment image devenv-3f2a9c1e:7 is used' },
+      { item: 'service app: build', reason: `the environment image ${PROJECT}:7 is used` },
     ]);
   });
 
@@ -625,7 +638,50 @@ describe('composeBuildModel', () => {
     // Review round 22, H22-7: the rewrite has no parameter dollarEscaped any more.
     const escaped = composeBuildModel(source, params());
     expect(escaped.devDockerfile).toBe('FROM alpine:3.22\nRUN echo $HOME\n');
-    expect(escaped.model.services.app.build).toEqual({ context: REPO, dockerfile: COMPOSE_DEV_DOCKERFILE });
+    // User decisions 2026-10-03: changed expectation, every built image carries the environment ID (build.labels).
+    expect(escaped.model.services.app.build).toEqual({ context: REPO, dockerfile: COMPOSE_DEV_DOCKERFILE, labels: { 'nimblescape.devenv.environment-id': ID } });
+  });
+
+  // User decisions 2026-10-03: the images that Compose builds and the networks that it creates carry the environment ID.
+  it('labels every built service with the environment ID, and keeps the build labels of the repository', () => {
+    const source = templateModel();
+    source.services.app.build = { context: `${REPO}/.devcontainer`, dockerfile: 'Dockerfile', labels: { team: 'a', 'nimblescape.devenv.environment-id': 'forged' } };
+    source.services.worker = { build: { context: REPO, labels: ['tier=worker'] } };
+    const { model } = composeBuildModel(source, params());
+    expect((model.services.app.build as Record<string, unknown>).labels).toEqual({ team: 'a', 'nimblescape.devenv.environment-id': ID });
+    expect((model.services.worker.build as Record<string, unknown>).labels).toEqual({ tier: 'worker', 'nimblescape.devenv.environment-id': ID });
+    expect(model.services.db.build).toBeUndefined();
+    // The up model builds side services too.
+    const up = composeUpModel(source, { ...params(), image: `${PROJECT}:7` }).model;
+    expect((up.services.worker.build as Record<string, unknown>).labels).toEqual({ tier: 'worker', 'nimblescape.devenv.environment-id': ID });
+  });
+
+  it('labels every network of the project with the environment ID, keeps its labels, and leaves an external network alone', () => {
+    const source = templateModel();
+    source.networks = {
+      default: { name: `${PROJECT}_default` },
+      back: { name: `${PROJECT}_back`, labels: { tier: 'back' } },
+      shared: { name: 'shared', external: true },
+      old: { name: 'old', external: { name: 'old' } },
+    };
+    for (const model of [composeBuildModel(source, params()).model, composeUpModel(source, { ...params(), image: `${PROJECT}:7` }).model]) {
+      expect(model.networks).toEqual({
+        default: { name: `${PROJECT}_default`, labels: { 'nimblescape.devenv.environment-id': ID } },
+        back: { name: `${PROJECT}_back`, labels: { tier: 'back', 'nimblescape.devenv.environment-id': ID } },
+        shared: { name: 'shared', external: true },
+        old: { name: 'old', external: { name: 'old' } },
+      });
+    }
+  });
+
+  // Review round 5 of PR #88 (B-R5-5, mutant H2): a network declared without a body (`networks:\n  backend:`, null in
+  // YAML) is created by Compose for the project, so it carries the environment ID too.
+  it('B-R5-5: labels a network of the project that is declared without a body with the environment ID', () => {
+    const source = templateModel();
+    source.networks = { backend: null };
+    for (const model of [composeBuildModel(source, params()).model, composeUpModel(source, { ...params(), image: `${PROJECT}:7` }).model]) {
+      expect(model.networks).toEqual({ backend: { labels: { 'nimblescape.devenv.environment-id': ID } } });
+    }
   });
 
   it('throws for a dev service without image and build', () => {
@@ -642,7 +698,7 @@ describe('escapeComposeDollars', () => {
 });
 
 describe('review round 1 of unit 6', () => {
-  const P = 'devenv-3f2a9c1e';
+  const P = PROJECT;
   const m: ComposeModel = {
     name: P,
     services: {
@@ -683,7 +739,7 @@ describe('review round 1 of unit 6', () => {
 });
 
 describe('review round 5 of unit 6 (D5-1, D5-2)', () => {
-  const up = (configPath: string | undefined) => composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7', configPath }).model;
+  const up = (configPath: string | undefined) => composeUpModel(templateModel(), { ...params(), image: `${PROJECT}:7`, configPath }).model;
 
   it('labels only the dev service with the configuration path, so the other services stay the same for another configuration (D5-1)', () => {
     const first = up('.devcontainer/devcontainer.json');
@@ -712,7 +768,7 @@ describe('review round 5 of unit 6 (D5-1, D5-2)', () => {
 });
 
 describe('review round 8 of unit 6: the restart and the stop of the services', () => {
-  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: 'devenv-3f2a9c1e:7' });
+  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: `${PROJECT}:7` });
 
   it('S8-6: rewrites restart on-failure[:n] and the condition on-failure to no and none, and logs it', () => {
     const model = templateModel();
@@ -790,14 +846,14 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
     expect(decideServiceMount(entry({}), context({ [SOURCE]: `${REPO}/data` }))).toMatchObject({ action: 'replace', createFolder: SOURCE });
     const model = templateModel();
     model.services.db.volumes = [entry()];
-    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: 'devenv-3f2a9c1e:7' });
+    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: `${PROJECT}:7` });
     expect(result.createFolders).toEqual([SOURCE]);
     expect(result.model.services.db.volumes).toEqual([{ type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/var/lib/postgresql/data', volume: { nocopy: true, subpath: 'api/data/postgres' } }]);
     expect(result.rewrites).toContainEqual({ item: `service db: bind mount ${SOURCE} → /var/lib/postgresql/data`, reason: expect.stringContaining('created in the repository before the start') });
     // The build model does not create it (no container).
     expect(composeBuildModel(model, params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }))).not.toHaveProperty('createFolders');
     // An existing folder is not created.
-    expect(composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7' })).not.toHaveProperty('createFolders');
+    expect(composeUpModel(templateModel(), { ...params(), image: `${PROJECT}:7` })).not.toHaveProperty('createFolders');
   });
 
   it.each<[string, Record<string, unknown>, Record<string, string | null> | undefined, ComposeEntryDecision]>([
@@ -819,13 +875,13 @@ describe('review round 8 of unit 6 (P8-2): a bind mount of a repository folder t
       { type: 'bind', source: REPO, target: '/src', bind: {} },
       { type: 'volume', source: 'pgdata', target: '/data', volume: {} },
     ];
-    model.volumes = { pgdata: { name: 'devenv-3f2a9c1e_pgdata' } };
+    model.volumes = { pgdata: { name: `${PROJECT}_pgdata` } };
     model.services.app.volumes = [...(model.services.app.volumes as unknown[]), { type: 'bind', source: `${REPO}/dev-only`, target: '/dev-only', bind: {} }];
-    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: 'devenv-3f2a9c1e:7' });
+    const result = composeUpModel(model, { ...params({ realPaths: { [SOURCE]: null }, mountAncestors: { [SOURCE]: REPO } }), image: `${PROJECT}:7` });
     // Review round 10, D10-3: without the read-only mount ./seed (before: [SOURCE, `${REPO}/seed`]); the owner restores give
     // it back when root rewrote it.
     expect(result.serviceFolders).toEqual([SOURCE]);
-    expect(composeUpModel(templateModel(), { ...params(), image: 'devenv-3f2a9c1e:7' })).not.toHaveProperty('serviceFolders');
+    expect(composeUpModel(templateModel(), { ...params(), image: `${PROJECT}:7` })).not.toHaveProperty('serviceFolders');
   });
 
   it('reads the nearest folders of the model run, and ignores values that are no paths', () => {
@@ -842,12 +898,12 @@ describe('review round 9 (S9-1): the bounds of the model in the extension host',
   // `runs`, so that one pause of the runner does not count).
   function folderModel(count: number): ComposeModel {
     const volumes = Array.from({ length: count }, (_, i) => ({ type: 'bind', source: `${REPO_FOLDER}/d/${i}`, target: `/m/${i}`, bind: { create_host_path: true } }));
-    return { name: 'devenv-3f2a9c1e', services: { app: { image: 'ubuntu', command: ['sleep'] }, db: { image: 'postgres:16', volumes } } } as unknown as ComposeModel;
+    return { name: PROJECT, services: { app: { image: 'ubuntu', command: ['sleep'] }, db: { image: 'postgres:16', volumes } } } as unknown as ComposeModel;
   }
   function rewriteFolders(model: ComposeModel): ReturnType<typeof composeUpModel> {
     const volumes = (model.services.db as { volumes: Array<{ source: string }> }).volumes;
     return composeUpModel(model, {
-      project: 'devenv-3f2a9c1e',
+      project: PROJECT,
       devService: 'app',
       environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d',
       containerName: 'c',
@@ -911,7 +967,7 @@ describe('review round 10 (D10-2, D10-3): the recorded paths of the repository t
   const up = (volumes: unknown[], overrides: Partial<ComposeRewriteParams> = {}) => {
     const model = templateModel();
     model.services.db.volumes = volumes;
-    return composeUpModel(model, { ...params(overrides), image: 'devenv-3f2a9c1e:7' });
+    return composeUpModel(model, { ...params(overrides), image: `${PROJECT}:7` });
   };
   const bind = (source: string, extra: Record<string, unknown> = {}) => ({ type: 'bind', source, target: `/t${source.length}`, bind: {}, ...extra });
 
@@ -1034,7 +1090,7 @@ describe('unit 15: the tmpfs of the token (/run/devenv) in the Docker Compose up
     ownVolume: OWN,
     engineApiVersion: '1.47',
   });
-  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: 'devenv-3f2a9c1e:7' }).model;
+  const up = (model: ComposeModel) => composeUpModel(model, { ...params(), image: `${PROJECT}:7` }).model;
 
   it('adds the tmpfs to the dev service only, after its own tmpfs entries (a text or a list)', () => {
     const model = templateModel();
@@ -1082,13 +1138,15 @@ describe('review round 20 (P20-1): the Dockerfile of a local build of the dev se
     const built = composeBuildModel(source, params({ dockerfiles: { app: TEXT } }));
     expect(built.devDockerfile).toBe(TEXT);
     // The context stays (escaped once, as every text); the Dockerfile is ours.
-    expect(built.model.services.app.build).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' } });
+    // User decisions 2026-10-03: changed expectation, every built image carries the environment ID (build.labels).
+    expect(built.model.services.app.build).toEqual({ context: `${REPO}/c$$d`, dockerfile: COMPOSE_DEV_DOCKERFILE, args: { A: '1' }, labels: { 'nimblescape.devenv.environment-id': ID } });
   });
 
   it('writes it for a plain Dockerfile too (no gap between the check and the read of the CLI and of BuildKit)', () => {
     const built = composeBuildModel(templateModel(), params({ dockerfiles: { app: TEXT, db: 'FROM x\n' } }));
     expect(built.devDockerfile).toBe(TEXT);
-    expect(built.model.services.app.build).toEqual({ context: `${REPO}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
+    // User decisions 2026-10-03: changed expectation, every built image carries the environment ID (build.labels).
+    expect(built.model.services.app.build).toEqual({ context: `${REPO}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE, labels: { 'nimblescape.devenv.environment-id': ID } });
   });
 
   it('throws for a local build of the dev service whose Dockerfile the model run did not read (fail closed)', () => {
@@ -1102,7 +1160,7 @@ describe('review round 20 (D20-1): keys with a $', () => {
     const source = templateModel();
     source.services.db.environment = { a$b: 'c$d' };
     source.services.db.labels = { 'k$': 'v$w' };
-    const up = composeUpModel(source, { ...params(), image: 'devenv-3f2a9c1e:7' }).model;
+    const up = composeUpModel(source, { ...params(), image: `${PROJECT}:7` }).model;
     for (const written of [up, composeBuildModel(source, params()).model]) {
       expect(written.services.db.environment).toEqual({ a$b: 'c$$d' });
       expect(written.services.db.labels).toMatchObject({ 'k$': 'v$$w' });

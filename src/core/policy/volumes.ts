@@ -7,13 +7,12 @@
 // helper, another program), and the networks of other environments. Account separation: refused whatever the switch
 // says (class `protected`), a volume of another program is access to the computer. Pure functions, no I/O.
 import {
-  ENVIRONMENT_VOLUME_PATTERN,
+  isEnvironmentResourceName,
   HELPER_CACHE_VOLUME,
   LABEL_ENVIRONMENT_ID,
   LABEL_OWNER_ID,
   LABEL_VOLUME,
   VOLUME_KIND_ADDITIONAL,
-  composeProjectName,
 } from '../names';
 import { DEV_CONTAINERS_VOLUMES, hasDevContainersVolumeLabel, isDevContainersCloneVolumeName } from '../devContainers';
 import { REMOTE_MONITOR_VOLUME } from '../remoteMonitor/protocol';
@@ -33,7 +32,7 @@ export function volumeContext(input: VolumeInput): VolumeContext {
 export interface VolumeInput {
   /**
    * The workspace volume of the environment: the only volume named like the workspace volume of an environment
-   * (ENVIRONMENT_VOLUME_PATTERN) that a mount may use.
+   * (isEnvironmentResourceName) that a mount may use.
    */
   ownVolume: string;
   /**
@@ -118,7 +117,7 @@ export function isAnonymousVolumeName(name: string): boolean {
 export function foreignVolumeName(name: string): string | undefined {
   if (name === HELPER_CACHE_VOLUME) return 'the workspace helper';
   if (name === REMOTE_MONITOR_VOLUME) return 'the Session Monitor';
-  if (ENVIRONMENT_VOLUME_PATTERN.test(name)) return 'another environment';
+  if (isEnvironmentResourceName(name)) return 'another environment';
   if (ANONYMOUS_VOLUME_NAME.test(name)) return 'another container';
   if (DEV_CONTAINERS_VOLUMES.includes(name)) return 'the Dev Containers extension';
   return undefined;
@@ -203,7 +202,7 @@ export function volumeNameProblems(name: string, volumes: VolumeContext): Proble
   const byName = foreignVolumeName(name);
   if (byName !== undefined) {
     const item = `volume ${name} of ${byName}`;
-    const protectedName = name === HELPER_CACHE_VOLUME || name === REMOTE_MONITOR_VOLUME || ENVIRONMENT_VOLUME_PATTERN.test(name);
+    const protectedName = name === HELPER_CACHE_VOLUME || name === REMOTE_MONITOR_VOLUME || isEnvironmentResourceName(name);
     return [protectedName ? guarded(item) : access(item)];
   }
   const labels = volumes.labels[name];
@@ -242,9 +241,15 @@ export function volumeNameFindings(name: string, input: VolumeInput): HostAccess
 // ---------------------------------------------------------------------------------------------------------------------
 // Networks
 
-/** A volume or network name of the Compose project of another environment: `devenv-<8 hex>_…`, not `<project>_…`. */
+/**
+ * A volume or network name of the Compose project of another environment: `<name of an environment>_…`
+ * (isEnvironmentResourceName; such a name has no `_`), not `<project>_…`.
+ */
 export function isOtherEnvironmentProjectName(name: string, project: string): boolean {
-  return /^devenv-[0-9a-f]{8}_/i.test(name) && !name.startsWith(`${project}_`);
+  const index = name.indexOf('_');
+  if (index <= 0) return false;
+  const prefix = name.slice(0, index);
+  return isEnvironmentResourceName(prefix) && prefix.toLowerCase() !== project.toLowerCase();
 }
 
 /**
@@ -269,21 +274,21 @@ export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /**
  * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass `protected`):
  * named like the Compose project of another environment (isOtherEnvironmentProjectName), labelled by Docker Compose for
- * the project of another environment (`devenv-<8 hex>`), or with a container of another environment attached (label
+ * the project of another environment (isEnvironmentResourceName), or with a container of another environment attached (label
  * nimblescape.devenv.environment-id) that is not an environment of the same owner (NetworkState.sameOwnerEnvironments,
  * review round 2, P2-2). The name rules apply to the written reference and to the name of the network that it resolves
- * to (NetworkState.name). `environmentId`: the environment that is checked (its own project and containers); without
- * it, every such network counts as another environment's. `undefined` for any other network.
+ * to (NetworkState.name). `environmentId`: the environment that is checked (its own containers), `project` its Compose
+ * project (composeProjectName, the same as its workspace volume); without them, every such network counts as another
+ * environment's. `undefined` for any other network.
  */
-export function foreignNetworkItem(name: string, state: NetworkState | undefined, environmentId: string | undefined): string | undefined {
-  const project = environmentId === undefined ? '' : composeProjectName(environmentId);
+export function foreignNetworkItem(name: string, state: NetworkState | undefined, environmentId: string | undefined, project = ''): string | undefined {
   const item = `network ${name} of another environment`;
   if (isOtherEnvironmentProjectName(name, project)) return item;
   if (!state) return undefined;
   // The network that the reference names (for example by its ID): its own name counts too (S2-04).
   if (state.name !== undefined && isOtherEnvironmentProjectName(state.name, project)) return item;
   const owner = state.labels[COMPOSE_PROJECT_LABEL];
-  if (owner !== undefined && /^devenv-[0-9a-f]{8}$/i.test(owner) && owner !== project) return item;
+  if (owner !== undefined && isEnvironmentResourceName(owner) && owner.toLowerCase() !== project.toLowerCase()) return item;
   // A container of another environment: only of the same owner may share the network (P2-2).
   const sameOwner = state.sameOwnerEnvironments ?? [];
   if (state.environments.some((id) => id !== environmentId && !sameOwner.includes(id))) return item;

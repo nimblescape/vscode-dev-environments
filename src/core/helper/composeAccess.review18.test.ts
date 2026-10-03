@@ -5,6 +5,7 @@
 // Review round 18 (S18-1, P18-2): a build argument named `__proto__` (Docker Compose and single container), and the time
 // of the check of the last stage name of the Dockerfile of the dev service.
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import { collectReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
 import { composeReferences, type ComposeModel } from './compose';
@@ -18,7 +19,12 @@ import {
   type HostAccessReport,
 } from '../policy';
 
-const PROJECT = 'devenv-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 
 /** A model of `docker compose config` whose dev service builds with `build` (parsed from JSON, as the model run does). */
@@ -42,7 +48,7 @@ function input(build: Record<string, unknown>, dockerfile: string): ComposeAcces
     devService: 'app',
     project: PROJECT,
     repositoryFolder: REPO,
-    ownVolume: 'devenv-acme-api-3f2a9c1e',
+    ownVolume: OWN,
     engineApiVersion: '1.47',
     dockerfiles: { app: dockerfile },
   };
@@ -59,7 +65,7 @@ describe('review round 18 (S18-1): a build argument named __proto__', () => {
   });
 
   it('Docker Compose: allows FROM the image of another environment through it', () => {
-    const report = composeAccessReport(input({ args: protoArgs('devenv-0badc0de:3') }, 'ARG __proto__\nFROM $__proto__\n'));
+    const report = composeAccessReport(input({ args: protoArgs(`${OTHER}:3`) }, 'ARG __proto__\nFROM $__proto__\n'));
     // Dockerfile refusals removed (user decision 2026-09-27): before, `… devenv-0badc0de:3 of another environment`.
     expect(refused(report)).toEqual([]);
   });
@@ -73,8 +79,8 @@ describe('review round 18 (S18-1): a build argument named __proto__', () => {
   });
 
   it('single container: `--build-arg __proto__=…` of build.options is allowed with the Dockerfile', () => {
-    const config = { build: { dockerfile: 'Dockerfile', options: ['--build-arg', '__proto__=devenv-0badc0de:3'] } };
-    const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: 'devenv-acme-api-3f2a9c1e' }, checksOn: true, config, dockerfileText: 'ARG __proto__\nFROM $__proto__\n' });
+    const config = { build: { dockerfile: 'Dockerfile', options: ['--build-arg', `__proto__=${OTHER}:3`] } };
+    const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config, dockerfileText: 'ARG __proto__\nFROM $__proto__\n' });
     // Dockerfile refusals removed (user decision 2026-09-27): before, `… devenv-0badc0de:3 of another environment`, and
     // `cafe1234` was an image reference for the question of image IDs.
     expect(refused(analysis.report)).toEqual([]);
@@ -91,13 +97,13 @@ describe('review round 18 (S18-1): a build argument named __proto__', () => {
 describe('Docker\'s view: an image of the Dockerfile', () => {
   const config = { build: { dockerfile: 'Dockerfile' } };
   const single = (dockerfile: string) =>
-    runAnalysisJob({ kind: 'single', input: { config, ownVolume: 'devenv-acme-api-3f2a9c1e' }, checksOn: true, config, dockerfileText: dockerfile });
+    runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config, dockerfileText: dockerfile });
 
   it('allows an image of another environment, and names it only for the update check', () => {
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`
     // (single and Compose), and `cafe1234` was an image reference for the question of image IDs.
-    expect(refused(single('FROM devenv-7c1d2e3f:2\n').report)).toEqual([]);
-    expect(refused(composeAccessReport(input({}, 'FROM devenv-7c1d2e3f:2\n')))).toEqual([]);
+    expect(refused(single(`FROM ${OTHER}:2\n`).report)).toEqual([]);
+    expect(refused(composeAccessReport(input({}, `FROM ${OTHER}:2\n`)))).toEqual([]);
     expect(single('FROM cafe1234\n').imageReferences).toEqual([]);
     expect(single('FROM cafe1234\n').references.images).toEqual(['cafe1234']);
   });

@@ -13,12 +13,13 @@ import {
   dockerTargetOf,
   environmentsOfHost,
   isOnDockerHost,
-  isOwnRemoteContext,
+  isOwnContextDescription,
   isRootlessEngine,
   isUsableSshAlias,
   parseContextInspect,
   parseSshAddress,
-  remoteContextName,
+  ownContextDescription,
+  remoteContextNames,
   rootlessSocketPath,
   sameDockerHost,
   sshCommandArgs,
@@ -26,6 +27,7 @@ import {
   sshTargetOf,
   RUNTIME_DIR_COMMAND,
 } from './dockerHost';
+import { namePair } from '../namePairs';
 
 describe('classifyDockerEndpoint (unit 7: SSH only for another computer)', () => {
   it.each([
@@ -84,18 +86,49 @@ describe('parseContextInspect', () => {
   });
 });
 
-describe('isOwnRemoteContext (the contexts of "Use a Remote Docker Host…")', () => {
-  it('is true only for the context of a host', () => {
-    expect(isOwnRemoteContext(remoteContextName('box'))).toBe(true);
-    expect(isOwnRemoteContext('devenv-remote-26f8567f')).toBe(true);
-    expect(isOwnRemoteContext(undefined)).toBe(false);
-    expect(isOwnRemoteContext('default')).toBe(false);
-    expect(isOwnRemoteContext('desktop-linux')).toBe(false);
-    expect(isOwnRemoteContext('devenv-remote-26F8567F')).toBe(false);
-    expect(isOwnRemoteContext('devenv-remote-26f8567')).toBe(false);
-    expect(isOwnRemoteContext('my-devenv-remote-26f8567f')).toBe(false);
-    // Greenfield, drop migration logic, user decision 2026-09-28: the bare prefix of earlier builds is not ours.
-    expect(isOwnRemoteContext('devenv-remote')).toBe(false);
+// User decisions 2026-10-03: the contexts are named after the SSH host and recognised as ours by their description
+// (replaces the tests of remoteContextName and isOwnRemoteContext).
+describe('remoteContextNames (the names of the context of a remote host)', () => {
+  it('takes an alias as it is, the pair of the host only for the second name', () => {
+    expect(remoteContextNames('htldvm')).toEqual(['htldvm', `htldvm-${namePair('htldvm')}`]);
+    expect(remoteContextNames('build_box.lan+1')).toEqual(['build_box.lan+1', `build_box.lan+1-${namePair('build_box.lan+1')}`]);
+  });
+
+  it('takes the host of an address, without the user and the port; the pair is of the whole address', () => {
+    expect(remoteContextNames('me@htldvm:2222')).toEqual(['htldvm', `htldvm-${namePair('me@htldvm:2222')}`]);
+    expect(remoteContextNames('me@htldvm')[0]).toBe('htldvm');
+    expect(remoteContextNames('htldvm:2222')[0]).toBe('htldvm');
+    // Same base name, different hosts: the second names differ.
+    expect(remoteContextNames('me@htldvm:2222')[1]).not.toBe(remoteContextNames('htldvm')[1]);
+  });
+
+  it('turns characters that Docker does not allow into "-"', () => {
+    const [name] = remoteContextNames('me@[fe80::1]:22');
+    expect(name).toMatch(/^[a-zA-Z0-9][a-zA-Z0-9_.+-]*$/);
+    expect(name).toBe('fe80-1');
+    expect(remoteContextNames('höst~name')[0]).toBe('h-st-name');
+    expect(remoteContextNames('-.box')[0]).toBe('box');
+  });
+
+  it("gives 'remote' for an empty name or the name 'default'", () => {
+    expect(remoteContextNames('default')).toEqual(['remote', `remote-${namePair('default')}`]);
+    expect(remoteContextNames('me@default')[0]).toBe('remote');
+    expect(remoteContextNames('')[0]).toBe('remote');
+    expect(remoteContextNames('~~~')[0]).toBe('remote');
+  });
+});
+
+describe('ownContextDescription and isOwnContextDescription (the contexts of "Use a Remote Docker Host…")', () => {
+  it('names the host in the description', () => {
+    expect(ownContextDescription('me@htldvm:2222')).toBe('Dev Environments: remote Docker host me@htldvm:2222');
+  });
+
+  it('is true only for a description that Dev Environments wrote, whatever the name of the context', () => {
+    expect(isOwnContextDescription(ownContextDescription('box'))).toBe(true);
+    expect(isOwnContextDescription(undefined)).toBe(false);
+    expect(isOwnContextDescription('')).toBe(false);
+    expect(isOwnContextDescription('Docker Desktop')).toBe(false);
+    expect(isOwnContextDescription('my box: Dev Environments: remote Docker host box')).toBe(false);
   });
 });
 
@@ -268,5 +301,43 @@ describe('isSshClosedBeforeLogin', () => {
     expect(isSshClosedBeforeLogin('root@box: Permission denied (publickey).\r\nConnection closed by 127.0.0.1 port 22')).toBe(false);
     expect(isSshClosedBeforeLogin('Connection to box closed by remote host.')).toBe(false);
     expect(isSshClosedBeforeLogin('ssh: connect to host box port 22: Connection refused')).toBe(false);
+  });
+});
+
+describe('review round 3 of PR #88 (A-R3-2): the context names of a host are valid Docker context names', () => {
+  // The Docker CLI takes only names of at least 2 characters (`docker context create b` fails, docker 29.3.1).
+  const DOCKER_CONTEXT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]+$/;
+  it.each(['b', 'user@b', 'b:2222', '[::1]', 'x_', 'htldvm'])('%s', (host) => {
+    for (const name of remoteContextNames(host)) expect(name).toMatch(DOCKER_CONTEXT_NAME);
+  });
+  it('prefixes a name of one character with remote-', () => {
+    expect(remoteContextNames('user@b')[0]).toBe('remote-b');
+  });
+});
+
+// Review round 3 of PR #88 (B-R3-9, mutant D2): the run of other characters at the end of the host name is trimmed, not
+// left as a trailing `-`.
+describe('review round 3 of PR #88 (B-R3-9): the context name of a host name that ends in other characters', () => {
+  it('has no trailing dash', () => {
+    expect(remoteContextNames('dev_box!')[0]).toBe('dev_box');
+  });
+});
+
+// Review round 4 of PR #88 (B-R4-4, mutant RC2): only a name of one character gets the prefix; a name of two characters
+// is a valid Docker context name as it is.
+describe('review round 4 of PR #88 (B-R4-4): the context name of a host name of two characters', () => {
+  it('keeps a name of two characters without the prefix', () => {
+    expect(remoteContextNames('db')[0]).toBe('db');
+    expect(remoteContextNames('user@db:2222')[0]).toBe('db');
+  });
+});
+
+// Review round 4 of PR #88 (B-R4-5, mutant X1): a description that shares only a part of the prefix (for example a context
+// of the user described as "Dev Environments staging") is not one that Dev Environments wrote.
+describe('review round 4 of PR #88 (B-R4-5): isOwnContextDescription needs the whole prefix', () => {
+  it('is false for a description that shares only a part of the prefix', () => {
+    expect(isOwnContextDescription('Dev Environments staging')).toBe(false);
+    expect(isOwnContextDescription('Dev Environments: remote')).toBe(false);
+    expect(isOwnContextDescription(ownContextDescription('h'))).toBe(true);
   });
 });

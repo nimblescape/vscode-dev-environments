@@ -19,7 +19,7 @@ import { DEFAULT_CONFIG_PATH, isContainerFault } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
 
 /** What Docker 29.3.1 prints in the output of `devcontainer up` when /etc/passwd of the container lacks the user. */
 const PASSWD_DAMAGED =
@@ -335,12 +335,13 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
     await seedEnvironment(h);
     const old = h.docker.containersOf(ENV_ID)[0];
     failFirstUp(PASSWD_DAMAGED);
-    const image2 = environmentImageName(ENV_ID, 2);
+    const image2 = environmentImageName(REPO, ENV_ID, 2);
     h.ui.recreateContainer = async (repository) => {
       h.ui.prompts.push(`recreateContainer ${repository}`);
       h.docker.images.add(image2);
       await h.registry.updateEnvironment(ENV_ID, (entry) => {
-        if (entry.buildRecord) entry.buildRecord = { ...entry.buildRecord, environmentImage: image2, buildNumber: 2 };
+        // Review round 1 of PR #88 (A-R1-1): a build pins the ID of its image, as buildAndReplace does.
+        if (entry.buildRecord) entry.buildRecord = { ...entry.buildRecord, environmentImage: image2, imageId: `sha256:image-of-${image2}`, buildNumber: 2 };
       });
       return true;
     };
@@ -351,6 +352,31 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
     expect(error.detail).toBe(Messages.containerChangedMeanwhile);
     expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
     expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expectVolumesKept();
+  });
+});
+
+// Review round 2 of PR #88 (B-R2-8): the image of the recreation is compared by the pinned ID of the record, and else
+// by the container's own image (containerImage), never by the name alone.
+describe('review round 2 of PR #88 (B-R2-8): the environment image was swapped under its name while the question was open', () => {
+  it('the container is not created again from the image that now has the name', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    const old = h.docker.containersOf(ENV_ID)[0];
+    failFirstUp(PASSWD_DAMAGED);
+    h.ui.recreateContainer = async (repository) => {
+      h.ui.prompts.push(`recreateContainer ${repository}`);
+      // Another image takes the name of the record (and of the container); the pinned image is gone by its ID.
+      h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+      return true;
+    };
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.containerChangedMeanwhile);
+    expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
     expectVolumesKept();
   });
 });

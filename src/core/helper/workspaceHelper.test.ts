@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { composeProjectName } from '../names';
 import type { ImageInfo } from '../docker/containerAdapter';
 import { preparingWorker } from '../docker/workerPreparation';
 import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
@@ -55,6 +56,10 @@ import {
   type HelperDocker,
   type HelperImageUse,
 } from './workspaceHelper';
+
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const PROJECT = composeProjectName('acme/api', NAME_ID);
 
 const TOKEN = 'gho_0123456789abcdefSECRET';
 const DOCKERFILE = 'FROM node:22-bookworm-slim\n';
@@ -2146,7 +2151,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
 
   it('build returns the result and sends every other output line to onOutput', async () => {
     docker.handler = () => ({
-      stdout: 'a log line on stdout\n{"outcome":"success","imageName":["devenv-3f2a9c1e:2"]}\n',
+      stdout: `a log line on stdout\n{"outcome":"success","imageName":["${PROJECT}:2"]}\n`,
       stderr: '[2026] Start: Run: docker buildx build\n',
     });
     const output: string[] = [];
@@ -2154,10 +2159,10 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       volumeName: 'vol',
       repository: 'acme/api',
       configPath: '.devcontainer/python/devcontainer.json',
-      imageName: 'devenv-3f2a9c1e:2',
+      imageName: `${PROJECT}:2`,
       onOutput: (text) => output.push(text),
     });
-    expect(result).toEqual({ outcome: 'success', imageName: ['devenv-3f2a9c1e:2'] });
+    expect(result).toEqual({ outcome: 'success', imageName: [`${PROJECT}:2`] });
     expect(output.join('')).toContain('a log line on stdout\n');
     expect(output.join('')).toContain('docker buildx build');
     expect(output.join('')).not.toContain('"outcome"');
@@ -2174,7 +2179,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       '--config',
       configFile,
       '--image-name',
-      'devenv-3f2a9c1e:2',
+      `${PROJECT}:2`,
       '--user-data-folder',
       '/devenv-cache',
     ]);
@@ -2221,7 +2226,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
     docker.handler = () => ({
       stdout: '{"outcome":"success","containerId":"c1","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/api"}\n',
     });
-    const override = { image: 'devenv-3f2a9c1e:2', shutdownAction: 'none' };
+    const override = { image: `${PROJECT}:2`, shutdownAction: 'none' };
     const result = await createHelper().up({
       volumeName: 'vol',
       repository: 'acme/api',
@@ -2259,7 +2264,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
 
   it('runUserCommands passes the override configuration on stdin and names the container of up (lifecycle token)', async () => {
     docker.handler = () => ({ stdout: '{"outcome":"success","result":"done"}\n' });
-    const override = { image: 'devenv-3f2a9c1e:2', shutdownAction: 'none' };
+    const override = { image: `${PROJECT}:2`, shutdownAction: 'none' };
     const result = await createHelper().runUserCommands({
       volumeName: 'vol',
       repository: 'acme/api',
@@ -2312,19 +2317,19 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
 });
 
 describe('WorkspaceHelper Docker Compose runs', () => {
-  const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: 'devenv-3f2a9c1e', services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {}, inputsHash: 'abc' };
+  const MODEL_OUTPUT = { version: '2.29.1', dollarEscaped: true, model: { name: PROJECT, services: { app: { image: 'x' } } }, dockerfiles: {}, realPaths: {}, inputsHash: 'abc' };
 
   it('composeModel runs the model script as the owner of the repository, with the project name', async () => {
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step composeModel of the batch helper runs as the owner of the
     // repository, with CONFIG_FOLDER closed (was: a per-step run without the socket and network, with a tmpfs over it).
     docker.handler = () => ({ stdout: `${JSON.stringify(MODEL_OUTPUT)}\n` });
     const files = ['/workspaces/api/.devcontainer/compose.yml'];
-    const result = await createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: 'devenv-3f2a9c1e' });
+    const result = await createHelper().composeModel({ volumeName: 'vol', repository: 'acme/api', files, project: PROJECT });
     expect(result).toEqual(MODEL_OUTPUT);
     const run = docker.runs[0];
     expect(bridge.kinds).toEqual(['composeModel']);
-    expect(batchStepCommand('composeModel', { repository: 'acme/api', files, project: 'devenv-3f2a9c1e' }).owner).toBe('/workspaces/api');
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(batchStepCommand('composeModel', { repository: 'acme/api', files, project: PROJECT }).owner).toBe('/workspaces/api');
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
     expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_MODEL_SCRIPT, '/workspaces/api', ...files]);
     expect(COMPOSE_MODEL_TIMEOUT_MS).toBe(60_000);
   });
@@ -2334,20 +2339,20 @@ describe('WorkspaceHelper Docker Compose runs', () => {
     // without the socket and network).
     const hash = 'c'.repeat(64);
     docker.handler = () => ({ stdout: `app ${hash}\ndb ${hash}\n` });
-    const hashes = await createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{"services":{}}', project: 'devenv-3f2a9c1e' });
+    const hashes = await createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{"services":{}}', project: PROJECT });
     expect(docker.runs[0].options.input).toBe('{"services":{}}');
     expect(hashes).toEqual(new Map([['app', hash], ['db', hash]]));
     const run = docker.runs[0];
     expect(bridge.kinds).toEqual(['composeHash']);
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
-    expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_HASH_SCRIPT, COMPOSE_MODEL_PATH, 'devenv-3f2a9c1e']);
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
+    expect(commandOf(run.args)).toEqual(['node', '-e', COMPOSE_HASH_SCRIPT, COMPOSE_MODEL_PATH, PROJECT]);
     docker.handler = () => ({ exitCode: 1, stderr: 'unknown flag: --hash' });
     await expect(createHelper().composeServiceHashes({ volumeName: 'vol', repository: 'acme/api', model: '{}', project: 'p' })).rejects.toBeInstanceOf(CommandError);
   });
 
   it('composeModel returns the message of Docker Compose, and throws when the helper fails', async () => {
     docker.handler = () => ({ stdout: '{"error":"yaml: bad"}\n' });
-    const p = { volumeName: 'vol', repository: 'acme/api', files: ['/workspaces/api/compose.yml'], project: 'devenv-3f2a9c1e' };
+    const p = { volumeName: 'vol', repository: 'acme/api', files: ['/workspaces/api/compose.yml'], project: PROJECT };
     expect(await createHelper().composeModel(p)).toEqual({ error: 'yaml: bad' });
     docker.handler = () => ({ exitCode: 1, stderr: 'boom' });
     await expect(createHelper().composeModel(p)).rejects.toBeInstanceOf(CommandError);
@@ -2397,14 +2402,14 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       merged: false,
       override,
       files: { [COMPOSE_MODEL_PATH]: '{"services":{}}' },
-      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+      env: { COMPOSE_PROJECT_NAME: PROJECT },
     });
     expect(result).toEqual({ config: { service: 'app' } });
     const run = docker.runs[0];
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step readConfiguration of the batch helper (root, with the
     // socket of the helper; was: a per-step run with the socket and the cache volume mounted).
     expect(bridge.kinds).toEqual(['readConfiguration']);
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
     expect(commandOf(run.args)).toEqual([
       'node',
       '-e',
@@ -2428,19 +2433,19 @@ describe('WorkspaceHelper Docker Compose runs', () => {
   });
 
   it('build with our copy of the configuration names it with --config and keeps the repository configuration for the lockfile', async () => {
-    docker.handler = () => ({ stdout: '{"outcome":"success","imageName":["devenv-3f2a9c1e:2"]}\n' });
+    docker.handler = () => ({ stdout: `{"outcome":"success","imageName":["${PROJECT}:2"]}\n` });
     const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app' };
     await createHelper().build({
       volumeName: 'vol',
       repository: 'acme/api',
       configPath: '.devcontainer/devcontainer.json',
-      imageName: 'devenv-3f2a9c1e:2',
+      imageName: `${PROJECT}:2`,
       override,
       files: { [COMPOSE_MODEL_PATH]: '{}', [COMPOSE_DEV_DOCKERFILE]: 'FROM x\n' },
-      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+      env: { COMPOSE_PROJECT_NAME: PROJECT },
     });
     const run = docker.runs[0];
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
     expect(commandOf(run.args)).toEqual([
       'node',
       '-e',
@@ -2454,7 +2459,7 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       '--config',
       OVERRIDE_CONFIG_PATH,
       '--image-name',
-      'devenv-3f2a9c1e:2',
+      `${PROJECT}:2`,
       '--user-data-folder',
       '/devenv-cache',
     ]);
@@ -2462,7 +2467,7 @@ describe('WorkspaceHelper Docker Compose runs', () => {
   });
 
   it('up with files writes them with the override configuration and passes the project name', async () => {
-    docker.handler = () => ({ stdout: '{"outcome":"success","containerId":"c1","composeProjectName":"devenv-3f2a9c1e"}\n' });
+    docker.handler = () => ({ stdout: `{"outcome":"success","containerId":"c1","composeProjectName":"${PROJECT}"}\n` });
     const override = { dockerComposeFile: [COMPOSE_MODEL_PATH], service: 'app', shutdownAction: 'none' };
     const result = await createHelper().up({
       volumeName: 'vol',
@@ -2470,17 +2475,17 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       override,
       environmentId: '3f2a9c1e-5b7d',
       removeExistingContainer: false,
-      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
-      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+      files: { [COMPOSE_MODEL_PATH]: `{"name":"${PROJECT}"}` },
+      env: { COMPOSE_PROJECT_NAME: PROJECT },
     });
     expect(result).toMatchObject({ outcome: 'success', containerId: 'c1' });
     const run = docker.runs[0];
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
     const command = commandOf(run.args);
     expect(command.slice(0, 7)).toEqual(['node', '-e', WRITE_AND_RUN_SCRIPT, '/tmp/devenv-override', '', '', 'up']);
     expect(command).toContain('--override-config');
     expect(JSON.parse(run.options.input ?? '')).toEqual({
-      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}', [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
+      files: { [COMPOSE_MODEL_PATH]: `{"name":"${PROJECT}"}`, [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
     });
   });
 
@@ -2494,13 +2499,13 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       environmentId: '3f2a9c1e-5b7d',
       // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the batch step takes a Docker container ID (12 to 64 hex digits; was: 'c1').
       containerId: 'c1c1c1c1c1c1',
-      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}' },
-      env: { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' },
+      files: { [COMPOSE_MODEL_PATH]: `{"name":"${PROJECT}"}` },
+      env: { COMPOSE_PROJECT_NAME: PROJECT },
       // review, PL-1/PL-2: runUserCommands takes the token (for the redaction of the output).
       token: TOKEN,
     });
     const run = docker.runs[0];
-    expect(run.args).toContain('COMPOSE_PROJECT_NAME=devenv-3f2a9c1e');
+    expect(run.args).toContain(`COMPOSE_PROJECT_NAME=${PROJECT}`);
     const command = commandOf(run.args);
     expect(command.slice(0, 7)).toEqual(['node', '-e', WRITE_AND_RUN_SCRIPT, '/tmp/devenv-override', '', '', 'run-user-commands']);
     expect(command.slice(7)).toEqual([
@@ -2517,7 +2522,7 @@ describe('WorkspaceHelper Docker Compose runs', () => {
       '--skip-post-attach',
     ]);
     expect(JSON.parse(run.options.input ?? '')).toEqual({
-      files: { [COMPOSE_MODEL_PATH]: '{"name":"devenv-3f2a9c1e"}', [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
+      files: { [COMPOSE_MODEL_PATH]: `{"name":"${PROJECT}"}`, [OVERRIDE_CONFIG_PATH]: JSON.stringify(override, null, 2) },
     });
   });
 

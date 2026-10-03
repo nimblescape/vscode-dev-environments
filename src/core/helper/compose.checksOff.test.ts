@@ -7,12 +7,13 @@
 // what only the class `computer` refuses (published ports on other addresses, bind mounts of the computer) and labels
 // every container nimblescape.devenv.host-access=unrestricted, as buildOverrideConfig does for a single container.
 import { describe, expect, it } from 'vitest';
-import { HOST_ACCESS_UNRESTRICTED, LABEL_HOST_ACCESS } from '../names';
+import { HOST_ACCESS_UNRESTRICTED, LABEL_HOST_ACCESS, composeProjectName, resourceName } from '../names';
 import { composeBuildModel, composeUpModel, serviceDecidesHostname, type ComposeModel, type ComposeRewriteParams, type ComposeService } from './compose';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
 const REPO = '/workspaces/api';
 
 function model(app: ComposeService = {}, db: ComposeService = {}): ComposeModel {
@@ -40,7 +41,7 @@ function params(overrides: Partial<ComposeRewriteParams> = {}): ComposeRewritePa
     volumeName: OWN,
     repositoryFolder: REPO,
     engineApiVersion: '1.47',
-    image: 'devenv-3f2a9c1e:7',
+    image: `${PROJECT}:7`,
     ...overrides,
   };
 }

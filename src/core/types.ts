@@ -18,8 +18,15 @@ export interface GitSummary {
 /** Name of the current environment image and the digests it was built from (concept 7.5, 7.7). */
 export interface BuildRecord {
   builtAt: string;
-  /** For example `devenv-3f2a9c1e:2`. */
+  /** For example `devenv-majikmate-module-ts-curious-hopper:2` (environmentImageName). */
   environmentImage: string;
+  /**
+   * User decisions 2026-10-03 (option 1): the full ID of environmentImage as this computer built it (after its labels,
+   * ContainerAdapter.labelImage) or took it over (from the labels of the newest image of a restored environment). An
+   * image under that name with another ID was swapped: it is not used (the open builds again). Not in the label of the
+   * build record (the label is part of the ID).
+   */
+  imageId?: string;
   buildNumber: number;
   /** Configuration that this build used. */
   configPath: string;
@@ -41,7 +48,7 @@ export interface BuildRecord {
 export interface ComposeBuildRecord {
   /** `service` of devcontainer.json: the dev service. */
   service: string;
-  /** `devenv-<short id>-<service>` of each service that Compose builds. */
+  /** `<project>-<service>` (composeServiceImage) of each service that Compose builds. */
   images: string[];
   /**
    * The `image` references of the other services that are not built (for example `postgres:16`), as the image check

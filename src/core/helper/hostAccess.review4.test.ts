@@ -5,10 +5,13 @@
 // Hotfix review 4: Q1 (the workspace folder of a repository named *.code-workspace) and Q2 (bind sources are shown
 // normalized, so that the truncation of an item cannot hide what the mount reaches).
 import { describe, expect, it } from 'vitest';
+import { resourceName } from '../names';
 import { helperCliVariables } from './cliVariables';
 import { MAX_ITEM_LENGTH, hostAccessReport, mountedVolumeNames } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
 
 describe('hotfix review 4, Q1: a repository named *.code-workspace', () => {
   it('checks the volume that the CLI mounts for ${localWorkspaceFolderBasename}', () => {

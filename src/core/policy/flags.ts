@@ -263,7 +263,7 @@ export function networkProblems(value: string, volumes?: VolumeContext): Problem
   // The network of another environment (its Compose project, perhaps of another account): account separation.
   const foreign: Problem[] = [];
   for (const network of networks.map((name) => name.trim())) {
-    const item = foreignNetworkItem(network, volumes?.networks[network], volumes?.environment?.id);
+    const item = foreignNetworkItem(network, volumes?.networks[network], volumes?.environment?.id, volumes?.own);
     if (item !== undefined) foreign.push(guarded(item));
   }
   return foreign;
