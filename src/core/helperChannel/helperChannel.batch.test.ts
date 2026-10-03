@@ -76,7 +76,7 @@ async function session(options: Partial<HelperChannelOptions> = {}) {
 describe('HelperChannel.batch (plan step 6, PR B)', () => {
   it('holds a batch without a place of the operations, up to its own cap, without a secret', async () => {
     const { channel, worker, batchOp, session: first } = await session();
-    expect(batchOp.secret).toBeUndefined();
+    expect(batchOp.secrets?.token).toBeUndefined();
     expect(first.session).toMatch(/^[0-9a-f]{24}$/);
     // The places of the operations stay free.
     for (let i = 0; i < MAX_CONCURRENT_OPERATIONS; i++) channel.operation('docker', { args: ['ps'] }).catch(() => {});
@@ -97,10 +97,11 @@ describe('HelperChannel.batch (plan step 6, PR B)', () => {
   it('masks the secret in the output of a step itself, also across pieces, and sends it only as the secret', async () => {
     const { channel, worker, session: s } = await session();
     const seen: string[] = [];
-    const running = s.step('up', { repository: 'o/r' }, { secret: TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    const running = s.step('up', { repository: 'o/r' }, { secrets: { token: TOKEN }, onOutput: (_stream, text) => seen.push(text) });
     await tick();
     const op = worker.ops().at(-1)!;
-    expect(op).toMatchObject({ op: OP_BATCH_STEP, secret: TOKEN, params: { session: s.session, kind: 'up', params: { repository: 'o/r' } } });
+    // Plan step 11A: changed expectation (before: one `secret`): named secrets.
+    expect(op).toMatchObject({ op: OP_BATCH_STEP, secrets: { token: TOKEN }, params: { session: s.session, kind: 'up', params: { repository: 'o/r' } } });
     worker.answer({ t: 'out', id: op.id, stream: 'stdout', data: `a ${TOKEN.slice(0, 7)}` });
     worker.answer({ t: 'out', id: op.id, stream: 'stdout', data: `${TOKEN.slice(7)} b` });
     worker.answer({ t: 'out', id: op.id, stream: 'stderr', data: TOKEN });
@@ -324,7 +325,7 @@ describe('the places and the limits of a batch on the client (review round 1 of 
 
   it('review round 2 of PR #80, B-R2-1: an overflow that only the flush after a success finds (a held-back tail that could start the secret) rejects with OutputTooLargeError', async () => {
     const { channel, worker, session: s } = await session({ maxCapturedOutputBytes: 1_000 });
-    const running = s.step('listConfigs', { repository: 'o/r' }, { secret: TOKEN });
+    const running = s.step('listConfigs', { repository: 'o/r' }, { secrets: { token: TOKEN } });
     await tick();
     const op = worker.ops().at(-1)!;
     // 999 characters pass; the masker holds back 'ghp_cl' (it could start the token), so no cancel goes out yet.
@@ -370,7 +371,7 @@ describe('the places and the limits of a batch on the client (review round 1 of 
 
   it('review round 1 of PR #80, B-R1-8: the end of the stdout of a masked step that could start the secret is kept (HC23)', async () => {
     const { channel, worker, session: s } = await session();
-    const running = s.step('up', { repository: 'o/r' }, { secret: TOKEN });
+    const running = s.step('up', { repository: 'o/r' }, { secrets: { token: TOKEN } });
     await tick();
     const op = worker.ops().at(-1)!;
     // TOKEN starts with `g`: the redactor holds the last `g` back until the end.
@@ -387,10 +388,11 @@ describe('the places and the limits of a batch on the client (review round 1 of 
     const params = { repository: 'o/r', text: 'a'.repeat(MAX_CHANNEL_REQUEST_BYTES - 100 - base) };
     expect(Buffer.byteLength(JSON.stringify(params), 'utf8')).toBe(MAX_CHANNEL_REQUEST_BYTES - 100);
     const before = worker.ops().length;
-    const running = s.step('up', params, { secret });
+    const running = s.step('up', params, { secrets: { token: secret } });
     const { step, chunks } = await answerPieces(worker, before);
     expect(chunks.length).toBeGreaterThan(1);
-    expect(step).toMatchObject({ secret, params: { session: s.session, kind: 'up', input: (chunks[0].params as { input: string }).input } });
+    // Plan step 11A: changed expectation (before: one `secret`): named secrets.
+    expect(step).toMatchObject({ secrets: { token: secret }, params: { session: s.session, kind: 'up', input: (chunks[0].params as { input: string }).input } });
     worker.answer({ t: 'result', id: step!.id, ok: true, value: { exitCode: 0 } });
     expect((await running).exitCode).toBe(0);
     channel.close();

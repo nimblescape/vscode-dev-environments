@@ -7,12 +7,13 @@ import { describe, expect, it } from 'vitest';
 import { parseProbeValue } from '../core/helperChannel/protocol';
 import { contextRunner, probeOperation } from './operations';
 import type { OperationContext } from './server';
+import { contextSecrets } from './operationContext.testkit';
 
 function context(answers: Record<string, { exitCode: number; stdout: string }>): { context: OperationContext; calls: string[][] } {
   const calls: string[][] = [];
   const value: OperationContext = {
     signal: new AbortController().signal,
-    secret: undefined,
+    ...contextSecrets(),
     progress: () => {},
     log: () => {},
     output: () => {},

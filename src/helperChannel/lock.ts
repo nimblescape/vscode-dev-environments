@@ -64,7 +64,7 @@ export function lockOperation(deps: LockDeps = LOCK_DEPS): OperationHandler {
   return async (params, context) => {
     const checked = parseLockParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the lock operation are invalid.');
-    if (context.secret !== undefined) throw new OperationError('invalid', 'The lock operation takes no secret.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The lock operation takes no secret.');
     context.progress('lock', checked.environmentId);
     let fd: number;
     try {

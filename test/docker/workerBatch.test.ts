@@ -180,7 +180,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(execIn(container, uid, 'ls /run/devenv-secrets').code).not.toBe(0);
 
     const output: string[] = [];
-    const clone = session.step('clone', { repository: CLONED }, { secret: DUMMY_TOKEN, timeoutMs: 20_000, onOutput: (_stream, text) => output.push(text) });
+    const clone = session.step('clone', { repository: CLONED }, { secrets: { token: DUMMY_TOKEN }, timeoutMs: 20_000, onOutput: (_stream, text) => output.push(text) });
     // The clone waits in its `git`, as the Git user: CONFIG_FOLDER is closed to that user for the step.
     await waitUntil(() => execIn(container, '0:0', `for p in /proc/[0-9]*; do [ "$(stat -c %u $p 2>/dev/null)" = ${BATCH_GIT_UID} ] && grep -q sleep $p/cmdline 2>/dev/null && exit 0; done; exit 1`).code === 0, 'the Git step');
     expect(execIn(container, uid, 'cat /workspaces/.devenv+/gitconfig').code).not.toBe(0);

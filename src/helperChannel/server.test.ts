@@ -192,7 +192,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
   it('gives the secret only as input of a call and masks it in the output, also when a chunk splits it', async () => {
     const { send, docker, of } = setup();
     const secret = 'ghp_secretTOKEN123';
-    send({ t: 'op', id: 1, op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, secret });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, secrets: { token: secret } });
     const [child] = docker.children;
     expect(child.args.join(' ')).not.toContain(secret);
     expect(child.input).toBe(secret);
@@ -223,8 +223,8 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
         },
       },
     });
-    send({ t: 'op', id: 1, op: 'fails', params: null, secret });
-    send({ t: 'op', id: 2, op: 'throws', params: null, secret });
+    send({ t: 'op', id: 1, op: 'fails', params: null, secrets: { token: secret } });
+    send({ t: 'op', id: 2, op: 'throws', params: null, secrets: { token: secret } });
     await vi.advanceTimersByTimeAsync(0);
     expect(JSON.stringify([...of(1), ...of(2)])).not.toContain(secret);
     expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { code: 'failed', message: 'the registry said: bad credentials ***' } });
@@ -437,7 +437,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       },
     };
     const { send, docker, of } = setup({ operations });
-    send({ t: 'op', id: 1, op: 'two', params: null, secret });
+    send({ t: 'op', id: 1, op: 'two', params: null, secrets: { token: secret } });
     await vi.advanceTimersByTimeAsync(0);
     const [a, b] = docker.children;
     a.stdout(`token ${secret.slice(0, 10)}`);
@@ -463,7 +463,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       },
     };
     const { send, docker, of } = setup({ operations });
-    send({ t: 'op', id: 1, op: 'build', params: null, secret });
+    send({ t: 'op', id: 1, op: 'build', params: null, secrets: { token: secret } });
     await vi.advanceTimersByTimeAsync(0);
     const [child] = docker.children;
     // One line without a line feed; the secret lies where the kept end would begin.
@@ -479,7 +479,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
   it('masks the secret before it cuts the last error line of the log (review round 1, S2)', async () => {
     const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
     const { send, docker, of } = setup();
-    send({ t: 'op', id: 1, op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, secret });
+    send({ t: 'op', id: 1, op: 'docker', params: { args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, secrets: { token: secret } });
     // The secret spans the cut at 500 characters of the last line.
     docker.children[0].stderr(`${'x'.repeat(480)}${secret} failed\n`);
     docker.children[0].exit(1);
@@ -536,7 +536,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       },
     };
     const { send, of } = setup({ operations });
-    send({ t: 'op', id: 1, op: 'steps', params: null, secret: 's3cr3t-value' });
+    send({ t: 'op', id: 1, op: 'steps', params: null, secrets: { token: 's3cr3t-value' } });
     await vi.advanceTimersByTimeAsync(0);
     expect(of(1)).toEqual([
       { t: 'progress', id: 1, step: 'Cloning', detail: 'acme/api' },
@@ -698,7 +698,7 @@ describe('the refresh operation over the fake Docker CLI (plan step 5, PR C)', (
   async function refresh(params: unknown, secret?: string) {
     const docker = fakeDocker({ respond: (args) => refreshFixture(args) });
     const ctx = setup({ docker });
-    ctx.send(secret === undefined ? { t: 'op', id: 1, op: 'refresh', params } : { t: 'op', id: 1, op: 'refresh', params, secret });
+    ctx.send(secret === undefined ? { t: 'op', id: 1, op: 'refresh', params } : { t: 'op', id: 1, op: 'refresh', params, secrets: { token: secret } });
     for (let round = 0; round < 200 && ctx.resultOf(1) === undefined; round++) await vi.advanceTimersByTimeAsync(0);
     return { result: ctx.resultOf(1), docker, messages: ctx.messages };
   }

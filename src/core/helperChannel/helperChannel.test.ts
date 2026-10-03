@@ -187,16 +187,18 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
     fake.answer({ ...HELLO, protocol: CHANNEL_PROTOCOL_VERSION + 1 } as ServerMessage);
     // Plan step 6, PR B: changed expectation (the protocol is version 2 now, so another one is 3).
-    await expect(opening).rejects.toThrow(/speaks version 3, not 2/);
+    // Plan step 11A: changed expectation (the protocol is 3 now; the test sends the next one).
+    await expect(opening).rejects.toThrow(/speaks version 4, not 3/);
     expect(fake.state.ended).toBe(true);
   });
 
   it('resolves an operation with its value; logs its start, its progress, its log lines, and its end; its output goes to the log', async () => {
     const { channel, fake, lines } = await openChannel();
     const progress: string[] = [];
-    const result = channel.operation('start', { repository: 'acme/api' }, { secret: 'ghp_token', onProgress: (step) => progress.push(step) });
+    const result = channel.operation('start', { repository: 'acme/api' }, { secrets: { token: 'ghp_token' }, onProgress: (step) => progress.push(step) });
     const op = lastOp(fake);
-    expect(op).toEqual({ t: 'op', id: op.id, op: 'start', params: { repository: 'acme/api' }, secret: 'ghp_token' });
+    // Plan step 11A: changed expectation (before: one `secret`): named secrets.
+    expect(op).toEqual({ t: 'op', id: op.id, op: 'start', params: { repository: 'acme/api' }, secrets: { token: 'ghp_token' } });
     fake.answer({ t: 'progress', id: op.id, step: 'Cloning', detail: 'acme/api' });
     fake.answer({ t: 'log', id: op.id, level: 'info', text: '$ docker run …' });
     fake.answer({ t: 'log', id: op.id, level: 'warn', text: 'exit code 1 after 0.2 s' });
@@ -477,7 +479,7 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const { channel, fake } = await openChannel();
       const result = channel.docker(['exec', '-i', 'c', 'sh', '-c', 'cat > /run/secrets/token'], { secretInput: 'ghp_token_value' });
       const op = lastOp(fake);
-      expect(op.secret).toBe('ghp_token_value');
+      expect(op.secrets?.token).toBe('ghp_token_value');
       expect(op.params).toEqual({ args: ['exec', '-i', 'c', 'sh', '-c', 'cat > /run/secrets/token'], inputIsSecret: true });
       expect(JSON.stringify(op.params)).not.toContain('ghp_token_value');
       fake.answer({ t: 'result', id: op.id, ok: true, value: { exitCode: 0 } });
@@ -488,7 +490,7 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     it('S6: a secret too short to be masked is not sent', async () => {
       const { channel, fake } = await openChannel();
       await expect(channel.docker(['exec'], { secretInput: 'abc' })).rejects.toMatchObject({ code: 'unsendable' });
-      await expect(channel.operation('start', {}, { secret: '' })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.operation('start', {}, { secrets: { token: '' } })).rejects.toMatchObject({ code: 'unsendable' });
       expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
     });
 
@@ -528,7 +530,7 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const pulling = channel.pull('ghcr.io/o/i:1', { credentials: { username: 'octo', password: 'gho_secret', serveraddress: 'ghcr.io' }, onOutput: (text) => output.push(text) });
       await vi.advanceTimersByTimeAsync(0);
       const op = lastOp(fake);
-      expect(op).toMatchObject({ op: 'pull', params: { reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, secret: 'gho_secret' });
+      expect(op).toMatchObject({ op: 'pull', params: { reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, secrets: { registry: 'gho_secret' } });
       expect(JSON.stringify(op.params)).not.toContain('gho_secret');
       fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: '1: Pulling from o/i\n' });
       fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
@@ -542,7 +544,7 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       const pulling = channel.pull('r.example/o/i:1', { credentials: { identityToken: 'refresh-token', serveraddress: 'r.example' } });
       await vi.advanceTimersByTimeAsync(0);
       const op = lastOp(fake);
-      expect(op).toMatchObject({ op: 'pull', params: { reference: 'r.example/o/i:1', identityToken: true, serveraddress: 'r.example' }, secret: 'refresh-token' });
+      expect(op).toMatchObject({ op: 'pull', params: { reference: 'r.example/o/i:1', identityToken: true, serveraddress: 'r.example' }, secrets: { registry: 'refresh-token' } });
       expect(op.params).not.toHaveProperty('username');
       fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
       await pulling;
@@ -567,7 +569,7 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
       await vi.advanceTimersByTimeAsync(0);
       const op = lastOp(fake);
       expect(op).toMatchObject({ op: 'startContainers', params: { ids: ['a'.repeat(64)] }, timeoutMs: 60_000 });
-      expect(op.secret).toBeUndefined();
+      expect(op.secrets?.token).toBeUndefined();
       fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'failed', message: 'port is already allocated' }, cancelled: false, timedOut: false });
       await expect(starting).rejects.toMatchObject({ name: 'HelperOperationError', message: 'port is already allocated' });
     });
@@ -655,7 +657,7 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
   it('sends the lock with its parameters and no secret, and resolves when the worker holds it', async () => {
     const { op, lock } = await held();
     expect(op).toMatchObject({ t: 'op', op: 'lock', params: { environmentId: ID, waitSeconds: 10 } });
-    expect(op.secret).toBeUndefined();
+    expect(op.secrets?.token).toBeUndefined();
     expect(lock.environmentId).toBe(ID);
   });
 
@@ -950,5 +952,111 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
     expect(fake.messages().at(-1)).toEqual({ t: 'cancel', id: op.id });
     fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
     await expect(locking).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+// Plan step 11A (decision of 2026-10-03, the worker is the deputy): the extension answers the requests of an operation.
+describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const answers = (fake: ReturnType<typeof fakeProcess>) => fake.messages().filter((message) => message.t === 'answer');
+
+  it('answers with the value and the secrets of onAsk', async () => {
+    const { channel, fake } = await openChannel();
+    const seen: unknown[] = [];
+    const running = channel.operation('open', {}, {
+      onAsk: async (kind, payload) => {
+        seen.push([kind, payload]);
+        return kind === 'secret' ? { value: 'ok', secrets: { registry: 'reg-pass' } } : { value: { recreate: true } };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: { text: 'Recreate?' } });
+    fake.answer({ t: 'ask', id: op.id, ask: 2, kind: 'secret', payload: { name: 'registry' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([
+      ['question', { text: 'Recreate?' }],
+      ['secret', { name: 'registry' }],
+    ]);
+    expect(answers(fake)).toEqual([
+      { t: 'answer', id: op.id, ask: 1, ok: true, value: { recreate: true } },
+      { t: 'answer', id: op.id, ask: 2, ok: true, value: 'ok', secrets: { registry: 'reg-pass' } },
+    ]);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: 1 });
+    await expect(running).resolves.toBe(1);
+  });
+
+  it('answers `unsupported` without onAsk, the code of a HelperOperationError, `failed` otherwise, and `invalid` for secrets it cannot send', async () => {
+    const { channel, fake } = await openChannel();
+    const plain = channel.operation('open', {});
+    await vi.advanceTimersByTimeAsync(0);
+    const first = lastOp(fake);
+    fake.answer({ t: 'ask', id: first.id, ask: 1, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).at(-1)).toMatchObject({ id: first.id, ask: 1, ok: false, error: { code: 'unsupported' } });
+    fake.answer({ t: 'result', id: first.id, ok: true, value: null });
+    await plain;
+
+    let call = 0;
+    const failing = channel.operation('open', {}, {
+      onAsk: async () => {
+        call++;
+        if (call === 1) throw new HelperOperationError('declined', 'The user declined.', false);
+        if (call === 2) throw new Error('boom');
+        return { value: null, secrets: { token: 'ab' } };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const second = lastOp(fake);
+    for (const ask of [1, 2, 3]) fake.answer({ t: 'ask', id: second.id, ask, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).slice(-3)).toEqual([
+      { t: 'answer', id: second.id, ask: 1, ok: false, error: { code: 'declined', message: 'The user declined.' } },
+      { t: 'answer', id: second.id, ask: 2, ok: false, error: { code: 'failed', message: 'boom' } },
+      { t: 'answer', id: second.id, ask: 3, ok: false, error: { code: 'invalid', message: 'The secrets of the answer cannot be sent.' } },
+    ]);
+    fake.answer({ t: 'result', id: second.id, ok: true, value: null });
+    await failing;
+  });
+
+  it('aborts the handler when the operation ends, and sends no answer after the end; a request of an unknown operation is ignored', async () => {
+    const { channel, fake } = await openChannel();
+    let handlerSignal: AbortSignal | undefined;
+    let release!: () => void;
+    const running = channel.operation('open', {}, {
+      onAsk: (_kind, _payload, signal) => {
+        handlerSignal = signal;
+        return new Promise((resolve) => (release = () => resolve({ value: 'late' })));
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    fake.answer({ t: 'ask', id: 999, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(handlerSignal?.aborted).toBe(false);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: 'done' });
+    await expect(running).resolves.toBe('done');
+    expect(handlerSignal?.aborted).toBe(true);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake)).toEqual([]);
+  });
+
+  it('sends named secrets, and refuses secrets that it cannot send', async () => {
+    const { channel, fake } = await openChannel();
+    const sending = channel.operation('open', {}, { secrets: { token: 'tok-1234', registry: 'reg-5678' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastOp(fake).secrets).toEqual({ token: 'tok-1234', registry: 'reg-5678' });
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: true, value: null });
+    await sending;
+    await expect(channel.operation('open', {}, { secrets: { 'Bad-Name': 'abcd' } })).rejects.toMatchObject({ code: 'unsendable' });
+    await expect(channel.operation('open', {}, { secrets: { token: 'ab' } })).rejects.toMatchObject({ code: 'unsendable' });
   });
 });

@@ -30,7 +30,7 @@ import * as fs from 'fs';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepCommand } from '../core/helper/batchSteps';
 import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
-import { CHANNEL_KILL_GRACE_MS } from '../core/helperChannel/protocol';
+import { CHANNEL_KILL_GRACE_MS, SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
@@ -303,14 +303,17 @@ export function batchHelperOperations(deps: BatchHelperDeps): Record<string, Ope
     } catch (error) {
       throw new OperationError('invalid', error instanceof BatchStepError ? error.message : 'The parameters of the step are invalid.');
     }
-    if (step.secret === undefined && context.secret !== undefined) throw new OperationError('invalid', `The step ${kind} takes no secret.`);
-    if (step.secret === 'stdin' && context.secret === undefined) throw new OperationError('invalid', `The step ${kind} needs a secret.`);
+    // Plan step 11A: a step takes at most the GitHub token (SECRET_TOKEN).
+    const token = context.secrets[SECRET_TOKEN];
+    if (step.secret === undefined && !context.hasNoSecret()) throw new OperationError('invalid', `The step ${kind} takes no secret.`);
+    if (Object.keys(context.secrets).some((name) => name !== SECRET_TOKEN)) throw new OperationError('invalid', `The step ${kind} takes no secret but the token.`);
+    if (step.secret === 'stdin' && token === undefined) throw new OperationError('invalid', `The step ${kind} needs a secret.`);
     if (deps.unsafe !== undefined) throw new OperationError('unsafe', `The batch helper cannot run steps: ${deps.unsafe}`);
     if (running) throw new OperationError('busy', 'Another step runs in the batch helper.');
     running = true;
     try {
       context.progress(kind);
-      const input = step.secret === 'stdin' ? context.secret : step.input;
+      const input = step.secret === 'stdin' ? token : step.input;
       const exitCode = step.git
         ? await asGitUser(deps, gitUser, step, () => runStep(deps, step, input, context, gitPrivilegeArgs()))
         : step.owner !== undefined

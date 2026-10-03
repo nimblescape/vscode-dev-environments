@@ -206,9 +206,9 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     ]);
     const byKind = Object.fromEntries(lock.steps.map((step) => [step.kind, step]));
     // The token: only in the `secret` field (the clone's standard input in the helper; `up` and run-user-commands mask it).
-    expect(byKind.clone).toMatchObject({ params: { repository: 'acme/app', branch: 'main' }, options: { secret: TOKEN } });
+    expect(byKind.clone).toMatchObject({ params: { repository: 'acme/app', branch: 'main' }, options: { secrets: { token: TOKEN } } });
     for (const step of lock.steps) expect(JSON.stringify(step.params)).not.toContain(TOKEN);
-    expect(lock.steps.filter((step) => step.options.secret !== undefined).map((step) => step.kind)).toEqual(['clone', 'up', 'runUserCommands']);
+    expect(lock.steps.filter((step) => step.options.secrets?.token !== undefined).map((step) => step.kind)).toEqual(['clone', 'up', 'runUserCommands']);
     // The variables pass the checks of `-e` (DOCKER_HOST never), and only to the kinds that take them.
     expect(byKind.readConfiguration.params).toEqual({ repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: ENVIRONMENT_ID, merged: false, env: { COMPOSE_PROJECT_NAME: 'p' } });
     expect(byKind.composeModel.params).toEqual({ repository: 'acme/app', files: [`${folder}/compose.yml`], project: 'p' });
@@ -618,7 +618,7 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       expect(command.env, kind).toEqual(built[0].env);
       // The clone takes the token as its secret, not as an input of the step.
       if (kind !== 'clone') expect(command.input, kind).toBe(built[0].input);
-      else expect(lock.steps[0].options.secret, kind).toBe(TOKEN);
+      else expect(lock.steps[0].options.secrets?.token, kind).toBe(TOKEN);
     }
   });
 

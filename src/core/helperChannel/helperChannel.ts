@@ -26,7 +26,8 @@ import {
 } from './batch';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from '../helper/analysisLimits';
 import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
-import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
+import { errorMessage } from '../errors';
+import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
@@ -52,7 +53,11 @@ import {
   parseStartContainersParams,
   StreamRedactor,
   encodeMessage,
-  isSecret,
+  SECRET_REGISTRY,
+  SECRET_TOKEN,
+  parseSecrets,
+  type AskKind,
+  type Secrets,
   newCleanupLabel,
   parseDockerOperationParams,
   parseDockerOperationValue,
@@ -108,8 +113,17 @@ export class HelperOperationError extends Error {
 }
 
 export interface OperationOptions {
-  /** The GitHub token, if the operation needs it (protocol.ts: never logged, only input of a process). */
-  secret?: string;
+  /**
+   * Plan step 11A: the named secrets of the operation (SECRET_TOKEN, SECRET_REGISTRY; protocol.ts: never logged, only
+   * input of a process or the header of a request to the engine, masked in everything that comes back).
+   */
+  secrets?: Secrets;
+  /**
+   * Plan step 11A: answers the requests of the operation (`ask`): resolves with the value and the secrets that the
+   * operation gets from then on; a rejection answers with a failure. Without it every request is answered with the
+   * failure `unsupported`. `signal` aborts when the operation ends.
+   */
+  onAsk?: (kind: AskKind, payload: unknown, signal: AbortSignal) => Promise<{ value: unknown; secrets?: Secrets }>;
   timeoutMs?: number;
   /** Cancels the operation in the helper; the promise rejects with an AbortError at once. */
   signal?: AbortSignal;
@@ -159,8 +173,11 @@ export interface ChannelPullOptions extends Pick<OperationOptions, 'signal' | 'r
 
 /** Plan step 6, PR B: the options of one step of a batch helper (HelperBatchSession.step). */
 export interface BatchStepOptions {
-  /** The GitHub token, for a step that needs it (the clone) or whose output may hold it (masked). */
-  secret?: string;
+  /**
+   * Plan step 11A: the named secrets of the step: SECRET_TOKEN, the GitHub token, for a step that needs it (the clone)
+   * or whose output may hold it (masked).
+   */
+  secrets?: Secrets;
   signal?: AbortSignal;
   /** Ends the step alone (its process group in the helper); the result has `timedOut`, and the session stays. */
   timeoutMs?: number;
@@ -247,6 +264,8 @@ interface Pending {
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
   onAbort?: () => void;
+  /** Plan step 11A: aborts the handlers of its requests when the operation ends. */
+  asks?: AbortController;
 }
 
 /** One open channel. Create it with HelperChannel.open. */
@@ -449,6 +468,9 @@ export class HelperChannel {
         else this.options.logger.output(message.data);
         return;
       }
+      case 'ask':
+        this.onAsk(message.id, message.ask, message.kind, message.payload);
+        return;
       case 'result': {
         const pending = this.pending.get(message.id);
         if (!pending) return;
@@ -466,6 +488,44 @@ export class HelperChannel {
         return;
       }
     }
+  }
+
+  /**
+   * Plan step 11A: a request of the running operation `id`: answered by its `onAsk` (the value and secrets; a rejection
+   * as the failure `failed`, or its code when it is a HelperOperationError), or with `unsupported` without one. The
+   * handler's signal aborts when the operation ends; a request of an operation that ended is not answered.
+   */
+  private onAsk(id: number, ask: number, kind: AskKind, payload: unknown): void {
+    const pending = this.pending.get(id);
+    if (!pending || pending.cancelling) return;
+    const reply = (message: ClientMessage) => {
+      if (this.state !== 'open' || !this.pending.has(id)) return;
+      this.write(encodeMessage(message));
+    };
+    const handler = pending.options.onAsk;
+    if (handler === undefined) {
+      reply({ t: 'answer', id, ask, ok: false, error: { code: 'unsupported', message: `The extension answers no request ${kind} of this operation.` } });
+      return;
+    }
+    const ended = pending.asks ?? (pending.asks = new AbortController());
+    void handler(kind, payload, ended.signal).then(
+      ({ value, secrets }) => {
+        if (secrets !== undefined && Object.keys(secrets).length > 0) {
+          const checked = parseSecrets(secrets);
+          if (checked === undefined) {
+            reply({ t: 'answer', id, ask, ok: false, error: { code: 'invalid', message: 'The secrets of the answer cannot be sent.' } });
+            return;
+          }
+          reply({ t: 'answer', id, ask, ok: true, value, secrets: checked });
+          return;
+        }
+        reply({ t: 'answer', id, ask, ok: true, value });
+      },
+      (error: unknown) => {
+        const code = error instanceof HelperOperationError ? error.code : isAbortError(error) ? 'cancelled' : 'failed';
+        reply({ t: 'answer', id, ask, ok: false, error: { code, message: errorMessage(error) } });
+      },
+    );
   }
 
   /** The line of the end of an operation of steps (the `docker` operation logs its call itself). */
@@ -487,6 +547,7 @@ export class HelperChannel {
     const pending = this.pending.get(id);
     if (!pending) return undefined;
     this.pending.delete(id);
+    pending.asks?.abort();
     if (pending.timer) clearTimeout(pending.timer);
     if (pending.onAbort) pending.options.signal?.removeEventListener('abort', pending.onAbort);
     // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
@@ -554,9 +615,10 @@ export class HelperChannel {
     }
     const id = this.nextId++;
     const message: ClientMessage = { t: 'op', id, op, params: params === undefined ? null : params };
-    if (options.secret !== undefined) {
-      if (!isSecret(options.secret)) throw new HelperChannelError('unsendable', 'The secret cannot be sent through the helper channel.');
-      message.secret = options.secret;
+    if (options.secrets !== undefined && Object.keys(options.secrets).length > 0) {
+      const secrets = parseSecrets(options.secrets);
+      if (secrets === undefined) throw new HelperChannelError('unsendable', 'The secrets cannot be sent through the helper channel.');
+      message.secrets = secrets;
     }
     if (options.timeoutMs !== undefined) message.timeoutMs = options.timeoutMs;
     let line = encodeMessage(message);
@@ -686,7 +748,7 @@ export class HelperChannel {
     if (!this.operations.includes(OP_PULL)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_PULL}.`);
     const onOutput = options.onOutput;
     await this.operation(OP_PULL, params, {
-      secret: login === undefined ? undefined : 'identityToken' in login ? login.identityToken : login.password,
+      ...(login === undefined ? {} : { secrets: { [SECRET_REGISTRY]: 'identityToken' in login ? login.identityToken : login.password } }),
       signal: options.signal,
       reserved: options.reserved,
       ...(onOutput !== undefined ? { onOutput: (_stream: 'stdout' | 'stderr', text: string) => onOutput(text) } : {}),
@@ -811,7 +873,8 @@ export class HelperChannel {
     if (options.timeoutMs !== undefined) request.timeoutMs = options.timeoutMs;
     if (typeof text !== 'string' || parseBatchStepParams(request) === undefined) throw new HelperChannelError('unsendable', 'The batch step is invalid.');
     // The request with its secret (at most 6 bytes per character as JSON) must fit in MAX_CHANNEL_REQUEST_BYTES.
-    if (Buffer.byteLength(text, 'utf8') + 6 * ((options.secret?.length ?? 0) + 1_024) > MAX_CHANNEL_REQUEST_BYTES) {
+    const secretLength = Object.values(options.secrets ?? {}).reduce((sum, secret) => sum + secret.length + 64, 0);
+    if (Buffer.byteLength(text, 'utf8') + 6 * (secretLength + 1_024) > MAX_CHANNEL_REQUEST_BYTES) {
       if (text.length > MAX_BATCH_INPUT_CHARACTERS) throw new HelperChannelError('unsendable', `The input of the step ${kind} is too large for the helper channel.`);
       const input = newCleanupLabel();
       for (let start = 0; start < text.length; start += BATCH_CHUNK_CHARACTERS) {
@@ -829,7 +892,7 @@ export class HelperChannel {
     const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
     // The output of the step, masked here too (the worker and the helper mask it before), also across pieces.
     const streams = {
-      stdout: new StreamRedactor(options.secret, (piece) => {
+      stdout: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
         if (tooLarge) return;
         stdoutBytes += Buffer.byteLength(piece, 'utf8');
         if (stdoutBytes > maxStdoutBytes) {
@@ -841,7 +904,7 @@ export class HelperChannel {
         stdout += piece;
         options.onOutput?.('stdout', piece);
       }),
-      stderr: new StreamRedactor(options.secret, (piece) => {
+      stderr: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
         stderr.push(piece);
         options.onOutput?.('stderr', piece);
       }),
@@ -852,7 +915,7 @@ export class HelperChannel {
     };
     try {
       const result = await this.operation(OP_BATCH_STEP, request, {
-        secret: options.secret,
+        secrets: options.secrets,
         // The helper ends the step at its time limit; the worker and this side wait longer for its result.
         timeoutMs: options.timeoutMs === undefined ? undefined : Math.min(options.timeoutMs + 2 * CHANNEL_RESULT_GRACE_MS, MAX_OPERATION_TIMEOUT_MS),
         reserved: true,
@@ -897,7 +960,7 @@ export class HelperChannel {
     }
     try {
       const value = await this.operation(OP_DOCKER, params, {
-        secret: options.secretInput,
+        ...(options.secretInput === undefined ? {} : { secrets: { [SECRET_TOKEN]: options.secretInput } }),
         timeoutMs: options.timeoutMs,
         slotWaitMs: options.slotWaitMs,
         reserved: options.reserved,

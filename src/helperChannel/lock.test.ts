@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, lockFilePath, lockFolder } from '../core/helperChannel/protocol';
 import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, type FlockProcess, type LockDeps } from './lock';
 import { OperationError, type OperationContext } from './server';
+import { contextSecrets } from './operationContext.testkit';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
@@ -30,7 +31,7 @@ function harness(secret?: string): Harness {
     progress,
     context: {
       signal: controller.signal,
-      secret,
+      ...contextSecrets(secret === undefined ? {} : { token: secret }),
       progress: (step) => progress.push(step),
       log: () => {},
       output: () => {},

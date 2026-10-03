@@ -32,6 +32,7 @@ import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
 import { BATCH_MISSING_VOLUME_CODE, batchChunkOperation, batchOperation, batchStepOperation, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
 import { ChannelServer, type ContextDockerOptions, type ServerChild, type SpawnDocker } from './server';
+import { contextSecrets } from './operationContext.testkit';
 
 const TOKEN = 'ghp_secret_token_of_the_test';
 const VOLUME = 'devenv-vol-1';
@@ -362,7 +363,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   it('relays a step: its command from the builders, its variables on the process only, its output masked everywhere', async () => {
     const { t, session } = await started({ autoExit: false });
     const seen: string[] = [];
-    const running = session.step('up', UP, { secret: TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    const running = session.step('up', UP, { secrets: { token: TOKEN }, onOutput: (_stream, text) => seen.push(text) });
     await waitUntil(() => t.steps.length === 1, 'the step');
     const step = t.steps[0];
     const built = batchStepCommand('up', UP);
@@ -381,13 +382,14 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(t.logLines.join('\n')).not.toContain(TOKEN);
     // The token travels only in the `secret` field of the request.
     const request = t.clientLines.map((line) => parseClientMessage(line)).find((message) => message?.t === 'op' && message.op === OP_BATCH_STEP);
-    expect(request).toMatchObject({ secret: TOKEN });
+    // Plan step 11A: changed expectation (before: one `secret`): named secrets.
+    expect(request).toMatchObject({ secrets: { token: TOKEN } });
     expect(JSON.stringify((request as { params: unknown }).params)).not.toContain(TOKEN);
   });
 
   it('runs the clone as the Git user with the token only on its standard input, and cleans up after it', async () => {
     const { t, session } = await started();
-    const result = await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+    const result = await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
     expect(result.exitCode).toBe(0);
     const step = t.steps[0];
     expect(step.command).toEqual(['setpriv', ...gitPrivilegeArgs(), ...batchStepCommand('clone', { repository: 'octo/hello' }).command]);
@@ -746,19 +748,19 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
       ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
     ];
-    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).exitCode).toBe(0);
     expect(t.quiet).toEqual([repair, oldClones, ...afterWritingStep]);
     t.quiet.length = 0;
-    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).exitCode).toBe(0);
     expect(t.quiet).toEqual(afterWritingStep);
     // A step that timed out is not cut off: its cleanup ran, and the next Git step does not repair either. (User decision
     // of 2026-10-01: Compose reads as the repository owner, so the Git step that times out is a clone now, not composeHash;
     // the fake step of a clone hangs on the secret `hang`.)
     t.quiet.length = 0;
-    expect(await session.step('clone', { repository: 'octo/hello' }, { secret: 'hang', timeoutMs: 100 })).toMatchObject({ timedOut: true });
+    expect(await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: 'hang' }, timeoutMs: 100 })).toMatchObject({ timedOut: true });
     expect(t.quiet).toEqual(afterWritingStep);
     t.quiet.length = 0;
-    expect((await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN })).exitCode).toBe(0);
+    expect((await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).exitCode).toBe(0);
     // Exactly the cleanup, with no repair before it (the repair has the command of the chown walk, so the exact list
     // is the check; the removal of old clones belongs to the repair alone).
     expect(t.quiet).toEqual(afterWritingStep);
@@ -774,8 +776,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       const { t, session } = await started();
       // User decision of 2026-10-01: Compose reads as the repository owner, so the first Git step is a clone (was:
       // composeHash, which ran as the Git user under option A).
-      await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
-      await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+      await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
+      await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
       // The repair is the first walk; the chown walk after each clone has the same command, so only the first is the repair.
       expect(t.quiet[0], `helper ${round}`).toEqual(repair);
       expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(repair)), `helper ${round}`).toHaveLength(3);
@@ -786,7 +788,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // Review round 1 of PR #80 (A-R1-1): a kill of the whole helper left /workspaces at 1777; the next Git step must not
     // take that for the mode to restore.
     const { t, session } = await started({ workspacesMode: 0o41777 });
-    await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+    await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
     expect(t.fsCalls).toContain(`chmod ${WORKSPACES_ROOT} 1777`);
     expect(t.fsCalls.filter((call) => call.startsWith(`chmod ${WORKSPACES_ROOT} `)).at(-1)).toBe(`chmod ${WORKSPACES_ROOT} 755`);
   });
@@ -795,7 +797,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     it(`review round 2 of PR #80, B-R2-2: a Git step never chmods CONFIG_FOLDER when it is a ${configFolder === 'symlink' ? 'symbolic link' : 'missing path'} (R23, R24)`, async () => {
       // A link planted as /workspaces/.devenv+ would otherwise give its target 0700 and then the link's own mode (0777).
       const { t, session } = await started({ configFolder });
-      const result = await session.step('clone', { repository: 'octo/hello' }, { secret: TOKEN });
+      const result = await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
       expect(result.exitCode).toBe(0);
       expect(t.fsCalls.filter((call) => call.includes(CONFIG_FOLDER))).toEqual([]);
       const uid = String(BATCH_GIT_UID);
@@ -819,7 +821,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'listConfigs', params: { repository: 'octo/hello', command: ['id'] } }, { reserved: true })).rejects.toMatchObject({
       code: 'invalid',
     });
-    await expect(session.step('listConfigs', { repository: 'octo/hello' }, { secret: TOKEN })).rejects.toMatchObject({ code: 'invalid' });
+    await expect(session.step('listConfigs', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).rejects.toMatchObject({ code: 'invalid' });
     await expect(session.step('clone', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'invalid' });
     expect(t.steps).toHaveLength(0);
   });
@@ -895,7 +897,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     });
     const context = {
       signal: new AbortController().signal,
-      secret: undefined,
+      ...contextSecrets(),
       progress: () => {},
       log: () => {},
       output: () => {},

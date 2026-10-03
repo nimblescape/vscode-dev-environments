@@ -26,6 +26,7 @@ import {
   type StepProcess,
 } from './batchHelper';
 import { OperationError, type OperationContext } from './server';
+import { contextSecrets } from './operationContext.testkit';
 
 function fakeFiles(options: { link?: string; mode?: number; folder?: boolean } = {}) {
   const calls: string[] = [];
@@ -53,7 +54,8 @@ function context(secret?: string, signal: AbortSignal = new AbortController().si
   return {
     logs,
     signal,
-    secret,
+    // Plan step 11A: the token is the named secret `token`.
+    ...contextSecrets(secret === undefined ? {} : { token: secret }),
     progress: () => {},
     log: (text) => logs.push(text),
     output: () => {},
@@ -80,6 +82,22 @@ describe('prepareBatchHelper (plan step 6, PR B)', () => {
     expect(prepareBatchHelper(fakeFiles({ folder: false }).files, 0)).toMatch(/not a folder/);
     expect(prepareBatchHelper(fakeFiles({ link: '/elsewhere.sock' }).files, 0)).toMatch(/leads elsewhere/);
     expect(prepareBatchHelper(fakeFiles({ link: BATCH_DOCKER_SOCKET }).files, 0)).toBeUndefined();
+  });
+
+  // Plan step 11A: a step takes only the named secret `token`, and only a step that uses it.
+  it('refuses a secret of another name, a secret for a step without one, and a clone without the token', async () => {
+    const operations = batchHelperOperations({
+      spawnStep: () => {
+        throw new Error('never');
+      },
+      runQuiet: async () => {},
+      fs: {} as never,
+      env: {},
+    });
+    const withRegistry = { ...context(), ...contextSecrets({ registry: 'reg-5678' }) };
+    await expect(operations.clone({ repository: 'octo/hello' }, withRegistry)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(operations.listConfigs({ repository: 'octo/hello' }, context('tok-1234'))).rejects.toMatchObject({ code: 'invalid' });
+    await expect(operations.clone({ repository: 'octo/hello' }, context())).rejects.toMatchObject({ code: 'invalid' });
   });
 
   it('refuses every step of an unsafe helper (after the checks of its parameters)', async () => {
