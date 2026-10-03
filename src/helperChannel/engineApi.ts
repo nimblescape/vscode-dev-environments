@@ -8,8 +8,10 @@
 // engine answers with its own API version. Registry credentials go only into the header of a request, never into a
 // file or an argument.
 import * as http from 'http';
+import type { Duplex } from 'stream';
 import { HELPER_DOCKER_SOCKET } from '../core/names';
 import { abortError } from '../core/ports';
+import { EngineError } from '../core/worker/dockerEngine';
 
 /** The most text of an answer that is kept (beyond: cut, and `truncated` is set). */
 export const MAX_ENGINE_ANSWER_CHARACTERS = 1024 * 1024;
@@ -37,19 +39,27 @@ export interface EngineAnswer {
 export type EngineApi = (request: EngineRequest) => Promise<EngineAnswer>;
 
 /**
- * Plan step 11B1: a hijacked connection of the Engine API (`POST /exec/<id>/start`, `/containers/<id>/attach`): the
- * engine answers 101 and the connection carries the streams of the process. `write` and `end` are its standard input;
- * `onFrame` gets the output as the engine frames it (stream 1 stdout, 2 stderr; 0 when the exec has a terminal and the
- * output comes raw), and `ended` resolves when the engine closed it.
+ * Plan step 11B1: a hijacked connection of the Engine API (`POST /exec/<id>/start`): the engine answers 101 and the
+ * connection carries the streams of the process. `write` and `end` are its standard input; the output goes to the
+ * `onFrame` of the request as the engine frames it (stream 1 stdout, 2 stderr). `ended` resolves when the engine ended
+ * the output cleanly, and rejects when the connection broke, when the output was not framed, or when it ended in the
+ * middle of a frame (review round 1 of plan step 11B1, A-R1-2: a broken connection is never a clean end).
  */
 export interface EngineStream {
   write(data: Buffer | string): boolean;
   end(): void;
-  onFrame(listener: (stream: 0 | 1 | 2, data: Buffer) => void): void;
   readonly ended: Promise<void>;
-  /** Ends the connection at once (a cancel). */
+  /** Ends the connection at once (a cancel, or the end of the exec). */
   destroy(): void;
 }
+
+/** A request of engineHijack; `onFrame` is given before the connection exists, so no output can come before it. */
+export interface EngineHijackRequest extends Pick<EngineRequest, 'path' | 'json' | 'signal'> {
+  onFrame: (stream: 1 | 2, data: Buffer) => void;
+}
+
+/** The largest frame that the parser accepts (a bigger length is no output of a process, but a broken stream). */
+export const MAX_ENGINE_FRAME_BYTES = 16 * 1024 * 1024;
 
 /**
  * The Engine API over the Unix socket `socketPath` (default: the socket of the worker's engine). Rejects with an
@@ -107,11 +117,12 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
 
 /**
  * Plan step 11B1: a hijacked request (`Upgrade: tcp`): resolves with the connection once the engine answered 101.
- * Rejects with an AbortError when the signal aborts, with the error of the connection, or with an Error naming the
- * status when the engine answered something else.
+ * Rejects with an AbortError when the signal aborts, with the error of the connection, or with an EngineError with the
+ * message and status of the engine when it answered anything else (review round 1 of plan step 11B1, A-R1-10, A-R1-20:
+ * there is no way without the upgrade, so a 200 is refused too).
  */
 export function engineHijack(socketPath: string = HELPER_DOCKER_SOCKET) {
-  return (request: Pick<EngineRequest, 'path' | 'json' | 'signal'>): Promise<EngineStream> =>
+  return (request: EngineHijackRequest): Promise<EngineStream> =>
     new Promise<EngineStream>((resolve, reject) => {
       if (request.signal?.aborted) {
         reject(abortError());
@@ -125,7 +136,10 @@ export function engineHijack(socketPath: string = HELPER_DOCKER_SOCKET) {
       }
       let settled = false;
       const finish = (error: Error | undefined, stream?: EngineStream) => {
-        if (settled) return;
+        if (settled) {
+          stream?.destroy();
+          return;
+        }
         settled = true;
         request.signal?.removeEventListener('abort', onAbort);
         if (error !== undefined) reject(error);
@@ -138,81 +152,89 @@ export function engineHijack(socketPath: string = HELPER_DOCKER_SOCKET) {
       };
       request.signal?.addEventListener('abort', onAbort, { once: true });
       req.on('error', (error) => finish(error));
-      // The engine answers 200 with a raw stream when it does not upgrade (an older API), and 101 with an upgrade.
       req.on('response', (res) => {
-        if (res.statusCode === 200) {
-          finish(undefined, engineStream(req, res, Buffer.alloc(0), request.signal));
-          return;
-        }
-        res.resume();
-        finish(new Error(`The engine answered the hijacked request with HTTP status ${res.statusCode ?? 0}.`));
+        res.setEncoding('utf8');
+        let text = '';
+        res.on('data', (chunk: string) => {
+          if (text.length < MAX_ENGINE_ANSWER_CHARACTERS) text += chunk;
+        });
+        const status = res.statusCode ?? 0;
+        const refuse = () => finish(new EngineError(engineErrorMessage({ status, body: text, truncated: false }), status));
+        res.on('end', refuse);
+        res.on('error', refuse);
       });
-      req.on('upgrade', (_res, socket, head) => finish(undefined, engineStream(socket, socket, head, request.signal)));
+      req.on('upgrade', (_res, socket, head) => finish(undefined, engineStream(socket, head, request.onFrame, request.signal)));
       req.end(body);
     });
 }
 
 /** The frames of a hijacked connection (8 byte header: stream, 3 bytes of padding, 4 bytes of length). */
-function engineStream(
-  input: { write(data: Buffer | string): boolean; end(): void; destroy(): void },
-  output: NodeJS.EventEmitter & { destroy?(): void },
-  head: Buffer,
-  signal: AbortSignal | undefined,
-): EngineStream {
+function engineStream(socket: Duplex, head: Buffer, onFrame: EngineHijackRequest['onFrame'], signal: AbortSignal | undefined): EngineStream {
   let buffer = head;
-  const listeners: ((stream: 0 | 1 | 2, data: Buffer) => void)[] = [];
   let resolveEnded!: () => void;
-  const ended = new Promise<void>((resolve) => (resolveEnded = resolve));
-  const emit = (stream: 0 | 1 | 2, data: Buffer) => {
-    for (const listener of listeners) listener(stream, data);
-  };
-  const consume = () => {
-    for (;;) {
-      if (buffer.length < 8) return;
-      const kind = buffer[0];
-      // A stream that is not framed (a terminal): everything is output of the process.
-      if (kind > 2 || buffer[1] !== 0 || buffer[2] !== 0 || buffer[3] !== 0) {
-        emit(0, buffer);
-        buffer = Buffer.alloc(0);
-        return;
-      }
-      const length = buffer.readUInt32BE(4);
-      if (buffer.length < 8 + length) return;
-      emit(kind as 0 | 1 | 2, buffer.subarray(8, 8 + length));
-      buffer = buffer.subarray(8 + length);
+  let rejectEnded!: (error: Error) => void;
+  const ended = new Promise<void>((resolve, reject) => {
+    resolveEnded = resolve;
+    rejectEnded = reject;
+  });
+  // The caller awaits `ended` only after it wrote the input; a failure before must not be an unhandled rejection.
+  ended.catch(() => {});
+  let done = false;
+  const settle = (error: Error | undefined) => {
+    if (done) return;
+    done = true;
+    signal?.removeEventListener('abort', onAbort);
+    if (error === undefined) resolveEnded();
+    else {
+      rejectEnded(error);
+      socket.destroy();
     }
   };
-  consume();
-  output.on('data', (chunk: Buffer) => {
+  /** Hands every whole frame to onFrame; false (and the stream fails) when the output is no frame. */
+  const consume = (): boolean => {
+    while (buffer.length >= 8) {
+      const kind = buffer[0];
+      if ((kind !== 1 && kind !== 2) || buffer[1] !== 0 || buffer[2] !== 0 || buffer[3] !== 0) {
+        settle(new Error('The engine sent output that is not framed.'));
+        return false;
+      }
+      const length = buffer.readUInt32BE(4);
+      if (length > MAX_ENGINE_FRAME_BYTES) {
+        settle(new Error(`The engine sent a frame of ${length} bytes.`));
+        return false;
+      }
+      if (buffer.length < 8 + length) return true;
+      // A copy: the data must not keep the whole buffer of the connection alive, nor change with it.
+      const data = Buffer.from(buffer.subarray(8, 8 + length));
+      buffer = buffer.subarray(8 + length);
+      onFrame(kind, data);
+    }
+    return true;
+  };
+  socket.on('data', (chunk: Buffer) => {
+    if (done) return;
     buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
     consume();
   });
-  const end = () => {
-    if (buffer.length > 0) {
-      emit(0, buffer);
-      buffer = Buffer.alloc(0);
-    }
-    resolveEnded();
-  };
-  output.on('end', end);
-  output.on('close', end);
-  output.on('error', end);
-  const destroy = () => {
-    try {
-      input.destroy();
-    } catch {
-      // It ended already.
-    }
-    output.destroy?.();
-    end();
-  };
-  signal?.addEventListener('abort', destroy, { once: true });
+  socket.on('end', () => {
+    if (done) return;
+    if (!consume()) return;
+    settle(buffer.length === 0 ? undefined : new Error('The engine ended the output in the middle of a frame.'));
+  });
+  socket.on('error', (error: Error) => settle(error));
+  socket.on('close', () => settle(new Error('The connection to the engine closed before the output ended.')));
+  const onAbort = () => settle(abortError());
+  signal?.addEventListener('abort', onAbort, { once: true });
+  // The output that came with the answer of the upgrade, now that onFrame is there (review round 1, A-R1-1).
+  if (consume() && signal?.aborted) onAbort();
   return {
-    write: (data) => input.write(data),
-    end: () => input.end(),
-    onFrame: (listener) => listeners.push(listener),
+    write: (data) => socket.write(data),
+    end: () => socket.end(),
     ended,
-    destroy,
+    destroy: () => {
+      settle(abortError());
+      socket.destroy();
+    },
   };
 }
 

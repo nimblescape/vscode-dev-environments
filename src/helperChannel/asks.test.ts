@@ -17,6 +17,8 @@ import {
   parseClientMessage,
   parseSecrets,
   parseServerMessage,
+  parseTokenRemoveParams,
+  parseTokenRemoveValue,
   redact,
   redactValue,
   type ClientMessage,
@@ -671,24 +673,46 @@ describe('the tokenRemove operation (plan step 11B1)', () => {
     };
   }
 
-  it('asks the extension for the record of the environment and answers with what it did', async () => {
-    const asks: { kind: string; payload: unknown }[] = [];
+  /** A context that records its log lines and progress (review round 1 of plan step 11B1, B-R1-15). */
+  function recording(ask: OperationContext['ask']) {
+    const logs: string[] = [];
+    const progress: unknown[][] = [];
     const context = {
       ...base,
       ...contextSecrets(),
-      ask: async (kind: string, payload: unknown) => {
-        asks.push({ kind, payload });
-        return { id: ENVIRONMENT_ID, remoteUser: 'dev' };
-      },
+      ask,
+      log: (line: string) => logs.push(line),
+      progress: (...args: unknown[]) => progress.push(args),
     } as unknown as OperationContext;
-    const value = await tokenRemoveOperation(engineOf(true))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context);
+    return { context, logs, progress };
+  }
+
+  it('asks the extension for the record of the environment when root may not, and answers with what it did', async () => {
+    const asks: { kind: string; payload: unknown }[] = [];
+    // Review round 1 of plan step 11B1 (A-R1-7): the record names only the user of the second try, so root fails here.
+    const engine = { ...engineOf(true), exec: async (_c: string, _cmd: readonly string[], options: { user?: string } = {}) => ({ exitCode: options.user === 'root' ? 1 : 0, stdout: '', stderr: '', timedOut: false }) };
+    const { context, logs, progress } = recording(async (kind: string, payload: unknown) => {
+      asks.push({ kind, payload });
+      return { id: ENVIRONMENT_ID, remoteUser: 'dev' };
+    });
+    const value = await tokenRemoveOperation(() => engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context);
     expect(value).toEqual({ outcome: 'removed', container: 'c'.repeat(12) });
     expect(asks).toEqual([{ kind: 'record', payload: { call: 'get', args: [ENVIRONMENT_ID] } }]);
+    expect(progress).toEqual([['tokenRemove', CONTAINER]]);
+    expect(logs).toEqual([`The removal as root failed in the container ${CONTAINER}: exit code 1.`, `The GitHub token was removed from the container ${CONTAINER}.`]);
+  });
+
+  it('builds the port of the engine with the context of the operation', async () => {
+    const seen: OperationContext[] = [];
+    const { context } = recording(async () => null);
+    await tokenRemoveOperation((given) => (seen.push(given), engineOf(true)))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context);
+    expect(seen).toEqual([context]);
   });
 
   it('answers `notRunning` when no container of the environment runs', async () => {
-    const context = { ...base, ...contextSecrets(), ask: async () => null } as unknown as OperationContext;
-    expect(await tokenRemoveOperation(engineOf(false))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).toEqual({ outcome: 'notRunning' });
+    const { context, logs } = recording(async () => null);
+    expect(await tokenRemoveOperation(() => engineOf(false))({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).toEqual({ outcome: 'notRunning' });
+    expect(logs).toEqual([`The container ${CONTAINER} does not run: its memory holds no GitHub token.`]);
   });
 
   it('refuses invalid parameters and any secret', async () => {
@@ -703,18 +727,46 @@ describe('the tokenRemove operation (plan step 11B1)', () => {
       { environmentId: ENVIRONMENT_ID, containerName: '../x' },
       { environmentId: ENVIRONMENT_ID, containerName: CONTAINER, user: 'root' },
     ]) {
-      await expect(tokenRemoveOperation(engine)(params, context)).rejects.toMatchObject({ code: 'invalid' });
+      await expect(tokenRemoveOperation(() => engine)(params, context)).rejects.toMatchObject({ code: 'invalid' });
     }
     const withSecret = { ...base, ...contextSecrets({ token: 'abcd1234' }), ask: async () => null } as unknown as OperationContext;
-    await expect(tokenRemoveOperation(engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, withSecret)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(tokenRemoveOperation(() => engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, withSecret)).rejects.toMatchObject({ code: 'invalid' });
   });
 
   it('fails with the reason when the token could still be there', async () => {
     const engine = { ...engineOf(true), exec: async () => ({ exitCode: 1, stdout: '', stderr: 'root may not', timedOut: false }) };
     const context = { ...base, ...contextSecrets(), ask: async () => null } as unknown as OperationContext;
-    await expect(tokenRemoveOperation(engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).rejects.toMatchObject({
+    await expect(tokenRemoveOperation(() => engine)({ environmentId: ENVIRONMENT_ID, containerName: CONTAINER }, context)).rejects.toMatchObject({
       code: 'failed',
       message: 'root may not',
     });
+  });
+});
+
+// Review round 1 of plan step 11B1 (B-R1-16): the checks of the parameters and the value of `tokenRemove`, directly.
+describe('the checks of tokenRemove (plan step 11B1)', () => {
+  it('takes the value of each outcome, and nothing else', () => {
+    expect(parseTokenRemoveValue({ outcome: 'notRunning' })).toEqual({ outcome: 'notRunning' });
+    expect(parseTokenRemoveValue({ outcome: 'removed', container: 'c0ffeec0ffee' })).toEqual({ outcome: 'removed', container: 'c0ffeec0ffee' });
+    expect(parseTokenRemoveValue({ outcome: 'removed' })).toEqual({ outcome: 'removed' });
+    for (const value of [
+      {},
+      null,
+      { outcome: 'maybe' },
+      { outcome: 'removed', container: 'c0ffee' },
+      { outcome: 'removed', container: 'C0FFEEC0FFEE' },
+      { outcome: 'removed', container: 1 },
+      { outcome: 'removed', extra: 1 },
+    ]) {
+      expect(parseTokenRemoveValue(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+
+  it('takes an environment ID and a container name, and nothing else', () => {
+    const params = { environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d', containerName: 'devenv-acme-api-brave-noether' };
+    expect(parseTokenRemoveParams(params)).toEqual(params);
+    for (const value of [null, [], { ...params, more: 1 }, { ...params, environmentId: 'a.b' }, { ...params, containerName: '-x' }, { ...params, containerName: 1 }]) {
+      expect(parseTokenRemoveParams(value), JSON.stringify(value)).toBeUndefined();
+    }
   });
 });

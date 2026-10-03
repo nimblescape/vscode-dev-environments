@@ -13,7 +13,7 @@ import * as path from 'path';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { IMAGE_INSPECT_BATCH, MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 import { Messages } from '../messages';
-import { LABEL_BUILD_ID, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
+import { LABEL_BUILD_ID, LABEL_ENVIRONMENT_ID } from '../names';
 import {
   abortError,
   isAbortError,
@@ -34,6 +34,7 @@ import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from '
 import { operationDockerTarget } from './dockerTargets';
 import { heldEnvironmentLock, type HeldEnvironmentLock } from './environmentLock';
 import { preparingWorker, runPreparingWorker } from './workerPreparation';
+import { isDevContainer } from '../worker/dockerEngine';
 import { HelperChannelError, HelperOperationError, type ChannelPullOptions } from '../helperChannel/helperChannel';
 import { pullReference } from '../helperChannel/protocol';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
@@ -448,13 +449,8 @@ function toNetworkInfo(value: unknown): NetworkInfo | undefined {
   return { name: value.Name, id: typeof value.Id === 'string' ? value.Id : '', labels: toLabels(value.Labels), containers };
 }
 
-/**
- * Whether a container of an environment is its dev container (findContainer): without the label
- * nimblescape.devenv.compose-service of the other services of Docker Compose, or with the name of the environment.
- */
-export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>, containerName: string): boolean {
-  return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
-}
+// Plan step 11B1: isDevContainer lives with the port of the flows (src/core/worker/dockerEngine.ts), one definition.
+export { isDevContainer };
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
   const { id, name, state, rawState, labels, image, imageId, volumes, volumeSubpaths, mountTargets } = container;

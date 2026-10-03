@@ -241,6 +241,8 @@ function createHarness(
     sessionMonitor?: ControllerDeps['sessionMonitor'];
     /** User decision 2026-09-28: the pause between the checks of the container (default 0). */
     readyPollMs?: number;
+    /** Plan step 11B1 (review round 1, A-R1-9): a window that runs no flow in a worker. */
+    noFlow?: boolean;
   } = {},
 ): Harness {
   const listOpenMode: Harness['listOpenMode'] = { value: 'singleClick' };
@@ -348,7 +350,7 @@ function createHarness(
     docker,
     // Plan step 11B1: the flows that run in the worker (the token removal); the flow itself is tested in
     // src/core/worker/tokenRemoveFlow.test.ts.
-    flow,
+    flow: options.noFlow === true ? undefined : flow,
     service,
     discovery,
     auth,
@@ -2431,7 +2433,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, { timeoutMs: 60_000 });
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
   });
 
@@ -2454,7 +2456,7 @@ describe('Accounts (concept 7.5)', () => {
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, { timeoutMs: 60_000 });
   });
 
   it('role A: without a sign-in, the window closes its connection', async () => {
@@ -2532,7 +2534,7 @@ describe('Accounts (concept 7.5)', () => {
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     await h.controller.onSessionChanged();
     await settle(() => tokenRemovals() > 0, 'the removal of the token');
-    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, {});
+    expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: env.id, containerName: CONTAINER }, { timeoutMs: 60_000 });
   });
 
   // Greenfield (user decision 2026-09-27): the token is only in the memory of the dev container; there is no removal
@@ -2551,7 +2553,8 @@ describe('Accounts (concept 7.5)', () => {
     it('sends the flow to the worker of the engine, with the environment and the container', async () => {
       await takeTokenOut();
       expect(h.flow).toHaveBeenCalledTimes(1);
-      expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: ENV_ID, containerName: CONTAINER }, {});
+      // Review round 1 of plan step 11B1 (A-R1-5): the removal is bounded, as the docker exec was before.
+      expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { environmentId: ENV_ID, containerName: CONTAINER }, { timeoutMs: 60_000 });
       expect(h.docker.exec).not.toHaveBeenCalled();
       expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
     });
@@ -2566,6 +2569,20 @@ describe('Accounts (concept 7.5)', () => {
       h.flow.mockResolvedValueOnce({ outcome: 'maybe' });
       await takeTokenOut();
       expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('answered the token removal with an invalid value'));
+    });
+
+    it('takes `notRunning` as an answer, without a warning (review round 1 of 11B1, B-R1-16)', async () => {
+      h.flow.mockResolvedValueOnce({ outcome: 'notRunning' });
+      await takeTokenOut();
+      expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
+    });
+
+    it('warns when this window runs no flow (review round 1 of 11B1, A-R1-9)', async () => {
+      recreateHarness({ noFlow: true });
+      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME });
+      await h.registry.add(env);
+      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+      await settle(() => h.logger.warn.mock.calls.some((call) => String(call[0]).includes('runs no flow in a worker')), 'the warning');
     });
 
     it('runs no flow on another Docker host', async () => {

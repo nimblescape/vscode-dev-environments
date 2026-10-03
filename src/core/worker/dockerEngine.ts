@@ -5,7 +5,8 @@
 // Plan step 11B1 (section 0 of the plan, one concept for commanding Docker): the one port through which a flow in the
 // worker acts on its engine. It is implemented over the Docker Engine API (src/helperChannel/engineClient.ts); there is
 // no `docker` process of our own behind it. The Docker CLI and Docker Compose run only as tools of the Dev Container CLI
-// in the batch helper, and in the extension only for the bootstrap. Pure types; no I/O, no `vscode`.
+// in the batch helper, and in the extension only for the bootstrap. Pure types and checks; no I/O, no `vscode`.
+import { LABEL_COMPOSE_SERVICE } from '../names';
 import type { ContainerState } from '../types';
 
 /** A container as a flow needs it (the fields of `docker inspect` that the flows read). */
@@ -47,8 +48,12 @@ export interface EngineExecOptions {
   workdir?: string;
   /** Its standard input, then closed. */
   input?: string;
-  /** The name of the secret whose value is its standard input instead (never an argument, never a log line). */
-  secretInput?: string;
+  /**
+   * The name of the secret of the operation (OperationContext.secrets) whose value is its standard input instead: never
+   * an argument, never a log line. A name, not a value (review round 1 of plan step 11B1, A-R1-3: ContainerAdapter's
+   * `secretInput` is a value); an exec fails when the operation holds no such secret.
+   */
+  secretInputName?: string;
   /** The output as it comes, in addition to the result. */
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
   timeoutMs?: number;
@@ -87,4 +92,12 @@ export class EngineError extends Error {
 /** True when the engine answered that the container, image, volume or network does not exist. */
 export function isMissing(error: unknown): boolean {
   return error instanceof EngineError && error.status === 404;
+}
+
+/**
+ * Whether a container of an environment is its dev container: without the label nimblescape.devenv.compose-service of
+ * the other services of Docker Compose, or with the name of the environment.
+ */
+export function isDevContainer(container: { name: string; labels: Record<string, string> }, containerName: string): boolean {
+  return container.labels[LABEL_COMPOSE_SERVICE] === undefined || container.name === containerName;
 }

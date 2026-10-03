@@ -6,7 +6,7 @@
 // worker (plan step 11A, `OperationOptions.onAsk`). It checks every request, calls the HostSide of this computer, and
 // answers with its value; a `secret` request answers with the secret in `secrets`, never in the value. No `vscode` here:
 // the extension passes its own HostSide (src/vscode).
-import { HOST_SECRET_NAMES, parseHostRequest, type HostSecretAnswer, type HostSide } from './hostSide';
+import { HOST_SECRET_NAMES, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSide } from './hostSide';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
 import type { AskKind, Secrets } from '../helperChannel/protocol';
 import { errorMessage } from '../errors';
@@ -15,15 +15,33 @@ import type { Logger } from '../ports';
 /** The answer of a request: its value, and the secrets that the operation gets with it. */
 type Answer = { value: unknown; secrets?: Secrets };
 
+/** A registry as Docker names it: a host name, with a port. */
+const REGISTRY_HOST = /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$/i;
+/** The longest text of a message of a flow. */
+const MAX_MESSAGE_CHARACTERS = 2000;
+/** The fields of a record that a flow may not change: its identity and its owner (review round 1 of plan step 11B1, A-R1-8). */
+const FIXED_FIELDS = new Set(['id', 'owner', '__proto__', 'constructor', 'prototype']);
+
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
 /**
  * Plan step 11B: `onAsk` of an operation that runs a flow: it answers the requests of `HostSide` of this computer. A
  * request that it does not know, or whose arguments do not fit, is refused with the code `invalid`; a call that throws is
- * refused with `failed` (its message), so the flow in the worker sees the failure of its call.
+ * refused with `failed` (its message), so the flow in the worker sees the failure of its call. Review round 1 of plan
+ * step 11B1 (A-R1-8): only the requests in `allowed` (FLOW_REQUESTS of the operation) are answered; everything else is
+ * refused before this computer is touched.
  */
-export function hostSideHandler(host: HostSide, logger: Logger): NonNullable<OperationOptions['onAsk']> {
+export function hostSideHandler(host: HostSide, logger: Logger, allowed: readonly HostCall[]): NonNullable<OperationOptions['onAsk']> {
+  const permitted = new Set<string>(allowed);
   return async (kind, payload, signal) => {
     const request = parseHostRequest(payload, kind);
     if (request === undefined) throw new HelperOperationError('invalid', 'The request of the operation is invalid.', false);
+    if (!permitted.has(`${request.kind} ${request.call}`)) {
+      logger.warn(`The worker sent the request ${request.kind} ${request.call}, which its operation may not send.`);
+      throw new HelperOperationError('invalid', `The operation may not send the request ${request.kind} ${request.call}.`, false);
+    }
     if (signal.aborted) throw new HelperOperationError('cancelled', 'The operation ended.', false);
     try {
       return await answer(host, request.kind, request.call, request.args);
@@ -87,7 +105,10 @@ async function question(host: HostSide, call: string, args: unknown[]): Promise<
     case 'message': {
       const [kind, text] = strings(args, 2);
       if (kind !== 'info' && kind !== 'warn' && kind !== 'registrySignIn') throw new HelperOperationError('invalid', `The message ${kind} is unknown.`, false);
-      await ui.message(kind, text);
+      // Review round 1 of plan step 11B1 (A-R1-16): the sign-in hint names a registry (a host name), and no text is longer
+      // than a message on screen can be.
+      if (kind === 'registrySignIn' && !REGISTRY_HOST.test(text)) throw new HelperOperationError('invalid', 'The registry of the sign-in hint is invalid.', false);
+      await ui.message(kind, text.length > MAX_MESSAGE_CHARACTERS ? `${text.slice(0, MAX_MESSAGE_CHARACTERS)}…` : text);
       return null;
     }
     default:
@@ -127,25 +148,34 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
       return (await records.findForAccount(repository, accountId, dockerHost)) ?? null;
     }
     case 'add': {
-      if (typeof args[0] !== 'object' || args[0] === null) throw new HelperOperationError('invalid', 'The environment is invalid.', false);
+      const environment = args[0] as { id?: unknown; owner?: { id?: unknown } } | null;
+      if (typeof environment !== 'object' || environment === null || Array.isArray(environment) || typeof environment.id !== 'string' || typeof environment.owner?.id !== 'string') {
+        throw new HelperOperationError('invalid', 'The environment is invalid.', false);
+      }
       await records.add(args[0] as Parameters<HostSide['records']['add']>[0]);
       return null;
     }
     case 'update': {
       const [id] = strings(args, 1);
-      if (typeof args[1] !== 'object' || args[1] === null) throw new HelperOperationError('invalid', 'The changes are invalid.', false);
+      const changes = args[1];
+      if (typeof changes !== 'object' || changes === null || Array.isArray(changes) || Object.keys(changes).some((key) => FIXED_FIELDS.has(key))) {
+        throw new HelperOperationError('invalid', 'The changes are invalid.', false);
+      }
       await records.update(id, args[1] as Parameters<HostSide['records']['update']>[1]);
       return null;
     }
     case 'remove': {
       const [id] = strings(args, 1);
-      const volumes = typeof args[1] === 'object' && args[1] !== null ? (args[1] as Parameters<HostSide['records']['remove']>[1]) : {};
-      await records.remove(id, volumes);
+      const volumes = (args[1] ?? {}) as { kept?: unknown; removed?: unknown };
+      if (typeof volumes !== 'object' || Array.isArray(volumes) || (volumes.kept !== undefined && !stringList(volumes.kept)) || (volumes.removed !== undefined && !stringList(volumes.removed))) {
+        throw new HelperOperationError('invalid', 'The volumes of the removal are invalid.', false);
+      }
+      await records.remove(id, { ...(volumes.kept !== undefined ? { kept: volumes.kept } : {}), ...(volumes.removed !== undefined ? { removed: volumes.removed } : {}) });
       return null;
     }
     case 'forgetKeptVolumes': {
       const names = args[0];
-      if (!Array.isArray(names) || !names.every((name) => typeof name === 'string')) throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
+      if (!stringList(names)) throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
       await records.forgetKeptVolumes(names as string[]);
       return null;
     }

@@ -19,7 +19,7 @@ interface ScriptEntry {
   program: 'sh' | 'node';
   script: string;
   /** The secret that is its standard input (plan step 11A: never an argument, never a log line). */
-  secretInput?: typeof SECRET_TOKEN;
+  secretInputName?: typeof SECRET_TOKEN;
 }
 
 /**
@@ -28,7 +28,7 @@ interface ScriptEntry {
  */
 export const CONTAINER_SCRIPTS = {
   /** Writes the GitHub token into the tmpfs of the dev container (its standard input is the token). */
-  tokenWrite: { program: 'sh', script: TOKEN_WRITE_SCRIPT, secretInput: SECRET_TOKEN },
+  tokenWrite: { program: 'sh', script: TOKEN_WRITE_SCRIPT, secretInputName: SECRET_TOKEN },
   /** Empties the token folder of the dev container. */
   tokenRemove: { program: 'sh', script: TOKEN_REMOVE_SCRIPT },
   /** The Git state of the repository folder (branch, changed files, unpushed commits, stashes). */
@@ -61,11 +61,11 @@ export async function runScript(
   container: string,
   name: ContainerScript,
   args: readonly string[],
-  options: Omit<EngineExecOptions, 'input' | 'secretInput'> = {},
+  options: Omit<EngineExecOptions, 'input' | 'secretInputName'> = {},
 ): Promise<EngineExecResult> {
   const entry: ScriptEntry = CONTAINER_SCRIPTS[name];
   return engine.exec(container, scriptCommand(name, args), {
     ...options,
-    ...(entry.secretInput !== undefined ? { secretInput: entry.secretInput } : {}),
+    ...(entry.secretInputName !== undefined ? { secretInputName: entry.secretInputName } : {}),
   });
 }

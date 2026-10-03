@@ -5,8 +5,8 @@
 // Plan step 11B (decision of 2026-10-03, the worker is the deputy): what a flow in the worker needs from the user's
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
-// answers them. Pure types and two pure functions; no I/O, no `vscode`.
-import { SECRET_REGISTRY, SECRET_TOKEN, type AskKind, type Secrets } from '../helperChannel/protocol';
+// answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
+import { OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { Environment, RegistryFile, WindowStatus } from '../types';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
@@ -103,9 +103,14 @@ export interface HostSecretAnswer {
   serveraddress?: string;
 }
 
-/** True for the secrets of an answer to a `secret` request: at most the name that was asked for. */
-export function isAnswerSecrets(secrets: Secrets | undefined, name: string): boolean {
-  if (secrets === undefined) return true;
-  const names = Object.keys(secrets);
-  return names.length <= 1 && names.every((entry) => entry === name);
-}
+/** A request as `<kind> <call>`, for example `record get`. */
+export type HostCall = `${AskKind} ${string}`;
+
+/**
+ * Review round 1 of plan step 11B1 (A-R1-8): the requests that each flow may send. The extension answers only these for
+ * an operation, so a flow gets no secret, and changes no record, that it has no business with; an operation that is not
+ * listed may send none. Each flow adds its requests here when it moves into the worker.
+ */
+export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
+  [OP_TOKEN_REMOVE]: ['record get'],
+};

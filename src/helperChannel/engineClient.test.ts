@@ -10,9 +10,11 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { EngineError, type DockerEngine } from '../core/worker/dockerEngine';
-import { engineApi, engineHijack } from './engineApi';
-import { dockerEngine } from './engineClient';
+import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
+import { SECRET_TOKEN } from '../core/helperChannel/protocol';
+import { scriptCommand } from '../core/worker/containerScripts';
+import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES } from './engineApi';
+import { dockerEngine, MAX_EXEC_OUTPUT_CHARACTERS } from './engineClient';
 
 interface Call {
   method: string;
@@ -39,7 +41,9 @@ const INSPECT = {
   Image: 'sha256:' + 'a'.repeat(64),
   Mounts: [
     { Type: 'volume', Name: 'devenv-acme-api-brave-noether' },
-    { Type: 'bind', Source: '/tmp' },
+    // Review round 1 of plan step 11B1 (B-R1-20): only the mounts of the type volume, whatever else has a name.
+    { Type: 'bind', Name: 'not-a-volume', Source: '/tmp' },
+    { Type: 'tmpfs', Name: 'not-a-volume-either' },
   ],
 };
 
@@ -58,8 +62,17 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   /** An engine whose requests `answer` serves; an exec is served over a hijacked connection by `exec`. */
   async function serve(
-    answer: (call: Call) => { status: number; json?: unknown; body?: string },
+    answer: (call: Call) => { status: number; json?: unknown; body?: string } | undefined,
     exec?: (socket: net.Socket, input: Buffer) => void,
+    more: {
+      /** Written in the same write as the answer 101 (review round 1 of 11B1, A-R1-1, B-R1-3). */
+      withUpgrade?: Buffer;
+      /** Called at once after the upgrade, before the input ended. */
+      onUpgrade?: (socket: net.Socket) => void;
+      /** The status of an exec start that the engine does not upgrade (review round 1 of 11B1, A-R1-10, B-R1-9). */
+      refuse?: { status: number; json: unknown };
+      secrets?: Record<string, string>;
+    } = {},
   ): Promise<{ engine: DockerEngine; calls: Call[] }> {
     folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-engine-'));
     const socketPath = path.join(folder, 'docker.sock');
@@ -71,6 +84,8 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         const call = { method: req.method ?? '', url: req.url ?? '', body };
         calls.push(call);
         const given = answer(call);
+        // No answer: the engine hangs.
+        if (given === undefined) return;
         res.writeHead(given.status, { 'Content-Type': 'application/json' });
         res.end(given.json !== undefined ? JSON.stringify(given.json) : (given.body ?? ''));
       });
@@ -81,14 +96,22 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       // As the engine does: the body of the request comes before the stream, so it is not input of the process.
       const length = Number(req.headers['content-length'] ?? 0);
       calls.push({ method: 'POST', url: req.url ?? '', body: head.subarray(0, length).toString('utf8') });
-      socket.write('HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n');
+      if (more.refuse !== undefined) {
+        const body = JSON.stringify(more.refuse.json);
+        socket.end(`HTTP/1.1 ${more.refuse.status} Refused\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+        return;
+      }
+      const upgrade = Buffer.from('HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n');
+      socket.write(more.withUpgrade === undefined ? upgrade : Buffer.concat([upgrade, more.withUpgrade]));
+      more.onUpgrade?.(socket);
       let input = head.subarray(length);
       socket.on('data', (chunk: Buffer) => (input = Buffer.concat([input, chunk])));
       socket.on('end', () => exec?.(socket, input));
     });
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-    return { engine: dockerEngine(engineApi(socketPath), engineHijack(socketPath)), calls };
+    const secrets = more.secrets ?? {};
+    return { engine: dockerEngine(engineApi(socketPath), engineHijack(socketPath), (name) => secrets[name]), calls };
   }
 
   it('reads a container with its state, labels, image and volumes; a missing one is undefined', async () => {
@@ -137,7 +160,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   it('runs a process in a container: its output by stream, its exit code, and its input on the connection', async () => {
     const { engine, calls } = await serve(
-      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 3 } }),
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 3, Running: false } }),
       (socket, input) => {
         socket.write(frame(1, `in:${input.toString('utf8')}`));
         socket.write(frame(2, 'a warning'));
@@ -154,7 +177,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   it('ends a process at its time limit and reports what it wrote until then', async () => {
     const { engine } = await serve(
-      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0 } }),
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0, Running: false } }),
       (socket) => {
         socket.write(frame(1, 'started'));
         // Never ends: the time limit of the call must end it.
@@ -169,6 +192,14 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     await engine.stop('c1', 20);
     await engine.start('c1');
     expect(calls.map((call) => call.url)).toEqual(['/containers/c1/stop?t=20', '/containers/c1/start']);
+    // Review round 1 of plan step 11B1 (B-R1-13): a stop of a container that does not run, and a missing one.
+    const nothing = await serve(() => ({ status: 304 }));
+    await nothing.engine.stop('c1', 20);
+    const missing = await serve(() => ({ status: 404, json: { message: 'No such container' } }));
+    for (const call of [missing.engine.stop('c1', 20), missing.engine.start('c1')]) {
+      const thrown = await call.catch((error: unknown) => error);
+      expect(isMissing(thrown)).toBe(true);
+    }
   });
 
   it('throws an EngineError with the message of the engine and its status', async () => {
@@ -189,7 +220,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   it('a cancel ends the call with an AbortError', async () => {
     const { engine } = await serve(
-      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0 } }),
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0, Running: false } }),
       () => {
         // Never answers.
       },
@@ -201,5 +232,134 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     const aborted = new AbortController();
     aborted.abort();
     await expect(engine.container('c1', aborted.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  /** An engine whose exec create and inspect succeed (exit code 0, ended), with the exec served by `exec`. */
+  const execAnswers = (inspect: unknown = { ExitCode: 0, Running: false }) => (call: Call) =>
+    call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: inspect };
+
+  it('hands on the output that came with the answer 101 (review round 1 of 11B1, A-R1-1, B-R1-3)', async () => {
+    const output: string[] = [];
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(), { withUpgrade: Buffer.concat([frame(1, 'early'), frame(2, 'warning')]) });
+    const result = await engine.exec('c1', ['true'], { onOutput: (stream, text) => output.push(`${stream}:${text}`) });
+    expect(result).toEqual({ exitCode: 0, stdout: 'early', stderr: 'warning', timedOut: false });
+    expect(output).toEqual(['stdout:early', 'stderr:warning']);
+  });
+
+  it('puts together frames that come in pieces, and characters split between frames (review round 1, B-R1-2, A-R1-13)', async () => {
+    const whole = Buffer.concat([frame(1, 'hello world'), frame(2, 'e'), frame(1, '!')]);
+    const euro = Buffer.from('€', 'utf8');
+    const { engine } = await serve(execAnswers(), (socket) => {
+      // The header in two pieces, then the data byte by byte, then a character split between two frames.
+      const pieces = [whole.subarray(0, 3), whole.subarray(3, 8), ...[...whole.subarray(8)].map((byte) => Buffer.from([byte]))];
+      for (const piece of pieces) socket.write(piece);
+      const first = Buffer.alloc(8 + 2);
+      first[0] = 1;
+      first.writeUInt32BE(2, 4);
+      euro.copy(first, 8, 0, 2);
+      const second = Buffer.alloc(8 + 1);
+      second[0] = 1;
+      second.writeUInt32BE(1, 4);
+      euro.copy(second, 8, 2, 3);
+      socket.write(first);
+      socket.end(second);
+    });
+    const output: string[] = [];
+    const result = await engine.exec('c1', ['true'], { onOutput: (stream, text) => output.push(`${stream}:${text}`) });
+    expect(result).toMatchObject({ stdout: 'hello world!€', stderr: 'e' });
+    expect(output.join('')).not.toContain('\uFFFD');
+  });
+
+  it('fails when the output is not framed, a frame is too long, or the output ends in the middle of a frame (review round 1, A-R1-12, B-R1-10, B-R1-11)', async () => {
+    const half = frame(1, 'hello').subarray(0, 10);
+    const tooLong = Buffer.alloc(8);
+    tooLong[0] = 1;
+    tooLong.writeUInt32BE(MAX_ENGINE_FRAME_BYTES + 1, 4);
+    for (const [written, message] of [
+      [Buffer.from('plain terminal output'), 'not framed'],
+      [tooLong, `a frame of ${MAX_ENGINE_FRAME_BYTES + 1} bytes`],
+      [half, 'in the middle of a frame'],
+    ] as const) {
+      const { engine } = await serve(execAnswers(), (socket) => socket.end(written));
+      await expect(engine.exec('c1', ['true'])).rejects.toThrow(message);
+    }
+  });
+
+  it('fails when the connection breaks, never as a clean end (review round 1, A-R1-2)', async () => {
+    const { engine, calls } = await serve(execAnswers(), undefined, {
+      onUpgrade: (socket) => {
+        // A Unix socket cannot be reset: the engine goes away in the middle of a frame.
+        socket.write(Buffer.concat([frame(1, 'started'), frame(1, 'more').subarray(0, 9)]));
+        setTimeout(() => socket.destroy(), 10);
+      },
+    });
+    await expect(engine.exec('c1', ['true'])).rejects.toThrow();
+    // The inspect is never asked after a broken connection.
+    expect(calls.some((call) => call.url.endsWith('/json') && call.url.startsWith('/exec/'))).toBe(false);
+  });
+
+  it('fails when the process still runs after its output ended, and when the inspect fails (review round 1, A-R1-2, B-R1-14)', async () => {
+    const running = await serve(execAnswers({ ExitCode: 0, Running: true }), (socket) => socket.end());
+    await expect(running.engine.exec('c1', ['true'])).rejects.toThrow('the process did not');
+    const failing = await serve(
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 500, json: { message: 'the daemon is busy' } }),
+      (socket) => socket.end(),
+    );
+    await expect(failing.engine.exec('c1', ['true'])).rejects.toMatchObject({ name: 'EngineError', status: 500, message: 'the daemon is busy' });
+    const noCode = await serve(execAnswers({ Running: false }), (socket) => socket.end());
+    expect(await noCode.engine.exec('c1', ['true'])).toMatchObject({ exitCode: null, timedOut: false });
+  });
+
+  it('refuses an exec start that the engine does not upgrade, with its message and status (review round 1, A-R1-10, A-R1-20, B-R1-9)', async () => {
+    for (const status of [409, 200]) {
+      const { engine } = await serve(execAnswers(), undefined, { refuse: { status, json: { message: 'the container is paused' } } });
+      const thrown = await engine.exec('c1', ['true']).catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(EngineError);
+      expect(thrown).toMatchObject({ message: 'the container is paused', status });
+    }
+  });
+
+  it('gives the secret that the operation holds as the standard input, never in a request (review round 1, A-R1-3, B-R1-8)', async () => {
+    const { engine, calls } = await serve(
+      execAnswers(),
+      (socket, input) => {
+        socket.end(frame(1, `in:${input.toString('utf8')}`));
+      },
+      { secrets: { [SECRET_TOKEN]: 'ghp_value' } },
+    );
+    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN });
+    expect(result.stdout).toBe('in:ghp_value');
+    expect(JSON.parse(calls[0].body)).toMatchObject({ AttachStdin: true });
+    expect(JSON.stringify(calls)).not.toContain('ghp_value');
+    // A secret that the operation does not hold is a failure, never an empty input.
+    const none = await serve(execAnswers(), (socket) => socket.end());
+    await expect(none.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow(`holds no secret ${SECRET_TOKEN}`);
+    expect(none.calls).toEqual([]);
+  });
+
+  it('ends at its time limit also when the operation gives its cancel signal (review round 1, B-R1-1)', async () => {
+    const { engine } = await serve(execAnswers(), () => {
+      // Never ends.
+    });
+    const started = Date.now();
+    const result = await engine.exec('c1', ['sleep', '60'], { signal: new AbortController().signal, timeoutMs: 50 });
+    expect(result).toMatchObject({ exitCode: null, timedOut: true });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('the time limit covers the create of the exec and its inspect (review round 1, A-R1-4)', async () => {
+    const hangingCreate = await serve(() => undefined);
+    expect(await hangingCreate.engine.exec('c1', ['true'], { timeoutMs: 50 })).toMatchObject({ timedOut: true, exitCode: null });
+    const hangingInspect = await serve((call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : undefined), (socket) => socket.end(frame(1, 'done')));
+    expect(await hangingInspect.engine.exec('c1', ['true'], { timeoutMs: 200 })).toMatchObject({ timedOut: true, exitCode: null, stdout: 'done' });
+  });
+
+  it('keeps at most MAX_EXEC_OUTPUT_CHARACTERS of a stream, and hands all of it to onOutput (review round 1, A-R1-14)', async () => {
+    const big = 'x'.repeat(MAX_EXEC_OUTPUT_CHARACTERS + 10);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(frame(1, big)));
+    let seen = 0;
+    const result = await engine.exec('c1', ['true'], { onOutput: (_stream, text) => (seen += text.length) });
+    expect(result.stdout).toHaveLength(MAX_EXEC_OUTPUT_CHARACTERS);
+    expect(seen).toBe(big.length);
   });
 });

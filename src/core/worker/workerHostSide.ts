@@ -5,7 +5,6 @@
 // Plan step 11B (decision of 2026-10-03, the worker is the deputy): the HostSide of a flow that runs in the worker. Every
 // call becomes a request of its kind to the extension (plan step 11A, `OperationContext.ask`), which answers it. Pure
 // over `ask`; no I/O of its own, no `vscode`.
-import type { Secrets } from '../helperChannel/protocol';
 import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
 
@@ -75,9 +74,4 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       connect: async (data) => void (await call('connect', 'connect', data)),
     },
   };
-}
-
-/** True when `secrets` holds the secret `name` (the answer of a `secret` request gives it with the value). */
-export function hasSecret(secrets: Secrets, name: string): boolean {
-  return Object.prototype.hasOwnProperty.call(secrets, name);
 }

@@ -57,8 +57,8 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
     await runScript(engine, 'c1', 'gitSummary', ['/workspaces/app'], { user: 'dev', timeoutMs: 1_000 });
     await runScript(engine, 'c1', 'tokenWrite', ['dev', 'octocat'], { user: 'root' });
     expect(execs[0]).toMatchObject({ container: 'c1', command: scriptCommand('gitSummary', ['/workspaces/app']), options: { user: 'dev', timeoutMs: 1_000 } });
-    expect(execs[0].options.secretInput).toBeUndefined();
-    expect(execs[1].options.secretInput).toBe(SECRET_TOKEN);
+    expect(execs[0].options.secretInputName).toBeUndefined();
+    expect(execs[1].options.secretInputName).toBe(SECRET_TOKEN);
     expect(JSON.stringify(execs)).not.toContain('"input"');
   });
 });

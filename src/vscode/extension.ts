@@ -63,6 +63,7 @@ import { updateOwnersContextKey } from './ownerSelector';
 import { isProcessAlive } from '../core/session/sessionRules';
 import { extensionHostSide } from './hostSide';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
+import { FLOW_REQUESTS } from '../core/worker/hostSide';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
@@ -656,6 +657,7 @@ async function activateExtension(
     flow: async (op, params, options) =>
       channels.flow(await targets.current(), op, params, {
         signal: options.signal,
+        timeoutMs: options.timeoutMs,
         onAsk: hostSideHandler(
           extensionHostSide({
             registry,
@@ -669,6 +671,7 @@ async function activateExtension(
             logger,
           }),
           logger,
+          FLOW_REQUESTS[op] ?? [],
         ),
       }),
     service,

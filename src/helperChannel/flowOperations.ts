@@ -19,8 +19,14 @@ export function flowHost(context: OperationContext) {
   return workerHostSide(ask, (name) => context.secrets[name]);
 }
 
+/**
+ * The port of the engine for one operation: with its own secrets for the standard input of an exec (review round 1 of
+ * plan step 11B1, A-R1-3).
+ */
+export type EngineOfOperation = (context: OperationContext) => DockerEngine;
+
 /** `tokenRemove`: empties the token folder of the dev container of an environment (concept section 9). */
-export function tokenRemoveOperation(engine: DockerEngine): OperationHandler {
+export function tokenRemoveOperation(engineOf: EngineOfOperation): OperationHandler {
   return async (params, context) => {
     const checked = parseTokenRemoveParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the tokenRemove operation are invalid.');
@@ -31,8 +37,9 @@ export function tokenRemoveOperation(engine: DockerEngine): OperationHandler {
       const result = await removeTokenFlow({
         environmentId: checked.environmentId,
         containerName: checked.containerName,
-        engine,
+        engine: engineOf(context),
         records: host.records,
+        log: (line) => context.log(line),
         signal: context.signal,
       });
       context.log(
