@@ -4733,7 +4733,15 @@ export class EnvironmentService {
         // Not here yet: Compose pulls it in the workspace helper (a limit, implementation notes section 15).
         continue;
       }
-      items.push(...imageLabelItems(reference, labels, ownImageLabels(ctx.env)));
+      // Review round 1 of PR #88 (A-R1-7; user decision 2026-09-28: the images of the account's own environments may be
+      // used): an image with the labels of another environment of the same account (a registry entry) carries that
+      // environment's labels; never with its build record (the record is allowed on the environment image only).
+      const labelled = labels[LABEL_ENVIRONMENT_ID];
+      const sameAccount =
+        labelled !== undefined && labelled !== ctx.env.id
+          ? (await this.deps.registry.list().catch(() => [])).find((entry) => entry.id === labelled && entry.owner.id === ctx.env.owner.id)
+          : undefined;
+      items.push(...imageLabelItems(reference, labels, ownImageLabels(sameAccount ?? ctx.env)));
     }
     return items;
   }

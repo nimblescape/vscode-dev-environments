@@ -33,6 +33,7 @@ import {
   LABEL_CONTAINER_VERSION,
   LABEL_HOST_ACCESS,
   LABEL_ENVIRONMENT_ID,
+  LABEL_BUILD_RECORD,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   LABEL_VOLUME,
@@ -525,6 +526,35 @@ describe('first open of a Docker Compose configuration', () => {
     h.docker.imageConfigs.set(DB_IMAGE, { Labels: { 'com.docker.compose.project': 'app', 'com.docker.compose.service': 'db' } });
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
+  });
+
+  describe('the image of another environment as the image of a side service (review round 1 of PR #88, A-R1-7)', () => {
+    const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: 'acme/web', [LABEL_OWNER_ID]: ACCOUNT.id };
+
+    it('uses one of an environment of the same account (user decision 2026-09-28)', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: theirs });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
+
+    it('refuses one of an environment of another account, and the build record on it', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, owner: OTHER_ACCOUNT });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id } });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toContain(`label ${LABEL_ENVIRONMENT_ID} of the image ${DB_IMAGE}`);
+      expect(h.helper.ups).toEqual([]);
+    });
+
+    it('refuses the label of a build record on it also for the same account', async () => {
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_BUILD_RECORD]: '{}' } });
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.message).toBe(Messages.hostAccess(`label ${LABEL_BUILD_RECORD} of the image ${DB_IMAGE}`));
+    });
   });
 
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
