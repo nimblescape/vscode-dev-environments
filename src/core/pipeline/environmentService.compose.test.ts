@@ -1513,6 +1513,8 @@ describe('a Docker Compose environment whose configuration became a single conta
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
     h.docker.images.add(`${PROJECT}-app`);
+    // Review round 1 of PR #88 (A-R1-2): as Compose builds it (build.labels), so that the rebuild removes it.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
   });
 
@@ -1794,6 +1796,14 @@ describe('a Docker Compose environment whose configuration became a single conta
     expect(h.docker.containersOf(ENV_ID)).toHaveLength(1);
     expect(h.docker.images.has(`${PROJECT}-app`)).toBe(false);
     expect((await h.registry.get(ENV_ID))?.buildRecord?.compose).toBeUndefined();
+  });
+
+  it('keeps a recorded image of the project that carries the ID of another environment (review round 1 of PR #88, A-R1-2)', async () => {
+    // The name `<project>-app` can also be the name of an image of another environment whose name starts with `<project>-`.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.ui.configurationChangedAnswer = 'rebuildNow';
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
   });
 });
 
@@ -3232,6 +3242,8 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     await record([PGDATA]);
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
     h.docker.images.add(`${PROJECT}-app`);
+    // Review round 1 of PR #88 (A-R1-2): as Compose builds it (build.labels), so that the rebuild removes it.
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     h.helper.files = { [DEFAULT_CONFIG_PATH]: { configText: DEFAULT_CONFIG_TEXT } };
     h.ui.configurationChangedAnswer = 'rebuildNow';
     await h.service.openEnvironment(ENV_ID, options());

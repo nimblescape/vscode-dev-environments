@@ -459,6 +459,19 @@ describe('the ID of a new environment (implementation notes 5)', () => {
     expect(ids).toHaveBeenCalledTimes(2);
   });
 
+  it('never removes a volume of its name that another environment created meanwhile (review round 1 of PR #88, A-R1-4)', async () => {
+    recreate({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    // Another first open on the engine created the volume of the same name between the check and the create.
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+    h.docker.volumes.set(name, theirs);
+    h.helper.cloneError = new Error('clone failed');
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect(h.docker.volumes.get(name)).toEqual(theirs);
+    expect(h.logger.warnings.some((line) => line.includes('belongs to another environment'))).toBe(true);
+  });
+
   it('is not one whose volume exists, and that volume is never touched', async () => {
     const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
     recreate({ newEnvironmentId: ids });

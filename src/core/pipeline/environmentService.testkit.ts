@@ -210,8 +210,10 @@ export class FakeDocker implements EnvironmentDocker {
   async runChecked(args: readonly string[]): Promise<string> {
     if (args[0] === 'image' && args[1] === 'inspect') {
       const reference = args[args.length - 1];
-      if (!this.images.has(reference)) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
-      return `${JSON.stringify(this.imageConfigs.get(reference) ?? { User: '', Labels: {} })}\n`;
+      // Review round 1 of PR #88 (A-R1-1): also by the ID of an image, as Docker resolves it.
+      const name = this.imageNamed(reference);
+      if (name === undefined) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
+      return `${JSON.stringify(this.imageConfigs.get(name) ?? { User: '', Labels: {} })}\n`;
     }
     if (args[0] === 'run') {
       const index = args.indexOf('--mount') + 2;
@@ -423,8 +425,10 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   async imageId(reference: string): Promise<string | undefined> {
-    if (!this.images.has(reference)) return undefined;
-    return this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
+    // Review round 1 of PR #88 (A-R1-1): also by the ID of an image, as Docker resolves it.
+    const name = this.imageNamed(reference);
+    if (name === undefined) return undefined;
+    return this.imageIds.get(name) ?? `sha256:image-of-${name}`;
   }
 
   /** The name of the image `reference` (a name, or the ID of one), undefined when none. */
@@ -523,6 +527,8 @@ export class FakeDocker implements EnvironmentDocker {
       rawState: p.state === 'running' ? 'running' : 'exited',
       labels: { ...(p.labels ?? { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION) }), [LABEL_ENVIRONMENT_ID]: p.environmentId },
       image: p.image,
+      // Review round 1 of PR #88 (A-R1-1): as Docker records it, the ID of the image at the creation of the container.
+      ...(this.images.has(p.image) ? { imageId: this.imageIds.get(p.image) ?? `sha256:image-of-${p.image}` } : {}),
       ...(p.volumeSubpaths !== undefined ? { volumeSubpaths: p.volumeSubpaths } : {}),
     };
     this.containers.set(id, container);

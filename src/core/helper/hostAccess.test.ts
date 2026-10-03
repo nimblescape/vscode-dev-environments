@@ -1552,7 +1552,8 @@ describe('imageLabelItems', () => {
   });
 
   describe('the labels that the extension gives the images of the environment (user decisions 2026-10-03)', () => {
-    const OWN_ENV = { id: '3f2a9c1e-0000-4000-8000-000000000000', repository: 'acme/api', ownerId: '1001' };
+    // Review round 1 of PR #88 (A-R1-3): the build record only on the environment image (environmentImage).
+    const OWN_ENV = { id: '3f2a9c1e-0000-4000-8000-000000000000', repository: 'acme/api', ownerId: '1001', environmentImage: true };
     const LABELS = {
       'nimblescape.devenv.environment-id': OWN_ENV.id,
       'nimblescape.devenv.repository': OWN_ENV.repository,
@@ -1564,6 +1565,12 @@ describe('imageLabelItems', () => {
       expect(imageLabelItems(`${OWN}:2`, LABELS, OWN_ENV)).toEqual([]);
       expect(imageLabelItems(`${OWN}:2`, { ...LABELS, 'nimblescape.devenv.build-record': 'anything' }, OWN_ENV)).toEqual([]);
       expect(imageLabelItems(`${OWN}-db`, { 'nimblescape.devenv.environment-id': OWN_ENV.id }, OWN_ENV)).toEqual([]);
+    });
+
+    it('refuses the build record on any image but the environment image (review round 1 of PR #88, A-R1-3)', () => {
+      const service = { ...OWN_ENV, environmentImage: false };
+      expect(imageLabelItems('base:1', { 'nimblescape.devenv.build-record': '{"forged":true}' }, service)).toEqual(['label nimblescape.devenv.build-record of the image base:1']);
+      expect(imageLabelItems('base:1', { 'nimblescape.devenv.environment-id': OWN_ENV.id }, service)).toEqual([]);
     });
 
     it.each<[string, Record<string, string>]>([

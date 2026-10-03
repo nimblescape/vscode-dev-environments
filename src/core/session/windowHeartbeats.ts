@@ -210,7 +210,7 @@ export interface HeartbeatEngineSources {
   current: () => Promise<DockerTarget>;
   /** The target of a named Docker context (DockerTargets.ofContext); undefined when it cannot be read. */
   ofContext: (name: string) => Promise<DockerTarget | undefined>;
-  /** The Docker context of "Use a Remote Docker Host…" for an SSH host (ensureRemoteContext); undefined when it fails. */
+  /** The existing Docker context of an SSH host (findRemoteContext); undefined when there is none or it fails. */
   remoteContext: (host: string) => Promise<string | undefined>;
 }
 

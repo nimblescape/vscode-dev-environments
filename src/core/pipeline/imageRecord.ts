@@ -16,13 +16,18 @@ import {
 import { isBuildRecord } from '../storage/registry';
 import type { BuildRecord, Environment } from '../types';
 
-/** The largest build record (as JSON) that the label takes; a larger one is left out (the next computer builds). */
-export const MAX_RECORD_LABEL_LENGTH = 32 * 1024;
+/**
+ * The largest build record (as JSON) that the label takes; a larger one is written as an empty label (the next computer
+ * builds). Review round 1 of PR #88 (A-R1-3): 8 KiB, so that the labels on the command line of `docker build` stay far
+ * below the 32,767 characters of a command line on Windows.
+ */
+export const MAX_RECORD_LABEL_LENGTH = 8 * 1024;
 
 /**
  * The labels that ContainerAdapter.labelImage gives the environment image of `env` with the build record `record`
- * (without its pinned image ID, which the labels change). The record is left out when it is longer than
- * MAX_RECORD_LABEL_LENGTH.
+ * (without its pinned image ID, which the labels change). Review round 1 of PR #88 (A-R1-3): the label of the record is
+ * always set, empty when the record is longer than MAX_RECORD_LABEL_LENGTH, so that no such label of the base image or of
+ * the Dockerfile stays on the image.
  */
 export function imageRecordLabels(env: Pick<Environment, 'id' | 'repository' | 'owner'>, record: BuildRecord): Record<string, string> {
   const { imageId: _pinned, ...stored } = record;
@@ -31,7 +36,7 @@ export function imageRecordLabels(env: Pick<Environment, 'id' | 'repository' | '
     [LABEL_ENVIRONMENT_ID]: env.id,
     [LABEL_REPOSITORY]: env.repository,
     [LABEL_OWNER_ID]: env.owner.id,
-    ...(json.length <= MAX_RECORD_LABEL_LENGTH ? { [LABEL_BUILD_RECORD]: json } : {}),
+    [LABEL_BUILD_RECORD]: json.length <= MAX_RECORD_LABEL_LENGTH ? json : '',
   };
 }
 

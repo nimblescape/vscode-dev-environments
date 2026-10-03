@@ -442,6 +442,16 @@ describe('the Docker context commands', () => {
     await expect(ensureRemoteContext(docker, 'box')).rejects.toThrow('docker context create box');
   });
 
+  it('takes the context that another window created meanwhile when its own create fails (review round 1 of PR #88, A-R1-5)', async () => {
+    let lists = 0;
+    const docker = fakeDocker((args) => {
+      if (args[1] === 'ls') return contextLs(lists++ === 0 ? [] : [own('box', 'box')]);
+      return fail('context "box" already exists');
+    });
+    await expect(ensureRemoteContext(docker, 'box')).resolves.toBe('box');
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
+  });
+
   it('chooses among the contexts by remoteContextChoice', () => {
     const [name, pair] = remoteContextNames('me@box');
     expect(remoteContextChoice('me@box', [])).toEqual({ free: name });

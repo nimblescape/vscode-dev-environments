@@ -15,7 +15,7 @@ import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/
 import { dockerHostOf, isOnDockerHost, sshEndpoint, type DockerTarget } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
-import { SshLoginCache, ensureRemoteContext, findRemoteContext, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, findRemoteContext, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -417,8 +417,10 @@ async function activateExtension(
         windowContext: (shown) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
         current: () => outsideOperation(() => targets.resolve()),
         ofContext: (name) => outsideOperation(() => targets.ofContext(name)),
+        // Review round 1 of PR #88 (A-R1-5): only an existing context; a heartbeat never creates one (a context that the
+        // user removed is not made again by a tick).
         remoteContext: (host) =>
-          outsideOperation(() => ensureRemoteContext(docker, host)).catch((error: unknown) => {
+          outsideOperation(() => findRemoteContext(docker, host)).catch((error: unknown) => {
             logger.warn(`The Docker context of ${host} could not be had: ${errorMessage(error)}`);
             return undefined;
           }),

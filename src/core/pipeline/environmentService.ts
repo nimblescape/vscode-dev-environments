@@ -2575,6 +2575,22 @@ export class EnvironmentService {
   }
 
   /**
+   * Review round 1 of PR #88 (A-R1-1): the image to create `container` again from without its build record: its name when
+   * that still names the image the container was created from (ContainerInfo.imageId), else that image by its ID (an
+   * image swapped under the name is never used); undefined when the image is gone or cannot be read.
+   */
+  private async containerImage(container: ContainerInfo): Promise<string | undefined> {
+    if (container.image === '') return undefined;
+    const named = await this.deps.docker.imageId(container.image).catch(() => undefined);
+    if (container.imageId === undefined) return named !== undefined ? container.image : undefined;
+    if (named !== undefined && named.toLowerCase() === container.imageId.toLowerCase()) return container.image;
+    const own = await this.deps.docker.imageId(container.imageId).catch(() => undefined);
+    if (own === undefined) return undefined;
+    this.logger.warn(`The name ${container.image} no longer names the image of the container ${container.name} (${container.imageId}); that image is used by its ID.`);
+    return container.imageId;
+  }
+
+  /**
    * User decisions 2026-10-03: the build record of the newest environment image of `ctx.env` (the highest build number
    * of environmentImageRepository), from its labels (imageBuildRecord: its environment ID, repository, and owner must
    * be those of the environment, and the record must name that image), with the ID of that image pinned (option 1). The
@@ -2593,8 +2609,16 @@ export class EnvironmentService {
     }
     const newest = tags.map((tag) => ({ tag, number: Number(tag.slice(repository.length + 1)) })).filter((entry) => Number.isSafeInteger(entry.number) && entry.number > 0).sort((a, b) => b.number - a.number)[0];
     if (newest === undefined) return undefined;
-    const id = await this.deps.docker.imageId(newest.tag);
-    const labels = id === undefined ? undefined : await this.deps.docker.imageLabels(id);
+    // Review round 1 of PR #88 (A-R1-8): as for the tags, a Docker failure only means that no record is taken over.
+    let id: string | undefined;
+    let labels: Record<string, string> | undefined;
+    try {
+      id = await this.deps.docker.imageId(newest.tag);
+      labels = id === undefined ? undefined : await this.deps.docker.imageLabels(id);
+    } catch (error) {
+      this.logger.warn(`The labels of ${newest.tag} could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
     const found = labels === undefined ? undefined : imageBuildRecord(labels, env, newest.tag, newest.number);
     if (id === undefined || found === undefined) {
       this.logger.warn(`The environment image ${newest.tag} has no build record of ${env.repository} (${found === undefined ? 'its labels do not fit' : 'it is gone'}). The environment is built again.`);
@@ -2679,7 +2703,7 @@ export class EnvironmentService {
     const containerUsable =
       container !== undefined &&
       (containerIsCurrent(container.labels, true, ctx.hostAccessChecks) ||
-        (await this.deps.docker.imageExists(container.image).catch(() => false)));
+        (await this.containerImage(container)) !== undefined);
     const canFallBack = containerUsable || oldImageUsable;
     // An update that only follows newer digests keeps the old environment when a download fails. Otherwise a build is
     // needed anyway, and an image that exists locally is good enough when its download fails.
@@ -2923,8 +2947,8 @@ export class EnvironmentService {
       const previousImage =
         oldImageUsable && record
           ? record.environmentImage
-          : container && (await this.deps.docker.imageExists(container.image).catch(() => false))
-            ? container.image
+          : container
+            ? await this.containerImage(container)
             : undefined;
       if (!previousImage) throw new UserFacingError('startFailed', PipelineTexts.startFailed, errorDetail(error));
       this.deps.ui.warn(Messages.buildFailed);
@@ -3214,10 +3238,9 @@ export class EnvironmentService {
     }
     // Assumption (V-10): `up` finds an existing container by --id-label and starts it without using the image of the
     // override configuration; a missing container is created from the environment image, without network access.
-    let image = record && imagePresent ? record.environmentImage : container?.image;
-    if (outdated && image === container?.image && image !== undefined && !(await this.deps.docker.imageExists(image).catch(() => false))) {
-      image = undefined;
-    }
+    // Review round 1 of PR #88 (A-R1-1): a container that must be created again only from the image it was created from
+    // (containerImage), never from another image under its name.
+    const image = record && imagePresent ? record.environmentImage : container === undefined ? undefined : outdated ? await this.containerImage(container) : container.image;
     if (!image) throw new UserFacingError('buildFailed', Messages.buildFailed, 'There is no environment image.');
     if (outdated && container && recreation) {
       this.logger.info(recreation.log);
@@ -3369,9 +3392,10 @@ export class EnvironmentService {
     // Docker Compose: only the dev container of the service that the configuration names is ever recreated.
     if (compose && container.labels[COMPOSE_SERVICE_LABEL] !== loaded?.compose?.service) return undefined;
     if (compose && loaded?.compose !== undefined && !(await this.composeServicesStay(ctx, loaded.compose, record))) return undefined;
-    const image = record && imagePresent ? record.environmentImage : container.image;
-    if (await this.deps.docker.imageExists(image).catch(() => false)) return image;
-    this.logger.info(`The environment image ${image} of ${ctx.env.repository} does not exist; the container cannot be created again without a build.`);
+    // Review round 1 of PR #88 (A-R1-1): the pinned image (imagePresent), else the image the container was created from.
+    const image = record && imagePresent ? record.environmentImage : await this.containerImage(container);
+    if (image !== undefined && (await this.deps.docker.imageExists(image).catch(() => false))) return image;
+    this.logger.info(`The environment image ${image ?? container.image} of ${ctx.env.repository} does not exist; the container cannot be created again without a build.`);
     return undefined;
   }
 
@@ -3444,8 +3468,9 @@ export class EnvironmentService {
     const env = ctx.env;
     const current = await this.deps.docker.findContainer(env.id, env.containerName);
     const record = env.buildRecord;
-    const imagePresent = record !== undefined && (await this.deps.docker.imageExists(record.environmentImage).catch(() => false));
-    const currentImage = current === undefined ? undefined : record && imagePresent ? record.environmentImage : current.image;
+    // Review round 1 of PR #88 (A-R1-1): as recreationImage decides it (the pinned image, else the container's own image).
+    const imagePresent = record !== undefined && (await this.pinnedImagePresent(record).catch(() => false));
+    const currentImage = current === undefined ? undefined : record && imagePresent ? record.environmentImage : await this.containerImage(current);
     if (current !== undefined && current.id === damaged.id && currentImage === image) return;
     this.logger.info(
       `The environment ${env.repository} changed while the question was open (container ${current?.name ?? 'missing'}, image ${currentImage ?? 'none'}). The container is not created again; nothing was changed.`,
@@ -5048,7 +5073,7 @@ export class EnvironmentService {
   ): Promise<string[]> {
     // Review round 15 (K1, K2): for Docker Compose, the `mounts` of the metadata also as the CLI writes them (composeMounts).
     const checked = await this.hostAccessInput(ctx.env, { metadata, ...(composeMounts ? { composeMounts: true } : {}) });
-    const report = addRefusedItems(await this.check(ctx, 'imageMetadata', checked, checks), 'hostAccess', [...imageLabelItems(image, labels, ownImageLabels(ctx.env)), ...moreItems]);
+    const report = addRefusedItems(await this.check(ctx, 'imageMetadata', checked, checks), 'hostAccess', [...imageLabelItems(image, labels, { ...ownImageLabels(ctx.env), environmentImage: true }), ...moreItems]);
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);
@@ -6440,12 +6465,28 @@ export class EnvironmentService {
       this.logger.warn(`The tags of ${repository} could not be listed: ${errorMessage(error)}`);
     }
     if (oldRecord) images.add(oldRecord.environmentImage);
-    for (const image of composeRecordOf(oldRecord)?.images ?? []) if (!keepCompose.includes(image)) images.add(image);
+    for (const image of await this.ownComposeImages(env, (composeRecordOf(oldRecord)?.images ?? []).filter((image) => !keepCompose.includes(image)))) images.add(image);
     if (keep) images.delete(keep);
     for (const image of images) {
       await this.quietly(`remove the image ${image}`, () => this.deps.docker.removeImage(image));
     }
     if (oldRecord) await this.removeUnusedBaseImages(oldRecord, keep ? undefined : env.id);
+  }
+
+  /**
+   * Review round 1 of PR #88 (A-R1-2): of the images `names` that Docker Compose built for `env` (BuildRecord.compose),
+   * those that carry the label nimblescape.devenv.environment-id of `env`: a name `<project>-<service>` can also be the
+   * name of an image of another environment whose name starts with `<project>-`, and such an image is never removed. An
+   * image whose labels cannot be read is kept.
+   */
+  private async ownComposeImages(env: Environment, names: readonly string[]): Promise<string[]> {
+    const own: string[] = [];
+    for (const name of names) {
+      const labels = await this.deps.docker.imageLabels(name).catch(() => undefined);
+      if (labels?.[LABEL_ENVIRONMENT_ID] === env.id) own.push(name);
+      else if (labels !== undefined) this.logger.info(`The image ${name} does not carry the environment ID of ${env.repository}; it is not removed.`);
+    }
+    return own;
   }
 
   private async removeUnusedBaseImages(oldRecord: BuildRecord, excludeEnvironmentId: string | undefined): Promise<void> {
@@ -6676,7 +6717,7 @@ export class EnvironmentService {
     });
     await this.quietly('remove the networks of the Docker Compose project', () => this.removeComposeNetworks(env));
     await this.quietly('remove the images of the Docker Compose project', async () => {
-      const images = new Set([...(composeRecordOf(env.buildRecord)?.images ?? []), ...(await docker.listProjectImages(project, env.id))]);
+      const images = new Set([...(await this.ownComposeImages(env, composeRecordOf(env.buildRecord)?.images ?? [])), ...(await docker.listProjectImages(project, env.id))]);
       for (const image of images) await this.quietly(`remove the image ${image}`, () => docker.removeImage(image));
     });
   }
@@ -6685,6 +6726,11 @@ export class EnvironmentService {
   private async removeFailedFirstOpen(env: Environment, compose = false): Promise<boolean> {
     const { docker } = this.deps;
     this.logger.info(`Removing what the failed first open of ${env.repository} created.`);
+    // Review round 1 of PR #88 (A-R1-4): a volume of the name with the labels of another environment (two first opens on
+    // one engine whose IDs got the same pair at the same moment) is that environment's: nothing of that name is removed.
+    const volumeOwner = (await docker.inspectVolumes([env.volumeName]).catch(() => []))[0]?.labels[LABEL_ENVIRONMENT_ID];
+    const foreignName = volumeOwner !== undefined && volumeOwner !== env.id;
+    if (foreignName) this.logger.warn(`The volume ${env.volumeName} belongs to another environment (${volumeOwner}); it and the container of its name are not removed.`);
     await this.quietly('remove the container', async () => {
       const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
       for (const container of containers) {
@@ -6692,12 +6738,12 @@ export class EnvironmentService {
         await this.stopServiceBeforeRemoval(container, env);
         await docker.removeContainer(container.id);
       }
-      await docker.removeContainer(env.containerName);
+      if (!foreignName) await docker.removeContainer(env.containerName);
       if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)))) await this.removeComposeProject(env, true);
     });
     await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
     try {
-      await this.removeVolumeWithRetry(env.volumeName);
+      if (!foreignName) await this.removeVolumeWithRetry(env.volumeName);
     } catch (error) {
       this.logger.warn(`Could not remove the volume ${env.volumeName}: ${errorMessage(error)}. The environment is kept; open it again to complete the clone, or delete it.`);
       await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));

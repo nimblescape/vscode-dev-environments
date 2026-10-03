@@ -446,8 +446,11 @@ export async function ensureRemoteContext(docker: RemoteDockerCli, host: string)
   }
   const args = ['create', choice.free, '--description', ownContextDescription(host), '--docker', `host=${sshEndpoint(host)}`];
   const written = await contextCommand(docker, args);
-  if (written.exitCode !== 0) throw contextCommandError(args, written);
-  return choice.free;
+  if (written.exitCode === 0) return choice.free;
+  // Review round 1 of PR #88 (A-R1-5): another window may have created it a moment ago; its context is taken as it is.
+  const again = remoteContextChoice(host, await listContextInfos(docker).catch(() => []));
+  if (again.existing !== undefined) return again.existing;
+  throw contextCommandError(args, written);
 }
 
 /** Makes the context of `host` (ensureRemoteContext) the current context (`docker context use`). Returns its name. */

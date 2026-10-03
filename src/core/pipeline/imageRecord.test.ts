@@ -57,11 +57,19 @@ describe('imageRecordLabels', () => {
     expect(imageRecordLabels(ENV, value)[LABEL_BUILD_RECORD]).toBe(JSON.stringify(value));
   });
 
-  it('leaves a record out that is longer than MAX_RECORD_LABEL_LENGTH, and keeps the other labels', () => {
+  it('writes an empty record when it is longer than MAX_RECORD_LABEL_LENGTH, and keeps the other labels', () => {
     const images = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`registry.example.com/image-${i}:1`, `sha256:${'f'.repeat(64)}`]));
     const big = record({ images });
     expect(JSON.stringify(stored(big)).length).toBeGreaterThan(MAX_RECORD_LABEL_LENGTH);
-    expect(imageRecordLabels(ENV, big)).toEqual({ [LABEL_ENVIRONMENT_ID]: ENV.id, [LABEL_REPOSITORY]: ENV.repository, [LABEL_OWNER_ID]: ENV.owner.id });
+    // Review round 1 of PR #88 (A-R1-3): the label is always set (empty), so that no such label of the base image stays.
+    expect(imageRecordLabels(ENV, big)).toEqual({
+      [LABEL_ENVIRONMENT_ID]: ENV.id,
+      [LABEL_REPOSITORY]: ENV.repository,
+      [LABEL_OWNER_ID]: ENV.owner.id,
+      [LABEL_BUILD_RECORD]: '',
+    });
+    // An empty record is never taken over.
+    expect(imageBuildRecord(imageRecordLabels(ENV, big), ENV, TAG, 3)).toBeUndefined();
   });
 
   it('keeps a record of exactly MAX_RECORD_LABEL_LENGTH characters', () => {

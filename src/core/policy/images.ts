@@ -210,7 +210,7 @@ export function imageInvalidReferenceItem(reference: string, what = 'image'): st
 export function imageLabelItems(
   image: string,
   labels: Readonly<Record<string, string>>,
-  own?: { id: string; repository: string; ownerId: string },
+  own?: OwnImageLabels,
 ): string[] {
   return Object.entries(labels)
     .map(([key, value]) => [key.trim(), value] as const)
@@ -218,13 +218,25 @@ export function imageLabelItems(
     .map(([key]) => `label ${key} of the image ${image}`);
 }
 
+/** The environment whose own image labels imageLabelItems allows. */
+export interface OwnImageLabels {
+  id: string;
+  repository: string;
+  ownerId: string;
+  /**
+   * Review round 1 of PR #88 (A-R1-3): the checked image is the environment image, which the extension labels with its
+   * build record after each build; on any other image the label of the build record is refused.
+   */
+  environmentImage?: boolean;
+}
+
 /**
  * User decisions 2026-10-03: the labels that the extension gives the images of the environment `own` (imageRecordLabels
  * of the environment image, and nimblescape.devenv.environment-id of the images that Compose builds for it), with the
- * values of `own`; the build record with any value (the extension writes it after each build). A container created
- * from such an image carries the same ID, repository, and owner as the environment.
+ * values of `own`; the build record with any value, only on the environment image (the extension writes it after each
+ * build). A container created from such an image carries the same ID, repository, and owner as the environment.
  */
-function isOwnImageLabel(key: string, value: string, own: { id: string; repository: string; ownerId: string } | undefined): boolean {
+function isOwnImageLabel(key: string, value: string, own: OwnImageLabels | undefined): boolean {
   if (own === undefined) return false;
   switch (key) {
     case LABEL_ENVIRONMENT_ID:
@@ -234,7 +246,7 @@ function isOwnImageLabel(key: string, value: string, own: { id: string; reposito
     case LABEL_OWNER_ID:
       return value === own.ownerId;
     case LABEL_BUILD_RECORD:
-      return true;
+      return own.environmentImage === true;
     default:
       return false;
   }

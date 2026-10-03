@@ -47,8 +47,13 @@ export interface ContainerInfo {
   /** `State.Status` of `docker inspect`, for example `exited`. */
   rawState: string;
   labels: Record<string, string>;
-  /** Image reference that the container was created from (`Config.Image`), for example `devenv-3f2a9c1e:2`. */
+  /** Image reference that the container was created from (`Config.Image`), for example `devenv-acme-api-brave-noether:2`. */
   image: string;
+  /**
+   * Review round 1 of PR #88 (A-R1-1): the full ID of the image that the container was created from (`Image` of `docker
+   * inspect`); `image` is only a name, which may name another image by now.
+   */
+  imageId?: string;
   /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
   volumes?: string[];
   /**
@@ -329,6 +334,7 @@ function toContainerInfo(value: unknown): InspectedContainer | undefined {
     rawState: state.Status,
     labels: toLabels(isRecord(config) ? config.Labels : undefined),
     image,
+    ...(typeof value.Image === 'string' && value.Image !== '' ? { imageId: value.Image } : {}),
     volumes: mountedVolumes(value.Mounts),
     volumeSubpaths: volumeSubpathMounts([
       ...(Array.isArray(value.Mounts) ? value.Mounts : []),

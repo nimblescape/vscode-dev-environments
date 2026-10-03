@@ -5630,7 +5630,9 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     h.helper.config = { image: BASE_IMAGE, mounts: ['source=shop_db,target=/db,type=volume', 'source=cache,target=/c,type=volume'] };
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('volume shop_db of the Docker Compose project shop'));
-    expect(h.docker.volumeInspections).toEqual([['shop_db', 'cache']]);
+    // Review round 1 of PR #88 (A-R1-4): changed expectation, the cleanup of the failed first open reads the labels of the
+    // workspace volume too (before: only the policy's inspection of the mounted volumes).
+    expect(h.docker.volumeInspections).toEqual([['shop_db', 'cache'], [expect.stringMatching(/^devenv-acme-api-[a-z]+-[a-z]+$/)]]);
     expect(h.helper.builds).toEqual([]);
   });
 

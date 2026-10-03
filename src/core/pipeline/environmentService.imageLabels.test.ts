@@ -7,11 +7,20 @@
 // with another ID is not used, an entry without a build record takes the record over from its newest image, and the
 // workspace volume of a restored entry must have the name of its labels (resourceName). The pure functions:
 // imageRecord.test.ts.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { UserFacingError } from '../errors';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CommandError, UserFacingError } from '../errors';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { Messages } from '../messages';
-import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, resourceName } from '../names';
+import {
+  CONTAINER_VERSION,
+  LABEL_BUILD_RECORD,
+  LABEL_CONTAINER_VERSION,
+  LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
+  LABEL_REPOSITORY,
+  environmentImageName,
+  resourceName,
+} from '../names';
 import type { BuildRecord } from '../types';
 import type { RepositoryTarget } from './environmentService';
 import {
@@ -265,5 +274,46 @@ describe('reconcileFromVolumes and the names of the environments', () => {
     expect(await h.service.reconcileFromVolumes()).toBe(0);
     expect(await h.registry.list()).toEqual([]);
     expect(h.logger.warnings).toContain(`The volume ${volume} has the labels of an environment but not its name. It is skipped.`);
+  });
+});
+
+describe('review round 1 of PR #88 (A-R1-1): a container is created again only from its own image', () => {
+  /** An outdated, stopped container, and a configuration that cannot be read: the container is created again without a build. */
+  async function outdatedWithoutConfiguration(): Promise<void> {
+    await seedEnvironment(h, { container: 'stopped', containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) } });
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+  }
+
+  it('never creates it from another image under the name of the record (the image is gone by its ID)', async () => {
+    await outdatedWithoutConfiguration();
+    h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+    await h.service.open(TARGET, options()).catch(() => undefined);
+    expect(h.logger.warnings.some((line) => line.includes('not the ID of its build record'))).toBe(true);
+    expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([]);
+  });
+
+  it('creates it from its own image by its ID when the name names another image', async () => {
+    await outdatedWithoutConfiguration();
+    const own = `sha256:image-of-${IMAGE_1}`;
+    // The image of the container is still there under another name; the name of the record names another image.
+    h.docker.images.add('kept:1');
+    h.docker.imageIds.set('kept:1', own);
+    h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+    await h.service.open(TARGET, options()).catch(() => undefined);
+    const ups = h.helper.calls.filter((call) => call.startsWith('up'));
+    expect(ups).toHaveLength(1);
+    expect(ups[0]).toBe(`up ${own} --remove-existing-container`);
+    expect(h.logger.warnings.some((line) => line.includes('no longer names the image of the container'))).toBe(true);
+  });
+});
+
+describe('review round 1 of PR #88 (A-R1-8): a Docker failure while the record is taken over', () => {
+  it('takes no record and builds, instead of failing the open', async () => {
+    await seedEnvironment(h, { record: null, container: null });
+    h.docker.images.add(IMAGE_1);
+    vi.spyOn(h.docker, 'imageLabels').mockRejectedValueOnce(new Error('timeout'));
+    await h.service.open(TARGET, options());
+    expect(h.logger.warnings.some((line) => line.includes(`The labels of ${IMAGE_1} could not be read: timeout`))).toBe(true);
+    expect(h.helper.builds).toHaveLength(1);
   });
 });

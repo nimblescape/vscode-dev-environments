@@ -340,7 +340,8 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
       h.ui.prompts.push(`recreateContainer ${repository}`);
       h.docker.images.add(image2);
       await h.registry.updateEnvironment(ENV_ID, (entry) => {
-        if (entry.buildRecord) entry.buildRecord = { ...entry.buildRecord, environmentImage: image2, buildNumber: 2 };
+        // Review round 1 of PR #88 (A-R1-1): a build pins the ID of its image, as buildAndReplace does.
+        if (entry.buildRecord) entry.buildRecord = { ...entry.buildRecord, environmentImage: image2, imageId: `sha256:image-of-${image2}`, buildNumber: 2 };
       });
       return true;
     };
