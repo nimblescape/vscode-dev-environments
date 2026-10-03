@@ -6785,16 +6785,12 @@ export class EnvironmentService {
     // one engine whose IDs got the same pair at the same moment) is that environment's: nothing of that name is removed.
     // Review round 2 (A-R2-2): neither its images nor its Compose project; and a volume whose labels cannot be read is
     // treated the same way (the entry stays, so the next open completes the clone or Delete removes it).
-    let volumeOwner: string | undefined;
-    let readable = true;
-    try {
-      volumeOwner = (await docker.inspectVolumes([env.volumeName]))[0]?.labels[LABEL_ENVIRONMENT_ID];
-    } catch (error) {
-      readable = false;
-      this.logger.warn(`The labels of the volume ${env.volumeName} could not be read: ${errorMessage(error)}. Only what carries the environment ID is removed.`);
-    }
-    const foreignName = !readable || (volumeOwner !== undefined && volumeOwner !== env.id);
-    if (readable && foreignName) this.logger.warn(`The volume ${env.volumeName} belongs to another environment (${volumeOwner}); nothing of its name is removed.`);
+    // Review round 3 of PR #88 (B-R3-5 follow-up): the same rule as an open and Delete (workspaceVolumeOwnership): a volume
+    // of the name without the ID label of this environment is not its own either (before: only another ID counted).
+    const ownership = await this.workspaceVolumeOwnership(env);
+    const readable = ownership !== 'unreadable';
+    const foreignName = ownership === 'foreign' || ownership === 'unreadable';
+    if (foreignName) this.logger.warn(`Nothing of the name ${env.volumeName} is removed: the volume is not the environment's own (${ownership}).`);
     await this.quietly('remove the container', async () => {
       const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
       for (const container of containers) {

@@ -629,3 +629,19 @@ describe('review round 3 of PR #88 (A-R3-1): a workspace volume of the name with
     expect(await h.registry.get(ENV_ID)).toBeDefined();
   });
 });
+
+describe('review round 3 of PR #88: a failed first open and a volume of its name without labels', () => {
+  it('refuses the volume and then removes nothing of its name (the same rule as Delete)', async () => {
+    const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    // A volume of the name without the labels of Dev Environments (made by hand, or by another program).
+    h.docker.volumes.set(name, {});
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.docker.volumes.get(name)).toEqual({});
+    expect(h.docker.log.filter((line) => line.startsWith('rm ') || line.startsWith('volume rm'))).toEqual([]);
+  });
+});

@@ -469,7 +469,8 @@ describe('the ID of a new environment (implementation notes 5)', () => {
     h.helper.cloneError = new Error('clone failed');
     await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
     expect(h.docker.volumes.get(name)).toEqual(theirs);
-    expect(h.logger.warnings.some((line) => line.includes('belongs to another environment'))).toBe(true);
+    // Review round 3 of PR #88: changed expectation, the text of workspaceVolumeOwnership (before: "belongs to another environment").
+    expect(h.logger.warnings.some((line) => line.includes(`carries the environment ID ${OTHER_ID}, not ${FREE}`))).toBe(true);
   });
 
   it('is not one whose volume exists, and that volume is never touched', async () => {
