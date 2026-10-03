@@ -5632,14 +5632,18 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
     expect(error.message).toBe(Messages.hostAccess('volume shop_db of the Docker Compose project shop'));
     // Review round 1 of PR #88 (A-R1-4): changed expectation, the cleanup of the failed first open reads the labels of the
     // workspace volume too (before: only the policy's inspection of the mounted volumes).
-    expect(h.docker.volumeInspections).toEqual([['shop_db', 'cache'], [expect.stringMatching(/^devenv-acme-api-[a-z]+-[a-z]+$/)]]);
+    // Review round 2 of PR #88 (A-R2-2): changed expectation, the first open also reads the labels of its workspace volume
+    // after it created it (requireOwnVolume).
+    const workspace = expect.stringMatching(/^devenv-acme-api-[a-z]+-[a-z]+$/);
+    expect(h.docker.volumeInspections).toEqual([[workspace], ['shop_db', 'cache'], [workspace]]);
     expect(h.helper.builds).toEqual([]);
   });
 
   it('reads no labels for a configuration without named volumes', async () => {
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
-    expect(h.docker.volumeInspections).toEqual([]);
+    // Review round 2 of PR #88 (A-R2-2): changed expectation, only the labels of the workspace volume (requireOwnVolume).
+    expect(h.docker.volumeInspections).toEqual([[expect.stringMatching(/^devenv-acme-api-[a-z]+-[a-z]+$/)]]);
   });
 
   describe('named volumes of environments of other accounts (finding 4)', () => {

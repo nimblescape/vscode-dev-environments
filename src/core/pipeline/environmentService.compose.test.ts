@@ -548,12 +548,13 @@ describe('first open of a Docker Compose configuration', () => {
       expect(h.helper.ups).toEqual([]);
     });
 
-    it('refuses the label of a build record on it also for the same account', async () => {
+    it('uses the environment image of an environment of the same account, with its build record (review round 2, A-R2-3)', async () => {
       await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
       h.docker.images.add(DB_IMAGE);
+      // Changed expectation (A-R2-3): every environment image carries the label of its build record (before: refused).
       h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_BUILD_RECORD]: '{}' } });
-      const error = await rejection(h.service.open(TARGET, options()));
-      expect(error.message).toBe(Messages.hostAccess(`label ${LABEL_BUILD_RECORD} of the image ${DB_IMAGE}`));
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
     });
   });
 

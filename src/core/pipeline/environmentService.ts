@@ -1392,6 +1392,9 @@ export class EnvironmentService {
         try {
           steps.step('downloadingRepository');
           await this.deps.docker.createVolume(name, volumeLabels(environment));
+          // Review round 2 of PR #88 (A-R2-2): `docker volume create` takes an existing volume as it is; one that another
+          // environment created meanwhile under the same name is never cloned into.
+          await this.requireOwnVolume(environment);
           await this.prepareHelper(ctx);
           await this.clone(ctx, session.token, target.defaultBranch ?? undefined);
           return await this.runPipeline(ctx);
@@ -2955,7 +2958,8 @@ export class EnvironmentService {
       // The old container is started when it still exists; a missing or half-created one is replaced.
       const survivor = await this.deps.docker.findContainer(env.id, env.containerName).catch(() => undefined);
       const keep =
-        survivor !== undefined && survivor.image === previousImage && containerIsCurrent(survivor.labels, true, ctx.hostAccessChecks);
+        // Review round 2 of PR #88 (A-R2-1): previousImage may be the ID of the container's image (containerImage).
+        survivor !== undefined && (survivor.image === previousImage || survivor.imageId === previousImage) && containerIsCurrent(survivor.labels, true, ctx.hostAccessChecks);
       this.logger.info(
         keep
           ? `The previous container ${survivor.name} is started again.`
@@ -4735,13 +4739,14 @@ export class EnvironmentService {
       }
       // Review round 1 of PR #88 (A-R1-7; user decision 2026-09-28: the images of the account's own environments may be
       // used): an image with the labels of another environment of the same account (a registry entry) carries that
-      // environment's labels; never with its build record (the record is allowed on the environment image only).
+      // environment's labels.
       const labelled = labels[LABEL_ENVIRONMENT_ID];
       const sameAccount =
         labelled !== undefined && labelled !== ctx.env.id
           ? (await this.deps.registry.list().catch(() => [])).find((entry) => entry.id === labelled && entry.owner.id === ctx.env.owner.id)
           : undefined;
-      items.push(...imageLabelItems(reference, labels, ownImageLabels(sameAccount ?? ctx.env)));
+      // Review round 2 of PR #88 (A-R2-3): that environment's image carries its build record too (labelImage writes it).
+      items.push(...imageLabelItems(reference, labels, sameAccount !== undefined ? { ...ownImageLabels(sameAccount), environmentImage: true } : ownImageLabels(ctx.env)));
     }
     return items;
   }
@@ -6435,6 +6440,14 @@ export class EnvironmentService {
     };
   }
 
+  /** Review round 2 of PR #88 (A-R2-2): the workspace volume of `env` carries the ID of `env`, else startFailed. */
+  private async requireOwnVolume(env: Environment): Promise<void> {
+    const owner = (await this.deps.docker.inspectVolumes([env.volumeName]))[0]?.labels[LABEL_ENVIRONMENT_ID];
+    if (owner === env.id) return;
+    this.logger.warn(`The volume ${env.volumeName} carries the environment ID ${owner ?? 'none'}, not ${env.id}. It is not used.`);
+    throw new UserFacingError('startFailed', PipelineTexts.startFailed, `The volume ${env.volumeName} belongs to another environment. Open the repository again.`);
+  }
+
   /** A helper run on a missing volume would create an empty one without labels (concept 7.5 forbids that). */
   private async requireVolume(env: Environment): Promise<void> {
     if (!(await this.deps.docker.volumeExists(env.volumeName))) {
@@ -6736,9 +6749,18 @@ export class EnvironmentService {
     this.logger.info(`Removing what the failed first open of ${env.repository} created.`);
     // Review round 1 of PR #88 (A-R1-4): a volume of the name with the labels of another environment (two first opens on
     // one engine whose IDs got the same pair at the same moment) is that environment's: nothing of that name is removed.
-    const volumeOwner = (await docker.inspectVolumes([env.volumeName]).catch(() => []))[0]?.labels[LABEL_ENVIRONMENT_ID];
-    const foreignName = volumeOwner !== undefined && volumeOwner !== env.id;
-    if (foreignName) this.logger.warn(`The volume ${env.volumeName} belongs to another environment (${volumeOwner}); it and the container of its name are not removed.`);
+    // Review round 2 (A-R2-2): neither its images nor its Compose project; and a volume whose labels cannot be read is
+    // treated the same way (the entry stays, so the next open completes the clone or Delete removes it).
+    let volumeOwner: string | undefined;
+    let readable = true;
+    try {
+      volumeOwner = (await docker.inspectVolumes([env.volumeName]))[0]?.labels[LABEL_ENVIRONMENT_ID];
+    } catch (error) {
+      readable = false;
+      this.logger.warn(`The labels of the volume ${env.volumeName} could not be read: ${errorMessage(error)}. Only what carries the environment ID is removed.`);
+    }
+    const foreignName = !readable || (volumeOwner !== undefined && volumeOwner !== env.id);
+    if (readable && foreignName) this.logger.warn(`The volume ${env.volumeName} belongs to another environment (${volumeOwner}); nothing of its name is removed.`);
     await this.quietly('remove the container', async () => {
       const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
       for (const container of containers) {
@@ -6746,10 +6768,15 @@ export class EnvironmentService {
         await this.stopServiceBeforeRemoval(container, env);
         await docker.removeContainer(container.id);
       }
-      if (!foreignName) await docker.removeContainer(env.containerName);
+      if (foreignName) return;
+      await docker.removeContainer(env.containerName);
       if (compose || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)))) await this.removeComposeProject(env, true);
     });
-    await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
+    if (!foreignName) await this.quietly('remove the environment images', () => this.removeEnvironmentImages(env, undefined, undefined));
+    if (!readable) {
+      await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(env.id));
+      return false;
+    }
     try {
       if (!foreignName) await this.removeVolumeWithRetry(env.volumeName);
     } catch (error) {

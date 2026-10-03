@@ -346,3 +346,55 @@ describe('review round 1 of PR #88 (A-R1-8): a Docker failure while the record i
     expect(h.helper.builds).toHaveLength(1);
   });
 });
+
+describe('review round 2 of PR #88', () => {
+  it('A-R2-1: a failed update starts the current container again whose image is used by its ID, and never removes it', async () => {
+    await seedEnvironment(h, { container: 'stopped' });
+    const own = `sha256:image-of-${IMAGE_1}`;
+    // The image of the container is still there under another name; IMAGE_1 names another image now, so the open builds.
+    h.docker.images.add('kept:1');
+    h.docker.imageIds.set('kept:1', own);
+    h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+    // The build succeeds; `up` of the new image fails before the CLI removed anything, so the old container survives.
+    h.helper.upFailsBeforeRemoval = true;
+    h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid override') : undefined);
+    await h.service.open(TARGET, options()).catch(() => undefined);
+    const ups = h.helper.calls.filter((call) => call.startsWith('up'));
+    expect(ups).toHaveLength(2);
+    expect(ups[1]).not.toContain('--remove-existing-container');
+  });
+
+  it('A-R2-2: a first open whose volume another environment created meanwhile clones nothing into it and removes nothing of it', async () => {
+    const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+    h.docker.volumes.set(name, theirs);
+    // The other first open built its image already (no container yet).
+    const image = `${name}:1`;
+    h.docker.images.add(image);
+    h.docker.imageConfigs.set(image, { User: '', Labels: theirs });
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('clone'))).toEqual([]);
+    expect(h.docker.volumes.get(name)).toEqual(theirs);
+    expect(h.docker.images.has(image)).toBe(true);
+  });
+
+  it('A-R2-2: a failed first open whose volume labels cannot be read removes nothing of its name and keeps the entry', async () => {
+    h.helper.cloneError = new Error('clone failed');
+    const inspect = h.docker.inspectVolumes.bind(h.docker);
+    let calls = 0;
+    h.docker.inspectVolumes = async (names) => {
+      // The check after the create reads them; the cleanup after the failed clone cannot.
+      if (calls++ > 0) throw new Error('timeout');
+      return inspect(names);
+    };
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    const [entry] = await h.registry.list();
+    expect(entry).toBeDefined();
+    expect(h.docker.volumes.has(entry.volumeName)).toBe(true);
+  });
+});
