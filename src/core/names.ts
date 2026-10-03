@@ -135,6 +135,13 @@ export const LABEL_HELPER_RUN = 'nimblescape.devenv.helper-run';
  */
 export const LABEL_BUILD_ID = 'nimblescape.devenv.build-id';
 /**
+ * User decisions 2026-10-03: a label of the environment image (ContainerAdapter.labelImage, after each build), with the
+ * build record of that image as JSON, next to nimblescape.devenv.environment-id, nimblescape.devenv.repository, and
+ * nimblescape.devenv.owner-id. The open of an environment that another computer created, or of one restored after a lost
+ * registry, takes the record from its newest image (imageBuildRecord), so its image check works as on the first computer.
+ */
+export const LABEL_BUILD_RECORD = 'nimblescape.devenv.build-record';
+/**
  * Every label key that the extension reads or writes (on containers, images, and volumes), each with LABEL_PREFIX, in
  * lower case. The host access policy refuses every key with LABEL_PREFIX in a configuration and on images
  * (isReservedLabel in ./policy/rules.ts), these and any later one: such a label would hide a container or volume from
@@ -155,6 +162,7 @@ export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
   LABEL_HELPER,
   LABEL_HELPER_RUN,
   LABEL_BUILD_ID,
+  LABEL_BUILD_RECORD,
   LABEL_SESSION_MONITOR,
   LABEL_MONITOR_CREATE,
   LABEL_HELPER_CHANNEL,

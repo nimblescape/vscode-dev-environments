@@ -1095,6 +1095,59 @@ export class ContainerAdapter {
   }
 
   /**
+   * The labels of the local images `references` (one `docker image inspect`), by their full IDs; an image that does not
+   * exist is left out (the call fails for every reference then, so they are asked one by one). Throws CommandError when
+   * Docker cannot answer, or an AbortError when `signal` aborts.
+   */
+  async imageLabelsOf(references: readonly string[], signal?: AbortSignal): Promise<Map<string, Record<string, string>>> {
+    const labels = new Map<string, Record<string, string>>();
+    if (references.length === 0) return labels;
+    const format = '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}';
+    const read = async (batch: readonly string[]): Promise<RunResult> => {
+      const result = await this.run(['image', 'inspect', '--format', format, ...batch], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal });
+      if (signal?.aborted) throw abortError();
+      return result;
+    };
+    const take = (stdout: string): void => {
+      for (const item of parseJsonLines(stdout)) {
+        if (!isRecord(item) || typeof item.id !== 'string' || item.id === '') continue;
+        labels.set(item.id.toLowerCase(), toLabels(item.labels));
+      }
+    };
+    const all = await read(references);
+    if (all.exitCode === 0) {
+      take(all.stdout);
+      return labels;
+    }
+    for (const reference of references) {
+      const args = ['image', 'inspect', '--format', format, reference];
+      const one = await read([reference]);
+      if (one.exitCode === 0) take(one.stdout);
+      else if (!this.isMissing(one, 'image')) throw this.commandError(args, one);
+    }
+    return labels;
+  }
+
+  /**
+   * User decisions 2026-10-03: gives the local image `image` the labels `labels` (the environment ID, its repository and
+   * owner, and its build record): `docker build --quiet -t <image> --label k=v… -` with only `FROM <image>` on standard
+   * input, a build of metadata without a new layer and without the network (its base is the local image). Docker moves
+   * the tag only when the build succeeds. The previous image under the tag is removed after that when nothing else uses
+   * it (best effort). Throws CommandError when the build fails.
+   */
+  async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
+    const previous = await this.imageId(image);
+    if (previous === undefined) throw new CommandError(commandText(['image', 'inspect', image]), 1, '', `The image ${image} does not exist.`);
+    await this.runChecked(['build', '--quiet', '-t', image, ...labelArgs(labels, '--label'), '-'], { input: `FROM ${image}\n`, signal });
+    const now = await this.imageId(image);
+    if (now !== undefined && now !== previous) {
+      await this.removeImage(previous).catch((error: unknown) => {
+        this.logger.info(`The image ${previous} before the labels of ${image} was not removed: ${errorMessage(error)}`);
+      });
+    }
+  }
+
+  /**
    * The names of the local image that `reference` names (`RepoTags` and `RepoDigests` of `docker image inspect`), or
    * `undefined` if it does not exist (review round 2, S2-05: whether Docker took the reference for an image ID,
    * resolvedByImageId). Throws CommandError for other errors.
