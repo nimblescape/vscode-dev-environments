@@ -113,7 +113,8 @@ describe('ClosingWork (review round 1 of PR #87, B-R1-7 (a))', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', 'vscode', 'extension.ts'), 'utf8');
     expect(source).toContain('context.subscriptions.push(closingWork.deferred(logger));');
     expect(source).toContain('subscriptions: closingWork.deferredSubscriptions(context.subscriptions),');
-    expect(source).toMatch(/closingWork\.deferred\(\{\s*dispose: \(\) => \{\s*docker\.setRouter\(undefined\);\s*channels\.dispose\(\);/);
+    // Plan step 10A: changed expectation (before: without setWorkerEngine): the worker's Engine API operations go with it.
+    expect(source).toMatch(/closingWork\.deferred\(\{\s*dispose: \(\) => \{\s*docker\.setRouter\(undefined\);\s*docker\.setWorkerEngine\(undefined\);\s*channels\.dispose\(\);/);
     expect(source).toContain('return closingWork.begin(() => coordinator?.deactivate());');
     expect(source).not.toContain('context.subscriptions.push(logger);');
   });

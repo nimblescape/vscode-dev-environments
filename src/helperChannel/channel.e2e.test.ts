@@ -117,7 +117,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     // Plan step 5, PR C: `refresh`.
     // Plan step 5, PR B: changed expectation: `lock` too.
     // Plan step 6, PR B: changed expectation: the batch operations too.
-    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'refresh', 'sweep']);
+    // Plan step 10A: changed expectation (before: without `pull` and `startContainers`).
+    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'sweep']);
     expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
     const result = await channel.docker(['cat'], { input: 'hello channel' });
     expect(result).toEqual({ exitCode: 0, stdout: 'hello channel', stderr: '', timedOut: false });

@@ -17,7 +17,7 @@ import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { errorMessage, isUserFacingError } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
-import { HelperChannel, HelperChannelError, HelperOperationError, type ChannelDockerOptions } from './helperChannel';
+import { HelperChannel, HelperChannelError, HelperOperationError, type ChannelDockerOptions, type ChannelPullOptions } from './helperChannel';
 import {
   CHANNEL_ENTRY,
   CHANNEL_IDLE_CLOSE_MS,
@@ -389,6 +389,32 @@ export class HelperChannels {
       const slotWaitMs = Math.min(CHANNEL_OPEN_WAIT_MS, options.timeoutMs ?? CHANNEL_OPEN_WAIT_MS);
       try {
         return await channel.docker(args, { ...options, slotWaitMs });
+      } catch (error) {
+        if (attempt === 0 && error instanceof HelperChannelError && error.code === 'closed') continue;
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Plan step 10A (decision of 2026-10-03): the pull of `reference` by the worker of `target` (HelperChannel.pull). Made
+   * ready and sent once more after `closed` as docker(); never the way without the worker.
+   */
+  async pull(target: DockerTarget, reference: string, options: ChannelPullOptions = {}): Promise<void> {
+    await this.withChannel(target, options.signal, (channel) => channel.pull(reference, options));
+  }
+
+  /** Plan step 10A: the start of the containers `ids` by the worker of `target` (HelperChannel.startContainers). */
+  async startContainers(target: DockerTarget, ids: readonly string[], options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
+    await this.withChannel(target, options.signal, (channel) => channel.startContainers(ids, options));
+  }
+
+  /** Plan step 10A: `call` with the channel of `target` (ready), once more through a new channel when it was `closed`. */
+  private async withChannel<T>(target: DockerTarget, signal: AbortSignal | undefined, call: (channel: HelperChannel) => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const channel = await this.ready(target, signal);
+      try {
+        return await call(channel);
       } catch (error) {
         if (attempt === 0 && error instanceof HelperChannelError && error.code === 'closed') continue;
         throw error;

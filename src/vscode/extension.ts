@@ -160,6 +160,8 @@ async function activateExtension(
       daemonRunning = running;
       adapterOptions.onDaemonStatus?.(running);
     },
+    // Plan step 10A: a pull through the worker sends the credentials that Docker stored here (the store comes below).
+    storedCredentials: (registry, signal) => credentials.get(registry, signal),
   });
   // Unit 7: the Docker host is the current Docker context, read at the start of each operation.
   const targets = new DockerTargets(docker, env, logger, platform);
@@ -282,11 +284,17 @@ async function activateExtension(
   });
   helperChannels = channels;
   docker.setRouter((target, args, options) => channels.docker(target, args, options));
+  // Plan step 10A (decision of 2026-10-03): the operations of the worker over the Engine API.
+  docker.setWorkerEngine({
+    pull: (target, reference, options) => channels.pull(target, reference, options),
+    startContainers: (target, ids, options) => channels.startContainers(target, ids, options),
+  });
   // Plan step 8, PR C: after the release of deactivate() (bounded; it never rejects), which needs the worker.
   context.subscriptions.push(
     closingWork.deferred({
       dispose: () => {
         docker.setRouter(undefined);
+        docker.setWorkerEngine(undefined);
         channels.dispose();
       },
     }),

@@ -511,6 +511,55 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     });
   });
 
+  // Plan step 10A (decision of 2026-10-03): the operations over the Engine API of the worker.
+  describe('pull and startContainers', () => {
+    async function openWithEngineOps() {
+      const fake = fakeProcess();
+      const { logger, lines } = recordingLogger();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ ...HELLO, ops: ['docker', 'pull', 'startContainers'] } as ServerMessage);
+      return { channel: await opening, fake, lines };
+    }
+
+    it('sends the pull with the user and server as parameters and the password only as the secret; passes its output on', async () => {
+      const { channel, fake } = await openWithEngineOps();
+      const output: string[] = [];
+      const pulling = channel.pull('ghcr.io/o/i:1', { credentials: { username: 'octo', password: 'gho_secret', serveraddress: 'ghcr.io' }, onOutput: (text) => output.push(text) });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'pull', params: { reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, secret: 'gho_secret' });
+      expect(JSON.stringify(op.params)).not.toContain('gho_secret');
+      fake.answer({ t: 'out', id: op.id, stream: 'stdout', data: '1: Pulling from o/i\n' });
+      fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
+      await pulling;
+      expect(output).toEqual(['1: Pulling from o/i\n']);
+    });
+
+    it('refuses a reference without a tag, a short password, and a worker without the operation, sending nothing', async () => {
+      const { channel, fake } = await openWithEngineOps();
+      const before = fake.messages().length;
+      await expect(channel.pull('alpine')).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.pull('alpine:1', { credentials: { username: 'u', password: 'x', serveraddress: 's' } })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.startContainers(['c1'])).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages()).toHaveLength(before);
+      const { channel: old } = await openChannel();
+      await expect(old.pull('alpine:1')).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(old.startContainers(['a'.repeat(64)])).rejects.toMatchObject({ code: 'unsendable' });
+    });
+
+    it('sends startContainers with the IDs and its time limit; a failure rejects as HelperOperationError', async () => {
+      const { channel, fake } = await openWithEngineOps();
+      const starting = channel.startContainers(['a'.repeat(64)], { timeoutMs: 60_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'startContainers', params: { ids: ['a'.repeat(64)] }, timeoutMs: 60_000 });
+      expect(op.secret).toBeUndefined();
+      fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'failed', message: 'port is already allocated' }, cancelled: false, timedOut: false });
+      await expect(starting).rejects.toMatchObject({ name: 'HelperOperationError', message: 'port is already allocated' });
+    });
+  });
+
   describe('docker', () => {
     it('returns the result of a Docker call: its output, its exit code, and passes its input', async () => {
       const { channel, fake, lines } = await openChannel();
@@ -614,6 +663,32 @@ describe('HelperChannel.lock (plan step 5, PR B)', () => {
       await expect(channel.lock(id, wait)).rejects.toMatchObject({ code: 'unsendable' });
     }
     expect(fake.messages()).toHaveLength(before);
+  });
+
+  // Plan step 10A: the operations over the Engine API under the lock go through the same worker.
+  it('pull and startContainers of a held lock go through its worker', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ ...HELLO, ops: ['docker', 'lock', 'pull', 'startContainers'] } as ServerMessage);
+    const channel = await opening;
+    const locking = channel.lock(ID, 10);
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'progress', id: lastOp(fake).id, step: LOCK_HELD_STEP });
+    const lock = await locking;
+    const pulling = lock.pull!('alpine:1', {});
+    await vi.advanceTimersByTimeAsync(0);
+    const pull = lastOp(fake);
+    expect(pull).toMatchObject({ op: 'pull', params: { reference: 'alpine:1' } });
+    fake.answer({ t: 'result', id: pull.id, ok: true, value: {} });
+    await pulling;
+    const starting = lock.startContainers!(['b'.repeat(64)], {});
+    await vi.advanceTimersByTimeAsync(0);
+    const start = lastOp(fake);
+    expect(start).toMatchObject({ op: 'startContainers', params: { ids: ['b'.repeat(64)] } });
+    fake.answer({ t: 'result', id: start.id, ok: true, value: {} });
+    await starting;
   });
 
   it('release waits until the worker let go of the lock', async () => {

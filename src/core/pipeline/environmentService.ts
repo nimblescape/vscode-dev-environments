@@ -285,6 +285,7 @@ export type EnvironmentDocker = Pick<
   | 'listProjectImages'
   | 'inspectNetworks'
   | 'inspectImageNames'
+  | 'startContainer'
 > & {
   /**
    * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
@@ -3729,7 +3730,8 @@ export class EnvironmentService {
     for (const container of stopped) {
       this.logger.info(`Starting the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${ctx.env.repository}.`);
       try {
-        await this.deps.docker.runChecked(['start', container.id], { timeoutMs: DOCKER_START_TIMEOUT_MS, signal: ctx.signal });
+        // Plan step 10A (decision of 2026-10-03): by the worker that holds the lock, over the Engine API.
+        await this.deps.docker.startContainer(container.id, { timeoutMs: DOCKER_START_TIMEOUT_MS, signal: ctx.signal });
       } catch (error) {
         if (this.isCancellation(error, ctx.signal)) throw error;
         this.logger.warn(`The container ${container.name} could not be started: ${errorDetail(error)}`);

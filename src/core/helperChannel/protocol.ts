@@ -736,3 +736,67 @@ export function flockArgs(waitSeconds: number, fd: number): string[] {
 export function flockNoWaitArgs(fd: number): string[] {
   return ['-n', '-E', String(LOCK_BUSY_EXIT), String(fd)];
 }
+
+/**
+ * Plan step 10A (decision of 2026-10-03): `pull`, the download of an image by the worker over the Engine API
+ * (`POST /images/create`). Parameters PullParams; the secret of the operation is the registry password (only with
+ * `username` and `serveraddress`), which the worker sends only in the header X-Registry-Auth. Its output is the progress
+ * of the download, as `docker pull` prints it. Value: `{}`.
+ */
+export const OP_PULL = 'pull';
+/** The longest image reference of a pull. */
+export const MAX_PULL_REFERENCE_LENGTH = 512;
+
+export interface PullParams {
+  /** The image, always with a tag or a digest (pullReference), so the engine never pulls every tag of a repository. */
+  reference: string;
+  /** With a secret: the user of the registry, and its server (`https://index.docker.io/v1/` for Docker Hub). */
+  username?: string;
+  serveraddress?: string;
+}
+
+/** `reference` with the tag `latest` when it has neither a tag nor a digest (the default of `docker pull`). */
+export function pullReference(reference: string): string {
+  if (reference.includes('@')) return reference;
+  const lastSlash = reference.lastIndexOf('/');
+  return reference.lastIndexOf(':') > lastSlash ? reference : `${reference}:latest`;
+}
+
+/** The strict check of PullParams (both sides). */
+export function parsePullParams(value: unknown): PullParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['reference'], ['username', 'serveraddress'])) return undefined;
+  const { reference, username, serveraddress } = value;
+  if (typeof reference !== 'string' || reference.length === 0 || reference.length > MAX_PULL_REFERENCE_LENGTH) return undefined;
+  if (/[\s\0]/.test(reference) || reference.startsWith('-') || pullReference(reference) !== reference) return undefined;
+  if ((username === undefined) !== (serveraddress === undefined)) return undefined;
+  const params: PullParams = { reference };
+  if (username !== undefined) {
+    if (typeof username !== 'string' || username.length === 0 || username.length > 256 || /[\0\n\r]/.test(username)) return undefined;
+    if (typeof serveraddress !== 'string' || serveraddress.length === 0 || serveraddress.length > 512 || /[\s\0]/.test(serveraddress)) return undefined;
+    params.username = username;
+    params.serveraddress = serveraddress;
+  }
+  return params;
+}
+
+/**
+ * Plan step 10A (decision of 2026-10-03): `startContainers`, `POST /containers/<id>/start` of each container by its full
+ * ID, in order (the stopped side services of a Docker Compose dev container). No secret. Value: `{}`; a container that
+ * runs already counts as started.
+ */
+export const OP_START_CONTAINERS = 'startContainers';
+/** The most containers of one startContainers. */
+export const MAX_START_CONTAINERS = 64;
+
+export interface StartContainersParams {
+  ids: string[];
+}
+
+/** The strict check of StartContainersParams (both sides). */
+export function parseStartContainersParams(value: unknown): StartContainersParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['ids'])) return undefined;
+  const { ids } = value;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_START_CONTAINERS) return undefined;
+  if (!ids.every((id) => typeof id === 'string' && /^[0-9a-f]{64}$/.test(id))) return undefined;
+  return { ids: [...(ids as string[])] };
+}

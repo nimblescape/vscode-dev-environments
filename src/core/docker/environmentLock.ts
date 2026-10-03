@@ -9,7 +9,7 @@
 // fails, whatever its kind. The scope is re-entrant: an operation that holds the lock of an environment does not take it
 // again. No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
-import type { HelperBatchSession } from '../helperChannel/helperChannel';
+import type { ChannelPullOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import type { RunOptions, RunResult } from '../ports';
 
 /** A held lock of an environment (HelperChannel.lock). */
@@ -32,6 +32,12 @@ export interface HeldEnvironmentLock {
    * 6, PR C: the open pipeline runs its volume steps in it (src/core/helper/batchScope.ts).
    */
   batch?(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
+  /**
+   * Plan step 10A (decision of 2026-10-03): the pull of an image and the start of containers by the worker that holds the
+   * lock (HelperChannel.pull, HelperChannel.startContainers).
+   */
+  pull?(reference: string, options: ChannelPullOptions): Promise<void>;
+  startContainers?(ids: readonly string[], options: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;
   /** Lets go of the lock and resolves when the worker confirmed it, or the worker was lost (the kernel frees it). Never rejects. */
   release(): Promise<void>;
 }
