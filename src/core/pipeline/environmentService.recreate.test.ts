@@ -19,7 +19,7 @@ import { DEFAULT_CONFIG_PATH, isContainerFault } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
 
 /** What Docker 29.3.1 prints in the output of `devcontainer up` when /etc/passwd of the container lacks the user. */
 const PASSWD_DAMAGED =
@@ -335,7 +335,7 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
     await seedEnvironment(h);
     const old = h.docker.containersOf(ENV_ID)[0];
     failFirstUp(PASSWD_DAMAGED);
-    const image2 = environmentImageName(ENV_ID, 2);
+    const image2 = environmentImageName(REPO, ENV_ID, 2);
     h.ui.recreateContainer = async (repository) => {
       h.ui.prompts.push(`recreateContainer ${repository}`);
       h.docker.images.add(image2);

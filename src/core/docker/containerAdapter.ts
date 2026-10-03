@@ -889,8 +889,10 @@ export class ContainerAdapter {
 
   /**
    * The images that Docker Compose built for the project `project`: `<project>-<service>` (composeServiceImage), as
-   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, an image whose label
-   * nimblescape.devenv.environment-id names another environment is left out (review round 1, D3). Throws CommandError.
+   * `repository:tag` (`docker image ls --filter reference=<project>-*`). With `environmentId`, only the images whose label
+   * nimblescape.devenv.environment-id names that environment (review round 1, D3; user decisions 2026-10-03: every image
+   * that Compose builds for an environment carries it, so an image without it, perhaps of another environment whose name
+   * starts with `<project>-`, is left out too). Throws CommandError.
    */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const args = ['image', 'ls', '--filter', `reference=${project}-*`, '--format', '{{json .}}'];
@@ -910,7 +912,7 @@ export class ContainerAdapter {
         const config = isRecord(item) ? item.Config : undefined;
         const owner = toLabels(isRecord(config) ? config.Labels : undefined)[LABEL_ENVIRONMENT_ID];
         const tags = isRecord(item) && Array.isArray(item.RepoTags) ? item.RepoTags.filter((tag): tag is string => typeof tag === 'string') : [];
-        if (owner !== undefined && owner !== environmentId) for (const tag of tags) foreign.add(tag);
+        if (owner !== environmentId) for (const tag of tags) foreign.add(tag);
       });
     }
     return sorted.filter((image) => !foreign.has(image));

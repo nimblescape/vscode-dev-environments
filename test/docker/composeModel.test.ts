@@ -15,7 +15,7 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import { composeProjectName } from '../../src/core/names';
+import { composeProjectName, environmentImageName, resourceName } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, runInVolume } from './harness';
@@ -23,7 +23,11 @@ import { inBatchScope, workerLocks } from './workerLocks';
 import { composeAccessReport } from '../../src/core/policy';
 
 const ENVIRONMENT_ID = 'c0ffee00-0000-4000-8000-000000000000';
-const PROJECT = composeProjectName(ENVIRONMENT_ID);
+/** User decisions 2026-10-03: the Compose project, the dev container, and the environment image are named after the repository and the pair of the ID. */
+const REPOSITORY = 'devenv-test/app';
+const PROJECT = composeProjectName(REPOSITORY, ENVIRONMENT_ID);
+const CONTAINER_NAME = resourceName(REPOSITORY, ENVIRONMENT_ID);
+const IMAGE = environmentImageName(REPOSITORY, ENVIRONMENT_ID, 1);
 const REPO = '/workspaces/app';
 
 /** Writes files into the volume (absolute paths), without the Docker socket and without network. */
@@ -187,12 +191,12 @@ describe('model run of a Docker Compose configuration', () => {
       project: PROJECT,
       devService: 'app',
       environmentId: ENVIRONMENT_ID,
-      containerName: 'devenv-test-compose-app',
+      containerName: CONTAINER_NAME,
       volumeName,
       repositoryFolder: REPO,
       engineApiVersion: '1.45',
       realPaths: output.realPaths,
-      image: 'devenv-c0ffee00:1',
+      image: IMAGE,
     });
     const script = `mkdir -p /tmp/m && cat > /tmp/m/compose.json && docker compose -p ${PROJECT} -f /tmp/m/compose.json --profile '*' config --format json`;
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the check is a plain container of the helper image.
@@ -239,14 +243,14 @@ describe('model run of a Docker Compose configuration', () => {
       project: PROJECT,
       devService: 'app',
       environmentId: ENVIRONMENT_ID,
-      containerName: 'devenv-test-compose-app',
+      containerName: CONTAINER_NAME,
       volumeName,
       repositoryFolder: REPO,
       // Only `config` reads the model (no container starts), so the rewrite of repository files is read also on an
       // engine before Docker Engine 26.
       engineApiVersion: '1.45',
       realPaths: output.realPaths,
-      image: 'devenv-c0ffee00:1',
+      image: IMAGE,
     });
     const script = `mkdir -p /tmp/m && cat > /tmp/m/compose.json && docker compose -p ${PROJECT} -f /tmp/m/compose.json --profile '*' config --format json`;
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the check is a plain container of the helper image.
@@ -255,7 +259,8 @@ describe('model run of a Docker Compose configuration', () => {
     const again = JSON.parse(result.stdout) as Record<string, Record<string, Record<string, unknown>>>;
     log.info(`Model read again: ${JSON.stringify(again)}`);
     expect(again.services.app.environment).toMatchObject({ LITERAL: output.dollarEscaped ? 'a$$b' : 'a$b' });
-    expect(again.services.app.image).toBe('devenv-c0ffee00:1');
+    // User decisions 2026-10-03: the environment image `<resourceName>:<n>`.
+    expect(again.services.app.image).toBe(IMAGE);
     expect(again.services.db.ports).toEqual([expect.objectContaining({ target: 5432, host_ip: '127.0.0.1' })]);
     expect(again.volumes.pgdata).toMatchObject({ name: `${PROJECT}_pgdata`, external: true });
     expect(again.services.db.volumes).toContainEqual(

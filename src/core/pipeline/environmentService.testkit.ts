@@ -187,11 +187,15 @@ export class FakeDocker implements EnvironmentDocker {
     this.networks.delete(name);
   }
 
+  /**
+   * As ContainerAdapter.listProjectImages. User decisions 2026-10-03: with `environmentId`, only the images whose label
+   * nimblescape.devenv.environment-id is that ID (an unlabelled `<project>-*` image is left out too).
+   */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const owner = (image: string): string | undefined => this.imageConfigs.get(image)?.Labels?.[LABEL_ENVIRONMENT_ID];
     return [...this.images]
       .filter((image) => image.startsWith(`${project}-`))
-      .filter((image) => environmentId === undefined || owner(image) === undefined || owner(image) === environmentId)
+      .filter((image) => environmentId === undefined || owner(image) === environmentId)
       .sort();
   }
 

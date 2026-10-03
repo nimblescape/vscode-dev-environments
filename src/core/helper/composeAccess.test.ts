@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { durationSeconds, type ComposeModel } from './compose';
-import { TOKEN_TMPFS } from '../names';
+import { TOKEN_TMPFS, composeProjectName, resourceName } from '../names';
 import {
   composeAccessReport,
   composeConfigurationReport,
@@ -16,8 +16,11 @@ import {
 } from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
-const PROJECT = 'devenv-3f2a9c1e';
-const OWN = 'devenv-acme-api-3f2a9c1e';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const PROJECT = composeProjectName('acme/api', ID);
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 const REPO = '/workspaces/api';
 const NONE: HostAccessReport = { hostAccess: [], unsupported: [] };
 
@@ -112,8 +115,8 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     // User decision 2026-09-28: changed expectation (it was refused as `… of another environment`), a name like
     // devenv-… is allowed; the pipeline refuses an image of the environments of another account by its ID
     // (otherAccountImageItems).
-    ['an image named like the image of an environment', 'db', { image: 'devenv-11111111:3' }, NONE],
-    ['an image named like the image of an environment on Docker Hub', 'db', { image: 'docker.io/library/devenv-11111111-app' }, NONE],
+    ['an image named like the image of an environment', 'db', { image: `${OTHER}:3` }, NONE],
+    ['an image named like the image of an environment on Docker Hub', 'db', { image: `docker.io/library/${OTHER}-app` }, NONE],
     // build
     ['a build context in the repository', 'db', { build: { context: REPO, dockerfile: 'docker/Dockerfile', args: { A: '1' }, target: 'dev', network: 'host', pull: true, no_cache: true, shm_size: '1g', extra_hosts: ['a:1.2.3.4'], platforms: ['linux/amd64'], ulimits: {}, isolation: 'default' } }, NONE],
     // Review round 5, S5-4: changed expectation, a remote build context is not supported yet.
@@ -135,7 +138,7 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['build secrets', 'db', { build: { context: REPO, secrets: ['npmrc'] } }, A('service db: build secrets')],
     ['build entitlements', 'db', { build: { context: REPO, entitlements: ['network.host'] } }, A('service db: build entitlements')],
     ['a privileged build', 'db', { build: { context: REPO, privileged: true } }, A('service db: build privileged')],
-    ['build tags', 'db', { build: { context: REPO, tags: ['devenv-11111111:1'] } }, U('service db: build tags')],
+    ['build tags', 'db', { build: { context: REPO, tags: [`${OTHER}:1`] } }, U('service db: build tags')],
     ['build cache_to', 'db', { build: { context: REPO, cache_to: ['type=local,dest=/x'] } }, U('service db: build cache_to')],
     ['an unknown build key', 'db', { build: { context: REPO, future: 1 } }, U('service db: build future')],
     ['cache_from of an image and a registry', 'db', { build: { context: REPO, cache_from: ['acme/cache:1', 'type=registry,ref=acme/cache'] } }, NONE],
@@ -186,8 +189,8 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['network_mode of a service of the configuration', 'app', { network_mode: 'service:db' }, NONE],
     ['network_mode of an unknown service', 'app', { network_mode: 'service:other' }, A('service app: network of another container (service:other)')],
     ['network_mode of the service itself', 'app', { network_mode: 'service:app' }, A('service app: network of another container (service:app)')],
-    ['network_mode of a container', 'app', { network_mode: 'container:devenv-acme-web-11111111' }, A('service app: network of another container (container:devenv-acme-web-11111111)')],
-    ['network_mode of another environment', 'db', { network_mode: 'devenv-11111111_default' }, A('service db: network devenv-11111111_default of another environment')],
+    ['network_mode of a container', 'app', { network_mode: `container:${OTHER}` }, A(`service app: network of another container (container:${OTHER})`)],
+    ['network_mode of another environment', 'db', { network_mode: `${OTHER}_default` }, A(`service db: network ${OTHER}_default of another environment`)],
     ['networks', 'db', { networks: { default: { aliases: ['database'], ipv4_address: '172.20.0.5' } } }, NONE],
     // volumes (D-6, D-11: details in compose.test.ts)
     // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
@@ -337,8 +340,8 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
     ['a volume with a label of another tool with the prefix devenv.', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, labels: { 'devenv.fingerprint': 'x' } } }), NONE],
     ['a volume with an unknown option', (m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, future: 1 } }), U('volume pgdata: future')],
     ['the key of the workspace volume', (m) => (m.volumes = { ...m.volumes, 'devenv-workspace': { name: `${PROJECT}_devenv-workspace` } }), U('volume key devenv-workspace (Dev Environments uses it)')],
-    ['a volume of the project of another environment', (m) => (m.volumes = { ...m.volumes, data: { name: 'devenv-11111111_pgdata', external: true } }), A('volume devenv-11111111_pgdata of another environment')],
-    ['the workspace volume of another environment', (m) => (m.volumes = { ...m.volumes, data: { name: 'devenv-acme-web-11111111', external: true } }), A('volume devenv-acme-web-11111111 of another environment')],
+    ['a volume of the project of another environment', (m) => (m.volumes = { ...m.volumes, data: { name: `${OTHER}_pgdata`, external: true } }), A(`volume ${OTHER}_pgdata of another environment`)],
+    ['the workspace volume of another environment', (m) => (m.volumes = { ...m.volumes, data: { name: OTHER, external: true } }), A(`volume ${OTHER} of another environment`)],
     ['the cache volume of the helper', (m) => (m.volumes = { ...m.volumes, data: { name: 'devenv-helper-cache', external: true } }), A('volume devenv-helper-cache of the workspace helper')],
     ['a volume of the Dev Containers extension', (m) => (m.volumes = { ...m.volumes, data: { name: 'vscode', external: true } }), A('volume vscode of the Dev Containers extension')],
     // networks
@@ -346,7 +349,7 @@ describe('composeAccessReport: the top level (rule table 4.1)', () => {
     ['an external network', (m) => (m.networks = { shared: { name: 'shared', external: true } }), NONE],
     ['a macvlan network', (m) => (m.networks = { lan: { driver: 'macvlan' } }), A('network lan: driver macvlan')],
     ['network driver options', (m) => (m.networks = { lan: { driver_opts: { parent: 'eth0' } } }), A('network lan: driver options')],
-    ['a network of another environment', (m) => (m.networks = { other: { name: 'devenv-11111111_default', external: true } }), A('network devenv-11111111_default of another environment')],
+    ['a network of another environment', (m) => (m.networks = { other: { name: `${OTHER}_default`, external: true } }), A(`network ${OTHER}_default of another environment`)],
     ['a network with a reserved label', (m) => (m.networks = { front: { labels: { 'com.docker.compose.network': 'x' } } }), U('network front: label com.docker.compose.network')],
     ['a network with a label of the extension', (m) => (m.networks = { front: { labels: { 'nimblescape.devenv.environment-id': 'x' } } }), U('network front: label nimblescape.devenv.environment-id')],
     ['a network with a label of another tool with the prefix devenv.', (m) => (m.networks = { front: { labels: { 'devenv.inputs': 'x' } } }), NONE],
@@ -445,7 +448,7 @@ describe('review round 5 of unit 6 (S5-4)', () => {
 
   it('refuses only the remote build context, not its dockerfile_inline', () => {
     const context = 'https://github.com/acme/tool.git';
-    const report = serviceReport('db', { build: { context, dockerfile_inline: 'FROM devenv-11111111:2' } }, { dockerfiles: { app: 'FROM alpine', db: 'FROM devenv-11111111:2' } });
+    const report = serviceReport('db', { build: { context, dockerfile_inline: `FROM ${OTHER}:2` } }, { dockerfiles: { app: 'FROM alpine', db: `FROM ${OTHER}:2` } });
     expect(report.unsupported).toEqual([REMOTE(context)]);
     // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image devenv-11111111:2 of another environment`.
     expect(report.hostAccess).toEqual([]);
@@ -458,7 +461,7 @@ describe('review round 5 of unit 6 (S5-4)', () => {
 describe('review round 6 of unit 6 (P6-1)', () => {
   const REMOTE = (context: string) => `service db: build context ${context} (a remote build context is not supported yet)`;
 
-  it.each(['github.com/acme/tool', 'github.com/acme/tool.git#main:docker', 'docker-image://devenv-11111111:2', 'oci-layout:///tmp/layout', 'target://base'])(
+  it.each(['github.com/acme/tool', 'github.com/acme/tool.git#main:docker', `docker-image://${OTHER}:2`, 'oci-layout:///tmp/layout', 'target://base'])(
     'refuses the build context %s, which Compose leaves as it is, as a remote build context (checks on and off)',
     (context) => {
       const services = { ...model().services, db: { build: { context } } };

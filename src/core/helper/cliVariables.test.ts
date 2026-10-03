@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { isDevContainersCloneVolumeName } from '../devContainers';
-import { ENVIRONMENT_VOLUME_PATTERN, HELPER_CACHE_VOLUME, environmentIdLabel } from '../names';
+import { HELPER_CACHE_VOLUME, composeProjectName, environmentIdLabel, isEnvironmentResourceName } from '../names';
 import {
   DEVCONTAINER_ID_PLACEHOLDER,
   HELPER_KNOWN_ENV,
@@ -247,7 +247,8 @@ describe('the placeholder of ${devcontainerId} (hotfix review 2, P6)', () => {
     expect(DEVCONTAINER_ID_PLACEHOLDER).toMatch(/^[0-9a-v]{52}$/);
     expect(cli.Q_(ID_LABELS)).toMatch(/^[0-9a-v]{52}$/);
     for (const name of [DEVCONTAINER_ID_PLACEHOLDER, `x-${DEVCONTAINER_ID_PLACEHOLDER}`, `devenv-x-${DEVCONTAINER_ID_PLACEHOLDER}`]) {
-      expect(ENVIRONMENT_VOLUME_PATTERN.test(name)).toBe(false);
+      // User decisions 2026-10-03: isEnvironmentResourceName replaces ENVIRONMENT_VOLUME_PATTERN.
+      expect(isEnvironmentResourceName(name)).toBe(false);
       expect(isDevContainersCloneVolumeName(name)).toBe(false);
       expect(name).not.toBe(HELPER_CACHE_VOLUME);
     }
@@ -451,11 +452,13 @@ describe('devcontainerIdOf: `${devcontainerId}` as Dev Container CLI 0.89.0 comp
 
 describe('helperCliVariables of a Docker Compose run (review round 18, D18-1)', () => {
   it('knows COMPOSE_PROJECT_NAME, which the pipeline passes to the CLI runs of Docker Compose, with its value', () => {
-    const variables = helperCliVariables('acme/api', { COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
-    expect(variables.env).toEqual({ HOME: '/root', COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e' });
-    expect(substituteCliVariables('source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume', variables)).toBe('source=cachedevenv-3f2a9c1e,target=/c,type=volume');
-    const { names } = composeMountVolumes('devenv-3f2a9c1e', [['source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume']], variables);
-    expect(names).toEqual(['devenv-3f2a9c1e_cachedevenv-3f2a9c1e']);
+    // User decisions 2026-10-03: the project is composeProjectName(repository, id) (before: devenv-<short id>).
+    const project = composeProjectName('acme/api', '3f2a9c1e-0000-4000-8000-000000000000');
+    const variables = helperCliVariables('acme/api', { COMPOSE_PROJECT_NAME: project });
+    expect(variables.env).toEqual({ HOME: '/root', COMPOSE_PROJECT_NAME: project });
+    expect(substituteCliVariables('source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume', variables)).toBe(`source=cache${project},target=/c,type=volume`);
+    const { names } = composeMountVolumes(project, [['source=cache${localEnv:COMPOSE_PROJECT_NAME},target=/c,type=volume']], variables);
+    expect(names).toEqual([`${project}_cache${project}`]);
   });
 
   it('a single container: COMPOSE_PROJECT_NAME is not set, and no variable of the helper process', () => {

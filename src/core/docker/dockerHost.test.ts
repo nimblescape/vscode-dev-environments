@@ -13,12 +13,13 @@ import {
   dockerTargetOf,
   environmentsOfHost,
   isOnDockerHost,
-  isOwnRemoteContext,
+  isOwnContextDescription,
   isRootlessEngine,
   isUsableSshAlias,
   parseContextInspect,
   parseSshAddress,
-  remoteContextName,
+  ownContextDescription,
+  remoteContextNames,
   rootlessSocketPath,
   sameDockerHost,
   sshCommandArgs,
@@ -26,6 +27,7 @@ import {
   sshTargetOf,
   RUNTIME_DIR_COMMAND,
 } from './dockerHost';
+import { namePair } from '../namePairs';
 
 describe('classifyDockerEndpoint (unit 7: SSH only for another computer)', () => {
   it.each([
@@ -84,18 +86,49 @@ describe('parseContextInspect', () => {
   });
 });
 
-describe('isOwnRemoteContext (the contexts of "Use a Remote Docker Host…")', () => {
-  it('is true only for the context of a host', () => {
-    expect(isOwnRemoteContext(remoteContextName('box'))).toBe(true);
-    expect(isOwnRemoteContext('devenv-remote-26f8567f')).toBe(true);
-    expect(isOwnRemoteContext(undefined)).toBe(false);
-    expect(isOwnRemoteContext('default')).toBe(false);
-    expect(isOwnRemoteContext('desktop-linux')).toBe(false);
-    expect(isOwnRemoteContext('devenv-remote-26F8567F')).toBe(false);
-    expect(isOwnRemoteContext('devenv-remote-26f8567')).toBe(false);
-    expect(isOwnRemoteContext('my-devenv-remote-26f8567f')).toBe(false);
-    // Greenfield, drop migration logic, user decision 2026-09-28: the bare prefix of earlier builds is not ours.
-    expect(isOwnRemoteContext('devenv-remote')).toBe(false);
+// User decisions 2026-10-03: the contexts are named after the SSH host and recognised as ours by their description
+// (replaces the tests of remoteContextName and isOwnRemoteContext).
+describe('remoteContextNames (the names of the context of a remote host)', () => {
+  it('takes an alias as it is, the pair of the host only for the second name', () => {
+    expect(remoteContextNames('htldvm')).toEqual(['htldvm', `htldvm-${namePair('htldvm')}`]);
+    expect(remoteContextNames('build_box.lan+1')).toEqual(['build_box.lan+1', `build_box.lan+1-${namePair('build_box.lan+1')}`]);
+  });
+
+  it('takes the host of an address, without the user and the port; the pair is of the whole address', () => {
+    expect(remoteContextNames('me@htldvm:2222')).toEqual(['htldvm', `htldvm-${namePair('me@htldvm:2222')}`]);
+    expect(remoteContextNames('me@htldvm')[0]).toBe('htldvm');
+    expect(remoteContextNames('htldvm:2222')[0]).toBe('htldvm');
+    // Same base name, different hosts: the second names differ.
+    expect(remoteContextNames('me@htldvm:2222')[1]).not.toBe(remoteContextNames('htldvm')[1]);
+  });
+
+  it('turns characters that Docker does not allow into "-"', () => {
+    const [name] = remoteContextNames('me@[fe80::1]:22');
+    expect(name).toMatch(/^[a-zA-Z0-9][a-zA-Z0-9_.+-]*$/);
+    expect(name).toBe('fe80-1');
+    expect(remoteContextNames('höst~name')[0]).toBe('h-st-name');
+    expect(remoteContextNames('-.box')[0]).toBe('box');
+  });
+
+  it("gives 'remote' for an empty name or the name 'default'", () => {
+    expect(remoteContextNames('default')).toEqual(['remote', `remote-${namePair('default')}`]);
+    expect(remoteContextNames('me@default')[0]).toBe('remote');
+    expect(remoteContextNames('')[0]).toBe('remote');
+    expect(remoteContextNames('~~~')[0]).toBe('remote');
+  });
+});
+
+describe('ownContextDescription and isOwnContextDescription (the contexts of "Use a Remote Docker Host…")', () => {
+  it('names the host in the description', () => {
+    expect(ownContextDescription('me@htldvm:2222')).toBe('Dev Environments: remote Docker host me@htldvm:2222');
+  });
+
+  it('is true only for a description that Dev Environments wrote, whatever the name of the context', () => {
+    expect(isOwnContextDescription(ownContextDescription('box'))).toBe(true);
+    expect(isOwnContextDescription(undefined)).toBe(false);
+    expect(isOwnContextDescription('')).toBe(false);
+    expect(isOwnContextDescription('Docker Desktop')).toBe(false);
+    expect(isOwnContextDescription('my box: Dev Environments: remote Docker host box')).toBe(false);
   });
 });
 

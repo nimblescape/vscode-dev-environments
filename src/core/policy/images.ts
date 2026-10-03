@@ -8,7 +8,7 @@
 // references (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, isEnvironmentResourceName, resourceName } from '../names';
+import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, isEnvironmentResourceName, resourceName } from '../names';
 import type { HostAccessFinding } from './report';
 import { isReservedLabel } from './rules';
 
@@ -205,13 +205,39 @@ export function imageInvalidReferenceItem(reference: string, what = 'image'): st
  * image that it builds (an image built for another project inherits them through FROM), and it sets its own on the
  * containers that it creates; the override configuration of a single container sets them empty
  * (COMPOSE_CLEARED_LABELS), so that such an image does not make `docker compose -p <project> down` remove the dev
- * container.
+ * container. `own`: the environment whose image it is; its own labels are allowed (isOwnImageLabel).
  */
-export function imageLabelItems(image: string, labels: Readonly<Record<string, string>>): string[] {
-  return Object.keys(labels)
-    .map((key) => key.trim())
-    .filter((key) => key !== 'devcontainer.metadata' && isReservedLabel(key))
-    .map((key) => `label ${key} of the image ${image}`);
+export function imageLabelItems(
+  image: string,
+  labels: Readonly<Record<string, string>>,
+  own?: { id: string; repository: string; ownerId: string },
+): string[] {
+  return Object.entries(labels)
+    .map(([key, value]) => [key.trim(), value] as const)
+    .filter(([key, value]) => key !== 'devcontainer.metadata' && isReservedLabel(key) && !isOwnImageLabel(key, value, own))
+    .map(([key]) => `label ${key} of the image ${image}`);
+}
+
+/**
+ * User decisions 2026-10-03: the labels that the extension gives the images of the environment `own` (imageRecordLabels
+ * of the environment image, and nimblescape.devenv.environment-id of the images that Compose builds for it), with the
+ * values of `own`; the build record with any value (the extension writes it after each build). A container created
+ * from such an image carries the same ID, repository, and owner as the environment.
+ */
+function isOwnImageLabel(key: string, value: string, own: { id: string; repository: string; ownerId: string } | undefined): boolean {
+  if (own === undefined) return false;
+  switch (key) {
+    case LABEL_ENVIRONMENT_ID:
+      return value === own.id;
+    case LABEL_REPOSITORY:
+      return value === own.repository;
+    case LABEL_OWNER_ID:
+      return value === own.ownerId;
+    case LABEL_BUILD_RECORD:
+      return true;
+    default:
+      return false;
+  }
 }
 
 /**

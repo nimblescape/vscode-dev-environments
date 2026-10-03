@@ -74,9 +74,11 @@ import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../policy';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const PROJECT = composeProjectName(ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
-const IMAGE_2 = environmentImageName(ENV_ID, 2);
+const PROJECT = composeProjectName(REPO, ENV_ID);
+/** The Compose project of the environment OTHER_ID of acme/web. */
+const OTHER_PROJECT = composeProjectName('acme/web', OTHER_ID);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
+const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
 const FOLDER = '/workspaces/api';
 const DB_IMAGE = 'postgres:16';
 const DB_DIGEST = `sha256:${'d'.repeat(64)}`;
@@ -398,7 +400,7 @@ describe('first open of a Docker Compose configuration', () => {
   });
 
   it('refuses a service image that is an image of an environment of another account, whatever the switch says (user decision 2026-09-28)', async () => {
-    const theirs = environmentImageName(OTHER_ID, 1);
+    const theirs = environmentImageName('acme/web', OTHER_ID, 1);
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false });
     h.docker.images.add(BASE_IMAGE);
     h.docker.images.add(DB_IMAGE);
@@ -1388,10 +1390,15 @@ describe('Delete of a Docker Compose environment', () => {
     h.docker.volumes.set(`${PROJECT}_cache`, volumeLabelsOf(VOLUME_KIND_COMPOSE));
     h.docker.volumes.set('shared-tools', volumeLabelsOf(VOLUME_KIND_ADDITIONAL));
     h.docker.networks.set(`${PROJECT}_default`, COMPOSE_LABELS);
-    h.docker.networks.set('devenv-7c1d2e3f_default', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
-    h.docker.images.add(`${PROJECT}-app`);
-    h.docker.images.add(`${PROJECT}-worker:latest`);
-    h.docker.images.add('devenv-7c1d2e3f-app');
+    // User decisions 2026-10-03: the project of another environment is named composeProjectName (no short ID).
+    h.docker.networks.set(`${OTHER_PROJECT}_default`, { 'com.docker.compose.project': OTHER_PROJECT });
+    // User decisions 2026-10-03: the images that Compose built for the environment carry its ID label (build.labels);
+    // listProjectImages keeps only those.
+    for (const built of [`${PROJECT}-app`, `${PROJECT}-worker:latest`]) {
+      h.docker.images.add(built);
+      h.docker.imageConfigs.set(built, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    }
+    h.docker.images.add(`${OTHER_PROJECT}-app`);
     // A one-off container of `docker compose run`: the label of the project, not the one of the environment.
     const oneOff = h.docker.addContainer({ environmentId: 'x', name: `${PROJECT}-db-run-1`, state: 'stopped', image: DB_IMAGE, labels: COMPOSE_LABELS });
     delete oneOff.labels[LABEL_ENVIRONMENT_ID];
@@ -1441,8 +1448,8 @@ describe('Delete of a Docker Compose environment', () => {
     // The data of the services and the other volumes stay; so does everything of another environment.
     expect(h.docker.volumes.has(`${PROJECT}_pgdata`)).toBe(true);
     expect(h.docker.volumes.has('shared-tools')).toBe(true);
-    expect(h.docker.networks.has('devenv-7c1d2e3f_default')).toBe(true);
-    expect(h.docker.images.has('devenv-7c1d2e3f-app')).toBe(true);
+    expect(h.docker.networks.has(`${OTHER_PROJECT}_default`)).toBe(true);
+    expect(h.docker.images.has(`${OTHER_PROJECT}-app`)).toBe(true);
     expect(await h.registry.list()).toEqual([]);
     // The containers go before the networks, which Docker removes only when no container uses them.
     expect(h.docker.log.indexOf(`network rm ${PROJECT}_default`)).toBeGreaterThan(h.docker.log.indexOf(`rm ${oneOff}`));
@@ -1483,6 +1490,8 @@ describe('a failed first open of a Docker Compose configuration', () => {
   it('removes the containers, the networks, and the images of the project', async () => {
     h.helper.onBuild = () => {
       h.docker.images.add(`${PROJECT}-app`);
+      // User decisions 2026-10-03: Compose builds it with the ID label of the environment (build.labels).
+      h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     };
     h.helper.composeProjectNameResult = 'api_devcontainer';
     await rejection(h.service.open(TARGET, options()));

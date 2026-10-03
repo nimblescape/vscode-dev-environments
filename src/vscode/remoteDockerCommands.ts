@@ -250,7 +250,9 @@ export class RemoteDockerCommands {
     if (!(await this.confirm('switchToRemote', RemoteDockerTexts.confirm(host), { detail: RemoteDockerTexts.confirmDetail }, button))) return false;
     const current = await this.deps.targets.resolve();
     // The context to go back to; not one of ours (a switch from one remote host to another keeps the first one).
-    if (current.context !== undefined && !(await isOwnContext(this.deps.docker, current.context))) {
+    // User decisions 2026-10-03: also not a context of the user that points to a remote host (one that this switch may
+    // take for its host): only a context of the local Docker is one to go back to.
+    if (current.context !== undefined && current.kind === 'local' && !(await isOwnContext(this.deps.docker, current.context))) {
       await this.deps.state.setPreviousContext(current.context);
     }
     const name = await useRemoteContext(this.deps.docker, host);

@@ -391,7 +391,7 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
         h.helper.composeOutput = {
           version: '2.40.3',
           dollarEscaped: true,
-          model: { name: composeProjectName(ENV_ID), services: { app: { image: BASE_IMAGE, command: ['sleep', 'infinity'] } } },
+          model: { name: composeProjectName(REPO, ENV_ID), services: { app: { image: BASE_IMAGE, command: ['sleep', 'infinity'] } } },
           dockerfiles: {},
           realPaths: {},
           inputsHash: 'inputs-1',

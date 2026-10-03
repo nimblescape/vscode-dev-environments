@@ -44,8 +44,8 @@ import { GITHUB_CLI_ACCOUNT_REASON, hostAccessProblems, runArgsProblems } from '
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
-const IMAGE_2 = environmentImageName(ENV_ID, 2);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
+const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
 const UNRESTRICTED_LABELS = { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED };
 const PRIVILEGED_WITH_SOCKET = {
   image: BASE_IMAGE,
@@ -353,7 +353,7 @@ describe('a refused update and the switch (concept 7.7)', () => {
     h.docker.containersOf(ENV_ID)[0].state = 'stopped';
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.builds).toHaveLength(2);
-    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(ENV_ID, 3));
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(REPO, ENV_ID, 3));
     expect(await refusedUpdate()).toBeUndefined();
     expect(h.docker.containersOf(ENV_ID)[0].labels[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
   });

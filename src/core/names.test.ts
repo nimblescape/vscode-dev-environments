@@ -5,7 +5,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { EXTENSION_LABEL_KEYS, LABEL_PREFIX } from './names';
+import { namePair } from './namePairs';
+import {
+  EXTENSION_LABEL_KEYS,
+  LABEL_PREFIX,
+  composeProjectName,
+  environmentImageName,
+  environmentImageRepository,
+  isEnvironmentResourceName,
+  resourceName,
+} from './names';
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -68,6 +77,8 @@ describe('EXTENSION_LABEL_KEYS', () => {
     expect([...EXTENSION_LABEL_KEYS].map((key) => key.slice(LABEL_PREFIX.length)).sort()).toEqual([
       // Changed expectation (review round 4 of PR #64, R4-2/R4-3): the build label of ContainerAdapter.buildImage.
       'build-id',
+      // User decisions 2026-10-03: the build record on the environment image (ContainerAdapter.labelImage).
+      'build-record',
       // Review round 1 of the helper channel (S1): the label of the containers that a cancel of an operation removes.
       'channel-step',
       'compose-service',
@@ -97,5 +108,92 @@ describe('EXTENSION_LABEL_KEYS', () => {
     expect(found.filter(({ file }) => !file.endsWith('.test.ts'))).toEqual([]);
     expect(found.filter(({ key }) => !FOREIGN_TEST_LABELS.has(key))).toEqual([]);
     expect(found.some(({ key }) => key === 'devenv.fingerprint')).toBe(true);
+  });
+});
+
+// User decisions 2026-10-03: one name for every resource of an environment, devenv-<owner>-<repo>-<adjective>-<scientist>.
+describe('resourceName', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+
+  it('is devenv-<owner>-<repository>-<pair of the environment ID>', () => {
+    expect(resourceName('acme/api', ID)).toBe(`devenv-acme-api-${namePair(ID)}`);
+    expect(resourceName('acme/api', ID)).toMatch(/^devenv-acme-api-[a-z]+-[a-z]+$/);
+  });
+
+  it('is the same for the same ID and differs by the ID and the repository', () => {
+    expect(resourceName('acme/api', ID)).toBe(resourceName('acme/api', ID));
+    expect(resourceName('acme/web', ID)).not.toBe(resourceName('acme/api', ID));
+    expect(resourceName('acme/api', '22222222-2222-4222-8222-222222222222')).toBe('devenv-acme-api-noble-berners');
+  });
+
+  it('is in lower case, each run of other characters than [a-z0-9] one -', () => {
+    expect(resourceName('Acme/My.Repo_Name', ID)).toBe(`devenv-acme-my-repo-name-${namePair(ID)}`);
+    expect(resourceName('o/name-with--dashes---', ID)).toBe(`devenv-o-name-with-dashes-${namePair(ID)}`);
+    expect(resourceName('-x/._y', ID)).toBe(`devenv-x-y-${namePair(ID)}`);
+  });
+
+  it('has at most 63 characters: a long owner and repository are shortened, the pair is kept', () => {
+    const name = resourceName(`${'a'.repeat(40)}/${'b'.repeat(40)}`, ID);
+    expect(name.length).toBeLessThanOrEqual(63);
+    expect(name.startsWith(`devenv-${'a'.repeat(20)}`)).toBe(true);
+    expect(name.endsWith(`-${namePair(ID)}`)).toBe(true);
+    expect(isEnvironmentResourceName(name)).toBe(true);
+    // A cut that ends in a separator drops it.
+    const dashed = resourceName(`${'a'.repeat(30)}/${'-b'.repeat(30)}`, ID);
+    expect(dashed.length).toBeLessThanOrEqual(63);
+    expect(dashed).not.toMatch(/--/);
+    expect(dashed.endsWith(`-${namePair(ID)}`)).toBe(true);
+    expect(isEnvironmentResourceName(dashed)).toBe(true);
+  });
+
+  it('refuses a repository without owner or name', () => {
+    expect(() => resourceName('api', ID)).toThrow();
+    expect(() => resourceName('acme/', ID)).toThrow();
+  });
+});
+
+describe('isEnvironmentResourceName', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+
+  it.each(['acme/api', 'Acme/My.Repo_Name', 'a/b', 'devenv/x', `${'a'.repeat(40)}/${'b'.repeat(40)}`])('takes the name of an environment of %s', (repository) => {
+    expect(isEnvironmentResourceName(resourceName(repository, ID))).toBe(true);
+  });
+
+  it.each([
+    'devenv-tools-node_modules',
+    'devenv-tools',
+    'devenv-cache',
+    'devenv-helper-cache',
+    'devenv-acme-api',
+    'devenv-acme-api-3f2a9c1e',
+    'devenv-acme-api-tidy',
+    'devenv-acme-api-tidy-nobody',
+    'devenv-acme-api-nobody-berners',
+    'devenv-acme-api-tidy-berners_data',
+    'acme-api-tidy-berners',
+    'x-devenv-acme-api-tidy-berners',
+    '',
+  ])('does not take %j for one', (name) => {
+    expect(isEnvironmentResourceName(name)).toBe(false);
+  });
+
+  it('ignores the case', () => {
+    expect(isEnvironmentResourceName('DEVENV-ACME-API-TIDY-BERNERS')).toBe(true);
+    expect(isEnvironmentResourceName(resourceName('acme/api', ID).toUpperCase())).toBe(true);
+  });
+});
+
+describe('the names derived from resourceName', () => {
+  const ID = '11111111-2222-4333-8444-555555555555';
+
+  it('the Compose project and the repository of the environment image are resourceName', () => {
+    expect(composeProjectName('acme/api', ID)).toBe(resourceName('acme/api', ID));
+    expect(environmentImageRepository('acme/api', ID)).toBe(resourceName('acme/api', ID));
+    expect(composeProjectName('Acme/My.Repo', ID)).toBe(resourceName('Acme/My.Repo', ID));
+  });
+
+  it('the environment image is <resourceName>:<build number>', () => {
+    expect(environmentImageName('acme/api', ID, 3)).toBe(`${resourceName('acme/api', ID)}:3`);
+    expect(environmentImageName('acme/api', ID, 1)).toBe('devenv-acme-api-tidy-berners:1');
   });
 });

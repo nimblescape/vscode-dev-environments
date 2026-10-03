@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { dockerTargetOf, remoteContextName, LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
+import { dockerTargetOf, remoteContextNames, LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { abortError, silentLogger, type Logger, type StartedProcess } from '../ports';
 import { UserFacingError } from '../errors';
@@ -23,7 +23,8 @@ import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
 import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, LOCK_BUSY_CODE, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
 import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+// User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
+const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 /** Plan step 5, PR A: the engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 const directEngine = async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false });
@@ -112,7 +113,8 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     expect(b).toBe(channel);
     expect(await channels.get(REMOTE)).toBe(channel);
     expect(open).toHaveBeenCalledTimes(1);
-    const other = dockerTargetOf('ssh://other-box', remoteContextName('other-box'));
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    const other = dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]);
     await channels.get(other);
     expect(open).toHaveBeenCalledTimes(2);
     channels.dispose();
@@ -305,7 +307,8 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
       .mockImplementationOnce(() => new Promise((resolve) => (finishOpen = resolve)));
     const channels = new HelperChannels({ open, logger: silentLogger });
     await channels.get(REMOTE);
-    const pending = channels.get(dockerTargetOf('ssh://other-box', remoteContextName('other-box')));
+    // User decisions 2026-10-03: the context named after the host (remoteContextNames; before: remoteContextName).
+    const pending = channels.get(dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]));
     channels.dispose();
     expect(open1.closed).toBe(1);
     finishOpen(open2 as unknown as HelperChannel);

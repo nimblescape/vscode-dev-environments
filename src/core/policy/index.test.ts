@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ComposeModel } from '../helper/compose';
 import { runAnalysisJob } from '../helper/configurationAnalysis';
-import { COMPOSE_CLEARED_LABELS } from '../names';
+import { COMPOSE_CLEARED_LABELS, composeProjectName, resourceName } from '../names';
 import {
   checkContainer,
   composeAccessReport,
@@ -18,8 +18,10 @@ import {
   type HostAccessInput,
 } from '.';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
-const PROJECT = 'devenv-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+const PROJECT = composeProjectName('acme/api', ID);
 
 /** A configuration with an item of each class: `computer` (privileged mode), `protected`, and `unsupported`. */
 const CONFIG: HostAccessInput = {

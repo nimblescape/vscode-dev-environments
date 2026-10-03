@@ -529,6 +529,11 @@ const VOLUME_REMOVE_DELAY_MS = 1_000;
 // About 15,000 pairs (namePair): an ID whose pair is in use on the engine is rare; a few attempts are enough.
 const ENVIRONMENT_ID_ATTEMPTS = 20;
 
+/** User decisions 2026-10-03: the values of the labels that the extension gives the images of `env` (imageLabelItems). */
+function ownImageLabels(env: Environment): { id: string; repository: string; ownerId: string } {
+  return { id: env.id, repository: env.repository, ownerId: env.owner.id };
+}
+
 /** devcontainer.json and its Dockerfile, read from the volume. */
 type ConfigFiles = NonNullable<Awaited<ReturnType<EnvironmentHelper['readConfigFiles']>>>;
 
@@ -4703,7 +4708,7 @@ export class EnvironmentService {
         // Not here yet: Compose pulls it in the workspace helper (a limit, implementation notes section 15).
         continue;
       }
-      items.push(...imageLabelItems(reference, labels));
+      items.push(...imageLabelItems(reference, labels, ownImageLabels(ctx.env)));
     }
     return items;
   }
@@ -5043,7 +5048,7 @@ export class EnvironmentService {
   ): Promise<string[]> {
     // Review round 15 (K1, K2): for Docker Compose, the `mounts` of the metadata also as the CLI writes them (composeMounts).
     const checked = await this.hostAccessInput(ctx.env, { metadata, ...(composeMounts ? { composeMounts: true } : {}) });
-    const report = addRefusedItems(await this.check(ctx, 'imageMetadata', checked, checks), 'hostAccess', [...imageLabelItems(image, labels), ...moreItems]);
+    const report = addRefusedItems(await this.check(ctx, 'imageMetadata', checked, checks), 'hostAccess', [...imageLabelItems(image, labels, ownImageLabels(ctx.env)), ...moreItems]);
     if (!isRefused(report)) return mountedVolumeNames(checked);
     this.logger.warn(`The environment image ${image} of ${ctx.env.repository} is refused by the host access policy: ${describeRefusal(report)}`);
     throw new HostAccessError(report);

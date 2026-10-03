@@ -48,7 +48,19 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, runInVolume } from './harness';
+import {
+  DUMMY_TOKEN,
+  FakeUi,
+  HELPER_DOCKERFILE,
+  RecordingProgress,
+  TEST_ACCOUNT,
+  dockerTestContext,
+  expectLabelledEnvironmentImage,
+  fakeAuth,
+  registryClient,
+  registryTransport,
+  runInVolume,
+} from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { workerLocks } from './workerLocks';
 
@@ -124,11 +136,14 @@ describe('open pipeline for a Docker Compose configuration', () => {
     windowStatuses: () => sessionFiles.readWindowStatuses(),
   });
 
-  /** A seeded environment: its workspace volume with the repository, and its registry entry. */
+  /**
+   * A seeded environment: its workspace volume with the repository, and its registry entry.
+   * User decisions 2026-10-03: the project and the environment image are named after the repository too (resourceName).
+   */
   function environment(repository: string) {
     const id = newEnvironmentId();
     const name = resourceName(repository, id);
-    return { repository, id, name, project: composeProjectName(id), folder: `/workspaces/${repository.split('/')[1]}` };
+    return { repository, id, name, project: composeProjectName(repository, id), folder: `/workspaces/${repository.split('/')[1]}` };
   }
   const app = environment('devenv-test/tiny-compose');
   const refused = environment('devenv-test/refused-compose');
@@ -232,7 +247,7 @@ ${extra}volumes:
       for (const name of cli.lines(['volume', 'ls', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${target.id}`])) {
         if (name !== target.name) cli.run(['volume', 'rm', name]);
       }
-      for (const image of cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(target.id)}*`])) cli.run(['image', 'rm', '-f', image]);
+      for (const image of cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(target.repository, target.id)}*`])) cli.run(['image', 'rm', '-f', image]);
     }
   }
 
@@ -272,7 +287,7 @@ ${extra}volumes:
     expect(error?.code).toBe('hostAccess');
     expect(error?.message).toBe(Messages.hostAccess('service db: privileged mode'));
     expect(containers(refused)).toEqual([]);
-    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(refused.id)}*`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(refused.repository, refused.id)}*`])).toEqual([]);
     expect(cli.volume(refused.name)).toBeDefined();
     expect(cli.volume(`${refused.project}_dbdata`)).toBeUndefined();
   });
@@ -291,7 +306,7 @@ ${extra}volumes:
     expect(error?.code).toBe('hostAccess');
     expect(error?.message).toContain(`mount ${JSON.stringify(TMPFS_SOURCE_MOUNT)} is written differently by the Dev Container CLI and is not supported`);
     expect(containers(tmpfsSource)).toEqual([]);
-    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(tmpfsSource.id)}*`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(tmpfsSource.repository, tmpfsSource.id)}*`])).toEqual([]);
   });
 
   it('first open: both services run with the labels, the port on 127.0.0.1, and repository files from the volume', async () => {
@@ -312,7 +327,7 @@ ${extra}volumes:
     // The dev container: the name of the environment, the labels, the project, the environment image, the workspace volume.
     const dev = cli.container(app.name);
     expect(dev?.State.Running).toBe(true);
-    expect(dev?.Config.Image).toBe(`${environmentImageRepository(app.id)}:1`);
+    expect(dev?.Config.Image).toBe(`${environmentImageRepository(app.repository, app.id)}:1`);
     expect(dev?.Config.Labels).toMatchObject({
       [LABEL_ENVIRONMENT_ID]: app.id,
       'nimblescape.devenv.container-version': String(CONTAINER_VERSION),
@@ -388,9 +403,19 @@ ${extra}volumes:
 
     const entry = await registry.get(app.id);
     expect(entry?.buildRecord).toMatchObject({
-      environmentImage: `${environmentImageRepository(app.id)}:1`,
+      environmentImage: `${environmentImageRepository(app.repository, app.id)}:1`,
       compose: { service: 'app', images: [`${app.project}-app`] },
     });
+    // User decisions 2026-10-03: the Compose project, the dev container, and the workspace volume have one name.
+    expect(app.project).toBe(app.name);
+    // User decisions 2026-10-03: the environment image carries the labels of the environment and its build record (the
+    // record pins its ID); the image that Compose built for the service and the networks of the project carry the
+    // environment ID (rewriteModel).
+    expectLabelledEnvironmentImage(cli, entry);
+    expect(cli.image(`${app.project}-app`)?.Config.Labels?.[LABEL_ENVIRONMENT_ID]).toBe(app.id);
+    const networks = cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]);
+    expect(networks.length).toBeGreaterThan(0);
+    for (const network of networks) expect(cli.ok(['network', 'inspect', '-f', `{{index .Labels "${LABEL_ENVIRONMENT_ID}"}}`, network])).toBe(app.id);
     // Review round 10, F1/F3 (was D9-1): the paths that other services mount are on the entry, not the build record, and
     // read-only mounts are not recorded: db mounts seed and init.sql read-only, so neither is left out of the ownership fixes.
     expect(entry?.buildRecord?.compose).not.toHaveProperty('serviceFolders');
@@ -424,7 +449,7 @@ ${extra}volumes:
     expect(containers(app).sort()).toEqual(before);
     expect(cli.container(app.name)?.State.Running).toBe(true);
     expect(cli.container(dbContainer())?.State.Running).toBe(true);
-    expect(cli.lines(['image', 'ls', '--format', '{{.Tag}}', environmentImageRepository(app.id)])).toEqual(['1']);
+    expect(cli.lines(['image', 'ls', '--format', '{{.Tag}}', environmentImageRepository(app.repository, app.id)])).toEqual(['1']);
     expect((await registry.get(app.id))?.buildRecord?.buildNumber).toBe(1);
     // Lifecycle token (user decision 2026-09-27): run-user-commands after the start does not run postCreateCommand again.
     expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
@@ -462,7 +487,7 @@ ${extra}volumes:
     expect(cli.container(oneOff)).toBeUndefined();
     expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`])).toEqual([]);
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`])).toEqual([]);
-    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(app.id)}:*`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(app.repository, app.id)}:*`])).toEqual([]);
     expect(cli.volume(app.name)).toBeUndefined();
     // Ticked: removed. Not ticked: the data of the database stays.
     expect(cli.volume(`${app.project}_cache`)).toBeUndefined();

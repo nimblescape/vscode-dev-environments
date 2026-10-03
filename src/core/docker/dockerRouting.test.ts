@@ -9,12 +9,13 @@ import { Messages } from '../messages';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { ContainerAdapter, type DockerRouter } from './containerAdapter';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextName, type DockerTarget } from './dockerHost';
+import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from './dockerHost';
 import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { runWithDockerTarget } from './dockerTargets';
 import { runPreparingWorker } from './workerPreparation';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName('build-box'));
+// User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
+const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 
 interface Call {
   args: string[];
@@ -283,6 +284,9 @@ describe('the classification of every Docker call of ContainerAdapter (plan step
       },
       buildImage: (d) => d.buildImage({ tag: 't', dockerfile: 'D', context: '.', onOutput: () => {} }),
       imageLabels: (d) => d.imageLabels('i'),
+      // User decisions 2026-10-03: the labels of the environment images (`image inspect`, and `build` with its input).
+      imageLabelsOf: (d) => d.imageLabelsOf(['i', 'j']),
+      labelImage: (d) => d.labelImage('i', { a: 'b' }),
     };
     const members = Object.getOwnPropertyNames(ContainerAdapter.prototype);
     const unknown = members.filter((name) => !NO_OWN_CALL.has(name) && !(name in exercised));

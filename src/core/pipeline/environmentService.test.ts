@@ -90,8 +90,8 @@ const TARGET: RepositoryTarget = {
   trusted: true,
 };
 
-const IMAGE_1 = environmentImageName(ENV_ID, 1);
-const IMAGE_2 = environmentImageName(ENV_ID, 2);
+const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
+const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
 const NAME = resourceName(REPO, ENV_ID);
 
 let h: Harness;
@@ -160,7 +160,7 @@ describe('open: first open', () => {
     expect(env!.owner).toEqual(ACCOUNT);
     expect(h.helper.clones).toEqual([{ volumeName: name, repository: REPO, branch: 'main', token: TOKEN }]);
     expect(h.docker.log).toContain(`pull ${BASE_IMAGE}`);
-    const image = environmentImageName(id, 1);
+    const image = environmentImageName(REPO, id, 1);
     expect(h.helper.calls).toContain(`build ${image}`);
     expect(h.helper.calls).toContain(`up ${image}`);
     expect(h.helper.ups[0].override).toMatchObject({
@@ -392,7 +392,7 @@ describe('open: first open', () => {
     expect(h.docker.runs).toHaveLength(1);
     expect(runsAtUp).toBe(1);
     const run = h.docker.runs[0];
-    expect(run.image).toBe(environmentImageName(env.id, 1));
+    expect(run.image).toBe(environmentImageName(REPO, env.id, 1));
     expect(run.all).toEqual(
       expect.arrayContaining(['--rm', '--user', 'root', '--network', 'none', '--entrypoint', 'sh', `type=volume,source=${env.volumeName},target=/workspaces`]),
     );
@@ -921,7 +921,7 @@ describe('open: existing environment', () => {
       id: OTHER_ID,
       repository: 'acme/web',
       container: null,
-      record: { images: { [BASE_IMAGE]: DIGEST_OLD }, environmentImage: environmentImageName(OTHER_ID, 1) },
+      record: { images: { [BASE_IMAGE]: DIGEST_OLD }, environmentImage: environmentImageName('acme/web', OTHER_ID, 1) },
     });
     await h.service.open(TARGET, options());
     expect(h.docker.log.filter((l) => l.includes(`@${DIGEST_OLD}`))).toEqual([]);
@@ -1227,15 +1227,15 @@ describe('open: existing environment', () => {
   });
 
   it('increments the build number past the registry and the local tags', async () => {
-    await seedEnvironment(h, { record: { buildNumber: 2, environmentImage: environmentImageName(ENV_ID, 2) }, extra: { lastBuildNumber: 5 } });
-    h.docker.images.add(environmentImageName(ENV_ID, 7));
+    await seedEnvironment(h, { record: { buildNumber: 2, environmentImage: environmentImageName(REPO, ENV_ID, 2) }, extra: { lastBuildNumber: 5 } });
+    h.docker.images.add(environmentImageName(REPO, ENV_ID, 7));
     await h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
-    const image8 = environmentImageName(ENV_ID, 8);
+    const image8 = environmentImageName(REPO, ENV_ID, 8);
     expect(h.helper.calls).toContain(`build ${image8}`);
     const env = await entry();
     expect(env?.buildRecord?.buildNumber).toBe(8);
     expect(env?.lastBuildNumber).toBe(8);
-    expect(await h.docker.listImageTags(environmentImageRepository(ENV_ID))).toEqual([image8]);
+    expect(await h.docker.listImageTags(environmentImageRepository(REPO, ENV_ID))).toEqual([image8]);
   });
 
   it('switches the configuration and rebuilds', async () => {
@@ -3541,8 +3541,8 @@ describe('open: registry lost', () => {
     expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
     expect(h.helper.clones).toEqual([]);
     // Without a build record, the environment is built again (concept 7.5).
-    expect(h.helper.calls).toContain(`build ${environmentImageName(OTHER_ID, 1)}`);
-    expect((await h.registry.get(OTHER_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(OTHER_ID, 1));
+    expect(h.helper.calls).toContain(`build ${environmentImageName(REPO, OTHER_ID, 1)}`);
+    expect((await h.registry.get(OTHER_ID))?.buildRecord?.environmentImage).toBe(environmentImageName(REPO, OTHER_ID, 1));
   });
 
   it('uses the labeled volume of the repository when registry.json is invalid', async () => {
@@ -3624,7 +3624,7 @@ describe('open: failed lifecycle command', () => {
     h.helper.lifecycleFailure = () => POST_CREATE_FAILED;
     const result = await h.service.open(TARGET, options());
     const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
-    const image = environmentImageName(env.id, 1);
+    const image = environmentImageName(REPO, env.id, 1);
     expect(result.environment.id).toBe(env.id);
     expect(env.buildRecord?.environmentImage).toBe(image);
     expect(h.docker.volumes.has(env.volumeName)).toBe(true);
@@ -3818,7 +3818,7 @@ describe('delete', () => {
       container: null,
       extra: { additionalVolumes: ['shared-cache'] },
     });
-    h.docker.images.add(environmentImageName(ENV_ID, 3));
+    h.docker.images.add(environmentImageName(REPO, ENV_ID, 3));
     h.docker.volumes.set('api-data', additionalVolumeLabels());
     h.docker.volumes.set('shared-cache', additionalVolumeLabels());
     await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
@@ -3833,7 +3833,7 @@ describe('delete', () => {
 
     expect(h.docker.containersOf(ENV_ID)).toEqual([]);
     expect(h.docker.images.has(IMAGE_1)).toBe(false);
-    expect(h.docker.images.has(environmentImageName(ENV_ID, 3))).toBe(false);
+    expect(h.docker.images.has(environmentImageName(REPO, ENV_ID, 3))).toBe(false);
     expect(h.docker.log).toContain(`rmi mcr.microsoft.com/devcontainers/base@${DIGEST_OLD}`);
     expect(h.docker.volumes.has(NAME)).toBe(false);
     expect(h.docker.volumes.has('api-data')).toBe(false);
@@ -3845,7 +3845,7 @@ describe('delete', () => {
     expect(fs.existsSync(h.paths.disconnectFile(ENV_ID))).toBe(false);
     expect(fs.existsSync(h.paths.disconnectFile(OTHER_ID))).toBe(true);
     // The other environment keeps its image.
-    expect(h.docker.images.has(environmentImageName(OTHER_ID, 1))).toBe(true);
+    expect(h.docker.images.has(environmentImageName('acme/web', OTHER_ID, 1))).toBe(true);
   });
 
   it('removes only the confirmed additional volumes, and keeps a volume that another program created under a recorded name', async () => {
@@ -3934,7 +3934,7 @@ describe('delete', () => {
 
   it('keeps a base image that another environment uses', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
-    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', record: { images: { [BASE_IMAGE]: DIGEST_OLD }, environmentImage: environmentImageName(OTHER_ID, 1) } });
+    await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', record: { images: { [BASE_IMAGE]: DIGEST_OLD }, environmentImage: environmentImageName('acme/web', OTHER_ID, 1) } });
     await h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }));
     expect(h.docker.log.filter((l) => l.includes(DIGEST_OLD))).toEqual([]);
   });
@@ -4349,7 +4349,7 @@ describe('reconcileFromVolumes', () => {
     // Mounted by another container only: never the environment's.
     h.docker.volumes.set('x-only', {});
     for (const volumes of [[name, 'api-node_modules', anonymous, 'api-history'], [name, 'api-node_modules', 'shop_db', 'x-cache', 'api-history']]) {
-      const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+      const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(REPO, OTHER_ID, 1) });
       h.docker.containers.set(container.id, { ...container, volumes });
     }
     const other = h.docker.addContainer({ environmentId: 'f0000001-0000-4000-8000-000000000001', name: 'x', state: 'stopped', image: 'x' });
@@ -4367,7 +4367,7 @@ describe('reconcileFromVolumes', () => {
     const restored = (id: string, repository: string, owner: GitHubAccount): string => {
       const name = resourceName(repository, id);
       h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: owner.id });
-      const container = h.docker.addContainer({ environmentId: id, name, state: 'stopped', image: environmentImageName(id, 1) });
+      const container = h.docker.addContainer({ environmentId: id, name, state: 'stopped', image: environmentImageName(repository, id, 1) });
       h.docker.containers.set(container.id, { ...container, volumes: [name, 'web-node_modules'] });
       return name;
     };
@@ -4390,7 +4390,7 @@ describe('reconcileFromVolumes', () => {
     const name = resourceName(REPO, OTHER_ID);
     const anonymous = 'cd'.repeat(32);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
-    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(REPO, OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, anonymous] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toBeUndefined();
@@ -4401,7 +4401,7 @@ describe('reconcileFromVolumes', () => {
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, ACCOUNT));
     const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-session-monitor', 'devenv-acme-web-12345678'];
-    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(OTHER_ID, 1) });
+    const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(REPO, OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(OTHER_ID))?.additionalVolumes).toEqual(['api-node_modules']);
@@ -5007,7 +5007,7 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     // User decision 2026-09-28: changed setup and item (it was refused by the name devenv-…, as `image
     // docker.io/library/devenv-7c1d2e3f:2 of another environment`): the image of an environment of another account, by
     // its ID.
-    const theirs = environmentImageName(OTHER_ID, 2);
+    const theirs = environmentImageName('acme/web', OTHER_ID, 2);
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false, record: { environmentImage: theirs, buildNumber: 2 } });
     h.docker.images.add('docker.io/library/devenv-7c1d2e3f:2');
     h.docker.imageIds.set(theirs, `sha256:${'e'.repeat(64)}`);
@@ -5456,7 +5456,7 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.builds).toHaveLength(3);
       const record = (await entry())?.buildRecord;
-      expect(record?.environmentImage).toBe(environmentImageName(ENV_ID, 4));
+      expect(record?.environmentImage).toBe(environmentImageName(REPO, ENV_ID, 4));
       expect(await refusedUpdate()).toBeUndefined();
     });
 
