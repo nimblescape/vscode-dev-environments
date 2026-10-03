@@ -243,4 +243,67 @@ describe('requests of an operation to the extension, in the script (plan step 11
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(2)).toMatchObject({ ok: true, value: 'invalid' });
   });
+
+  // Review round 1 of plan step 11A (A-R1-1, A-R1-4): masked value by value, so a secret with `"` or `\` is masked too,
+  // and a secret that looks like JSON cannot break the payload.
+  it('masks a secret with quotes and backslashes in the payload and its keys, and a JSON-like secret breaks nothing', async () => {
+    const secret = 'pa"ss\\word';
+    const { send, asksOf } = setup({
+      asking: async (_params, context) => context.ask('local', { text: `x ${secret} y`, [secret]: 1, list: [secret], n: 123456 }),
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null, secrets: { registry: secret, other: '2345' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asksOf(1)[0].payload).toEqual({ text: 'x *** y', '***': 1, list: ['***'], n: 123456 });
+    expect(JSON.stringify(asksOf(1))).not.toContain('pa\\"ss');
+  });
+
+  // Review round 1 of plan step 11A (A-R1-2): an answer that gives a name a new value keeps the old value masked.
+  it('keeps masking the old value when an answer redefines a secret name', async () => {
+    const { send, of } = setup({
+      asking: async (_params, context) => {
+        await context.ask('secret', null);
+        context.log('old oldtoken1 new newtoken1');
+        return 'done';
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null, secrets: { token: 'oldtoken1' } });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null, secrets: { token: 'newtoken1' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(of(1).find((message) => message.t === 'log')).toMatchObject({ text: 'old *** new ***' });
+  });
+
+  // Review round 1 of plan step 11A (pre-existing gap): the value of a result is masked too.
+  it('masks the secrets in the value of a result, and fails a result that cannot be sent', async () => {
+    const { send, resultOf } = setup({
+      echo: async (_params, context) => ({ said: `token ${context.secrets.token}` }),
+      cyclic: async () => {
+        const value: Record<string, unknown> = {};
+        value.self = value;
+        return value;
+      },
+    });
+    send({ t: 'op', id: 1, op: 'echo', params: null, secrets: { token: 'tok-1234' } });
+    send({ t: 'op', id: 2, op: 'cyclic', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toEqual({ t: 'result', id: 1, ok: true, value: { said: 'token ***' } });
+    expect(resultOf(2)).toMatchObject({ ok: false, error: { code: 'invalid' } });
+  });
+
+  it('refuses a request whose payload cannot be sent (a cycle, a BigInt)', async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const { send, resultOf } = setup({
+      asking: async (_params, context) => {
+        const codes: string[] = [];
+        for (const payload of [cyclic, { n: BigInt(1) }]) {
+          await context.ask('local', payload).catch((error: unknown) => codes.push((error as OperationError).code));
+        }
+        return codes;
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: ['invalid', 'invalid'] });
+  });
 });

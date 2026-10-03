@@ -1059,4 +1059,50 @@ describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
     await expect(channel.operation('open', {}, { secrets: { 'Bad-Name': 'abcd' } })).rejects.toMatchObject({ code: 'unsendable' });
     await expect(channel.operation('open', {}, { secrets: { token: 'ab' } })).rejects.toMatchObject({ code: 'unsendable' });
   });
+
+  // Review round 1 of plan step 11A (A-R1-3, A-R1-5, A-R1-7).
+  it('answers `invalid` for a value it cannot encode, `tooLarge` beyond the channel, `failed` for a handler that throws at once', async () => {
+    const { channel, fake } = await openChannel();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: ((): never | Promise<{ value: unknown }> => {
+        call++;
+        if (call === 1) return Promise.resolve({ value: cyclic });
+        if (call === 2) return Promise.resolve({ value: 'x'.repeat(300 * 1024) });
+        throw new Error('at once');
+      }) as never,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    for (const ask of [1, 2, 3]) fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code)).sort()).toEqual(['failed', 'invalid', 'tooLarge']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('aborts the handler of an open request at the cancel, before the script confirms it', async () => {
+    const { channel, fake } = await openChannel();
+    const controller = new AbortController();
+    let handlerSignal: AbortSignal | undefined;
+    const running = channel
+      .operation('open', {}, {
+        signal: controller.signal,
+        onAsk: (_kind, _payload, signal) => {
+          handlerSignal = signal;
+          return new Promise(() => {});
+        },
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    expect(handlerSignal?.aborted).toBe(true);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await running;
+  });
 });

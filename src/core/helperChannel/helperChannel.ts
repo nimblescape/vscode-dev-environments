@@ -498,9 +498,20 @@ export class HelperChannel {
   private onAsk(id: number, ask: number, kind: AskKind, payload: unknown): void {
     const pending = this.pending.get(id);
     if (!pending || pending.cancelling) return;
+    // Review round 1 of plan step 11A (A-R1-3): an answer that cannot be encoded, or is longer than the channel carries,
+    // goes as a failure instead (a longer line would end the whole channel in the script).
     const reply = (message: ClientMessage) => {
       if (this.state !== 'open' || !this.pending.has(id)) return;
-      this.write(encodeMessage(message));
+      let line: string;
+      try {
+        line = encodeMessage(message);
+      } catch {
+        line = encodeMessage({ t: 'answer', id, ask, ok: false, error: { code: 'invalid', message: 'The answer cannot be sent.' } });
+      }
+      if (line.length - 1 > MAX_CLIENT_LINE || Buffer.byteLength(line, 'utf8') - 1 > (this.options.maxRequestBytes ?? MAX_CHANNEL_REQUEST_BYTES)) {
+        line = encodeMessage({ t: 'answer', id, ask, ok: false, error: { code: 'tooLarge', message: 'The answer is too large for the helper channel.' } });
+      }
+      this.write(line);
     };
     const handler = pending.options.onAsk;
     if (handler === undefined) {
@@ -508,7 +519,10 @@ export class HelperChannel {
       return;
     }
     const ended = pending.asks ?? (pending.asks = new AbortController());
-    void handler(kind, payload, ended.signal).then(
+    // Review round 1 of plan step 11A (A-R1-5): a handler that throws at once answers like one that rejects.
+    void Promise.resolve()
+      .then(() => handler(kind, payload, ended.signal))
+      .then(
       ({ value, secrets }) => {
         if (secrets !== undefined && Object.keys(secrets).length > 0) {
           const checked = parseSecrets(secrets);
@@ -682,6 +696,7 @@ export class HelperChannel {
       if (timeoutMs !== undefined) {
         // The helper ends the operation at its time limit and answers; this is for a helper that does not answer.
         pending.timer = setTimeout(() => {
+          pending.asks?.abort();
           this.send({ t: 'cancel', id });
           this.finish(id);
           this.logResult(id, pending, 'the helper did not answer in time');
@@ -693,6 +708,8 @@ export class HelperChannel {
         // usually within a round trip; when the channel is lost first, the operation rejects as lost (outcome unknown).
         pending.onAbort = () => {
           pending.cancelling = true;
+          // Review round 1 of plan step 11A (A-R1-7): an open question ends with the cancel, not with its confirmation.
+          pending.asks?.abort();
           if (!this.send({ t: 'cancel', id }) && this.pending.has(id)) {
             this.finish(id);
             reject(new HelperChannelError('lost', `The cancel of ${op} could not be sent to ${this.options.name}.`));

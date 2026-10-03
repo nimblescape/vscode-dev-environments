@@ -248,6 +248,34 @@ export function redact(text: string, secrets: Iterable<string> | string | undefi
 }
 
 /**
+ * Review round 1 of plan step 11A (A-R1-1): every string and key of a JSON value with the secrets masked, before it is
+ * encoded (in the encoded text a secret with `"` or `\\` would no longer match). Throws for a value that JSON cannot
+ * hold (a cycle, a BigInt, a function).
+ */
+export function redactValue(value: unknown, secrets: Iterable<string>): unknown {
+  const list = maskable(secrets);
+  const seen = new Set<object>();
+  const walk = (item: unknown): unknown => {
+    if (typeof item === 'string') return list.length === 0 ? item : redact(item, list);
+    if (item === null || typeof item === 'number' || typeof item === 'boolean') return item;
+    if (item === undefined) return undefined;
+    if (typeof item !== 'object') throw new TypeError(`A ${typeof item} cannot be sent.`);
+    if (seen.has(item)) throw new TypeError('A value with a cycle cannot be sent.');
+    seen.add(item);
+    const result = Array.isArray(item)
+      ? item.map((entry) => walk(entry) ?? null)
+      : Object.fromEntries(
+          Object.entries(item as Record<string, unknown>)
+            .map(([key, entry]) => [list.length === 0 ? key : redact(key, list), walk(entry)] as const)
+            .filter(([, entry]) => entry !== undefined),
+        );
+    seen.delete(item);
+    return result;
+  };
+  return walk(value);
+}
+
+/**
  * Passes a stream on with the secrets masked, also when a chunk splits one: the last characters that could be the start
  * of a secret wait for the next chunk; flush passes them on. `secrets` is read at each piece, so a secret that an answer
  * added later (plan step 11A) is masked from then on.
