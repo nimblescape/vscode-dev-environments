@@ -426,7 +426,7 @@ export function isDevContainer(container: Pick<ContainerInfo, 'name' | 'labels'>
 }
 
 function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, volumes, volumeSubpaths, mountTargets } = container;
+  const { id, name, state, rawState, labels, image, imageId, volumes, volumeSubpaths, mountTargets } = container;
   return {
     id,
     name,
@@ -434,6 +434,8 @@ function publicInfo(container: InspectedContainer): ContainerInfo {
     rawState,
     labels,
     image,
+    // Review round 2 of PR #88 (B-R2-1): the ID of the container's image (containerImage, A-R1-1).
+    ...(imageId !== undefined ? { imageId } : {}),
     ...(volumes && volumes.length > 0 ? { volumes } : {}),
     ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
     ...(mountTargets && mountTargets.length > 0 ? { mountTargets } : {}),

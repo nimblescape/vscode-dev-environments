@@ -284,6 +284,52 @@ describe('containers', () => {
       rawState: 'exited',
       labels: { 'nimblescape.devenv.environment-id': 'env-1', 'devcontainer.metadata': metadata },
       image: 'devenv-3f2a9c1e:1',
+      // Review round 2 of PR #88 (B-R2-1): changed expectation, the ID of the image (`Image`) is passed on.
+      imageId: 'sha256:abc',
+    });
+  });
+
+  // Review round 2 of PR #88 (B-R2-1): the ID of the container's image (`Image` of `docker container inspect`) is read
+  // into ContainerInfo.imageId next to its name (`Config.Image`); an empty or missing `Image` gives no imageId.
+  describe('review round 2 of PR #88 (B-R2-1): imageId from `Image` of docker container inspect', () => {
+    const imageId = `sha256:${'abc'.repeat(21)}d`;
+    const inspected = (image: unknown): Record<string, unknown> => {
+      const json: Record<string, unknown> = {
+        Id: 'c1',
+        Created: '2026-09-24T10:00:00.000000000Z',
+        Path: '/bin/sh',
+        Name: '/devenv-acme-api-3f2a9c1e',
+        State: { Status: 'running', Running: true, Pid: 42 },
+        Image: image,
+        HostConfig: { NetworkMode: 'bridge' },
+        Mounts: [],
+        Config: { Image: 'devenv-acme-api-brave-noether:2', Labels: { 'nimblescape.devenv.environment-id': 'env-1' } },
+      };
+      if (image === undefined) delete json.Image;
+      return json;
+    };
+    const reading = (image: unknown) =>
+      adapter((call) => (call.args[0] === 'ps' ? ok(idLines(['c1'])) : ok(inspectOutput([inspected(image)]))));
+
+    it.each([
+      ['findContainer', (docker: ContainerAdapter) => docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e')],
+      ['listEnvironmentContainers', async (docker: ContainerAdapter) => (await docker.listEnvironmentContainers())[0]],
+      ['listProjectContainers', async (docker: ContainerAdapter) => (await docker.listProjectContainers('devenv-3f2a9c1e'))[0]],
+    ])('%s reads `Image` into imageId and `Config.Image` into image', async (_name, read) => {
+      const info = await read(reading(imageId).docker);
+      expect(info?.imageId).toBe(imageId);
+      expect(info?.image).toBe('devenv-acme-api-brave-noether:2');
+    });
+
+    it.each([
+      ['an empty', ''],
+      ['no', undefined],
+      ['a non-string', 7],
+    ])('findContainer gives no imageId for %s `Image`', async (_name, image) => {
+      const info = await reading(image).docker.findContainer('env-1', 'devenv-acme-api-3f2a9c1e');
+      expect(info?.id).toBe('c1');
+      expect(info?.image).toBe('devenv-acme-api-brave-noether:2');
+      expect(info).not.toHaveProperty('imageId');
     });
   });
 
@@ -369,7 +415,8 @@ describe('containers', () => {
       );
     });
     const list = await docker.listEnvironmentContainers();
-    expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1' }]);
+    // Review round 2 of PR #88 (B-R2-1): changed expectation, with the ID of the image (`Image`).
+    expect(list).toEqual([{ id: 'c1', name: 'x', state: 'running', rawState: 'running', labels: {}, image: 'devenv-3f2a9c1e:1', imageId: 'sha256:abc' }]);
   });
 
   it('reads the named volumes that a container mounts', async () => {
