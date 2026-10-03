@@ -2,6 +2,10 @@
 
 This is the agreed plan for the remote worker and the work queue around it (user decisions 2026-09-28 and 2026-09-29). It is the reference for the next pull requests. Update it when a step is merged or a decision changes.
 
+## 0. Principle
+
+The extension sets up the worker and everything that the worker needs (whether Docker runs, the helper image, the start of the worker and its engine check, the test of a new host, the Docker contexts). From then on the worker is responsible for everything else on the Docker engine, commanded through operations: the extension decides, asks the user, keeps its local records, and sends operations; it runs no Docker action and no script itself. The only exception on purpose is the attach diagnostics, which checks what the local Docker CLI sees. (The user, 2026-10-03: "so we setup the worker an everything that is needed for it and then the worker is responsible for anything else commanded through operations".)
+
 ## 1. Why
 
 On a remote Docker host every Docker call of the extension opens its own SSH connection (about 1.6 s), and every helper step starts, runs and removes its own container. A first Start needs 15–30 such calls, including about 8 helper containers. The remote worker pays the connection once and runs the work next to the engine.
