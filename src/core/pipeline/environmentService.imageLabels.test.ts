@@ -936,6 +936,8 @@ describe('review round 5 of PR #88 (A-R5-1): Clone again when Docker cannot say 
     await rejection(h.service.open(TARGET, options()));
     expect(h.docker.volumes.has(NAME)).toBe(true);
     expect((await h.registry.get(ENV_ID))?.busy?.operation).toBe('create');
+    // Review round 6 of PR #88 (B-R6-1): the mark is ended (it blocks no window), not live.
+    expect((await h.registry.get(ENV_ID))?.busy?.since).toBe(new Date(0).toISOString());
   });
 
   it('keeps the create mark (ended) when its own new volume cannot be removed after a failed clone', async () => {
@@ -947,6 +949,8 @@ describe('review round 5 of PR #88 (A-R5-1): Clone again when Docker cannot say 
     };
     await rejection(h.service.open(TARGET, options()));
     expect((await h.registry.get(ENV_ID))?.busy?.operation).toBe('create');
+    // Review round 6 of PR #88 (B-R6-1): the mark is ended (it blocks no window), not live.
+    expect((await h.registry.get(ENV_ID))?.busy?.since).toBe(new Date(0).toISOString());
   });
 });
 
@@ -1006,5 +1010,52 @@ describe('review round 6 of PR #88 (A-R6-1): Clone again whose `docker volume cr
     const clones = h.helper.clones.length;
     await h.service.open(TARGET, options());
     expect(h.helper.clones.length).toBe(clones + 1);
+  });
+});
+
+describe('review round 6 of PR #88 (B-R6-2 to B-R6-4)', () => {
+  it('B-R6-2: a failed Clone again never ends a mark of another window', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    const theirs = { operation: 'create' as const, since: '2026-10-03T10:00:00.000Z', pid: process.pid + 1, windowId: 'another-window' };
+    h.helper.onClone = async () => {
+      await h.registry.updateEnvironment(ENV_ID, (entry) => {
+        entry.busy = { ...theirs };
+      });
+      // Whose the volume is cannot be read after the failure: the mark would be kept as ended, but only its own.
+      h.docker.inspectVolumes = async () => {
+        throw new Error('timeout');
+      };
+    };
+    await rejection(h.service.open(TARGET, options()));
+    expect((await h.registry.get(ENV_ID))?.busy).toEqual(theirs);
+  });
+
+  it('B-R6-3: a failure to keep the create mark never hides the error of the clone', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    h.helper.onClone = () => {
+      h.docker.inspectVolumes = async () => {
+        throw new Error('timeout');
+      };
+      const update = h.registry.updateEnvironment.bind(h.registry);
+      let calls = 0;
+      h.registry.updateEnvironment = async (id, mutator) => {
+        if (calls++ === 0) throw new Error('registry not writable');
+        return update(id, mutator);
+      };
+    };
+    await expect(h.service.open(TARGET, options())).rejects.toMatchObject({ detail: expect.stringContaining('network down') });
+  });
+
+  it('B-R6-4: takes no record over from an image with the tag 0', async () => {
+    await seedEnvironment(h, { record: null, container: null });
+    const zero = `${NAME}:0`;
+    addImage(zero, labelsOf(recordOf(zero, 0)));
+    await h.service.open(TARGET, options());
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).not.toBe(zero);
+    expect(h.helper.builds).toHaveLength(1);
   });
 });
