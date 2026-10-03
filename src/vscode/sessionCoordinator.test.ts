@@ -607,6 +607,16 @@ describe('SessionCoordinator: the cleanup of the storage folder (plan step 8, PR
     expect(sessionFileNames(h)).toContain('dead-later.json');
   });
 
+  // Found by the CI of PR #91: a run that was under way when the window closed removed a file written after it started.
+  it('a run that is under way when the window closes removes nothing more', async () => {
+    await h.coordinator.start(ID_A);
+    await writeStatusFile('dead-old', DEAD_PID, T0 - 3_600_000);
+    const running = h.coordinator.cleanUpStorage();
+    h.coordinator.deactivateSync();
+    await running;
+    expect(sessionFileNames(h)).toContain('dead-old.json');
+  });
+
   it('never throws when the status files cannot be read', async () => {
     fs.mkdirSync(h.root, { recursive: true });
     fs.writeFileSync(h.paths.sessionsDir, 'not a folder');
