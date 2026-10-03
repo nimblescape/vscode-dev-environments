@@ -452,6 +452,22 @@ describe('the Docker context commands', () => {
     expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
   });
 
+  // Review round 2 of PR #88 (B-R2-12, mutant E2): when the list after the failed create fails too, the error of the
+  // create is thrown (it says why), not the one of the list.
+  it('throws the error of the create when the list after it fails too (review round 2 of PR #88, B-R2-12)', async () => {
+    let lists = 0;
+    const docker = fakeDocker((args) => {
+      if (args[1] === 'ls') return lists++ === 0 ? contextLs([]) : fail('Cannot connect to the Docker daemon');
+      return fail('permission denied');
+    });
+    const thrown = await ensureRemoteContext(docker, 'box').catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('docker context create box');
+    expect((thrown as Error).message).toContain('permission denied');
+    expect((thrown as Error).message).not.toContain('Cannot connect to the Docker daemon');
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
+  });
+
   it('chooses among the contexts by remoteContextChoice', () => {
     const [name, pair] = remoteContextNames('me@box');
     expect(remoteContextChoice('me@box', [])).toEqual({ free: name });

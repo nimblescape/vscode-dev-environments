@@ -398,3 +398,181 @@ describe('review round 2 of PR #88', () => {
     expect(h.docker.volumes.has(entry.volumeName)).toBe(true);
   });
 });
+
+describe('review round 2 of PR #88: the gaps of the mutation review (B-R2-2, B-R2-4, B-R2-5, B-R2-6, B-R2-9)', () => {
+  const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
+  /** The ID of an image that no local image has (the image is gone). */
+  const SWAPPED = `sha256:${'7'.repeat(64)}`;
+  const OWN = `sha256:image-of-${IMAGE_1}`;
+
+  function ups(): string[] {
+    return h.helper.calls.filter((call) => call.startsWith('up'));
+  }
+
+  /** IMAGE_1 names another image now; with `keep`, the image of the container is still there under the name kept:1. */
+  function swapName(keep: boolean): void {
+    if (keep) {
+      h.docker.images.add('kept:1');
+      h.docker.imageIds.set('kept:1', OWN);
+    }
+    h.docker.imageIds.set(IMAGE_1, SWAPPED);
+  }
+
+  // Review round 2 of PR #88 (B-R2-2, mutant F2): the container of the environment's name belongs to the other
+  // environment whose volume took the name; a failed first open never removes it by its name (`docker rm -f`).
+  it('B-R2-2: a failed first open never removes the container of its name that another environment created meanwhile', async () => {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    vi.spyOn(h.docker, 'containerState').mockResolvedValue('missing');
+    h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
+    const theirs = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'running', image: 'their-image:1' });
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect(h.docker.containerByRef(theirs.id)).toMatchObject({ name, state: 'running' });
+    expect(h.docker.log).not.toContain(`rm ${name}`);
+    expect(h.docker.log).not.toContain(`rm ${theirs.id}`);
+  });
+
+  // Review round 2 of PR #88 (B-R2-2, mutant F4): a volume without the ID label (here: none, `docker volume create`
+  // failed) is no other environment's: the failed first open still removes what carries its name.
+  it('B-R2-2: a failed first open without its volume still removes the container of its name and the entry', async () => {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    vi.spyOn(h.docker, 'createVolume').mockRejectedValue(new CommandError(`docker volume create ${name}`, 1, '', 'no space left on device'));
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect(h.docker.log).toContain(`rm ${name}`);
+    expect(h.logger.warnings.some((line) => line.includes('belongs to another environment'))).toBe(false);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  describe('B-R2-4: the recreate offer for a damaged container without a pinned image (recreationImage)', () => {
+    /** A stopped, current container whose `up` fails because it is damaged; no registry, so no build. */
+    async function damagedWithoutBuild(): Promise<void> {
+      await seedEnvironment(h);
+      h.checker.outcome = { status: 'unreachable', registries: ['mcr.microsoft.com'] };
+      h.helper.upError = (_image, removeExisting) =>
+        removeExisting
+          ? undefined
+          : new DevcontainerCommandError('devcontainer up', 1, '', 'Error response from daemon: unable to find user vscode: no matching entries in passwd file');
+      h.ui.recreateAnswer = true;
+    }
+
+    it('creates it again from its own image by its ID when the name names another image', async () => {
+      await damagedWithoutBuild();
+      swapName(true);
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(h.helper.builds).toEqual([]);
+      expect(h.ui.prompts).toEqual([`recreateContainer ${REPO}`]);
+      expect(ups()).toEqual([`up ${IMAGE_1}`, `up ${OWN} --remove-existing-container`]);
+    });
+
+    it('offers nothing when its own image is gone, although the name names another image', async () => {
+      await damagedWithoutBuild();
+      swapName(false);
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('startFailed');
+      expect(h.ui.prompts).toEqual([]);
+      expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    });
+  });
+
+  describe('B-R2-5: the fallback after a failed build or update uses the container only with its own image', () => {
+    it('a failed build creates the outdated container again from its own image by its ID (containerUsable)', async () => {
+      await seedEnvironment(h, { containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) } });
+      swapName(true);
+      h.helper.buildError = () => new Error('build broke');
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(h.helper.builds).toHaveLength(1);
+      expect(ups()).toEqual([`up ${OWN} --remove-existing-container`]);
+    });
+
+    it('a failed build is no fallback for an outdated container whose own image is gone (containerUsable)', async () => {
+      await seedEnvironment(h, { containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) } });
+      swapName(false);
+      h.helper.buildError = () => new Error('build broke');
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('buildFailed');
+      expect(error.detail).toContain('build broke');
+      expect(h.ui.warnings).toEqual([]);
+      expect(ups()).toEqual([]);
+    });
+
+    it('a failed update starts the container again from its own image by its ID, never from the name (previousImage)', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      swapName(true);
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid override') : undefined);
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(ups()).toEqual([`up ${IMAGE_2} --remove-existing-container`, `up ${OWN}`]);
+    });
+
+    it('a failed update does not start the container again when its own image is gone (previousImage)', async () => {
+      await seedEnvironment(h, { container: 'stopped' });
+      swapName(false);
+      h.helper.upFailsBeforeRemoval = true;
+      h.helper.upError = (image) => (image === IMAGE_2 ? new DevcontainerCommandError('devcontainer up', 1, '', 'invalid override') : undefined);
+      const error = await rejection(h.service.open(TARGET, options()));
+      expect(error.code).toBe('startFailed');
+      expect(error.detail).toContain('invalid override');
+      expect(ups()).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
+    });
+  });
+
+  // Review round 2 of PR #88 (B-R2-6, mutant C6): the name moved and the container's own image is gone: there is no
+  // image to create it again from (never `up` of an image ID that does not exist).
+  it('B-R2-6: an outdated container whose own image is gone and whose name names another image: buildFailed, no up', async () => {
+    await seedEnvironment(h, { containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) } });
+    h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    swapName(false);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(error.detail).toBe('There is no environment image.');
+    expect(ups()).toEqual([]);
+  });
+
+  describe('B-R2-9: containerImage details', () => {
+    /**
+     * An outdated container created from `old:1` (still there), a record whose image is not pinned (so the container's
+     * own image is used), and a configuration that cannot be read: the container is created again without a build.
+     */
+    async function outdatedFromOld(imageId?: string): Promise<void> {
+      await seedEnvironment(h, { container: null, record: { imageId: SWAPPED } });
+      h.docker.images.add('old:1');
+      const container = h.docker.addContainer({
+        environmentId: ENV_ID,
+        name: NAME,
+        state: 'stopped',
+        image: 'old:1',
+        labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION - 1) },
+      });
+      if (imageId !== undefined) h.docker.containers.set(container.id, { ...container, imageId });
+      h.helper.readConfigurationError = new CommandError('devcontainer read-configuration', 1, '', 'SyntaxError');
+    }
+
+    it('uses the name while it still names the container image, without a warning (C9)', async () => {
+      await outdatedFromOld();
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(ups()).toEqual(['up old:1 --remove-existing-container']);
+      expect(h.logger.warnings.some((line) => line.includes('no longer names the image of the container'))).toBe(false);
+    });
+
+    it('compares the IDs without regard to case (C5)', async () => {
+      await outdatedFromOld('sha256:IMAGE-OF-OLD:1');
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(ups()).toEqual(['up old:1 --remove-existing-container']);
+    });
+
+    it('falls back to the image ID when Docker cannot look up the name (C8)', async () => {
+      await outdatedFromOld();
+      const imageId = h.docker.imageId.bind(h.docker);
+      vi.spyOn(h.docker, 'imageId').mockImplementation(async (reference) => {
+        if (reference === 'old:1') throw new CommandError('docker image inspect old:1', 1, '', 'timeout');
+        return imageId(reference);
+      });
+      await h.service.open(TARGET, options()).catch(() => undefined);
+      expect(ups()).toEqual(['up sha256:image-of-old:1 --remove-existing-container']);
+    });
+  });
+});

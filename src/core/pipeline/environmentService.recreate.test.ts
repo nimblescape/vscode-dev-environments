@@ -356,6 +356,31 @@ describe('recreate offer, review round 1 (D1): the environment changed while the
   });
 });
 
+// Review round 2 of PR #88 (B-R2-8): the image of the recreation is compared by the pinned ID of the record, and else
+// by the container's own image (containerImage), never by the name alone.
+describe('review round 2 of PR #88 (B-R2-8): the environment image was swapped under its name while the question was open', () => {
+  it('the container is not created again from the image that now has the name', async () => {
+    h = createHarness();
+    await seedEnvironment(h);
+    const old = h.docker.containersOf(ENV_ID)[0];
+    failFirstUp(PASSWD_DAMAGED);
+    h.ui.recreateContainer = async (repository) => {
+      h.ui.prompts.push(`recreateContainer ${repository}`);
+      // Another image takes the name of the record (and of the container); the pinned image is gone by its ID.
+      h.docker.imageIds.set(IMAGE_1, `sha256:${'7'.repeat(64)}`);
+      return true;
+    };
+
+    const error = await rejection(h.service.open(TARGET, options()));
+
+    expect(error.code).toBe('startFailed');
+    expect(error.detail).toBe(Messages.containerChangedMeanwhile);
+    expect(ups()).toEqual([`up ${IMAGE_1}`]);
+    expect(h.docker.containersOf(ENV_ID).map((c) => c.id)).toEqual([old.id]);
+    expectVolumesKept();
+  });
+});
+
 describe('recreate offer: a running container that the remote user cannot use', () => {
   /** Review round 3 (F1): the current setup, and the user of the container in its label devcontainer.metadata. */
   const RUNNING_LABELS = { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'devcontainer.metadata': JSON.stringify([{ remoteUser: 'vscode' }]) };

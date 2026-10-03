@@ -556,6 +556,17 @@ describe('first open of a Docker Compose configuration', () => {
       await h.service.open(TARGET, options());
       expect(h.helper.ups).toHaveLength(1);
     });
+
+    // Review round 2 of PR #88 (B-R2-12, mutant P6): with several environments of the account, the image is checked
+    // against the one whose ID it carries, not against the first environment of the account.
+    it('uses the image of the second of several environments of the same account (review round 2 of PR #88, B-R2-12)', async () => {
+      await seedEnvironment(h, { id: '9a9a9a9a-0000-4000-8000-000000000009', repository: 'acme/tools', container: null });
+      await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null });
+      h.docker.images.add(DB_IMAGE);
+      h.docker.imageConfigs.set(DB_IMAGE, { Labels: { ...theirs, [LABEL_BUILD_RECORD]: '{}' } });
+      await h.service.open(TARGET, options());
+      expect(h.helper.ups).toHaveLength(1);
+    });
   });
 
   it('refuses a label of the extension on the image of a side service before up creates the containers (review round 1, D2)', async () => {
@@ -1501,6 +1512,33 @@ describe('Delete of a Docker Compose environment', () => {
     expect(h.docker.log).not.toContain(`rm ${foreign.id}`);
     expect(h.docker.images.has(`${PROJECT}-tool`)).toBe(true);
     expect(h.docker.images.has(`${PROJECT}-app`)).toBe(false);
+  });
+
+  // Review round 2 of PR #88 (B-R2-3, mutant O3): Delete removes a recorded image of the project (BuildRecord.compose)
+  // only when it carries the ID of this environment (ownComposeImages in removeComposeProject).
+  it('keeps a recorded image of the project that carries the ID of another environment (review round 2 of PR #88, B-R2-3)', async () => {
+    await seedForDelete();
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-worker:latest`)).toBe(false);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  // Review round 2 of PR #88 (B-R2-3, mutant O4): a recorded image whose labels cannot be read is kept.
+  it('keeps a recorded image of the project whose labels cannot be read (review round 2 of PR #88, B-R2-3)', async () => {
+    await seedForDelete();
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    const imageLabels = h.docker.imageLabels.bind(h.docker);
+    h.docker.imageLabels = async (reference: string) => {
+      if (reference === `${PROJECT}-app`) throw new CommandError(`docker image inspect ${reference}`, 1, '', 'timeout');
+      return imageLabels(reference);
+    };
+    await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-worker:latest`)).toBe(false);
   });
 
   it('removes the volumes of the project that the user ticked', async () => {
@@ -5277,5 +5315,23 @@ describe('review round 4 of PR #68', () => {
     expect(error.code).toBe('helperFailed');
     // Before: "Its dev container was created", which the listing could not tell.
     expect(error.detail).toContain('The configuration now uses Docker Compose. Its dev container was created or started, but its lifecycle commands could not run.');
+  });
+});
+
+// Review round 2 of PR #88 (B-R2-7, mutant O5): after a rebuild, the images that Compose built under the same names as
+// before (`<project>-<service>`, the images of the new build record, with this environment's ID) are not removed.
+describe('review round 2 of PR #88 (B-R2-7): a rebuild keeps the images of the project that it just built', () => {
+  it('does not remove `<project>-app` that the old and the new build record name', async () => {
+    await seedCompose({ record: { images: { [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST } } });
+    h.docker.images.add(`${PROJECT}-app`);
+    h.docker.imageConfigs.set(`${PROJECT}-app`, { User: '', Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    h.checker.outcome = checked({ [BASE_IMAGE]: DIGEST_NEW, [DB_IMAGE]: DB_DIGEST_NEW }, { [FEATURE]: FEATURE_DIGEST });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.builds.map((build) => build.imageName)).toEqual([IMAGE_2]);
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.compose?.images).toEqual([`${PROJECT}-app`]);
+    expect(h.docker.log).not.toContain(`rmi ${PROJECT}-app`);
+    expect(h.docker.images.has(`${PROJECT}-app`)).toBe(true);
+    // The old environment image goes, as after every update.
+    expect(h.docker.images.has(IMAGE_1)).toBe(false);
   });
 });

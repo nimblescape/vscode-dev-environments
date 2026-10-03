@@ -78,6 +78,20 @@ describe('imageRecordLabels', () => {
     expect(JSON.stringify(stored(exact)).length).toBe(MAX_RECORD_LABEL_LENGTH);
     expect(imageRecordLabels(ENV, exact)).toHaveProperty([LABEL_BUILD_RECORD]);
   });
+
+  // Review round 2 of PR #88 (B-R2-11): the boundary itself is pinned (the label above is always set, so the test above
+  // cannot fail any more): exactly MAX_RECORD_LABEL_LENGTH characters keep the record as JSON, one more give ''; and the
+  // limit stays 8 KiB (A-R1-3: the command line of `docker build` on Windows).
+  it('keeps the JSON of a record of exactly MAX_RECORD_LABEL_LENGTH characters and empties one of a character more (review round 2 of PR #88, B-R2-11)', () => {
+    expect(MAX_RECORD_LABEL_LENGTH).toBe(8192);
+    const base = JSON.stringify(stored(record({ configHash: '' }))).length;
+    const exact = record({ configHash: 'x'.repeat(MAX_RECORD_LABEL_LENGTH - base) });
+    const longer = record({ configHash: 'x'.repeat(MAX_RECORD_LABEL_LENGTH - base + 1) });
+    expect(JSON.stringify(stored(exact)).length).toBe(MAX_RECORD_LABEL_LENGTH);
+    expect(JSON.stringify(stored(longer)).length).toBe(MAX_RECORD_LABEL_LENGTH + 1);
+    expect(imageRecordLabels(ENV, exact)[LABEL_BUILD_RECORD]).toBe(JSON.stringify(stored(exact)));
+    expect(imageRecordLabels(ENV, longer)[LABEL_BUILD_RECORD]).toBe('');
+  });
 });
 
 describe('imageBuildRecord', () => {

@@ -421,7 +421,8 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   async imageExists(reference: string): Promise<boolean> {
-    return this.images.has(reference);
+    // Review round 2 of PR #88 (B-R2-4): also by the ID of an image, as `docker image inspect` resolves it (imageId).
+    return this.imageNamed(reference) !== undefined;
   }
 
   async imageId(reference: string): Promise<string | undefined> {

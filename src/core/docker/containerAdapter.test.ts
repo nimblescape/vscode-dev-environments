@@ -1279,6 +1279,37 @@ describe('ContainerAdapter: the labels of images (imageLabelsOf, labelImage)', (
     expect(runner.calls.some((call) => call.args[0] === 'image' && call.args[1] === 'rm')).toBe(false);
   });
 
+  // Review round 2 of PR #88 (B-R2-10, mutant L4): the tag is gone after the build: the previous image is not touched.
+  it('labelImage removes nothing when the tag is gone after the build (review round 2 of PR #88, B-R2-10)', async () => {
+    const { docker, runner } = labelling([idA, undefined]);
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['image', 'inspect', '--format', '{{json .Id}}', 'img:1'],
+      ['build', '--quiet', '-t', 'img:1', '--label', 'a=b', '-'],
+      ['image', 'inspect', '--format', '{{json .Id}}', 'img:1'],
+    ]);
+  });
+
+  // Review round 2 of PR #88 (B-R2-10, mutant L5): the previous image is reported missing by its names: no `image rm`.
+  it('labelImage removes nothing when the previous image is gone before its names are read (review round 2 of PR #88, B-R2-10)', async () => {
+    let built = false;
+    const { docker, runner } = adapter((call) => {
+      if (call.args[0] === 'image' && call.args[1] === 'inspect' && call.args[3]?.startsWith('{"repoTags"')) {
+        return fail(`Error response from daemon: No such image: ${call.args[4]}`);
+      }
+      if (call.args[0] === 'image' && call.args[1] === 'inspect') return ok(`${JSON.stringify(built ? idB : idA)}\n`);
+      if (call.args[0] === 'build') {
+        built = true;
+        return ok(`${idB}\n`);
+      }
+      if (call.args[0] === 'image' && call.args[1] === 'rm') return ok();
+      return fail('unexpected');
+    });
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(runner.calls.at(-1)?.args).toEqual(['image', 'inspect', '--format', '{"repoTags":{{json .RepoTags}},"repoDigests":{{json .RepoDigests}}}', idA]);
+    expect(runner.calls.some((call) => call.args[0] === 'image' && call.args[1] === 'rm')).toBe(false);
+  });
+
   it('labelImage refuses a missing image without a build', async () => {
     const { docker, runner } = labelling([undefined, undefined]);
     const thrown = await docker.labelImage('gone:1', { a: 'b' }).catch((e: unknown) => e);
