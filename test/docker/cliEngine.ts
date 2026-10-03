@@ -37,6 +37,10 @@ function containerOf(details: ContainerDetails): EngineContainer {
 export function cliEngine(cli: DockerCli, secrets: Readonly<Record<string, string>> = {}): DockerEngine {
   const exec = async (container: string, command: readonly string[], options: EngineExecOptions = {}): Promise<EngineExecResult> => {
     const input = options.secretInputName !== undefined ? secrets[options.secretInputName] : options.input;
+    // As the port (review round 2 of plan step 11B1, A-R2-8): a secret that is not held fails, never an empty input.
+    if (options.secretInputName !== undefined && input === undefined) {
+      throw new EngineError(`The operation holds no secret ${options.secretInputName} for the process in the container.`, 0);
+    }
     const args = ['exec', ...(input === undefined ? [] : ['-i']), ...(options.user === undefined ? [] : ['-u', options.user])];
     if (options.workdir !== undefined) args.push('-w', options.workdir);
     // The Docker CLI of the tests runs to its end: `timeoutMs` and `signal` of the port are not served here.

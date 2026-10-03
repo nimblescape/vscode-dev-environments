@@ -9,7 +9,7 @@
 // and the seams; no I/O of its own, no `vscode`.
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import { runScript } from './containerScripts';
-import { isDevContainer, type DockerEngine, type EngineContainer } from './dockerEngine';
+import { EngineError, isDevContainer, type DockerEngine, type EngineContainer, type EngineExecResult } from './dockerEngine';
 import type { HostRecords } from './hostSide';
 
 /** The time limit of each try in the container (the script only empties a folder in memory). */
@@ -45,8 +45,9 @@ const MAX_REASON_CHARACTERS = 1000;
 export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveResult> {
   const container = await devContainer(p);
   if (container === undefined) return { outcome: 'notRunning' };
-  const options = { signal: p.signal, timeoutMs: TOKEN_REMOVE_TIMEOUT_MS };
-  const asRoot = await runScript(p.engine, container.id, 'tokenRemove', [], { ...options, user: 'root' });
+  const attempt = (user: string) => tryRemoval(p, container.id, user);
+  const asRoot = await attempt('root');
+  if (asRoot === 'notRunning') return { outcome: 'notRunning' };
   if (asRoot.exitCode === 0) return { outcome: 'removed', container: container.id.slice(0, 12) };
   p.log?.(`The removal as root failed in the container ${container.name}: ${reason(asRoot)}`);
   // Review round 1 of plan step 11B1 (A-R1-7): the record only names the user of the second try; a record that cannot be
@@ -54,9 +55,25 @@ export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveRe
   const record = await p.records.get(p.environmentId).catch(() => undefined);
   const user = record?.remoteUser;
   if (user === undefined || user === '' || user === 'root' || user === '0') throw new Error(reason(asRoot));
-  const asUser = await runScript(p.engine, container.id, 'tokenRemove', [], { ...options, user });
+  const asUser = await attempt(user);
+  if (asUser === 'notRunning') return { outcome: 'notRunning' };
   if (asUser.exitCode !== 0) throw new Error(`${reason(asRoot)} As ${user}: ${reason(asUser)}`);
   return { outcome: 'removed', container: container.id.slice(0, 12) };
+}
+
+/**
+ * One try of the script as `user`. Review round 2 of plan step 11B1 (A-R2-5): a failure of the engine is a failed try
+ * (its message the reason), as a failed `docker exec` was, so the second try still runs; a container that stopped since
+ * the lookup (409) holds no token any more. A cancel ends the flow.
+ */
+async function tryRemoval(p: TokenRemoveFlow, container: string, user: string): Promise<EngineExecResult | 'notRunning'> {
+  try {
+    return await runScript(p.engine, container, 'tokenRemove', [], { signal: p.signal, timeoutMs: TOKEN_REMOVE_TIMEOUT_MS, user });
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    if (error.status === 409 && /is not running/i.test(error.message)) return 'notRunning';
+    return { exitCode: null, stdout: '', stderr: error.message, timedOut: false };
+  }
 }
 
 /**
@@ -70,7 +87,9 @@ async function devContainer(p: TokenRemoveFlow): Promise<EngineContainer | undef
   const running = labelled.filter((container) => container.state === 'running' && isDevContainer(container, p.containerName));
   const named = running.find((container) => container.name === p.containerName);
   if (named !== undefined) return named;
-  const newest = [...running].sort((a, b) => (b.created ?? '').localeCompare(a.created ?? ''))[0];
+  // Review round 2 of plan step 11B1 (A-R2-7): by the time, not the text (the engine trims the zeros of a fraction).
+  const time = (container: EngineContainer) => Date.parse(container.created ?? '') || 0;
+  const newest = [...running].sort((a, b) => time(b) - time(a))[0];
   if (newest !== undefined) p.log?.(`The container ${p.containerName} does not run; the running container ${newest.name} of the environment is used.`);
   return newest;
 }

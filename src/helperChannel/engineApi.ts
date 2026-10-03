@@ -207,7 +207,13 @@ function engineStream(socket: Duplex, head: Buffer, onFrame: EngineHijackRequest
       // A copy: the data must not keep the whole buffer of the connection alive, nor change with it.
       const data = Buffer.from(buffer.subarray(8, 8 + length));
       buffer = buffer.subarray(8 + length);
-      onFrame(kind, data);
+      try {
+        onFrame(kind, data);
+      } catch (error) {
+        // Review round 2 of plan step 11B1 (A-R2-1): a listener that throws ends the exec, never the worker.
+        settle(error instanceof Error ? error : new Error(String(error)));
+        return false;
+      }
     }
     return true;
   };

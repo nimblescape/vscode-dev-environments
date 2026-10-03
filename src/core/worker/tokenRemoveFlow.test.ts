@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import type { Environment } from '../types';
 import { scriptCommand } from './containerScripts';
-import type { DockerEngine, EngineContainer, EngineExecOptions, EngineExecResult } from './dockerEngine';
+import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { removeTokenFlow, TOKEN_REMOVE_TIMEOUT_MS } from './tokenRemoveFlow';
 
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -157,4 +157,37 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
       expect(execs).toHaveLength(1);
     }
   });
+
+  it('takes a failure of the engine as a failed try, and a container that stopped since as notRunning (review round 2, A-R2-5)', async () => {
+    const lines: string[] = [];
+    let calls = 0;
+    const engine = fakeEngine([container()]).engine;
+    engine.exec = async (_c, _cmd, options = {}) => {
+      calls++;
+      if (options.user === 'root') throw new EngineError('the daemon is busy', 500);
+      return ok();
+    };
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }), log: (line) => lines.push(line) })).toMatchObject({ outcome: 'removed' });
+    expect(calls).toBe(2);
+    expect(lines).toEqual([`The removal as root failed in the container ${CONTAINER}: the daemon is busy`]);
+    engine.exec = async () => {
+      throw new EngineError(`Container ${ID} is not running`, 409);
+    };
+    expect(await flow(engine)).toEqual({ outcome: 'notRunning' });
+    // A cancel is no failed try: it ends the flow.
+    engine.exec = async () => {
+      throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    };
+    await expect(flow(engine, { records: records({ remoteUser: 'vscode' }) })).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('takes the newest by its time, whatever the digits of its fraction (review round 2, A-R2-7)', async () => {
+    const { engine, execs } = fakeEngine([
+      container({ id: 'a'.repeat(64), name: 'one', created: '2026-10-03T20:00:00.9Z' }),
+      container({ id: 'b'.repeat(64), name: 'two', created: '2026-10-03T20:00:00.10Z' }),
+    ]);
+    await flow(engine);
+    expect(execs[0].container).toBe('a'.repeat(64));
+  });
 });
+

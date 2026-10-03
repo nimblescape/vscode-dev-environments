@@ -362,4 +362,25 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     expect(result.stdout).toHaveLength(MAX_EXEC_OUTPUT_CHARACTERS);
     expect(seen).toBe(big.length);
   });
+
+  it('ends the exec when onOutput throws, never the process (review round 2, A-R2-1)', async () => {
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(frame(1, 'x')));
+    await expect(
+      engine.exec('c1', ['true'], {
+        onOutput: () => {
+          throw new Error('the listener broke');
+        },
+      }),
+    ).rejects.toThrow('the listener broke');
+  });
+
+  it('a cancel while the output streams ends the exec with an AbortError (review round 2, missing test 1)', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(frame(1, 'started')) });
+    const controller = new AbortController();
+    const output: string[] = [];
+    const running = engine.exec('c1', ['sleep', '60'], { signal: controller.signal, onOutput: (_stream, text) => (output.push(text), controller.abort()) });
+    await expect(running).rejects.toMatchObject({ name: 'AbortError' });
+    expect(output).toEqual(['started']);
+  });
 });
+

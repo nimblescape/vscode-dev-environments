@@ -43,20 +43,20 @@ function hostWith(remoteUser: string | undefined, requests: string[]): HostSide 
     requests.push(name);
     throw new Error(`The flow called ${name}.`);
   };
-  const deny = new Proxy({}, { get: (_target, key) => refuse(String(key)) });
+  const deny = (names: string[]) => Object.fromEntries(names.map((name) => [name, refuse(name)]));
   return {
-    questions: deny,
-    state: deny,
-    secrets: deny,
-    connect: deny,
+    questions: deny(['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message']),
+    state: deny(['windowStatuses', 'pendings', 'settings', 'processAlive']),
+    secrets: deny(['token', 'registry']),
+    connect: deny(['connect']),
     records: {
-      ...(deny as HostSide['records']),
+      ...deny(['read', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile']),
       get: async (id: string) => {
         requests.push(`get ${id}`);
         return { id, remoteUser } as Environment;
       },
     },
-  } as HostSide;
+  } as unknown as HostSide;
 }
 
 describe('the flows through a real worker (plan step 11B1)', () => {

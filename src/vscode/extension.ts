@@ -671,7 +671,7 @@ async function activateExtension(
             logger,
           }),
           logger,
-          FLOW_REQUESTS[op] ?? [],
+          Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [],
         ),
       }),
     service,
