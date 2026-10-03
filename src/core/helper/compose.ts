@@ -690,6 +690,9 @@ function rewriteModel(
         service.stop_grace_period = capped;
       }
     }
+    // User decisions 2026-10-03: every image that Compose builds carries the environment ID (the image checks link the
+    // images to their environments by it).
+    if (isRecord(service.build)) service.build.labels = { ...labelMap(service.build.labels), [LABEL_ENVIRONMENT_ID]: p.environmentId };
     // Images that Compose builds: the name of the project, never a name that another environment could use too.
     if (!isDev && isRecord(service.build)) {
       const image = composeServiceImage(p.project, name);
@@ -707,6 +710,15 @@ function rewriteModel(
   }
   volumes[WORKSPACE_VOLUME_KEY] = { name: p.volumeName, external: true };
   model.volumes = volumes;
+  // User decisions 2026-10-03: every network that Compose creates for the project carries the environment ID; an
+  // external network is not the project's.
+  if (isRecord(model.networks)) {
+    for (const [key, network] of Object.entries(model.networks)) {
+      const value = isRecord(network) ? network : {};
+      if (value.external === true || isRecord(value.external)) continue;
+      model.networks[key] = { ...value, labels: { ...labelMap(value.labels), [LABEL_ENVIRONMENT_ID]: p.environmentId } };
+    }
+  }
   return { model, rewrites, createFolders: [...createFolders], serviceFolders: [...serviceFolders] };
 }
 

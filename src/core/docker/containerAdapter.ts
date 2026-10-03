@@ -1290,8 +1290,8 @@ export class ContainerAdapter {
   /**
    * User decision 2026-09-28: the named images of the Docker host whose repository starts with `devenv-` (`docker image
    * ls --filter reference=devenv-*`), each image once with its full ID and its references `repository:tag`: the
-   * environment images `devenv-<short id>:<build>` and the images that Docker Compose built for an environment
-   * (`devenv-<short id>-<service>`), whichever computer built them. Throws CommandError, or an AbortError when `signal`
+   * environment images `<environment name>:<build>` and the images that Docker Compose built for an environment
+   * (`<environment name>-<service>`; resourceName), whichever computer built them. Throws CommandError, or an AbortError when `signal`
    * aborts.
    */
   async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {

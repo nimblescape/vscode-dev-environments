@@ -329,56 +329,79 @@ export function environmentImageClass(names: readonly string[], own: ReadonlySet
   return names.some((name) => own.has(name)) ? 'own' : 'other';
 }
 
+/** The owner accounts of the environments on a host: by name (resourceName, in lower case) and by environment ID. */
+export interface EnvironmentOwners {
+  byName: ReadonlyMap<string, string>;
+  byId: ReadonlyMap<string, string>;
+}
+
 /**
- * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag`), by the
- * owner account of each environment name (`owners`: of the registry entries, and of the labels of the volumes of the
- * host) and the account `accountId`.
+ * EnvironmentImageIds of `images` (the environment images of the host, with their references `repository:tag` and the
+ * label nimblescape.devenv.environment-id that the extension gives the images it builds, `environmentId`), by the
+ * owner accounts of the environments (`owners`: of the registry entries, and of the labels of the volumes of the host)
+ * and the account `accountId`. User decisions 2026-10-03: an image with the label belongs to the environment of that ID
+ * (an ID of no known owner counts as another account's), unless one of its names is the name of a known environment of
+ * another account; an image without it is decided by its names (environmentImageClass).
  */
 export function environmentImageIds(
-  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
-  owners: ReadonlyMap<string, string>,
+  images: ReadonlyArray<{ id: string; tags: readonly string[]; environmentId?: string }>,
+  owners: EnvironmentOwners,
   accountId: string,
 ): EnvironmentImageIds {
-  const ownNames = new Set([...owners].filter(([, owner]) => owner === accountId).map(([name]) => name));
-  const otherNames = new Set([...owners].filter(([, owner]) => owner !== accountId).map(([name]) => name));
+  const ownNames = new Set([...owners.byName].filter(([, owner]) => owner === accountId).map(([name]) => name));
+  const otherNames = new Set([...owners.byName].filter(([, owner]) => owner !== accountId).map(([name]) => name));
   const own = new Set<string>();
   const others = new Set<string>();
   for (const image of images) {
-    for (const tag of image.tags) {
-      const kind = environmentImageClass(environmentImageNames(tag), ownNames, otherNames);
-      if (kind !== 'none') (kind === 'own' ? own : others).add(image.id.toLowerCase());
+    const names = image.tags.map(environmentImageNames);
+    let kinds: Array<'none' | 'own' | 'other'>;
+    if (image.environmentId !== undefined) {
+      const byLabel = owners.byId.get(image.environmentId) === accountId ? 'own' : 'other';
+      kinds = [names.some((list) => list.some((name) => otherNames.has(name))) ? 'other' : byLabel];
+    } else {
+      kinds = names.map((list) => environmentImageClass(list, ownNames, otherNames));
     }
+    for (const kind of kinds) if (kind !== 'none') (kind === 'own' ? own : others).add(image.id.toLowerCase());
   }
   return { own, others, ownNames, otherNames };
 }
 
 /**
  * Whether a reference of `images` (with `ids`, only of the images with one of these IDs: the images that the references
- * of a configuration found) or of `references` has names of environments (environmentImageNames) of which `owners`
- * knows none: then the owners of the volumes of the host are read too.
+ * of a configuration found) or of `references` belongs to an environment that `owners` does not know: an image with an
+ * environment ID of no known owner, or names of environments (environmentImageNames) of which none is known. Then the
+ * owners of the volumes of the host are read too.
  */
-export function hasUnknownEnvironmentNames(
-  images: ReadonlyArray<{ id: string; tags: readonly string[] }>,
+export function hasUnknownEnvironment(
+  images: ReadonlyArray<{ id: string; tags: readonly string[]; environmentId?: string }>,
   references: readonly string[],
-  owners: ReadonlyMap<string, string>,
+  owners: EnvironmentOwners,
   ids?: ReadonlySet<string>,
 ): boolean {
   const unknown = (reference: string): boolean => {
     const names = environmentImageNames(reference);
-    return names.length > 0 && !names.some((name) => owners.has(name));
+    return names.length > 0 && !names.some((name) => owners.byName.has(name));
   };
   if (references.some(unknown)) return true;
-  return images.some((image) => (ids === undefined || ids.has(image.id.toLowerCase())) && image.tags.some(unknown));
+  return images.some(
+    (image) =>
+      (ids === undefined || ids.has(image.id.toLowerCase())) &&
+      (image.environmentId !== undefined ? !owners.byId.has(image.environmentId) : image.tags.some(unknown)),
+  );
 }
 
 /**
- * The owner account of each environment name (resourceName, in lower case) by the labels of `volumes`
- * (nimblescape.devenv.environment-id, nimblescape.devenv.repository, and nimblescape.devenv.owner-id). A name whose
- * volumes carry different owners is left out: its images count as another account's (environmentImageClass).
+ * The owner account of each environment name (resourceName, in lower case) and of each environment ID by the labels of
+ * `volumes` (nimblescape.devenv.environment-id, nimblescape.devenv.repository, and nimblescape.devenv.owner-id). A name
+ * or ID whose volumes carry different owners is left out: its images count as another account's.
  */
-export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): Map<string, string> {
+export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<string, string>> }>): { byName: Map<string, string>; byId: Map<string, string> } {
   const owners = new Map<string, string | undefined>();
+  const ids = new Map<string, string | undefined>();
   for (const volume of volumes) {
+    const labelledId = volume.labels[LABEL_ENVIRONMENT_ID];
+    const labelledOwner = volume.labels[LABEL_OWNER_ID];
+    if (labelledId && labelledOwner) ids.set(labelledId, ids.has(labelledId) && ids.get(labelledId) !== labelledOwner ? undefined : labelledOwner);
     const id = volume.labels[LABEL_ENVIRONMENT_ID];
     const repository = volume.labels[LABEL_REPOSITORY];
     const owner = volume.labels[LABEL_OWNER_ID];
@@ -391,7 +414,8 @@ export function volumeOwners(volumes: ReadonlyArray<{ labels: Readonly<Record<st
     }
     owners.set(name, owners.has(name) && owners.get(name) !== owner ? undefined : owner);
   }
-  return new Map([...owners].filter((entry): entry is [string, string] => entry[1] !== undefined));
+  const known = (map: Map<string, string | undefined>): Map<string, string> => new Map([...map].filter((entry): entry is [string, string] => entry[1] !== undefined));
+  return { byName: known(owners), byId: known(ids) };
 }
 
 /** The item of an image reference that names an image of the environments of another account (protected). */

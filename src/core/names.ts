@@ -45,7 +45,7 @@ export const LABEL_OWNER_ID = 'nimblescape.devenv.owner-id';
 export const LABEL_VOLUME = 'nimblescape.devenv.volume';
 export const VOLUME_KIND_ADDITIONAL = 'additional';
 /**
- * nimblescape.devenv.volume of a named volume of the Compose project of an environment (`devenv-<short id>_<key>`, the
+ * nimblescape.devenv.volume of a named volume of the Compose project of an environment (`<project>_<key>`, composeProjectName, the
  * data of its services, for example of a database): created by the extension before `up` with the labels of the
  * environment, never shared with another environment, and removed by Delete only when the user asks for it.
  */
@@ -218,10 +218,6 @@ export const GH_VOLUME_CONFIG_FILE = `${GH_VOLUME_FOLDER}/config.yml`;
 
 export function newEnvironmentId(): string {
   return crypto.randomUUID();
-}
-
-export function shortId(environmentId: string): string {
-  return environmentId.slice(0, 8);
 }
 
 export function splitRepository(repository: string): { owner: string; name: string } {

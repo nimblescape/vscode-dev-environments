@@ -102,6 +102,7 @@ import {
   splitRepository,
 } from '../names';
 import { namePair } from '../namePairs';
+import { imageBuildRecord, imageRecordLabels } from './imageRecord';
 import { isAvailableTo, ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
 import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
@@ -122,7 +123,7 @@ import {
   imageReferencesToInspect,
   inspectedImageItems,
   otherAccountImageItems,
-  hasUnknownEnvironmentNames,
+  hasUnknownEnvironment,
   volumeOwners,
   isOwnVolume,
   isRefused,
@@ -259,6 +260,9 @@ export type EnvironmentDocker = Pick<
   | 'runChecked'
   | 'findContainer'
   | 'containerState'
+  | 'imageLabels'
+  | 'imageLabelsOf'
+  | 'labelImage'
   | 'listEnvironmentContainers'
   | 'removeContainer'
   | 'renameContainer'
@@ -1603,8 +1607,10 @@ export class EnvironmentService {
     ctx.lifecycleMarkRead = ctx.env.lifecycleIncomplete;
     const container = await docker.findContainer(ctx.env.id, ctx.env.containerName);
     ctx.composeContainer = container !== undefined && isComposeContainer(container.labels, composeProjectName(ctx.env.repository, ctx.env.id));
-    const record = ctx.env.buildRecord;
-    const imagePresent = record !== undefined && (await docker.imageExists(record.environmentImage));
+    // User decisions 2026-10-03: an entry without a build record (restored from its volume after a lost registry, or an
+    // environment that another computer created) takes the record of its newest image (adoptImageRecord).
+    const record = ctx.env.buildRecord ?? (await this.adoptImageRecord(ctx));
+    const imagePresent = record !== undefined && (await this.pinnedImagePresent(record));
     this.logger.info(
       `State of ${ctx.env.repository}: container ${container ? container.state : 'missing'}, environment image ` +
         (record ? `${record.environmentImage} ${imagePresent ? 'present' : 'missing'}` : 'not built yet') +
@@ -2315,11 +2321,26 @@ export class EnvironmentService {
       return unread('images of the environments', ENVIRONMENT_IMAGES_UNREAD, error);
     }
     this.throwIfCancelled(signal);
-    const owners = new Map<string, string>();
-    for (const entry of environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env))) owners.set(resourceName(entry.repository, entry.id).toLowerCase(), entry.owner.id);
-    owners.set(resourceName(env.repository, env.id).toLowerCase(), env.owner.id);
+    // User decisions 2026-10-03: the label nimblescape.devenv.environment-id of each image (one `docker image inspect`).
+    let labels: Map<string, Record<string, string>>;
+    try {
+      labels = images.length === 0 ? new Map() : await this.deps.docker.imageLabelsOf(images.map((image) => image.id), signal);
+    } catch (error) {
+      return unread('images of the environments', ENVIRONMENT_IMAGES_UNREAD, error);
+    }
+    this.throwIfCancelled(signal);
+    const labelled = images.map((image) => {
+      const environmentId = labels.get(image.id.toLowerCase())?.[LABEL_ENVIRONMENT_ID];
+      return environmentId === undefined ? image : { ...image, environmentId };
+    });
+    const byName = new Map<string, string>();
+    const byId = new Map<string, string>();
+    for (const entry of [...environmentsOfHost(await this.deps.registry.list(), dockerHostOf(env)), env]) {
+      byName.set(resourceName(entry.repository, entry.id).toLowerCase(), entry.owner.id);
+      byId.set(entry.id, entry.owner.id);
+    }
     const foundIds = new Set(found.map((image) => image.id.toLowerCase()));
-    if (hasUnknownEnvironmentNames(images, missingNamed, owners, foundIds)) {
+    if (hasUnknownEnvironment(labelled, missingNamed, { byName, byId }, foundIds)) {
       let volumes: VolumeInfo[];
       try {
         volumes = await this.deps.docker.listEnvironmentVolumes(signal);
@@ -2327,9 +2348,11 @@ export class EnvironmentService {
         return unread('volumes of the environments', ENVIRONMENT_OWNERS_UNREAD, error);
       }
       this.throwIfCancelled(signal);
-      for (const [name, owner] of volumeOwners(volumes)) if (!owners.has(name)) owners.set(name, owner);
+      const fromVolumes = volumeOwners(volumes);
+      for (const [name, owner] of fromVolumes.byName) if (!byName.has(name)) byName.set(name, owner);
+      for (const [id, owner] of fromVolumes.byId) if (!byId.has(id)) byId.set(id, owner);
     }
-    return { ids: environmentImageIds(images, owners, env.owner.id) };
+    return { ids: environmentImageIds(labelled, { byName, byId }, env.owner.id) };
   }
 
   /**
@@ -2533,6 +2556,55 @@ export class EnvironmentService {
   }
 
   /**
+   * User decisions 2026-10-03 (option 1): whether the environment image of `record` exists with the ID that the record
+   * pins (BuildRecord.imageId). An image under that name with another ID (or a record without a pinned ID) was not built
+   * or taken over by this computer: it is not used, and the open builds again (the build removes the other tags of the
+   * environment image).
+   */
+  private async pinnedImagePresent(record: BuildRecord): Promise<boolean> {
+    const id = await this.deps.docker.imageId(record.environmentImage);
+    if (id === undefined) return false;
+    if (record.imageId !== undefined && id.toLowerCase() === record.imageId.toLowerCase()) return true;
+    this.logger.warn(`The environment image ${record.environmentImage} has the ID ${id}, not the ID of its build record (${record.imageId ?? 'none'}). It is not used.`);
+    return false;
+  }
+
+  /**
+   * User decisions 2026-10-03: the build record of the newest environment image of `ctx.env` (the highest build number
+   * of environmentImageRepository), from its labels (imageBuildRecord: its environment ID, repository, and owner must
+   * be those of the environment, and the record must name that image), with the ID of that image pinned (option 1). The
+   * record is written to the entry. `undefined` when there is no such image or its labels do not fit (the open builds,
+   * as without a record). Only the image of the environment's own ID: never an image without the volume of its ID.
+   */
+  private async adoptImageRecord(ctx: PipelineContext): Promise<BuildRecord | undefined> {
+    const env = ctx.env;
+    const repository = environmentImageRepository(env.repository, env.id);
+    let tags: string[];
+    try {
+      tags = await this.deps.docker.listImageTags(repository);
+    } catch (error) {
+      this.logger.warn(`The tags of ${repository} could not be listed: ${errorMessage(error)}`);
+      return undefined;
+    }
+    const newest = tags.map((tag) => ({ tag, number: Number(tag.slice(repository.length + 1)) })).filter((entry) => Number.isSafeInteger(entry.number) && entry.number > 0).sort((a, b) => b.number - a.number)[0];
+    if (newest === undefined) return undefined;
+    const id = await this.deps.docker.imageId(newest.tag);
+    const labels = id === undefined ? undefined : await this.deps.docker.imageLabels(id);
+    const found = labels === undefined ? undefined : imageBuildRecord(labels, env, newest.tag, newest.number);
+    if (id === undefined || found === undefined) {
+      this.logger.warn(`The environment image ${newest.tag} has no build record of ${env.repository} (${found === undefined ? 'its labels do not fit' : 'it is gone'}). The environment is built again.`);
+      return undefined;
+    }
+    const record: BuildRecord = { ...found, imageId: id };
+    await this.updateEntry(ctx, (entry) => {
+      entry.buildRecord = record;
+      entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, record.buildNumber);
+    });
+    this.logger.info(`The build record of ${env.repository} was taken from its environment image ${newest.tag} (${id}).`);
+    return record;
+  }
+
+  /**
    * Step 7: digests of the registries, compared with the build record (concept 7.7). `localEnvironment`: an environment
    * image or a container exists, which starts without a registry.
    */
@@ -2634,6 +2706,31 @@ export class EnvironmentService {
     await this.updateEntry(ctx, (entry) => {
       entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);
     });
+    // User decisions 2026-10-03: the build record of the new image, before the build, so that the image carries it
+    // (imageRecordLabels); its pinned ID follows after the labels (option 1).
+    const current = plan.check.kind === 'checked' ? plan.check.outcome : undefined;
+    const builtRecord: BuildRecord = {
+      builtAt: isoTime(this.deps.clock),
+      environmentImage: imageName,
+      buildNumber,
+      configPath: loaded.configPath,
+      configHash: loaded.configHash,
+      images: recordDigests(loaded.references.images, current?.images, record?.images, stale),
+      features: recordDigests(loaded.references.features, current?.features, record?.features),
+      ...(loaded.compose
+        ? {
+            compose: {
+              service: loaded.compose.service,
+              images: builtServiceImages(loaded.compose.output.model, loaded.compose.project, loaded.compose.service),
+              serviceImages: composeServiceImageReferences(loaded.compose.output.model, loaded.compose.service),
+              version: loaded.compose.output.version,
+              inputsHash: loaded.compose.inputsHash,
+              // Review round 10 (D10-1): the paths that other services mount are in Environment.serviceFolders.
+            },
+          }
+        : {}),
+    };
+    let builtImageId: string;
     try {
       await this.requireVolume(env);
       await this.deps.helper.build({
@@ -2654,6 +2751,17 @@ export class EnvironmentService {
         throw error;
       });
       if (!present) throw new Error(`The environment image ${imageName} is missing after the build.`);
+      // User decisions 2026-10-03: the labels of the environment image (its environment ID, repository, owner, and build
+      // record), and its ID after them, which the record pins (option 1). A failure removes the image like a failed build.
+      try {
+        await this.deps.docker.labelImage(imageName, imageRecordLabels(env, builtRecord), ctx.signal);
+        const id = await this.deps.docker.imageId(imageName);
+        if (id === undefined) throw new Error(`The environment image ${imageName} is missing after its labels.`);
+        builtImageId = id;
+      } catch (error) {
+        if (!this.isCancellation(error, ctx.signal)) await this.quietly(`remove the image ${imageName}`, () => this.deps.docker.removeImage(imageName));
+        throw error;
+      }
     } catch (error) {
       // Review round 3 of PR #64 (P6a): the helper image of the open is gone; no "started instead" and no buildFailed.
       if (isHelperFailed(error)) return this.helperFailedInUpdate(ctx, error);
@@ -2855,29 +2963,8 @@ export class EnvironmentService {
       return keep ? { result, created: false, container: survivor } : { result, created: true };
     }
 
-    // Concept 7.7 step 4: the new build record, then the old images go.
-    const current = plan.check.kind === 'checked' ? plan.check.outcome : undefined;
-    const newRecord: BuildRecord = {
-      builtAt: isoTime(this.deps.clock),
-      environmentImage: imageName,
-      buildNumber,
-      configPath: loaded.configPath,
-      configHash: loaded.configHash,
-      images: recordDigests(loaded.references.images, current?.images, record?.images, stale),
-      features: recordDigests(loaded.references.features, current?.features, record?.features),
-      ...(loaded.compose
-        ? {
-            compose: {
-              service: loaded.compose.service,
-              images: builtServiceImages(loaded.compose.output.model, loaded.compose.project, loaded.compose.service),
-              serviceImages: composeServiceImageReferences(loaded.compose.output.model, loaded.compose.service),
-              version: loaded.compose.output.version,
-              inputsHash: loaded.compose.inputsHash,
-              // Review round 10 (D10-1): the paths that other services mount are in Environment.serviceFolders.
-            },
-          }
-        : {}),
-    };
+    // Concept 7.7 step 4: the new build record (with the ID of the labelled image), then the old images go.
+    const newRecord: BuildRecord = { ...builtRecord, imageId: builtImageId };
     await this.updateEntry(ctx, (entry) => {
       entry.buildRecord = newRecord;
       entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);

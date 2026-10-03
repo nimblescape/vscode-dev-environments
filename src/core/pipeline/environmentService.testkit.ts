@@ -423,6 +423,39 @@ export class FakeDocker implements EnvironmentDocker {
     return this.imageIds.get(reference) ?? `sha256:image-of-${reference}`;
   }
 
+  /** The name of the image `reference` (a name, or the ID of one), undefined when none. */
+  private imageNamed(reference: string): string | undefined {
+    if (this.images.has(reference)) return reference;
+    return [...this.images].find((name) => (this.imageIds.get(name) ?? `sha256:image-of-${name}`) === reference);
+  }
+
+  async imageLabels(reference: string): Promise<Record<string, string> | undefined> {
+    const name = this.imageNamed(reference);
+    return name === undefined ? undefined : { ...(this.imageConfigs.get(name)?.Labels ?? {}) };
+  }
+
+  async imageLabelsOf(references: readonly string[]): Promise<Map<string, Record<string, string>>> {
+    const labels = new Map<string, Record<string, string>>();
+    for (const reference of references) {
+      const name = this.imageNamed(reference);
+      if (name !== undefined) labels.set((this.imageIds.get(name) ?? `sha256:image-of-${name}`).toLowerCase(), { ...(this.imageConfigs.get(name)?.Labels ?? {}) });
+    }
+    return labels;
+  }
+
+  /** The labels that labelImage gave each image, by name (the fake keeps the ID of the image). */
+  readonly labelled = new Map<string, Record<string, string>>();
+  /** labelImage fails with this error, when set. */
+  labelImageError: Error | undefined;
+
+  async labelImage(image: string, labels: Record<string, string>): Promise<void> {
+    if (this.labelImageError) throw this.labelImageError;
+    if (!this.images.has(image)) throw new Error(`The image ${image} does not exist.`);
+    this.labelled.set(image, { ...labels });
+    const config = this.imageConfigs.get(image) ?? { User: '' };
+    this.imageConfigs.set(image, { ...config, Labels: { ...(config.Labels ?? {}), ...labels } });
+  }
+
   async removeImage(reference: string): Promise<boolean> {
     this.log.push(`rmi ${reference}`);
     return this.images.delete(reference);
@@ -1400,6 +1433,7 @@ export async function seedEnvironment(h: Harness, options: SeedOptions = {}): Pr
       : {
           builtAt: '2026-09-20T10:00:00.000Z',
           environmentImage: environmentImageName(repository, id, 1),
+          imageId: `sha256:image-of-${environmentImageName(repository, id, 1)}`,
           buildNumber: 1,
           configPath: DEFAULT_CONFIG_PATH,
           configHash: configHash(DEFAULT_CONFIG_TEXT),
