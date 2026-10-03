@@ -55,6 +55,7 @@ function fakeChannel() {
     docker: vi.fn(async () => ({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false })),
     pull: vi.fn(async (_reference: string, _options?: unknown) => {}),
     startContainers: vi.fn(async (_ids: readonly string[], _options?: unknown) => {}),
+    flow: vi.fn(async (_op: string, _params: unknown, _options?: unknown): Promise<unknown> => ({ outcome: 'notRunning' })),
   };
   return channel;
 }
@@ -214,6 +215,21 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     }
     await channels.startContainers(REMOTE, ['a'.repeat(64)], { signal, timeoutMs: 1_000 });
     expect(channel.startContainers.mock.calls.at(-1)).toEqual([['a'.repeat(64)], { signal, timeoutMs: 1_000 }]);
+    channels.dispose();
+  });
+
+  // Plan step 11B1 (review round 2, B-R2-3): a flow goes to the channel of its target with all its options, once more
+  // after `closed`.
+  it('flow: its options passed on, once more after closed', async () => {
+    const channel = fakeChannel();
+    const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
+    const options = { signal: new AbortController().signal, timeoutMs: 60_000, onAsk: async () => ({ value: null }) };
+    channel.flow.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
+    expect(await channels.flow(REMOTE, 'tokenRemove', { environmentId: 'e1' }, options)).toEqual({ outcome: 'notRunning' });
+    expect(channel.flow.mock.calls).toEqual([
+      ['tokenRemove', { environmentId: 'e1' }, options],
+      ['tokenRemove', { environmentId: 'e1' }, options],
+    ]);
     channels.dispose();
   });
 

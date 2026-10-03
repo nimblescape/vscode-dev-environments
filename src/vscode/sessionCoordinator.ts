@@ -304,6 +304,7 @@ export class SessionCoordinator implements vscode.Disposable {
       } catch (error) {
         this.logger.warn(`The storage folder could not be cleaned up. ${errorMessage(error)}`);
       }
+      if (this.deactivated || this.stopped) return;
       const maxAgeMs = HEARTBEAT_MAX_AGE_MS + waitingTimeMs(this.deps.settings());
       let statuses: WindowStatus[] = [];
       try {
@@ -312,6 +313,9 @@ export class SessionCoordinator implements vscode.Disposable {
         this.logger.warn(`The window status files could not be read. ${errorMessage(error)}`);
       }
       for (const status of statuses) {
+        // A run that was under way when the window closed removes nothing more (it reads files that the closing wrote
+        // after it started; found by the CI of PR #91).
+        if (this.deactivated || this.stopped) break;
         if (status.windowId === this.windowId || this.isAlive(status.pid)) continue;
         const updatedAt = Date.parse(status.updatedAt);
         if (Number.isFinite(updatedAt) && Math.abs(now - updatedAt) <= maxAgeMs) continue;

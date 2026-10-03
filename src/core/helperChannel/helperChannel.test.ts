@@ -575,6 +575,51 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     });
   });
 
+  // Plan step 11B1 (review round 1, missing test 5): a flow in the worker, with its time limit; refused, sending nothing,
+  // by a worker that does not know it.
+  describe('flow', () => {
+    it('sends the operation with its parameters and time limit, and gives its value', async () => {
+      const fake = fakeProcess();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger: recordingLogger().logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ ...HELLO, ops: ['docker', 'tokenRemove'] } as ServerMessage);
+      const channel = await opening;
+      const removing = channel.flow('tokenRemove', { environmentId: 'e1', containerName: 'c' }, { timeoutMs: 60_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'tokenRemove', params: { environmentId: 'e1', containerName: 'c' }, timeoutMs: 60_000 });
+      fake.answer({ t: 'result', id: op.id, ok: true, value: { outcome: 'notRunning' } });
+      expect(await removing).toEqual({ outcome: 'notRunning' });
+    });
+
+    it('answers the requests of the flow with its onAsk, and a cancel of its signal ends it (review round 2, B-R2-3)', async () => {
+      const fake = fakeProcess();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger: recordingLogger().logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ ...HELLO, ops: ['docker', 'tokenRemove'] } as ServerMessage);
+      const channel = await opening;
+      const controller = new AbortController();
+      const removing = channel.flow('tokenRemove', {}, { signal: controller.signal, onAsk: async () => ({ value: { remoteUser: 'dev' } }) });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'record', payload: { call: 'get', args: ['e1'] } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.messages().filter((message) => message.t === 'answer')).toEqual([{ t: 'answer', id: op.id, ask: 1, ok: true, value: { remoteUser: 'dev' } }]);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.messages().some((message) => message.t === 'cancel' && (message as { id?: number }).id === op.id)).toBe(true);
+      fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+      await expect(removing).rejects.toBeDefined();
+    });
+
+    it('refuses an operation that the worker does not know, sending nothing', async () => {
+      const { channel, fake } = await openChannel();
+      const before = fake.messages().length;
+      await expect(channel.flow('tokenRemove', {})).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages()).toHaveLength(before);
+    });
+  });
+
   describe('docker', () => {
     it('returns the result of a Docker call: its output, its exit code, and passes its input', async () => {
       const { channel, fake, lines } = await openChannel();

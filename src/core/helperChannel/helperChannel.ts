@@ -782,6 +782,15 @@ export class HelperChannel {
   }
 
   /**
+   * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): a flow that runs in the worker (`tokenRemove`
+   * first). `onAsk` answers its requests for what only the user's computer has (hostSideHandler). Rejects as `operation`.
+   */
+  async flow(op: string, params: unknown, options: Pick<OperationOptions, 'signal' | 'timeoutMs' | 'onAsk' | 'onProgress'> = {}): Promise<unknown> {
+    if (!this.operations.includes(op)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${op}.`);
+    return this.operation(op, params, options);
+  }
+
+  /**
    * Plan step 10A (decision of 2026-10-03): `startContainers` of the containers `ids` (full IDs) by the worker over the
    * Engine API. Rejects as `operation`; HelperChannelError('unsendable') for IDs that the worker would refuse.
    */

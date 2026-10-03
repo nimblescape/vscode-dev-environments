@@ -16,7 +16,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
-import { removeContainerToken } from '../core/helper/containerToken';
+import { OP_TOKEN_REMOVE, parseTokenRemoveValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
@@ -84,8 +84,11 @@ const HANDOFF_CHECK_MS = 30_000;
  * Connection" that its connection closed; a running extension host means that the user kept the connection.
  */
 const LEAVE_CHECK_MS = 10_000;
-/** The `docker exec` that removes the token of the owner account from the memory of a running dev container. */
-const TOKEN_REMOVAL_TIMEOUT_MS = 30_000;
+/**
+ * The whole token removal in the worker (plan step 11B1): the two tries of the flow (TOKEN_REMOVE_TIMEOUT_MS each) and
+ * the requests around them.
+ */
+const TOKEN_REMOVAL_TIMEOUT_MS = 60_000;
 /**
  * The reopen rule (concept 7.10) looks at the other windows. Windows that VS Code restores at the same start write their
  * status files during their own activation; this pause lets them do so first.
@@ -114,6 +117,12 @@ export interface ControllerDeps {
   /** Requests of other windows to close this window's connection first (concept 6.2 Stop, 7.14). */
   disconnectRequests: DisconnectRequests;
   docker: ContainerAdapter;
+  /**
+   * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the current engine
+   * (`tokenRemove` first), with the HostSide of this computer answering its requests. Undefined only in tests that do not
+   * exercise a flow.
+   */
+  flow?: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
   service: EnvironmentService;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
@@ -1861,8 +1870,8 @@ export class Controller implements vscode.Disposable {
   /**
    * Concept 7.5: the token of the owner account leaves the environment that the signed-in account may not use, so that
    * Git and the GitHub CLI there cannot work as the owner while a window keeps its connection. Unit 15: the token is only
-   * in the memory of the dev container, so it is removed from there when the container runs (removeContainerToken:
-   * TOKEN_REMOVE_SCRIPT with `docker exec`, as root, or as the remote user of the entry when root may not); a stopped
+   * in the memory of the dev container, so it is removed from there when the container runs (plan step 11B1: the
+   * operation `tokenRemove`, a flow of the worker, as root, or as the remote user of the entry when root may not); a stopped
    * container holds no token. The credential helper of the container then gives nothing; the next open of the owner
    * writes the token again (section 9). Best effort: the result is logged.
    */
@@ -1876,18 +1885,15 @@ export class Controller implements vscode.Disposable {
         this.logger.info(`The container ${containerName} is on another Docker host. Its token is not removed from here.`);
         return;
       }
-      const container = await this.deps.docker.findContainer(left.environmentId, containerName);
-      if (container?.state !== 'running') {
-        this.logger.info(`The container ${containerName} does not run: its memory holds no GitHub token.`);
+      // Plan step 11B1: the flow runs in the worker of the engine (its log lines come from there).
+      if (this.deps.flow === undefined) {
+        // Review round 1 of plan step 11B1 (A-R1-9): never silent.
+        this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: this window runs no flow in a worker.`);
         return;
       }
-      const entry = await this.deps.registry.get(left.environmentId).catch(() => undefined);
-      await removeContainerToken((c, command, options) => this.deps.docker.exec(c, command, options), {
-        container: container.id,
-        user: entry?.remoteUser,
-        timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS,
-      });
-      this.logger.info(`The GitHub token was removed from the container ${containerName}.`);
+      // Review round 1 of plan step 11B1 (A-R1-5): bounded, as the docker exec was before.
+      const value = await this.deps.flow(OP_TOKEN_REMOVE, { environmentId: left.environmentId, containerName }, { timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS });
+      if (parseTokenRemoveValue(value) === undefined) throw new Error('The worker answered the token removal with an invalid value.');
     } catch (error) {
       this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${errorMessage(error)}`);
     }

@@ -319,11 +319,6 @@ export function tokenWriteCommand(user: string, login: string): string[] {
   return ['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', user, login];
 }
 
-/** `sh -c` command of TOKEN_REMOVE_SCRIPT. */
-export function tokenRemoveCommand(): string[] {
-  return ['sh', '-c', TOKEN_REMOVE_SCRIPT, 'sh'];
-}
-
 /** The login that TOKEN_WRITE_SCRIPT gets: `''` for a login that is no GitHub login (gh is then signed in nowhere). */
 export function tokenLogin(login: string): string {
   return isGitHubLogin(login) ? login : '';
@@ -361,21 +356,4 @@ export async function writeContainerToken(
   });
   if (result.exitCode !== 0) throw new Error(tokenRunMessage(result, p.token));
   return tokenRunMessage({ ...result, stderr: '' }, p.token);
-}
-
-/**
- * Empties TOKEN_FOLDER of the running dev container `container` (TOKEN_REMOVE_SCRIPT): as root, and when that fails
- * (for example when the configuration takes the rights of root away) as `user`. Throws an Error with the reason when the
- * token is still there.
- */
-export async function removeContainerToken(
-  exec: ContainerExec,
-  p: { container: string; user?: string; signal?: AbortSignal; timeoutMs?: number },
-): Promise<void> {
-  const options = { signal: p.signal, timeoutMs: p.timeoutMs };
-  const asRoot = await exec(p.container, tokenRemoveCommand(), { ...options, user: 'root' });
-  if (asRoot.exitCode === 0) return;
-  if (p.user === undefined || p.user === '' || p.user === 'root' || p.user === '0') throw new Error(tokenRunMessage(asRoot));
-  const asUser = await exec(p.container, tokenRemoveCommand(), { ...options, user: p.user });
-  if (asUser.exitCode !== 0) throw new Error(`${tokenRunMessage(asRoot)} As ${p.user}: ${tokenRunMessage(asUser)}`);
 }
