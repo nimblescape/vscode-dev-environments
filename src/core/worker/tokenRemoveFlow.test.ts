@@ -188,8 +188,10 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
 
   it('takes the newest by its time, whatever the digits of its fraction (review round 2, A-R2-7)', async () => {
     const { engine, execs } = fakeEngine([
-      container({ id: 'a'.repeat(64), name: 'one', created: '2026-10-03T20:00:00.9Z' }),
-      container({ id: 'b'.repeat(64), name: 'two', created: '2026-10-03T20:00:00.10Z' }),
+      container({ id: 'a'.repeat(64), name: 'one', created: '2026-10-03T20:00:00.5Z' }),
+      // Review round 3 of plan step 11B1 (A-R3-5): sorts before `.5Z` as text, but is older.
+      container({ id: 'b'.repeat(64), name: 'two', created: '2026-10-03T20:00:00Z' }),
+      container({ id: 'c'.repeat(64), name: 'three' }),
     ]);
     await flow(engine);
     expect(execs[0].container).toBe('a'.repeat(64));
@@ -202,5 +204,25 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
     // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts).
     expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(60_000);
+  });
+
+  it('takes any failure but a cancel as a failed try, and a removed container as notRunning (review round 3, A-R3-2, A-R3-3)', async () => {
+    const engine = fakeEngine([container()]).engine;
+    let calls = 0;
+    engine.exec = async (_c, _cmd, options = {}) => {
+      calls++;
+      if (options.user === 'root') throw new Error('The connection to the engine closed before the output ended.');
+      return ok();
+    };
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }) })).toMatchObject({ outcome: 'removed' });
+    expect(calls).toBe(2);
+    engine.exec = async () => {
+      throw new EngineError(`No such container: ${ID}`, 404);
+    };
+    expect(await flow(engine)).toEqual({ outcome: 'notRunning' });
+    engine.exec = async () => {
+      throw new EngineError('No such exec instance', 404);
+    };
+    await expect(flow(engine)).rejects.toThrow('No such exec instance');
   });
 });

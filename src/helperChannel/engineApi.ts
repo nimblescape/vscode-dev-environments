@@ -193,6 +193,8 @@ function engineStream(socket: Duplex, head: Buffer, onFrame: EngineHijackRequest
   /** Hands every whole frame to onFrame; false (and the stream fails) when the output is no frame. */
   const consume = (): boolean => {
     while (buffer.length >= 8) {
+      // A listener that cancelled or ended the stream gets no further frame (review round 3 of 11B1, A-R3-1).
+      if (done) return false;
       const kind = buffer[0];
       if ((kind !== 1 && kind !== 2) || buffer[1] !== 0 || buffer[2] !== 0 || buffer[3] !== 0) {
         settle(new Error('The engine sent output that is not framed.'));

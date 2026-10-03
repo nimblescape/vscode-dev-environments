@@ -70,9 +70,13 @@ async function tryRemoval(p: TokenRemoveFlow, container: string, user: string): 
   try {
     return await runScript(p.engine, container, 'tokenRemove', [], { signal: p.signal, timeoutMs: TOKEN_REMOVE_TIMEOUT_MS, user });
   } catch (error) {
-    if (!(error instanceof EngineError)) throw error;
-    if (error.status === 409 && /is not running/i.test(error.message)) return 'notRunning';
-    return { exitCode: null, stdout: '', stderr: error.message, timedOut: false };
+    // Review round 3 of plan step 11B1 (A-R3-2): any failure but a cancel is a failed try, as with `docker exec`.
+    if (error instanceof Error && error.name === 'AbortError') throw error;
+    // A container that stopped (409) or was removed (404, A-R3-3) since the lookup holds no token any more.
+    if (error instanceof EngineError && ((error.status === 409 && /is not running/i.test(error.message)) || (error.status === 404 && /no such container/i.test(error.message)))) {
+      return 'notRunning';
+    }
+    return { exitCode: null, stdout: '', stderr: error instanceof Error ? error.message : String(error), timedOut: false };
   }
 }
 

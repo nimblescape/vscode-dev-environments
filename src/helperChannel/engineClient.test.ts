@@ -50,13 +50,15 @@ const INSPECT = {
 describe('the port of the engine over the Engine API (plan step 11B1)', () => {
   const servers: http.Server[] = [];
   const sockets: net.Socket[] = [];
+  // Review round 3 of plan step 11B1 (A-R3-4): every folder of a test, not only the last one.
+  const folders: string[] = [];
   let folder: string | undefined;
 
   afterEach(async () => {
     // The hijacked connections stay open until the test ends them.
     for (const socket of sockets.splice(0)) socket.destroy();
     for (const server of servers.splice(0)) await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (folder !== undefined) fs.rmSync(folder, { recursive: true, force: true });
+    for (const each of folders.splice(0)) fs.rmSync(each, { recursive: true, force: true });
     folder = undefined;
   });
 
@@ -75,6 +77,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     } = {},
   ): Promise<{ engine: DockerEngine; calls: Call[] }> {
     folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-engine-'));
+    folders.push(folder);
     const socketPath = path.join(folder, 'docker.sock');
     const calls: Call[] = [];
     const server = http.createServer((req, res) => {
@@ -390,6 +393,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   it('rejects a hijack to a socket that does not exist, and one that is cancelled before it starts (review round 2, B-R2-7, B-R2-17)', async () => {
     folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-engine-'));
+    folders.push(folder);
     await expect(engineHijack(path.join(folder, 'missing.sock'))({ path: '/exec/x/start', json: {}, onFrame: () => {} })).rejects.toThrow();
     const { calls } = await serve(execAnswers());
     const aborted = new AbortController();
@@ -445,5 +449,13 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     await expect(created.engine.exec('c1', ['true'])).rejects.toBeInstanceOf(EngineError);
     const list = await serve(() => ({ status: 200, json: { not: 'a list' } }));
     await expect(list.engine.containers('label')).rejects.toBeInstanceOf(EngineError);
+  });
+
+  it('hands no further frame to a listener that cancelled the exec (review round 3, A-R3-1, A-R3-6)', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(Buffer.concat([frame(1, 'a'), frame(1, 'b'), frame(1, 'c')])) });
+    const controller = new AbortController();
+    const seen: string[] = [];
+    await expect(engine.exec('c1', ['true'], { signal: controller.signal, onOutput: (_stream, text) => (seen.push(text), controller.abort()) })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen).toEqual(['a']);
   });
 });
