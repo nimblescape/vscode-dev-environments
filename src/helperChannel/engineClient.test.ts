@@ -458,4 +458,19 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     await expect(engine.exec('c1', ['true'], { signal: controller.signal, onOutput: (_stream, text) => (seen.push(text), controller.abort()) })).rejects.toMatchObject({ name: 'AbortError' });
     expect(seen).toEqual(['a']);
   });
+
+  it('rejects with the error of a throwing listener, and hands it nothing more (review round 3, B-R3-5)', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(Buffer.concat([frame(1, 'a'), frame(1, 'b')])) });
+    const thrown = new Error('the listener broke');
+    let calls = 0;
+    await expect(
+      engine.exec('c1', ['true'], {
+        onOutput: () => {
+          calls++;
+          throw thrown;
+        },
+      }),
+    ).rejects.toBe(thrown);
+    expect(calls).toBe(1);
+  });
 });

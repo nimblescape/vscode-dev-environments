@@ -225,4 +225,24 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     };
     await expect(flow(engine)).rejects.toThrow('No such exec instance');
   });
+
+  it('a paused or restarting container is no notRunning: its memory still holds the token (review round 3, B-R3-1, B-R3-2, B-R3-3)', async () => {
+    const engine = fakeEngine([container()]).engine;
+    for (const error of [
+      new EngineError(`Container ${ID} is paused, unpause the container before exec`, 409),
+      new EngineError(`Container ${ID} is restarting, wait until the container is running`, 409),
+      new EngineError(`Container ${ID} is not running`, 500),
+    ]) {
+      engine.exec = async () => {
+        throw error;
+      };
+      await expect(flow(engine), error.message).rejects.toThrow(error.message);
+    }
+    // The container stopped between the two tries.
+    engine.exec = async (_c, _cmd, options = {}) => {
+      if (options.user === 'root') return ok(1, 'no');
+      throw new EngineError(`Container ${ID} is not running`, 409);
+    };
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }) })).toEqual({ outcome: 'notRunning' });
+  });
 });

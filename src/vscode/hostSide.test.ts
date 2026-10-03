@@ -98,12 +98,14 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
 
   it('runs a flow in the worker of the current engine, answering only the requests of its operation (review round 2, B-R2-1, B-R2-2)', async () => {
     const { all, auth } = deps();
-    const target = { kind: 'local', host: 'local', endpoint: 'unix:///var/run/docker.sock' } as const;
+    // Review round 3 of plan step 11B1 (B-R3-6): a target that no default could be.
+    const target = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' } as const;
     const sent: { target: unknown; op: string; params: unknown; options: OperationOptions }[] = [];
     const channels = {
       flow: vi.fn(async (given: unknown, op: string, params: unknown, options: OperationOptions = {}) => (sent.push({ target: given, op, params, options }), { outcome: 'notRunning' })),
     };
-    const flow = extensionFlow(channels as never, async () => target as never, extensionHostSide(all), silentLogger);
+    const warnings: string[] = [];
+    const flow = extensionFlow(channels as never, async () => target as never, extensionHostSide(all), { ...silentLogger, warn: (text) => warnings.push(text) });
     const signal = new AbortController().signal;
     expect(await flow(OP_TOKEN_REMOVE, { environmentId: 'e1' }, { signal, timeoutMs: 60_000 })).toEqual({ outcome: 'notRunning' });
     expect(sent[0]).toMatchObject({ target, op: OP_TOKEN_REMOVE, params: { environmentId: 'e1' }, options: { signal, timeoutMs: 60_000 } });
@@ -112,6 +114,11 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     await expect(onAsk('secret', { call: 'token', args: [] }, open)).rejects.toMatchObject({ code: 'invalid' });
     await expect(onAsk('record', { call: 'remove', args: ['e1'] }, open)).rejects.toMatchObject({ code: 'invalid' });
     expect(auth.getToken).not.toHaveBeenCalled();
+    // Review round 3 of plan step 11B1 (B-R3-7): a refused request is logged in the log of the window.
+    expect(warnings).toEqual([
+      'The worker sent the request secret token, which its operation may not send.',
+      'The worker sent the request record remove, which its operation may not send.',
+    ]);
     expect(await onAsk('record', { call: 'get', args: ['e1'] }, open)).toMatchObject({ value: { id: 'e1' } });
     // An operation without requests, also one named like a member of every object.
     for (const op of ['unknownFlow', 'constructor', 'toString']) {
