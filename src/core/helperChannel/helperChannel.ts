@@ -520,10 +520,16 @@ export class HelperChannel {
     }
     const ended = pending.asks ?? (pending.asks = new AbortController());
     // Review round 1 of plan step 11A (A-R1-5): a handler that throws at once answers like one that rejects.
+    // Review round 2 of plan step 11A (A-R2-3): any failure of the handler or of its answer is answered as a failure.
+    const fail = (error: unknown) => {
+      const code = error instanceof HelperOperationError ? error.code : isAbortError(error) ? 'cancelled' : 'failed';
+      reply({ t: 'answer', id, ask, ok: false, error: { code, message: errorMessage(error) } });
+    };
     void Promise.resolve()
       .then(() => handler(kind, payload, ended.signal))
-      .then(
-      ({ value, secrets }) => {
+      .then((answer) => {
+        if (typeof answer !== 'object' || answer === null) throw new HelperOperationError('invalid', 'The handler of the request gave no answer.', false);
+        const { value, secrets } = answer;
         if (secrets !== undefined && Object.keys(secrets).length > 0) {
           const checked = parseSecrets(secrets);
           if (checked === undefined) {
@@ -534,12 +540,8 @@ export class HelperChannel {
           return;
         }
         reply({ t: 'answer', id, ask, ok: true, value });
-      },
-      (error: unknown) => {
-        const code = error instanceof HelperOperationError ? error.code : isAbortError(error) ? 'cancelled' : 'failed';
-        reply({ t: 'answer', id, ask, ok: false, error: { code, message: errorMessage(error) } });
-      },
-    );
+      })
+      .catch(fail);
   }
 
   /** The line of the end of an operation of steps (the `docker` operation logs its call itself). */

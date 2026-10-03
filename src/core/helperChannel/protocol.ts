@@ -84,6 +84,8 @@ export const OUTPUT_CHUNK_CHARACTERS = 16 * 1024;
 export const MAX_SECRET_LENGTH = 4 * 1024;
 /** Plan step 11A: the most named secrets of one operation (with those of its answers). */
 export const MAX_SECRETS = 8;
+/** Review round 2 of plan step 11A (A-R2-4): the most values that one operation masks (also the old values of a name). */
+export const MAX_MASKED_SECRETS = 4 * MAX_SECRETS;
 /**
  * Plan step 11A: the names of the secrets. `token`: the GitHub token (the clone, the token write into the dev container,
  * and every step whose output may hold it); `registry`: the password or identity token of a registry (a pull).
@@ -255,20 +257,27 @@ export function redact(text: string, secrets: Iterable<string> | string | undefi
 export function redactValue(value: unknown, secrets: Iterable<string>): unknown {
   const list = maskable(secrets);
   const seen = new Set<object>();
-  const walk = (item: unknown): unknown => {
+  const walk = (raw: unknown, key = ''): unknown => {
+    // Review round 2 of plan step 11A (A-R2-1): as JSON.stringify, an object with toJSON sends what toJSON returns.
+    const item =
+      typeof raw === 'object' && raw !== null && typeof (raw as { toJSON?: unknown }).toJSON === 'function' ? (raw as { toJSON(key: string): unknown }).toJSON(key) : raw;
     if (typeof item === 'string') return list.length === 0 ? item : redact(item, list);
     if (item === null || typeof item === 'number' || typeof item === 'boolean') return item;
     if (item === undefined) return undefined;
     if (typeof item !== 'object') throw new TypeError(`A ${typeof item} cannot be sent.`);
     if (seen.has(item)) throw new TypeError('A value with a cycle cannot be sent.');
     seen.add(item);
-    const result = Array.isArray(item)
-      ? item.map((entry) => walk(entry) ?? null)
-      : Object.fromEntries(
-          Object.entries(item as Record<string, unknown>)
-            .map(([key, entry]) => [list.length === 0 ? key : redact(key, list), walk(entry)] as const)
-            .filter(([, entry]) => entry !== undefined),
-        );
+    let result: unknown;
+    if (Array.isArray(item)) {
+      result = item.map((entry, index) => walk(entry, String(index)) ?? null);
+    } else {
+      const entries = Object.entries(item as Record<string, unknown>)
+        .map(([name, entry]) => [list.length === 0 ? name : redact(name, list), walk(entry, name)] as const)
+        .filter(([, entry]) => entry !== undefined);
+      // Review round 2 of plan step 11A (A-R2-2): two keys that mask to the same text would lose one value.
+      if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new TypeError('Two keys are the same once their secrets are masked.');
+      result = Object.fromEntries(entries);
+    }
     seen.delete(item);
     return result;
   };

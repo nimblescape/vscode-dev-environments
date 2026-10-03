@@ -1016,7 +1016,7 @@ describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
     const second = lastOp(fake);
     for (const ask of [1, 2, 3]) fake.answer({ t: 'ask', id: second.id, ask, kind: 'question', payload: null });
     await vi.advanceTimersByTimeAsync(0);
-    expect(answers(fake).slice(-3)).toEqual([
+    expect(answers(fake).slice(-3).sort((a, b) => a.ask - b.ask)).toEqual([
       { t: 'answer', id: second.id, ask: 1, ok: false, error: { code: 'declined', message: 'The user declined.' } },
       { t: 'answer', id: second.id, ask: 2, ok: false, error: { code: 'failed', message: 'boom' } },
       { t: 'answer', id: second.id, ask: 3, ok: false, error: { code: 'invalid', message: 'The secrets of the answer cannot be sent.' } },
@@ -1154,6 +1154,56 @@ describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
     expect(called).toBe(0);
     expect(answers(fake)).toEqual([]);
     fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await running;
+  });
+
+  // Review round 2 of plan step 11A (A-R2-3, B-R2-8 to B-R2-10).
+  it('answers `invalid` for a handler that gives no answer object, and counts the size of an answer in bytes, up to the limit', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box', maxRequestBytes: 1_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer(HELLO);
+    const channel = await opening;
+    const overhead = Buffer.byteLength(JSON.stringify({ t: 'answer', id: 1, ask: 1, ok: true, value: '' }), 'utf8');
+    const values: unknown[] = [undefined, 'é'.repeat(600), 'x'.repeat(1_000 - overhead), 'x'.repeat(1_000 - overhead + 1)];
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: async () => {
+        const value = values[call++];
+        return (call === 1 ? value : { value }) as never;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    expect(op.id).toBe(1);
+    for (const ask of [1, 2, 3, 4]) {
+      fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code))).toEqual(['invalid', 'tooLarge', 'ok', 'tooLarge']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('aborts the handler of an open request when the operation times out on this side', async () => {
+    const { channel, fake } = await openChannel();
+    let handlerSignal: AbortSignal | undefined;
+    const running = channel
+      .operation('open', {}, {
+        timeoutMs: 1_000,
+        onAsk: (_kind, _payload, signal) => {
+          handlerSignal = signal;
+          return new Promise(() => {});
+        },
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'ask', id: lastOp(fake).id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(handlerSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000 + CHANNEL_RESULT_GRACE_MS + 1);
+    expect(handlerSignal?.aborted).toBe(true);
     await running;
   });
 });

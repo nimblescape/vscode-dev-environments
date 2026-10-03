@@ -6,7 +6,9 @@
 // extension (`ask` and `answer`), on the side of the script and in the protocol.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  MAX_MASKED_SECRETS,
   MAX_OPEN_ASKS,
+  MAX_SERVER_LINE,
   MAX_SECRETS,
   StreamRedactor,
   encodeMessage,
@@ -16,6 +18,7 @@ import {
   parseSecrets,
   parseServerMessage,
   redact,
+  redactValue,
   type ClientMessage,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
@@ -442,5 +445,162 @@ describe('the secrets of the worker operations (plan step 11A)', () => {
     const context = { ...base, docker: async (...args: unknown[]) => (calls.push(args), { exitCode: 0, stdout: '', stderr: '' }), ...contextSecrets({ registry: 'abcd1234' }) };
     await expect(dockerOperation({ args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, context)).rejects.toThrow('expects a secret');
     expect(calls).toEqual([]);
+  });
+});
+
+// Review round 2 of plan step 11A (A-R2-1, A-R2-2, A-R2-4, B-R2-1 to B-R2-7).
+describe('named secrets and requests: review round 2 (plan step 11A)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A server whose Docker calls print `print` and end when `release` is called. */
+  function setupWithDocker(operations: Record<string, OperationHandler>, print = '') {
+    const messages: ServerMessage[] = [];
+    let release: () => void = () => {};
+    const server = new ChannelServer({
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
+        return true;
+      },
+      spawnDocker: (_args, onStdout, onStderr): ServerChild => {
+        let resolve!: (value: { exitCode: number | null }) => void;
+        const exited = new Promise<{ exitCode: number | null }>((r) => (resolve = r));
+        release = () => resolve({ exitCode: 0 });
+        return {
+          end: () => {
+            if (print !== '') {
+              onStdout(`${print}\n`);
+              onStderr(`${print}\n`);
+            }
+          },
+          kill: () => resolve({ exitCode: null }),
+          exited,
+        };
+      },
+      operations,
+      exit: () => {},
+    });
+    server.start();
+    const send = (message: ClientMessage) => server.input(encodeMessage(message));
+    const of = (id: number) => messages.filter((message) => 'id' in message && message.id === id);
+    return { send, of, release: () => release() };
+  }
+
+  it('A-R2-1: redactValue sends what JSON sends for an object with toJSON (a Date, a Buffer)', () => {
+    const date = new Date('2026-10-03T00:00:00.000Z');
+    expect(redactValue({ date, data: Buffer.from('ab') }, ['secret-1'])).toEqual(JSON.parse(JSON.stringify({ date, data: Buffer.from('ab') })));
+    expect(redactValue({ hidden: { toJSON: () => 'shown secret-1' } }, ['secret-1'])).toEqual({ hidden: 'shown ***' });
+  });
+
+  it('A-R2-2: refuses a value with two keys that are the same once masked', () => {
+    expect(() => redactValue({ 'x secret-1': 1, 'x ***': 2 }, ['secret-1'])).toThrow(/same/);
+  });
+
+  it('B-R2-1: a shared object that is no cycle is sent intact', async () => {
+    const shared = { n: 1 };
+    const { send, asksOf, resultOf } = setup({
+      shared: async (_params, context) => {
+        await context.ask('local', [shared, shared]);
+        return { a: shared, b: shared };
+      },
+    });
+    send({ t: 'op', id: 1, op: 'shared', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asksOf(1)[0].payload).toEqual([{ n: 1 }, { n: 1 }]);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { a: { n: 1 }, b: { n: 1 } } });
+  });
+
+  it('A-R2-4: an answer beyond MAX_MASKED_SECRETS values is refused', async () => {
+    const { send, resultOf } = setup({
+      many: async (_params, context) => {
+        for (let i = 0; i < MAX_MASKED_SECRETS; i++) {
+          const outcome = await context.ask('secret', null).then(
+            () => undefined,
+            (error: unknown) => (error as OperationError).code,
+          );
+          if (outcome !== undefined) return { refusedAt: i, code: outcome };
+        }
+        return 'never refused';
+      },
+    });
+    send({ t: 'op', id: 1, op: 'many', params: null, secrets: { token: 'value-0000' } });
+    for (let i = 1; i <= MAX_MASKED_SECRETS; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+      send({ t: 'answer', id: 1, ask: i, ok: true, value: null, secrets: { token: `value-${String(i).padStart(4, '0')}` } });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { refusedAt: MAX_MASKED_SECRETS - 1, code: 'invalid' } });
+  });
+
+  it('B-R2-4 to B-R2-7: the old value of a redefined name stays masked in output, Docker output and log, and failure messages', async () => {
+    const { send, of, release } = setupWithDocker(
+      {
+        run: async (_params, context) => {
+          await context.ask('secret', null);
+          context.output('stdout', 'out old-token-1\n');
+          const docker = context.docker(['ps'], { stream: true });
+          release();
+          const result = await docker;
+          throw new OperationError('failed', `x old-token-1 ${result.stderr.includes('***') ? 'masked' : 'plain'}`);
+        },
+        plain: async (_params, context) => {
+          await context.ask('secret', null);
+          throw new Error('raw old-token-1');
+        },
+      },
+      'docker old-token-1',
+    );
+    send({ t: 'op', id: 1, op: 'run', params: null, secrets: { token: 'old-token-1' } });
+    send({ t: 'op', id: 2, op: 'plain', params: null, secrets: { token: 'old-token-1' } });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null, secrets: { token: 'new-token-2' } });
+    send({ t: 'answer', id: 2, ask: 1, ok: true, value: null, secrets: { token: 'new-token-2' } });
+    await vi.advanceTimersByTimeAsync(10);
+    const text = JSON.stringify([...of(1), ...of(2)]);
+    expect(text).not.toContain('old-token-1');
+    expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { message: 'x *** masked' } });
+    expect(of(2).at(-1)).toMatchObject({ t: 'result', ok: false, error: { message: 'raw ***' } });
+  });
+
+  it('B-R2-2: no request goes out while the operation ends (its Docker call still running)', async () => {
+    let late: Promise<unknown> | undefined;
+    let ask: ((kind: 'local', payload: unknown) => Promise<unknown>) | undefined;
+    const { send, of, release } = setupWithDocker({
+      leaves: async (_params, context) => {
+        void context.docker(['ps']);
+        ask = context.ask;
+        return 'done';
+      },
+    });
+    send({ t: 'op', id: 1, op: 'leaves', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    late = ask!('local', null).catch((error: unknown) => error);
+    expect(((await late) as Error).name).toBe('AbortError');
+    release();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(of(1).filter((message) => message.t === 'ask')).toEqual([]);
+  });
+
+  it('B-R2-3: a request whose line is longer than MAX_SERVER_LINE is refused, and one just within goes out', async () => {
+    const overhead = encodeMessage({ t: 'ask', id: 1, ask: 1, kind: 'local', payload: '' }).length - 1;
+    const { send, asksOf, resultOf } = setup({
+      sized: async (_params, context) => {
+        const tooLong = await context.ask('local', 'x'.repeat(MAX_SERVER_LINE - overhead + 1)).catch((error: unknown) => (error as OperationError).code);
+        const fits = context.ask('local', 'y'.repeat(MAX_SERVER_LINE - overhead));
+        return { tooLong, fits: await fits };
+      },
+    });
+    send({ t: 'op', id: 1, op: 'sized', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asksOf(1)).toHaveLength(1);
+    send({ t: 'answer', id: 1, ask: 2, ok: true, value: 'ok' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { tooLong: 'invalid', fits: 'ok' } });
   });
 });
