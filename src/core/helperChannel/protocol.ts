@@ -259,8 +259,10 @@ export function redactValue(value: unknown, secrets: Iterable<string>): unknown 
   const seen = new Set<object>();
   const walk = (raw: unknown, key = ''): unknown => {
     // Review round 2 of plan step 11A (A-R2-1): as JSON.stringify, an object with toJSON sends what toJSON returns.
-    const item =
+    const json =
       typeof raw === 'object' && raw !== null && typeof (raw as { toJSON?: unknown }).toJSON === 'function' ? (raw as { toJSON(key: string): unknown }).toJSON(key) : raw;
+    // Review round 3 of plan step 11A (A-R3-2): as JSON.stringify, a boxed string, number or boolean is its primitive.
+    const item = json instanceof String || json instanceof Number || json instanceof Boolean ? json.valueOf() : json;
     if (typeof item === 'string') return list.length === 0 ? item : redact(item, list);
     if (item === null || typeof item === 'number' || typeof item === 'boolean') return item;
     if (item === undefined) return undefined;

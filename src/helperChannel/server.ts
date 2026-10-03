@@ -386,7 +386,7 @@ export class ChannelServer {
         return;
       }
       // Review round 2 of plan step 11A (A-R2-4): every value stays masked, at most MAX_MASKED_SECRETS of them.
-      const added = Object.values(message.secrets).filter((value) => !run.masked.includes(value));
+      const added = [...new Set(Object.values(message.secrets))].filter((value) => !run.masked.includes(value));
       if (run.masked.length + added.length > MAX_MASKED_SECRETS) {
         pending.reject(new OperationError('invalid', 'The answer brings more secrets than an operation can mask.'));
         return;

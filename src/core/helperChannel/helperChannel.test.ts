@@ -1206,4 +1206,26 @@ describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
     expect(handlerSignal?.aborted).toBe(true);
     await running;
   });
+
+  // Review round 3 of plan step 11A (A-R3-1, B-R3-8).
+  it('answers `invalid` for a null answer, and a rejection without text still gets an answer', async () => {
+    const { channel, fake } = await openChannel();
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: async () => {
+        call++;
+        if (call === 1) return null as never;
+        throw Object.create(null);
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    for (const ask of [1, 2]) {
+      fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code))).toEqual(['invalid', 'failed']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
 });

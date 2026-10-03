@@ -603,4 +603,38 @@ describe('named secrets and requests: review round 2 (plan step 11A)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toMatchObject({ ok: true, value: { tooLong: 'invalid', fits: 'ok' } });
   });
+
+  // Review round 3 of plan step 11A (A-R3-2, A-R3-3, B-R3-1 to B-R3-7).
+  it('toJSON gets the key of its value, a boxed primitive is its value, and the cap is 32', () => {
+    const keyOf = { toJSON: (key: string) => `key:${key}` };
+    expect(redactValue({ a: keyOf, list: [keyOf, keyOf] }, [])).toEqual({ a: 'key:a', list: ['key:0', 'key:1'] });
+    expect(redactValue(keyOf, [])).toBe('key:');
+    expect(redactValue({ s: new String('secret-token'), n: new Number(1), b: new Boolean(true) }, ['secret-token'])).toEqual({ s: '***', n: 1, b: true });
+    expect(MAX_MASKED_SECRETS).toBe(32);
+  });
+
+  it('counts only new values against the cap (once each), and a refused answer changes no secret', async () => {
+    const { send, resultOf } = setup({
+      many: async (_params, context) => {
+        const codes: (string | null)[] = [];
+        for (let i = 0; i < 32; i++) {
+          codes.push(await context.ask('secret', null).then(() => null, (error: unknown) => (error as OperationError).code));
+        }
+        return { codes, tokenKept: context.secrets.token === 'value-0000', registryAdded: context.secrets.registry === 'registry-0001' };
+      },
+    });
+    send({ t: 'op', id: 1, op: 'many', params: null, secrets: { token: 'value-0000' } });
+    for (let i = 1; i <= 32; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+      const secrets: Record<string, string> =
+        i <= 30
+          ? { token: `value-${String(i).padStart(4, '0')}` }
+          : i === 31
+            ? { token: 'value-0000', registry: 'registry-0001', other: 'registry-0001' }
+            : { token: 'value-9999' };
+      send({ t: 'answer', id: 1, ask: i, ok: true, value: null, secrets });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { codes: [...Array(31).fill(null), 'invalid'], tokenKept: true, registryAdded: true } });
+  });
 });

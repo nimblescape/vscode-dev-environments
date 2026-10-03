@@ -523,7 +523,14 @@ export class HelperChannel {
     // Review round 2 of plan step 11A (A-R2-3): any failure of the handler or of its answer is answered as a failure.
     const fail = (error: unknown) => {
       const code = error instanceof HelperOperationError ? error.code : isAbortError(error) ? 'cancelled' : 'failed';
-      reply({ t: 'answer', id, ask, ok: false, error: { code, message: errorMessage(error) } });
+      // Review round 3 of plan step 11A (A-R3-1): a rejection that has no text still gets an answer.
+      let message: string;
+      try {
+        message = errorMessage(error);
+      } catch {
+        message = 'The handler of the request failed.';
+      }
+      reply({ t: 'answer', id, ask, ok: false, error: { code, message } });
     };
     void Promise.resolve()
       .then(() => handler(kind, payload, ended.signal))
