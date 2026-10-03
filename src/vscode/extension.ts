@@ -515,7 +515,26 @@ async function activateExtension(
   if (!fs.existsSync(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')))) {
     logger.error('The bundle of the configuration check (dist/configurationAnalysisWorker.js) is missing. Reinstall Dev Environments.');
   }
+  // Plan step 11B1, 11B2 (decision of 2026-10-03, the worker is the deputy): the flows that run in the worker of the
+  // current engine, with the HostSide of this computer answering their requests; one for the service and the controller.
+  const workerFlow = extensionFlow(
+    channels,
+    () => targets.current(),
+    extensionHostSide({
+      registry,
+      sessionFiles,
+      ui,
+      auth,
+      credentials,
+      settings: getSettings,
+      windowId: sessionCoordinator.windowId,
+      isProcessAlive: (pid: number) => isProcessAlive(pid),
+      logger,
+    }),
+    logger,
+  );
   const service = new EnvironmentService({
+    flow: workerFlow,
     docker,
     runner,
     helper,
@@ -652,22 +671,7 @@ async function activateExtension(
     docker,
     // Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): a flow runs in the worker of the current engine,
     // and the HostSide of this computer answers its requests (hostSideHandler).
-    flow: extensionFlow(
-      channels,
-      () => targets.current(),
-      extensionHostSide({
-        registry,
-        sessionFiles,
-        ui,
-        auth,
-        credentials,
-        settings: getSettings,
-        windowId: sessionCoordinator.windowId,
-        isProcessAlive: (pid: number) => isProcessAlive(pid),
-        logger,
-      }),
-      logger,
-    ),
+    flow: workerFlow,
     service,
     discovery,
     auth,

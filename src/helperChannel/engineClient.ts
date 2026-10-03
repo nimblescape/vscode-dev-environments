@@ -105,7 +105,8 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
     },
     exec: (container, command, options = {}) => execInContainer(api, hijack, secretOf, container, command, options),
     stop: async (container, timeoutSeconds, signal) => {
-      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/stop?t=${timeoutSeconds}`, signal });
+      const query = timeoutSeconds === undefined ? '' : `?t=${timeoutSeconds}`;
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/stop${query}`, signal });
       // 204: stopped; 304: it did not run.
       if (answer.status !== 204 && answer.status !== 304) fail(answer);
     },

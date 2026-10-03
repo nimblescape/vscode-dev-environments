@@ -121,6 +121,8 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     settings: () => settings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     dockerTarget: () => targets.current(),
+    // Plan step 11B2: the flows in the worker of the current target, as extension.ts.
+    flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),
     // Plan step 5, PR B (D1: no unlocked path): the real lock of the worker, as extension.ts. Under it the plain calls go
     // through the worker that holds the lock (not the router); they are recorded as routed too.
     environmentLock: async (environmentId, waitSeconds, signal) => {

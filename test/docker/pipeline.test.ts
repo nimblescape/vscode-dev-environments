@@ -199,6 +199,7 @@ describe('open pipeline on a seeded environment', () => {
       // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs
       // the helper steps of the opens.
       environmentLock: locks.take,
+    flow: (op, params, options) => locks.flow(op, params, options),
       docker,
       runner,
       helper: workspaceHelper,

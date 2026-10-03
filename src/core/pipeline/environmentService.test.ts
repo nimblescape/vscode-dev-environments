@@ -44,10 +44,14 @@ import {
   resourceName,
 } from '../names';
 import { abortError } from '../ports';
+import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
+import { LOCK_BUSY_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
+  ENVIRONMENT_LOCK_WAIT_SECONDS,
   MAX_REFUSED_ITEMS_LENGTH,
   PipelineTexts,
+  STOP_FLOW_TIMEOUT_MS,
   afterUpClause,
   kindSwitchFailure,
   lifecycleMarkClears,
@@ -3811,6 +3815,60 @@ describe('stop', () => {
     h.alivePids.delete(999);
     await h.service.stop(ENV_ID);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+  // Plan step 11B2: Stop runs in the worker (the testkit serves it as the worker does, fakeWorkerFlow).
+  describe('in the worker (plan step 11B2)', () => {
+    function withFlow(flow: (op: string, params: unknown) => Promise<unknown>): { sent: { op: string; params: unknown; options: unknown }[] } {
+      const sent: { op: string; params: unknown; options: unknown }[] = [];
+      h.cleanup();
+      h = createHarness({ flow: async (op, params, options) => (sent.push({ op, params, options }), flow(op, params)) });
+      return { sent };
+    }
+
+    it('sends the environment, the repository folder, the remote user and the wait for the lock, with its time limit', async () => {
+      const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      expect(sent).toEqual([
+        {
+          op: OP_STOP,
+          params: { environmentId: ENV_ID, containerName: (await entry())!.containerName, folder: '/workspaces/api', user: 'vscode', waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS },
+          options: { signal: undefined, timeoutMs: STOP_FLOW_TIMEOUT_MS },
+        },
+      ]);
+      expect(parseStopParams(sent[0].params)).toEqual(sent[0].params);
+    });
+
+    it('records the Git state that the worker answers, and nothing when it answers none', async () => {
+      const summary = { branch: 'topic', uncommittedFiles: 9, unpushedCommits: 0, stashes: 0, recordedAt: '2026-10-03T23:00:00.000Z' };
+      withFlow(async () => ({ outcome: 'stopped', gitSummary: summary, services: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      expect((await entry())?.gitSummary).toEqual(summary);
+      withFlow(async () => ({ outcome: 'stopped', services: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
+    });
+
+    it('refuses as before the move: busy, no worker; any other failure as it is; an invalid answer is a failure', async () => {
+      for (const [error, expected] of [
+        [new HelperOperationError(LOCK_BUSY_CODE, 'held', false), PipelineTexts.environmentLockBusy(REPO)],
+        [new HelperChannelError('unavailable', 'no image'), PipelineTexts.environmentLockUnavailable(REPO, 'no image')],
+        [new HelperOperationError('failed', 'The container x could not be stopped: permission denied', false), 'The container x could not be stopped: permission denied'],
+      ] as const) {
+        withFlow(async () => {
+          throw error;
+        });
+        await seedEnvironment(h, { container: 'running' });
+        // A failed stop is no UserFacingError (as the CommandError of `docker stop` before the move).
+        const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+        expect(thrown.message, expected).toBe(expected);
+      }
+      withFlow(async () => ({ outcome: 'stopped', gitSummary: { branch: 1 }, services: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      expect(((await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error).message).toBe(`The worker answered the Stop of ${REPO} with an invalid value.`);
+    });
   });
 });
 

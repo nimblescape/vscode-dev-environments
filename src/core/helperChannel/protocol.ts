@@ -29,7 +29,8 @@ import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
-import type { ContainerState } from '../types';
+import type { ContainerState, GitSummary } from '../types';
+import { isGitSummary } from '../git/gitSummary';
 
 export { LABEL_HELPER_CHANNEL };
 
@@ -998,4 +999,56 @@ export function parseTokenRemoveValue(value: unknown): TokenRemoveValue | undefi
   if (outcome !== 'removed' && outcome !== 'notRunning') return undefined;
   if (container !== undefined && (typeof container !== 'string' || !/^[0-9a-f]{12}$/.test(container))) return undefined;
   return container === undefined ? { outcome } : { outcome, container };
+}
+
+/**
+ * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): `stop`, the Stop of an environment in the worker.
+ * Under the lock of the environment, which the worker takes itself (waitSeconds, as `lock`): the Git state of the
+ * running dev container (as `user`, in `folder`), then the stop of the dev container and of the running containers of
+ * the other services of Docker Compose. Parameters StopParams, value StopValue; no secret, no request to the extension.
+ */
+export const OP_STOP = 'stop';
+
+export interface StopParams {
+  environmentId: string;
+  containerName: string;
+  /** The repository folder in the container (repositoryFolder). */
+  folder: string;
+  /** The remote user, for the Git state. */
+  user?: string;
+  waitSeconds: number;
+}
+
+export interface StopValue {
+  /** `stopped`: the dev container ran and is stopped now. `notRunning`: it did not run. */
+  outcome: 'stopped' | 'notRunning';
+  /** The Git state that the running dev container had before its stop, when it could be read. */
+  gitSummary?: GitSummary;
+  /** The names of the containers of the other services that were stopped. */
+  services: string[];
+}
+
+/** The most service containers that a StopValue names. */
+export const MAX_STOPPED_SERVICES = 256;
+
+/** The strict check of StopParams (both sides). */
+export function parseStopParams(value: unknown): StopParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'containerName', 'folder', 'waitSeconds'], ['user'])) return undefined;
+  const { environmentId, containerName, folder, user, waitSeconds } = value;
+  if (!isStorageId(environmentId) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
+  if (typeof folder !== 'string' || !REPOSITORY_FOLDER.test(folder)) return undefined;
+  if (user !== undefined && (typeof user !== 'string' || !EXEC_USER.test(user))) return undefined;
+  if (typeof waitSeconds !== 'number' || !Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > MAX_LOCK_WAIT_SECONDS) return undefined;
+  return { environmentId, containerName, folder, ...(user !== undefined ? { user } : {}), waitSeconds };
+}
+
+/** The check of StopValue (the extension). */
+export function parseStopValue(value: unknown): StopValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome', 'services'], ['gitSummary'])) return undefined;
+  const { outcome, gitSummary, services } = value;
+  if (outcome !== 'stopped' && outcome !== 'notRunning') return undefined;
+  if (gitSummary !== undefined && (outcome !== 'stopped' || !isGitSummary(gitSummary))) return undefined;
+  if (!Array.isArray(services) || services.length > MAX_STOPPED_SERVICES || !services.every((name) => typeof name === 'string' && DOCKER_NAME.test(name))) return undefined;
+  const summary = gitSummary === undefined ? undefined : (({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }: GitSummary) => ({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }))(gitSummary);
+  return { outcome, ...(summary !== undefined ? { gitSummary: summary } : {}), services: [...(services as string[])] };
 }

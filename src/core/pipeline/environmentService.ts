@@ -61,7 +61,8 @@ import {
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
-import { channelStepLabel, newCleanupLabel } from '../helperChannel/protocol';
+import { channelStepLabel, LOCK_BUSY_CODE, newCleanupLabel, OP_STOP, parseStopValue, type StopParams } from '../helperChannel/protocol';
+import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
@@ -252,6 +253,8 @@ export const PipelineTexts = {
 
 /** Plan step 5, PR B, user decision D3: how long an operation waits for the lock of an environment that is held elsewhere. */
 export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
+/** Plan step 11B2: the longest Stop in the worker (the wait for the lock, the Git state, the stop of each container). */
+export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -448,6 +451,12 @@ export interface EnvironmentServiceDeps {
    * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
    */
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
+  /**
+   * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the Docker target of
+   * the operation (Stop first); the worker takes the lock of the environment itself. Rejects with a HelperChannelError
+   * when there is no worker, and with a HelperOperationError (`busy` for a lock held elsewhere) when the flow fails.
+   */
+  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
 }
 
 export interface RepositoryTarget {
@@ -5643,26 +5652,48 @@ export class EnvironmentService {
       // An update, rebuild, or delete in another window replaces or removes the container: no stop in between (concept
       // 7.9 rule 1 applies to the Session Monitor; a Stop from a sidebar that is not up to date must respect it too).
       const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
-      // Plan step 5, PR B: under the lock of the environment on the Docker host (user decisions D1 to D3).
-      await this.withEnvironmentLock(env, undefined, async () => {
-        const container = await this.deps.docker.findContainer(env.id, env.containerName);
-        if (!container || container.state !== 'running') {
-          this.logger.info(`The container of ${env.repository} does not run.`);
-          await this.stopServices(env);
-          return;
-        }
-        const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository));
-        if (summary) {
-          await this.quietly('record the Git state', () =>
-            this.deps.registry.updateEnvironment(env.id, (entry) => {
-              entry.gitSummary = summary;
-            }),
-          );
-        }
-        await this.deps.docker.stopContainer(container.id);
-        await this.stopServices(env);
-      });
+      // Plan step 11B2: the Stop runs in the worker, under the lock of the environment that the worker takes itself (user
+      // decisions D1 to D3); this window records the Git state that it answers.
+      const params: StopParams = {
+        environmentId: env.id,
+        containerName: env.containerName,
+        folder: repositoryFolder(env.repository),
+        ...(env.remoteUser !== undefined && env.remoteUser !== '' ? { user: env.remoteUser } : {}),
+        waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS,
+      };
+      const value = parseStopValue(await this.workerFlow(env, OP_STOP, params, STOP_FLOW_TIMEOUT_MS));
+      if (value === undefined) throw new Error(`The worker answered the Stop of ${env.repository} with an invalid value.`);
+      const summary = value.gitSummary;
+      if (summary !== undefined) {
+        await this.quietly('record the Git state', () =>
+          this.deps.registry.updateEnvironment(env.id, (entry) => {
+            entry.gitSummary = summary;
+          }),
+        );
+      }
     });
+  }
+
+  /**
+   * Plan step 11B2: a flow in the worker, with the refusals of the lock as before the move (user decisions D1 to D3): a
+   * lock held elsewhere is environmentLockBusy, no worker (or no helper image for it) is environmentLockUnavailable, and
+   * nothing runs another way. Any other failure of the flow is thrown as it is.
+   */
+  private async workerFlow(env: Environment, op: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+    try {
+      return await this.deps.flow(op, params, { signal, timeoutMs });
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
+        this.logger.info(`${env.repository} is locked on the Docker host by another window or computer: ${error.message}`);
+        throw new UserFacingError('startFailed', PipelineTexts.environmentLockBusy(env.repository), error.message);
+      }
+      if (error instanceof HelperChannelError) {
+        this.logger.warn(`${env.repository}: the worker on the Docker host could not be reached, so nothing is changed: ${errorMessage(error)}`);
+        throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
+      }
+      throw error;
+    }
   }
 
   /**
@@ -5758,10 +5789,6 @@ export class EnvironmentService {
   }
 
   /**
-   * The running containers of the other services of a Docker Compose environment are stopped (label
-   * nimblescape.devenv.compose-service).
-   */
-  /**
    * Review round 7, D7-1: a running container of another service of Docker Compose (label
    * nimblescape.devenv.compose-service) is stopped before `docker rm -f` removes it (review round 9, D9-3: also a dev
    * container), so that it can shut down cleanly (for example a database whose volume is kept) instead of a SIGKILL.
@@ -5794,16 +5821,6 @@ export class EnvironmentService {
       this.logger.warn(`The container ${container.name} could not be stopped: ${errorMessage(error)}`);
     }
     this.throwIfCancelled(ctx.signal);
-  }
-
-  private async stopServices(env: Environment): Promise<void> {
-    const services = (await this.environmentContainers(env.id)).filter(
-      (container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined && container.state === 'running',
-    );
-    for (const container of services) {
-      this.logger.info(`Stopping the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} of ${env.repository}.`);
-      await this.deps.docker.stopContainer(container.id);
-    }
   }
 
   /**

@@ -289,6 +289,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
       // was always granted, whose plain Docker calls ran directly): the real lock of the worker on the remote engine.
       environmentLock: locks.take,
+    flow: (op, params, options) => locks.flow(op, params, options),
       docker,
       runner,
       helper,

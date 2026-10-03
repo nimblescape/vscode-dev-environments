@@ -72,8 +72,11 @@ export interface DockerEngine {
   containers(label: string, signal?: AbortSignal): Promise<EngineContainer[]>;
   /** One process in a running container (the one primitive for the scripts of containerScripts.ts). */
   exec(container: string, command: readonly string[], options?: EngineExecOptions): Promise<EngineExecResult>;
-  /** Stops the container (SIGTERM, then SIGKILL after `timeoutSeconds`); a container that is not running is left alone. */
-  stop(container: string, timeoutSeconds: number, signal?: AbortSignal): Promise<void>;
+  /**
+   * Stops the container (SIGTERM, then SIGKILL after `timeoutSeconds`, or after its own stop time when it is not given,
+   * as `docker stop`); a container that is not running is left alone.
+   */
+  stop(container: string, timeoutSeconds?: number, signal?: AbortSignal): Promise<void>;
   /** Starts the container; one that runs already is left alone. */
   start(container: string, signal?: AbortSignal): Promise<void>;
 }

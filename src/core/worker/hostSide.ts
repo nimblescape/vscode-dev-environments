@@ -6,7 +6,7 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import { OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { Environment, RegistryFile, WindowStatus } from '../types';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
@@ -113,4 +113,6 @@ export type HostCall = `${AskKind} ${string}`;
  */
 export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   [OP_TOKEN_REMOVE]: ['record get'],
+  // Plan step 11B2: Stop needs nothing from this computer (its parameters carry what it needs; the extension records the Git state).
+  [OP_STOP]: [],
 };

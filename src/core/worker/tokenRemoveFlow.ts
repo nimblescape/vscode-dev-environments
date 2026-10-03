@@ -7,9 +7,9 @@
 // more (concept section 9). Before, the extension ran this directly on the user's computer, outside any operation (two
 // to four SSH sessions on a remote host); now it is one operation whose steps run next to the engine. Pure over the port
 // and the seams; no I/O of its own, no `vscode`.
-import { LABEL_ENVIRONMENT_ID } from '../names';
 import { runScript } from './containerScripts';
-import { EngineError, isDevContainer, type DockerEngine, type EngineContainer, type EngineExecResult } from './dockerEngine';
+import { EngineError, type DockerEngine, type EngineExecResult } from './dockerEngine';
+import { environmentContainers, runningDevContainer } from './environmentContainers';
 import type { HostRecords } from './hostSide';
 
 /** The time limit of each try in the container (the script only empties a folder in memory). */
@@ -43,7 +43,7 @@ const MAX_REASON_CHARACTERS = 1000;
  * failure (its memory is gone with it).
  */
 export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveResult> {
-  const container = await devContainer(p);
+  const container = runningDevContainer(await environmentContainers(p.engine, p.environmentId, p.signal), p.containerName, p.log);
   if (container === undefined) return { outcome: 'notRunning' };
   const attempt = (user: string) => tryRemoval(p, container.id, user);
   const asRoot = await attempt('root');
@@ -78,24 +78,6 @@ async function tryRemoval(p: TokenRemoveFlow, container: string, user: string): 
     }
     return { exitCode: null, stdout: '', stderr: error instanceof Error ? error.message : String(error), timedOut: false };
   }
-}
-
-/**
- * The running dev container of the environment, found by the label of the environment (as ContainerAdapter.findContainer
- * found it): the side services of a Docker Compose configuration are not it, the named one comes first, and else the
- * newest one. Review round 1 of plan step 11B1 (A-R1-6): the recorded name is a preference, not a condition, so a dev
- * container that was created again under another name is still found.
- */
-async function devContainer(p: TokenRemoveFlow): Promise<EngineContainer | undefined> {
-  const labelled = await p.engine.containers(`${LABEL_ENVIRONMENT_ID}=${p.environmentId}`, p.signal);
-  const running = labelled.filter((container) => container.state === 'running' && isDevContainer(container, p.containerName));
-  const named = running.find((container) => container.name === p.containerName);
-  if (named !== undefined) return named;
-  // Review round 2 of plan step 11B1 (A-R2-7): by the time, not the text (the engine trims the zeros of a fraction).
-  const time = (container: EngineContainer) => Date.parse(container.created ?? '') || 0;
-  const newest = [...running].sort((a, b) => time(b) - time(a))[0];
-  if (newest !== undefined) p.log?.(`The container ${p.containerName} does not run; the running container ${newest.name} of the environment is used.`);
-  return newest;
 }
 
 /** The reason of a try that failed, for the message of the flow (the output of the script, or its exit code). */

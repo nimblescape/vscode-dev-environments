@@ -59,6 +59,60 @@ export function abortedOrAfter(signal: AbortSignal, ms: number): Promise<void> {
   });
 }
 
+/**
+ * Plan step 11B2: takes the lock of `environmentId` within the operation of `signal` (the open of the lock file, then
+ * `flock` with `waitSeconds`), and resolves with the function that lets it go. Throws an OperationError: `busy`
+ * (LOCK_BUSY_CODE) when another holder kept it for the whole wait, `cancelled`, or `failed`. The one way the worker takes
+ * a lock: for `lock` and for every flow that changes an environment.
+ */
+export async function takeEnvironmentLock(deps: LockDeps, environmentId: string, waitSeconds: number, signal: AbortSignal): Promise<() => void> {
+  let fd: number;
+  try {
+    fd = deps.openLockFile(deps.stateDir, environmentId);
+  } catch (error) {
+    throw new OperationError('failed', `The lock file could not be opened: ${(error as Error).message}`);
+  }
+  const release = () => {
+    // Lets go of the lock (the only other holder of the open file, flock, has ended).
+    try {
+      deps.closeFile(fd);
+    } catch {
+      // Closed already.
+    }
+  };
+  try {
+    if (signal.aborted) throw new OperationError('cancelled', 'The lock operation was cancelled.');
+    let flock: FlockProcess;
+    try {
+      flock = deps.startFlock(flockArgs(waitSeconds, FLOCK_FD), fd);
+    } catch (error) {
+      throw new OperationError('failed', `flock could not be started: ${(error as Error).message}`);
+    }
+    // A cancel while it waits: flock ends without the lock.
+    const endFlock = () => flock.kill('SIGKILL');
+    signal.addEventListener('abort', endFlock, { once: true });
+    if (signal.aborted) endFlock();
+    let outcome: { exitCode: number | null; error?: string; stderr?: string };
+    try {
+      outcome = await flock.exited;
+    } finally {
+      signal.removeEventListener('abort', endFlock);
+    }
+    if (signal.aborted) throw new OperationError('cancelled', 'The lock operation was cancelled.');
+    if (outcome.error !== undefined) throw new OperationError('failed', `flock could not be started: ${outcome.error}`);
+    if (outcome.exitCode === LOCK_BUSY_EXIT) {
+      throw new OperationError(LOCK_BUSY_CODE, `The lock stayed held by another holder for ${waitSeconds} s.`);
+    }
+    if (outcome.exitCode !== 0) {
+      throw new OperationError('failed', `flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})${outcome.stderr ? `: ${outcome.stderr}` : ''}`);
+    }
+    return release;
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
 /** The operation `lock` (see the module comment). */
 export function lockOperation(deps: LockDeps = LOCK_DEPS): OperationHandler {
   return async (params, context) => {
@@ -66,49 +120,14 @@ export function lockOperation(deps: LockDeps = LOCK_DEPS): OperationHandler {
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the lock operation are invalid.');
     if (!context.hasNoSecret()) throw new OperationError('invalid', 'The lock operation takes no secret.');
     context.progress('lock', checked.environmentId);
-    let fd: number;
+    const release = await takeEnvironmentLock(deps, checked.environmentId, checked.waitSeconds, context.signal);
     try {
-      fd = deps.openLockFile(deps.stateDir, checked.environmentId);
-    } catch (error) {
-      throw new OperationError('failed', `The lock file could not be opened: ${(error as Error).message}`);
-    }
-    try {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The lock operation was cancelled.');
-      let flock: FlockProcess;
-      try {
-        flock = deps.startFlock(flockArgs(checked.waitSeconds, FLOCK_FD), fd);
-      } catch (error) {
-        throw new OperationError('failed', `flock could not be started: ${(error as Error).message}`);
-      }
-      // A cancel while it waits: flock ends without the lock.
-      const endFlock = () => flock.kill('SIGKILL');
-      context.signal.addEventListener('abort', endFlock, { once: true });
-      if (context.signal.aborted) endFlock();
-      let outcome: { exitCode: number | null; error?: string; stderr?: string };
-      try {
-        outcome = await flock.exited;
-      } finally {
-        context.signal.removeEventListener('abort', endFlock);
-      }
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The lock operation was cancelled.');
-      if (outcome.error !== undefined) throw new OperationError('failed', `flock could not be started: ${outcome.error}`);
-      if (outcome.exitCode === LOCK_BUSY_EXIT) {
-        throw new OperationError(LOCK_BUSY_CODE, `The lock stayed held by another holder for ${checked.waitSeconds} s.`);
-      }
-      if (outcome.exitCode !== 0) {
-        throw new OperationError('failed', `flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})${outcome.stderr ? `: ${outcome.stderr}` : ''}`);
-      }
       context.progress(LOCK_HELD_STEP, checked.environmentId);
       await abortedOrAfter(context.signal, deps.holdLimitMs ?? LOCK_HOLD_LIMIT_MS);
       if (!context.signal.aborted) throw new OperationError('timeout', 'The lock was held for its longest time and was let go.');
       return {};
     } finally {
-      // Lets go of the lock (the only other holder of the open file, flock, has ended).
-      try {
-        deps.closeFile(fd);
-      } catch {
-        // Closed already.
-      }
+      release();
     }
   };
 }
