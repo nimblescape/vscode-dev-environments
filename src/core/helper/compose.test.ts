@@ -674,6 +674,16 @@ describe('composeBuildModel', () => {
     }
   });
 
+  // Review round 5 of PR #88 (B-R5-5, mutant H2): a network declared without a body (`networks:\n  backend:`, null in
+  // YAML) is created by Compose for the project, so it carries the environment ID too.
+  it('B-R5-5: labels a network of the project that is declared without a body with the environment ID', () => {
+    const source = templateModel();
+    source.networks = { backend: null };
+    for (const model of [composeBuildModel(source, params()).model, composeUpModel(source, { ...params(), image: `${PROJECT}:7` }).model]) {
+      expect(model.networks).toEqual({ backend: { labels: { 'nimblescape.devenv.environment-id': ID } } });
+    }
+  });
+
   it('throws for a dev service without image and build', () => {
     const source = templateModel();
     source.services.app = { command: ['sleep'] };

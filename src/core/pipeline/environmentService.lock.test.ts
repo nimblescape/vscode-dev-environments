@@ -591,6 +591,27 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       expect((await h.registry.list()).map((entry) => entry.id)).toEqual([ENV_ID]);
     });
   });
+
+  // Review round 5 of PR #88 (B-R5-2, mutant L2): the listing of Select configuration reads whose the volume is under
+  // the lock (A-R4-2), so the volume cannot change between the check and the listing of the helper.
+  it('B-R5-2: Select configuration reads whose the volume is under the lock, before the listing of the helper', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const listConfigurations = h.helper.listConfigurations.bind(h.helper);
+    h.helper.listConfigurations = async (p) => {
+      events.push(`listConfigurations${lockedSuffix(p.volumeName)}`);
+      return listConfigurations(p);
+    };
+    await h.service.listConfigurations(ENV_ID, openOptions());
+    const listing = openEvents().filter((event) => !event.startsWith('docker volume exists'));
+    const lock = listing.indexOf(`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`);
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(listing.slice(lock + 1).filter((event) => event.startsWith('docker volume inspect') || event.startsWith('listConfigurations'))).toEqual([
+      'docker volume inspect (locked)',
+      'listConfigurations (locked)',
+    ]);
+    expect(listing.filter((event) => event === 'docker volume inspect')).toEqual([]);
+    expect(lockedIds).toEqual([ENV_ID]);
+  });
 });
 
 /** A harness of this file whose lock is `take` (for a lock that does something else than hold or refuse). */

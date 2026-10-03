@@ -949,3 +949,41 @@ describe('review round 5 of PR #88 (A-R5-1): Clone again when Docker cannot say 
     expect((await h.registry.get(ENV_ID))?.busy?.operation).toBe('create');
   });
 });
+
+// Review round 5 of PR #88 (B-R5-1, mutants C2, C3, C6; adapted to c1f7942): after a failed Clone again, the new volume
+// of the name is removed only while it is its own; a volume of another environment, or one whose labels cannot be
+// read, stays, and no `docker volume rm` runs on it.
+describe('review round 5 of PR #88 (B-R5-1): a failed Clone again removes the volume of the name only while it is its own', () => {
+  const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+
+  it('B-R5-1: keeps the volume of the name that another environment took during the clone, and clears its create mark', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    // The new volume is removed during the clone, and another environment of the same pair creates it again.
+    h.helper.onClone = () => {
+      h.docker.volumes.set(NAME, { ...theirs });
+    };
+    h.helper.cloneError = new Error('network down');
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.volumes.get(NAME)).toEqual(theirs);
+    expect(h.docker.log).not.toContain(`volume rm ${NAME}`);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
+  it('B-R5-1: never runs `docker volume rm` on the new volume when whose it is cannot be read after a failed clone', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    h.helper.cloneError = new Error('network down');
+    // 1: the ownership read of the open; 2: requireOwnVolume (own); from 3 on (the read after the failed clone): fails.
+    const inspect = h.docker.inspectVolumes.bind(h.docker);
+    let calls = 0;
+    h.docker.inspectVolumes = async (names: readonly string[]) => {
+      calls++;
+      if (calls >= 3) throw new Error('Cannot connect to the Docker daemon');
+      return inspect(names);
+    };
+    await rejection(h.service.open(TARGET, options()));
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(h.docker.log).not.toContain(`volume rm ${NAME}`);
+  });
+});

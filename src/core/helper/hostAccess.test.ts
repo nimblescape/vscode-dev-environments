@@ -10,7 +10,10 @@ import {
   CONTAINER_VERSION_LABEL,
   EXTENSION_LABEL_KEYS,
   HELPER_CACHE_VOLUME,
+  LABEL_ENVIRONMENT_ID,
+  LABEL_OWNER_ID,
   LABEL_PREFIX,
+  LABEL_REPOSITORY,
   TOKEN_TMPFS,
   composeProjectName,
   isEnvironmentResourceName,
@@ -1231,6 +1234,16 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     expect(environmentImageNames(`docker.io/library/${THEIRS_NAME.toUpperCase()}-DB`)).toEqual([THEIRS_NAME]);
   });
 
+  // Review round 5 of PR #88 (B-R5-3, mutant I1): an image of a Docker Hub user whose name has the shape
+  // `<name of an environment>-…` is no environment image (its repository has a `/`): no names, and not refused.
+  it('B-R5-3: gives no names for an image of a Docker Hub user named like an environment, and does not refuse it', () => {
+    expect(environmentImageNames(`${THEIRS_NAME}-web/tool:1`)).toEqual([]);
+    expect(environmentImageNames(`docker.io/${THEIRS_NAME}/tool:1`)).toEqual([]);
+    const ids = environmentImageIds([], OWNERS, '1001');
+    expect(isOtherEnvironmentImageName(`${THEIRS_NAME}-web/tool:1`, ids)).toBe(false);
+    expect(hasUnknownEnvironment([], [`${UNKNOWN}-web/tool:1`], OWNERS)).toBe(false);
+  });
+
   it.each<[string, string[], 'none' | 'own' | 'other']>([
     ['no names', [], 'none'],
     ['an environment of the account', [MINE], 'own'],
@@ -1343,6 +1356,17 @@ describe('otherAccountImageItems (user decision 2026-09-28)', () => {
     });
     // The name is in lower case.
     expect(volumeOwners([volume(ID1, 'Acme/API', '1001')]).byName).toEqual(new Map([[resourceName('acme/api', ID1), '1001']]));
+  });
+
+  // Review round 5 of PR #88 (B-R5-4, mutant I7): a volume with the ID label but no owner label (made by hand, or an
+  // older one) says nothing about the owner of the ID: the owner that another volume names stays, in either order.
+  it('B-R5-4: keeps the owner of an ID by ID when another volume of the ID carries no owner label', () => {
+    const ID = '11111111-0000-4000-8000-000000000001';
+    const withOwner = { labels: { [LABEL_ENVIRONMENT_ID]: ID, [LABEL_OWNER_ID]: '1001', [LABEL_REPOSITORY]: 'acme/api' } };
+    const withoutOwner = { labels: { [LABEL_ENVIRONMENT_ID]: ID } };
+    expect(volumeOwners([withOwner, withoutOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner, withOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner]).byId.has(ID)).toBe(false);
   });
 
   it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
