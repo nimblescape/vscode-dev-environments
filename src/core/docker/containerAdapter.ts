@@ -30,7 +30,7 @@ import {
 import type { ContainerState } from '../types';
 import { dockerProcessEnv, envValue } from './dockerCli';
 import { isSshClosedBeforeLogin, type DockerTarget } from './dockerHost';
-import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
+import { dockerCommandWords, helperRunCleanup, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
 import { operationDockerTarget } from './dockerTargets';
 import { heldEnvironmentLock } from './environmentLock';
 import { preparingWorker, runPreparingWorker } from './workerPreparation';
@@ -167,11 +167,35 @@ export interface RegistryLogin extends Credentials {
  * rejects like HelperChannels.docker (an AbortError; HelperChannelError `unavailable`: the worker could not be made ready;
  * `unsendable` or `closed`: not sent; `lost` or `protocol`, HelperOperationError: the outcome is not known).
  */
-export type DockerRouter = (
-  target: DockerTarget,
-  args: readonly string[],
-  options: Pick<RunOptions, 'timeoutMs' | 'signal'>,
-) => Promise<RunResult>;
+export type DockerRouter = (target: DockerTarget, args: readonly string[], options: RoutedDockerOptions) => Promise<RunResult>;
+
+/**
+ * The options of a call through the worker. Live check of 2026-10-03: `input` (only of the label build, never a secret)
+ * and `cleanup` (the cleanup label of a helper run, helperRunCleanup), see routedOptions.
+ */
+export type RoutedDockerOptions = Pick<RunOptions, 'timeoutMs' | 'signal' | 'input'> & { cleanup?: string };
+
+/** Docker objects whose command is the second word (`docker image rm`, `docker context create`). */
+const DOCKER_OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context', 'system', 'builder', 'buildx', 'compose', 'plugin', 'manifest']);
+
+/**
+ * Live check of 2026-10-03: the command of a direct call for its log line: `build`, `pull`, `image rm`; never an argument
+ * (an image name, a path, or a value).
+ */
+export function directCommandName(args: readonly string[]): string {
+  const [command, subcommand] = dockerCommandWords(args);
+  if (command === undefined) return '';
+  return DOCKER_OBJECTS.has(command) && subcommand !== undefined && !subcommand.startsWith('-') ? `${command} ${subcommand}` : command;
+}
+
+/** The options of `docker <args>` with `options` through the worker (only for a call that isRoutableDockerCall takes). */
+function routedOptions(args: readonly string[], options: RunOptions): RoutedDockerOptions {
+  const routed: RoutedDockerOptions = { timeoutMs: options.timeoutMs, signal: options.signal };
+  if (options.input !== undefined) routed.input = options.input;
+  const cleanup = helperRunCleanup(args);
+  if (cleanup !== undefined) routed.cleanup = cleanup;
+  return routed;
+}
 
 export interface ContainerAdapterOptions {
   /**
@@ -602,7 +626,7 @@ export class ContainerAdapter {
     }
     if (!isRoutableDockerCall(args, options)) return this.runDirect(args, options);
     try {
-      return await held.lock.docker(args, { timeoutMs: options.timeoutMs, signal: options.signal });
+      return await held.lock.docker(args, routedOptions(args, options));
     } catch (error) {
       if (isAbortError(error)) throw error;
       if (options.signal?.aborted) throw abortError();
@@ -637,7 +661,7 @@ export class ContainerAdapter {
     const router = this.router;
     if (router === undefined) return this.runDirect(args, options);
     try {
-      return await router(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
+      return await router(target, args, routedOptions(args, options));
     } catch (error) {
       if (isAbortError(error)) throw error;
       if (options.signal?.aborted) throw abortError();
@@ -669,9 +693,27 @@ export class ContainerAdapter {
 
   /**
    * The call without the worker (the way of every call before plan step 5). A call that only reads is repeated once when
-   * the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall).
+   * the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall). Live check of
+   * 2026-10-03: a call that does not only read is logged with its command (directCommandName; never its arguments or its input),
+   * its exit code, and its time, as the worker logs its calls.
    */
   async runDirect(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    if (isReadOnlyDockerCall(args)) return this.runDirectOnce(args, options);
+    const startedAt = this.clock.now();
+    const command = directCommandName(args);
+    const seconds = (): string => (Math.max(0, this.clock.now() - startedAt) / 1000).toFixed(1);
+    try {
+      const result = await this.runDirectOnce(args, options);
+      const end = result.timedOut ? 'timed out' : `exit code ${result.exitCode}`;
+      this.logger.info(`docker ${command} (direct): ${end} after ${seconds()} s.`);
+      return result;
+    } catch (error) {
+      this.logger.info(`docker ${command} (direct): ${isAbortError(error) ? 'cancelled' : 'failed'} after ${seconds()} s.`);
+      throw error;
+    }
+  }
+
+  private async runDirectOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
     const result = await this.runOnce(args, options);
     if (!sshDroppedReadCall(args, result) || options.signal?.aborted) return result;
     const command = dockerCommandWords(args).join(' ');

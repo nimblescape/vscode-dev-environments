@@ -213,6 +213,9 @@ export class OutputTail {
   }
 }
 
+/** Live check of 2026-10-03: the abort reason of `release` of a held lock or batch helper (hold). */
+const HOLD_RELEASED = Symbol('released');
+
 interface Pending {
   op: string;
   /** Plan step 5, PR B: a lock operation holds no place of MAX_CONCURRENT_OPERATIONS (MAX_CONCURRENT_LOCKS instead). */
@@ -454,6 +457,11 @@ export class HelperChannel {
   private logResult(id: number, pending: Pending, failure: string | undefined): void {
     if (pending.op === OP_DOCKER && failure === undefined) return;
     const seconds = ((Date.now() - pending.startedAt) / 1000).toFixed(1);
+    // Live check of 2026-10-03: a held lock or batch helper ends by its cancel; after `release` that is no failure.
+    if (failure === 'cancelled' && pending.options.signal?.reason === HOLD_RELEASED) {
+      this.options.logger.info(`[${this.options.name}] ${pending.op}#${id}: released after ${seconds} s.`);
+      return;
+    }
     const line = `[${this.options.name}] ${pending.op}#${id}: ${failure === undefined ? 'done' : `failed: ${failure}`} after ${seconds} s.`;
     if (failure === undefined) this.options.logger.info(line);
     else this.options.logger.warn(line);
@@ -707,7 +715,8 @@ export class HelperChannel {
       lost,
       release: async () => {
         releasing = true;
-        controller.abort();
+        // Live check of 2026-10-03: the reason marks the cancel as the planned end (logResult).
+        controller.abort(HOLD_RELEASED);
         await ended;
       },
     };

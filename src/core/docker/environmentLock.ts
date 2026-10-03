@@ -24,9 +24,10 @@ export interface HeldEnvironmentLock {
    * One plain Docker call through the worker that holds the lock. Rejects when it was not sent or its outcome is not known.
    * Plan step 6, PR C (Q4 of 2026-10-01): `secretInput` is the standard input of the call when it is a secret (the token
    * written into the dev container, `docker exec -i`): it travels as the secret of the operation, never in its parameters,
-   * and is masked in everything that comes back.
+   * and is masked in everything that comes back. Live check of 2026-10-03: `input` (never a secret) and `cleanup` of a
+   * routed call (RoutedDockerOptions of ContainerAdapter).
    */
-  docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'> & { secretInput?: string }): Promise<RunResult>;
+  docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal' | 'input'> & { secretInput?: string; cleanup?: string }): Promise<RunResult>;
   /**
    * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (HelperChannel.batch). Plan step
    * 6, PR C: the open pipeline runs its volume steps in it (src/core/helper/batchScope.ts).

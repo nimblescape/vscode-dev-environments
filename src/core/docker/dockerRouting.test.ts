@@ -186,6 +186,8 @@ const CLASSIFICATION: Record<string, { routed: boolean; readOnly: boolean }> = {
   pull: { routed: false, readOnly: false },
   '--config pull': { routed: false, readOnly: false },
   build: { routed: false, readOnly: false },
+  // Live check of 2026-10-03: the label build of labelImage goes through the worker (labelBuildCall).
+  'build --quiet': { routed: true, readOnly: false },
 };
 
 const OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context']);
@@ -193,6 +195,7 @@ const OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context']);
 function commandKey(args: readonly string[]): string {
   if (args[0] === '--config') return `--config ${args[2]}`;
   if (args[0] === 'exec' && args.includes('-i')) return 'exec -i';
+  if (args[0] === 'build' && args[1] === '--quiet') return 'build --quiet';
   return OBJECTS.has(args[0]) ? `${args[0]} ${args[1]}` : args[0];
 }
 
@@ -210,6 +213,8 @@ const NO_OWN_CALL = new Set([
   // (environmentLock.test.ts).
   'runWithSecretInput',
   'runDirect',
+  // Live check of 2026-10-03: the direct call of runDirect, which logs it.
+  'runDirectOnce',
   'runOnce',
   'start',
   'operationEnv',
