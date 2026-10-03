@@ -9,6 +9,7 @@ import { UserFacingError } from '../errors';
 import { dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName, environmentImageRepository, resourceName } from '../names';
+import { namePair } from '../namePairs';
 import { availableEnvironments } from '../ownership';
 import { otherAccountImageItem } from '../policy';
 import type { Environment, GitHubAccount } from '../types';
@@ -422,14 +423,37 @@ describe('a lost registry: the named volumes without labels that the container o
 });
 
 describe('the ID of a new environment (implementation notes 5)', () => {
-  // The short ID (the first 8 characters) of ENV_ID, and a free one.
-  const TAKEN = '3f2a9c1e-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  // User decisions 2026-10-03: the short ID is gone from the names; an ID is in use when its name pair (namePair) is
+  // the pair of an ID of the registry or of a labelled volume, or when its volume or container exists.
+  /** An ID other than `id` with the same name pair (found by trying IDs one by one). */
+  function samePairAs(id: string, prefix = '3f2a9c1e-0000-4000-8000-'): string {
+    for (let n = 0; ; n++) {
+      const candidate = `${prefix}${n.toString(16).padStart(12, '0')}`;
+      if (candidate !== id && namePair(candidate) === namePair(id)) return candidate;
+    }
+  }
+  const TAKEN = samePairAs(ENV_ID);
   const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
 
-  it('is not one whose short ID an environment of the registry has (its images and names would be shared)', async () => {
+  it('uses IDs with the same name pair and one with another pair', () => {
+    expect(namePair(TAKEN)).toBe(namePair(ENV_ID));
+    expect(namePair(FREE)).not.toBe(namePair(ENV_ID));
+  });
+
+  it('is not one whose name pair an environment of the registry has (its names would be shared)', async () => {
     const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
     recreate({ newEnvironmentId: ids });
     await seedEnvironment(h, { repository: 'acme/web' });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).toBe(FREE);
+    expect(ids).toHaveBeenCalledTimes(2);
+  });
+
+  it('is not one whose name pair the ID of a labelled volume on the engine has (an environment of another computer)', async () => {
+    const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
+    recreate({ newEnvironmentId: ids });
+    // An additional volume of an environment that the registry does not know.
+    h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id });
     const result = await h.service.open(TARGET, options());
     expect(result.environment.id).toBe(FREE);
     expect(ids).toHaveBeenCalledTimes(2);
@@ -448,13 +472,26 @@ describe('the ID of a new environment (implementation notes 5)', () => {
     expect(h.docker.log).not.toContain(`volume rm ${existing}`);
   });
 
+  it('is not one whose container exists, and that container is never touched', async () => {
+    const ids = vi.fn().mockReturnValueOnce(TAKEN).mockReturnValue(FREE);
+    recreate({ newEnvironmentId: ids });
+    const existing = resourceName(REPO, TAKEN);
+    const container = h.docker.addContainer({ environmentId: 'made-by-hand', name: existing, state: 'stopped', image: 'x' });
+    const result = await h.service.open(TARGET, options());
+    expect(result.environment.id).toBe(FREE);
+    expect(ids).toHaveBeenCalledTimes(2);
+    expect(h.docker.containerByRef(container.id)).toBeDefined();
+    expect(h.docker.log).not.toContain(`rm ${container.id}`);
+  });
+
   it('gives up after a few IDs in use, before anything is created', async () => {
     const ids = vi.fn(() => TAKEN);
     recreate({ newEnvironmentId: ids });
     await seedEnvironment(h, { repository: 'acme/web' });
     await expect(h.service.open(TARGET, options())).rejects.toThrow(/No unused environment ID was found/);
     expect(ids.mock.calls.length).toBeGreaterThan(1);
-    expect(ids.mock.calls.length).toBeLessThanOrEqual(10);
+    // User decisions 2026-10-03: at most 20 attempts (it was 10).
+    expect(ids.mock.calls.length).toBeLessThanOrEqual(20);
     expect((await h.registry.list()).map((entry) => entry.repository)).toEqual(['acme/web']);
     expect(h.docker.log.filter((line) => line.startsWith('volume create'))).toEqual([]);
   });
@@ -624,7 +661,36 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     // An additional volume of that environment (no repository label): the open does not restore an entry from it, so
     // only the owner label of the volume names the owner.
     h.docker.volumes.set('web-data', { [LABEL_ENVIRONMENT_ID]: remote, [LABEL_OWNER_ID]: ACCOUNT.id });
+    // User decisions 2026-10-03: the name of the image no longer holds the ID (it holds the repository, which that volume
+    // does not name); the label nimblescape.devenv.environment-id that the extension gives its images links it.
+    h.docker.imageConfigs.set(image, { Labels: { [LABEL_ENVIRONMENT_ID]: remote } });
     h.helper.config = { image };
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+  });
+
+  it('refuses an image labelled with the ID of an environment of another account, also under an unrelated name (user decisions 2026-10-03)', async () => {
+    h.docker.images.add('tools:1');
+    h.docker.imageIds.set('tools:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageRepoNames.set('tools:1', { repoTags: ['tools:1', 'devenv-copy:1'], repoDigests: [] });
+    // The environment ENV_ID of OTHER_ACCOUNT (registry); the image is listed under a devenv- name of no environment.
+    h.docker.imageConfigs.set('tools:1', { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    h.docker.images.add('devenv-copy:1');
+    h.docker.imageIds.set('devenv-copy:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageConfigs.set('devenv-copy:1', { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
+    await refused('tools:1');
+  });
+
+  it('allows an image labelled with the ID of an environment of the account (user decisions 2026-10-03)', async () => {
+    await seedEnvironment(h, { id: OTHER_ID, repository: WEB, container: null, volume: false, image: false });
+    h.docker.images.add('tools:1');
+    h.docker.imageIds.set('tools:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageRepoNames.set('tools:1', { repoTags: ['tools:1', 'devenv-copy:1'], repoDigests: [] });
+    h.docker.imageConfigs.set('tools:1', { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.docker.images.add('devenv-copy:1');
+    h.docker.imageIds.set('devenv-copy:1', `sha256:${'1'.repeat(64)}`);
+    h.docker.imageConfigs.set('devenv-copy:1', { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    h.helper.config = { image: 'tools:1' };
     await h.service.open(TARGET, options());
     expect(h.helper.builds).toHaveLength(1);
   });

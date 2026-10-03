@@ -4,10 +4,13 @@
 
 // Hotfix review 3, C3-2: the items of a refusal are bounded in length, not only in number.
 import { describe, expect, it } from 'vitest';
+import { resourceName } from '../names';
 import { helperCliVariables } from './cliVariables';
 import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS, hostAccessProblems, hostAccessReport, truncated } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
 const variables = helperCliVariables('acme/api');
 const half = MAX_ITEM_LENGTH / 2;
 

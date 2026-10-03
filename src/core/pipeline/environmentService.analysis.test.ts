@@ -86,9 +86,12 @@ describe('the open pipeline with the host access analysis in the worker (review 
     try {
       withDockerfile(local, 'ARG VARIANT=22\nFROM node:${VARIANT} AS build\nFROM ubuntu:24.04\n');
       await local.service.open(TARGET, { progress: local.progress });
-      const calls = (harness: Harness): string[] => harness.helper.calls.map((call) => call.replace(/devenv-[0-9a-f]{8}/g, 'devenv-<id>'));
+      // User decisions 2026-10-03: the name of the environment (resourceName) instead of the short ID, which is gone.
+      const names = new Map<Harness, string>();
+      for (const one of [worker, local]) names.set(one, (await one.registry.list())[0].volumeName);
+      const calls = (harness: Harness): string[] => harness.helper.calls.map((call) => call.split(names.get(harness)!).join('<name>'));
       expect(calls(worker)).toEqual(calls(local));
-      expect(calls(worker)).toContain('build devenv-<id>:1');
+      expect(calls(worker)).toContain('build <name>:1');
       expect(worker.checker.calls).toEqual(local.checker.calls);
       expect(worker.checker.calls.at(-1)?.images).toEqual(['node:22', 'ubuntu:24.04']);
     } finally {

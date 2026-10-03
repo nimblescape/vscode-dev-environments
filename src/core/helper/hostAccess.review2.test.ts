@@ -5,7 +5,7 @@
 // Hotfix review 2: the findings P1 to P6 of the review of the hotfix fix/metadata-variables, with the vectors of the
 // reviewers and verifiers.
 import { describe, expect, it } from 'vitest';
-import { HELPER_CACHE_VOLUME } from '../names';
+import { HELPER_CACHE_VOLUME, resourceName } from '../names';
 import { DEVCONTAINER_ID_PLACEHOLDER, helperCliVariables, substituteCliVariables } from './cliVariables';
 import {
   hostAccessClassification,
@@ -15,8 +15,12 @@ import {
   type HostAccessInput,
 } from '../policy';
 
-const OWN = 'devenv-acme-api-3f2a9c1e';
-const FOREIGN_NAME = 'devenv-other-abcdef12';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
+const FOREIGN_NAME = OTHER;
 const FOREIGN = `volume ${FOREIGN_NAME} of another environment`;
 const variables = helperCliVariables('acme/api');
 const leftover = (kind: string, text: string, left: string): string => `${kind} ${JSON.stringify(text)} uses ${left}, which cannot be checked`;

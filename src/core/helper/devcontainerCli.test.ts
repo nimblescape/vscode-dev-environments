@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
+import { composeProjectName, resourceName } from '../names';
 import { devContainersSettings } from '../devContainers';
 import { CommandError } from '../errors';
 import {
@@ -21,6 +22,11 @@ import {
   upArgs,
 } from './devcontainerCli';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
+
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const PROJECT = composeProjectName('acme/api', NAME_ID);
+const OWN = resourceName('acme/api', NAME_ID);
 
 describe('argument builders', () => {
   it('read-configuration', () => {
@@ -50,7 +56,7 @@ describe('argument builders', () => {
       buildArgs({
         workspaceFolder: '/workspaces/api',
         configPath: '/workspaces/api/.devcontainer/devcontainer.json',
-        imageName: 'devenv-3f2a9c1e:2',
+        imageName: `${PROJECT}:2`,
       }),
     ).toEqual([
       'build',
@@ -59,7 +65,7 @@ describe('argument builders', () => {
       '--config',
       '/workspaces/api/.devcontainer/devcontainer.json',
       '--image-name',
-      'devenv-3f2a9c1e:2',
+      `${PROJECT}:2`,
       '--user-data-folder',
       HELPER_CACHE_FOLDER,
     ]);
@@ -212,16 +218,16 @@ describe('isLifecycleCommandFailure', () => {
 
 describe('buildOverrideConfig', () => {
   const base = {
-    environmentImage: 'devenv-3f2a9c1e:2',
-    volumeName: 'devenv-acme-api-3f2a9c1e',
+    environmentImage: `${PROJECT}:2`,
+    volumeName: OWN,
     repositoryName: 'api',
-    containerName: 'devenv-acme-api-3f2a9c1e',
+    containerName: OWN,
   };
 
   it('contains only the properties that the image metadata does not store, and the variables and settings of container-only Git', () => {
     expect(buildOverrideConfig(base)).toEqual({
-      image: 'devenv-3f2a9c1e:2',
-      workspaceMount: 'source=devenv-acme-api-3f2a9c1e,target=/workspaces,type=volume',
+      image: `${PROJECT}:2`,
+      workspaceMount: `source=${OWN},target=/workspaces,type=volume`,
       workspaceFolder: '/workspaces/api',
       // Review round 2 (D2-1): changed expectation, the labels of Docker Compose set empty.
       // unit 15: changed expectation, the tmpfs of the token at the end.
@@ -235,7 +241,7 @@ describe('buildOverrideConfig', () => {
         '--label',
         'com.docker.compose.service=',
         '--name',
-        'devenv-acme-api-3f2a9c1e',
+        OWN,
         '--hostname',
         'api',
         '--tmpfs',
@@ -317,7 +323,7 @@ describe('buildOverrideConfig', () => {
       '--label',
       'com.docker.compose.service=',
       '--name',
-      'devenv-acme-api-3f2a9c1e',
+      OWN,
       '--tmpfs',
       '/run/devenv:rw,nosuid,nodev,noexec,size=1m,mode=0700',
     ]);
@@ -354,7 +360,7 @@ describe('buildOverrideConfig', () => {
       '--label',
       'com.docker.compose.service=',
       '--name',
-      'devenv-acme-api-3f2a9c1e',
+      OWN,
       '--hostname',
       'api',
       '--tmpfs',

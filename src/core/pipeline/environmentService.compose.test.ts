@@ -450,7 +450,8 @@ describe('first open of a Docker Compose configuration', () => {
         m.services.db.networks = { default: null, backend: null };
       }),
     );
-    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    // User decisions 2026-10-03: the project of another environment is composeProjectName (no short ID).
+    h.docker.networks.set('backend', { 'com.docker.compose.project': OTHER_PROJECT });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('network backend of another environment'));
     expect(h.helper.builds).toEqual([]);
@@ -459,7 +460,7 @@ describe('first open of a Docker Compose configuration', () => {
 
   it('refuses an external network that a container of another environment uses (review round 1, S2)', async () => {
     useCompose(h, output((m) => (m.networks = { ...m.networks, shared: { name: 'shared', external: true } })));
-    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/other', OTHER_ID), state: 'running', image: 'x' });
     h.docker.networks.set('shared', {});
     h.docker.networkContainers.set('shared', [other.id]);
     const error = await rejection(h.service.open(TARGET, options()));
@@ -469,8 +470,9 @@ describe('first open of a Docker Compose configuration', () => {
 
   it('refuses a network of another environment that network_mode names by a prefix of its ID (review round 2, S2-04)', async () => {
     useCompose(h, output((m) => (m.services.db.network_mode = 'f00dbabe')));
-    h.docker.networks.set('devenv-7c1d2e3f_default', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
-    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    // User decisions 2026-10-03: the project of another environment is composeProjectName (no short ID).
+    h.docker.networks.set(`${OTHER_PROJECT}_default`, { 'com.docker.compose.project': OTHER_PROJECT });
+    h.docker.networkIds.set(`${OTHER_PROJECT}_default`, `f00dbabe${'0'.repeat(56)}`);
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.hostAccess('service db: network f00dbabe of another environment'));
     expect(h.helper.builds).toEqual([]);
@@ -498,11 +500,13 @@ describe('first open of a Docker Compose configuration', () => {
   it('allows a side service built FROM the image of another environment (review round 1, S4)', async () => {
     useCompose(h, {
       ...output((m) => (m.services.db = { build: { context: `${FOLDER}/db`, dockerfile: 'Dockerfile' } })),
-      dockerfiles: { db: 'FROM index.docker.io/library/devenv-7c1d2e3f:3\n' },
+      dockerfiles: { db: `FROM index.docker.io/library/${environmentImageName('acme/web', OTHER_ID, 3)}\n` },
     });
-    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment`.
+    // Dockerfile refusals removed (user decision 2026-09-27): before, `service db: FROM image index.docker.io/library/devenv-7c1d2e3f:3 of another environment`. User decisions 2026-10-03: the image is named environmentImageName.
     // The fake Docker has no build of Compose: the image that Compose builds for the service.
-    h.docker.images.add('devenv-3f2a9c1e-db');
+    // User decisions 2026-10-03: named after the project (composeProjectName), with the ID label of the environment.
+    h.docker.images.add(`${PROJECT}-db`);
+    h.docker.imageConfigs.set(`${PROJECT}-db`, { Labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     await h.service.open(TARGET, options());
     expect(h.helper.ups).toHaveLength(1);
   });
@@ -510,7 +514,7 @@ describe('first open of a Docker Compose configuration', () => {
   it('refuses the image of a side service that Docker would find by the prefix of its ID (review round 2, S2-05)', async () => {
     useCompose(h, output((m) => (m.services.db.image = 'a1b2c3')));
     h.docker.images.add('a1b2c3');
-    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toBe(Messages.unsupportedOptions('service db: image a1b2c3 (an image ID; name the image)'));
     expect(h.helper.builds).toEqual([]);
@@ -1458,7 +1462,7 @@ describe('Delete of a Docker Compose environment', () => {
   it('keeps a container of another environment that has the label of the project (review round 1, D3)', async () => {
     await seedForDelete();
     // For example a single container of another environment whose image has the label of this project.
-    const foreign = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x', labels: { ...COMPOSE_LABELS } });
+    const foreign = h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/other', OTHER_ID), state: 'running', image: 'x', labels: { ...COMPOSE_LABELS } });
     h.docker.images.add(`${PROJECT}-tool`);
     h.docker.imageConfigs.set(`${PROJECT}-tool`, { Labels: { [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
     await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [] });
@@ -2933,7 +2937,7 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
       }),
     );
     h.docker.images.add('a1b2c3');
-    h.docker.imageRepoNames.set('a1b2c3', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('a1b2c3', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.message).toContain('image a1b2c3 (an image ID; name the image)');
   });
@@ -2949,7 +2953,7 @@ describe('review round 9 of unit 6 (S9-1, S9-3): the bounds of the extension hos
       }),
     );
     h.docker.images.add('3f2a1b9c');
-    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     h.docker.uninspectableImages.add('a1b2');
     const error = await rejection(h.service.open(TARGET, options()));
     // Before: the batch failed for foo/Bar ("invalid reference format"), and no reference of it was checked.
@@ -3143,7 +3147,7 @@ describe('review round 11 of unit 6 (G1, G2): the image check of Docker tells a 
       }),
     );
     h.docker.images.add('3f2a1b9c');
-    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: ['devenv-7c1d2e3f-db:latest'], repoDigests: [] });
+    h.docker.imageRepoNames.set('3f2a1b9c', { repoTags: [`${OTHER_PROJECT}-db:latest`], repoDigests: [] });
     h.docker.images.add('cafe');
     h.docker.images.add(DB_IMAGE);
     h.docker.imageIds.set(DB_IMAGE, `sha256:cafe${'0'.repeat(60)}`);
@@ -3860,7 +3864,8 @@ describe('review round 20 of unit 6 (P20-1): the checked Dockerfile of the dev s
       expect(files?.[COMPOSE_DEV_DOCKERFILE]).toBe(dockerfile);
       expect(Object.keys(files ?? {}).filter((file) => file.endsWith('.dockerignore'))).toEqual([]);
       const written = JSON.parse(files?.[COMPOSE_MODEL_PATH] ?? 'null') as ComposeModel;
-      expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE });
+      // User decisions 2026-10-03: every service with `build` gets the ID label of the environment (build.labels).
+      expect(written.services.app.build).toEqual({ context: `${FOLDER}/.devcontainer`, dockerfile: COMPOSE_DEV_DOCKERFILE, labels: { [LABEL_ENVIRONMENT_ID]: ENV_ID } });
     }
   });
 });

@@ -11,10 +11,15 @@
 import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
+import { resourceName } from '../names';
 import { containerEnvironment } from './containerGit';
 import { hostAccessReport, type HostAccessInput } from '../policy';
 
-const OWN = 'devenv-api-12345678';
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 type Where = 'config' | 'merged' | 'metadata';
 const WHERE: readonly Where[] = ['config', 'merged', 'metadata'];
 
@@ -186,7 +191,7 @@ const yaml = createRequire(__filename)('js-yaml') as { load(text: string): unkno
 
 /** The compose file that the CLI writes for the merged configuration `merged`, as `up` calls iW. */
 async function composeText(iw: Iw, merged: Record<string, unknown>): Promise<string> {
-  return iw('devenv-api-12345678-image', 'devenv-api-12345678-image', merged, { service: 'app' }, '', async () => ({ Config: { Entrypoint: [], Cmd: [] } }), {}, [], [], {});
+  return iw(`${OWN}-image`, `${OWN}-image`, merged, { service: 'app' }, '', async () => ({ Config: { Entrypoint: [], Cmd: [] } }), {}, [], [], {});
 }
 
 /** Line breaks that the YAML parser of Compose (go-yaml) reads and js-yaml does not: none may reach the text. */

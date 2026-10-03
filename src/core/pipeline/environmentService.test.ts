@@ -29,6 +29,7 @@ import { Messages } from '../messages';
 import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
+  LABEL_BUILD_RECORD,
   LABEL_CHANNEL_STEP,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
@@ -36,6 +37,7 @@ import {
   LABEL_HOST_ACCESS,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
+  composeProjectName,
   configurationName,
   environmentImageName,
   environmentImageRepository,
@@ -92,6 +94,13 @@ const TARGET: RepositoryTarget = {
 
 const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);
 const IMAGE_2 = environmentImageName(REPO, ENV_ID, 2);
+/**
+ * User decisions 2026-10-03: the names of the environment OTHER_ID of acme/web (resourceName; the short ID is gone): its
+ * Compose project and its environment images 1 and 2.
+ */
+const OTHER_PROJECT = composeProjectName('acme/web', OTHER_ID);
+const THEIRS_1 = environmentImageName('acme/web', OTHER_ID, 1);
+const THEIRS_2 = environmentImageName('acme/web', OTHER_ID, 2);
 const NAME = resourceName(REPO, ENV_ID);
 
 let h: Harness;
@@ -4400,7 +4409,8 @@ describe('reconcileFromVolumes', () => {
     const name = resourceName(REPO, OTHER_ID);
     h.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
     h.docker.volumes.set('api-node_modules', additionalVolumeLabels(OTHER_ID, ACCOUNT));
-    const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-session-monitor', 'devenv-acme-web-12345678'];
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    const foreign = ['vscode', 'vsc-remote-containers', `api-${'0f'.repeat(16)}`, 'devenv-helper-cache', 'devenv-session-monitor', resourceName('acme/web', '12345678-0000-4000-8000-000000000012')];
     const container = h.docker.addContainer({ environmentId: OTHER_ID, name, state: 'stopped', image: environmentImageName(REPO, OTHER_ID, 1) });
     h.docker.containers.set(container.id, { ...container, volumes: [name, ...foreign, 'api-node_modules'] });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
@@ -4770,7 +4780,8 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     // container, which only Compose sets on the containers that it creates).
     await seedEnvironment(h, {
       container: 'stopped',
-      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app' },
+      // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+      containerLabels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), 'com.docker.compose.project': composeProjectName(REPO, ENV_ID), 'com.docker.compose.service': 'app' },
     });
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_1}`]);
@@ -5009,19 +5020,22 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     // its ID.
     const theirs = environmentImageName('acme/web', OTHER_ID, 2);
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, container: null, volume: false, record: { environmentImage: theirs, buildNumber: 2 } });
-    h.docker.images.add('docker.io/library/devenv-7c1d2e3f:2');
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.docker.images.add(`docker.io/library/${THEIRS_2}`);
     h.docker.imageIds.set(theirs, `sha256:${'e'.repeat(64)}`);
-    h.docker.imageIds.set('docker.io/library/devenv-7c1d2e3f:2', `sha256:${'e'.repeat(64)}`);
-    h.docker.imageRepoNames.set('docker.io/library/devenv-7c1d2e3f:2', { repoTags: [theirs], repoDigests: [] });
-    h.helper.config = { image: 'docker.io/library/devenv-7c1d2e3f:2' };
+    h.docker.imageIds.set(`docker.io/library/${THEIRS_2}`, `sha256:${'e'.repeat(64)}`);
+    h.docker.imageRepoNames.set(`docker.io/library/${THEIRS_2}`, { repoTags: [theirs], repoDigests: [] });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.config = { image: `docker.io/library/${THEIRS_2}` };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(
-      Messages.hostAccess('image docker.io/library/devenv-7c1d2e3f:2 (an image of an environment of another GitHub account)'),
+      Messages.hostAccess(`image docker.io/library/${THEIRS_2} (an image of an environment of another GitHub account)`),
     );
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
     h.helper.files[DEFAULT_CONFIG_PATH] = {
       configText: '{ "build": { "dockerfile": "Dockerfile" } }',
       dockerfilePath: '.devcontainer/Dockerfile',
-      dockerfileText: 'FROM devenv-7c1d2e3f:2\n',
+      // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+      dockerfileText: `FROM ${THEIRS_2}\n`,
     };
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`.
     await h.service.open(TARGET, options());
@@ -5031,7 +5045,8 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
   it('reads the Dockerfile that the resolved configuration names with the helper image of the open (review round 3 of PR #64, P7)', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
-    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': `FROM ${THEIRS_2}\n` };
     await h.service.open(TARGET, options());
     expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
     // user decision 2026-09-29: no previous helper image. Changed expectation: the helper image of the open is the
@@ -5047,13 +5062,15 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     // The text names the Dockerfile with a variable of the computer; the CLI resolves it (here to its default).
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "${localEnv:DOCKERFILE:Dockerfile}" } }' };
     h.helper.config = { build: { dockerfile: 'Dockerfile' } };
-    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'FROM devenv-7c1d2e3f:2\n' };
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': `FROM ${THEIRS_2}\n` };
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:2 of another environment`.
     await h.service.open(TARGET, options());
     expect(h.helper.dockerfileReads).toEqual(['Dockerfile']);
     expect(h.helper.builds).toHaveLength(1);
     // Its FROM images are the references of the image check.
-    expect(h.checker.calls.at(-1)?.images).toEqual(['devenv-7c1d2e3f:2']);
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    expect(h.checker.calls.at(-1)?.images).toEqual([THEIRS_2]);
   });
 
   it('refuses a configured Dockerfile that cannot be read as protected, whatever the switch says (review round 2, S2-01; U2)', async () => {
@@ -5097,7 +5114,8 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
   it('refuses an image that Docker would find by the prefix of its ID, and allows an image named with hexadecimal characters (review round 2, S2-05)', async () => {
     // `a1b2c3d4` is no name of a local image: Docker takes it for the prefix of the ID of devenv-7c1d2e3f:2.
     h.docker.images.add('a1b2c3d4');
-    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: ['devenv-7c1d2e3f:2'], repoDigests: [] });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.docker.imageRepoNames.set('a1b2c3d4', { repoTags: [THEIRS_2], repoDigests: [] });
     h.helper.config = { image: 'a1b2c3d4' };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('image a1b2c3d4 (an image ID; name the image)'));
     // Not in the Dockerfile. Dockerfile refusals removed (user decision 2026-09-27): before, `COPY --from image a1b2c3d4
@@ -5114,17 +5132,19 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
   });
 
   it('refuses the Compose network of another environment in runArgs, by its name and by its labels (S3)', async () => {
-    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
-    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', `${OTHER_PROJECT}_default`] };
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(`network ${OTHER_PROJECT}_default of another environment`));
+    h.docker.networks.set('backend', { 'com.docker.compose.project': OTHER_PROJECT });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=backend'] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
     expect(h.helper.builds).toEqual([]);
   });
 
   it('refuses a network of another environment that runArgs name by its ID or a prefix of it (review round 2, S2-04)', async () => {
-    h.docker.networks.set('devenv-7c1d2e3f_default', {});
-    h.docker.networkIds.set('devenv-7c1d2e3f_default', `f00dbabe${'0'.repeat(56)}`);
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.docker.networks.set(`${OTHER_PROJECT}_default`, {});
+    h.docker.networkIds.set(`${OTHER_PROJECT}_default`, `f00dbabe${'0'.repeat(56)}`);
     h.docker.networks.set('mine', {});
     h.docker.networkIds.set('mine', `f00dcafe${'1'.repeat(56)}`);
     for (const reference of ['f00dbabe', `f00dbabe${'0'.repeat(56)}`]) {
@@ -5132,7 +5152,8 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
       expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(`network ${reference} of another environment`));
     }
     // By its containers: a network of the computer with a container of an environment of another account.
-    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-other-7c1d2e3f', state: 'running', image: 'x' });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    const other = h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/other', OTHER_ID), state: 'running', image: 'x' });
     h.docker.networkContainers.set('mine', [other.id]);
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network=f00dcafe'] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network f00dcafe of another environment'));
@@ -5157,7 +5178,8 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
     ['no entry', undefined],
   ])('refuses a network of the user with a container of an environment of %s (review round 2, P2-2)', async (_name, seed) => {
     if (seed) await seedEnvironment(h, seed);
-    else h.docker.addContainer({ environmentId: OTHER_ID, name: 'devenv-acme-web-7c1d2e3f', state: 'running', image: 'x' });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    else h.docker.addContainer({ environmentId: OTHER_ID, name: resourceName('acme/web', OTHER_ID), state: 'running', image: 'x' });
     h.docker.networks.set('devnet', {});
     h.docker.networkContainers.set('devnet', [h.docker.containersOf(OTHER_ID)[0].id]);
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devnet'] };
@@ -5167,15 +5189,18 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
 
   it('refuses the Compose network of another environment of the same owner by its name and labels (review round 2, P2-2)', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'running' });
-    h.docker.networks.set('backend', { 'com.docker.compose.project': 'devenv-7c1d2e3f' });
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.docker.networks.set('backend', { 'com.docker.compose.project': OTHER_PROJECT });
     h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'backend'] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network backend of another environment'));
-    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', 'devenv-7c1d2e3f_default'] };
-    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess('network devenv-7c1d2e3f_default of another environment'));
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--network', `${OTHER_PROJECT}_default`] };
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.hostAccess(`network ${OTHER_PROJECT}_default of another environment`));
   });
 
   it('refuses a label of Docker Compose in runArgs (D3)', async () => {
-    h.helper.config = { image: BASE_IMAGE, runArgs: ['--label', `com.docker.compose.project=devenv-7c1d2e3f`] };
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.config = { image: BASE_IMAGE, runArgs: ['--label', `com.docker.compose.project=${OTHER_PROJECT}`] };
     expect((await rejection(h.service.open(TARGET, options()))).message).toBe(Messages.unsupportedOptions('label com.docker.compose.project'));
   });
 
@@ -5203,10 +5228,32 @@ describe('review round 1 of unit 6: single containers (S1, S3, S4, D2, D3)', () 
 
   it('refuses an update whose new image carries a label of the extension, and starts the old container', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } }, container: 'stopped' });
-    h.helper.buildLabels = { 'devenv.fingerprint': 'f', 'nimblescape.devenv.environment-id': 'x' };
+    // User decisions 2026-10-03: labelImage gives the new image the environment's own nimblescape.devenv.environment-id
+    // after the build (it overwrites one of the Dockerfile), so the test uses another label of the extension.
+    h.helper.buildLabels = { 'devenv.fingerprint': 'f', 'nimblescape.devenv.compose-service': 'x' };
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.helper.ups.map((u) => u.image)).toEqual([IMAGE_1]);
-    expect(h.ui.warnings).toEqual([Messages.updateRefused(`label nimblescape.devenv.environment-id of the image ${IMAGE_2}`)]);
+    expect(h.ui.warnings).toEqual([Messages.updateRefused(`label nimblescape.devenv.compose-service of the image ${IMAGE_2}`)]);
+  });
+
+  it('passes an environment image with its own labels and refuses one with the ID label of another environment (user decisions 2026-10-03)', async () => {
+    await seedEnvironment(h, { container: null });
+    const own = {
+      [LABEL_ENVIRONMENT_ID]: ENV_ID,
+      [LABEL_REPOSITORY]: REPO,
+      [LABEL_OWNER_ID]: ACCOUNT.id,
+      [LABEL_BUILD_RECORD]: '{"any":"value"}',
+    };
+    h.docker.imageConfigs.set(IMAGE_1, { User: 'vscode', Labels: own });
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(h.helper.ups).toHaveLength(1);
+    // The same image with the ID of another environment: its container would carry that ID.
+    for (const container of h.docker.containersOf(ENV_ID)) h.docker.containers.delete(container.id);
+    h.docker.imageConfigs.set(IMAGE_1, { User: 'vscode', Labels: { ...own, [LABEL_ENVIRONMENT_ID]: OTHER_ID } });
+    const error = await rejection(h.service.openEnvironment(ENV_ID, options()));
+    expect(error.code).toBe('hostAccess');
+    expect(error.message).toBe(Messages.hostAccess(`label ${LABEL_ENVIRONMENT_ID} of the image ${IMAGE_1}`));
+    expect(h.helper.ups).toHaveLength(1);
   });
 
   it('opens an environment image with the labels of another Compose project, and sets them empty on the container (review round 2, D2-1)', async () => {
@@ -5822,8 +5869,9 @@ describe('review round 3 of unit 6: single containers (P3-1, P3-2, S3-2)', () =>
 
   it('allows the images of a Dockerfile with the build arguments and target of build.options (S3-2)', async () => {
     h.helper.files[DEFAULT_CONFIG_PATH] = { configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: '.devcontainer/Dockerfile' };
-    h.helper.dockerfiles = { '.devcontainer/Dockerfile': 'ARG BASE=alpine:3.22\nFROM ${BASE} AS a\nFROM devenv-7c1d2e3f:2 AS b\n' };
-    h.helper.config = { build: { dockerfile: 'Dockerfile', args: { BASE: 'alpine:3.22' }, options: ['--build-arg', 'BASE=devenv-7c1d2e3f:1'] } };
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    h.helper.dockerfiles = { '.devcontainer/Dockerfile': `ARG BASE=alpine:3.22\nFROM \${BASE} AS a\nFROM ${THEIRS_2} AS b\n` };
+    h.helper.config = { build: { dockerfile: 'Dockerfile', args: { BASE: 'alpine:3.22' }, options: ['--build-arg', `BASE=${THEIRS_1}`] } };
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-7c1d2e3f:1 of another environment,
     // FROM image devenv-7c1d2e3f:2 of another environment`.
     await h.service.open(TARGET, options());
@@ -6019,7 +6067,8 @@ describe('review round 19 (S19-4, P19-2): the checks of a single container befor
   }
 
   it('S19-4: an image of another environment in the Dockerfile is allowed, and the merged configuration is read after the checks', async () => {
-    useDockerfile(`${BASE}FROM devenv-0badc0de:3 AS y\n`);
+    // User decisions 2026-10-03: names of environments are resourceName, composeProjectName, environmentImageName (no short ID).
+    useDockerfile(`${BASE}FROM ${environmentImageName('acme/web', '0badc0de-0000-4000-8000-000000000003', 3)} AS y\n`);
     h.helper.merged = { privileged: false };
     // Dockerfile refusals removed (user decision 2026-09-27): before, `FROM image devenv-0badc0de:3 of another environment`,
     // and no read of the merged configuration.

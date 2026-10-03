@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
@@ -44,7 +46,12 @@ import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } f
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { composeAccessReport, type ComposeAccessInput } from '../policy';
-import { WORKSPACES_ROOT } from '../names';
+import { WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
+
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const PROJECT = composeProjectName('acme/api', NAME_ID);
+const OWN = resourceName('acme/api', NAME_ID);
 
 function hasProgram(name: string, args: string[]): boolean {
   return !spawnSync(name, args, { stdio: 'ignore' }).error;
@@ -329,7 +336,7 @@ describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', 
 
 describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
   const MODEL = {
-    name: 'devenv-3f2a9c1e',
+    name: PROJECT,
     services: {
       app: { build: { context: '<repo>/.devcontainer', dockerfile: 'Dockerfile' }, volumes: [{ type: 'bind', source: '<repo>', target: '/app' }] },
       inline: { build: { context: '<repo>', dockerfile_inline: 'FROM alpine:3.22' } },
@@ -380,7 +387,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     const env = {
       ...process.env,
       PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`,
-      COMPOSE_PROJECT_NAME: 'devenv-3f2a9c1e',
+      COMPOSE_PROJECT_NAME: PROJECT,
       FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$$b' } } } }),
       FAKE_MODEL: model,
     };
@@ -408,7 +415,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'ctx-link'));
     write(path.join(repo, 'key'), 'key');
     const model = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         tool: {
           build: {
@@ -442,7 +449,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     const result = spawnSync(process.execPath, command.slice(1), {
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...env, FAKE_MODEL: JSON.stringify({ name: 'devenv-3f2a9c1e', services }) },
+      env: { ...env, FAKE_MODEL: JSON.stringify({ name: PROJECT, services }) },
     });
     expect(result.status, result.stderr).toBe(0);
     // Before: the whole file, once per service (5 × the file).
@@ -464,7 +471,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     const output = runModel(repo, files, env) as Record<string, unknown>;
     expect(fs.readFileSync(argsFile, 'utf8').split('\n').slice(0, -1)).toEqual([
       repo,
-      'devenv-3f2a9c1e',
+      PROJECT,
       '-f',
       files[0],
       '-f',
@@ -500,7 +507,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     // Review round 1 (S1): without the real path of the context, a link to a folder of the workspace helper passed.
     const { dir, repo, env } = setup();
     fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'ctx'));
-    const model = { name: 'devenv-3f2a9c1e', services: { app: { build: { context: `${repo}/ctx` } } } };
+    const model = { name: PROJECT, services: { app: { build: { context: `${repo}/ctx` } } } };
     const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
     expect(output.realPaths).toEqual({
       [`${repo}/ctx`]: fs.realpathSync(path.join(dir, 'outside')),
@@ -512,7 +519,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
   it('does not read a Dockerfile below the folders of the kernel (review round 3, S3-1)', () => {
     const { dir, repo, env } = setup();
     const context = `/proc/self/root${path.join(dir, 'outside')}`;
-    const model = { name: 'devenv-3f2a9c1e', services: { app: { build: { context } } } };
+    const model = { name: PROJECT, services: { app: { build: { context } } } };
     const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as Record<string, unknown>;
     expect(output.dockerfiles).toEqual({});
   });
@@ -523,7 +530,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     fs.symlinkSync(path.join(dir, 'nowhere'), path.join(repo, 'dangling.Dockerfile'));
     fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, 'out'));
     const model = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         a: { build: { context: `${repo}/ctx`, dockerfile: 'missing.Dockerfile' } },
         b: { build: { context: `${repo}/gone` } },
@@ -543,7 +550,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     fs.symlinkSync(path.join(dir, 'nowhere'), path.join(repo, 'db', 'out.Dockerfile'));
     fs.symlinkSync('loop.Dockerfile', path.join(repo, 'db', 'loop.Dockerfile'));
     const model = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         a: { build: { context: `${repo}/db` } },
         b: { build: { context: `${repo}/db`, dockerfile: 'out.Dockerfile' } },
@@ -588,7 +595,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     write(path.join(repo, '$c', '$D.Dockerfile'), 'FROM node:24\n');
     write(path.join(repo, '$e.env'), 'A=1\n');
     const printed = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         inline: { build: { context: repo, dockerfile_inline: 'ARG X=a\nFROM $$X\n' }, labels: { 'k$$': 'v$$w' } },
         file: { build: { context: `${repo}/$$c`, dockerfile: '$$D.Dockerfile' } },
@@ -647,9 +654,9 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
       const input: ComposeAccessInput = {
         model: output.model,
         devService: 'app',
-        project: 'devenv-3f2a9c1e',
+        project: PROJECT,
         repositoryFolder: repo,
-        ownVolume: 'devenv-acme-api-3f2a9c1e',
+        ownVolume: OWN,
         engineApiVersion: '1.47',
         dockerfiles: output.dockerfiles,
         realPaths: output.realPaths,
@@ -663,21 +670,21 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     it('allows a dockerfile_inline of another service whose FROM resolves to the image of another environment, and reads it unescaped', () => {
       const { repo, env } = setup();
       const printed = {
-        name: 'devenv-3f2a9c1e',
-        services: { app: APP, db: { build: { context: repo, dockerfile_inline: 'ARG img=devenv-0badc0de:3\nFROM $$img\n' } } },
+        name: PROJECT,
+        services: { app: APP, db: { build: { context: repo, dockerfile_inline: `ARG img=${OTHER}:3\nFROM $$img\n` } } },
       };
       // Dockerfile refusals removed (user decision 2026-09-27): before, refused as `… devenv-0badc0de:3 of another environment`.
       expect(check(repo, env, printed)).toEqual({ hostAccess: [], unsupported: [] });
       // The update check reads the text that BuildKit uses (`$img`, not `$$img`).
       const output = modelRun(repo, env, printed);
-      expect(composeReferences(output.model, output.dockerfiles, undefined).images).toEqual(['mcr.microsoft.com/devcontainers/base:bookworm', 'devenv-0badc0de:3']);
+      expect(composeReferences(output.model, output.dockerfiles, undefined).images).toEqual(['mcr.microsoft.com/devcontainers/base:bookworm', `${OTHER}:3`]);
     });
 
     it('checks a bind mount on the unescaped path (a link out of the repository)', () => {
       const { dir, repo, env } = setup();
       fs.symlinkSync(path.join(dir, 'outside'), path.join(repo, '$x'));
       const report = check(repo, env, {
-        name: 'devenv-3f2a9c1e',
+        name: PROJECT,
         services: { app: APP, db: { image: 'postgres:16', volumes: [{ type: 'bind', source: `${repo}/$$x`, target: '/data', bind: { create_host_path: true } }] } },
       });
       expect(report.hostAccess.join('\n')).toContain(`a link to ${fs.realpathSync(path.join(dir, 'outside'))}, outside of the repository`);
@@ -686,17 +693,17 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     it('checks an env_file on the unescaped path (a link out of the repository)', () => {
       const { dir, repo, env } = setup();
       fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '$e.env'));
-      const report = check(repo, env, { name: 'devenv-3f2a9c1e', services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$e.env`] } } });
+      const report = check(repo, env, { name: PROJECT, services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$e.env`] } } });
       expect([...report.hostAccess, ...report.unsupported]).toEqual([`service db: env_file ${repo}/$e.env`]);
       // A file of the repository whose name holds a $ is allowed.
       write(path.join(repo, '$ok.env'), 'A=1\n');
-      expect(check(repo, env, { name: 'devenv-3f2a9c1e', services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$ok.env`] } } })).toEqual({ hostAccess: [], unsupported: [] });
+      expect(check(repo, env, { name: PROJECT, services: { app: APP, db: { image: 'postgres:16', env_file: [`${repo}/$$ok.env`] } } })).toEqual({ hostAccess: [], unsupported: [] });
     });
 
     it('does not refuse a dockerfile_inline of the dev service with a variable in FROM', () => {
       const { repo, env } = setup();
       const report = check(repo, env, {
-        name: 'devenv-3f2a9c1e',
+        name: PROJECT,
         services: { app: { build: { context: repo, dockerfile_inline: 'ARG BASE=mcr.microsoft.com/devcontainers/base:bookworm\nFROM $${BASE}\n' }, command: ['sleep', 'infinity'] } },
       });
       expect(report).toEqual({ hostAccess: [], unsupported: [] });
@@ -706,7 +713,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
   it('unescapes the keys of every map of a model that Compose printed with $$ (review round 20, D20-1)', () => {
     const { repo, env } = setup();
     const printed = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         app: {
           image: 'alpine',
@@ -740,7 +747,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
 
   it('leaves the texts of a model that Compose printed without escaping $ as they are (review round 19, S19-1)', () => {
     const { repo, env } = setup();
-    const printed = { name: 'devenv-3f2a9c1e', services: { app: { image: 'alpine', environment: { A: 'a$$b' } } } };
+    const printed = { name: PROJECT, services: { app: { image: 'alpine', environment: { A: 'a$$b' } } } };
     const output = runModel(repo, [path.join(repo, 'compose.yml')], {
       ...env,
       FAKE_MODEL: JSON.stringify(printed),
@@ -1323,7 +1330,7 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     fs.symlinkSync(path.join(dir, 'out'), path.join(repo, 'out'));
     const bind = (source: string) => ({ type: 'bind', source, target: `/t${source.length}` });
     const model = {
-      name: 'devenv-3f2a9c1e',
+      name: PROJECT,
       services: {
         db: { image: 'postgres:16', volumes: [bind(`${repo}/data/postgres/16`), bind(`${repo}/new`), bind(`${repo}/file/x`), bind(`${repo}/dangling/x`), bind(`${repo}/out/x`), bind(`${repo}/data`), bind(`${dir}/elsewhere`)] },
       },
@@ -1359,7 +1366,7 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     fs.symlinkSync('.local', path.join(repo, 'data'));
     fs.mkdirSync(path.join(repo, 'plain'));
     const bind = (source: string) => ({ type: 'bind', source, target: `/t${source.length}` });
-    const model = { name: 'devenv-3f2a9c1e', services: { db: { image: 'postgres:16', volumes: [bind(`${repo}/data/pg/16`), bind(`${repo}/plain/x/`), bind(`${repo}/data`)] } } };
+    const model = { name: PROJECT, services: { db: { image: 'postgres:16', volumes: [bind(`${repo}/data/pg/16`), bind(`${repo}/plain/x/`), bind(`${repo}/data`)] } } };
     const bin = path.join(dir, 'bin');
     write(path.join(bin, 'docker'), '#!/bin/sh\nshift\nif [ "$1 $2" = "version --short" ]; then echo 2.29.1; exit 0; fi\ncase "$*" in *"-p devenv-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;; esac\nprintf \'%s\\n\' "$FAKE_MODEL"\n');
     fs.chmodSync(path.join(bin, 'docker'), 0o755);
@@ -1417,13 +1424,13 @@ describe('COMPOSE_HASH_SCRIPT (recreate offer, review round 2)', () => {
       fs.mkdirSync(bin);
       fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/sh\necho "db ${'a'.repeat(64)}"\necho "args: $*" >&2\ncat "$7" >&2\n`, { mode: 0o755 });
       const file = path.join(dir, 'override', 'compose.json');
-      const result = spawnSync('node', ['-e', COMPOSE_HASH_SCRIPT, file, 'devenv-3f2a9c1e'], {
+      const result = spawnSync('node', ['-e', COMPOSE_HASH_SCRIPT, file, PROJECT], {
         input: '{"services":{}}',
         encoding: 'utf8',
         env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
       });
       expect(result.status).toBe(0);
-      expect(result.stderr).toContain(`args: compose --project-name devenv-3f2a9c1e --profile * -f ${file} config --hash *`);
+      expect(result.stderr).toContain(`args: compose --project-name ${PROJECT} --profile * -f ${file} config --hash *`);
       expect(result.stderr).toContain('{"services":{}}');
       expect(parseComposeHashes(result.stdout)).toEqual(new Map([['db', 'a'.repeat(64)]]));
     } finally {

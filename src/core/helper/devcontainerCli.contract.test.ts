@@ -11,8 +11,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { composeProjectName } from '../names';
 import { buildArgs, isLifecycleCommandFailure, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
 import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, buildCommand, upCommand, writeAndRunCommand } from './scripts';
+
+// User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
+const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
+const PROJECT = composeProjectName('acme/api', NAME_ID);
 
 const CLI_FOLDER = path.resolve(__dirname, '../../../node_modules/@devcontainers/cli');
 const CLI_SCRIPT = path.join(CLI_FOLDER, 'devcontainer.js');
@@ -114,7 +119,7 @@ describe('options of the helper against `devcontainer <command> --help`', () => 
     const config = path.join(tempDir(), 'repo', '.devcontainer', 'devcontainer.json');
     fs.mkdirSync(path.dirname(config), { recursive: true });
     fs.writeFileSync(config, '{}');
-    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: config, imageName: 'devenv-3f2a9c1e:2' });
+    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: config, imageName: `${PROJECT}:2` });
     const args = argsThroughScript(buildCommand(config, builderArgs));
     expect(args[0]).toBe('build');
     expect(contractProblems(args, documentedOptions('build'))).toEqual([]);
@@ -162,7 +167,7 @@ describe('options of the helper against `devcontainer <command> --help`', () => 
     const repositoryConfig = path.join(tempDir(), 'repo', '.devcontainer', 'devcontainer.json');
     fs.mkdirSync(path.dirname(repositoryConfig), { recursive: true });
     fs.writeFileSync(repositoryConfig, '{}');
-    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: OVERRIDE_CONFIG_PATH, imageName: 'devenv-3f2a9c1e:2' });
+    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: OVERRIDE_CONFIG_PATH, imageName: `${PROJECT}:2` });
     const args = throughWriteAndRun(writeAndRunCommand({ repositoryConfig }, builderArgs));
     expect(args.slice(0, builderArgs.length)).toEqual(builderArgs);
     expect(args).toContain('--no-lockfile');
