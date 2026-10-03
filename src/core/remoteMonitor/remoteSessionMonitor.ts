@@ -13,6 +13,7 @@
 // goes on: no signal is passed on). The loader stores the script at REMOTE_MONITOR_SCRIPT_PATH, so a restart of the
 // container resumes from it without input. Neither the script line nor any other input is logged.
 import { randomUUID } from 'crypto';
+import { monitorImageTag } from '../helper/helperState';
 import { errorMessage } from '../errors';
 import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from '../loader/pipeLoader';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
@@ -284,7 +285,17 @@ export class RemoteSessionMonitor {
     const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
     // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
     const createId = randomUUID();
-    const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images, createId);
+    // User decision 2026-10-03: the monitor runs from the tag devenv-monitor:<hash> of the pinned helper image (so Docker
+    // tools show it as the monitor, not as its image ID); tagMonitorImage tags the image before each create, and
+    // checkMonitorImage checks after it that the container got the pinned image.
+    const monitorTag = helperImage === undefined ? undefined : monitorImageTag(helperTag);
+    const runArgs = this.runArgs(monitorTag ?? helperImage ?? helperTag, socketPath, label, script, images, createId);
+    const create = async (): Promise<Created> => {
+      if (monitorTag !== undefined && helperImage !== undefined && !(await this.tagMonitorImage(helperImage, monitorTag, signal))) {
+        return this.create(this.runArgs(helperImage, socketPath, label, script, images, createId), scriptLine, signal);
+      }
+      return this.create(runArgs, scriptLine, signal);
+    };
     let current = await this.inspect(signal);
     // Review round 4 of PR #69 (A-R4-1): a `created` container (of any label) may be the create of another window
     // between its create and its start: look again for a while before anything is decided.
@@ -296,7 +307,7 @@ export class RemoteSessionMonitor {
       // window created meanwhile.
       await this.docker(['rm', '-f', this.idOf(current)], signal);
     }
-    let created = await this.create(runArgs, scriptLine, signal);
+    let created = await create();
     let triedAgain = false;
     // Another window creates or removes it at the same time: accept it when it is the same version and runs. It is not
     // ours, so it is not removed. Review round 3 of PR #69 (A-R3-1, A-R3-2): wait while it is being created or removed,
@@ -314,7 +325,7 @@ export class RemoteSessionMonitor {
       if (found === 'running') return 'running';
       if (found === 'missing' && !triedAgain) {
         triedAgain = true;
-        created = await this.create(runArgs, scriptLine, signal);
+        created = await create();
         continue;
       }
       // Review round 4 of PR #69 (A-R4-2): by the nonce only, so after a true conflict it finds nothing.
@@ -322,6 +333,7 @@ export class RemoteSessionMonitor {
       throw new Error(`docker run failed: ${created.detail}`);
     }
     if (created.kind === 'ready') {
+      if (helperImage !== undefined) await this.checkMonitorImage(helperImage, createId, signal);
       logger.info(`The Session Monitor on the Docker host was created (${this.containerName}, image ${helperTag}).`);
       return 'created';
     }
@@ -585,6 +597,41 @@ export class RemoteSessionMonitor {
    * `docker rm -f <id>`), never by the name: when the create failed because another window removed and replaced the
    * container meanwhile ("No such container"), the container of the name is that of the other window.
    */
+  /**
+   * User decision 2026-10-03: `docker tag <image ID> devenv-monitor:<hash>` before a create. False when it failed (logged):
+   * the create then runs by the image ID, as before.
+   */
+  private async tagMonitorImage(imageId: string, tag: string, signal: AbortSignal | undefined): Promise<boolean> {
+    const result = await this.options.docker.run(['image', 'tag', imageId, tag], { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
+    if (signal?.aborted) throw abortError();
+    if (result.exitCode === 0) return true;
+    this.options.logger.info(`The Session Monitor image could not be tagged as ${tag} (${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}); it runs by its image ID.`);
+    return false;
+  }
+
+  /**
+   * User decision 2026-10-03: the container of this create (by its nonce) runs the pinned image `imageId`, whatever its
+   * tag names by now (another window may have tagged another build of the same helper tag meanwhile). Otherwise it is
+   * removed and the create fails; the next open creates it again.
+   */
+  private async checkMonitorImage(imageId: string, createId: string, signal: AbortSignal | undefined): Promise<void> {
+    const own = await this.listOwn(createId, signal);
+    if (own === undefined || own.length === 0) throw new Error('The container of the Session Monitor could not be found after its create.');
+    for (const id of own) {
+      const result = await this.options.docker.run(['container', 'inspect', '--format', '{{json .Image}}', id], { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
+      let image: unknown;
+      try {
+        image = result.exitCode === 0 ? JSON.parse(result.stdout.trim()) : undefined;
+      } catch {
+        image = undefined;
+      }
+      if (image !== imageId) {
+        await this.removeBestEffort(createId);
+        throw new Error(`The Session Monitor was created from ${typeof image === 'string' ? image : 'an image that cannot be read'}, not from the pinned helper image ${imageId}; it was removed.`);
+      }
+    }
+  }
+
   private async removeBestEffort(createId: string): Promise<void> {
     try {
       const listed = await this.listOwn(createId, undefined);

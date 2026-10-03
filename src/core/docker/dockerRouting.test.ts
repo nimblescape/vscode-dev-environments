@@ -76,6 +76,9 @@ describe('isRoutableDockerCall and isReadOnlyDockerCall (plan step 5, PR A)', ()
       ['network', 'inspect', 'n'],
       ['network', 'ls'],
       ['network', 'rm', 'n'],
+      // User decision 2026-10-03: the Session Monitor tag of the helper image.
+      ['tag', 'sha256:1', 'devenv-monitor:0123456789ab'],
+      ['image', 'tag', 'sha256:1', 'devenv-monitor:0123456789ab'],
     ];
     for (const args of routable) expect(isRoutableDockerCall(args, { timeoutMs: 1_000, signal: new AbortController().signal }), args.join(' ')).toBe(true);
     const refused = [

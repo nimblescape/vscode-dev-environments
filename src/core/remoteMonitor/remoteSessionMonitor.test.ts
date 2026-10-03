@@ -243,19 +243,34 @@ describe('RemoteSessionMonitor.ensure', () => {
 
   it('runs the helper image of the open by its checked image ID, with the label and the log line of its tag (review round 1 of PR #64, S1)', async () => {
     const imageId = `sha256:${'7'.repeat(64)}`;
-    const docker = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
+    // User decision 2026-10-03: changed expectation (before: `docker run` by the image ID, as the second call). The image
+    // ID gets the tag devenv-monitor:<hash> first; the run names that tag, and the container's image is checked after it.
+    const monitorTag = `devenv-monitor:${TAG.slice('devenv-helper:'.length)}`;
+    const docker = new FakeDocker((args) =>
+      args[0] === 'container' && args.includes('{{json .Image}}')
+        ? result(0, `${JSON.stringify(imageId)}\n`)
+        : args[0] === 'container'
+          ? MISSING
+          : args[0] === 'ps'
+            ? result(0, `${'c'.repeat(64)}\n`)
+            : result(0, 'id\n'),
+    );
     const logger = new Log();
     expect(await monitor(docker, logger).ensure(TAG, SOCKET, undefined, imageId)).toBe('created');
-    const byId = docker.calls[1].args;
+    expect(docker.calls[1].args).toEqual(['image', 'tag', imageId, monitorTag]);
+    const byMonitorTag = docker.calls[2].args;
+    expect(docker.calls.slice(3).map((call) => call.args.slice(0, 2))).toEqual([['ps', '-aq'], ['container', 'inspect']]);
     const byTag = new FakeDocker((args) => (args[0] === 'container' ? MISSING : result(0, 'id\n')));
     await monitor(byTag).ensure(TAG, SOCKET);
     // The same arguments as with the tag, the label included; only the image reference differs. Review round 1 of PR #69
     // (A-R1-2): changed expectation (before: the arguments compared as they are): the nonce of each create differs too.
-    const byTagArgs = byTag.calls[1].args.map((arg) => (arg === TAG ? imageId : arg === `${LABEL_MONITOR_CREATE}=${createIdOf(byTag.calls[1].args)}` ? `${LABEL_MONITOR_CREATE}=${createIdOf(byId)}` : arg));
-    expect(byId).toEqual(byTagArgs);
-    expect(createIdOf(byId)).not.toBe(createIdOf(byTag.calls[1].args));
-    expect(byId).toContain(`${LABEL_SESSION_MONITOR}=${LABEL}`);
-    expect(byId).not.toContain(TAG);
+    const byTagArgs = byTag.calls[1].args.map((arg) =>
+      arg === TAG ? monitorTag : arg === `${LABEL_MONITOR_CREATE}=${createIdOf(byTag.calls[1].args)}` ? `${LABEL_MONITOR_CREATE}=${createIdOf(byMonitorTag)}` : arg,
+    );
+    expect(byMonitorTag).toEqual(byTagArgs);
+    expect(createIdOf(byMonitorTag)).not.toBe(createIdOf(byTag.calls[1].args));
+    expect(byMonitorTag).toContain(`${LABEL_SESSION_MONITOR}=${LABEL}`);
+    expect(byMonitorTag).not.toContain(TAG);
     expect(logger.lines).toContain(`info The Session Monitor on the Docker host was created (devenv-session-monitor, image ${TAG}).`);
   });
 

@@ -1134,6 +1134,24 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     expect(h.docker.removals).not.toContain('mine:1');
   });
 
+  // User decision 2026-10-03: the Session Monitor tag (devenv-monitor:<hash>) goes with its helper tag.
+  it('removes the monitor tag with its helper tag, and a monitor tag whose helper tag is gone; keeps that of a kept or the current tag', async () => {
+    const monitorOf = (tag: string) => `devenv-monitor:${tag.slice('devenv-helper:'.length)}`;
+    const { h, currentId } = current({ [OLD_TAG]: { lastUsedAt: '2026-01-01T00:00:00.000Z' } });
+    const oldId = h.docker.addImage([OLD_TAG, monitorOf(OLD_TAG)]);
+    const recentId = h.docker.addImage([OTHER_TAG, monitorOf(OTHER_TAG)]);
+    const orphanId = h.docker.addImage([monitorOf('devenv-helper:0a0a0a0a0a0a')]);
+    // The current helper's monitor tag on an older image (a rebuild of the same tag): kept for the next create.
+    const refreshedId = h.docker.addImage([monitorOf(h.tag)]);
+    await h.ensure();
+    expect([...h.docker.removals].sort()).toEqual([OLD_TAG, monitorOf(OLD_TAG), monitorOf('devenv-helper:0a0a0a0a0a0a')].sort());
+    expect(h.docker.images.has(oldId)).toBe(false);
+    expect(h.docker.images.has(orphanId)).toBe(false);
+    expect(h.docker.images.get(recentId)?.tags).toEqual([OTHER_TAG, monitorOf(OTHER_TAG)]);
+    expect(h.docker.images.get(refreshedId)?.tags).toEqual([monitorOf(h.tag)]);
+    expect(h.docker.images.get(currentId)?.tags).toEqual([h.tag]);
+  });
+
   it('never removes the image of the current tag, also when it has another expired helper tag', async () => {
     const { h, currentId } = current({ [OLD_TAG]: { lastUsedAt: '2026-01-01T00:00:00.000Z' } });
     h.docker.images.get(currentId)!.tags.push(OLD_TAG);

@@ -18,7 +18,7 @@ import { parseImageReference } from '../imageCheck/reference';
 import type { RegistryClient } from '../imageCheck/registryClient';
 import { LABEL_HELPER } from '../names';
 import { abortError, isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
-import { isHelperImageTag, readHelperState, updateHelperState, type HelperImageRecord, type HelperState } from './helperState';
+import { isHelperImageTag, isMonitorImageTag, readHelperState, updateHelperState, type HelperImageRecord, type HelperState } from './helperState';
 
 /**
  * Version of `@devcontainers/cli` in the helper image. It comes from the exact devDependency in package.json:
@@ -671,6 +671,15 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
         m.logger.info(`The workspace helper image ${tag} was not used for ${Math.floor(age / DAY_MS)} days. It is removed.`);
         if (await removeHelperImage(m, image, tag, currentId)) removed.push(tag);
       }
+    }
+    // User decision 2026-10-03: the Session Monitor tag of a helper image (monitorImageTag) goes with its helper tag: it
+    // is removed when the image no longer has that helper tag (removed now or before), except the tag of the current
+    // helper, which the next create of a monitor moves to the current image. A running monitor keeps its image anyway.
+    const helperTags = new Set(image.tags.filter((tag) => isHelperImageTag(tag) && !removed.includes(tag)));
+    for (const tag of image.tags.filter(isMonitorImageTag)) {
+      const helperTag = `${HELPER_IMAGE_REPOSITORY}:${tag.slice(tag.indexOf(':') + 1)}`;
+      if (helperTag === m.tag || helperTags.has(helperTag)) continue;
+      await removeHelperImage(m, image, tag, currentId);
     }
   }
 

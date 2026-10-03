@@ -71,6 +71,22 @@ export function isHelperImageTag(tag: string): boolean {
   return HELPER_TAG.test(tag);
 }
 
+/**
+ * User decision 2026-10-03: the second tag of a helper image that the Session Monitor runs from, so that it shows as
+ * `devenv-monitor:<hash>` (not as its image ID) in the container lists of Docker tools: `devenv-monitor:<the 12 hex
+ * characters of the helper tag>`, or undefined for anything that is no helper tag.
+ */
+export function monitorImageTag(helperTag: string): string | undefined {
+  return isHelperImageTag(helperTag) ? `devenv-monitor:${helperTag.slice('devenv-helper:'.length)}` : undefined;
+}
+
+const MONITOR_TAG = /^devenv-monitor:[0-9a-f]{12}$/;
+
+/** True for a tag that `monitorImageTag` returns. */
+export function isMonitorImageTag(tag: string): boolean {
+  return MONITOR_TAG.test(tag);
+}
+
 const RECORD_FIELDS = [
   'baseImage',
   'baseDigest',

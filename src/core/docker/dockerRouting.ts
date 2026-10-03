@@ -33,10 +33,11 @@ const READ_ONLY_OBJECT_COMMANDS: Record<string, readonly string[]> = {
 };
 
 /** The commands that may go through the worker: `docker <command>`, or `docker <object> <command>`. */
-const ROUTABLE_COMMANDS = new Set(['ps', 'inspect', 'info', 'version', 'images', 'stop', 'rm', 'rmi', 'rename', 'exec']);
+// User decision 2026-10-03: `tag` and `image tag` too (the Session Monitor tag of the helper image).
+const ROUTABLE_COMMANDS = new Set(['ps', 'inspect', 'info', 'version', 'images', 'stop', 'rm', 'rmi', 'rename', 'exec', 'tag']);
 const ROUTABLE_OBJECT_COMMANDS: Record<string, readonly string[]> = {
   container: ['inspect', 'ls', 'ps', 'stop', 'rm', 'rename'],
-  image: ['inspect', 'ls', 'rm'],
+  image: ['inspect', 'ls', 'rm', 'tag'],
   volume: ['inspect', 'ls', 'rm', 'create'],
   network: ['inspect', 'ls', 'rm'],
 };
