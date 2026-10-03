@@ -234,6 +234,11 @@ export class FakeDocker implements EnvironmentDocker {
     return '';
   }
 
+  /** Plan step 10A: like ContainerAdapter.startContainer (recorded as the `start` of runChecked). */
+  async startContainer(id: string, _options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<void> {
+    await this.runChecked(['start', id]);
+  }
+
   /**
    * Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped; the container
    * with the name of the environment first (final review, FC-1), then a running one, then the newest (the order of

@@ -186,6 +186,9 @@ const CLASSIFICATION: Record<string, { routed: boolean; readOnly: boolean }> = {
   pull: { routed: false, readOnly: false },
   '--config pull': { routed: false, readOnly: false },
   build: { routed: false, readOnly: false },
+  // Plan step 10A: `start` of startContainer runs directly only without a WorkerEngine (as here); within an operation it
+  // is the worker operation `startContainers` (containerAdapter.engine.test.ts).
+  start: { routed: false, readOnly: false },
 };
 
 const OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context']);
@@ -210,6 +213,13 @@ const NO_OWN_CALL = new Set([
   // (environmentLock.test.ts).
   'runWithSecretInput',
   'runDirect',
+  // Plan step 10A: the direct call of runDirect, which logs it; the operations of the worker over the Engine API (their
+  // routing: containerAdapter.engine.test.ts).
+  'runDirectOnce',
+  'setWorkerEngine',
+  'engineRoute',
+  'throughWorker',
+  'pullThroughWorker',
   'runOnce',
   'start',
   'operationEnv',
@@ -287,6 +297,7 @@ describe('the classification of every Docker call of ContainerAdapter (plan step
       // User decisions 2026-10-03: the labels of the environment images (`image inspect`, and `build` with its input).
       imageLabelsOf: (d) => d.imageLabelsOf(['i', 'j']),
       labelImage: (d) => d.labelImage('i', { a: 'b' }),
+      startContainer: (d) => d.startContainer('c'),
     };
     const members = Object.getOwnPropertyNames(ContainerAdapter.prototype);
     const unknown = members.filter((name) => !NO_OWN_CALL.has(name) && !(name in exercised));

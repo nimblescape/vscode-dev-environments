@@ -46,6 +46,10 @@ import {
   MAX_SERVER_LINE,
   OP_DOCKER,
   OP_LOCK,
+  OP_PULL,
+  OP_START_CONTAINERS,
+  parsePullParams,
+  parseStartContainersParams,
   StreamRedactor,
   encodeMessage,
   isSecret,
@@ -142,6 +146,17 @@ export interface ChannelDockerOptions
   secretInput?: string;
 }
 
+/**
+ * Plan step 10A (decision of 2026-10-03): the pull of an image by the worker (HelperChannel.pull). `credentials`: the
+ * registry login; its password is the secret of the operation (masked, only in the header of the request to the engine).
+ */
+export interface ChannelPullOptions extends Pick<OperationOptions, 'signal' | 'reserved'> {
+  /** Review round 1 of PR #89 (A-R1-3): or an identity token of `docker login` (sent as `identitytoken`). */
+  credentials?: { username: string; password: string; serveraddress: string } | { identityToken: string; serveraddress: string };
+  /** The progress of the download, line by line (default: the log). */
+  onOutput?: (text: string) => void;
+}
+
 /** Plan step 6, PR B: the options of one step of a batch helper (HelperBatchSession.step). */
 export interface BatchStepOptions {
   /** The GitHub token, for a step that needs it (the clone) or whose output may hold it (masked). */
@@ -212,6 +227,9 @@ export class OutputTail {
     return this.kept;
   }
 }
+
+/** Live check of 2026-10-03: the abort reason of `release` of a held lock or batch helper (hold). */
+const HOLD_RELEASED = Symbol('released');
 
 interface Pending {
   op: string;
@@ -454,6 +472,11 @@ export class HelperChannel {
   private logResult(id: number, pending: Pending, failure: string | undefined): void {
     if (pending.op === OP_DOCKER && failure === undefined) return;
     const seconds = ((Date.now() - pending.startedAt) / 1000).toFixed(1);
+    // Live check of 2026-10-03: a held lock or batch helper ends by its cancel; after `release` that is no failure.
+    if (failure === 'cancelled' && pending.options.signal?.reason === HOLD_RELEASED) {
+      this.options.logger.info(`[${this.options.name}] ${pending.op}#${id}: released after ${seconds} s.`);
+      return;
+    }
     const line = `[${this.options.name}] ${pending.op}#${id}: ${failure === undefined ? 'done' : `failed: ${failure}`} after ${seconds} s.`;
     if (failure === undefined) this.options.logger.info(line);
     else this.options.logger.warn(line);
@@ -637,10 +660,50 @@ export class HelperChannel {
       lost: held.lost,
       // PR #74 review round 1 (A-R1-2): the calls under the lock have their own places (MAX_CONCURRENT_LOCKED_OPERATIONS).
       docker: (args, options) => this.docker(args, { ...options, reserved: true }),
+      // Plan step 10A: the operations over the Engine API, through the same worker, with the places of the calls under it.
+      pull: (reference, options) => this.pull(reference, { ...options, reserved: true }),
+      startContainers: (ids, options) => this.startContainers(ids, { ...options, reserved: true }),
       // Plan step 6, PR B: a batch helper of the operation that holds the lock, through the same worker.
       batch: (batch, batchSignal) => this.batch(batch, batchSignal),
       release: held.release,
     };
+  }
+
+  /**
+   * Plan step 10A (decision of 2026-10-03): `pull` of `reference` (pullReference: with a tag or a digest) by the worker
+   * over the Engine API. Rejects as `operation`; HelperChannelError('unsendable') for parameters that the worker would
+   * refuse, or a password that cannot travel as a secret (isSecret).
+   */
+  async pull(reference: string, options: ChannelPullOptions = {}): Promise<void> {
+    const params: Record<string, unknown> = { reference };
+    const login = options.credentials;
+    if (login !== undefined) {
+      if ('identityToken' in login) params.identityToken = true;
+      else params.username = login.username;
+      params.serveraddress = login.serveraddress;
+    }
+    if (parsePullParams(params) === undefined) throw new HelperChannelError('unsendable', `The pull of ${reference} cannot be sent through the helper channel.`);
+    if (!this.operations.includes(OP_PULL)) throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_PULL}.`);
+    const onOutput = options.onOutput;
+    await this.operation(OP_PULL, params, {
+      secret: login === undefined ? undefined : 'identityToken' in login ? login.identityToken : login.password,
+      signal: options.signal,
+      reserved: options.reserved,
+      ...(onOutput !== undefined ? { onOutput: (_stream: 'stdout' | 'stderr', text: string) => onOutput(text) } : {}),
+    });
+  }
+
+  /**
+   * Plan step 10A (decision of 2026-10-03): `startContainers` of the containers `ids` (full IDs) by the worker over the
+   * Engine API. Rejects as `operation`; HelperChannelError('unsendable') for IDs that the worker would refuse.
+   */
+  async startContainers(ids: readonly string[], options: Pick<OperationOptions, 'signal' | 'reserved' | 'timeoutMs'> = {}): Promise<void> {
+    const params = parseStartContainersParams({ ids: [...ids] });
+    if (params === undefined) throw new HelperChannelError('unsendable', 'The containers to start cannot be sent through the helper channel.');
+    if (!this.operations.includes(OP_START_CONTAINERS)) {
+      throw new HelperChannelError('unsendable', `The helper channel to ${this.options.name} does not know the operation ${OP_START_CONTAINERS}.`);
+    }
+    await this.operation(OP_START_CONTAINERS, params, { signal: options.signal, reserved: options.reserved, timeoutMs: options.timeoutMs });
   }
 
   /**
@@ -707,7 +770,8 @@ export class HelperChannel {
       lost,
       release: async () => {
         releasing = true;
-        controller.abort();
+        // Live check of 2026-10-03: the reason marks the cancel as the planned end (logResult).
+        controller.abort(HOLD_RELEASED);
         await ended;
       },
     };

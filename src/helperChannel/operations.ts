@@ -12,6 +12,8 @@ import {
   OP_DOCKER,
   OP_LOCK,
   OP_PROBE,
+  OP_PULL,
+  OP_START_CONTAINERS,
   OP_REFRESH,
   OP_SWEEP,
   engineIdentity,
@@ -27,6 +29,8 @@ import { readEnvironmentStates } from '../core/pipeline/refreshStates';
 import { abortError, type Logger, type ProcessRunner } from '../core/ports';
 import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/batch';
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation } from './batch';
+import { engineApi } from './engineApi';
+import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
@@ -142,6 +146,9 @@ export const refreshOperation: OperationHandler = async (params, context) => {
   return value;
 };
 
+/** Plan step 10A: the Engine API of the worker's engine, over its socket. */
+const ENGINE = engineApi();
+
 /** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
 const BATCH = batchDeps();
 
@@ -156,4 +163,7 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_BATCH]: batchOperation(BATCH),
   [OP_BATCH_STEP]: batchStepOperation(BATCH),
   [OP_BATCH_CHUNK]: batchChunkOperation(BATCH),
+  // Plan step 10A (decision of 2026-10-03): operations over the Engine API of the worker's engine (engineOperations.ts).
+  [OP_PULL]: pullOperation(ENGINE),
+  [OP_START_CONTAINERS]: startContainersOperation(ENGINE),
 };

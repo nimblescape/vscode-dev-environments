@@ -26,11 +26,13 @@ import {
   CLEANUP_SECOND_PASS_MS,
   ChannelServer,
   LATE_CANCEL_WINDOW_MS,
+  OperationError,
   MAX_LOG_TEXT,
   MAX_CONTEXT_STDERR_CHARACTERS,
   MAX_CONTEXT_STDOUT_CHARACTERS,
   StreamRedactor,
   commandLine,
+  MAX_LOGGED_SCRIPT_LENGTH,
   redact,
   type ContextDockerResult,
   type OperationHandler,
@@ -141,7 +143,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(messages).toEqual([
       // Review round 4 (M1): with the sweep of never-started channel containers.
       // Plan step 5, PR B: changed expectation: `lock` too.
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'refresh', 'sweep'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'sweep'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations; plan step 10A: changed expectation, `pull` and `startContainers`
       { t: 'pong', n: 7 },
     ]);
   });
@@ -206,6 +208,27 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
       .map((message) => (message as { data: string }).data)
       .join('');
     expect(stdout).toBe('echo *** done\n');
+  });
+
+  // Review round 1 of PR #89 (A-R1-4): the message of a failed operation can carry text of the engine or a registry.
+  it('masks the secret in the error message of a failed operation', async () => {
+    const secret = 'registry-PASSWORD-9';
+    const { send, of } = setup({
+      operations: {
+        fails: async () => {
+          throw new OperationError('failed', `the registry said: bad credentials ${secret}`);
+        },
+        throws: async () => {
+          throw new Error(`raw ${secret}`);
+        },
+      },
+    });
+    send({ t: 'op', id: 1, op: 'fails', params: null, secret });
+    send({ t: 'op', id: 2, op: 'throws', params: null, secret });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(JSON.stringify([...of(1), ...of(2)])).not.toContain(secret);
+    expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { code: 'failed', message: 'the registry said: bad credentials ***' } });
+    expect(of(2).at(-1)).toMatchObject({ t: 'result', ok: false, error: { code: 'failed', message: 'raw ***' } });
   });
 
   it('refuses a docker operation that expects a secret without one', async () => {
@@ -648,6 +671,19 @@ describe('the helpers of the server', () => {
 
   it('commandLine quotes arguments with spaces or quotes', () => {
     expect(commandLine(['ps', '--format', '{{json .}}', '', 'a"b'])).toBe('docker ps --format "{{json .}}" "" "a\\"b"');
+  });
+
+  // Live check of 2026-10-03: a long script is `<script>` in the log line, as in the batch helper.
+  it('commandLine shows a script of more than one line or more than MAX_LOGGED_SCRIPT_LENGTH characters as <script>', () => {
+    const long = 'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH + 1);
+    expect(commandLine(['exec', '-i', 'c', 'sh', '-c', 'set -eu\necho hi', 'sh', 'dev'])).toBe('docker exec -i c sh -c <script> sh dev');
+    expect(commandLine(['run', 'img', 'node', '-e', long, '/opt/x.js'])).toBe('docker run img node -e <script> /opt/x.js');
+    expect(commandLine(['exec', 'c', '/bin/sh', '-c', long])).toBe('docker exec c /bin/sh -c <script>');
+    // A short one-line script stays, and so does a long argument that is no script.
+    expect(commandLine(['exec', 'c', 'sh', '-c', 'echo hi'])).toBe('docker exec c sh -c "echo hi"');
+    expect(commandLine(['exec', 'c', 'cat', long])).toBe(`docker exec c cat ${long}`);
+    expect(commandLine(['exec', '-e', long, 'c', 'true'])).toBe(`docker exec -e ${long} c true`);
+    expect(commandLine(['run', 'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH)])).toBe(`docker run ${'x'.repeat(MAX_LOGGED_SCRIPT_LENGTH)}`);
   });
 });
 

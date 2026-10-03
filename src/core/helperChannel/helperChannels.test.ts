@@ -53,6 +53,8 @@ function fakeChannel() {
       for (const listener of closeListeners) listener('lost');
     },
     docker: vi.fn(async () => ({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false })),
+    pull: vi.fn(async (_reference: string, _options?: unknown) => {}),
+    startContainers: vi.fn(async (_ids: readonly string[], _options?: unknown) => {}),
   };
   return channel;
 }
@@ -190,6 +192,28 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'unsendable' });
     channel.docker.mockRejectedValueOnce(new HelperChannelError('lost', 'lost'));
     await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'lost' });
+    channels.dispose();
+  });
+
+  // Review round 1 of PR #89 (B-R1-7): pull and startContainers are sent once more only after `closed`, with their options.
+  it('pull and startContainers: once more after closed; not twice, not after unsendable or lost; options passed on', async () => {
+    const channel = fakeChannel();
+    const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
+    const signal = new AbortController().signal;
+    channel.pull.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
+    await channels.pull(REMOTE, 'alpine:1', { signal });
+    expect(channel.pull).toHaveBeenCalledTimes(2);
+    expect(channel.pull.mock.calls[1]).toEqual(['alpine:1', { signal }]);
+    channel.pull.mockRejectedValueOnce(new HelperChannelError('closed', 'a')).mockRejectedValueOnce(new HelperChannelError('closed', 'b'));
+    await expect(channels.pull(REMOTE, 'alpine:1')).rejects.toMatchObject({ code: 'closed', message: 'b' });
+    for (const code of ['unsendable', 'lost'] as const) {
+      const before = channel.startContainers.mock.calls.length;
+      channel.startContainers.mockRejectedValueOnce(new HelperChannelError(code, code));
+      await expect(channels.startContainers(REMOTE, ['a'.repeat(64)])).rejects.toMatchObject({ code });
+      expect(channel.startContainers.mock.calls.length - before).toBe(1);
+    }
+    await channels.startContainers(REMOTE, ['a'.repeat(64)], { signal, timeoutMs: 1_000 });
+    expect(channel.startContainers.mock.calls.at(-1)).toEqual([['a'.repeat(64)], { signal, timeoutMs: 1_000 }]);
     channels.dispose();
   });
 
