@@ -146,6 +146,11 @@ describe('resourceName', () => {
     expect(isEnvironmentResourceName(dashed)).toBe(true);
   });
 
+  it('names an owner and repository of only separators `x` (review round 1 of PR #88, B-R1-8)', () => {
+    expect(resourceName('-/_', ID)).toBe(`devenv-x-${namePair(ID)}`);
+    expect(isEnvironmentResourceName(resourceName('-/_', ID))).toBe(true);
+  });
+
   it('refuses a repository without owner or name', () => {
     expect(() => resourceName('api', ID)).toThrow();
     expect(() => resourceName('acme/', ID)).toThrow();
@@ -154,6 +159,12 @@ describe('resourceName', () => {
 
 describe('isEnvironmentResourceName', () => {
   const ID = '11111111-2222-4333-8444-555555555555';
+
+  it('refuses `_` and `.` in the name (review round 1 of PR #88, B-R1-7: resourceName never writes them)', () => {
+    const name = resourceName('acme/api', ID);
+    expect(isEnvironmentResourceName(name.replace('devenv-acme-', 'devenv-acme_'))).toBe(false);
+    expect(isEnvironmentResourceName(name.replace('devenv-acme-', 'devenv-acme.'))).toBe(false);
+  });
 
   it.each(['acme/api', 'Acme/My.Repo_Name', 'a/b', 'devenv/x', `${'a'.repeat(40)}/${'b'.repeat(40)}`])('takes the name of an environment of %s', (repository) => {
     expect(isEnvironmentResourceName(resourceName(repository, ID))).toBe(true);

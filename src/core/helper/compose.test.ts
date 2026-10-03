@@ -122,6 +122,9 @@ describe('names', () => {
     [`${OTHER_PROJECT}_default`, true],
     [`${OTHER_PROJECT.toUpperCase()}_data`, true],
     [`${composeProjectName('acme/api', '11111111-2222-4333-8444-555555555555')}_default`, true],
+    // Review round 1 of PR #88 (B-R1-2): a key with `_` of its own; the project is what comes before the first `_`.
+    [`${OTHER_PROJECT}_my_data`, true],
+    [`${PROJECT}_my_data`, false],
     [`${PROJECT}_default`, false],
     [`${PROJECT.toUpperCase()}_default`, false],
     ['devenv-tools_default', false],

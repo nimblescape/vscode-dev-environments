@@ -161,6 +161,18 @@ describe('the labels of a new environment image, and its pinned ID', () => {
     expect([...h.docker.images].filter((image) => image.startsWith('devenv-'))).toEqual([]);
   });
 
+  it('fails a first open whose image is gone after its labels, and writes no record (review round 1 of PR #88, B-R1-4)', async () => {
+    const label = h.docker.labelImage.bind(h.docker);
+    h.docker.labelImage = async (image, labels) => {
+      await label(image, labels);
+      h.docker.images.delete(image);
+    };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('buildFailed');
+    expect(h.helper.ups).toEqual([]);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
   it('keeps the old container when the labels of an update cannot be set, and removes the new image', async () => {
     await seedEnvironment(h, { record: { images: { [BASE_IMAGE]: DIGEST_OLD } } });
     h.docker.labelImageError = new Error('Cannot connect to the Docker daemon');
@@ -222,6 +234,23 @@ describe('an entry without a build record takes the record over from its newest 
     const env = await h.registry.get(ENV_ID);
     expect(env?.buildRecord).toEqual({ ...recordOf(IMAGE_3, 3), imageId: `sha256:image-of-${IMAGE_3}` });
     expect(env?.lastBuildNumber).toBe(3);
+  });
+
+  it('never lowers the last build number of the entry (review round 1 of PR #88, B-R1-5)', async () => {
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.lastBuildNumber = 7;
+    });
+    addImage(IMAGE_3, labelsOf(recordOf(IMAGE_3, 3)));
+    await h.service.open(TARGET, options());
+    expect((await h.registry.get(ENV_ID))?.lastBuildNumber).toBe(7);
+  });
+
+  it('takes no tag that is no build number as the newest image (review round 1 of PR #88, B-R1-6)', async () => {
+    addImage(IMAGE_1, labelsOf(recordOf(IMAGE_1, 1)));
+    for (const tag of [`${NAME}:0`, `${NAME}:1e30`, `${NAME}:latest`]) h.docker.images.add(tag);
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toEqual([]);
+    expect((await h.registry.get(ENV_ID))?.buildRecord?.environmentImage).toBe(IMAGE_1);
   });
 
   it('pins the ID that Docker gives the image, never one of the labels', async () => {

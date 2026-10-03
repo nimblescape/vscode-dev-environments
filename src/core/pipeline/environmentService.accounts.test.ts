@@ -748,6 +748,17 @@ describe('images of the environments of other accounts (user decision 2026-09-28
     expect(h.helper.builds).toEqual([]);
   });
 
+  it('fails the check when Docker cannot read the labels of the images of the environments (review round 1 of PR #88, B-R1-1)', async () => {
+    // The labels decide whose image it is (user decisions 2026-10-03): without them the check fails, never by name only.
+    h.docker.imageLabelsOf = async () => {
+      throw new Error('Cannot connect to the Docker daemon');
+    };
+    h.helper.config = { image: THEIRS };
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.message).toBe(Messages.configurationCheckDocker(dockerCheckItem('the images of the environments on the Docker host could not be read')));
+    expect(h.helper.builds).toEqual([]);
+  });
+
   it('fails the check when Docker cannot list the volumes that name the owner of an image', async () => {
     const gone = '9a8b7c6d-0000-4000-8000-000000000009';
     h.docker.images.add(environmentImageName(WEB, gone, 2));

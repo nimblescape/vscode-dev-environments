@@ -66,6 +66,14 @@ function serviceReport(service: string, settings: Record<string, unknown>, overr
 }
 
 const A = (...items: string[]): HostAccessReport => ({ hostAccess: items, unsupported: [] });
+
+describe('network_mode and the Compose project label of a network (review round 1 of PR #88, B-R1-3)', () => {
+  it('allows the own project network by its label, and refuses one with the label of another project', () => {
+    const state = (project: string) => ({ [`net-${project}`]: { labels: { 'com.docker.compose.project': project }, environments: [] } });
+    expect(serviceReport('db', { network_mode: `net-${PROJECT}` }, { networks: state(PROJECT) }).hostAccess).toEqual([]);
+    expect(serviceReport('db', { network_mode: `net-${OTHER}` }, { networks: state(OTHER) }).hostAccess).toEqual([`service db: network net-${OTHER} of another environment`]);
+  });
+});
 const U = (...items: string[]): HostAccessReport => ({ hostAccess: [], unsupported: items });
 
 describe('composeAccessReport: the allowed model', () => {
@@ -191,6 +199,8 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['network_mode of the service itself', 'app', { network_mode: 'service:app' }, A('service app: network of another container (service:app)')],
     ['network_mode of a container', 'app', { network_mode: `container:${OTHER}` }, A(`service app: network of another container (container:${OTHER})`)],
     ['network_mode of another environment', 'db', { network_mode: `${OTHER}_default` }, A(`service db: network ${OTHER}_default of another environment`)],
+    // Review round 1 of PR #88 (B-R1-3): the own project's network, also by the name rule of foreignNetworkItem.
+    ['network_mode of the own project', 'db', { network_mode: `${PROJECT}_default` }, NONE],
     ['networks', 'db', { networks: { default: { aliases: ['database'], ipv4_address: '172.20.0.5' } } }, NONE],
     // volumes (D-6, D-11: details in compose.test.ts)
     // unit 15: the workspace volume no longer holds the GitHub token (it is in the memory of the dev container).
