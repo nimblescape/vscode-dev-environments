@@ -576,3 +576,56 @@ describe('review round 2 of PR #88: the gaps of the mutation review (B-R2-2, B-R
     });
   });
 });
+
+describe('review round 3 of PR #88 (A-R3-1): a workspace volume of the name with another environment\'s ID', () => {
+  const theirs = { [LABEL_ENVIRONMENT_ID]: OTHER_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: OTHER_ACCOUNT.id };
+
+  it('is never removed by the Delete of the entry that a failed first open kept (its labels were unreadable then)', async () => {
+    const FREE = '5e5e5e5e-0000-4000-8000-000000000005';
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => FREE });
+    const name = resourceName(REPO, FREE);
+    const exists = vi.spyOn(h.docker, 'volumeExists').mockResolvedValue(false);
+    h.docker.volumes.set(name, theirs);
+    const inspect = h.docker.inspectVolumes.bind(h.docker);
+    let failing = true;
+    h.docker.inspectVolumes = async (names) => {
+      if (failing) throw new Error('timeout');
+      return inspect(names);
+    };
+    await expect(h.service.open(TARGET, options())).rejects.toBeDefined();
+    expect((await h.registry.list()).map((entry) => entry.id)).toEqual([FREE]);
+    exists.mockRestore();
+    failing = false;
+    await h.service.delete(FREE, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(h.docker.volumes.get(name)).toEqual(theirs);
+    expect(await h.registry.list()).toEqual([]);
+  });
+
+  it('is never opened by an existing environment', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.volumes.set(NAME, theirs);
+    const error = await rejection(h.service.open(TARGET, options()));
+    expect(error.code).toBe('startFailed');
+    expect(h.helper.calls.filter((call) => call.startsWith('up') || call.startsWith('clone'))).toEqual([]);
+  });
+
+  it('is never removed by the Delete of an existing environment, nor its images', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.volumes.set(NAME, theirs);
+    await h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(h.docker.volumes.get(NAME)).toEqual(theirs);
+    expect(h.docker.images.has(IMAGE_1)).toBe(true);
+    expect(await h.registry.get(ENV_ID)).toBeUndefined();
+  });
+
+  it('stops Delete without removing anything when Docker cannot say whose it is', async () => {
+    await seedEnvironment(h, { container: null });
+    h.docker.inspectVolumes = async () => {
+      throw new Error('timeout');
+    };
+    await expect(h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] })).rejects.toBeDefined();
+    expect(h.docker.volumes.has(NAME)).toBe(true);
+    expect(await h.registry.get(ENV_ID)).toBeDefined();
+  });
+});

@@ -30,12 +30,14 @@ export function isOwnContextDescription(description: string | undefined): boolea
  * order (user decisions 2026-10-03): the alias of the SSH config, or the host name of an address (without the user and
  * the port), for example `htldvm`; on a clash with a context of that name that points elsewhere, the name with the pair
  * of the host (namePair), for example `htldvm-brave-noether`. Docker allows only `[a-zA-Z0-9_.+-]`, starting with a
- * letter or digit, in the name of a context: every run of other characters becomes `-`.
+ * letter or digit, and at least 2 characters, in the name of a context: every run of other characters becomes `-`, and a
+ * name of one character gets the prefix `remote-`.
  */
 export function remoteContextNames(host: string): [string, string] {
   const target = sshTargetOf(host)?.host ?? host;
   const base = target.replace(/[^a-zA-Z0-9_.+-]+/g, '-').replace(/^[^a-zA-Z0-9]+/, '').replace(/-+$/, '');
-  const name = base === '' || base === DEFAULT_CONTEXT_NAME ? 'remote' : base;
+  // Review round 3 of PR #88 (A-R3-2): Docker needs at least 2 characters (`^[a-zA-Z0-9][a-zA-Z0-9_.+-]+$`).
+  const name = base === '' || base === DEFAULT_CONTEXT_NAME ? 'remote' : base.length < 2 ? `remote-${base}` : base;
   return [name, `${name}-${namePair(host)}`];
 }
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */

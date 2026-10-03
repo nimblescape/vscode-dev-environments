@@ -1493,7 +1493,10 @@ export class EnvironmentService {
           hostAccessChecks: this.hostAccessChecksFor(env.repository),
         };
         ctx = opened;
-        if (!(await this.deps.docker.volumeExists(env.volumeName))) {
+        // Review round 3 of PR #88 (A-R3-1): a volume of its name that is another environment's is never opened.
+        const ownership = await this.workspaceVolumeOwnership(env);
+        if (ownership === 'foreign' || ownership === 'unreadable') await this.requireOwnVolume(env);
+        if (ownership === 'missing') {
           await this.recoverMissingFiles(opened, defaultBranch, options.progress);
         } else if (env.busy?.operation === 'create') {
           await this.resumeInterruptedClone(opened, defaultBranch);
@@ -5894,6 +5897,12 @@ export class EnvironmentService {
       // Plan step 5, PR B: the busy mark first, then the lock of the environment on the Docker host (user decisions D1 to
       // D3); both are released in `finally`.
       await this.withEnvironmentLock(env, options.signal, async () => {
+        // Review round 3 of PR #88 (A-R3-1): Delete removes nothing of the name of the environment (its dev container, the
+        // Compose project, the images, the volume) when the volume of that name is another environment's; it stops when
+        // Docker cannot say whose it is.
+        const ownership = await this.workspaceVolumeOwnership(env);
+        if (ownership === 'unreadable') throw new Error(`The labels of the volume ${env.volumeName} could not be read; nothing was removed.`);
+        const byName = ownership !== 'foreign';
         // Step 3: container, environment image, unused base images.
         const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
         for (const container of containers) {
@@ -5902,15 +5911,17 @@ export class EnvironmentService {
         }
         // Review round 9 (D9-3): a dev container of the name without the ID label (for example relabelled by hand) is
         // stopped first too.
-        const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
-        if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
-        await docker.removeContainer(env.containerName);
-        // Docker Compose: the other containers, the networks, and the built images of the project too.
-        const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)));
-        if (compose) await this.removeComposeProject(env, false);
-        await this.removeEnvironmentImages(env, undefined, env.buildRecord);
-        // Step 4: the workspace volume; additional volumes only when the user confirmed it.
-        await this.removeVolumeWithRetry(env.volumeName);
+        if (byName) {
+          const dev = await docker.findContainer(env.id, env.containerName).catch(() => undefined);
+          if (dev !== undefined) await this.stopServiceBeforeRemoval(dev, env);
+          await docker.removeContainer(env.containerName);
+          // Docker Compose: the other containers, the networks, and the built images of the project too.
+          const compose = composeRecordOf(env.buildRecord) !== undefined || containers.some((c) => isComposeContainer(c.labels, composeProjectName(env.repository, env.id)));
+          if (compose) await this.removeComposeProject(env, false);
+          await this.removeEnvironmentImages(env, undefined, env.buildRecord);
+          // Step 4: the workspace volume; additional volumes only when the user confirmed it.
+          await this.removeVolumeWithRetry(env.volumeName);
+        }
         const removedVolumes =
           options.additionalVolumesToRemove.length > 0 ? await this.removeAdditionalVolumes(env, options.additionalVolumesToRemove) : [];
         // Step 5: the registry entry and the files that reference the environment. The additional volumes that stay keep
@@ -6440,12 +6451,35 @@ export class EnvironmentService {
     };
   }
 
-  /** Review round 2 of PR #88 (A-R2-2): the workspace volume of `env` carries the ID of `env`, else startFailed. */
+  /**
+   * Review round 3 of PR #88 (A-R3-1): whose the workspace volume of `env` is, by its label nimblescape.devenv.environment-id:
+   * `own`, `missing`, or `foreign` (another environment's, or a volume of its name without the label); `unreadable` when
+   * Docker cannot answer. A volume of its name that is not its own is never used or removed by name.
+   */
+  private async workspaceVolumeOwnership(env: Environment): Promise<'own' | 'missing' | 'foreign' | 'unreadable'> {
+    let volumes: VolumeInfo[];
+    try {
+      volumes = await this.deps.docker.inspectVolumes([env.volumeName]);
+    } catch (error) {
+      this.logger.warn(`The labels of the volume ${env.volumeName} could not be read: ${errorMessage(error)}`);
+      return 'unreadable';
+    }
+    const volume = volumes.find((candidate) => candidate.name === env.volumeName);
+    if (volume === undefined) return 'missing';
+    if (volume.labels[LABEL_ENVIRONMENT_ID] === env.id) return 'own';
+    this.logger.warn(`The volume ${env.volumeName} carries the environment ID ${volume.labels[LABEL_ENVIRONMENT_ID] ?? 'none'}, not ${env.id}. It is not used.`);
+    return 'foreign';
+  }
+
+  /** Review round 2 of PR #88 (A-R2-2): the workspace volume of `env` is its own (workspaceVolumeOwnership), else startFailed. */
   private async requireOwnVolume(env: Environment): Promise<void> {
-    const owner = (await this.deps.docker.inspectVolumes([env.volumeName]))[0]?.labels[LABEL_ENVIRONMENT_ID];
-    if (owner === env.id) return;
-    this.logger.warn(`The volume ${env.volumeName} carries the environment ID ${owner ?? 'none'}, not ${env.id}. It is not used.`);
-    throw new UserFacingError('startFailed', PipelineTexts.startFailed, `The volume ${env.volumeName} belongs to another environment. Open the repository again.`);
+    const ownership = await this.workspaceVolumeOwnership(env);
+    if (ownership === 'own') return;
+    throw new UserFacingError(
+      'startFailed',
+      PipelineTexts.startFailed,
+      ownership === 'unreadable' ? `The labels of the volume ${env.volumeName} could not be read.` : `The volume ${env.volumeName} belongs to another environment.`,
+    );
   }
 
   /** A helper run on a missing volume would create an empty one without labels (concept 7.5 forbids that). */

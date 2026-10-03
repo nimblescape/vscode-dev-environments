@@ -303,3 +303,14 @@ describe('isSshClosedBeforeLogin', () => {
     expect(isSshClosedBeforeLogin('ssh: connect to host box port 22: Connection refused')).toBe(false);
   });
 });
+
+describe('review round 3 of PR #88 (A-R3-2): the context names of a host are valid Docker context names', () => {
+  // The Docker CLI takes only names of at least 2 characters (`docker context create b` fails, docker 29.3.1).
+  const DOCKER_CONTEXT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]+$/;
+  it.each(['b', 'user@b', 'b:2222', '[::1]', 'x_', 'htldvm'])('%s', (host) => {
+    for (const name of remoteContextNames(host)) expect(name).toMatch(DOCKER_CONTEXT_NAME);
+  });
+  it('prefixes a name of one character with remote-', () => {
+    expect(remoteContextNames('user@b')[0]).toBe('remote-b');
+  });
+});
