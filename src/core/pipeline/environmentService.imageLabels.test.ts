@@ -987,3 +987,24 @@ describe('review round 5 of PR #88 (B-R5-1): a failed Clone again removes the vo
     expect(h.docker.log).not.toContain(`volume rm ${NAME}`);
   });
 });
+
+describe('review round 6 of PR #88 (A-R6-1): Clone again whose `docker volume create` reports a failure after the daemon created the volume', () => {
+  it('removes the volume that was created, so the files count as missing again and the next open clones', async () => {
+    await seedEnvironment(h, { container: null, volume: false });
+    h.ui.filesMissingAnswer = 'cloneAgain';
+    const create = h.docker.createVolume.bind(h.docker);
+    let failed = false;
+    h.docker.createVolume = async (name: string, labels: Record<string, string>) => {
+      await create(name, labels);
+      if (!failed) {
+        failed = true;
+        throw new Error('error during connect: unexpected EOF (ssh connection lost)');
+      }
+    };
+    await expect(h.service.open(TARGET, options())).rejects.toThrow('unexpected EOF');
+    expect(h.docker.volumes.has(NAME)).toBe(false);
+    const clones = h.helper.clones.length;
+    await h.service.open(TARGET, options());
+    expect(h.helper.clones.length).toBe(clones + 1);
+  });
+});

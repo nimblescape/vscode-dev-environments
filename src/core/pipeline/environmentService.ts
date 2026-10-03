@@ -1561,8 +1561,10 @@ export class EnvironmentService {
 
     await this.markBusy(ctx, 'create');
     ctx.steps.step('downloadingRepository');
-    await this.deps.docker.createVolume(env.volumeName, volumeLabels(env));
     try {
+      // Review round 6 of PR #88 (A-R6-1): inside the try, as at the first open: a create that Docker did but reported as
+      // failed (a dropped connection) leaves a volume that the catch below handles like any other.
+      await this.deps.docker.createVolume(env.volumeName, volumeLabels(env));
       // Review round 4 of PR #88 (A-R4-1): as the first open, never a volume of the name that another environment created
       // meanwhile (`docker volume create` takes it as it is), and that volume is never removed.
       await this.requireOwnVolume(env);
