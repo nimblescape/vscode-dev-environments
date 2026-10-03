@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAX_CAPTURED_OUTPUT_BYTES } from '../helper/analysisLimits';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { OutputTooLargeError } from '../process';
-import type { Logger, StartedProcess } from '../ports';
+import { abortError, type Logger, type StartedProcess } from '../ports';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
 import {
@@ -1102,6 +1102,57 @@ describe('HelperChannel: the requests of an operation (plan step 11A)', () => {
     await vi.advanceTimersByTimeAsync(0);
     controller.abort();
     expect(handlerSignal?.aborted).toBe(true);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await running;
+  });
+
+  // Review round 1 of plan step 11A, mutation review (B-R1-11 to B-R1-13, B-R1-15).
+  it('answers `cancelled` for a handler that was aborted, ok without secrets for empty secrets, and sends no empty secrets', async () => {
+    const { channel, fake } = await openChannel();
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      secrets: {},
+      onAsk: async () => {
+        call++;
+        if (call === 1) throw abortError();
+        return { value: 1, secrets: {} };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    expect(op).not.toHaveProperty('secrets');
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'ask', id: op.id, ask: 2, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake)).toEqual([
+      { t: 'answer', id: op.id, ask: 1, ok: false, error: { code: 'cancelled', message: expect.any(String) } },
+      { t: 'answer', id: op.id, ask: 2, ok: true, value: 1 },
+    ]);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('runs no handler for a request that comes after the cancel', async () => {
+    const { channel, fake } = await openChannel();
+    const controller = new AbortController();
+    let called = 0;
+    const running = channel
+      .operation('open', {}, {
+        signal: controller.signal,
+        onAsk: async () => {
+          called++;
+          return { value: null };
+        },
+      })
+      .catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    controller.abort();
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(called).toBe(0);
+    expect(answers(fake)).toEqual([]);
     fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
     await running;
   });

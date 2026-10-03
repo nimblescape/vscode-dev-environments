@@ -381,6 +381,26 @@ describe('the places and the limits of a batch on the client (review round 1 of 
     channel.close();
   });
 
+  // Review round 1 of plan step 11A (B-R1-14): the length of the secrets counts for the pieces.
+  it('a step that fits without a secret goes in pieces with a long token', async () => {
+    const { channel, worker, session: s } = await session();
+    const base = JSON.stringify({ repository: 'o/r', text: '' }).length;
+    const params = { repository: 'o/r', text: 'a'.repeat(MAX_CHANNEL_REQUEST_BYTES - 6 * 1_024 - 2_000 - base) };
+    const before = worker.ops().length;
+    const plain = s.step('up', params);
+    await tick();
+    expect(worker.ops().slice(before).map((op) => op.op)).toEqual(['batchStep']);
+    worker.answer({ t: 'result', id: worker.ops().at(-1)!.id, ok: true, value: { exitCode: 0 } });
+    await plain;
+    const middle = worker.ops().length;
+    const running = s.step('up', params, { secrets: { token: 'x'.repeat(4_096) } });
+    const { step, chunks } = await answerPieces(worker, middle);
+    expect(chunks.length).toBeGreaterThan(0);
+    worker.answer({ t: 'result', id: step!.id, ok: true, value: { exitCode: 0 } });
+    expect((await running).exitCode).toBe(0);
+    channel.close();
+  });
+
   it('review round 1 of PR #80, B-R1-16: a step with a long secret and parameters just below the request limit goes in pieces (HC8)', async () => {
     const { channel, worker, session: s } = await session();
     const secret = 'x'.repeat(200);

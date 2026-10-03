@@ -11,6 +11,7 @@ import {
   StreamRedactor,
   encodeMessage,
   isAskKind,
+  isSecretName,
   parseClientMessage,
   parseSecrets,
   parseServerMessage,
@@ -18,6 +19,10 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
+import { batchChunkOperation, type BatchDeps } from './batch';
+import { batchHelperOperations } from './batchHelper';
+import { contextSecrets } from './operationContext.testkit';
+import { dockerOperation } from './operations';
 import { ChannelServer, OperationError, type OperationHandler, type ServerChild } from './server';
 
 function setup(operations: Record<string, OperationHandler>) {
@@ -305,5 +310,137 @@ describe('requests of an operation to the extension, in the script (plan step 11
     send({ t: 'op', id: 1, op: 'asking', params: null });
     await vi.advanceTimersByTimeAsync(0);
     expect(resultOf(1)).toMatchObject({ ok: true, value: ['invalid', 'invalid'] });
+  });
+});
+
+// Review round 1 of plan step 11A, mutation review (B-R1-1 to B-R1-10).
+describe('named secrets and requests: the gaps of the mutation review (plan step 11A)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('B-R1-1, B-R1-2: with several secrets, the longest one split across pieces and the start of a shorter one wait for the next piece', () => {
+    const run = (pieces: string[]) => {
+      const out: string[] = [];
+      const redactor = new StreamRedactor(['abcdefghij', 'wxyz'], (text) => out.push(text));
+      for (const piece of pieces) redactor.push(piece);
+      redactor.flush();
+      return out;
+    };
+    const long = run(['x abcdef', 'ghij y']);
+    expect(long.join('')).toBe('x *** y');
+    expect(long.some((piece) => piece.includes('abcdef'))).toBe(false);
+    const short = run(['a wx', 'yz b']);
+    expect(short.join('')).toBe('a *** b');
+    expect(short.some((piece) => piece.endsWith('wx'))).toBe(false);
+  });
+
+  it('B-R1-3: a secret name has at most 32 characters', () => {
+    expect(isSecretName('a'.repeat(32))).toBe(true);
+    expect(isSecretName('a'.repeat(33))).toBe(false);
+  });
+
+  it('B-R1-4, B-R1-5: an answer with an unknown key, or a failure without `ok: false`, is refused', () => {
+    for (const line of [
+      '{"t":"answer","id":1,"ask":1,"ok":true,"value":1,"extra":1}',
+      '{"t":"answer","id":1,"ask":1,"ok":"no","error":{"code":"x","message":"y"}}',
+      '{"t":"answer","id":1,"ask":1,"error":{"code":"x","message":"y"}}',
+    ]) {
+      expect(parseClientMessage(line), line).toBeUndefined();
+    }
+  });
+
+  it('B-R1-6: an answered request frees its place, so more than MAX_OPEN_ASKS requests one after another all get answers', async () => {
+    const { send, asksOf, resultOf } = setup({
+      many: async (_params, context) => {
+        let sum = 0;
+        for (let i = 0; i <= MAX_OPEN_ASKS; i++) sum += (await context.ask('local', i)) as number;
+        return sum;
+      },
+    });
+    send({ t: 'op', id: 1, op: 'many', params: null });
+    for (let i = 1; i <= MAX_OPEN_ASKS + 1; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+      send({ t: 'answer', id: 1, ask: i, ok: true, value: 1 });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asksOf(1)).toHaveLength(MAX_OPEN_ASKS + 1);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: MAX_OPEN_ASKS + 1 });
+  });
+
+  it('B-R1-7: a request that the operation did not wait for ends with an AbortError at the end of the operation', async () => {
+    let open: Promise<unknown> | undefined;
+    const { send, resultOf } = setup({
+      leaves: async (_params, context) => {
+        open = context.ask('local', null).catch((error: unknown) => error);
+        return 'done';
+      },
+    });
+    send({ t: 'op', id: 1, op: 'leaves', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: 'done' });
+    expect(((await open) as Error).name).toBe('AbortError');
+  });
+
+  it('B-R1-8: a request of an unknown kind is refused and not sent', async () => {
+    const { send, asksOf, resultOf } = setup({
+      bogus: async (_params, context) => context.ask('bogus' as never, null).catch((error: unknown) => (error as OperationError).code),
+    });
+    send({ t: 'op', id: 1, op: 'bogus', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: 'invalid' });
+    expect(asksOf(1)).toEqual([]);
+  });
+
+  it('B-R1-9, B-R1-10: the secrets of an answer count, and a handler cannot change the secrets or their masking', async () => {
+    const { send, of, resultOf } = setup({
+      asking: async (_params, context) => {
+        const before = context.hasNoSecret();
+        await context.ask('secret', null);
+        const after = { none: context.hasNoSecret(), registry: context.secrets.registry };
+        delete (context.secrets as Record<string, string>).registry;
+        context.log('x abcd1234 y');
+        return { before, after, still: context.secrets.registry };
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null, secrets: { registry: 'abcd1234' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({ ok: true, value: { before: true, after: { none: false, registry: '***' }, still: '***' } });
+    expect(of(1).find((message) => message.t === 'log')).toMatchObject({ text: 'x *** y' });
+  });
+});
+
+// Review round 1 of plan step 11A, mutation review (B-R1-16 to B-R1-18): each operation takes only its own secret.
+describe('the secrets of the worker operations (plan step 11A)', () => {
+  const base = {
+    signal: new AbortController().signal,
+    progress: () => {},
+    log: () => {},
+    output: () => {},
+    docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+  };
+
+  it('B-R1-16: a step that takes the token refuses another secret beside it', async () => {
+    const operations = batchHelperOperations({ spawnStep: () => { throw new Error('never'); }, runQuiet: async () => {}, fs: {} as never, env: {} });
+    const context = { ...base, ...contextSecrets({ token: 'abcd1234', registry: 'wxyz1234' }) };
+    await expect(operations.clone({ repository: 'octo/hello' }, context)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('but the token') });
+  });
+
+  it('B-R1-17: a batch input takes no secret', async () => {
+    const handler = batchChunkOperation({} as BatchDeps);
+    const context = { ...base, ...contextSecrets({ token: 'abcd1234' }) };
+    await expect(handler({ session: '0123456789abcdef01234567', input: 'fedcba9876543210fedcba98', data: 'x' }, context)).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  it('B-R1-18: the secret input of a Docker call is only the token, never another secret', async () => {
+    const calls: unknown[] = [];
+    const context = { ...base, docker: async (...args: unknown[]) => (calls.push(args), { exitCode: 0, stdout: '', stderr: '' }), ...contextSecrets({ registry: 'abcd1234' }) };
+    await expect(dockerOperation({ args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, context)).rejects.toThrow('expects a secret');
+    expect(calls).toEqual([]);
   });
 });
