@@ -9,7 +9,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
 import { SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { scriptCommand } from '../core/worker/containerScripts';
@@ -692,6 +692,125 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         expect(long.length).toBe(64 * 1024);
       });
 
+      // Review round 4 of 11B3a (mutation testing, G1 to G6): the time limits of their own, driven by a spy of
+      // AbortSignal.timeout that hands out a controllable signal per call.
+      function controlledTimeouts(): { limits: { ms: number; controller: AbortController }[]; restore: () => void } {
+        const limits: { ms: number; controller: AbortController }[] = [];
+        const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+          const controller = new AbortController();
+          limits.push({ ms, controller });
+          return controller.signal;
+        });
+        return { limits, restore: () => spy.mockRestore() };
+      }
+      const abortWith = (signal: AbortSignal | undefined): Promise<never> =>
+        new Promise((_resolve, reject) => {
+          const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          if (signal?.aborted) fail();
+          signal?.addEventListener('abort', fail);
+        });
+      const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+      const limitOf = (limits: { ms: number; controller: AbortController }[], signal: AbortSignal | undefined) => limits.find((limit) => limit.controller.signal === signal);
+
+      it('G1: a create of labelImage that does not answer in time is an EngineError, and its container is removed by its name', async () => {
+        const { limits, restore } = controlledTimeouts();
+        try {
+          const { engine, requests } = fake((request) => {
+            if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+            if (request.path.startsWith('/containers/create')) return abortWith(request.signal);
+            return ok('', 204);
+          });
+          const labelling = engine.labelImage('img:1', {});
+          await settle();
+          const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+          expect(limitOf(limits, create.signal)?.ms).toBe(60_000);
+          limitOf(limits, create.signal)!.controller.abort();
+          const error = await labelling.catch((caught: unknown) => caught);
+          expect(error).toBeInstanceOf(EngineError);
+          expect(error).toMatchObject({ status: 0, message: expect.stringContaining('did not answer the create') });
+          expect(error).not.toMatchObject({ name: 'AbortError' });
+          const name = create.path.split('name=')[1];
+          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+          // G5: the removal by name has a time limit of its own, never an aborted signal, and its failure changes nothing.
+          expect(requests.at(-1)?.signal).toBeDefined();
+          expect(requests.at(-1)?.signal?.aborted).toBe(false);
+        } finally {
+          restore();
+        }
+        const failingRemoval = fake((request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+          if (request.path.startsWith('/containers/create')) return ok({ Id: '' }, 201);
+          if (request.method === 'DELETE') throw new Error('engine gone');
+          return ok('', 204);
+        });
+        await expect(failingRemoval.engine.labelImage('img:1', {})).rejects.toThrow('invalid value');
+      });
+
+      it('G2, G3, G4: the log of a run and its start have time limits; the removal has its own and never fails the run', async () => {
+        const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: {}, volumes: [] };
+        const { limits, restore } = controlledTimeouts();
+        try {
+          // G2: a log that does not end is cut by its own limit; the exit code stays, the container goes.
+          const { engine, requests } = fake((request) => {
+            if (request.path.startsWith('/containers/create')) return ok({ Id: 'r' }, 201);
+            if (request.path.endsWith('/wait')) return ok({ StatusCode: 4 });
+            if (request.path.includes('/logs')) return abortWith(request.signal);
+            return ok('', 204);
+          });
+          const running = engine.runContainer(spec);
+          await settle();
+          const log = requests.find((request) => request.path.includes('/logs'))!;
+          expect(limitOf(limits, log.signal)?.ms).toBe(60_000);
+          limitOf(limits, log.signal)!.controller.abort();
+          expect(await running).toEqual({ exitCode: 4, output: '', timedOut: false });
+          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
+          // G4: the removal has a time limit of its own, not aborted.
+          expect(limitOf(limits, requests.at(-1)?.signal)?.ms).toBe(60_000);
+          expect(requests.at(-1)?.signal?.aborted).toBe(false);
+        } finally {
+          restore();
+        }
+        // G3: a start that does not answer is cut by the time limit of the run.
+        const hangingStart = fake((request) => {
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 's' }, 201);
+          if (request.path.endsWith('/start')) return abortWith(request.signal);
+          return ok('', 204);
+        });
+        expect(await hangingStart.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
+        expect(hangingStart.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/s?force=true&v=true' });
+        // G4: a cancel does not reach the removal; a removal that fails does not fail a run that succeeded.
+        const controller = new AbortController();
+        const cancelled = fake((request) => {
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'c' }, 201);
+          if (request.path.endsWith('/wait')) return abortWith(request.signal);
+          return ok('', 204);
+        });
+        const run = cancelled.engine.runContainer(spec, { signal: controller.signal });
+        await settle();
+        controller.abort();
+        await expect(run).rejects.toMatchObject({ name: 'AbortError' });
+        const removal = cancelled.requests.at(-1)!;
+        expect(removal).toMatchObject({ method: 'DELETE', path: '/containers/c?force=true&v=true' });
+        expect(removal.signal).toBeDefined();
+        expect(removal.signal).not.toBe(controller.signal);
+        expect(removal.signal?.aborted).toBe(false);
+        const failingRemoval = fake((request) => {
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'f' }, 201);
+          if (request.path.endsWith('/wait')) return ok({ StatusCode: 0 });
+          if (request.method === 'DELETE') throw new Error('engine gone');
+          return ok('', 204);
+        });
+        expect(await failingRemoval.engine.runContainer(spec)).toEqual({ exitCode: 0, output: '', timedOut: false });
+        // G6 (#21): a wait without a status code reads the log, for the reason.
+        const noCode = fake((request) => {
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'n' }, 201);
+          if (request.path.endsWith('/wait')) return ok({});
+          if (request.path.includes('/logs')) return ok('the reason');
+          return ok('', 204);
+        });
+        expect(await noCode.engine.runContainer(spec)).toEqual({ exitCode: null, output: 'the reason', timedOut: false });
+      });
+
       it('B-R2-15: a pull prints a line that is no JSON, fails with the first error, and needs the secret of its login', async () => {
         const { engine } = fake((request) => {
           request.onChunk?.('plain text\n{"error":"first"}\n{"error":"second"}\n');
@@ -824,8 +943,11 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
     it('never pulls a reference without a tag or a digest (review round 2 of 11B3a, A-R2-1)', async () => {
       const { engine, calls } = await serve(() => ({ status: 200, body: '' }));
-      for (const reference of ['node', 'ghcr.io/o/i', 'registry:5000/i', 'node:']) {
+      // Review round 4 of 11B3a (G6): also an invalid digest, and as an EngineError with status 0.
+      for (const reference of ['node', 'ghcr.io/o/i', 'registry:5000/i', 'node:', 'node@sha256:xyz', 'node@']) {
         await expect(engine.pull(reference)).rejects.toThrow(`The pull of ${reference} needs a tag or a digest.`);
+        await expect(engine.pull(reference)).rejects.toMatchObject({ status: 0 });
+        await expect(engine.pull(reference)).rejects.toBeInstanceOf(EngineError);
       }
       expect(calls).toEqual([]);
       await engine.pull('registry:5000/i:1');
