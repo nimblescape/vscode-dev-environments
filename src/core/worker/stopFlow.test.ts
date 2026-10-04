@@ -135,6 +135,17 @@ describe('Stop as a flow of the worker (plan step 11B2)', () => {
     expect(answered.failures).toHaveLength(1);
     expect(answered.failures[0]).toHaveLength(MAX_STOP_FAILURE_LENGTH);
     expect(answered.failures[0].endsWith('…')).toBe(true);
+    // Review round 2 (B-R2-2, B-R2-8): the clipped reason passes the check of the extension; one of exactly the longest
+    // length is not clipped.
+    expect(parseStopValue(answered)?.failures).toEqual(answered.failures);
+    const prefix = `The container ${NAME} could not be stopped: `;
+    const exact = fakeEngine([container()]);
+    exact.engine.stop = async () => {
+      throw new EngineError('y'.repeat(MAX_STOP_FAILURE_LENGTH - prefix.length), 500);
+    };
+    const unclipped = (await run(exact.engine).result).failures[0];
+    expect(unclipped).toHaveLength(MAX_STOP_FAILURE_LENGTH);
+    expect(unclipped.endsWith('y')).toBe(true);
     // One that is gone meanwhile is no failure.
     const gone = fakeEngine([container(), service(`${NAME}-db`)]);
     gone.engine.stop = async () => {

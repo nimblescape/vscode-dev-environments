@@ -414,6 +414,16 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
     expect(failing.events.at(-1)).toBe('close 42');
   });
 
+  it('a cancel while it waits for the lock is cancelled, not lockUnavailable (review round 2, B-R2-4)', async () => {
+    const { deps, events } = fakeDeps();
+    const h = harness();
+    const done = stopOperation(() => engineOf(), deps)(PARAMS, h.context);
+    await settle();
+    h.controller.abort();
+    await expect(done).rejects.toMatchObject({ code: 'cancelled' });
+    expect(events.at(-1)).toBe('close 42');
+  });
+
   it('a cancel under the lock is cancelled, and lets go of it', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
@@ -506,6 +516,9 @@ describe('the checks of stop (plan step 11B2)', () => {
     expect(parseStopValue({ outcome: 'notRunning', services: [], failures: [] })).toEqual({ outcome: 'notRunning', services: [], failures: [] });
     // Review round 1 (B-R1-13, B-R1-14, B-R1-17): the limits, exactly, and the check of the Git state.
     expect(MAX_STOPPED_SERVICES).toBe(256);
+    // Review round 2 (B-R2-2): a reason of exactly the longest length, as the worker clips one, is accepted.
+    expect(MAX_STOP_FAILURE_LENGTH).toBe(1000);
+    expect(parseStopValue({ outcome: 'stopped', services: [], failures: ['x'.repeat(MAX_STOP_FAILURE_LENGTH)] })?.failures).toHaveLength(1);
     const all = Array.from({ length: MAX_STOPPED_SERVICES }, (_, i) => `s${i}`);
     expect(parseStopValue({ outcome: 'notRunning', services: all, failures: [] })?.services).toHaveLength(MAX_STOPPED_SERVICES);
     for (const gitSummary of [{ ...summary, branch: 1 }, { ...summary, uncommittedFiles: 1.5 }, { branch: 'x', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 }]) {
@@ -518,6 +531,9 @@ describe('the checks of stop (plan step 11B2)', () => {
       { outcome: 'stopped', services: Array.from({ length: MAX_STOPPED_SERVICES + 1 }, (_, i) => `s${i}`), failures: [] },
       { outcome: 'stopped', services: [], failures: Array.from({ length: MAX_STOPPED_SERVICES + 2 }, () => 'x') },
       { outcome: 'stopped', services: [], failures: ['x'.repeat(MAX_STOP_FAILURE_LENGTH + 1)] },
+      // Review round 2 (B-R2-7): the type of the failures and of the list.
+      { outcome: 'stopped', services: [], failures: [[]] },
+      { outcome: 'stopped', services: [], failures: 'x' },
       { outcome: 'stopped', services: [], failures: [1] },
       { outcome: 'stopped', services: [] },
       { outcome: 'stopped', failures: [] },

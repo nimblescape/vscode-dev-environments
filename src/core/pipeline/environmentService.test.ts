@@ -3906,6 +3906,10 @@ describe('stop', () => {
         [new HelperChannelError('lost', 'The worker ended.'), 'The worker ended.'],
         // Review round 2 (A-R2-1): a channel that closed before the flow was sent changed nothing.
         [new HelperChannelError('closed', 'closed'), PipelineTexts.environmentLockUnavailable(REPO, 'closed')],
+        // Review round 2 (B-R2-3): the other refusals before the flow, and one during it thrown as it is.
+        [new HelperChannelError('unsendable', 'u'), PipelineTexts.environmentLockUnavailable(REPO, 'u')],
+        [new HelperChannelError('open', 'o'), PipelineTexts.environmentLockUnavailable(REPO, 'o')],
+        [new HelperChannelError('protocol', 'The worker answered with an invalid line.'), 'The worker answered with an invalid line.'],
         [new HelperOperationError('failed', 'The container x could not be stopped: permission denied', false), 'The container x could not be stopped: permission denied'],
       ] as const) {
         withFlow(async () => {
@@ -3915,6 +3919,8 @@ describe('stop', () => {
         // A failed stop is no UserFacingError (as the CommandError of `docker stop` before the move).
         const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
         expect(thrown.message, expected).toBe(expected);
+        // Review round 2 (B-R2-6): the refusals before the flow keep their code of before the move.
+        if (expected.startsWith(`${REPO} was not changed:`)) expect((thrown as UserFacingError).code).toBe('helperFailed');
       }
       withFlow(async () => ({ outcome: 'stopped', gitSummary: { branch: 1 }, services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
