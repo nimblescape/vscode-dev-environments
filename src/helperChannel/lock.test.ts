@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, MAX_STOPPED_SERVICES, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
+import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
 import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
 import { stopOperation } from './flowOperations';
@@ -373,14 +373,14 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
     expect(events).toEqual(['open /state ' + ID, `flock -w 10 -E ${LOCK_BUSY_EXIT} ${FLOCK_FD} fd=42`]);
     flocks[0].exit(0);
     const value = await done;
-    expect(value).toMatchObject({ outcome: 'stopped', services: [], gitSummary: { branch: 'main', uncommittedFiles: 0 } });
+    expect(value).toMatchObject({ outcome: 'stopped', services: [], failures: [], gitSummary: { branch: 'main', uncommittedFiles: 0 } });
     expect(parseStopValue(value)).toBeDefined();
     expect(events.slice(2)).toEqual(['list', 'git', 'docker stop', 'close 42']);
     expect(h.progress).toEqual(['lock', 'stop']);
     expect(seen).toEqual([h.context]);
   });
 
-  it('a lock held elsewhere is busy and stops nothing; a failed stop is failed; the lock is let go either way', async () => {
+  it('a lock held elsewhere is busy and stops nothing; one that cannot be taken is lockUnavailable; a failed stop is answered; the lock is let go', async () => {
     const busy = fakeDeps();
     const stops: string[] = [];
     const first = stopOperation(() => engineOf(undefined, stops), busy.deps)(PARAMS, harness().context);
@@ -389,8 +389,18 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
     await expect(first).rejects.toMatchObject({ code: 'busy' });
     expect(stops).toEqual([]);
     expect(busy.events.at(-1)).toBe('close 42');
+    // Review round 1 (A-R1-3): another failure of the lock changed nothing either.
+    const broken = fakeDeps();
+    const second = stopOperation(() => engineOf(undefined, stops), broken.deps)(PARAMS, harness().context);
+    await settle();
+    broken.flocks[0].exit(1, 'flock: bad file');
+    await expect(second).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE, message: 'flock failed (exit code 1): flock: bad file' });
+    const unopened = fakeDeps({ openFails: true });
+    await expect(stopOperation(() => engineOf(undefined, stops), unopened.deps)(PARAMS, harness().context)).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE });
+    expect(stops).toEqual([]);
+    // Review round 1 (A-R1-2): a stop that failed is answered with the Git state, not thrown.
     const failing = fakeDeps();
-    const second = stopOperation(
+    const third = stopOperation(
       () =>
         engineOf(async () => {
           throw new EngineError('permission denied', 500);
@@ -399,7 +409,7 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
     )(PARAMS, harness().context);
     await settle();
     failing.flocks[0].exit(0);
-    await expect(second).rejects.toMatchObject({ code: 'failed', message: `The container ${NAME} could not be stopped: permission denied` });
+    expect(await third).toMatchObject({ outcome: 'stopped', gitSummary: { branch: 'main' }, failures: [`The container ${NAME} could not be stopped: permission denied`] });
     expect(failing.events.at(-1)).toBe('close 42');
   });
 
@@ -463,16 +473,25 @@ describe('the checks of stop (plan step 11B2)', () => {
 
   it('takes the value of a Stop, the Git state only after a stop, and only its fields', () => {
     const summary = { branch: null, uncommittedFiles: 0, unpushedCommits: 0, stashes: 1, recordedAt: '2026-10-03T23:00:00.000Z' };
-    expect(parseStopValue({ outcome: 'stopped', gitSummary: { ...summary, extra: 'x' }, services: ['db-1'] })).toEqual({ outcome: 'stopped', gitSummary: summary, services: ['db-1'] });
-    expect(parseStopValue({ outcome: 'notRunning', services: [] })).toEqual({ outcome: 'notRunning', services: [] });
+    expect(parseStopValue({ outcome: 'stopped', gitSummary: { ...summary, extra: 'x' }, services: ['db-1'], failures: ['no'] })).toEqual({
+      outcome: 'stopped',
+      gitSummary: summary,
+      services: ['db-1'],
+      failures: ['no'],
+    });
+    expect(parseStopValue({ outcome: 'notRunning', services: [], failures: [] })).toEqual({ outcome: 'notRunning', services: [], failures: [] });
     for (const value of [
-      { outcome: 'notRunning', gitSummary: summary, services: [] },
-      { outcome: 'stopped', gitSummary: { ...summary, stashes: -1 }, services: [] },
-      { outcome: 'stopped', services: ['-x'] },
-      { outcome: 'stopped', services: Array.from({ length: MAX_STOPPED_SERVICES + 1 }, (_, i) => `s${i}`) },
-      { outcome: 'stopped' },
-      { outcome: 'maybe', services: [] },
-      { outcome: 'stopped', services: [], more: 1 },
+      { outcome: 'notRunning', gitSummary: summary, services: [], failures: [] },
+      { outcome: 'stopped', gitSummary: { ...summary, stashes: -1 }, services: [], failures: [] },
+      { outcome: 'stopped', services: ['-x'], failures: [] },
+      { outcome: 'stopped', services: Array.from({ length: MAX_STOPPED_SERVICES + 1 }, (_, i) => `s${i}`), failures: [] },
+      { outcome: 'stopped', services: [], failures: Array.from({ length: MAX_STOPPED_SERVICES + 2 }, () => 'x') },
+      { outcome: 'stopped', services: [], failures: ['x'.repeat(MAX_STOP_FAILURE_LENGTH + 1)] },
+      { outcome: 'stopped', services: [], failures: [1] },
+      { outcome: 'stopped', services: [] },
+      { outcome: 'stopped', failures: [] },
+      { outcome: 'maybe', services: [], failures: [] },
+      { outcome: 'stopped', services: [], failures: [], more: 1 },
     ]) {
       expect(parseStopValue(value), JSON.stringify(value).slice(0, 80)).toBeUndefined();
     }

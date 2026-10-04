@@ -165,7 +165,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       { environmentId: id, containerName: name, folder: '/workspaces/stop', waitSeconds: 10 },
       { timeoutMs: 120_000, onAsk: hostSideHandler(hostWith(undefined, requests), log, FLOW_REQUESTS[OP_STOP]) },
     );
-    expect(parseStopValue(value)).toMatchObject({ outcome: 'stopped', gitSummary: { branch: 'feature/stop', uncommittedFiles: 0 }, services: [`${name}-db-1`] });
+    expect(parseStopValue(value)).toMatchObject({ outcome: 'stopped', gitSummary: { branch: 'feature/stop', uncommittedFiles: 0 }, services: [`${name}-db-1`], failures: [] });
     expect(requests).toEqual([]);
     expect(cli.container(name)?.State.Running).toBe(false);
     expect(cli.container(`${name}-db-1`)?.State.Running).toBe(false);
@@ -173,6 +173,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     expect(parseStopValue(await channels.flow(await targets.current(), OP_STOP, { environmentId: id, containerName: name, folder: '/workspaces/stop', waitSeconds: 10 }, { timeoutMs: 60_000 }))).toEqual({
       outcome: 'notRunning',
       services: [],
+      failures: [],
     });
   });
 });

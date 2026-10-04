@@ -34,7 +34,7 @@ import {
 } from '../names';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
 import { stopFlow } from '../worker/stopFlow';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunOptions, type RunResult } from '../ports';
@@ -1404,7 +1404,8 @@ export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' |
     } catch (error) {
       if (error instanceof EnvironmentLockError) {
         if (error.kind === 'busy') throw new HelperOperationError(LOCK_BUSY_CODE, error.message, false);
-        throw new HelperChannelError('unavailable', error.message);
+        // As the worker (review round 1 of 11B2, A-R1-3): a lock that could not be taken otherwise.
+        throw new HelperOperationError(LOCK_UNAVAILABLE_CODE, error.message, false);
       }
       throw error;
     }

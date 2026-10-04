@@ -61,7 +61,7 @@ import {
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
-import { channelStepLabel, LOCK_BUSY_CODE, newCleanupLabel, OP_STOP, parseStopValue, type StopParams } from '../helperChannel/protocol';
+import { channelStepLabel, LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, newCleanupLabel, OP_STOP, parseStopParams, parseStopValue } from '../helperChannel/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
@@ -249,11 +249,17 @@ export const PipelineTexts = {
    */
   environmentLockUnavailable: (repository: string, cause: string) =>
     `${repository} was not changed: the Dev Environments worker on the Docker host could not be prepared (${cause}). Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
+  /** Plan step 11B2 (review round 1, A-R1-5): the record of the environment holds a name or user that Stop cannot use. */
+  stopRefused: (repository: string) =>
+    `${repository} cannot be stopped from here: its container name or remote user is not one that Dev Environments can pass on. Stop it with Docker.`,
 } as const;
 
 /** Plan step 5, PR B, user decision D3: how long an operation waits for the lock of an environment that is held elsewhere. */
 export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
-/** Plan step 11B2: the longest Stop in the worker (the wait for the lock, the Git state, the stop of each container). */
+/**
+ * Plan step 11B2: the longest Stop in the worker (the wait for the lock, the Git state, the stop of each container). A
+ * Stop with more than about eight services that all hit their own time limit ends here (review round 1, A-R1-6).
+ */
 export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
@@ -5654,23 +5660,34 @@ export class EnvironmentService {
       const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
       // Plan step 11B2: the Stop runs in the worker, under the lock of the environment that the worker takes itself (user
       // decisions D1 to D3); this window records the Git state that it answers.
-      const params: StopParams = {
+      // Review round 1 (A-R1-4): never under a lock that this window holds (the worker would wait for it and refuse).
+      if (holdsEnvironmentLock(env.id)) throw new Error(`Stop of ${env.repository} under a lock of the environment that this window holds.`);
+      // Review round 1 (A-R1-5): the parameters are checked here, so that one the worker would refuse is named.
+      const params = parseStopParams({
         environmentId: env.id,
         containerName: env.containerName,
         folder: repositoryFolder(env.repository),
         ...(env.remoteUser !== undefined && env.remoteUser !== '' ? { user: env.remoteUser } : {}),
         waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS,
-      };
+      });
+      if (params === undefined) {
+        throw new UserFacingError('startFailed', PipelineTexts.stopRefused(env.repository), `container ${env.containerName}, remote user ${JSON.stringify(env.remoteUser ?? '')}`);
+      }
       const value = parseStopValue(await this.workerFlow(env, OP_STOP, params, STOP_FLOW_TIMEOUT_MS));
       if (value === undefined) throw new Error(`The worker answered the Stop of ${env.repository} with an invalid value.`);
       const summary = value.gitSummary;
       if (summary !== undefined) {
+        // Review round 1 (A-R1-1): the time of this computer, as the other times of the entry (lastUsedAt), never the
+        // clock of the Docker host; recordedStateNote compares them.
+        const recorded = { ...summary, recordedAt: isoTime(this.deps.clock) };
         await this.quietly('record the Git state', () =>
           this.deps.registry.updateEnvironment(env.id, (entry) => {
-            entry.gitSummary = summary;
+            entry.gitSummary = recorded;
           }),
         );
       }
+      // Review round 1 (A-R1-2): the containers that could not be stopped, after the Git state is recorded.
+      if (value.failures.length > 0) throw new Error(value.failures.join(' '));
     });
   }
 
@@ -5688,7 +5705,10 @@ export class EnvironmentService {
         this.logger.info(`${env.repository} is locked on the Docker host by another window or computer: ${error.message}`);
         throw new UserFacingError('startFailed', PipelineTexts.environmentLockBusy(env.repository), error.message);
       }
-      if (error instanceof HelperChannelError) {
+      // Review round 1 (A-R1-3): only a refusal before anything ran is "nothing is changed": the lock that could not be
+      // taken, or a worker that could not be reached or knows no such flow. A channel lost while the flow ran is thrown as
+      // it is (the flow may have changed something).
+      if ((error instanceof HelperOperationError && error.code === LOCK_UNAVAILABLE_CODE) || (error instanceof HelperChannelError && (error.code === 'unavailable' || error.code === 'unsendable' || error.code === 'open'))) {
         this.logger.warn(`${env.repository}: the worker on the Docker host could not be reached, so nothing is changed: ${errorMessage(error)}`);
         throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
       }

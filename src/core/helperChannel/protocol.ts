@@ -816,6 +816,11 @@ export const LOCK_FOLDER = 'locks';
 export const LOCK_BUSY_EXIT = 75;
 /** The failure code of a lock that another window or computer holds (user decision D3). */
 export const LOCK_BUSY_CODE = 'busy';
+/**
+ * Plan step 11B2 (review round 1, A-R1-3): the code of a flow whose lock could not be taken for another reason than a
+ * holder elsewhere (the lock file, flock): nothing was changed, as `unavailable` of the lock before the move.
+ */
+export const LOCK_UNAVAILABLE_CODE = 'lockUnavailable';
 /** The progress step that says that the lock is held. */
 export const LOCK_HELD_STEP = 'locked';
 /** The longest wait for a lock, in seconds. */
@@ -1024,12 +1029,19 @@ export interface StopValue {
   outcome: 'stopped' | 'notRunning';
   /** The Git state that the running dev container had before its stop, when it could be read. */
   gitSummary?: GitSummary;
-  /** The names of the containers of the other services that were stopped. */
+  /** The names of the containers of the other services that were stopped (at most MAX_STOPPED_SERVICES). */
   services: string[];
+  /**
+   * Review round 1 of 11B2 (A-R1-2): the reasons of the containers that could not be stopped; the others were stopped
+   * anyway, and the Git state is answered with them (the extension records it, then reports these).
+   */
+  failures: string[];
 }
 
 /** The most service containers that a StopValue names. */
 export const MAX_STOPPED_SERVICES = 256;
+/** The longest reason in StopValue.failures. */
+export const MAX_STOP_FAILURE_LENGTH = 1000;
 
 /** The strict check of StopParams (both sides). */
 export function parseStopParams(value: unknown): StopParams | undefined {
@@ -1044,11 +1056,12 @@ export function parseStopParams(value: unknown): StopParams | undefined {
 
 /** The check of StopValue (the extension). */
 export function parseStopValue(value: unknown): StopValue | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome', 'services'], ['gitSummary'])) return undefined;
-  const { outcome, gitSummary, services } = value;
+  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome', 'services', 'failures'], ['gitSummary'])) return undefined;
+  const { outcome, gitSummary, services, failures } = value;
   if (outcome !== 'stopped' && outcome !== 'notRunning') return undefined;
   if (gitSummary !== undefined && (outcome !== 'stopped' || !isGitSummary(gitSummary))) return undefined;
   if (!Array.isArray(services) || services.length > MAX_STOPPED_SERVICES || !services.every((name) => typeof name === 'string' && DOCKER_NAME.test(name))) return undefined;
+  if (!Array.isArray(failures) || failures.length > MAX_STOPPED_SERVICES + 1 || !failures.every((text) => typeof text === 'string' && text.length <= MAX_STOP_FAILURE_LENGTH)) return undefined;
   const summary = gitSummary === undefined ? undefined : (({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }: GitSummary) => ({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }))(gitSummary);
-  return { outcome, ...(summary !== undefined ? { gitSummary: summary } : {}), services: [...(services as string[])] };
+  return { outcome, ...(summary !== undefined ? { gitSummary: summary } : {}), services: [...(services as string[])], failures: [...(failures as string[])] };
 }

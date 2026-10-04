@@ -10,6 +10,7 @@
 import { errorMessage } from '../errors';
 import { parseGitSummaryOutput } from '../git/gitSummary';
 import { LABEL_COMPOSE_SERVICE } from '../names';
+import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH } from '../helperChannel/protocol';
 import type { GitSummary } from '../types';
 import { runScript } from './containerScripts';
 import { isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
@@ -41,28 +42,34 @@ export interface StopResult {
   outcome: 'stopped' | 'notRunning';
   gitSummary?: GitSummary;
   services: string[];
+  failures: string[];
 }
 
 /**
  * Plan step 11B2: the Stop of the environment, under its lock. The Git state is best effort (a failure is logged, the
- * stop goes on); a stop that fails throws with its reason; a cancel throws its AbortError.
+ * stop goes on). Review round 1 (A-R1-2): a container that cannot be stopped does not end the flow: the others are
+ * stopped anyway, and its reason is answered in `failures` with the Git state (which the extension records before it
+ * reports them). A cancel throws its AbortError.
  */
 export async function stopFlow(p: StopFlow): Promise<StopResult> {
   const containers = await environmentContainers(p.engine, p.environmentId, p.signal);
   const dev = runningDevContainer(containers, p.containerName, p.log);
+  const failures: string[] = [];
   let gitSummary: GitSummary | undefined;
   if (dev === undefined) {
     p.log(`The container ${p.containerName} does not run.`);
   } else {
     gitSummary = await readGitSummary(p, dev);
-    await stopContainer(p, dev, `Stopping the container ${dev.name}.`);
+    await stopContainer(p, dev, `Stopping the container ${dev.name}.`, failures);
   }
   const services: string[] = [];
   for (const service of runningServices(containers, dev)) {
-    await stopContainer(p, service, `Stopping the container ${service.name} of the service ${service.labels[LABEL_COMPOSE_SERVICE]}.`);
-    services.push(service.name);
+    if (await stopContainer(p, service, `Stopping the container ${service.name} of the service ${service.labels[LABEL_COMPOSE_SERVICE]}.`, failures)) {
+      // Review round 1 (A-R1-6): the answer names at most MAX_STOPPED_SERVICES of them; all are stopped.
+      if (services.length < MAX_STOPPED_SERVICES) services.push(service.name);
+    }
   }
-  return { outcome: dev === undefined ? 'notRunning' : 'stopped', ...(gitSummary !== undefined ? { gitSummary } : {}), services };
+  return { outcome: dev === undefined ? 'notRunning' : 'stopped', ...(gitSummary !== undefined ? { gitSummary } : {}), services, failures };
 }
 
 /** The Git state of the running dev container, or undefined (logged) when it cannot be read. A cancel throws. */
@@ -81,20 +88,29 @@ async function readGitSummary(p: StopFlow, dev: EngineContainer): Promise<GitSum
   }
 }
 
-/** `docker stop` of one container, with its own stop time, within STOP_CONTAINER_TIMEOUT_MS. */
-async function stopContainer(p: StopFlow, container: EngineContainer, line: string): Promise<void> {
+/**
+ * `docker stop` of one container, with its own stop time, within STOP_CONTAINER_TIMEOUT_MS. True when it is stopped (or
+ * gone); a failure is added to `failures` (its reason, clipped). A cancel throws.
+ */
+async function stopContainer(p: StopFlow, container: EngineContainer, line: string, failures: string[]): Promise<boolean> {
   p.log(line);
   const limit = AbortSignal.timeout(STOP_CONTAINER_TIMEOUT_MS);
   try {
     await p.engine.stop(container.id, undefined, p.signal ? AbortSignal.any([p.signal, limit]) : limit);
+    return true;
   } catch (error) {
     if (p.signal?.aborted) throw error;
     // Removed since the list (as `docker stop` of a missing container before the move): nothing to stop.
     if (isMissing(error)) {
       p.log(`The container ${container.name} does not exist any more.`);
-      return;
+      return true;
     }
-    if (limit.aborted) throw new Error(`The container ${container.name} did not stop within ${STOP_CONTAINER_TIMEOUT_MS / 1000} s.`);
-    throw new Error(`The container ${container.name} could not be stopped: ${errorMessage(error)}`);
+    const reason = limit.aborted
+      ? `The container ${container.name} did not stop within ${STOP_CONTAINER_TIMEOUT_MS / 1000} s.`
+      : `The container ${container.name} could not be stopped: ${errorMessage(error)}`;
+    p.log(reason);
+    // At most as many as the answer takes (StopValue: MAX_STOPPED_SERVICES + 1); the log has them all.
+    if (failures.length <= MAX_STOPPED_SERVICES) failures.push(reason.length > MAX_STOP_FAILURE_LENGTH ? `${reason.slice(0, MAX_STOP_FAILURE_LENGTH - 1)}…` : reason);
+    return false;
   }
 }

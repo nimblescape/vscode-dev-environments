@@ -9,6 +9,7 @@ import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { runningDevContainer, runningServices } from './environmentContainers';
 import { STOP_GIT_TIMEOUT_MS, stopFlow } from './stopFlow';
+import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, parseStopValue } from '../helperChannel/protocol';
 
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const NAME = 'devenv-acme-api-brave-noether';
@@ -64,6 +65,7 @@ describe('Stop as a flow of the worker (plan step 11B2)', () => {
       outcome: 'stopped',
       gitSummary: { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: NOW },
       services: [`${NAME}-db`],
+      failures: [],
     });
     expect(calls).toEqual([`list ${LABEL_ENVIRONMENT_ID}=${ENVIRONMENT_ID}`, `exec ${'d'.repeat(64)}`, `stop ${'d'.repeat(64)}`, `stop ${db.id}`]);
     expect(execs[0]).toMatchObject({ command: scriptCommand('gitSummary', [FOLDER]), options: { user: 'dev', timeoutMs: STOP_GIT_TIMEOUT_MS, signal: controller.signal } });
@@ -78,7 +80,7 @@ describe('Stop as a flow of the worker (plan step 11B2)', () => {
     const db = service(`${NAME}-db`);
     const { engine, execs, stops } = fakeEngine([container({ state: 'stopped', rawState: 'exited' }), db]);
     const { result, lines } = run(engine);
-    expect(await result).toEqual({ outcome: 'notRunning', services: [`${NAME}-db`] });
+    expect(await result).toEqual({ outcome: 'notRunning', services: [`${NAME}-db`], failures: [] });
     expect(execs).toEqual([]);
     expect(stops.map((stop) => stop.container)).toEqual([db.id]);
     expect(lines[0]).toBe(`The container ${NAME} does not run.`);
@@ -98,26 +100,65 @@ describe('Stop as a flow of the worker (plan step 11B2)', () => {
     ] as const) {
       const { engine, stops } = fakeEngine([container()], exec);
       const { result, lines } = run(engine);
-      expect(await result).toEqual({ outcome: 'stopped', services: [] });
+      expect(await result).toEqual({ outcome: 'stopped', services: [], failures: [] });
       expect(stops).toHaveLength(1);
       expect(lines[0]).toContain(`The Git state in ${NAME} could not be read: `);
       expect(lines[0]).toContain(reason);
     }
   });
 
-  it('fails with the reason when a container cannot be stopped; one that is gone meanwhile is no failure', async () => {
-    const failing = fakeEngine([container()]);
-    failing.engine.stop = async () => {
-      throw new EngineError('cannot stop container: permission denied', 500);
+  it('stops the others when a container cannot be stopped, and answers its reason with the Git state (review round 1, A-R1-2)', async () => {
+    const db = service(`${NAME}-db`);
+    const cache = service(`${NAME}-cache`);
+    const failing = fakeEngine([container(), db, cache]);
+    const stopped: string[] = [];
+    failing.engine.stop = async (id) => {
+      if (id === db.id) throw new EngineError('cannot stop container: permission denied', 500);
+      stopped.push(id);
     };
-    await expect(run(failing.engine).result).rejects.toThrow(`The container ${NAME} could not be stopped: cannot stop container: permission denied`);
+    const { result, lines } = run(failing.engine);
+    expect(await result).toEqual({
+      outcome: 'stopped',
+      gitSummary: { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: NOW },
+      services: [`${NAME}-cache`],
+      failures: [`The container ${NAME}-db could not be stopped: cannot stop container: permission denied`],
+    });
+    expect(stopped).toEqual(['d'.repeat(64), cache.id]);
+    expect(lines).toContain(`The container ${NAME}-db could not be stopped: cannot stop container: permission denied`);
+    // The dev container itself, and a reason that is clipped.
+    const dev = fakeEngine([container()]);
+    dev.engine.stop = async () => {
+      throw new EngineError('x'.repeat(5000), 500);
+    };
+    const answered = await run(dev.engine).result;
+    expect(answered.gitSummary).toBeDefined();
+    expect(answered.failures).toHaveLength(1);
+    expect(answered.failures[0]).toHaveLength(MAX_STOP_FAILURE_LENGTH);
+    expect(answered.failures[0].endsWith('…')).toBe(true);
+    // One that is gone meanwhile is no failure.
     const gone = fakeEngine([container(), service(`${NAME}-db`)]);
     gone.engine.stop = async () => {
       throw new EngineError('No such container', 404);
     };
-    const { result, lines } = run(gone.engine);
-    expect(await result).toMatchObject({ outcome: 'stopped', services: [`${NAME}-db`] });
-    expect(lines.filter((line) => line.endsWith('does not exist any more.'))).toHaveLength(2);
+    const { result: goneResult, lines: goneLines } = run(gone.engine);
+    expect(await goneResult).toMatchObject({ outcome: 'stopped', services: [`${NAME}-db`], failures: [] });
+    expect(goneLines.filter((line) => line.endsWith('does not exist any more.'))).toHaveLength(2);
+  });
+
+  it('names at most MAX_STOPPED_SERVICES services and as many failures as the answer takes, and stops all (review round 1, A-R1-6)', async () => {
+    const many = Array.from({ length: MAX_STOPPED_SERVICES + 5 }, (_, i) => service(`${NAME}-s${i}`));
+    const ok = fakeEngine(many);
+    const answered = await run(ok.engine).result;
+    expect(ok.stops).toHaveLength(many.length);
+    expect(answered.services).toHaveLength(MAX_STOPPED_SERVICES);
+    expect(parseStopValue(answered)).toBeDefined();
+    const failing = fakeEngine(many);
+    failing.engine.stop = async () => {
+      throw new EngineError('busy', 500);
+    };
+    const refused = await run(failing.engine).result;
+    expect(refused.failures).toHaveLength(MAX_STOPPED_SERVICES + 1);
+    expect(parseStopValue(refused)).toBeDefined();
   });
 
   it('a cancel ends it with its AbortError, also while the Git state is read', async () => {
