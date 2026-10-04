@@ -2383,6 +2383,131 @@ describe('Connection of this window', () => {
     await opening;
   });
 
+  // Review round 4 of 11C1 (B-R4): the gaps of the mutation tests of round 3's changes.
+  it('a Start whose first read finds the container running ends Reconnect, and shows it connected again (B-R4 L5)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showConnectionLost.mock.calls.length > 0, 'Reconnect');
+    const lostCalls = h.statusBar.showConnectionLost.mock.calls.length;
+    const connectedCalls = h.statusBar.showConnected.mock.calls.length;
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnectionLost.mock.calls.length).toBe(lostCalls);
+    expect(h.statusBar.showConnected.mock.calls.length).toBeGreaterThan(connectedCalls);
+    expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', expect.anything());
+  });
+
+  it('a Start whose read in the operation finds the container running ends Reconnect (B-R4 T13)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showConnectionLost.mock.calls.length > 0, 'Reconnect');
+    const lostCalls = h.statusBar.showConnectionLost.mock.calls.length;
+    const connectedCalls = h.statusBar.showConnected.mock.calls.length;
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnectionLost.mock.calls.length).toBe(lostCalls);
+    expect(h.statusBar.showConnected.mock.calls.length).toBeGreaterThan(connectedCalls);
+  });
+
+  it('a Start whose read in the operation finds the container running removes the hint of an unknown state (B-R4 T14, T15)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showStateUnknown.mock.lastCall?.[0] === true, 'the hint');
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(false);
+  });
+
+  it('the read in the operation of Start reads the container of the folder of the window (B-R4 T18)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const reads = h.service.currentBranch.mock.calls.length;
+    await h.controller.openAttachedWindow(env, 'devenv-old', { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) });
+    await settle(() => h.service.currentBranch.mock.calls.length > reads, 'the branch of the window');
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.windowStateInWorker.mock.calls.filter((call) => call[2]?.signal !== undefined).map((call) => call[1])).toEqual(['devenv-old']);
+  });
+
+  it('a Cancel during the read in the operation of Start shows no error (B-R4 T4)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const progress = cancellableProgress();
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.service.windowStateInWorker.mockImplementationOnce(async () => {
+      progress.cancel();
+      return undefined;
+    });
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it('the check of the connection shows Reconnect when Docker is not installed (B-R4 K7)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.docker.isInstalled.mockReturnValue(false);
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showConnectionLost.mock.calls.length > 0, 'Reconnect');
+  });
+
+  it('a check of the connection that read the container current ends the pending outdated check (B-R4 K3)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    h.service.windowStateInWorker.mockResolvedValue({ state: 'running' });
+    let reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    h.service.windowStateInWorker.mockResolvedValue({ state: 'running', outdated: 'hostAccess' });
+    reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  it('a failed Reconnect that read the container current sets no pending outdated check (B-R4 O3)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    h.service.windowStateInWorker.mockResolvedValue({ state: 'running', outdated: 'hostAccess' });
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
   // Review round 3 of 11C1 (A-R3-M2): a container read as current when the window attached is not left by the check.
   it('does not leave a container that was current when the window attached, also when the check reads it outdated', async () => {
     const env = environment();

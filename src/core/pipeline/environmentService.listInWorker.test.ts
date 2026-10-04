@@ -162,7 +162,9 @@ describe('the reads of an attached window through the worker, from the extension
     const env = await seedEnvironment(h, { container: 'running' });
     const signal = new AbortController().signal;
     await h.service.windowStateInWorker(env, 'devenv-x', { signal });
-    expect(sent[0]).toMatchObject({ timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, signal });
+    expect(sent[0]).toMatchObject({ timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS });
+    // Review round 4 of 11C1 (B-R4 W3, W6): that very signal, not one bounded by a time limit.
+    expect(sent[0].signal).toBe(signal);
     expect(sent[0].passive).toBeUndefined();
   });
 
