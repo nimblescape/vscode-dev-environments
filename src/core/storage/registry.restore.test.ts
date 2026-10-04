@@ -76,4 +76,12 @@ describe('the restore of the registry from the volumes (plan step 11C3)', () => 
     expect(await registry.restore([])).toEqual({ added: 0, skipped: [] });
     expect(await registry.exists()).toBe(false);
   });
+
+  it('a volume or container of the same name in another case is the same one (review round 1 of 11C3, A-R1-L3)', async () => {
+    await registry.add(entry(ID_A, 'acme/api', { volumeName: 'devenv-acme-api-x', containerName: 'devenv-acme-api-x' }));
+    const volume = entry(ID_B, 'acme/web', { volumeName: 'DEVENV-ACME-API-X', containerName: 'other' });
+    const container = entry(ID_C, 'acme/web', { volumeName: 'another', containerName: 'Devenv-Acme-Api-X' });
+    expect(await registry.restore([volume, container])).toEqual({ added: 0, skipped: [] });
+    expect(await registry.list()).toHaveLength(1);
+  });
 });

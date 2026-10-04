@@ -6416,7 +6416,8 @@ export class EnvironmentService {
       const id = volume.labels[LABEL_ENVIRONMENT_ID];
       const repository = volume.labels[LABEL_REPOSITORY];
       const ownerId = volume.labels[LABEL_OWNER_ID];
-      if (!isStorageId(id) || !isRepositoryName(repository) || !isStorageId(ownerId)) {
+      // Review round 1 of 11C3 (A-R1-M1): a repository as `record restore` takes it (no control characters, at most 256).
+      if (!isStorageId(id) || !isRepositoryName(repository) || repository.length > 256 || /[\u0000-\u001f\u007f]/.test(repository) || !isStorageId(ownerId)) {
         this.logger.warn(`The volume ${volume.name} has invalid labels and is skipped.`);
         continue;
       }

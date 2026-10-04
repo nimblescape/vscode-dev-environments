@@ -192,7 +192,9 @@ export class EnvironmentRegistry {
       let added = 0;
       const skipped: string[] = [];
       for (const entry of entries) {
-        if (file.environments.some((e) => e.id === entry.id || e.volumeName === entry.volumeName)) continue;
+        // Review round 1 of 11C3 (A-R1-L3): a volume or container of the same name in another case is the same one.
+        const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+        if (file.environments.some((e) => e.id === entry.id || same(e.volumeName, entry.volumeName) || same(e.containerName, entry.containerName))) continue;
         if (file.environments.some((e) => isEnvironmentOf(e, entry.repository, entry.owner.id, dockerHostOf(entry)))) {
           skipped.push(entry.volumeName);
           continue;

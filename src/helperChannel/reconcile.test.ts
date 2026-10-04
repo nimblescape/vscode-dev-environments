@@ -191,4 +191,12 @@ describe('reconcile in the worker (plan step 11C3)', () => {
       expect(asks).toEqual([]);
     }
   });
+
+  it('a volume whose repository label has a control character is skipped; the others are restored (review round 1 of 11C3, A-R1-M1)', async () => {
+    const odd = workspace(OTHER_ID, 'acme/w\u0001eb');
+    const { result, lines } = run([workspace(), odd]);
+    expect(await result).toEqual({ added: 1 });
+    expect((await registry.list()).map((e) => e.id)).toEqual([ID]);
+    expect(lines.some((line) => line.includes(`The volume ${odd.name} has invalid labels and is skipped.`))).toBe(true);
+  });
 });

@@ -40,8 +40,9 @@ async function onAskOf(params: Record<string, unknown>) {
 describe('record restore in the extension (plan step 11C3)', () => {
   it('restores the entries of the Docker host of the operation, with the clock of this window', async () => {
     const { restore, restored } = await onAskOf({ dockerHost: 'ssh://box', owner: { windowId: 'w1', pid: 1 } });
-    await expect(restore([ENTRY])).rejects.toMatchObject({ code: 'invalid' });
-    expect(await restore([{ ...ENTRY, dockerHost: 'ssh://box' }])).toEqual({ value: { added: 1, skipped: [] } });
+    // Review round 1 of 11C3 (A-R1-M1, A-R1-L1): changed, one request (an operation sends it once), in which the entry of
+    // the local Docker is left out (before: a request of its own, refused).
+    expect(await restore([ENTRY, { ...ENTRY, dockerHost: 'ssh://box' }])).toEqual({ value: { added: 1, skipped: [] } });
     const time = new Date(NOW).toISOString();
     expect(restored).toEqual([[{ ...ENTRY, dockerHost: 'ssh://box', createdAt: time, lastUsedAt: time }]]);
   });
