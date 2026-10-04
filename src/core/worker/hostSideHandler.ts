@@ -11,7 +11,7 @@ import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
 import { sameBusyMark } from '../pipeline/openRecords';
 import type { BusyMark, BusyOperation, Environment } from '../types';
-import { checkedBusyMark, checkedGitSummary, checkedLifecycleChange, checkedOpenFinish, type OpenRequestScope } from './openRequests';
+import { busyMarkFields, checkedBusyMark, checkedGitSummary, checkedLifecycleChange, checkedOpenFinish, type OpenRequestScope } from './openRequests';
 import { MAX_RESTORE_ENTRIES } from '../helperChannel/protocol';
 import { isConfigPathLabelValue, repositoryFolder, resourceName } from '../names';
 import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/pipelineRules';
@@ -484,13 +484,18 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
         return (await records.createMark(environmentId, 'ended', undefined, openScope(dockerHost))) ?? null;
       }
       if (kind !== 'previous' || args.length > 3) throw new HelperOperationError('invalid', 'The create mark of the request is invalid.', false);
-      // `previous` only as a well-formed mark that a `record markBusy` of this operation replaced; the remembered one is
-      // given back, never the worker's object.
+      // `previous` only as a mark that a `record markBusy` of this operation replaced; the remembered one is given back,
+      // never the worker's object. Review round 1 of PR #105 (A-L1): it is found by its four fields as the registry held
+      // them (the worker read it there); one that is not found ends this window's create mark instead (`ended`), so the
+      // mark never stays live for the rest of the window.
       let previous: BusyMark | undefined;
       if (args.length === 3) {
-        const sent = checkedBusyMark(args[2]);
-        previous = replaced.find((mark) => sameBusyMark(mark, sent));
-        if (previous === undefined) throw new HelperOperationError('invalid', 'The previous busy mark is not one that the busy mark of this operation replaced.', false);
+        const sent = busyMarkFields(args[2]);
+        previous = sent === undefined ? undefined : replaced.find((mark) => sameBusyMark(mark, sent));
+        if (previous === undefined) {
+          logger?.warn(`The previous busy mark of ${environmentId} is not one that the busy mark of this operation replaced; the create mark of this window is ended instead.`);
+          return (await records.createMark(environmentId, 'ended', undefined, openScope(dockerHost))) ?? null;
+        }
       }
       return (await records.createMark(environmentId, 'previous', previous, openScope(dockerHost))) ?? null;
     }
@@ -498,9 +503,9 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
       const [environmentId, kind] = strings(args, 2);
       argumentCount(args, 3);
       if (kind === 'take') {
-        const operation = args[2];
-        if (!(BUSY_OPERATIONS as readonly unknown[]).includes(operation)) throw new HelperOperationError('invalid', 'The busy operation of the step mark is unknown.', false);
-        return (await records.takeStepMark(environmentId, operation as BusyOperation, openScope(dockerHost))) ?? null;
+        // Review round 1 of PR #105 (A-L3): the open takes only an `update` step mark.
+        if (args[2] !== 'update') throw new HelperOperationError('invalid', 'The busy operation of the step mark is not update.', false);
+        return (await records.takeStepMark(environmentId, 'update', openScope(dockerHost))) ?? null;
       }
       if (kind !== 'release') throw new HelperOperationError('invalid', 'The step mark of the request is invalid.', false);
       return (await records.releaseStepMark(environmentId, checkedBusyMark(args[2]), openScope(dockerHost))) ?? null;

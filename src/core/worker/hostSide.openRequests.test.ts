@@ -138,8 +138,12 @@ describe('the registry writes of the open as requests (plan step 11E4b)', () => 
     });
 
     it('openFinished: its closed list of fields, a POSIX user, an absolute folder, container IDs, a checked Git state', async () => {
+      // Review round 1 of PR #105 (A-L2): the user as `docker exec -u` takes it (before: a POSIX name of at most 64).
+      for (const remoteUser of ['john@corp', 'svc$', 'u'.repeat(65), 'u'.repeat(256)]) {
+        await expect(setup().ask('openFinished', ID, { ...FINISH, remoteUser })).resolves.toMatchObject({ remoteUser });
+      }
       const refused = [
-        { ...FINISH, remoteUser: 'u'.repeat(65) },
+        { ...FINISH, remoteUser: 'u'.repeat(257) },
         { ...FINISH, remoteUser: '-root' },
         { ...FINISH, remoteUser: 'ro ot' },
         { ...FINISH, remoteUser: '' },
@@ -242,24 +246,43 @@ describe('the registry writes of the open as requests (plan step 11E4b)', () => 
       expect(entry()?.busy).toEqual(interrupted);
     });
 
-    it('refuses any other mark, a malformed one, and one that another operation replaced; no mark clears the own', async () => {
+    // Review round 1 of PR #105 (A-L1): changed (before: refused, which left the create mark of this window live for
+    // the rest of the window): a mark that is not one the markBusy of this operation replaced ends that create mark.
+    it('any other mark, a malformed one, or one that another operation replaced ends the create mark of this window; no mark clears the own', async () => {
       const { ask, entry, handlerOf, signal } = setup({ busy: interrupted });
       await ask('markBusy', ID, 'create');
-      const ownMark = entry()?.busy;
-      for (const previous of [other(), endedMark(other()), { ...interrupted, pid: 201 }, { ...interrupted, extra: 1 }, { ...interrupted, since: 'then' }, 'x', null]) {
-        await expect(ask('createMark', ID, 'previous', previous)).rejects.toMatchObject({ code: 'invalid' });
-        expect(entry()?.busy).toEqual(ownMark);
+      const ownMark = entry()!.busy!;
+      for (const previous of [other(), endedMark(other()), { ...interrupted, pid: 201 }, { ...interrupted, since: 'then' }, 'x', null, { ...interrupted, pid: 'x' }]) {
+        expect(await ask('createMark', ID, 'previous', previous)).toMatchObject({ busy: endedMark(ownMark) });
+        expect(entry()?.busy).toEqual(endedMark(ownMark));
       }
-      // The handler of another operation has not seen that markBusy.
-      await expect(handlerOf()('record', { call: 'createMark', args: [ID, 'previous', interrupted] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+      // The handler of another operation has not seen that markBusy: the create mark of this window is ended too.
+      expect(await handlerOf()('record', { call: 'createMark', args: [ID, 'previous', interrupted] }, signal)).toMatchObject({ value: { busy: endedMark(ownMark) } });
       expect(await ask('createMark', ID, 'previous')).not.toHaveProperty('busy');
     });
 
-    it('a markBusy that replaced nothing gives nothing to give back', async () => {
+    it('review round 1 of PR #105 (A-L1): the mark is found by its four fields as the registry held it, other keys aside; its remembered copy is written', async () => {
+      const { ask, entry } = setup({ busy: interrupted });
+      await ask('markBusy', ID, 'create');
+      expect(await ask('createMark', ID, 'previous', { ...interrupted, extra: 1 })).toMatchObject({ busy: interrupted });
+      expect(entry()?.busy).toEqual(interrupted);
+    });
+
+    it('a markBusy that replaced nothing gives nothing to give back: the create mark of this window is ended', async () => {
       const { ask, entry } = setup();
       await ask('markBusy', ID, 'create');
-      await expect(ask('createMark', ID, 'previous', interrupted)).rejects.toMatchObject({ code: 'invalid' });
-      expect(entry()?.busy).toMatchObject({ pid: OWNER.pid });
+      const ownMark = entry()!.busy!;
+      // Review round 1 of PR #105 (A-L1): changed (before: refused).
+      expect(await ask('createMark', ID, 'previous', interrupted)).toMatchObject({ busy: endedMark(ownMark) });
+      expect(entry()?.busy).toEqual(endedMark(ownMark));
+    });
+
+    it('review round 1 of PR #105 (A-L3): stepMark takes only an update mark', async () => {
+      for (const operation of ['create', 'delete', 'stop', 'other']) {
+        const { ask, entry } = setup();
+        await expect(ask('stepMark', ID, 'take', operation)).rejects.toMatchObject({ code: 'invalid' });
+        expect(entry()?.busy).toBeUndefined();
+      }
     });
   });
 

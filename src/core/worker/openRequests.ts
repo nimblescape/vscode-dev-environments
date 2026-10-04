@@ -9,6 +9,7 @@
 // the registry lock of the extension with its owner, clock, signed-in account and view of the windows, only on the entry
 // of the operation's environment, owned by that account and on the operation's Docker host (requestOpenRecords).
 // Pure over its deps; no `vscode`.
+import { EXEC_USER } from '../helperChannel/protocol';
 import { isGitSummary } from '../git/gitSummary';
 import { HelperOperationError } from '../helperChannel/helperChannel';
 import { isOnDockerHost } from '../docker/dockerHost';
@@ -34,8 +35,6 @@ export interface OpenRequestScope {
 
 /** A container ID as Docker gives it (12 to 64 hex digits). */
 const CONTAINER_ID = /^[0-9a-f]{12,64}$/;
-/** A POSIX user name (the portable characters, no leading hyphen), at most 64 characters. */
-const USER_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
 /** The longest window ID of a busy mark. */
 const MAX_WINDOW_ID_LENGTH = 256;
 /** The longest time of a busy mark or a Git state. */
@@ -66,6 +65,18 @@ function isTime(value: unknown): value is string {
 /** True for a container ID of 12 to 64 hex digits. */
 export function isContainerId(value: unknown): value is string {
   return typeof value === 'string' && CONTAINER_ID.test(value);
+}
+
+/**
+ * Review round 1 of PR #105 (A-L1): the four fields of a busy mark as the registry may hold it (isBusyMark: any operation,
+ * any time text, other keys allowed), each bounded, for the lookup of a remembered mark; undefined when they are not.
+ */
+export function busyMarkFields(value: unknown): BusyMark | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const { operation, since, pid, windowId } = value;
+  if (!plainText(operation, MAX_TIME_LENGTH) || !plainText(since, MAX_TIME_LENGTH) || !plainText(windowId, MAX_WINDOW_ID_LENGTH)) return undefined;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid)) return undefined;
+  return { operation: operation as BusyOperation, since, pid, windowId };
 }
 
 /** A busy mark of a request: its four fields only, each bounded; rebuilt from them. */
@@ -107,7 +118,8 @@ export function checkedOpenFinish(value: unknown): HostOpenFinish {
   const { lifecycleMarkRead, lifecycleRanFor, remoteUser, remoteWorkspaceFolder, gitSummary } = value;
   if (lifecycleMarkRead !== undefined && !isContainerId(lifecycleMarkRead)) throw invalid('lifecycle mark of the end of the open');
   if (lifecycleRanFor !== undefined && !isContainerId(lifecycleRanFor)) throw invalid('container of the end of the open');
-  if (remoteUser !== undefined && (typeof remoteUser !== 'string' || !USER_NAME.test(remoteUser))) throw invalid('remote user');
+  // Review round 1 of PR #105 (A-L2): the user as `docker exec -u` takes it (EXEC_USER), the one rule of the system.
+  if (remoteUser !== undefined && (typeof remoteUser !== 'string' || !EXEC_USER.test(remoteUser))) throw invalid('remote user');
   if (
     !plainText(remoteWorkspaceFolder, MAX_FOLDER_LENGTH) ||
     !remoteWorkspaceFolder.startsWith('/') ||

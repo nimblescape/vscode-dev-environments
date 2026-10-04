@@ -88,7 +88,8 @@ describe('the registry writes of the open in the extension (plan step 11E4b)', (
     const signal = new AbortController().signal;
     await onAsk('record', { call: 'markBusy', args: [ID, 'create'] }, signal);
     expect(entry().busy).toMatchObject({ pid: 100, windowId: 'w1' });
-    await expect(onAsk('record', { call: 'createMark', args: [ID, 'previous', other] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    // Review round 1 of PR #105 (A-L1): changed (before: refused): another mark ends the create mark of this window.
+    expect(await onAsk('record', { call: 'createMark', args: [ID, 'previous', other] }, signal)).toMatchObject({ value: { busy: { pid: 100, windowId: 'w1', since: new Date(0).toISOString() } } });
     expect(await onAsk('record', { call: 'createMark', args: [ID, 'previous', interrupted] }, signal)).toMatchObject({ value: { busy: interrupted } });
   });
 
