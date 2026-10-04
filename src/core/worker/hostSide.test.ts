@@ -575,6 +575,13 @@ describe('the questions of a flow name its repository, and their answers are obs
     expect(calls).toEqual([]);
     await handler('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
     expect(observed).toEqual([['confirmDelete', ['acme/api', confirmation], 'delete']]);
+    // Review round 3 of 11C2b (A-R3-L1): each question is announced and settled, also one that fails.
+    const states: string[] = [];
+    const tracked = hostSideHandler(host, silentLogger, ALL, { environmentId: 'e1', repository: 'acme/api', onQuestion: (state) => states.push(state) });
+    await tracked('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
+    await expect(tracked('question', { call: 'deleteAdditionalVolumes', args: [['../x']] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await tracked('record', { call: 'get', args: ['e1'] }, signal);
+    expect(states).toEqual(['asked', 'settled', 'asked', 'settled']);
     // Review round 2 of 11C2b: a question whose arguments are refused is not observed.
     await expect(handler('question', { call: 'deleteAdditionalVolumes', args: [['../x']] }, signal)).rejects.toMatchObject({ code: 'invalid' });
     expect(observed).toHaveLength(1);

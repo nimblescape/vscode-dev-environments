@@ -433,6 +433,34 @@ describe('the check of Delete in the worker, from the extension (plan step 11C2b
       };
       expect(((await check()) as Error).message, call).toContain('a decision that the user did not give');
     }
+    // Review round 3 of 11C2b (A-R3, missing tests 1–4): the cancel stays, the last confirmation counts, the last
+    // answer about the volumes counts.
+    const gate = [
+      [['confirmDelete', 'delete'], ['deleteAdditionalVolumes', null], ['confirmDelete', 'delete']],
+      [['confirmDelete', 'delete'], ['deleteAdditionalVolumes', null], ['deleteAdditionalVolumes', 'remove']],
+      [['confirmDelete', 'delete'], ['confirmDelete', null]],
+    ] as const;
+    for (const steps of gate) {
+      answer = (options) => {
+        for (const [call, value] of steps) options.onAnswer?.(call, call === 'confirmDelete' ? ['acme/api', {}] : [['api-cache']], value);
+        return { decision: 'delete', additionalVolumesToRemove: [] };
+      };
+      expect(((await check()) as Error).message, JSON.stringify(steps)).toContain('a decision that the user did not give');
+    }
+    answer = (options) => {
+      options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');
+      options.onAnswer?.('deleteAdditionalVolumes', [['api-cache']], 'remove');
+      options.onAnswer?.('deleteAdditionalVolumes', [['api-other']], 'keep');
+      return { decision: 'delete', additionalVolumesToRemove: ['api-cache'] };
+    };
+    expect(((await check()) as Error).message).toContain('volumes that the user did not choose: api-cache');
+    // Review round 3 of 11C2b (A-R3-L1): a decision while a question is still open is refused.
+    answer = (options) => {
+      options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');
+      options.onQuestion?.('asked');
+      return { decision: 'delete', additionalVolumesToRemove: [] };
+    };
+    expect(((await check()) as Error).message).toContain('a decision that the user did not give');
     // What the user gave passes; a cancel always does.
     answer = (options) => {
       options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');

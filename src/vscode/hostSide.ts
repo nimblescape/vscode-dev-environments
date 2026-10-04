@@ -162,7 +162,13 @@ export function extensionFlow(
 ): (
   op: string,
   params: unknown,
-  options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean; onAnswer?: (call: string, args: unknown[], value: unknown) => void },
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    passive?: boolean;
+    onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+    onQuestion?: (state: 'asked' | 'settled') => void;
+  },
 ) => Promise<unknown> {
   return async (op, params, options) =>
     channels.flow(await current(), op, params, {
@@ -175,6 +181,7 @@ export function extensionFlow(
         environmentId: environmentOf(params),
         repository: repositoryOf(params),
         ...(options.onAnswer ? { onAnswer: options.onAnswer } : {}),
+        ...(options.onQuestion ? { onQuestion: options.onQuestion } : {}),
       }),
     });
 }

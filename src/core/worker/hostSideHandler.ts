@@ -44,7 +44,13 @@ export function hostSideHandler(
   // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS). Review round 1
   // of 11C2b (A-R1-M1, A-R1-M2): the name of the repository that the questions must name, and the observer of the answers
   // of the user (the extension checks the decision of the flow against them).
-  scope: { environmentId?: string; repository?: string; onAnswer?: (call: string, args: unknown[], value: unknown) => void } = {},
+  scope: {
+    environmentId?: string;
+    repository?: string;
+    onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+    // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked (`asked`) and has its answer or failed (`settled`).
+    onQuestion?: (state: 'asked' | 'settled') => void;
+  } = {},
 ): NonNullable<OperationOptions['onAsk']> {
   const permitted = new Set<string>(allowed);
   return async (kind, payload, signal) => {
@@ -70,9 +76,15 @@ export function hostSideHandler(
       if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
         throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
       }
-      const answered = await answer(host, request.kind, request.call, request.args);
-      if (request.kind === 'question') scope.onAnswer?.(request.call, request.args, answered.value);
-      return answered;
+      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args);
+      scope.onQuestion?.('asked');
+      try {
+        const answered = await answer(host, request.kind, request.call, request.args);
+        scope.onAnswer?.(request.call, request.args, answered.value);
+        return answered;
+      } finally {
+        scope.onQuestion?.('settled');
+      }
     } catch (error) {
       if (error instanceof HelperOperationError) throw error;
       logger.warn(`The request ${request.kind} ${request.call} of the worker failed: ${errorMessage(error)}`);

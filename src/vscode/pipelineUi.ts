@@ -4,7 +4,7 @@
 
 // Decisions and messages of the open pipeline (PipelineUi) in VS Code (concept 6.5, 7.12, section 9).
 import * as vscode from 'vscode';
-import { Actions, Messages, formatChanges, listSome, recordedStateNote } from '../core/messages';
+import { Actions, MAX_LISTED_NAMES, Messages, formatChanges, listSome, recordedStateNote } from '../core/messages';
 import type { DeleteConfirmation } from '../core/pipeline/deleteCheck';
 import { ControllerTexts } from './controllerTexts';
 import { systemClock, type Clock, type Logger, type PipelineUi } from '../core/ports';
@@ -77,8 +77,14 @@ export class VsCodePipelineUi implements PipelineUi {
 
   /** Plan step 11C2b: the additional volumes that Delete may remove (moved from the controller's Delete). */
   async deleteAdditionalVolumes(volumes: readonly string[]): Promise<'remove' | 'keep' | undefined> {
-    // Review round 2 of 11C2b (A-R2-L-a): a list of normal length (the names come from the worker).
-    const choice = await vscode.window.showWarningMessage(Messages.deleteAdditionalVolumes(listSome(volumes)), { modal: true }, Actions.remove, Actions.keep);
+    // Review round 2 of 11C2b (A-R2-L-a): a message of normal length (the names come from the worker); review round 3
+    // (A-R3-L2): every name that Remove removes is in its detail.
+    const choice = await vscode.window.showWarningMessage(
+      Messages.deleteAdditionalVolumes(listSome(volumes)),
+      { modal: true, ...(volumes.length > MAX_LISTED_NAMES ? { detail: volumes.join('\n') } : {}) },
+      Actions.remove,
+      Actions.keep,
+    );
     return choice === Actions.remove ? 'remove' : choice === Actions.keep ? 'keep' : undefined;
   }
 

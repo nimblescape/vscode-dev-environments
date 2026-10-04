@@ -535,6 +535,8 @@ export interface EnvironmentServiceDeps {
       passive?: boolean;
       // Review round 1 of 11C2b (A-R1-M1): each answer of the user to a question of the flow.
       onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+      // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked, and has its answer (or failed).
+      onQuestion?: (state: 'asked' | 'settled') => void;
     },
   ) => Promise<unknown>;
 }
@@ -5763,9 +5765,10 @@ export class EnvironmentService {
     timeoutMs: number,
     signal?: AbortSignal,
     onAnswer?: (call: string, args: unknown[], value: unknown) => void,
+    onQuestion?: (state: 'asked' | 'settled') => void,
   ): Promise<unknown> {
     try {
-      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}) });
+      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}), ...(onQuestion ? { onQuestion } : {}) });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
@@ -6066,11 +6069,16 @@ export class EnvironmentService {
           if (!Array.isArray(value)) given.cancelled = true;
         }
       };
-      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer));
+      // Review round 3 of 11C2b (A-R3-L1): a decision while a question is still open is not the user's.
+      let open = 0;
+      const onQuestion = (state: 'asked' | 'settled') => {
+        open += state === 'asked' ? 1 : -1;
+      };
+      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer, onQuestion));
       if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with an invalid value.`);
       if ('refused' in value) throw refusalError(value.refused);
       if (value.decision === 'cancel') return value;
-      if (value.decision !== given.confirm || (value.decision === 'delete' && given.cancelled)) {
+      if (value.decision !== given.confirm || (value.decision === 'delete' && given.cancelled) || open > 0) {
         throw new Error(`The worker answered the check of the Delete of ${environment.repository} with a decision that the user did not give.`);
       }
       if (value.decision === 'delete') {
