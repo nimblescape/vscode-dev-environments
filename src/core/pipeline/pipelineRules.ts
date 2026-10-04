@@ -827,3 +827,30 @@ export function composeMountVolumes(
   }
   return { names: [...names], sources: [...sources], skipped: [...skipped] };
 }
+
+/** Plan step 11E4a: moved from ./environmentService. Docker and the Dev Container CLI name a container by its full ID or by a prefix of it. */
+export function sameContainerId(a: string, b: string): boolean {
+  return a !== '' && b !== '' && (a.startsWith(b) || b.startsWith(a));
+}
+
+/**
+ * Review round 2 of PR #68: the same container. Two full IDs (64 hexadecimal digits) are compared exactly; only a short
+ * one is compared as a prefix (sameContainerId), so that no ID that merely starts with another one matches.
+ */
+export function sameContainer(a: string, b: string): boolean {
+  if (a === b) return true;
+  const full = /^[0-9a-f]{64}$/;
+  return full.test(a) !== full.test(b) && sameContainerId(a, b);
+}
+
+/**
+ * Review round 4 of PR #68 (A-R4-1): whether finish clears the mark Environment.lifecycleIncomplete (`mark`, as the
+ * registry holds it under the lock): only when it is the value this run decided with (`read`), or when it names the
+ * container whose `up` and run-user-commands this run completed (`ranFor`). A mark that another window set after this run
+ * read the entry (for example for the container that this run opened as it is) stays.
+ */
+export function lifecycleMarkClears(mark: string | undefined, read: string | undefined, ranFor: string | undefined): boolean {
+  if (mark === undefined) return false;
+  if (read !== undefined && sameContainer(mark, read)) return true;
+  return ranFor !== undefined && sameContainer(mark, ranFor);
+}
