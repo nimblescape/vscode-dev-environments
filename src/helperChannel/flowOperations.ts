@@ -50,6 +50,9 @@ import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { sendHeartbeat, sendMonitorSettings } from '../core/worker/monitorFlow';
 import { engineMonitor, limited } from '../core/worker/engineMonitor';
+import analysisScript from 'devenv:analysis-script';
+import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
+import type { ConfigurationAnalyzer } from '../core/helper/configurationAnalysis';
 import { monitorImageTag } from '../core/helper/helperState';
 import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { workerHostSide } from '../core/worker/workerHostSide';
@@ -176,6 +179,15 @@ export function flowRefusal(error: unknown, context: OperationContext): { refuse
 export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
 
 /**
+ * Plan step 11E2: the host access analysis of an operation in the worker: each job in a thread of its own, started from
+ * the script in the worker's bundle (`devenv:analysis-script`) with the limits of the extension's (ANALYSIS_LIMITS), its
+ * failures logged to the operation and refused (fail closed).
+ */
+export function workerAnalyzer(context: OperationContext): ConfigurationAnalyzer {
+  return new WorkerConfigurationAnalyzer({ code: analysisScript }, contextLogger(context));
+}
+
+/**
  * Plan step 11B3b: the worker's own helper image, read once (`read`), and again after a failure (review round 1, B-R1-10:
  * one failed read never holds every later flow).
  */
@@ -233,6 +245,7 @@ export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelp
       dockerHost: checked.dockerHost,
       owner: checked.owner,
       environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
     });
     try {
       const configPaths = await service.listConfigurations(checked.environmentId, { progress: silentProgress, signal: context.signal });
@@ -291,6 +304,7 @@ export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHel
       dockerHost: checked.dockerHost,
       owner: checked.owner,
       environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
       monitorSource: checked.monitorSource,
     });
     try {
@@ -330,6 +344,7 @@ export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: O
       dockerHost: checked.dockerHost,
       owner: checked.owner,
       environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
     });
     try {
       const decision = await service.deleteCheck(checked.environmentId, { progress: silentProgress, signal: context.signal, repository: checked.repository, otherWindow: checked.otherWindow });
@@ -367,6 +382,7 @@ export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: Own
       dockerHost: checked.dockerHost,
       owner: checked.owner,
       environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
     });
     try {
       return { added: await service.reconcileFromVolumes() } satisfies ReconcileValue;
@@ -439,6 +455,7 @@ export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf
       dockerHost: checked.dockerHost,
       owner: checked.owner,
       environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
     });
     const recorded = await service.recordGitState(checked.environmentId, context.signal);
     if (context.signal.aborted) throw new OperationError('cancelled', 'The recordGitState operation was cancelled.');

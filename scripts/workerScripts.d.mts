@@ -4,5 +4,5 @@
 
 import type { Plugin } from 'esbuild';
 
-export const MONITOR_SCRIPT_MODULE: string;
-export function monitorScriptPlugin(root: string, define: Record<string, string>): Plugin;
+export const WORKER_SCRIPT_ENTRIES: Record<'devenv:monitor-script' | 'devenv:analysis-script', string[]>;
+export function workerScriptsPlugin(root: string, define: Record<string, string>): Plugin;

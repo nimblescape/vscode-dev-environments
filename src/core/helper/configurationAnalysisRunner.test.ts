@@ -335,6 +335,33 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect((await analyzer().analyze(other)).failure?.kind).toBe('internal');
   });
 
+  it('plan step 11E2: runs from the text of its script (the worker carries it) as from its path, with the same limits', async () => {
+    const code = fs.readFileSync(bundle, 'utf8');
+    const variables = helperCliVariables('acme/api');
+    const job: AnalysisJob = {
+      kind: 'hostAccess',
+      checksOn: true,
+      input: { ownVolume: OWN, variables, metadata: [{ mounts: ['source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind'] }] },
+    };
+    const fromText = await new WorkerConfigurationAnalyzer({ code }, warnings()).analyze(job);
+    expect(fromText.failure).toBeUndefined();
+    expect(fromText.report).toEqual((await analyzer().analyze(job)).report);
+    expect(fromText.report.hostAccess).toEqual(['bind mount /root/.ssh']);
+    // The time limit holds for a script from text too.
+    const slow = 'require("worker_threads").parentPort.on("message", () => { const t = Date.now(); while (Date.now() - t < 2000); });';
+    const result = await new WorkerConfigurationAnalyzer({ code: slow }, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 300 }).analyze(job);
+    expect(result.failure).toEqual({ kind: 'limit', reason: 'it took longer than 300 ms' });
+    // So does the memory limit.
+    const greedy = 'require("worker_threads").parentPort.on("message", () => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); });';
+    const memory = await new WorkerConfigurationAnalyzer({ code: greedy }, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 20_000, maxOldGenerationSizeMb: 32 }).analyze(job);
+    expect(memory.failure?.kind).toBe('limit');
+    expect(memory.report).toEqual(REFUSED);
+    // A text that does not compile is an internal failure, refused.
+    const broken = await new WorkerConfigurationAnalyzer({ code: 'this is not JavaScript' }, warnings()).analyze(job);
+    expect(broken.failure?.kind).toBe('internal');
+    expect(broken.report).toEqual({ hostAccess: [], unsupported: [analysisInternalItem(broken.failure!.reason)] });
+  });
+
   it('is built by esbuild.mjs and included in the package', () => {
     expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("entryPoints: ['src/core/helper/configurationAnalysisWorker.ts']");
     expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("'dist/configurationAnalysisWorker.js'");

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Review round 2 of PR #100 (B, mutation probes): the esbuild plugin of the module `devenv:monitor-script`
-// (scripts/monitorScript.mjs): its resolve filter, the options of its nested build, its watched files after a success,
+// (scripts/workerScripts.mjs): its resolve filter, the options of its nested build, its watched files after a success,
 // and after a failure (review rounds 1 and 2 of PR #100, A-L2 and A-L1).
 import * as path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,13 +11,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const nested = vi.hoisted(() => ({ build: vi.fn() }));
 vi.mock('esbuild', () => ({ build: nested.build }));
 
-import { monitorScriptPlugin } from '../../scripts/monitorScript.mjs';
+import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 
 const DEFINE = { __DEVCONTAINER_CLI_VERSION__: '"0.0.0"' };
 const REPO = path.resolve(__dirname, '../..');
 const FAKE_ROOT = path.resolve('/nonexistent-devenv-root');
 
-type OnLoad = () => Promise<{ contents?: string; loader?: string; errors?: unknown[]; watchFiles?: string[]; watchDirs?: string[] }>;
+type OnLoad = (args: { path: string }) => Promise<{ contents?: string; loader?: string; errors?: unknown[]; watchFiles?: string[]; watchDirs?: string[] }>;
 
 function setUp(root: string) {
   let filter: RegExp | undefined;
@@ -26,8 +26,9 @@ function setUp(root: string) {
     onResolve: (options: { filter: RegExp }) => (filter = options.filter),
     onLoad: (_options: unknown, callback: OnLoad) => (onLoad = callback),
   };
-  (monitorScriptPlugin(root, DEFINE) as unknown as { setup(build: unknown): void }).setup(build);
-  return { filter: filter as RegExp, load: onLoad as OnLoad };
+  (workerScriptsPlugin(root, DEFINE) as unknown as { setup(build: unknown): void }).setup(build);
+  // Plan step 11E2: the plugin serves two scripts and takes the module from the path of its load (before: no argument).
+  return { filter: filter as RegExp, load: () => (onLoad as OnLoad)({ path: 'devenv:monitor-script' }) };
 }
 
 const succeeded = (text: string, inputs: string[]) => ({ outputFiles: [{ text }], metafile: { inputs: Object.fromEntries(inputs.map((file) => [file, {}])) } });

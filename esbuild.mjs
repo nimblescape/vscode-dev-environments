@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as esbuild from 'esbuild';
 import { devcontainerCliVersion } from './scripts/cliVersion.mjs';
-import { monitorScriptPlugin } from './scripts/monitorScript.mjs';
+import { workerScriptsPlugin } from './scripts/workerScripts.mjs';
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -85,15 +85,16 @@ const contexts = await Promise.all([
   // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it over SSH as
   // the first input line of the pipe loader of the channel container (plan step 3, src/core/loader/pipeLoader.ts), so it
   // is always minified (less data over SSH) and has no source map. Plan step 11D2: it holds the script of the Session
-  // Monitor (the module `devenv:monitor-script`, scripts/monitorScript.mjs), which it gives the monitor container it
-  // creates; before, the extension read dist/remoteMonitor.js for it.
+  // Monitor (the module `devenv:monitor-script`, scripts/workerScripts.mjs), which it gives the monitor container it
+  // creates; before, the extension read dist/remoteMonitor.js for it. Plan step 11E2: and the thread of the host access
+  // analysis (the module `devenv:analysis-script`), which it starts from that text.
   esbuild.context({
     ...shared,
     entryPoints: ['src/helperChannel/main.ts'],
     outfile: outfiles[3],
     minify: true,
     sourcemap: false,
-    plugins: [...shared.plugins, monitorScriptPlugin(fileURLToPath(new URL('.', import.meta.url)), shared.define)],
+    plugins: [...shared.plugins, workerScriptsPlugin(fileURLToPath(new URL('.', import.meta.url)), shared.define)],
   }),
 ]);
 

@@ -239,6 +239,11 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     expect(deps({ settings }).all.settings()).toBe(settings);
   });
 
+  it('plan step 11E2: the analysis of the operation, when it brings one (the analysis thread of the worker)', () => {
+    const analyzer = { analyze: async () => ({}) as never };
+    expect(deps({ analyzer }).all.analyzer).toBe(analyzer);
+  });
+
   it('the Docker host of the operation, the engine check, the window reads, the questions, and the secret of the operation', async () => {
     const { all, calls } = deps();
     expect(await all.dockerTarget!()).toEqual({ kind: 'remote', host: 'build-box', endpoint: '' });
