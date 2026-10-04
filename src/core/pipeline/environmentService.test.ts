@@ -3838,6 +3838,13 @@ describe('stop', () => {
         },
       ]);
       expect(parseStopParams(sent[0].params)).toEqual(sent[0].params);
+      expect(STOP_FLOW_TIMEOUT_MS).toBe(600_000);
+      // Review round 1 (B-R1-19): an empty remote user is no user.
+      await h.registry.updateEnvironment(ENV_ID, (env) => {
+        env.remoteUser = '';
+      });
+      await h.service.stop(ENV_ID);
+      expect(sent[1].params).not.toHaveProperty('user');
     });
 
     it('records the Git state that the worker answers with the time of this computer, and nothing when it answers none (review round 1, A-R1-1)', async () => {

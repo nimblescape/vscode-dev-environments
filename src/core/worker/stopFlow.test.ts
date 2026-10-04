@@ -8,7 +8,7 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { runningDevContainer, runningServices } from './environmentContainers';
-import { STOP_GIT_TIMEOUT_MS, stopFlow } from './stopFlow';
+import { STOP_CONTAINER_TIMEOUT_MS, STOP_GIT_TIMEOUT_MS, stopFlow } from './stopFlow';
 import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, parseStopValue } from '../helperChannel/protocol';
 
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -169,6 +169,62 @@ describe('Stop as a flow of the worker (plan step 11B2)', () => {
     });
     await expect(run(engine, { signal: controller.signal }).result).rejects.toMatchObject({ name: 'AbortError' });
     expect(stops).toEqual([]);
+  });
+
+  it('stops every running service, not only the first, and logs each (review round 1, B-R1-1, B-R1-16)', async () => {
+    const a = service(`${NAME}-a`);
+    const b = service(`${NAME}-b`);
+    const { engine, stops } = fakeEngine([container(), a, b]);
+    const { result, lines } = run(engine);
+    expect((await result).services).toEqual([`${NAME}-a`, `${NAME}-b`]);
+    expect(stops.map((stop) => stop.container)).toEqual(['d'.repeat(64), a.id, b.id]);
+    expect(lines.filter((line) => line.startsWith('Stopping the container'))).toHaveLength(3);
+  });
+
+  it('ends a stop at its own time limit also while the operation runs on, and names it (review round 1, B-R1-2)', async () => {
+    const controller = new AbortController();
+    const { engine } = fakeEngine([container()]);
+    engine.stop = (_id, _timeout, signal) =>
+      new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+    const answered = await run(engine, { signal: controller.signal, stopContainerTimeoutMs: 30 }).result;
+    expect(controller.signal.aborted).toBe(false);
+    expect(answered.failures).toEqual([`The container ${NAME} did not stop within 0.03 s.`]);
+    expect(STOP_CONTAINER_TIMEOUT_MS).toBe(60_000);
+    expect(STOP_GIT_TIMEOUT_MS).toBe(30_000);
+  });
+
+  it('a cancel during a stop ends the flow with its AbortError, and the list gets the signal (review round 1, B-R1-9, B-R1-10)', async () => {
+    const controller = new AbortController();
+    const { engine } = fakeEngine([container()]);
+    const signals: (AbortSignal | undefined)[] = [];
+    const list = engine.containers;
+    engine.containers = async (label, signal) => (signals.push(signal), list(label, signal));
+    engine.stop = async () => {
+      controller.abort();
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    };
+    await expect(run(engine, { signal: controller.signal }).result).rejects.toMatchObject({ name: 'AbortError' });
+    expect(signals).toEqual([controller.signal]);
+  });
+
+  it('names the running dev container that has another name than the recorded one (review round 1, B-R1-11)', async () => {
+    const { engine, stops } = fakeEngine([container({ name: 'renamed' })]);
+    const { result, lines } = run(engine);
+    expect((await result).outcome).toBe('stopped');
+    expect(stops.map((stop) => stop.container)).toEqual(['d'.repeat(64)]);
+    expect(lines[0]).toBe(`The container ${NAME} does not run; the running container renamed of the environment is used.`);
+  });
+
+  it('takes the reason of an unread Git state from stdout, trimmed, or names the exit code (review round 1, B-R1-12)', async () => {
+    for (const [exec, expected] of [
+      [() => ({ exitCode: 1, stdout: '  only on stdout \n', stderr: '', timedOut: false }), `The Git state in ${NAME} could not be read: only on stdout`],
+      [() => ({ exitCode: 2, stdout: '', stderr: '', timedOut: false }), `The Git state in ${NAME} could not be read: exit code 2.`],
+    ] as const) {
+      const { engine } = fakeEngine([container()], exec);
+      const { result, lines } = run(engine);
+      await result;
+      expect(lines[0]).toBe(expected);
+    }
   });
 });
 

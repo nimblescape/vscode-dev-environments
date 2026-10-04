@@ -6,7 +6,7 @@
 // requests, hostSideHandler answers them. Here they are wired to each other, so one test covers both.
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import { OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
 import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { FLOW_REQUESTS, parseHostRequest, type HostCall, type HostSide } from './hostSide';
@@ -257,6 +257,8 @@ describe('the handler of the requests on the side of the extension (plan step 11
     const lines: string[] = [];
     const { handler, signal, calls } = wired({ token: 'ghp_token_value', get: ENVIRONMENT }, { ...silentLogger, warn: (text) => lines.push(text) }, FLOW_REQUESTS[OP_TOKEN_REMOVE]);
     expect(FLOW_REQUESTS[OP_TOKEN_REMOVE]).toEqual(['record get']);
+    // Plan step 11B2 (review round 1, B-R1-8): Stop asks for nothing.
+    expect(FLOW_REQUESTS[OP_STOP]).toEqual([]);
     for (const [kind, call] of [
       ['secret', 'token'],
       ['record', 'remove'],

@@ -12,7 +12,8 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
-import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
+import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions } from '../core/worker/dockerEngine';
+import { scriptCommand } from '../core/worker/containerScripts';
 import { stopOperation } from './flowOperations';
 import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
 import { OperationError, type OperationContext } from './server';
@@ -353,12 +354,12 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
   const NAME = 'devenv-acme-api-brave-noether';
   const PARAMS = { environmentId: ID, containerName: NAME, folder: '/workspaces/api', user: 'dev', waitSeconds: 10 };
 
-  function engineOf(stop: () => Promise<void> = async () => {}, events: string[] = []): DockerEngine {
+  function engineOf(stop: () => Promise<void> = async () => {}, events: string[] = [], execs: { command: readonly string[]; options: EngineExecOptions }[] = []): DockerEngine {
     const dev: EngineContainer = { id: 'd'.repeat(64), name: NAME, state: 'running', rawState: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ID }, image: 'img:1' };
     return {
       container: async () => undefined,
       containers: async () => (events.push('list'), [dev]),
-      exec: async () => (events.push('git'), { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: '', timedOut: false }),
+      exec: async (_c, command, options = {}) => (events.push('git'), execs.push({ command, options }), { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: '', timedOut: false }),
       stop: async () => (events.push('docker stop'), stop()),
       start: async () => {},
     };
@@ -459,6 +460,29 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
     await expect(refused).rejects.toMatchObject({ code: 'failed', message: 'flock failed (exit code 1): flock: bad file' });
     expect(failed.events.at(-1)).toBe('close 42');
   });
+
+  it('reads the Git state in the folder, as the user, with the cancel of the operation; waits as asked; logs (review round 1, B-R1-3 to B-R1-5, B-R1-15, B-R1-16)', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const h = harness();
+    const lines: string[] = [];
+    h.context.log = (line) => lines.push(line);
+    const execs: { command: readonly string[]; options: EngineExecOptions }[] = [];
+    const done = stopOperation(() => engineOf(undefined, [], execs), deps)({ ...PARAMS, waitSeconds: 7 }, h.context);
+    await settle();
+    expect(events[1]).toBe(`flock -w 7 -E ${LOCK_BUSY_EXIT} ${FLOCK_FD} fd=42`);
+    flocks[0].exit(0);
+    await done;
+    expect(execs).toHaveLength(1);
+    expect(execs[0].command).toEqual(scriptCommand('gitSummary', ['/workspaces/api']));
+    expect(execs[0].options).toMatchObject({ user: 'dev', signal: h.context.signal });
+    expect(lines).toContain(`Stopping the container ${NAME}.`);
+  });
+
+  it('flock that cannot start names why (review round 1, B-R1-18)', async () => {
+    const { deps } = fakeDeps();
+    deps.startFlock = () => ({ exited: Promise.resolve({ exitCode: null, error: 'ENOENT flock' }), kill: () => {} });
+    await expect(takeEnvironmentLock(deps, ID, 5, new AbortController().signal)).rejects.toMatchObject({ code: 'failed', message: 'flock could not be started: ENOENT flock' });
+  });
 });
 
 describe('the checks of stop (plan step 11B2)', () => {
@@ -480,6 +504,13 @@ describe('the checks of stop (plan step 11B2)', () => {
       failures: ['no'],
     });
     expect(parseStopValue({ outcome: 'notRunning', services: [], failures: [] })).toEqual({ outcome: 'notRunning', services: [], failures: [] });
+    // Review round 1 (B-R1-13, B-R1-14, B-R1-17): the limits, exactly, and the check of the Git state.
+    expect(MAX_STOPPED_SERVICES).toBe(256);
+    const all = Array.from({ length: MAX_STOPPED_SERVICES }, (_, i) => `s${i}`);
+    expect(parseStopValue({ outcome: 'notRunning', services: all, failures: [] })?.services).toHaveLength(MAX_STOPPED_SERVICES);
+    for (const gitSummary of [{ ...summary, branch: 1 }, { ...summary, uncommittedFiles: 1.5 }, { branch: 'x', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 }]) {
+      expect(parseStopValue({ outcome: 'stopped', gitSummary, services: [], failures: [] }), JSON.stringify(gitSummary)).toBeUndefined();
+    }
     for (const value of [
       { outcome: 'notRunning', gitSummary: summary, services: [], failures: [] },
       { outcome: 'stopped', gitSummary: { ...summary, stashes: -1 }, services: [], failures: [] },

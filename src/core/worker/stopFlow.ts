@@ -35,6 +35,8 @@ export interface StopFlow {
   log: (line: string) => void;
   /** The time of the Git state (ISO 8601). */
   now: () => string;
+  /** Only for the tests: STOP_CONTAINER_TIMEOUT_MS. */
+  stopContainerTimeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -94,7 +96,8 @@ async function readGitSummary(p: StopFlow, dev: EngineContainer): Promise<GitSum
  */
 async function stopContainer(p: StopFlow, container: EngineContainer, line: string, failures: string[]): Promise<boolean> {
   p.log(line);
-  const limit = AbortSignal.timeout(STOP_CONTAINER_TIMEOUT_MS);
+  const limitMs = p.stopContainerTimeoutMs ?? STOP_CONTAINER_TIMEOUT_MS;
+  const limit = AbortSignal.timeout(limitMs);
   try {
     await p.engine.stop(container.id, undefined, p.signal ? AbortSignal.any([p.signal, limit]) : limit);
     return true;
@@ -106,7 +109,7 @@ async function stopContainer(p: StopFlow, container: EngineContainer, line: stri
       return true;
     }
     const reason = limit.aborted
-      ? `The container ${container.name} did not stop within ${STOP_CONTAINER_TIMEOUT_MS / 1000} s.`
+      ? `The container ${container.name} did not stop within ${limitMs / 1000} s.`
       : `The container ${container.name} could not be stopped: ${errorMessage(error)}`;
     p.log(reason);
     // At most as many as the answer takes (StopValue: MAX_STOPPED_SERVICES + 1); the log has them all.

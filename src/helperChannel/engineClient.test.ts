@@ -194,7 +194,9 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     const { engine, calls } = await serve((call) => ({ status: call.url.includes('stop') ? 204 : 304 }));
     await engine.stop('c1', 20);
     await engine.start('c1');
-    expect(calls.map((call) => call.url)).toEqual(['/containers/c1/stop?t=20', '/containers/c1/start']);
+    // Plan step 11B2 (review round 1, B-R1-6, B-R1-7): without a time, the container's own stop time (no query).
+    await engine.stop('c1');
+    expect(calls.map((call) => call.url)).toEqual(['/containers/c1/stop?t=20', '/containers/c1/start', '/containers/c1/stop']);
     // Review round 1 of plan step 11B1 (B-R1-13): a stop of a container that does not run, and a missing one.
     const nothing = await serve(() => ({ status: 304 }));
     await nothing.engine.stop('c1', 20);
