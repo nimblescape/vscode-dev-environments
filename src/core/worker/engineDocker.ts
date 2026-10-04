@@ -8,9 +8,9 @@
 // 11B3 and 11E); the inspect JSON is read by the same functions (dockerObjects.ts). Pure over the port; no I/O, no
 // `vscode`.
 import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
-import type { ImageInspection, ImageNames, VolumeRun } from '../docker/containerAdapter';
+import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS, type ImageInspection, type ImageNames, type VolumeRun } from '../docker/containerAdapter';
 import { errorMessage } from '../errors';
-import { SECRET_REGISTRY } from '../helperChannel/protocol';
+import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
 import type { PullCredentials } from '../pipeline/pullCredentials';
@@ -46,10 +46,25 @@ export class EngineDocker implements EnvironmentDocker {
     private readonly secretOf: (name: string) => string | undefined = () => undefined,
   ) {}
 
-  /** As `docker info`: the engine answers. Rejects only with an AbortError. */
+  /**
+   * Review round 1 of 11B3a (A-R1-2): every request has a time limit, as each `docker` call of ContainerAdapter has
+   * (DOCKER_QUERY_TIMEOUT_MS unless the caller gives one); a request that the engine does not answer in time fails with an
+   * EngineError, and a cancel of `signal` stays its AbortError.
+   */
+  private async call<T>(what: string, signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>, timeoutMs = DOCKER_QUERY_TIMEOUT_MS): Promise<T> {
+    const limit = AbortSignal.timeout(timeoutMs);
+    try {
+      return await run(signal ? AbortSignal.any([signal, limit]) : limit);
+    } catch (error) {
+      if (limit.aborted && !signal?.aborted) throw new EngineError(`The engine did not answer ${what} within ${timeoutMs / 1000} s.`, 0);
+      throw error;
+    }
+  }
+
+  /** As `docker info` (within DOCKER_INFO_TIMEOUT_MS): the engine answers. Rejects only with an AbortError. */
   async isRunning(signal?: AbortSignal): Promise<boolean> {
     try {
-      await this.engine.version(signal);
+      await this.call('the version', signal, (limited) => this.engine.version(limited), DOCKER_INFO_TIMEOUT_MS);
       return true;
     } catch (error) {
       if (isAbortError(error) || signal?.aborted) throw error;
@@ -59,7 +74,7 @@ export class EngineDocker implements EnvironmentDocker {
 
   async engineApiVersion(signal?: AbortSignal): Promise<string | undefined> {
     try {
-      const { apiVersion } = await this.engine.version(signal);
+      const { apiVersion } = await this.call('the version', signal, (limited) => this.engine.version(limited));
       if (/^\d+\.\d+$/.test(apiVersion)) return apiVersion;
       this.logger.warn(`The API version of the Docker Engine could not be read: ${apiVersion || 'none'}`);
     } catch (error) {
@@ -69,8 +84,10 @@ export class EngineDocker implements EnvironmentDocker {
     return undefined;
   }
 
-  async imageConfig(reference: string, options: { signal?: AbortSignal } = {}): Promise<unknown> {
-    const value = (await this.engine.inspect('image', reference, options.signal)) as { Config?: unknown } | undefined;
+  async imageConfig(reference: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<unknown> {
+    const value = (await this.call(`the inspect of ${reference}`, options.signal, (limited) => this.engine.inspect('image', reference, limited), options.timeoutMs)) as
+      | { Config?: unknown }
+      | undefined;
     if (value === undefined) throw new EngineError(`No such image: ${reference}`, 404);
     return value.Config ?? null;
   }
@@ -84,13 +101,21 @@ export class EngineDocker implements EnvironmentDocker {
     if (result.exitCode !== 0) throw new EngineError(`The container of ${p.image} on ${p.volume} failed with exit code ${result.exitCode ?? 'none'}: ${result.output.trim().slice(-2000)}`, 0);
   }
 
-  containerIdsWithLabel(label: string, options: { signal?: AbortSignal } = {}): Promise<string[]> {
-    return this.engine.containerIds({ label: [label] }, options.signal);
+  containerIdsWithLabel(label: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string[]> {
+    return this.call('the list of the containers', options.signal, (limited) => this.engine.containerIds({ label: [label] }, limited), options.timeoutMs);
+  }
+
+  private containersWithLabel(label: string, signal?: AbortSignal): Promise<EngineContainer[]> {
+    return this.call('the list of the containers', signal, (limited) => this.engine.containers(label, limited));
+  }
+
+  private inspect(kind: 'container' | 'image' | 'volume' | 'network', reference: string, signal?: AbortSignal): Promise<unknown> {
+    return this.call(`the inspect of ${reference}`, signal, (limited) => this.engine.inspect(kind, reference, limited));
   }
 
   /** As ContainerAdapter.findContainer: the dev container (isDevContainer), the named one first, else running, else newest. */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
-    const containers = (await this.engine.containers(`${LABEL_ENVIRONMENT_ID}=${environmentId}`)).filter((container) => isDevContainer(container, containerName));
+    const containers = (await this.containersWithLabel(`${LABEL_ENVIRONMENT_ID}=${environmentId}`)).filter((container) => isDevContainer(container, containerName));
     if (containers.length === 0) return undefined;
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
@@ -100,25 +125,25 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   async listEnvironmentContainers(): Promise<ContainerInfo[]> {
-    return (await this.engine.containers(LABEL_ENVIRONMENT_ID)).map((container) => publicInfo(inspected(container)));
+    return (await this.containersWithLabel(LABEL_ENVIRONMENT_ID)).map((container) => publicInfo(inspected(container)));
   }
 
   async listProjectContainers(project: string): Promise<ContainerInfo[]> {
-    return (await this.engine.containers(`${COMPOSE_PROJECT_LABEL}=${project}`)).map((container) => publicInfo(inspected(container)));
+    return (await this.containersWithLabel(`${COMPOSE_PROJECT_LABEL}=${project}`)).map((container) => publicInfo(inspected(container)));
   }
 
   listProjectNetworks(project: string): Promise<string[]> {
-    return this.engine.networkNames({ label: [`${COMPOSE_PROJECT_LABEL}=${project}`] });
+    return this.call('the list of the networks', undefined, (limited) => this.engine.networkNames({ label: [`${COMPOSE_PROJECT_LABEL}=${project}`] }, limited));
   }
 
   async removeNetwork(name: string): Promise<void> {
     this.logger.info(`Removing network ${name}.`);
-    await this.engine.removeNetwork(name);
+    await this.call(`the removal of ${name}`, undefined, (limited) => this.engine.removeNetwork(name, limited));
   }
 
   /** As ContainerAdapter.listProjectImages: `<project>-*` images with a tag; with `environmentId`, only its own. */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
-    const images = await this.engine.images({ reference: [`${project}-*`] });
+    const images = await this.call('the list of the images', undefined, (limited) => this.engine.images({ reference: [`${project}-*`] }, limited));
     const tags = new Set<string>();
     const foreign = new Set<string>();
     for (const image of images) {
@@ -130,14 +155,14 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   async containerState(nameOrId: string): Promise<ContainerState> {
-    const container = await this.engine.container(nameOrId);
+    const container = await this.call(`the inspect of ${nameOrId}`, undefined, (limited) => this.engine.container(nameOrId, limited));
     return container === undefined ? 'missing' : mapContainerState(container.rawState);
   }
 
   async stopContainer(nameOrId: string): Promise<void> {
     this.logger.info(`Stopping container ${nameOrId}.`);
     try {
-      await this.engine.stop(nameOrId);
+      await this.call(`the stop of ${nameOrId}`, undefined, (limited) => this.engine.stop(nameOrId, undefined, limited));
     } catch (error) {
       if (!isMissing(error)) throw error;
       this.logger.info(`Container ${nameOrId} does not exist.`);
@@ -146,12 +171,12 @@ export class EngineDocker implements EnvironmentDocker {
 
   async renameContainer(nameOrId: string, newName: string): Promise<void> {
     this.logger.info(`Renaming container ${nameOrId} to ${newName}.`);
-    await this.engine.renameContainer(nameOrId, newName);
+    await this.call(`the rename of ${nameOrId}`, undefined, (limited) => this.engine.renameContainer(nameOrId, newName, limited));
   }
 
   async removeContainer(nameOrId: string): Promise<void> {
     this.logger.info(`Removing container ${nameOrId}.`);
-    await this.engine.removeContainer(nameOrId);
+    await this.call(`the removal of ${nameOrId}`, undefined, (limited) => this.engine.removeContainer(nameOrId, limited));
   }
 
   /**
@@ -164,32 +189,46 @@ export class EngineDocker implements EnvironmentDocker {
     options: { user?: string; workdir?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<RunResult> {
     if (options.input !== undefined && options.secretInput !== undefined) throw new Error('A docker exec has either an input or a secret input.');
-    const input = options.secretInput ?? options.input;
-    return this.engine.exec(container, command, {
-      ...(options.user ? { user: options.user } : {}),
-      ...(options.workdir ? { workdir: options.workdir } : {}),
-      ...(input !== undefined ? { input } : {}),
-      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    });
+    // Review round 1 of 11B3a (A-R1-9): a secret input is the token that the operation holds, passed on by its name.
+    if (options.secretInput !== undefined && this.secretOf(SECRET_TOKEN) !== options.secretInput) {
+      throw new EngineError('A docker exec with a secret input needs it as the token secret of the operation.', 0);
+    }
+    try {
+      return await this.engine.exec(container, command, {
+        ...(options.user ? { user: options.user } : {}),
+        ...(options.workdir ? { workdir: options.workdir } : {}),
+        ...(options.input !== undefined ? { input: options.input } : {}),
+        ...(options.secretInput !== undefined ? { secretInputName: SECRET_TOKEN } : {}),
+        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      // Review round 1 of 11B3a (A-R1-3): a refusal of the engine (an unknown user, a container that does not run or
+      // does not exist) is a result, as `docker exec` reports it (exit code 1, the message on stderr), so that the
+      // pipeline sees it (for example isContainerFault).
+      if (error instanceof EngineError && error.status >= 400 && !options.signal?.aborted) {
+        return { exitCode: 1, stdout: '', stderr: `Error response from daemon: ${error.message}\n`, timedOut: false };
+      }
+      throw error;
+    }
   }
 
   async volumeExists(name: string): Promise<boolean> {
-    return (await this.engine.inspect('volume', name)) !== undefined;
+    return (await this.inspect('volume', name)) !== undefined;
   }
 
   async createVolume(name: string, labels: Record<string, string>): Promise<void> {
     this.logger.info(`Creating volume ${name}.`);
-    await this.engine.createVolume(name, labels);
+    await this.call(`the create of ${name}`, undefined, (limited) => this.engine.createVolume(name, labels, limited));
   }
 
   async removeVolume(name: string): Promise<void> {
     this.logger.info(`Removing volume ${name}.`);
-    await this.engine.removeVolume(name);
+    await this.call(`the removal of ${name}`, undefined, (limited) => this.engine.removeVolume(name, limited));
   }
 
   async listEnvironmentVolumes(signal?: AbortSignal): Promise<VolumeInfo[]> {
-    const names = await this.engine.volumeNames({ label: [LABEL_ENVIRONMENT_ID] }, signal);
+    const names = await this.call('the list of the volumes', signal, (limited) => this.engine.volumeNames({ label: [LABEL_ENVIRONMENT_ID] }, limited));
     // User decision 2026-09-28: a cancellation of the check of the images of the environments ends before the inspect.
     if (signal?.aborted) throw abortError();
     return this.inspectVolumes(names);
@@ -198,7 +237,7 @@ export class EngineDocker implements EnvironmentDocker {
   async inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]> {
     const volumes: VolumeInfo[] = [];
     for (const name of new Set(names)) {
-      const volume = toVolumeInfo(await this.engine.inspect('volume', name));
+      const volume = toVolumeInfo(await this.inspect('volume', name));
       if (volume !== undefined) volumes.push(volume);
     }
     return volumes;
@@ -207,25 +246,25 @@ export class EngineDocker implements EnvironmentDocker {
   async inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]> {
     const networks: NetworkInfo[] = [];
     for (const name of new Set(names)) {
-      const network = toNetworkInfo(await this.engine.inspect('network', name));
+      const network = toNetworkInfo(await this.inspect('network', name));
       if (network !== undefined) networks.push(network);
     }
     return networks;
   }
 
   async imageExists(reference: string): Promise<boolean> {
-    return (await this.engine.inspect('image', reference)) !== undefined;
+    return (await this.inspect('image', reference)) !== undefined;
   }
 
   async imageId(reference: string): Promise<string | undefined> {
-    const value = (await this.engine.inspect('image', reference)) as { Id?: unknown } | undefined;
+    const value = (await this.inspect('image', reference)) as { Id?: unknown } | undefined;
     if (value === undefined) return undefined;
     if (typeof value.Id !== 'string' || value.Id === '') throw new EngineError(`The engine answered the inspect of the image ${reference} without an ID.`, 200);
     return value.Id;
   }
 
   async imageLabels(reference: string): Promise<Record<string, string> | undefined> {
-    const value = (await this.engine.inspect('image', reference)) as { Config?: { Labels?: unknown } } | undefined;
+    const value = (await this.inspect('image', reference)) as { Config?: { Labels?: unknown } } | undefined;
     return value === undefined ? undefined : toLabels(value.Config?.Labels);
   }
 
@@ -233,7 +272,7 @@ export class EngineDocker implements EnvironmentDocker {
   async imageLabelsOf(references: readonly string[], signal?: AbortSignal): Promise<Map<string, Record<string, string>>> {
     const labels = new Map<string, Record<string, string>>();
     for (const reference of references) {
-      const value = (await this.engine.inspect('image', reference, signal)) as { Id?: unknown; Config?: { Labels?: unknown } } | undefined;
+      const value = (await this.inspect('image', reference, signal)) as { Id?: unknown; Config?: { Labels?: unknown } } | undefined;
       if (signal?.aborted) throw abortError();
       if (value === undefined || typeof value.Id !== 'string' || value.Id === '') continue;
       labels.set(value.Id.toLowerCase(), toLabels(value.Config?.Labels));
@@ -261,7 +300,7 @@ export class EngineDocker implements EnvironmentDocker {
 
   /** As ContainerAdapter.imageNames. */
   async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
-    const value = (await this.engine.inspect('image', reference)) as { RepoTags?: unknown; RepoDigests?: unknown } | undefined;
+    const value = (await this.inspect('image', reference)) as { RepoTags?: unknown; RepoDigests?: unknown } | undefined;
     if (value === undefined) return undefined;
     const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
     return { repoTags: texts(value.RepoTags), repoDigests: texts(value.RepoDigests) };
@@ -279,7 +318,7 @@ export class EngineDocker implements EnvironmentDocker {
       if (signal?.aborted) throw abortError();
       const reference = references[index];
       try {
-        const value = (await this.engine.inspect('image', reference, signal)) as { Id?: unknown; RepoTags?: unknown; RepoDigests?: unknown } | undefined;
+        const value = (await this.inspect('image', reference, signal)) as { Id?: unknown; RepoTags?: unknown; RepoDigests?: unknown } | undefined;
         if (value === undefined) continue;
         if (typeof value.Id !== 'string') throw new Error('an answer without an ID');
         const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
@@ -299,7 +338,7 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   async removeImage(reference: string): Promise<boolean> {
-    const outcome = await this.engine.removeImage(reference);
+    const outcome = await this.call(`the removal of ${reference}`, undefined, (limited) => this.engine.removeImage(reference, limited));
     if (outcome === 'removed') this.logger.info(`Removed image ${reference}.`);
     if (outcome === 'inUse') this.logger.info(`Image ${reference} is in use and was not removed.`);
     return outcome === 'removed';
@@ -307,7 +346,7 @@ export class EngineDocker implements EnvironmentDocker {
 
   /** As ContainerAdapter.listEnvironmentImages: the named images `devenv-*`, each once with its references. */
   async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {
-    const images = await this.engine.images({ reference: ['devenv-*'] }, signal);
+    const images = await this.call('the list of the images', signal, (limited) => this.engine.images({ reference: ['devenv-*'] }, limited));
     if (signal?.aborted) throw abortError();
     return images
       .map((image) => ({ id: image.id, tags: image.repoTags.filter((tag) => tag.startsWith('devenv-') && !tag.endsWith(':<none>')), createdAt: image.created }))
@@ -315,7 +354,7 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   async listImageTags(repository: string): Promise<string[]> {
-    const images = await this.engine.images({ reference: [repository] });
+    const images = await this.call('the list of the images', undefined, (limited) => this.engine.images({ reference: [repository] }, limited));
     const tags: string[] = [];
     for (const image of images) {
       for (const tag of image.repoTags) {
@@ -328,12 +367,14 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   async startContainer(id: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
-    await this.engine.start(id, options.signal);
+    await this.call(`the start of ${id}`, options.signal, (limited) => this.engine.start(id, limited), options.timeoutMs);
   }
 
   /**
    * As ContainerAdapter.pullImage over the API. With `credentials`, their password must be the registry secret that the
    * operation holds (SECRET_REGISTRY: the worker got it through its request); it goes only into the header of the pull.
+   * Without `credentials` it pulls anonymously: the logins that the Docker CLI of the host would read are not here (review
+   * round 1 of 11B3a, A-R1-4; plan step 11B3b hands them in as the registry secret).
    */
   async pullImage(reference: string, options: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials } = {}): Promise<void> {
     const onOutput = options.onOutput ?? ((text: string) => this.logger.output(text));

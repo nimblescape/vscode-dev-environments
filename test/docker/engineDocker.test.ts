@@ -27,6 +27,7 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
   const tag = crypto.randomBytes(4).toString('hex');
   const name = `devenv-test-engine-${tag}`;
   const image = `devenv-test-engine-${tag}:1`;
+  const withVolume = `devenv-test-engine-${tag}:volume`;
 
   beforeAll(() => {
     cli.ok(['volume', 'create', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, name]);
@@ -39,6 +40,7 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
   afterAll(() => {
     removeRunObjects(cli, run.runId);
     cli.run(['image', 'rm', '-f', image]);
+    cli.run(['image', 'rm', '-f', withVolume]);
   });
 
   it('answers the reads as the Docker CLI does', async () => {
@@ -84,6 +86,34 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
       apiDocker.runOnVolume({ image: TEST_BASE_IMAGE, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo broken >&2; exit 3'], user: 'root', labels }),
     ).rejects.toThrow(/exit code 3: .*broken/);
     expect(await apiDocker.containerIdsWithLabel(`nimblescape.devenv.test-run=${tag}`)).toEqual([]);
+  });
+
+  it('leaves no anonymous volume of an image with `VOLUME` behind (review round 1 of 11B3a, A-R1-1)', async () => {
+    cli.ok(['create', '--name', `${name}-base`, '--label', runLabel, TEST_BASE_IMAGE, 'true']);
+    cli.ok(['commit', '--change', 'VOLUME /data', `${name}-base`, withVolume]);
+    cli.ok(['rm', `${name}-base`]);
+    const anonymous = (): Set<string> => new Set(cli.lines(['volume', 'ls', '-q', '--filter', 'dangling=true']).filter((volume) => /^[0-9a-f]{64}$/.test(volume)));
+    const before = anonymous();
+    const labels = { [TEST_RUN_LABEL]: run.runId };
+    await apiDocker.runOnVolume({ image: withVolume, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo x > /data/x'], user: 'root', labels });
+    await apiDocker.labelImage(withVolume, { 'nimblescape.devenv.test': 'yes' });
+    expect([...anonymous()].filter((volume) => !before.has(volume))).toEqual([]);
+  });
+
+  it('exec: a refusal of the engine is a result, over the API as over the Docker CLI (review round 1 of 11B3a, A-R1-3)', async () => {
+    const target = `${name}-exec`;
+    cli.ok(['run', '-d', '--name', target, '--network', 'none', '--init', '--label', runLabel, TEST_BASE_IMAGE, 'sleep', '600']);
+    for (const docker of [cliDocker, apiDocker]) {
+      const unknownUser = await docker.exec(target, ['id'], { user: 'nobody2' });
+      expect(unknownUser.exitCode).not.toBe(0);
+      expect(unknownUser.stdout + unknownUser.stderr).toMatch(/nobody2/);
+    }
+    cli.ok(['stop', '-t', '0', target]);
+    for (const docker of [cliDocker, apiDocker]) {
+      const stopped = await docker.exec(target, ['id']);
+      expect(stopped.exitCode).not.toBe(0);
+      expect(stopped.stderr).toMatch(/is not running/);
+    }
   });
 
   it('stops, renames and removes as the Docker CLI does; a missing container is no failure', async () => {

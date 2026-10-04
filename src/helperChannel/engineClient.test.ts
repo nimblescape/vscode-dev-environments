@@ -558,7 +558,14 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       const commit = calls.find((call) => call.url.startsWith('/commit'))!;
       expect(decodeURIComponent(commit.url)).toBe('/commit?container=tmp&repo=registry:5000/devenv-a&tag=2&pause=false');
       expect(JSON.parse(commit.body)).toEqual({ Cmd: ['node'], Labels: { keep: 'x', add: 'y' }, User: 'dev' });
-      expect(calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true' });
+      // Review round 1 of 11B3a (A-R1-1): the throwaway container goes with its anonymous volumes (`v=true`).
+      expect(calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
+      // Review round 1 of 11B3a (A-R1-7): the create is never cancelled half-way; a cancel before it creates nothing.
+      const cancelled = new AbortController();
+      cancelled.abort();
+      const before = calls.length;
+      await expect(engine.labelImage('img', {}, cancelled.signal)).rejects.toMatchObject({ name: 'AbortError' });
+      expect(calls.slice(before).filter((call) => call.url === '/containers/create')).toEqual([]);
       // A commit that fails removes the container too.
       const failing = await serve((call) => {
         if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: {} } };
@@ -567,7 +574,8 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         return { status: 204 };
       });
       await expect(failing.engine.labelImage('img', {})).rejects.toThrow('no space left on device');
-      expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true' });
+      // Review round 1 of 11B3a (A-R1-1): the throwaway container goes with its anonymous volumes (`v=true`).
+      expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
       expect(decodeURIComponent(failing.calls.find((call) => call.url.startsWith('/commit'))!.url)).toContain('repo=img&tag=latest');
     });
 
@@ -589,12 +597,15 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         Labels: { a: 'b' },
         HostConfig: { Init: true, NetworkMode: 'none', Mounts: [{ Type: 'volume', Source: 'v', Target: '/workspaces' }] },
       });
-      expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create', 'POST /containers/run1/start', 'POST /containers/run1/wait', 'DELETE /containers/run1?force=true']);
+      expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create', 'POST /containers/run1/start', 'POST /containers/run1/wait', 'DELETE /containers/run1?force=true&v=true']);
       code = 2;
       expect(await engine.runContainer(spec)).toEqual({ exitCode: 2, output: 'chown: denied', timedOut: false });
+      // Review round 1 of 11B3a (A-R1-8): only the end of the log is read.
+      expect(calls.find((call) => call.url.includes('/logs'))?.url).toBe('/containers/run1/logs?stdout=true&stderr=true&tail=200');
       const hanging = await serve((call) => (call.url === '/containers/create' ? { status: 201, json: { Id: 'run2' } } : call.url.endsWith('/wait') ? undefined : { status: 204 }));
       expect(await hanging.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
-      expect(hanging.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/run2?force=true' });
+      // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; the named volume of the workspace is kept by the engine.
+      expect(hanging.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/run2?force=true&v=true' });
     });
   });
 });

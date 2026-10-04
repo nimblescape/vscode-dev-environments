@@ -5,7 +5,7 @@
 // Plan step 11B3: the Docker of the pipeline over the port of the worker's engine answers as ContainerAdapter answers
 // over the Docker CLI.
 import { describe, expect, it } from 'vitest';
-import { SECRET_REGISTRY } from '../helperChannel/protocol';
+import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import { silentLogger, type Logger } from '../ports';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineImage } from './dockerEngine';
@@ -143,10 +143,149 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
   it('exec: the input or the secret input as standard input, never both', async () => {
     const seen: unknown[] = [];
     const engine: DockerEngine = { ...unusedEngine(), exec: async (c, command, options) => (seen.push([c, command, options]), { exitCode: 0, stdout: 'x', stderr: '', timedOut: false }) };
-    const docker = new EngineDocker(engine);
+    const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_TOKEN ? 'ghp_x' : undefined));
     expect(await docker.exec('c', ['cat'], { user: 'root', secretInput: 'ghp_x', timeoutMs: 5 })).toEqual({ exitCode: 0, stdout: 'x', stderr: '', timedOut: false });
-    expect(seen[0]).toEqual(['c', ['cat'], { user: 'root', input: 'ghp_x', timeoutMs: 5 }]);
+    // Review round 1 of 11B3a (A-R1-9): the secret goes to the port by its name, never as its value.
+    expect(seen[0]).toEqual(['c', ['cat'], { user: 'root', secretInputName: SECRET_TOKEN, timeoutMs: 5 }]);
+    expect(JSON.stringify(seen[0])).not.toContain('ghp_x');
     await expect(docker.exec('c', ['cat'], { input: 'a', secretInput: 'b' })).rejects.toThrow('either an input or a secret input');
+    // A secret input that is not the token of the operation is refused before anything is sent.
+    await expect(docker.exec('c', ['cat'], { secretInput: 'other' })).rejects.toThrow('token secret of the operation');
+    await expect(new EngineDocker(engine).exec('c', ['cat'], { secretInput: 'ghp_x' })).rejects.toThrow('token secret of the operation');
+    await docker.exec('c', ['id'], { input: 'plain', workdir: '/w' });
+    expect(seen).toEqual([seen[0], ['c', ['id'], { input: 'plain', workdir: '/w' }]]);
+  });
+
+  it('exec: a refusal of the engine is a result as `docker exec` gives it; a cancel and other failures stay failures (review round 1 of 11B3a, A-R1-3)', async () => {
+    let failure: Error = new EngineError('unable to find user nobody2: no matching entries in passwd file', 400);
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      exec: async () => {
+        throw failure;
+      },
+    };
+    const docker = new EngineDocker(engine);
+    expect(await docker.exec('c', ['id'], { user: 'nobody2' })).toEqual({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Error response from daemon: unable to find user nobody2: no matching entries in passwd file\n',
+      timedOut: false,
+    });
+    failure = new EngineError('container c is not running', 409);
+    expect((await docker.exec('c', ['id'])).stderr).toBe('Error response from daemon: container c is not running\n');
+    failure = new EngineError('The operation holds no secret token.', 0);
+    await expect(docker.exec('c', ['id'])).rejects.toBe(failure);
+    failure = new Error('socket hang up');
+    await expect(docker.exec('c', ['id'])).rejects.toBe(failure);
+    const controller = new AbortController();
+    controller.abort();
+    failure = new EngineError('cancelled while refused', 409);
+    await expect(docker.exec('c', ['id'], { signal: controller.signal })).rejects.toBe(failure);
+  });
+
+  it('each request has a time limit; a cancel stays an AbortError (review round 1 of 11B3a, A-R1-2)', async () => {
+    // As the port: a request ends with an AbortError when its signal aborts.
+    const hanging = <T>(signal?: AbortSignal): Promise<T> =>
+      new Promise((_resolve, reject) => {
+        const fail = (): void => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        if (signal?.aborted) fail();
+        signal?.addEventListener('abort', fail);
+      });
+    const signals: (AbortSignal | undefined)[] = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      containerIds: (_filters, signal) => (signals.push(signal), hanging(signal)),
+      inspect: (_kind, _reference, signal) => (signals.push(signal), hanging(signal)),
+      start: (_id, signal) => (signals.push(signal), hanging(signal)),
+    };
+    const docker = new EngineDocker(engine);
+    await expect(docker.containerIdsWithLabel('a=b', { timeoutMs: 20 })).rejects.toThrow(new EngineError('The engine did not answer the list of the containers within 0.02 s.', 0));
+    await expect(docker.imageConfig('img', { timeoutMs: 20 })).rejects.toThrow('did not answer the inspect of img within 0.02 s');
+    await expect(docker.startContainer('c', { timeoutMs: 20 })).rejects.toThrow('did not answer the start of c within 0.02 s');
+    const controller = new AbortController();
+    const cancelled = docker.containerIdsWithLabel('a=b', { signal: controller.signal, timeoutMs: 60_000 });
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+    // The signal of the caller reaches the port.
+    const passed = docker.imageConfig('img', { signal: controller.signal });
+    await expect(passed).rejects.toMatchObject({ name: 'AbortError' });
+    expect(signals.every((signal) => signal !== undefined)).toBe(true);
+    expect(signals.at(-1)?.aborted).toBe(true);
+  });
+
+  it('the signal and the filter of each list reach the port (review round 1 of 11B3a, mutation testing)', async () => {
+    const seen: unknown[] = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      containerIds: async (filters, signal) => (seen.push(['ids', filters, signal?.aborted]), ['id1']),
+      containers: async (label) => (seen.push(['containers', label]), [container()]),
+      inspect: async (_kind, reference, signal) => (seen.push(['inspect', reference, signal?.aborted]), { Id: 'sha256:1' }),
+      version: async (signal) => (seen.push(['version', signal?.aborted]), { apiVersion: '1.48', version: '29.0.0' }),
+    };
+    const docker = new EngineDocker(engine);
+    const controller = new AbortController();
+    // A signal that aborts later: the port gets one that follows it.
+    const late = { aborted: false };
+    controller.signal.addEventListener('abort', () => (late.aborted = true));
+    expect(await docker.containerIdsWithLabel('nimblescape.devenv.step=x', { signal: controller.signal })).toEqual(['id1']);
+    expect(seen.at(-1)).toEqual(['ids', { label: ['nimblescape.devenv.step=x'] }, false]);
+    // The image has no configuration: as `docker image inspect --format {{json .Config}}`, null.
+    expect(await docker.imageConfig('img')).toBeNull();
+    expect(await docker.listEnvironmentContainers()).toEqual([expect.not.objectContaining({ created: expect.anything() })]);
+    expect((await docker.listEnvironmentContainers())[0]).not.toHaveProperty('created');
+    expect(seen).toContainEqual(['containers', LABEL_ENVIRONMENT_ID]);
+    expect((await docker.listProjectContainers('acme'))[0]).not.toHaveProperty('created');
+    expect(seen.at(-1)).toEqual(['containers', 'com.docker.compose.project=acme']);
+    const signals: AbortSignal[] = [];
+    const watching: DockerEngine = {
+      ...engine,
+      version: async (signal) => (signals.push(signal!), { apiVersion: '1.48', version: '29.0.0' }),
+      inspect: async (_kind, _reference, signal) => (signals.push(signal!), { Id: 'sha256:1' }),
+      containerIds: async (_filters, signal) => (signals.push(signal!), []),
+    };
+    const watched = new EngineDocker(watching);
+    await watched.isRunning(controller.signal);
+    await watched.engineApiVersion(controller.signal);
+    await watched.imageConfig('img', { signal: controller.signal });
+    await watched.containerIdsWithLabel('a=b', { signal: controller.signal });
+    expect(signals).toHaveLength(4);
+    controller.abort();
+    expect(signals.map((signal) => signal.aborted)).toEqual([true, true, true, true]);
+  });
+
+  it('isRunning and engineApiVersion: a cancel is never an answer (review round 1 of 11B3a, mutation testing)', async () => {
+    const abort = (): Error => Object.assign(new Error('aborted'), { name: 'AbortError' });
+    let answer: () => Promise<{ apiVersion: string; version: string }> = async () => {
+      throw abort();
+    };
+    const engine: DockerEngine = { ...unusedEngine(), version: () => answer() };
+    const { logger, lines } = recording();
+    const docker = new EngineDocker(engine, logger);
+    // An AbortError without a signal of the caller (the engine went away while asked) is no answer either.
+    await expect(docker.isRunning()).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(docker.engineApiVersion()).rejects.toMatchObject({ name: 'AbortError' });
+    // A cancel of the caller while the engine fails otherwise.
+    const controller = new AbortController();
+    answer = async () => {
+      controller.abort();
+      throw new Error('connect ENOENT');
+    };
+    await expect(docker.isRunning(controller.signal)).rejects.toThrow('connect ENOENT');
+    await expect(docker.engineApiVersion(controller.signal)).rejects.toThrow('connect ENOENT');
+    expect(lines).toEqual([]);
+    // Only a version `<major>.<minor>` is one; an empty one is named.
+    for (const apiVersion of ['v1.48', '1.48-beta', '1.48.1', '']) {
+      answer = async () => ({ apiVersion, version: '' });
+      expect(await docker.engineApiVersion()).toBeUndefined();
+    }
+    expect(lines.at(-1)).toBe('warn The API version of the Docker Engine could not be read: none');
+  });
+
+  it('findContainer: the named one also when another one runs or is newer (review round 1 of 11B3a, mutation testing)', async () => {
+    const named = container({ state: 'stopped', rawState: 'exited', created: '2026-10-01T00:00:00Z' });
+    const other = container({ id: 'r'.repeat(64), name: 'running', created: '2026-10-03T12:00:00Z' });
+    const engine: DockerEngine = { ...unusedEngine(), containers: async () => [other, named] };
+    expect((await new EngineDocker(engine).findContainer(ENV, NAME))?.id).toBe(named.id);
   });
 
   it('pullImage: anonymous, or with the registry secret that the operation holds, and the lines as output', async () => {
@@ -207,5 +346,15 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     await expect(docker.runOnVolume(run)).rejects.toThrow('failed with exit code 2: chown: denied');
     result = { exitCode: null, output: '', timedOut: true };
     await expect(docker.runOnVolume(run)).rejects.toThrow('did not end in time');
+    // Review round 1 of 11B3a (mutation testing): no exit code without a time limit is a failure too; the user and the
+    // options reach the port.
+    result = { exitCode: null, output: 'killed', timedOut: false };
+    await expect(docker.runOnVolume(run)).rejects.toThrow('failed with exit code none: killed');
+    result = { exitCode: 0, output: '', timedOut: false };
+    const options: unknown[] = [];
+    const watching: DockerEngine = { ...unusedEngine(), runContainer: async (spec, given) => (specs.push(spec), options.push(given), result) };
+    await new EngineDocker(watching).runOnVolume({ ...run, user: '1000:1000' }, { timeoutMs: 7 });
+    expect(specs.at(-1)).toMatchObject({ user: '1000:1000' });
+    expect(options).toEqual([{ timeoutMs: 7 }]);
   });
 });

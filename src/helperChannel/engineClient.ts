@@ -230,7 +230,12 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       const config = { ...(inspected.Config ?? {}) };
       config.Labels = { ...toLabels(config.Labels), ...labels };
       // Created only to be committed: never started, and removed again; its command is never run.
-      const created = await api({ method: 'POST', path: '/containers/create', json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal });
+      if (signal?.aborted) throw abortError();
+      // Review round 1 of 11B3a (A-R1-7): without the signal, so that a cancel never leaves it behind created but unknown.
+      // A commit of an image without a command gives it this container's `Cmd ['true']` (the engine merges the
+      // container's command into an empty one, A-R1-5); the images of an environment have one, or Dev Containers sets it.
+      // On the classic image store the commit is a child of the previous image, which is then kept (A-R1-6).
+      const created = await api({ method: 'POST', path: '/containers/create', json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} } });
       if (created.status !== 201) fail(created);
       const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
       if (typeof container !== 'string' || container === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
@@ -248,7 +253,8 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
         if (typeof id !== 'string' || id === '') throw new EngineError('The engine answered the commit with an invalid value.', committed.status);
         return id;
       } finally {
-        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true` }).catch(() => undefined);
+        // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes (`VOLUME` of the image), as `docker run --rm`.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true` }).catch(() => undefined);
       }
     },
     runContainer: (spec, options = {}) => runContainer(api, spec, options),
@@ -301,7 +307,8 @@ async function runContainer(
     const exitCode = typeof code === 'number' ? code : null;
     let output = '';
     if (exitCode !== 0) {
-      const logs = await api({ method: 'GET', path: `/containers/${id}/logs?stdout=true&stderr=true`, signal });
+      // Review round 1 of 11B3a (A-R1-8): the end of the log, where the reason is.
+      const logs = await api({ method: 'GET', path: `/containers/${id}/logs?stdout=true&stderr=true&tail=200`, signal });
       // The frames of the log of a container without a terminal: their headers are left out.
       output = logs.status === 200 ? logs.body.replace(/[\u0000-\u0002]\u0000\u0000\u0000[\s\S]{4}/g, '').slice(-MAX_RUN_OUTPUT_CHARACTERS) : '';
     }
@@ -312,7 +319,8 @@ async function runContainer(
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     // Removed in every case, also after a cancel (without its signal).
-    await api({ method: 'DELETE', path: `/containers/${id}?force=true` }).catch(() => undefined);
+    // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; a named volume (the workspace) is kept.
+    await api({ method: 'DELETE', path: `/containers/${id}?force=true&v=true` }).catch(() => undefined);
   }
 }
 
