@@ -18,16 +18,17 @@ import {
   remoteMonitorLabelValue,
 } from './protocol';
 import {
-  REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS,
   REMOTE_MONITOR_CONFLICT_WAITS_MS,
   REMOTE_MONITOR_CREATED_WAITS_MS,
   REMOTE_MONITOR_DOCKER_TIMEOUT_MS,
-  REMOTE_MONITOR_LOG_OPTIONS,
+  REMOTE_MONITOR_LOG,
   REMOTE_MONITOR_STALE_CREATED_MS,
   RemoteSessionMonitor,
-  isMissingContainer,
-  parseDockerTime,
 } from './remoteSessionMonitor';
+// Plan step 11D2: the ensure asks a MonitorEngine; these tests drive it through the CLI-shaped fake as before
+// (cliMonitorEngine, the CLI reading of the extension that the worker's Engine API replaced).
+import { CLI_CLIENT_EXIT_WAIT_MS as REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS, cliMonitorEngine, cliRunArgs, isMissingContainer } from './cliMonitorEngine.testkit';
+import { parseDockerTime } from './monitorEngine';
 
 const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';
@@ -155,7 +156,7 @@ class Log implements Logger {
 }
 
 function monitor(docker: FakeDocker, logger = new Log(), script = SCRIPT): RemoteSessionMonitor {
-  return new RemoteSessionMonitor({ docker, logger, script: async () => script });
+  return new RemoteSessionMonitor({ engine: cliMonitorEngine(docker), logger, script: async () => script });
 }
 
 describe('RemoteSessionMonitor.ensure', () => {
@@ -400,7 +401,7 @@ describe('RemoteSessionMonitor.ensure', () => {
 
   it('fails when the script cannot be read', async () => {
     const docker = new FakeDocker(() => MISSING);
-    const failing = new RemoteSessionMonitor({ docker, logger: new Log(), script: async () => Promise.reject(new Error('ENOENT')) });
+    const failing = new RemoteSessionMonitor({ engine: cliMonitorEngine(docker), logger: new Log(), script: async () => Promise.reject(new Error('ENOENT')) });
     expect(await failing.ensure(TAG, SOCKET)).toBe('failed');
   });
 
@@ -411,7 +412,7 @@ describe('RemoteSessionMonitor.ensure', () => {
 
   it('gives the tests their own names, labels, and variables', () => {
     const custom = new RemoteSessionMonitor({
-      docker: new FakeDocker(() => result(0)),
+      engine: cliMonitorEngine(new FakeDocker(() => result(0))),
       logger: new Log(),
       script: async () => SCRIPT,
       containerName: 'devenv-test-monitor',
@@ -419,7 +420,7 @@ describe('RemoteSessionMonitor.ensure', () => {
       labels: { 'devenv-test.run': 'abc' },
       containerEnv: { DEVENV_MONITOR_TICK_MS: '500' },
     });
-    const args = custom.runArgs(TAG, SOCKET, LABEL, SCRIPT);
+    const args = cliRunArgs(custom.runSpec(TAG, SOCKET, LABEL, SCRIPT));
     expect(args).toContain('devenv-test-monitor');
     expect(args).toContain('devenv-test-monitor-state:/state');
     expect(args).toContain('devenv-test.run=abc');
@@ -556,11 +557,13 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
     const script = built.outputFiles[0].text;
     expect(script).toContain(REMOTE_MONITOR_READY_TEXT);
     const most = imagePrefixesOf(Array.from({ length: 50 }, (_, index) => `ghcr.io/${String(index).padStart(2, '0')}${'a'.repeat(118)}*`));
-    const args = monitor(new FakeDocker(() => result(0)), new Log(), script).runArgs(TAG, '/run/user/1000/docker.sock', LABEL, script, {
-      prefixes: most,
-      schedule: '7 6 * * *',
-      timeZone: 'America/Argentina/Buenos_Aires',
-    });
+    const args = cliRunArgs(
+      monitor(new FakeDocker(() => result(0)), new Log(), script).runSpec(TAG, '/run/user/1000/docker.sock', LABEL, script, {
+        prefixes: most,
+        schedule: '7 6 * * *',
+        timeZone: 'America/Argentina/Buenos_Aires',
+      }),
+    );
     expect(args.slice(-6)).toEqual(['node', '-e', PIPE_LOADER, REMOTE_MONITOR_SCRIPT_PATH, bundleHash(script), 'startMonitor']);
     for (let at = 0; at + 64 <= script.length; at += 4096) {
       const piece = script.slice(at, at + 64);
@@ -882,15 +885,15 @@ describe('RemoteSessionMonitor: images', () => {
 
   it('gives the container the prefixes and outbound network; without prefixes still no network', () => {
     const plain = monitor(new FakeDocker(() => result(0)));
-    expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT)).toEqual(expect.arrayContaining(['--network', 'none']));
-    const args = plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, IMAGES);
+    expect(cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT))).toEqual(expect.arrayContaining(['--network', 'none']));
+    const args = cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, IMAGES));
     expect(args).not.toContain('--network');
     expect(args).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(PREFIXES)}`);
     // User request 2026-09-28: "1 minute after the monitor starts then in the morning again, at 6:07 CEST"; the daily time
     // became a cron schedule ("in a guided cron style manner").
     expect(args).toContain('DEVENV_IMAGE_SCHEDULE=7 6 * * *');
     expect(args).toContain('DEVENV_IMAGE_TZ=Europe/Vienna');
-    expect(plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] })).toEqual(expect.arrayContaining(['--network', 'none']));
+    expect(cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] }))).toEqual(expect.arrayContaining(['--network', 'none']));
     // Still no capability, no published port, no new privileges.
     expect(args).toEqual(expect.arrayContaining(['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']));
     expect(args.some((arg) => arg === '-p' || arg === '--publish')).toBe(false);
@@ -901,8 +904,9 @@ describe('RemoteSessionMonitor: images', () => {
   it('caps the Docker log of the container in every variant', () => {
     const plain = monitor(new FakeDocker(() => result(0)));
     const capped = ['--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=2'];
-    expect(REMOTE_MONITOR_LOG_OPTIONS).toEqual(capped);
-    for (const args of [plain.runArgs(TAG, SOCKET, LABEL, SCRIPT), plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, IMAGES)]) {
+    // Plan step 11D2: changed, the log of the container as the create of the engine takes it (before: the CLI options).
+    expect(REMOTE_MONITOR_LOG).toEqual({ driver: 'json-file', maxSize: '1m', maxFile: '2' });
+    for (const args of [cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT)), cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, IMAGES))]) {
       const at = args.indexOf('--log-driver');
       expect(at).toBeGreaterThan(0);
       expect(args.slice(at, at + capped.length)).toEqual(capped);
@@ -919,7 +923,7 @@ describe('RemoteSessionMonitor: images', () => {
     expect(withImages).not.toBe(LABEL);
     expect(remoteMonitorLabelValue(SCRIPT, TAG, [])).toBe(LABEL);
     const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL) : result(0, 'id\n')));
-    const withSetting = new RemoteSessionMonitor({ docker, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => IMAGES });
+    const withSetting = new RemoteSessionMonitor({ engine: cliMonitorEngine(docker), logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => IMAGES });
     expect(await withSetting.ensure(TAG, SOCKET)).toBe('created');
     const run = docker.calls.find((call) => call.args[0] === 'run');
     expect(run?.args).toContain(`${LABEL_SESSION_MONITOR}=${withImages}`);
@@ -930,13 +934,13 @@ describe('RemoteSessionMonitor: images', () => {
       { ...IMAGES, timeZone: 'America/New_York' },
     ]) {
       const running = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0)));
-      const otherComputer = new RemoteSessionMonitor({ docker: running, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => other });
+      const otherComputer = new RemoteSessionMonitor({ engine: cliMonitorEngine(running), logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => other });
       expect(await otherComputer.ensure(TAG, SOCKET)).toBe('running');
       expect(running.calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false);
     }
     // Turned off: replaced (no network again).
     const off = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0, 'id\n')));
-    const offComputer = new RemoteSessionMonitor({ docker: off, logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => ({ ...IMAGES, prefixes: [] }) });
+    const offComputer = new RemoteSessionMonitor({ engine: cliMonitorEngine(off), logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => ({ ...IMAGES, prefixes: [] }) });
     expect(await offComputer.ensure(TAG, SOCKET)).toBe('created');
   });
 
@@ -948,10 +952,10 @@ describe('RemoteSessionMonitor: images', () => {
     const many = Array.from({ length: 50 }, (_, index) => `ghcr.io/${String(index).padStart(2, '0')}${'a'.repeat(76)}`);
     const plain = monitor(new FakeDocker(() => result(0)));
     const script = 'x'.repeat(28_000);
-    const args = plain.runArgs(TAG, SOCKET, LABEL, script, { ...IMAGES, prefixes: many });
+    const args = cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, script, { ...IMAGES, prefixes: many }));
     expect(args).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(many)}`);
     expect(args.some((arg) => arg.includes(script))).toBe(false);
-    const short = plain.runArgs(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: many });
+    const short = cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: many }));
     expect(short.join(' ').length).toBe(args.join(' ').length);
   });
 

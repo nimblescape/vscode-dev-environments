@@ -2,20 +2,21 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The Session Monitor container on a Docker engine, from the side of this computer (unit 7, PR 2; implementation notes
-// 16; plan step 8, PR A: on every engine, local and remote): the open pipeline ensures it (ensureOrThrow), the windows
-// send their heartbeats (src/core/session/windowHeartbeats.ts), and Delete removes the record of this computer. The Docker calls go through the current Docker context of the operation
-// (ContainerAdapter.run and start pin DOCKER_CONTEXT); DOCKER_HOST is never set. No `vscode`.
+// The Session Monitor container on a Docker engine (unit 7, PR 2; implementation notes 16; plan step 8, PR A: on every
+// engine, local and remote): its ensure. Plan step 11D2 (decision of 2026-10-03): it runs in the worker of the engine,
+// over the port MonitorEngine (the Engine API, src/core/worker/engineMonitor.ts); before, the extension ran it with the
+// Docker CLI. The windows send their heartbeats through the operation `heartbeat` (11D1). No `vscode`.
 //
 // Plan step 3 (pipe loading, user decisions 2026-09-29): the container runs the pipe loader; the script is never an
-// argument or a variable. ensure starts `docker run -i --sig-proxy=false …` attached, writes the script as the first line
-// of its input, waits for the monitor's REMOTE_MONITOR_READY_TEXT, then ends its input and the client (the container
-// goes on: no signal is passed on). The loader stores the script at REMOTE_MONITOR_SCRIPT_PATH, so a restart of the
-// container resumes from it without input. Neither the script line nor any other input is logged.
+// argument or a variable. The create writes the script as the first line of the container's input, waits for the
+// monitor's REMOTE_MONITOR_READY_TEXT, then closes its input (the container goes on). The loader stores the script at
+// REMOTE_MONITOR_SCRIPT_PATH, so a restart of the container resumes from it without input. Neither the script line nor
+// any other input is logged.
 import { randomUUID } from 'crypto';
 import { errorMessage } from '../errors';
-import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand, readableStderr } from '../loader/pipeLoader';
-import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
+import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
+import { abortError, isAbortError, type Logger } from '../ports';
+import type { MonitorEngine, MonitorInspected, MonitorRunSpec } from './monitorEngine';
 import {
   IMAGE_MAINTENANCE_LABEL_PART,
   LABEL_MONITOR_CREATE,
@@ -26,32 +27,20 @@ import {
   REMOTE_MONITOR_SCRIPT_PATH,
   REMOTE_MONITOR_STATE_DIR,
   REMOTE_MONITOR_VOLUME,
-  heartbeatCommand,
-  isUnderRecordsLock,
-  monitorExecFailure,
-  imageSettingsCommand,
-  imagesCommand,
-  parseRecordsOutput,
-  recordsCommand,
   remoteMonitorLabelValue,
-  type HeartbeatInput,
-  type ImageSettings,
-  type RecordsOutput,
 } from './protocol';
 
 /** Time limit of each Docker call of ensure (an SSH connection plus the call). */
 export const REMOTE_MONITOR_DOCKER_TIMEOUT_MS = 60_000;
-/** Time limit of a heartbeat, `records`, and `forget` (`docker exec`). */
+/** Time limit of the check of the stored script (a process in the container). */
 export const REMOTE_MONITOR_EXEC_TIMEOUT_MS = 20_000;
-/** The characters of the end of stderr of the attached `docker run` that are kept (for the conflict and the log). */
-const STDERR_TAIL_LENGTH = 4_000;
 
 /**
- * Monitor cleanup, user decision 2026-09-29 (R5): the log options of the monitor container, `docker logs` of at most
- * about 2 MB. Not part of the label (remoteMonitorLabelValue covers the script, the helper tag and whether it maintains
- * images): a running monitor keeps its log settings until it is replaced for another reason.
+ * Monitor cleanup, user decision 2026-09-29 (R5): the log of the monitor container, `docker logs` of at most about 2 MB.
+ * Not part of the label (remoteMonitorLabelValue covers the script, the helper tag and whether it maintains images): a
+ * running monitor keeps its log settings until it is replaced for another reason.
  */
-export const REMOTE_MONITOR_LOG_OPTIONS: readonly string[] = ['--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=2'];
+export const REMOTE_MONITOR_LOG: MonitorRunSpec['log'] = { driver: 'json-file', maxSize: '1m', maxFile: '2' };
 
 /**
  * Plan step 8, PR B (Q5): the restart policy of the monitor container (see runArgs). Every monitor of an older version
@@ -59,15 +48,9 @@ export const REMOTE_MONITOR_LOG_OPTIONS: readonly string[] = ['--log-driver', 'j
  */
 export const MONITOR_RESTART_POLICY = 'on-failure';
 
-/** The part of ContainerAdapter that is used here. */
-export interface RemoteMonitorDocker {
-  run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
-  /** `docker <args>` with an open standard input (the attached `docker run` of the monitor); undefined without a CLI. */
-  start(args: readonly string[]): StartedProcess | undefined;
-}
-
 export interface RemoteSessionMonitorOptions {
-  docker: RemoteMonitorDocker;
+  /** Plan step 11D2: the engine of the monitor (the worker's, over the Engine API). */
+  engine: MonitorEngine;
   logger: Logger;
   /** The content of dist/remoteMonitor.js. */
   script: () => Promise<string>;
@@ -95,19 +78,7 @@ export interface ImageMaintenanceSettings {
 /** What ensure found or did. `failed`: logged as a warning (ensureOrThrow rejects instead; plan step 8, PR A). */
 export type EnsureOutcome = 'running' | 'started' | 'created' | 'failed';
 
-/** The result of a `docker exec` in the monitor container. `missing`: the container does not exist or does not run. */
-export type MonitorExecResult = { ok: true; stdout: string } | { ok: false; missing: boolean; detail: string };
-
-/**
- * The state of the monitor container: missing, or its status (`created`, `running`, `paused`, `restarting`, `removing`,
- * `exited`, `dead`), the exit code of its last run, its label, how often Docker restarted it by its restart policy since
- * its last start by a client (`RestartCount`; 0 when it cannot be read), its ID (64 hex digits; undefined when it
- * cannot be read; review round 2 of PR #69, A-R2-2), and when the daemon created it (`.Created`, milliseconds since the
- * epoch on the clock of the daemon; undefined when it cannot be read; review round 4 of PR #69, A-R4-1).
- */
-type Inspected =
-  | { exists: false }
-  | { exists: true; status: string; exitCode: number | undefined; label: string; restartCount: number; id: string | undefined; createdAt: number | undefined };
+type Inspected = MonitorInspected;
 
 /**
  * Review round 2 of PR #69 (A-R2-2): what `docker exec <name> sha256sum REMOTE_MONITOR_SCRIPT_PATH` tells about the
@@ -115,22 +86,6 @@ type Inspected =
  * not run it), `unknown` (the check itself failed: no answer in time, a transport error, an unexpected answer).
  */
 type StoredScript = 'same' | 'other' | 'unknown';
-
-/**
- * A failed `sha256sum` that shows that no script is stored (coreutils, BusyBox) or that the container does not run.
- * Review round 3 of PR #69 (B-R3-1): each alternative is tied to the start of a line of its source (`sha256sum`, the
- * daemon or the CLI, the OCI runtime), so an unrelated line of a transport failure (an SSH warning about an identity
- * file, a missing daemon socket) that also says "No such file or directory" is no evidence; a miss counts as `unknown`
- * (kept). A-R3-4: a stored script that cannot be read (`Permission denied`, BusyBox or coreutils) is no evidence of
- * another or no script either (before, BusyBox's `can't open` counted). A-R3-5: the runtime's refusal of an exec in a
- * container that stopped between two restarts is evidence that it does not run (the wording of newer runc and the older
- * one).
- */
-const NO_STORED_SCRIPT =
-  /^sha256sum: .*No such file or directory|^(?:Error response from daemon|Error): (?:No such container: |container \S+ is (?:not running|restarting)\b)|^(?:Error response from daemon: )?OCI runtime exec failed: exec failed: cannot exec (?:in a stopped container|a container that has stopped)\b/im;
-
-/** Review round 3 of PR #69 (A-R3-1): another window removes the same container right now; its removal goes on. */
-const REMOVAL_IN_PROGRESS = /removal of container .* is already in progress/i;
 
 /**
  * Review round 3 of PR #69 (A-R3-1, A-R3-2): the waits (ms) between the looks at the container after a name conflict of
@@ -160,35 +115,12 @@ const CONFLICT_LOOK_BUDGET = Math.max(REMOTE_MONITOR_CREATED_WAITS_MS.length, RE
  */
 export const REMOTE_MONITOR_STALE_CREATED_MS = REMOTE_MONITOR_DOCKER_TIMEOUT_MS + 30_000;
 
-/**
- * Review round 4 of PR #69 (A-R4-1): how long a create that failed waits for its killed client to end before it looks
- * for its container by the nonce, so that the list runs after the create request of that client is done.
- */
-export const REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS = 5_000;
-
-/**
- * Review round 4 of PR #69 (A-R4-2): the name conflict of the create, only the daemon's own message at the start of a
- * line (the CLI prefixes `docker: `), and only with the exit code 125 of the CLI: the stderr of the attached run also
- * holds the container's own stderr (the loader's `devenv loader: …` line, Node.js warnings) and SSH warnings.
- */
-const NAME_CONFLICT = /^(?:docker: )?Error response from daemon: Conflict\. The container name\b.*\bis already in use\b/m;
-/** The exit code of the Docker CLI when the daemon refused the create (review round 4 of PR #69, A-R4-2). */
-const DOCKER_CLI_DAEMON_ERROR = 125;
-
-/** How the attached `docker run` of the monitor ended for ensure. */
-type Created = { kind: 'ready' } | { kind: 'exited'; detail: string; conflict: boolean } | { kind: 'timeout' } | { kind: 'aborted' };
-
 /** A status in which the container runs its script (paused: it goes on when it is unpaused). */
 function isRunning(status: string): boolean {
   return status === 'running' || status === 'paused';
 }
 
-/** A failed call because the container does not exist (or does not run, for `docker exec`). */
-export function isMissingContainer(result: Pick<RunResult, 'stderr' | 'timedOut' | 'exitCode'>): boolean {
-  return !result.timedOut && result.exitCode !== 0 && /no such (container|object)|is not running/i.test(result.stderr);
-}
-
-/** The Session Monitor container of the engine of the current Docker context. */
+/** The Session Monitor container of an engine (its ensure). */
 export class RemoteSessionMonitor {
   readonly containerName: string;
   readonly volumeName: string;
@@ -232,9 +164,9 @@ export class RemoteSessionMonitor {
    * name: when the ID cannot be read, nothing is removed or started and ensure fails.
    * Review round 3 of PR #69 (A-R3-1): an `rm` that finds the removal of that container already in progress (another
    * window removes it) is tolerated too, and the create goes on to the name conflict.
-   * Create: the attached `docker run -i --sig-proxy=false` (runArgs) gets the script as its first input line, and the
-   * monitor is up when its output has REMOTE_MONITOR_READY_TEXT within REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then the client
-   * is ended. Review round 3 of PR #69 (A-R3-1, A-R3-2): on a name conflict (another window creates or removes the
+   * Create: the attached create (runSpec, MonitorEngine.create; plan step 11D2: over the Engine API) gets the script as
+   * the first line of its input, and the monitor is up when its output has REMOTE_MONITOR_READY_TEXT within
+   * REMOTE_MONITOR_DOCKER_TIMEOUT_MS; then its input is closed. Review round 3 of PR #69 (A-R3-1, A-R3-2): on a name conflict (another window creates or removes the
    * container meanwhile) it looks again (resolveConflict): while that container is `created` or `removing` it waits and
    * looks again (review round 5 of PR #69, A-R5-1: `created` 12.75 s at most, REMOTE_MONITOR_CREATED_WAITS_MS;
    * `removing` REMOTE_MONITOR_CONFLICT_WAITS_MS; one counter for both; review round 6 of PR #69, A-R6-1: only the
@@ -242,15 +174,17 @@ export class RemoteSessionMonitor {
    * 9 waits, 7.75 s, 10 looks in all); a matching one that runs or is paused is
    * accepted; when the name is free, the create is tried once more (once only); anything else (still `created` after the
    * waits, another label, another status) fails. Nothing is removed there: the container is not ours. Review round 4 of
-   * PR #69: a conflict is only the daemon's message at a line start with the CLI's exit 125 (A-R4-2), and only when no
-   * container has the nonce of this create (a list that fails is a failure); a matching running container that Docker
+   * PR #69: a conflict is only the daemon's refusal of the name (A-R4-2; plan step 11D2: its status 409 with that
+   * message), and only when no container has the nonce of this create (a list that fails is a failure); a matching running container that Docker
    * restarted is accepted only with the stored script of this version (A-R4-3); a conflict that fails removes the
    * container of its nonce (none after a true conflict). Any other failure (no ready line in time, the container ended, a
-   * cancellation) kills the client, waits up to REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS for its end (A-R4-1), and
-   * removes the container of this create (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
+   * cancellation) removes the container of this create (plan step 11D2: the wait for the end of the CLI client of review
+   * round 4 of PR #69, A-R4-1, is gone; review round 1 of PR #100, A-L1: a create request that the time limit or the
+   * cancel cut off may still make its container after this removal; that `created` container is replaced as abandoned
+   * after REMOTE_MONITOR_STALE_CREATED_MS) (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
    * #69, A-R1-2: never by its name). `socketPath`: the source of the socket mount on the host of the
-   * engine (as for the workspace helper, rootless aware). `helperImage`: the image reference of `docker run` when it is
-   * not `helperTag`: the checked image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3
+   * engine (as for the workspace helper, rootless aware). `helperImage`: the image of the container when it is not
+   * `helperTag`: the checked image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3
    * of PR #64, P2); the label and the log lines keep the tag. Never throws, except an AbortError; a failure is logged as
    * a warning.
    */
@@ -283,7 +217,7 @@ export class RemoteSessionMonitor {
     const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
     // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
     const createId = randomUUID();
-    const runArgs = this.runArgs(helperImage ?? helperTag, socketPath, label, script, images, createId);
+    const spec = this.runSpec(helperImage ?? helperTag, socketPath, label, script, images, createId);
     let current = await this.inspect(signal);
     // Review round 4 of PR #69 (A-R4-1): a `created` container (of any label) may be the create of another window
     // between its create and its start: look again for a while before anything is decided.
@@ -293,9 +227,9 @@ export class RemoteSessionMonitor {
       if (decided !== 'replace') return decided;
       // Review round 2 of PR #69 (A-R2-2), review round 4 (A-R4-5): by its ID only, so never a container that another
       // window created meanwhile.
-      await this.docker(['rm', '-f', this.idOf(current)], signal);
+      await this.options.engine.remove(this.idOf(current), signal);
     }
-    let created = await this.create(runArgs, scriptLine, signal);
+    let created = await this.create(spec, scriptLine, signal);
     let triedAgain = false;
     // Another window creates or removes it at the same time: accept it when it is the same version and runs. It is not
     // ours, so it is not removed. Review round 3 of PR #69 (A-R3-1, A-R3-2): wait while it is being created or removed,
@@ -313,7 +247,7 @@ export class RemoteSessionMonitor {
       if (found === 'running') return 'running';
       if (found === 'missing' && !triedAgain) {
         triedAgain = true;
-        created = await this.create(runArgs, scriptLine, signal);
+        created = await this.create(spec, scriptLine, signal);
         continue;
       }
       // Review round 4 of PR #69 (A-R4-2): by the nonce only, so after a true conflict it finds nothing.
@@ -380,7 +314,7 @@ export class RemoteSessionMonitor {
       // Review round 4 of PR #69 (A-R4-4): started by its ID, then the stored script is checked as for a restarted one:
       // a first run killed before its script was stored exits 3 again at once. Only definite evidence replaces it.
       const id = this.idOf(current);
-      await this.docker(['start', id], signal);
+      await this.options.engine.start(id, signal);
       let stored = await this.storedScript(script, signal);
       // Review round 1 of PR #83 (B-R1-1): `docker start` resets RestartCount to 0, so the count before the start is no
       // base for a restart by the policy after it.
@@ -467,8 +401,8 @@ export class RemoteSessionMonitor {
   }
 
   /**
-   * Review round 4 of PR #69 (A-R4-1): how long ago (ms) the daemon created `current`, by its `.Created` and the clock
-   * of the daemon (`docker info --format '{{json .SystemTime}}'`), so the clock of this computer does not count.
+   * Review round 4 of PR #69 (A-R4-1): how long ago (ms) the daemon created `current`, by its creation time and the clock
+   * of the daemon (MonitorEngine.daemonTime), so the clock of this computer does not count.
    * Undefined when either cannot be read (logged); a cancellation passes.
    */
   private async ageOnDaemon(current: Inspected & { exists: true }, signal: AbortSignal | undefined): Promise<number | undefined> {
@@ -477,17 +411,9 @@ export class RemoteSessionMonitor {
       logger.info(`The creation time of the Session Monitor container cannot be read (${this.containerName}).`);
       return undefined;
     }
-    let result: RunResult;
-    try {
-      result = await this.options.docker.run(['info', '--format', '{{json .SystemTime}}'], { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      logger.info(`The time of the Docker host cannot be read: ${errorMessage(error)}`);
-      return undefined;
-    }
-    const now = result.exitCode === 0 && !result.timedOut ? parseDockerTime(parseJson(result.stdout.trim())) : undefined;
-    if (now === undefined) {
-      logger.info(`The time of the Docker host cannot be read: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
+    const now = await this.options.engine.daemonTime(signal);
+    if (typeof now !== 'number') {
+      logger.info(`The time of the Docker host cannot be read: ${now.reason}`);
       return undefined;
     }
     return now - current.createdAt;
@@ -524,71 +450,25 @@ export class RemoteSessionMonitor {
   }
 
   /**
-   * The attached `docker run` of the monitor: writes `scriptLine` (the first line of the loader), waits for the ready line,
-   * the end of the client, the time limit, or the cancellation, and then ends the input and the client in every case
-   * (after the ready line, the container goes on alone: `--sig-proxy=false`).
+   * The attached create of the monitor (MonitorEngine.create): writes `scriptLine` (the first line of the loader), waits for
+   * the ready line, its end, the time limit (REMOTE_MONITOR_DOCKER_TIMEOUT_MS), or the cancellation, and then closes its
+   * input in every case (after the ready line, the container goes on alone).
    */
-  private async create(args: readonly string[], scriptLine: string, signal: AbortSignal | undefined): Promise<Created> {
-    const client = this.options.docker.start(args);
-    if (client === undefined) throw new Error('The Docker CLI cannot be started.');
-    const created = await new Promise<Created>((resolve) => {
-      let output = '';
-      let stderr = '';
-      let settled = false;
-      const settle = (value: Created) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
-        resolve(value);
-      };
-      const timer = setTimeout(() => settle({ kind: 'timeout' }), REMOTE_MONITOR_DOCKER_TIMEOUT_MS);
-      const onAbort = () => settle({ kind: 'aborted' });
-      if (signal?.aborted) onAbort();
-      else signal?.addEventListener('abort', onAbort, { once: true });
-      client.onStdout((text) => {
-        // Only the tail is kept: enough for the ready line across pieces of output.
-        output = (output + text).slice(-8_192);
-        if (output.includes(REMOTE_MONITOR_READY_TEXT)) settle({ kind: 'ready' });
-      });
-      client.onStderr((text) => {
-        stderr = (stderr + text).slice(-STDERR_TAIL_LENGTH);
-      });
-      void client.exited.then(({ exitCode, error }) => {
-        // Review round 1 of PR #69 (A-R1-3): the conflict is recognised in the whole tail, but only its short lines are
-        // logged (Node.js prints the source line of an uncaught error, and the script is one long line). Review round 2 of PR #69 (A-R2-3): the
-        // script has short lines too, so readableStderr also drops the source excerpt by its shape.
-        const detail = error ? error.message : readableStderr(stderr, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
-        // Review round 4 of PR #69 (A-R4-2): only the daemon's message at a line start, and only with the CLI's exit 125.
-        settle({ kind: 'exited', detail, conflict: !error && exitCode === DOCKER_CLI_DAEMON_ERROR && NAME_CONFLICT.test(stderr) });
-      });
-      if (!settled) {
-        try {
-          client.write(scriptLine);
-        } catch {
-          // A client whose input is closed reports its end (exited).
-        }
-      }
-    });
-    client.end();
-    client.kill();
-    // Review round 4 of PR #69 (A-R4-1): after a failure, wait (bounded) for the killed client to end, so that the list
-    // of the cleanup by the nonce runs after its create request is done and no `created` container is left behind.
-    if (created.kind !== 'ready') await exitedWithin(client, REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS);
-    return created;
+  private create(spec: MonitorRunSpec, scriptLine: string, signal: AbortSignal | undefined) {
+    return this.options.engine.create(spec, scriptLine, REMOTE_MONITOR_READY_TEXT, signal);
   }
 
   /**
-   * `docker rm -f` of the container of a failed create; a failure is ignored (the next open replaces it anyway). Review
-   * round 1 of PR #69 (A-R1-2): by the nonce label of this create (`docker ps -aq --no-trunc --filter label=…`, then
-   * `docker rm -f <id>`), never by the name: when the create failed because another window removed and replaced the
+   * The removal of the container of a failed create; a failure is ignored (the next open replaces it anyway). Review
+   * round 1 of PR #69 (A-R1-2): by the nonce label of this create (the containers with it, then each by its ID), never by
+   * the name: when the create failed because another window removed and replaced the
    * container meanwhile ("No such container"), the container of the name is that of the other window.
    */
   private async removeBestEffort(createId: string): Promise<void> {
     try {
       const listed = await this.listOwn(createId, undefined);
       for (const id of listed ?? []) {
-        await this.options.docker.run(['rm', '-f', id], { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS });
+        await this.options.engine.remove(id);
       }
     } catch {
       // Best effort.
@@ -596,140 +476,73 @@ export class RemoteSessionMonitor {
   }
 
   /**
-   * The IDs of the containers with the nonce `createId` of a create (`docker ps -aq --no-trunc --filter label=…`; only
-   * full IDs of 64 hex digits); undefined when the list fails. A cancellation passes (review round 4 of PR #69, A-R4-2:
+   * The IDs of the containers with the nonce `createId` of a create (MonitorEngine.idsWithLabel; only full IDs of 64 hex
+   * digits); undefined when the list fails. A cancellation passes (review round 4 of PR #69, A-R4-2:
    * the conflict check passes the signal of ensure; the cleanup passes none).
    */
   private async listOwn(createId: string, signal: AbortSignal | undefined): Promise<string[] | undefined> {
-    let listed: RunResult;
-    try {
-      listed = await this.options.docker.run(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_MONITOR_CREATE}=${createId}`], {
-        timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS,
-        signal,
-      });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      return undefined;
-    }
-    if (listed.exitCode !== 0 || listed.timedOut) return undefined;
-    return listed.stdout.split(/\s+/).filter((line) => /^[0-9a-f]{64}$/.test(line));
+    const listed = await this.options.engine.idsWithLabel(`${LABEL_MONITOR_CREATE}=${createId}`, signal);
+    return listed?.filter((id) => /^[0-9a-f]{64}$/.test(id));
   }
 
   /**
    * Review round 1 of PR #69 (A-R1-1), review round 2 (A-R2-2): whether the running container holds the script
-   * (`docker exec <name> sha256sum REMOTE_MONITOR_SCRIPT_PATH`, StoredScript). Exit 0 with its bundleHash → `same`; exit
-   * 0 with another hash of 64 hex digits → `other`; a failed call whose stderr says that no file is stored or that the
-   * container does not run (NO_STORED_SCRIPT) → `other`. No answer in time, a thrown error, another answer, or another
-   * stderr → `unknown`. A cancellation passes. Review round 3 of PR #69 (A-R3-5): when the exec fails after the stream
-   * was hijacked (the runtime's refusal of an exec in a container that just stopped), the daemon writes the error to the
-   * stdout of the exec and the CLI exits 126, so a failed call is matched on stderr and stdout; every alternative of
-   * NO_STORED_SCRIPT starts a line, so a hash on stdout never matches.
+   * (`sha256sum REMOTE_MONITOR_SCRIPT_PATH` in it, MonitorEngine.storedScript): its bundleHash → `same`; another hash of
+   * 64 hex digits → `other`; definite evidence that no script is stored or that the container does not run (`none`,
+   * NO_STORED_SCRIPT) → `other`. No answer in time, a failure, or another answer → `unknown`. A cancellation passes.
    */
   private async storedScript(script: string, signal: AbortSignal | undefined): Promise<StoredScript> {
-    let result: RunResult;
-    try {
-      result = await this.options.docker.run(['exec', this.containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH], {
-        timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS,
-        signal,
-      });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      return 'unknown';
-    }
-    if (result.timedOut) return 'unknown';
-    if (result.exitCode === 0) {
-      const hash = result.stdout.trim().split(/\s+/)[0] ?? '';
-      if (!/^[0-9a-f]{64}$/.test(hash)) return 'unknown';
-      return hash === bundleHash(script) ? 'same' : 'other';
-    }
-    return NO_STORED_SCRIPT.test(`${result.stderr}\n${result.stdout}`) ? 'other' : 'unknown';
+    const found = await this.options.engine.storedScript(this.containerName, signal);
+    if (found === 'none') return 'other';
+    if (found === 'unknown') return 'unknown';
+    const hash = found.hash.trim().split(/\s+/)[0] ?? '';
+    if (!/^[0-9a-f]{64}$/.test(hash)) return 'unknown';
+    return hash === bundleHash(script) ? 'same' : 'other';
   }
 
   /**
-   * The arguments of `docker run` for the monitor container. `helperImage`: the helper tag, or an image ID (S1). Plan
-   * step 3 (pipe loading): attached with an open input (`-i`, no `-d`) and without passing signals on
-   * (`--sig-proxy=false`), so ending the client leaves the container running; the command is the pipe loader with the
-   * path, the hash of `script`, and REMOTE_MONITOR_ENTRY. The script itself goes over the input (ensure), never here.
-   * `createId`: the nonce of this create (LABEL_MONITOR_CREATE; review round 1 of PR #69, A-R1-2), which ensure always
-   * passes.
+   * The container of the monitor as its create makes it (MonitorRunSpec). `helperImage`: the helper tag, or an image ID
+   * (S1). Plan step 3 (pipe loading): the command is the pipe loader with the path, the hash of `script`, and
+   * REMOTE_MONITOR_ENTRY; the script itself goes over the input (ensure), never here. `createId`: the nonce of this create
+   * (LABEL_MONITOR_CREATE; review round 1 of PR #69, A-R1-2), which ensure always passes. Review round 4 of PR #64 (R4-8):
+   * never a pull: the helper image exists only on the engine.
    */
-  runArgs(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string): string[] {
+  runSpec(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string): MonitorRunSpec {
     const imagePrefixes = images?.prefixes ?? [];
-    // Review round 4 of PR #64 (R4-8): never a pull, like the helper runs: the helper image exists only on the engine, and
-    // a missing image must not be looked up in a registry under its name.
-    const args = ['run', '-i', '--sig-proxy=false', '--pull', 'never', '--name', this.containerName, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
-    if (createId !== undefined) args.push('--label', `${LABEL_MONITOR_CREATE}=${createId}`);
-    for (const [key, value] of Object.entries(this.options.labels ?? {})) args.push('--label', `${key}=${value}`);
-    // Our own container (the refusal of restart policies is for the containers of repositories). Plan step 8, PR B (user
-    // decision Q5 of 2026-10-02): `on-failure`, no longer `unless-stopped`: the monitor exits with 0 when it is idle (no
-    // running environment container for 5 minutes, REMOTE_IDLE_EXIT_MS of src/remoteMonitor/main.ts, no image maintenance) and stays exited until an open
-    // ensures it (`docker start`) or the heartbeats of a window repair it; a failure (an uncaught error, the loader's exit
-    // 3) is restarted, and the loader resumes from the stored script. A monitor that a `docker stop`, or the shutdown of
-    // the daemon, ended (SIGTERM, exit 0) is not started with the daemon: no environment container is either. No
-    // published port, no capability: it needs the socket and its volume. User requests 2026-09-28: with image maintenance
-    // it reads the tags of the registry, so it has the default network then (outbound only); without it, no network.
-    args.push('--restart', MONITOR_RESTART_POLICY);
-    if (imagePrefixes.length === 0) args.push('--network', 'none');
-    args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
-    // Monitor cleanup, user decision 2026-09-29 (R5): its own Docker log is capped (two files of at most 1 MB). The driver
-    // is named, as max-size fails on a host whose default driver is journald or syslog.
-    args.push(...REMOTE_MONITOR_LOG_OPTIONS);
-    args.push('-v', `${socketPath}:/var/run/docker.sock`, '-v', `${this.volumeName}:${REMOTE_MONITOR_STATE_DIR}`);
-    for (const [key, value] of Object.entries(this.options.containerEnv ?? {})) args.push('-e', `${key}=${value}`);
+    const labels: Record<string, string> = { [LABEL_SESSION_MONITOR]: label };
+    if (createId !== undefined) labels[LABEL_MONITOR_CREATE] = createId;
+    for (const [key, value] of Object.entries(this.options.labels ?? {})) labels[key] = value;
+    const env: Record<string, string> = { ...(this.options.containerEnv ?? {}) };
     if (images && imagePrefixes.length > 0) {
       // Plan step 3: the command line holds no script, so all prefixes fit (imagePrefixesOf keeps them within
       // MAX_IMAGE_PREFIXES_JSON_LENGTH); the whole list comes with `settings -` at each open anyway.
-      args.push(
-        '-e',
-        `DEVENV_IMAGE_PREFIXES=${JSON.stringify(imagePrefixes)}`,
-        '-e',
-        `DEVENV_IMAGE_SCHEDULE=${images.schedule}`,
-        '-e',
-        `DEVENV_IMAGE_TZ=${images.timeZone}`,
-      );
+      env.DEVENV_IMAGE_PREFIXES = JSON.stringify(imagePrefixes);
+      env.DEVENV_IMAGE_SCHEDULE = images.schedule;
+      env.DEVENV_IMAGE_TZ = images.timeZone;
     }
-    args.push(helperImage, ...loaderCommand({ path: REMOTE_MONITOR_SCRIPT_PATH, hash: bundleHash(script), entry: REMOTE_MONITOR_ENTRY }));
-    return args;
-  }
-
-  private async inspect(signal: AbortSignal | undefined): Promise<Inspected> {
-    const args = [
-      'container',
-      'inspect',
-      '--format',
-      `{{json .State.Status}}\t{{json .State.ExitCode}}\t{{json .Config.Labels}}\t{{json .RestartCount}}\t{{json .Id}}\t{{json .Created}}`,
-      this.containerName,
-    ];
-    const result = await this.options.docker.run(args, { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
-    if (result.exitCode !== 0) {
-      if (isMissingContainer(result)) return { exists: false };
-      throw new Error(`docker container inspect failed: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
-    }
-    const [statusText = '', exitCodeText = '', labelsText = '', restartCountText = '', idText = '', createdText = ''] = result.stdout.trim().split('\t');
-    const status = parseJson(statusText);
-    const exitCode = parseJson(exitCodeText);
-    const labels = parseJson(labelsText);
-    const restartCount = parseJson(restartCountText);
-    const id = parseJson(idText);
-    const value = typeof labels === 'object' && labels !== null ? (labels as Record<string, unknown>)[LABEL_SESSION_MONITOR] : undefined;
     return {
-      exists: true,
-      status: typeof status === 'string' ? status : '',
-      exitCode: typeof exitCode === 'number' && Number.isInteger(exitCode) ? exitCode : undefined,
-      label: typeof value === 'string' ? value : '',
-      restartCount: typeof restartCount === 'number' && Number.isInteger(restartCount) && restartCount > 0 ? restartCount : 0,
-      id: typeof id === 'string' && /^[0-9a-f]{64}$/.test(id) ? id : undefined,
-      createdAt: parseDockerTime(parseJson(createdText)),
+      name: this.containerName,
+      image: helperImage,
+      labels,
+      // Our own container (the refusal of restart policies is for the containers of repositories). Plan step 8, PR B
+      // (user decision Q5 of 2026-10-02): `on-failure`, no longer `unless-stopped`: the monitor exits with 0 when it is
+      // idle (no running environment container for 5 minutes, REMOTE_IDLE_EXIT_MS of src/remoteMonitor/main.ts, no image
+      // maintenance) and stays exited until an open ensures it or the heartbeats of a window repair it; a failure (an
+      // uncaught error, the loader's exit 3) is restarted, and the loader resumes from the stored script. No published
+      // port, no capability: it needs the socket and its volume.
+      restartPolicy: MONITOR_RESTART_POLICY,
+      // User requests 2026-09-28: with image maintenance it reads the tags of the registry, so it has the default network
+      // then (outbound only); without it, no network.
+      network: imagePrefixes.length === 0 ? 'none' : 'default',
+      log: REMOTE_MONITOR_LOG,
+      mounts: { socket: socketPath, volume: this.volumeName, volumeTarget: REMOTE_MONITOR_STATE_DIR },
+      env,
+      command: loaderCommand({ path: REMOTE_MONITOR_SCRIPT_PATH, hash: bundleHash(script), entry: REMOTE_MONITOR_ENTRY }),
     };
   }
 
-  private async docker(args: readonly string[], signal: AbortSignal | undefined): Promise<void> {
-    const result = await this.options.docker.run(args, { timeoutMs: REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal });
-    // Review round 3 of PR #69 (A-R3-1): an `rm` whose container is gone or is being removed by another window already.
-    const tolerated = args[0] === 'rm' && (isMissingContainer(result) || (!result.timedOut && REMOVAL_IN_PROGRESS.test(result.stderr)));
-    if (result.exitCode !== 0 && !tolerated) {
-      throw new Error(`docker ${args[0]} failed: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
-    }
+  private inspect(signal: AbortSignal | undefined): Promise<Inspected> {
+    return this.options.engine.inspect(this.containerName, signal);
   }
 }
 
@@ -750,46 +563,4 @@ function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-/**
- * Review round 4 of PR #69 (A-R4-1): a time of Docker as JSON gives it (Go's RFC 3339 with nanoseconds, `Z` or an
- * offset), in milliseconds since the epoch; undefined for anything else (never a guess).
- */
-export function parseDockerTime(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined;
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
-  if (match === null) return undefined;
-  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
-  if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return undefined;
-  const fraction = Number(`0.${match[7] ?? '0'}`);
-  const zone = match[8];
-  const offsetMinutes = zone === 'Z' ? 0 : (zone.startsWith('-') ? -1 : 1) * (Number(zone.slice(1, 3)) * 60 + Number(zone.slice(4, 6)));
-  const ms = Date.UTC(year, month - 1, day, hour, minute, second) + Math.floor(fraction * 1000) - offsetMinutes * 60_000;
-  return new Date(Date.UTC(year, month - 1, day)).getUTCDate() === day ? ms : undefined;
-}
-
-/** Review round 4 of PR #69 (A-R4-1): waits until `client` ended, at most `ms`. */
-function exitedWithin(client: StartedProcess, ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    void client.exited.then(
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-    );
-  });
-}
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
 }

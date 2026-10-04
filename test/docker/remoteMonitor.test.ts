@@ -43,6 +43,8 @@ import {
   type RecordsOutput,
 } from '../../src/core/remoteMonitor/protocol';
 import { forgetRecord, sendHeartbeat, sendMonitorSettings } from '../../src/core/worker/monitorFlow';
+import { engineMonitor } from '../../src/core/worker/engineMonitor';
+import { cliRunArgs } from '../../src/core/remoteMonitor/cliMonitorEngine.testkit';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
@@ -98,8 +100,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
   const timings = new Timings();
   let script = '';
   let helperTag = '';
+  // Plan step 11D2: the ensure as the worker runs it, over the Engine API of the local engine (engineMonitor).
   const monitor = new RemoteSessionMonitor({
-    docker,
+    engine: engineMonitor(dockerEngine(engineApi(helperDockerSocket(env, process.platform)), engineHijack(helperDockerSocket(env, process.platform)))),
     logger: log,
     script: async () => script,
     containerName,
@@ -299,7 +302,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
   it('replaces a monitor whose first load was cut off (review round 1 of PR #69, A-R1-1)', { timeout: 240_000 }, async () => {
     cli.run(['rm', '-f', containerName]);
     const label = remoteMonitorLabelValue(script, helperTag, []);
-    const client = spawn(run.dockerPath, monitor.runArgs(helperTag, socket, label, script), { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // Plan step 11D2: changed, the attached `docker run` of the container of runSpec, as the extension ran it before (a
+    // client that a test can kill before it wrote the script).
+    const client = spawn(run.dockerPath, cliRunArgs(monitor.runSpec(helperTag, socket, label, script)), { env, stdio: ['pipe', 'pipe', 'pipe'] });
     client.stdin.on('error', () => {});
     client.stdout.resume();
     client.stderr.resume();
@@ -534,7 +539,8 @@ describe('the Session Monitor container: the environment lock of its stops and i
 
   function newMonitor(idleMs: number): RemoteSessionMonitor {
     return new RemoteSessionMonitor({
-      docker,
+      // Plan step 11D2: over the Engine API, as the worker runs it.
+      engine: engineMonitor(dockerEngine(engineApi(helperDockerSocket(env, process.platform)), engineHijack(helperDockerSocket(env, process.platform)))),
       logger: log,
       script: async () => script,
       containerName,

@@ -52,24 +52,27 @@ function setup() {
 }
 
 // Review round 4 of PR #85 (B-R4-1): the worker's preparation and the repair of a heartbeat share the wait of their engine.
+// Plan step 11D2: changed, the repair is an operation of the worker (monitorEnsure), so its helper image is the worker's
+// preparation (prepareWorker); before, a build of its own (repairImage, removed).
 describe('heartbeatHelperImage (review round 4 of PR #85, B-R4-1)', () => {
   it('a failed build of a heartbeat, then a second preparation and a repair on the same engine: one build', async () => {
     const { preparation, builds, checks, image } = setup();
     await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).rejects.toThrow('no space left');
     await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).rejects.toThrow('prepared again in 60 seconds');
-    await expect(preparation.scope(() => image.repairImage(LOCAL, undefined))).rejects.toThrow('prepared again in 60 seconds');
+    await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).rejects.toThrow('prepared again in 60 seconds');
     expect(builds).toEqual([LOCAL]);
     // Within the wait, only the presence of the tag was checked, on that engine.
     expect(checks).toEqual([LOCAL, LOCAL]);
     // Another engine has its own wait.
-    await expect(preparation.scope(() => image.repairImage(REMOTE, undefined))).rejects.toThrow('no space left');
+    await expect(preparation.scope(() => image.prepareWorker(REMOTE, undefined))).rejects.toThrow('no space left');
     expect(builds).toEqual([LOCAL, REMOTE]);
     preparation.dispose();
   });
 
   it('a failed build of a repair holds back the build of the next preparation of a worker on that engine', async () => {
     const { preparation, builds, image } = setup();
-    await expect(preparation.scope(() => image.repairImage(REMOTE, undefined))).rejects.toThrow('no space left');
+    // Plan step 11D2: changed, the repair's build is the preparation of its worker.
+    await expect(preparation.scope(() => image.prepareWorker(REMOTE, undefined))).rejects.toThrow('no space left');
     await expect(preparation.scope(() => image.prepareWorker(REMOTE, undefined))).rejects.toThrow('prepared again');
     expect(builds).toEqual([REMOTE]);
     preparation.dispose();
@@ -79,7 +82,8 @@ describe('heartbeatHelperImage (review round 4 of PR #85, B-R4-1)', () => {
     const { preparation, state, builds, image } = setup();
     await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).rejects.toThrow('no space left');
     state.present = true;
-    await expect(preparation.scope(() => image.repairImage(LOCAL, undefined))).resolves.toEqual(IMAGE);
+    // Plan step 11D2: changed, the repair's worker is prepared as any other (before: repairImage answered the image).
+    await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).resolves.toBeUndefined();
     await expect(preparation.scope(() => image.prepareWorker(LOCAL, undefined))).resolves.toBeUndefined();
     expect(builds).toEqual([LOCAL]);
     preparation.dispose();
@@ -99,7 +103,7 @@ describe('heartbeatHelperImage (review round 4 of PR #85, B-R4-1)', () => {
   });
 });
 
-/** prepareWorker or repairImage. */
+/** prepareWorker (plan step 11D2: repairImage is removed). */
 type Call = (target: DockerTarget, signal: AbortSignal | undefined) => Promise<unknown>;
 
 /** Whether `promise` rejects with an AbortError within a few turns of the event loop. */
@@ -145,7 +149,8 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
     expect(await rejectsAtOnceWithAbort(first)).toBe(true);
     const secondDeadline = new AbortController();
     const second = preparation.scope(() => image.prepareWorker(LOCAL, secondDeadline.signal));
-    const repair = preparation.scope(() => image.repairImage(LOCAL, secondDeadline.signal));
+    // Plan step 11D2: changed, the repair's preparation is prepareWorker too.
+    const repair = preparation.scope(() => image.prepareWorker(LOCAL, secondDeadline.signal));
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(builds).toEqual([LOCAL, REMOTE]);
     secondDeadline.abort();
@@ -155,7 +160,8 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
     preparation.dispose();
   });
 
-  it.each(['prepareWorker', 'repairImage'] as const)(
+  // Plan step 11D2: changed, prepareWorker only (repairImage is removed; the repair prepares its worker).
+  it.each(['prepareWorker'] as const)(
     "in the scope of a heartbeat, %s builds with the long signal: not the caller's, and not aborted with it (B-R5-2, I10)",
     async (method) => {
       const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
@@ -181,7 +187,8 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
     },
   );
 
-  it.each(['prepareWorker', 'repairImage'] as const)(
+  // Plan step 11D2: changed, prepareWorker only (repairImage is removed; the repair prepares its worker).
+  it.each(['prepareWorker'] as const)(
     'within the wait, %s checks the tag as an operation on its engine, with the signal of its caller (B-R5-3 I04, B-R5-5 I09)',
     async (method) => {
       const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });

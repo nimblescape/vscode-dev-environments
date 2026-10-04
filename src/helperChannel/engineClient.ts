@@ -18,7 +18,10 @@ import {
   type EnginePullLogin,
   type EngineRun,
 } from '../core/worker/dockerEngine';
-import { abortError } from '../core/ports';
+import { abortError, isAbortError } from '../core/ports';
+import { errorMessage } from '../core/errors';
+import { readableStderr } from '../core/loader/pipeLoader';
+import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
 import * as crypto from 'crypto';
 import { hasTagOrDigest } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
@@ -281,6 +284,12 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       }
     },
     runContainer: (spec, options = {}) => runContainer(api, spec, options),
+    systemTime: async (signal) => {
+      const value = (await list('/info', signal)) as { SystemTime?: unknown };
+      if (typeof value?.SystemTime !== 'string') throw new EngineError('The engine answered /info without its time.', 200);
+      return value.SystemTime;
+    },
+    createAttached: (spec, options) => createAttached(api, hijack, spec, options),
   };
 }
 
@@ -531,5 +540,121 @@ async function execInContainer(
     throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Plan step 11D2: the characters of the end of the error output of an attached create that are kept (for the log). */
+const ATTACHED_STDERR_TAIL_LENGTH = 4_000;
+/** Review round 4 of PR #69 (A-R4-2): the engine's refusal of a create whose name is in use. */
+const NAME_CONFLICT = /\bConflict\. The container name\b.*\bis already in use\b/;
+
+/**
+ * Plan step 11D2 (plan step 3, pipe loading): the attached create of the Session Monitor over the API (DockerEngine.
+ * createAttached): the create with an open input (OpenStdin, StdinOnce, as `docker run -i`), the attach (stdin, stdout,
+ * stderr), the start, the input line, then the wait for `readyText` on the output (its end kept across frames), the end
+ * of the output (the container ended), the time limit, or the cancel. The input is closed and the connection ended in
+ * every case; the container goes on alone after its ready line.
+ */
+async function createAttached(
+  api: EngineApi,
+  hijack: EngineHijack,
+  spec: MonitorRunSpec,
+  options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal },
+): Promise<MonitorCreated> {
+  if (options.signal?.aborted) throw abortError();
+  const ended = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
+  let timedOut = false;
+  const timer = setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
+  let stream: EngineStream | undefined;
+  let stdout = '';
+  let stderr = '';
+  const decoders = { 1: new StringDecoder('utf8'), 2: new StringDecoder('utf8') };
+  let onReady: () => void = () => {};
+  const ready = new Promise<void>((resolve) => (onReady = resolve));
+  const outcome = (error: unknown): MonitorCreated => {
+    if (timedOut) return { kind: 'timeout' };
+    if (options.signal?.aborted || isAbortError(error)) return { kind: 'aborted' };
+    return { kind: 'exited', detail: errorMessage(error), conflict: false };
+  };
+  try {
+    let created: EngineAnswer;
+    try {
+      created = await api({
+        method: 'POST',
+        path: `/containers/create?name=${encodeURIComponent(spec.name)}`,
+        signal,
+        json: {
+          Image: spec.image,
+          Cmd: [...spec.command],
+          Labels: spec.labels,
+          Env: Object.entries(spec.env).map(([key, value]) => `${key}=${value}`),
+          AttachStdin: true,
+          AttachStdout: true,
+          AttachStderr: true,
+          OpenStdin: true,
+          StdinOnce: true,
+          Tty: false,
+          HostConfig: {
+            RestartPolicy: { Name: spec.restartPolicy },
+            NetworkMode: spec.network === 'none' ? 'none' : 'default',
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges'],
+            LogConfig: { Type: spec.log.driver, Config: { 'max-size': spec.log.maxSize, 'max-file': spec.log.maxFile } },
+            Binds: [`${spec.mounts.socket}:/var/run/docker.sock`, `${spec.mounts.volume}:${spec.mounts.volumeTarget}`],
+          },
+        },
+      });
+    } catch (error) {
+      // The request was sent: the container may exist; the caller removes it by its labels.
+      return outcome(error);
+    }
+    if (created.status !== 201) {
+      const detail = engineErrorMessage({ ...created, truncated: false });
+      return { kind: 'exited', detail, conflict: created.status === 409 && NAME_CONFLICT.test(detail) };
+    }
+    const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+    if (typeof id !== 'string' || id === '') return { kind: 'exited', detail: 'The engine answered the create of a container with an invalid value.', conflict: false };
+    try {
+      stream = await hijack({
+        path: `/containers/${encodeURIComponent(id)}/attach?stream=1&stdin=1&stdout=1&stderr=1`,
+        signal,
+        onFrame: (kind, data) => {
+          const text = decoders[kind].write(data);
+          if (kind === 2) {
+            stderr = (stderr + text).slice(-ATTACHED_STDERR_TAIL_LENGTH);
+            return;
+          }
+          // Only the tail is kept: enough for the ready line across frames.
+          stdout = (stdout + text).slice(-8_192);
+          if (stdout.includes(options.readyText)) onReady();
+        },
+      });
+      const started = await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/start`, signal });
+      if (started.status !== 204 && started.status !== 304) return { kind: 'exited', detail: engineErrorMessage({ ...started, truncated: false }), conflict: false };
+      stream.write(options.input);
+      const result = await Promise.race([
+        ready.then((): MonitorCreated => ({ kind: 'ready' })),
+        stream.ended.then(
+          (): MonitorCreated => ({ kind: 'exited', detail: readableStderr(stderr, ATTACHED_STDERR_TAIL_LENGTH) || 'the container ended before it reported its start', conflict: false }),
+          (error: unknown) => outcome(error),
+        ),
+        new Promise<MonitorCreated>((resolve) => signal.addEventListener('abort', () => resolve(outcome(undefined)), { once: true })),
+      ]);
+      return result;
+    } catch (error) {
+      return outcome(error);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (stream !== undefined) {
+      try {
+        // The input ends (the loader read its line); the container goes on alone.
+        stream.end();
+      } catch {
+        // A connection that ended already.
+      }
+      stream.destroy();
+    }
   }
 }

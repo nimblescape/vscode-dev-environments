@@ -235,7 +235,7 @@ The socket that answers credential requests stays open, and a program in the con
 
 ```sh
 npm install
-npm run build         # bundles dist/extension.js, the worker threads, dist/remoteMonitor.js and dist/helperChannel.js
+npm run build         # bundles dist/extension.js, the worker threads and dist/helperChannel.js (with the script of the Session Monitor)
 npm test              # unit tests, without VS Code and without Docker
 npm run test:docker   # integration tests against the running Docker engine
 npm run package       # creates the .vsix file

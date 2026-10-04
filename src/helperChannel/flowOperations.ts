@@ -17,6 +17,8 @@ import {
   parseReconcileParams,
   parseHeartbeatParams,
   parseMonitorSettingsParams,
+  parseMonitorEnsureParams,
+  type MonitorEnsureValue,
   parseRecordGitStateParams,
   type HeartbeatValue,
   type MonitorSettingsValue,
@@ -46,6 +48,8 @@ import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { sendHeartbeat, sendMonitorSettings } from '../core/worker/monitorFlow';
+import { engineMonitor } from '../core/worker/engineMonitor';
+import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -437,5 +441,28 @@ export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf
     const recorded = await service.recordGitState(checked.environmentId, context.signal);
     if (context.signal.aborted) throw new OperationError('cancelled', 'The recordGitState operation was cancelled.');
     return { recorded } satisfies RecordGitStateValue;
+  };
+}
+
+/**
+ * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the Session Monitor container of the worker's engine made
+ * sure (RemoteSessionMonitor.ensureOrThrow over the Engine API, engineMonitor): with the worker's own helper image (the
+ * image the worker runs from: its tag in the label, its ID as the image of the container), the socket that the worker
+ * mounts, and `script` (the monitor of the worker's bundle). A failure fails the operation with its cause.
+ */
+export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, script: () => string): OperationHandler {
+  return async (params, context) => {
+    const checked = parseMonitorEnsureParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the monitorEnsure operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorEnsure operation takes no secret.');
+    try {
+      const own = await ownHelperOf(context);
+      const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engineOf(context)), logger: contextLogger(context), script: async () => script(), imageMaintenance: () => checked.images });
+      const outcome = await monitor.ensureOrThrow(own.image.tag, own.socket, context.signal, own.image.id);
+      return { outcome } satisfies MonitorEnsureValue;
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorEnsure operation was cancelled.');
+      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+    }
   };
 }

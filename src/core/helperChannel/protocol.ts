@@ -1443,3 +1443,34 @@ export function parseRecordGitStateParams(value: unknown): RecordGitStateParams 
 export function parseRecordGitStateValue(value: unknown): RecordGitStateValue | undefined {
   return isRecord(value) && hasOnlyKeys(value, ['recorded']) && typeof value.recorded === 'boolean' ? { recorded: value.recorded } : undefined;
 }
+
+/**
+ * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the ensure of the Session Monitor container of the worker's
+ * engine (RemoteSessionMonitor.ensureOrThrow over the Engine API), with the worker's own helper image (its tag and ID)
+ * and socket, and the script of its bundle. `images`: the image maintenance of this computer (the settings imageUpdates
+ * and imageUpdateSchedule, in its time zone); with prefixes the monitor gets the default network. A failure fails the
+ * operation with its cause. No request, no secret. Parameters MonitorEnsureParams; value MonitorEnsureValue.
+ */
+export const OP_MONITOR_ENSURE = 'monitorEnsure';
+
+export interface MonitorEnsureParams {
+  images: ImageSettings;
+}
+
+export interface MonitorEnsureValue {
+  outcome: 'running' | 'started' | 'created';
+}
+
+/** The strict check of MonitorEnsureParams (both sides): the settings as the monitor takes them (prefixes may be none). */
+export function parseMonitorEnsureParams(value: unknown): MonitorEnsureParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['images'])) return undefined;
+  const images = parseImageSettingsInput(JSON.stringify(value.images) ?? '');
+  return images === undefined ? undefined : { images };
+}
+
+/** The check of MonitorEnsureValue (the extension). */
+export function parseMonitorEnsureValue(value: unknown): MonitorEnsureValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome'])) return undefined;
+  const { outcome } = value;
+  return outcome === 'running' || outcome === 'started' || outcome === 'created' ? { outcome } : undefined;
+}
