@@ -8,7 +8,7 @@
 // engine is the worker's own (EngineDocker), the helper image is the worker's own image, and the lock and the batch
 // helper are taken in the worker (`environmentLock`, given by the operation). What only the open runs (the host access
 // analysis, the image update check, the GitHub viewer, the variables of the computer) comes with plan step 11E; until
-// then it fails closed here, as do the record writes by a function (plan step 11C) and the Session Monitor beyond Delete's
+// then it fails closed here, as do the record writes by a function (plan steps 11D, 11E) and the Session Monitor beyond Delete's
 // `forget` (plan step 11D). Plan step 11C2a: the busy marks are specific requests to the extension (decision of
 // 2026-10-04). Pure over its deps; no `vscode`.
 import { UserFacingError, errorMessage } from '../errors';
@@ -32,7 +32,10 @@ function notInWorker(what: string, step: string): Error {
   return new Error(`${what} does not run in the worker before plan step ${step}.`);
 }
 
-/** EnvironmentStore over the `record` requests; a write by a function cannot cross the channel (plan step 11C). */
+/**
+ * EnvironmentStore over the `record` requests; a write by a function cannot cross the channel (plan step 11C: each write
+ * is a specific request, decision of 2026-10-04).
+ */
 export function hostStore(records: HostSide['records']): EnvironmentStore {
   return {
     read: () => records.read(),
@@ -42,11 +45,11 @@ export function hostStore(records: HostSide['records']): EnvironmentStore {
     add: (environment) => records.add(environment),
     remove: (id, volumes = {}) => records.remove(id, volumes),
     forgetKeptVolumes: (names) => records.forgetKeptVolumes(names),
-    update: async () => {
-      throw notInWorker('A change of the registry by a function', '11C');
-    },
+    // Plan step 11C3: the entries rebuilt from the volumes of the engine.
+    restore: (entries) => records.restore(entries),
+    // The changes of an entry by the flows that still make them become specific requests when they move (plan steps 11D, 11E).
     updateEnvironment: async () => {
-      throw notInWorker('A change of a registry entry by a function', '11C');
+      throw notInWorker('A change of a registry entry by a function', '11D or 11E');
     },
   };
 }

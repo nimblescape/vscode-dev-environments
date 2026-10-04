@@ -14,13 +14,13 @@ import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
 import { registryBusyMarks } from '../core/pipeline/busyMarks';
-import type { Clock } from '../core/ports';
+import { isoTime, type Clock } from '../core/ports';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { HelperChannels } from '../core/helperChannel/helperChannels';
 import type { DockerTarget } from '../core/docker/dockerHost';
 
 export interface HostSideDeps {
-  registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
+  registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'restore' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
   sessionFiles: Pick<
     SessionFiles,
     'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeReopenOf' | 'removeDisconnectRequest'
@@ -110,6 +110,11 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         void (await deps.registry.updateEnvironment(environmentId, (entry) => {
           entry.gitSummary = summary;
         })),
+      // Plan step 11C3 (decision of 2026-10-04): the entries rebuilt from the volumes, with the clock of this window.
+      restore: async (entries) => {
+        const now = isoTime(deps.clock);
+        return deps.registry.restore(entries.map((entry) => ({ ...entry, createdAt: now, lastUsedAt: now })));
+      },
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),
@@ -141,6 +146,13 @@ function environmentOf(params: unknown): string | undefined {
   if (typeof params !== 'object' || params === null) return undefined;
   const id = (params as { environmentId?: unknown }).environmentId;
   return typeof id === 'string' ? id : undefined;
+}
+
+/** Plan step 11C3: the Docker host of an operation, from its parameters (`dockerHost`), for `record restore`. */
+function dockerHostOfParams(params: unknown): string | undefined {
+  if (typeof params !== 'object' || params === null) return undefined;
+  const host = (params as { dockerHost?: unknown }).dockerHost;
+  return typeof host === 'string' ? host : undefined;
 }
 
 /** Review round 1 of 11C2b (A-R1-M2): the name of the repository that the questions of the operation name. */
@@ -180,6 +192,7 @@ export function extensionFlow(
       onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
         environmentId: environmentOf(params),
         repository: repositoryOf(params),
+        dockerHost: dockerHostOfParams(params),
         ...(options.onAnswer ? { onAnswer: options.onAnswer } : {}),
         ...(options.onQuestion ? { onQuestion: options.onQuestion } : {}),
       }),

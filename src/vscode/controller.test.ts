@@ -191,7 +191,8 @@ interface Harness {
     /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; signal?: AbortSignal }) => Promise<WindowStateValue | undefined>>>;
-    reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
+    // Plan step 11C3: changed, the restore runs in the worker (reconcileInWorker).
+    reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean }) => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     possibleServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
@@ -308,7 +309,7 @@ function createHarness(
         return undefined;
       }
     }),
-    reconcileFromVolumes: vi.fn(async () => 0),
+    reconcileInWorker: vi.fn(async (_options: { passive: boolean }) => 0),
     // By default, Delete could remove every recorded volume (their labels make them the environment's own).
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
     // No volumes of a Docker Compose project, unless a test gives them (D-19).
@@ -1816,14 +1817,15 @@ describe('Sign in and Refresh', () => {
   it('refreshes the list, restores a lost registry while Docker runs, and reads the states', async () => {
     await run('refresh');
     expect(h.sidebar.refreshDiscovery).toHaveBeenCalledWith({ again: true });
-    expect(h.service.reconcileFromVolumes).toHaveBeenCalled();
+    // Plan step 11C3: changed, by the worker, made ready in full (the user asked for the refresh).
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false });
     expect(h.sidebar.refreshStates).toHaveBeenCalled();
   });
 
   it('restores the environments from the volumes when registry.json exists but cannot be read as a registry', async () => {
     fs.writeFileSync(h.paths.registry, '{ "version": 1, "environments": [ { "id": ');
     await run('refresh');
-    expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
+    expect(h.service.reconcileInWorker).toHaveBeenCalledTimes(1);
   });
 
   it('leaves the check of the Docker target and of a running Docker to the restore itself (review, D2)', async () => {
@@ -1831,19 +1833,19 @@ describe('Sign in and Refresh', () => {
     fs.writeFileSync(h.paths.registry, '{ "version": 1, "environments": [ { "id": ');
     h.docker.isRunning.mockClear();
     let runningAsked = 0;
-    h.service.reconcileFromVolumes.mockImplementation(async () => {
+    h.service.reconcileInWorker.mockImplementation(async () => {
       runningAsked = h.docker.isRunning.mock.calls.length;
       return 0;
     });
     await run('refresh');
-    expect(h.service.reconcileFromVolumes).toHaveBeenCalledTimes(1);
+    expect(h.service.reconcileInWorker).toHaveBeenCalledTimes(1);
     expect(runningAsked).toBe(0);
   });
 
   it('does not restore from the volumes while registry.json is valid', async () => {
     await h.registry.add(environment());
     await run('refresh');
-    expect(h.service.reconcileFromVolumes).not.toHaveBeenCalled();
+    expect(h.service.reconcileInWorker).not.toHaveBeenCalled();
   });
 
   it('signs in on Refresh when the user is not signed in', async () => {
@@ -3035,7 +3037,7 @@ describe('Accounts (concept 7.5)', () => {
     h.connection.currentContainerName.mockReturnValue(CONTAINER);
     // registry.json is missing; the restore adds the entry of this window.
     fs.rmSync(h.paths.registry, { force: true });
-    h.service.reconcileFromVolumes.mockImplementation(async () => {
+    h.service.reconcileInWorker.mockImplementation(async () => {
       await h.registry.add(env);
       return 1;
     });
@@ -3046,6 +3048,8 @@ describe('Accounts (concept 7.5)', () => {
       return containerInfo(String(CONTAINER_VERSION));
     });
     await h.controller.reconcileIfRegistryLost();
+    // Plan step 11C3: in the background, the worker is made ready passively.
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: true });
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
     await settle(() => tokenRemovals() > 0, 'the removal of the token');

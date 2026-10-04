@@ -14,6 +14,7 @@ import {
   parseDeleteCheckParams,
   parseDeleteParams,
   parseListConfigurationsParams,
+  parseReconcileParams,
   parseStopParams,
   parseTokenRemoveParams,
   parseWindowStateParams,
@@ -24,6 +25,7 @@ import {
   type ListConfigurationsValue,
   type StopValue,
   type TokenRemoveValue,
+  type ReconcileValue,
 } from '../core/helperChannel/protocol';
 import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
 import { isAbortError, silentProgress, type Logger } from '../core/ports';
@@ -321,6 +323,43 @@ export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: O
       return decision satisfies DeleteCheckValue;
     } catch (error) {
       return flowRefusal(error, context) satisfies DeleteCheckValue;
+    }
+  };
+}
+
+/**
+ * Plan step 11C3 (decisions of 2026-10-03 and 2026-10-04): `reconcile`, the registry rebuilt from the labels of the
+ * volumes of the engine (concept 7.5 "registry lost"), by the worker's own pipeline (workerServices,
+ * EnvironmentService.reconcileFromVolumes): the volumes and the containers read over the port of the engine, the entries
+ * added by the extension (`record restore`). No lock: it only reads on the engine.
+ */
+export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseReconcileParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the reconcile operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The reconcile operation takes no secret.');
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine: engineOf(context),
+      secretOf: (name) => context.secrets[name],
+      logger: contextLogger(context),
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+    });
+    try {
+      return { added: await service.reconcileFromVolumes() } satisfies ReconcileValue;
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The reconcile operation was cancelled.');
+      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
     }
   };
 }

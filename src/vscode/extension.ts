@@ -854,10 +854,10 @@ async function findWindowEnvironment(
   try {
     const environment = await registry.findByContainerName(containerName);
     if (environment || !(await needsRestore())) return environment;
-    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
-    // then whether Docker runs.
+    // Review D2: reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs. Plan step 11C3: by the worker of the Docker host, in the background (passive).
     if (!docker.isInstalled()) return undefined;
-    if ((await service.reconcileFromVolumes()) === 0) return undefined;
+    if ((await service.reconcileInWorker({ passive: true })) === 0) return undefined;
     return await registry.findByContainerName(containerName);
   } catch (error) {
     logger.error('The environment of this window could not be found.', error);

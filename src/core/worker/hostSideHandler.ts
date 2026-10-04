@@ -10,7 +10,13 @@ import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUES
 import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
 import { isGitSummary } from '../git/gitSummary';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
-import type { BusyOperation } from '../types';
+import type { BusyOperation, Environment } from '../types';
+import { MAX_RESTORE_ENTRIES } from '../helperChannel/protocol';
+import { isConfigPathLabelValue, repositoryFolder, resourceName } from '../names';
+import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/pipelineRules';
+import { boundServiceFolders, MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_LENGTH } from '../git/gitSummary';
+import { dockerHostField } from '../docker/dockerHost';
+import { isStorageId } from '../storage/paths';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
 import type { AskKind, Secrets } from '../helperChannel/protocol';
 import { errorMessage } from '../errors';
@@ -47,6 +53,8 @@ export function hostSideHandler(
   scope: {
     environmentId?: string;
     repository?: string;
+    // Plan step 11C3: the Docker host of the operation, the only one whose entries `record restore` adds.
+    dockerHost?: string;
     onAnswer?: (call: string, args: unknown[], value: unknown) => void;
     // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked (`asked`) and has its answer or failed (`settled`).
     onQuestion?: (state: 'asked' | 'settled') => void;
@@ -76,7 +84,7 @@ export function hostSideHandler(
       if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
         throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
       }
-      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args);
+      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, scope.dockerHost);
       scope.onQuestion?.('asked');
       try {
         const answered = await answer(host, request.kind, request.call, request.args);
@@ -142,6 +150,91 @@ function deleteConfirmation(value: unknown): DeleteConfirmation {
   };
 }
 
+/** The fields of an entry that the rebuild from the volumes gives it (EnvironmentService.reconcileFromVolumes). */
+const RESTORED_FIELDS = new Set([
+  'id',
+  'repository',
+  'configPath',
+  'volumeName',
+  'containerName',
+  'createdAt',
+  'lastUsedAt',
+  'owner',
+  'dockerHost',
+  'additionalVolumes',
+  'serviceVolumes',
+  'serviceFolders',
+  'serviceFoldersOverflow',
+]);
+
+/**
+ * Plan step 11C3 (decision of 2026-10-04: `record restore`): the entries that the worker rebuilt from the labels of the
+ * volumes, checked as reconcileFromVolumes makes them: the name of the volume that the extension gives the environment
+ * of its labels, an owner without login, the Docker host of the operation, and only the fields of a rebuild (no build
+ * record, no Git state, no busy mark). Each entry is rebuilt from its checked fields; nothing else is passed on.
+ */
+function restoredEntries(value: unknown, dockerHost: string): Environment[] {
+  const invalid = (why: string) => new HelperOperationError('invalid', `The restored entries are invalid: ${why}.`, false);
+  if (!Array.isArray(value) || value.length > MAX_RESTORE_ENTRIES) throw invalid(`not a list of at most ${MAX_RESTORE_ENTRIES}`);
+  const isTime = (time: unknown) => plainText(time, 64) && Number.isFinite(Date.parse(time));
+  return value.map((entry: unknown): Environment => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw invalid('an entry is not an object');
+    const fields = entry as Record<string, unknown>;
+    const odd = Object.keys(fields).find((key) => !RESTORED_FIELDS.has(key));
+    if (odd !== undefined) throw invalid(`the field ${odd} is not one of a restored entry`);
+    const { id, repository, configPath, volumeName, containerName, createdAt, lastUsedAt, owner } = fields;
+    if (!isStorageId(id) || !isRepositoryName(repository) || repository.length > 256 || !plainText(repository, 256)) throw invalid('an ID or a repository');
+    // Only the volume of the name that the extension gives the environment of these labels, and its container.
+    if (typeof volumeName !== 'string' || volumeName.toLowerCase() !== resourceName(repository, id).toLowerCase() || containerName !== volumeName) {
+      throw invalid(`the volume of ${id} has not the name of its environment`);
+    }
+    if (typeof configPath !== 'string' || (configPath !== DEFAULT_CONFIG_PATH && !isConfigPathLabelValue(configPath))) throw invalid('a configuration path');
+    if (!isTime(createdAt) || !isTime(lastUsedAt)) throw invalid('a time');
+    if (typeof owner !== 'object' || owner === null || Array.isArray(owner)) throw invalid('an owner');
+    const { id: ownerId, login, ...rest } = owner as Record<string, unknown>;
+    // The owner label gives the entry its owner again; its login follows at the next open.
+    if (!isStorageId(ownerId) || login !== '' || Object.keys(rest).length > 0) throw invalid('an owner');
+    if ((fields.dockerHost ?? '') !== dockerHost || fields.dockerHost === '') throw invalid('the Docker host is not the one of the operation');
+    const additional = fields.additionalVolumes === undefined ? [] : volumeList(fields.additionalVolumes, invalid);
+    if (fields.additionalVolumes !== undefined && (additional.length === 0 || additional.includes(volumeName) || new Set(additional).size !== additional.length)) {
+      throw invalid('the additional volumes');
+    }
+    const services = fields.serviceVolumes === undefined ? [] : volumeList(fields.serviceVolumes, invalid);
+    if (fields.serviceVolumes !== undefined && (services.length === 0 || !services.every((name) => additional.includes(name)))) throw invalid('the volumes of the services');
+    const { serviceFolders, serviceFoldersOverflow } = fields;
+    if (serviceFoldersOverflow !== undefined && serviceFoldersOverflow !== true) throw invalid('the overflow of the service folders');
+    if (
+      serviceFolders !== undefined &&
+      (!Array.isArray(serviceFolders) || serviceFolders.length > MAX_SERVICE_FOLDERS || !serviceFolders.every((folder) => plainText(folder, MAX_SERVICE_PATH_LENGTH)))
+    ) {
+      throw invalid('the service folders');
+    }
+    // As the pipeline records them: only paths of the repository, within the bounds (an overflow is kept).
+    const folders = boundServiceFolders(repositoryFolder(repository), [(serviceFolders as string[] | undefined) ?? []], serviceFoldersOverflow === true);
+    return {
+      id,
+      repository,
+      configPath,
+      volumeName,
+      containerName: volumeName,
+      createdAt: createdAt as string,
+      lastUsedAt: lastUsedAt as string,
+      owner: { id: ownerId, login: '' },
+      ...dockerHostField(dockerHost),
+      ...(additional.length > 0 ? { additionalVolumes: additional } : {}),
+      ...(services.length > 0 ? { serviceVolumes: services } : {}),
+      ...(folders.folders.length > 0 ? { serviceFolders: folders.folders } : {}),
+      ...(folders.overflow ? { serviceFoldersOverflow: true } : {}),
+    };
+  });
+}
+
+/** Plan step 11C3: the names of volumes of a restored entry. */
+function volumeList(value: unknown, invalid: (why: string) => Error): string[] {
+  if (!Array.isArray(value) || value.length > MAX_QUESTION_NAMES || !value.every((name) => typeof name === 'string' && VOLUME_NAME.test(name))) throw invalid('the names of volumes');
+  return [...(value as string[])];
+}
+
 function strings(args: unknown[], count: number): string[] {
   const values = args.slice(0, count);
   if (values.length !== count || !values.every((value) => typeof value === 'string')) {
@@ -150,14 +243,14 @@ function strings(args: unknown[], count: number): string[] {
   return values as string[];
 }
 
-async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[]): Promise<Answer> {
+async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[], dockerHost?: string): Promise<Answer> {
   switch (kind) {
     case 'question':
       return { value: await question(host, call, args) };
     case 'local':
       return { value: await local(host, call, args) };
     case 'record':
-      return { value: await record(host, call, args) };
+      return { value: await record(host, call, args, dockerHost) };
     case 'secret':
       return secret(host, call, args);
     case 'connect': {
@@ -243,7 +336,7 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
   }
 }
 
-async function record(host: HostSide, call: string, args: unknown[]): Promise<unknown> {
+async function record(host: HostSide, call: string, args: unknown[], dockerHost: string | undefined): Promise<unknown> {
   const records = host.records;
   switch (call) {
     case 'read':
@@ -314,6 +407,13 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
       }
       await records.recordGitSummary(environmentId, { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt });
       return null;
+    }
+    // Plan step 11C3: the entries rebuilt from the volumes of the engine of the operation, each rebuilt here from its checked fields.
+    case 'restore': {
+      if (dockerHost === undefined) throw new HelperOperationError('invalid', 'The operation names no Docker host for the restored entries.', false);
+      const entries = restoredEntries(args[0], dockerHost);
+      const { added, skipped } = await records.restore(entries);
+      return { added, skipped: [...skipped] };
     }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);

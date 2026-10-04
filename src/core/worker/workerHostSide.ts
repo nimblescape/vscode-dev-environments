@@ -13,6 +13,20 @@ import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
  * Plan step 11C2a: the answer of `record markBusy` as the pipeline uses it: the entry of `environmentId`, or a busy mark
  * that keeps it, or undefined (no entry). Anything else is a failure of the request (never taken as "not busy").
  */
+/**
+ * Plan step 11C3: the answer of `record restore`: the number of added entries and the volumes left out. Anything else is
+ * a failure of the request.
+ */
+export function parseRestoreAnswer(value: unknown): { added: number; skipped: string[] } {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    const { added, skipped } = value as { added?: unknown; skipped?: unknown };
+    if (typeof added === 'number' && Number.isSafeInteger(added) && added >= 0 && Array.isArray(skipped) && skipped.every((name) => typeof name === 'string')) {
+      return { added, skipped: [...(skipped as string[])] };
+    }
+  }
+  throw new Error('The extension answered the restore of the registry with an invalid value.');
+}
+
 export function parseBusyMarkAnswer(value: unknown, environmentId: string): BusyMarkResult {
   if (value === null) return undefined;
   if (typeof value === 'object' && !Array.isArray(value)) {
@@ -101,6 +115,7 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       markBusy: async (environmentId, operation) => parseBusyMarkAnswer(await call('record', 'markBusy', environmentId, operation), environmentId),
       clearBusy: async (environmentId) => void (await call('record', 'clearBusy', environmentId)),
       recordGitSummary: async (environmentId, summary) => void (await call('record', 'recordGitSummary', environmentId, summary)),
+      restore: async (entries) => parseRestoreAnswer(await call('record', 'restore', entries)),
     },
     secrets: {
       token: async () => {

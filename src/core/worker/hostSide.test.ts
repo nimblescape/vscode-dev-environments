@@ -69,6 +69,8 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       markBusy: async (environmentId, operation) => (record('markBusy', environmentId, operation), of('markBusy', undefined as BusyMarkResult)),
       clearBusy: async (environmentId) => void record('clearBusy', environmentId),
       recordGitSummary: async (environmentId, summary) => void record('recordGitSummary', environmentId, summary),
+      // Plan step 11C3.
+      restore: async (entries) => (record('restore', entries), of('restore', { added: entries.length, skipped: [] as string[] })),
     },
     secrets: {
       token: async () => (record('token'), of('token', undefined)),

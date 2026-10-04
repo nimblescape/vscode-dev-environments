@@ -602,19 +602,21 @@ export class Controller implements vscode.Disposable {
   /**
    * Concept 7.5 "registry lost": entries for the volumes with the label nimblescape.devenv.environment-id, when
    * registry.json is missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
+   * Plan step 11C3: by the worker of the Docker host; `passive` (the default, a call in the background): it is made ready
+   * as for the refresh.
    */
-  async reconcileIfRegistryLost(): Promise<void> {
-    await this.withDockerTarget(() => this.reconcileIfRegistryLostNow());
+  async reconcileIfRegistryLost(options: { passive: boolean } = { passive: true }): Promise<void> {
+    await this.withDockerTarget(() => this.reconcileIfRegistryLostNow(options));
   }
 
-  private async reconcileIfRegistryLostNow(): Promise<void> {
+  private async reconcileIfRegistryLostNow(options: { passive: boolean }): Promise<void> {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
     if (!(await this.deps.registryNeedsRestore())) return;
-    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
-    // then whether Docker runs; no `docker info` here before that check.
+    // Review D2: reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs; no `docker info` here before that check. Plan step 11C3: by the worker of the Docker host.
     if (!docker.isInstalled()) return;
-    const added = await service.reconcileFromVolumes();
+    const added = await service.reconcileInWorker(options);
     if (added === 0) return;
     await this.adoptWindowEnvironment();
     await this.deps.sidebar.render();
@@ -935,7 +937,8 @@ export class Controller implements vscode.Disposable {
   async refresh(): Promise<void> {
     if (await this.deps.auth.isSignedIn()) await this.deps.sidebar.refreshDiscovery({ again: true });
     else await this.signIn();
-    await this.reconcileIfRegistryLost().catch((error: unknown) =>
+    // Plan step 11C3: the user asked for it, so the worker is made ready in full (as for an operation of the user).
+    await this.reconcileIfRegistryLost({ passive: false }).catch((error: unknown) =>
       this.logger.warn(`The environments could not be restored from the volumes: ${errorMessage(error)}`),
     );
     await this.deps.sidebar.refreshStates();

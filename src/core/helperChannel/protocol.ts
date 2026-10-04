@@ -1126,13 +1126,19 @@ const MAX_DOCKER_HOST_LENGTH = 1024;
 /** The strict check of ListConfigurationsParams (both sides). */
 export function parseListConfigurationsParams(value: unknown): ListConfigurationsParams | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'dockerHost', 'owner'])) return undefined;
-  const { environmentId, dockerHost, owner } = value;
+  const { environmentId } = value;
   if (!isStorageId(environmentId)) return undefined;
+  const target = parseOperationTarget(value.dockerHost, value.owner);
+  return target === undefined ? undefined : { environmentId, ...target };
+}
+
+/** Plan step 11C3: the Docker host and the window of an operation (the parameters of every flow). */
+function parseOperationTarget(dockerHost: unknown, owner: unknown): { dockerHost: string; owner: { windowId: string; pid: number } } | undefined {
   if (typeof dockerHost !== 'string' || dockerHost.length > MAX_DOCKER_HOST_LENGTH || /[\u0000-\u001f\u007f]/.test(dockerHost)) return undefined;
   if (!isRecord(owner) || !hasOnlyKeys(owner, ['windowId', 'pid'])) return undefined;
   const { windowId, pid } = owner;
   if (!isStorageId(windowId) || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  return { environmentId, dockerHost, owner: { windowId, pid } };
+  return { dockerHost, owner: { windowId, pid } };
 }
 
 /** The check of ListConfigurationsValue (the extension). */
@@ -1301,4 +1307,40 @@ export function parseWindowStateValue(value: unknown): WindowStateValue | undefi
   if (outdated !== undefined && outdated !== 'version' && outdated !== 'hostAccess') return undefined;
   if (branch !== undefined && branch !== null && (typeof branch !== 'string' || branch === '' || branch.length > MAX_BRANCH_LENGTH || /[\u0000-\u001f\u007f]/.test(branch))) return undefined;
   return { state, ...(outdated !== undefined ? { outdated } : {}), ...(branch !== undefined ? { branch } : {}) };
+}
+
+/**
+ * Plan step 11C3 (decisions of 2026-10-03 and 2026-10-04): `reconcile`, the registry rebuilt from the labels of the
+ * volumes of the engine (concept 7.5 "registry lost"; EnvironmentService.reconcileFromVolumes), by the worker: it reads
+ * the volumes and the containers there, and the entries go to the extension as `record restore`, which adds them under
+ * its registry lock. No lock of an environment, no secret. Parameters ReconcileParams; value ReconcileValue.
+ */
+export const OP_RECONCILE = 'reconcile';
+
+export interface ReconcileParams {
+  /** The Docker host of the operation as the extension resolved it ('' for the local Docker; DockerTargets.host). */
+  dockerHost: string;
+  /** The window that sends the operation (EnvironmentServiceDeps.owner). */
+  owner: { windowId: string; pid: number };
+}
+
+/** The number of entries that the extension added. */
+export interface ReconcileValue {
+  added: number;
+}
+
+/** The most entries of one `record restore` (the environments of one engine). */
+export const MAX_RESTORE_ENTRIES = 1000;
+
+/** The strict check of ReconcileParams (both sides). */
+export function parseReconcileParams(value: unknown): ReconcileParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['dockerHost', 'owner'])) return undefined;
+  return parseOperationTarget(value.dockerHost, value.owner);
+}
+
+/** The check of ReconcileValue (the extension). */
+export function parseReconcileValue(value: unknown): ReconcileValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['added'])) return undefined;
+  const { added } = value;
+  return typeof added === 'number' && Number.isSafeInteger(added) && added >= 0 && added <= MAX_RESTORE_ENTRIES ? { added } : undefined;
 }
