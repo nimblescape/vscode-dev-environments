@@ -120,6 +120,8 @@ describe('open pipeline for a Docker Compose configuration', () => {
     // helper steps of the opens.
     environmentLock: locks.take,
     flow: (op, params, options) => locks.flow(op, params, options),
+    // Plan step 11C1: the refresh through the worker, as extension.ts.
+    workerRefresh: (environments) => locks.refresh(environments),
     docker,
     runner,
     helper,

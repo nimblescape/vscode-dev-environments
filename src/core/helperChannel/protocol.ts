@@ -1147,3 +1147,55 @@ export function parseListConfigurationsValue(value: unknown): ListConfigurations
   if (!configPaths.every((path) => typeof path === 'string' && path !== '' && path.length <= MAX_CONFIGURATION_PATH_LENGTH && !/[\u0000-\u001f\u007f]/.test(path))) return undefined;
   return { configPaths: [...(configPaths as string[])] };
 }
+
+/**
+ * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): `windowState`, what an attached window reads of its dev
+ * container, by the worker: its state, why it must not be used as it is (`outdated`, with `checks`, the host access
+ * checks of its repository), and with `branch` the branch of the repository (the Git user and folder). It only reads;
+ * no lock, no secret, no request to the extension. Parameters WindowStateParams; value WindowStateValue.
+ */
+export const OP_WINDOW_STATE = 'windowState';
+
+export interface WindowStateParams {
+  environmentId: string;
+  containerName: string;
+  /** The host access checks of the repository now (hostAccessChecks): for `outdated`. */
+  checks: 'on' | 'off';
+  /** When given: the branch of the repository in the running container. */
+  branch?: { folder: string; user?: string };
+}
+
+export interface WindowStateValue {
+  state: ContainerState;
+  /** Why the container must not be used as it is (containerIsCurrent): `version` or `hostAccess`. */
+  outdated?: 'version' | 'hostAccess';
+  /** With `branch`: the branch, `null` for a detached HEAD; left out when it could not be read. */
+  branch?: string | null;
+}
+
+/** The longest branch name of a WindowStateValue. */
+export const MAX_BRANCH_LENGTH = 255;
+
+/** The strict check of WindowStateParams (both sides). */
+export function parseWindowStateParams(value: unknown): WindowStateParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'containerName', 'checks'], ['branch'])) return undefined;
+  const { environmentId, containerName, checks, branch } = value;
+  if (!isStorageId(environmentId) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
+  if (checks !== 'on' && checks !== 'off') return undefined;
+  if (branch === undefined) return { environmentId, containerName, checks };
+  if (!isRecord(branch) || !hasOnlyKeys(branch, ['folder'], ['user'])) return undefined;
+  const { folder, user } = branch;
+  if (typeof folder !== 'string' || !REPOSITORY_FOLDER.test(folder)) return undefined;
+  if (user !== undefined && (typeof user !== 'string' || !EXEC_USER.test(user))) return undefined;
+  return { environmentId, containerName, checks, branch: { folder, ...(user !== undefined ? { user } : {}) } };
+}
+
+/** The check of WindowStateValue (the extension). */
+export function parseWindowStateValue(value: unknown): WindowStateValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['state'], ['outdated', 'branch'])) return undefined;
+  const { state, outdated, branch } = value;
+  if (state !== 'running' && state !== 'stopped' && state !== 'missing') return undefined;
+  if (outdated !== undefined && outdated !== 'version' && outdated !== 'hostAccess') return undefined;
+  if (branch !== undefined && branch !== null && (typeof branch !== 'string' || branch === '' || branch.length > MAX_BRANCH_LENGTH || /[\u0000-\u001f\u007f]/.test(branch))) return undefined;
+  return { state, ...(outdated !== undefined ? { outdated } : {}), ...(branch !== undefined ? { branch } : {}) };
+}

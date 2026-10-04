@@ -155,6 +155,8 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
       windowStatuses: () => sessionFiles.readWindowStatuses(),
       dockerTarget: () => targets.current(),
       // Plan step 11B2: the flows in the worker of the current target, as extension.ts.
+      // Plan step 11C1: the refresh through the worker, as extension.ts.
+      workerRefresh: async (environments) => channels.refresh(await targets.current(), environments),
       flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),
       // As extension.ts, with the short wait of the test (or the wait that the service asks for).
       environmentLock: async (environmentId, serviceWait, signal) =>

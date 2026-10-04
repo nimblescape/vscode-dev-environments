@@ -124,6 +124,11 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     const signal = new AbortController().signal;
     expect(await flow(OP_TOKEN_REMOVE, { environmentId: 'e1' }, { signal, timeoutMs: 60_000 })).toEqual({ outcome: 'notRunning' });
     expect(sent[0]).toMatchObject({ target, op: OP_TOKEN_REMOVE, params: { environmentId: 'e1' }, options: { signal, timeoutMs: 60_000 } });
+    expect(sent[0].options).not.toHaveProperty('passive');
+    // Plan step 11C1, review round 1 (A-R1-1): a read in the background is passive in the worker channels too.
+    await flow(OP_TOKEN_REMOVE, { environmentId: 'e1' }, { timeoutMs: 1_000, passive: true });
+    expect(sent[1].options).toMatchObject({ timeoutMs: 1_000, passive: true });
+    sent.splice(1, 1);
     const onAsk = sent[0].options.onAsk!;
     const open = new AbortController().signal;
     await expect(onAsk('secret', { call: 'token', args: [] }, open)).rejects.toMatchObject({ code: 'invalid' });

@@ -8,6 +8,8 @@
 export const ControllerTexts = {
   // Progress titles (concept 6.5: one notification per operation).
   stopping: (repository: string) => `Stopping ${repository}…`,
+  // Plan step 11C1, review round 3 (A-R3-M1): a Start in the window of the environment whose container could not be read.
+  containerStateUnreadable: (repository: string) => `The state of the container of ${repository} could not be read. Details are in the log.`,
   deleting: (repository: string) => `Deleting the environment of ${repository}…`,
   rebuilding: (repository: string) => `Rebuilding ${repository}…`,
   checkingChanges: (repository: string) => `Checking ${repository} for changes…`,

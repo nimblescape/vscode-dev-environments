@@ -109,11 +109,13 @@ export function extensionFlow(
   current: () => Promise<DockerTarget>,
   host: HostSide,
   logger: Logger,
-): (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown> {
+): (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean }) => Promise<unknown> {
   return async (op, params, options) =>
     channels.flow(await current(), op, params, {
       signal: options.signal,
       timeoutMs: options.timeoutMs,
+      // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.
+      ...(options.passive === true ? { passive: true } : {}),
       onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : []),
     });
 }

@@ -124,6 +124,8 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     dockerTarget: () => targets.current(),
     // Plan step 11B2: the flows in the worker of the current target, as extension.ts.
+    // Plan step 11C1: the refresh through the worker, as extension.ts.
+    workerRefresh: async (environments) => channels.refresh(await targets.current(), environments),
     flow: async (op, params, options) => {
       flows.push(op);
       return channels.flow(await targets.current(), op, params, options);

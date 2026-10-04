@@ -19,6 +19,7 @@ import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../p
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
 import { EngineDocker } from './engineDocker';
+import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
 
@@ -187,6 +188,8 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     analyzer: ANALYZER_NOT_IN_WORKER,
     dockerTarget: async () => ({ kind: deps.dockerHost === '' ? 'local' : 'remote', host: deps.dockerHost, endpoint: '' }),
     environmentLock: deps.environmentLock,
+    // Plan step 11C1: the pipeline of the worker reads the states itself, over its engine.
+    workerRefresh: (environments) => readEnvironmentStates(docker, environments),
     flow: async (op) => {
       throw new Error(`The pipeline of the worker sends no flow (${op}): it is the flow.`);
     },

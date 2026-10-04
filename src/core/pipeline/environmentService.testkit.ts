@@ -34,7 +34,10 @@ import {
 } from '../names';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, parseStopParams, parseWindowStateParams } from '../helperChannel/protocol';
+import { EngineDocker } from '../worker/engineDocker';
+import { windowStateFlow } from '../worker/windowStateFlow';
+import { readEnvironmentStates } from './refreshStates';
 import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
@@ -1417,6 +1420,12 @@ export function fakeDockerEngine(docker: FakeDocker): DockerEngine {
  */
 export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' | 'clock'>, lock: EnvironmentServiceDeps['environmentLock']): EnvironmentServiceDeps['flow'] {
   return async (op, params, options) => {
+    // Plan step 11C1: the reads of an attached window, over the same FakeDocker (no lock, no helper image).
+    if (op === OP_WINDOW_STATE) {
+      const checked = parseWindowStateParams(params);
+      if (checked === undefined) throw new HelperOperationError('invalid', 'The parameters of the windowState operation are invalid.', false);
+      return windowStateFlow({ ...checked, docker: new EngineDocker(fakeDockerEngine(h.docker), h.logger), signal: options.signal });
+    }
     if (op !== OP_STOP) throw new HelperChannelError('unsendable', `The worker of the tests does not know the operation ${op}.`);
     try {
       await h.helper.ensureImagePresent({ signal: options.signal });
@@ -1532,6 +1541,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     environmentLock: h.lock.take,
     // Plan step 11B2: the flows of the worker against the same FakeDocker, under the lock of the service.
     flow: fakeWorkerFlow(h, overrides.environmentLock ?? h.lock.take),
+    // Plan step 11C1: the refresh of the worker, which reads the same FakeDocker.
+    workerRefresh: (environments) => readEnvironmentStates(h.docker, environments),
     ...overrides,
   });
   return h;

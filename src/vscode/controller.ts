@@ -16,7 +16,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
-import { OP_TOKEN_REMOVE, parseTokenRemoveValue } from '../core/helperChannel/protocol';
+import { OP_TOKEN_REMOVE, parseTokenRemoveValue, type WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
@@ -216,6 +216,8 @@ interface WindowEnvironment {
   lost: boolean;
   /** Branch read from the container. */
   branch?: string;
+  /** Plan step 11C1, review round 1 (A-R1-3): the last check of the connection could not read the state (unknown). */
+  unknown?: boolean;
 }
 
 /**
@@ -248,6 +250,12 @@ export class Controller implements vscode.Disposable {
   private checkingLeft = false;
   private ready: Promise<void> = Promise.resolve();
   private checkingConnection = false;
+  /**
+   * Plan step 11C1, review round 3 (A-R3-M2): the environment of this window whose container could not be read for
+   * whether it is outdated when the window attached (containerOutdated); checkConnection reads it again. Review round 4
+   * (A-R4-M2): with the host access checks of its repository then; turning them on later applies from the next open.
+   */
+  private outdatedUncheckedFor: { environmentId: string; checks: HostAccessChecks } | undefined;
   /** Numbers the flows that connect this window (see `connect`). */
   private connectRequests = 0;
   /** The connecting flows that still run. */
@@ -1136,15 +1144,38 @@ export class Controller implements vscode.Disposable {
     const repository = this.displayName(target);
     let reconnecting = false;
     let otherWindow: WindowStatus | undefined;
+    // Review round 3 of 11C1 (A-R3-M1): the container of this window whose state is read again within the operation, and
+    // what that read found running.
+    let recheck: string | undefined;
+    let found: WindowStateValue | undefined;
+    // Review round 4 of 11C1 (A-R4-M1): the gate refused the operation (another one of the repository runs in this window).
+    let refused = false;
     if (environment) {
       if (this.isConnectedHere(environment)) {
+        // Review round 4 of 11C1 (A-R4-M1): while an operation of this environment runs in this window (the open pipeline
+        // of a restored window, Reconnect), its end decides the state: nothing is read or left here.
+        const running = this.gate.runningFor(repositoryKey(repository));
+        if (running !== undefined) {
+          this.logger.info(`Start of ${repository} was not started: ${running} of ${repository} is still running.`);
+          return;
+        }
         // "Already connected → nothing" only while the container runs; otherwise this is Reconnect (concept 6.3, 7.12).
         const containerName = this.current?.containerName ?? environment.containerName;
-        if (await this.containerRuns(containerName)) {
+        // Review round 1 of 11C1 (A-R1-2): one read of the worker gives whether it runs and whether it is outdated.
+        const value = await this.windowState(environment, containerName);
+        // Review round 5 of 11C1 (A-R5-2): an operation of this environment may have started, or the window may have left
+        // it, while the worker read.
+        if (this.gate.runningFor(repositoryKey(repository)) !== undefined || this.current?.environment.id !== environment.id) {
+          this.logger.info(`Start of ${repository} was not started: the window or its operation changed while the state of its container was read.`);
+          return;
+        }
+        // Review round 4 of 11C1 (A-R4-L2): a known read decides here; the check of the connection need not read it again.
+        if (value !== undefined && this.outdatedUncheckedFor?.environmentId === environment.id) this.outdatedUncheckedFor = undefined;
+        if (value?.state === 'running') {
           // Concept section 9: a container of an older version lacks the current setup. The pipeline must not
           // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
           // The same for a container made while the host access checks were off, when they are on now.
-          const outdated = await this.containerOutdated(environment);
+          const outdated = value.outdated;
           if (outdated) {
             this.logger.info(this.outdatedTexts(outdated, repository).log);
             await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
@@ -1156,17 +1187,26 @@ export class Controller implements vscode.Disposable {
             return;
           }
           this.logger.info(`This window is connected to ${repository}.`);
-          if (this.current?.lost) {
+          // Review round 2 of 11C1 (A-R2-L1): the read succeeded, so the state is known again.
+          if (this.current?.lost || this.current?.unknown) {
             this.current.lost = false;
+            this.current.unknown = false;
             this.updateStatusBar();
           }
           this.inform(ControllerTexts.alreadyConnected(repository));
           return;
         }
-        this.logger.info(`The container of ${repository} does not run. The window connects again.`);
+        if (value === undefined) {
+          // Review round 3 of 11C1 (A-R3-M1): the pipeline must not replace a running container under this window, so an
+          // unknown state is read once more within the operation, with the worker made ready in full (below).
+          this.logger.info(`The state of the container of ${repository} could not be read. It is read again before the window connects again.`);
+          recheck = containerName;
+        } else {
+          this.logger.info(`The container of ${repository} does not run. The window connects again.`);
+        }
         reconnecting = true;
       } else if ((otherWindow = await this.otherWindowOf(environment.id))) {
-        if (await this.containerRuns(environment.containerName)) {
+        if ((await this.containerRuns(environment, environment.containerName)) === true) {
           // The pipeline must not replace the container under the other window (an update would disconnect it).
           // Assumption (V-2): VS Code shows the window that has this folder open instead of opening it again (concept 7.11).
           // Also for Start in New Window: never two windows on one environment.
@@ -1197,6 +1237,15 @@ export class Controller implements vscode.Disposable {
           task: (progress, signal) =>
             this.connectingFlow(newWindow, async (request) => {
               let result: OpenResult;
+              if (environment && recheck !== undefined) {
+                const again = await service.windowStateInWorker(environment, recheck, { signal });
+                if (signal.aborted) throw new UserFacingError('cancelled', PipelineTexts.cancelled);
+                if (again === undefined) throw new UserFacingError('helperFailed', ControllerTexts.containerStateUnreadable(repository));
+                if (again.state === 'running') {
+                  found = again;
+                  return;
+                }
+              }
               if (environment) {
                 result = await service.openEnvironment(environment.id, { progress, signal, configPath: options.configPath });
               } else {
@@ -1212,10 +1261,51 @@ export class Controller implements vscode.Disposable {
         }),
       // Try again is a Start: a repository takes the account of a session with a working token, as at the first try; it
       // opens in the same kind of window as the first try.
-      { retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'), { window: options.window })) },
+      {
+        retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'), { window: options.window })),
+        refused: () => (refused = true),
+      },
     );
-    // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
-    if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
+    if (started && found !== undefined && environment && this.current?.environment.id === environment.id) {
+      // Review round 3 of 11C1 (A-R3-M1): the container runs after all: as for a Start whose first read found it running.
+      const containerName = recheck ?? environment.containerName;
+      // Review round 5 of 11C1 (B-R5, design question of A-R4-L2): this known read decides too.
+      if (this.outdatedUncheckedFor?.environmentId === environment.id) this.outdatedUncheckedFor = undefined;
+      if (found.outdated) {
+        this.logger.info(this.outdatedTexts(found.outdated, repository).log);
+        await this.leaveEnvironment(this.outdatedTexts(found.outdated, repository).message, { environmentId: environment.id, containerName, repository, reason: 'outdated' });
+        return;
+      }
+      this.logger.info(`This window is connected to ${repository}.`);
+      this.current.lost = false;
+      this.current.unknown = false;
+      this.updateStatusBar();
+      this.inform(ControllerTexts.alreadyConnected(repository));
+      return;
+    }
+    if (!started && !refused && reconnecting && environment) {
+      // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
+      if (await this.leaveDeletedEnvironment(environment.id)) return;
+      // Review round 3 of 11C1 (A-R3-M1b): as for a restored window whose pipeline failed: a container that was not made
+      // again and must not be used as it is is left.
+      const outdated = this.current?.environment.id === environment.id ? await this.containerOutdated(environment) : undefined;
+      if (outdated) {
+        this.logger.info(`${this.outdatedTexts(outdated, repository).log} It was not made again.`);
+        await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
+          environmentId: environment.id,
+          containerName: this.current?.containerName ?? environment.containerName,
+          repository,
+          reason: 'outdated',
+        });
+        return;
+      }
+      // Decision of 2026-10-04 ("unknown"): a Reconnect of the user that failed leaves the window disconnected, also when
+      // the state of its container could not be read before.
+      if (this.current?.environment.id === environment.id && !this.current.lost) {
+        this.current.lost = true;
+        this.updateStatusBar();
+      }
+    }
   }
 
   /**
@@ -1963,16 +2053,12 @@ export class Controller implements vscode.Disposable {
    */
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;
-    try {
-      const container = await this.deps.docker.findContainer(environment.id, environment.containerName);
-      if (container === undefined) return undefined;
-      const checks = hostAccessChecks(environment.repository, this.deps.settings());
-      if (containerIsCurrent(container.labels, true, checks)) return undefined;
-      return containerIsCurrent(container.labels, true, 'off') && isUnrestrictedContainer(container.labels) ? 'hostAccess' : 'version';
-    } catch (error) {
-      this.logger.info(`The container of the environment ${environment.id} could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
+    // Plan step 11C1: read by the worker; unknown (undefined) when it cannot be read (decision of 2026-10-04).
+    const value = await this.deps.service.windowStateInWorker(environment, environment.containerName);
+    // Review round 3 of 11C1 (A-R3-M2): the window stays then, and the next check of the connection that can read it
+    // leaves an outdated container (checkConnection).
+    this.outdatedUncheckedFor = value === undefined ? { environmentId: environment.id, checks: hostAccessChecks(environment.repository, this.deps.settings()) } : undefined;
+    return value?.outdated;
   }
 
   /** The message and the log line when the window leaves a container for the reason of containerOutdated. */
@@ -1999,7 +2085,36 @@ export class Controller implements vscode.Disposable {
     if (this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
     this.checkingConnection = true;
     try {
-      const lost = !(await this.containerRuns(current.containerName));
+      const value = await this.windowState(current.environment, current.containerName);
+      const runs = this.deps.docker.isInstalled() ? (value === undefined ? undefined : value.state === 'running') : false;
+      // Review round 1 of 11C1 (A-R1-4): the window or its operation may have changed while the worker read.
+      if (this.current !== current || this.disposed || this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
+      // Review round 3 of 11C1 (A-R3-M2): whether it is outdated could not be read when the window attached; now it can.
+      const unchecked = this.outdatedUncheckedFor;
+      if (value !== undefined && unchecked?.environmentId === current.environment.id) {
+        this.outdatedUncheckedFor = undefined;
+        // Review round 4 of 11C1 (A-R4-M2): a container made while the checks were off is left only when they were on
+        // already when the window attached ("applies from the next open").
+        const sameChecks = hostAccessChecks(current.environment.repository, this.deps.settings()) === unchecked.checks;
+        if (value.outdated === 'version' || (value.outdated === 'hostAccess' && sameChecks)) {
+          this.logger.info(this.outdatedTexts(value.outdated, repository).log);
+          await this.leaveEnvironment(this.outdatedTexts(value.outdated, repository).message, {
+            environmentId: current.environment.id,
+            containerName: current.containerName,
+            repository,
+            reason: 'outdated',
+          });
+          return;
+        }
+      }
+      // Decision of 2026-10-04: a state that could not be read (the worker could not be reached) changes nothing but the
+      // tooltip (review round 1 of 11C1, A-R1-3).
+      if ((runs === undefined) !== (current.unknown === true)) {
+        current.unknown = runs === undefined;
+        this.updateStatusBar();
+      }
+      if (runs === undefined) return;
+      const lost = !runs;
       if (lost === current.lost) return;
       current.lost = lost;
       this.logger.info(lost ? `The container of ${repository} does not run.` : `The container of ${repository} runs again.`);
@@ -2014,14 +2129,20 @@ export class Controller implements vscode.Disposable {
     const current = this.current;
     if (!current) return;
     await this.checkConnection();
-    const branch = await this.deps.service.currentBranch(current.environment.id);
+    // Plan step 11C1: read by the worker.
+    // Review round 1 of 11C1 (A-R1-1): a passive read, which never builds the helper image (windowStateInWorker).
+    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true }))?.branch;
     if (branch && this.current === current) {
       current.branch = branch;
       this.updateStatusBar();
     }
   }
 
-  /** The state of the container as Docker reports it, or why it could not be read. */
+  /**
+   * The state of the container as the Docker port of the window reports it, or why it could not be read: the check of the
+   * attach (readyForWindow). Plan step 11C1 (review round 1, A-R1-5): it is not a window read of 11C1; within an operation
+   * the Docker port sends it through the worker (its generic `docker` operation).
+   */
   private async containerStateText(containerName: string): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
     try {
@@ -2031,14 +2152,24 @@ export class Controller implements vscode.Disposable {
     }
   }
 
-  private async containerRuns(containerName: string): Promise<boolean> {
+  /**
+   * Whether the container runs, read by the worker (plan step 11C1); `undefined` when it could not be read (decision of
+   * 2026-10-04: unknown). A Start or Reconnect of the user takes unknown as "not running" and tries; its failure leaves
+   * the window disconnected.
+   */
+  private async containerRuns(environment: Environment, containerName: string): Promise<boolean | undefined> {
     if (!this.deps.docker.isInstalled()) return false;
-    try {
-      return (await this.deps.docker.containerState(containerName)) === 'running';
-    } catch (error) {
-      this.logger.info(`The state of the container ${containerName} could not be read: ${errorMessage(error)}`);
-      return false;
-    }
+    const value = await this.deps.service.windowStateInWorker(environment, containerName);
+    return value === undefined ? undefined : value.state === 'running';
+  }
+
+  /**
+   * Review round 1 of 11C1 (A-R1-2): the state of the container and whether it is outdated, in one read of the worker
+   * (passive and bounded, review round 2, A-R2-M2). `undefined` when it could not be read, or Docker is not installed.
+   */
+  private async windowState(environment: Environment, containerName: string): Promise<WindowStateValue | undefined> {
+    if (!this.deps.docker.isInstalled()) return undefined;
+    return this.deps.service.windowStateInWorker(environment, containerName);
   }
 
   private updateStatusBar(): void {
@@ -2046,10 +2177,12 @@ export class Controller implements vscode.Disposable {
     const { statusBar } = this.deps;
     this.updateConnectedContext(current !== undefined);
     if (!current) {
+      statusBar.showStateUnknown(false);
       statusBar.showNotConnected();
       return;
     }
     const repository = this.displayName({ repository: current.environment.repository });
+    statusBar.showStateUnknown(current.unknown === true);
     if (current.lost) statusBar.showConnectionLost(repository, current.environment.id);
     else statusBar.showConnected(repository, current.branch ?? current.environment.gitSummary?.branch ?? undefined);
   }
@@ -2278,13 +2411,14 @@ export class Controller implements vscode.Disposable {
     repository: string,
     label: string,
     fn: () => Promise<void>,
-    options: { retry?: () => Promise<void> } = {},
+    options: { retry?: () => Promise<void>; refused?: () => void } = {},
   ): Promise<boolean> {
     await this.ready;
     try {
       const outcome = await this.gate.run(repositoryKey(repository), label, () => this.withDockerTarget(fn));
       if (!outcome.started) {
         this.logger.info(`${label} of ${repository} was not started: ${outcome.running} of ${repository} is still running.`);
+        options.refused?.();
         return false;
       }
       return true;

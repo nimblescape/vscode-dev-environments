@@ -545,11 +545,11 @@ async function activateExtension(
     // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
     viewer: (token, signal) => discovery.viewer(token, signal),
     // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker of the Docker target of the operation
-    // (none outside of an operation: the refresh reads directly then). Plan step 5, PR D (rule D1 of 2026-09-30): within
+    // (plan step 11C1: outside of an operation, of the current one; never read directly). Plan step 5, PR D (rule D1 of 2026-09-30): within
     // an operation, the worker is made ready first; when it cannot be, the refresh fails (never read directly).
     workerRefresh: async (environments) => {
-      const target = operationDockerTarget();
-      if (target === undefined) return undefined;
+      // Plan step 11C1: always through the worker, of the target of the operation or else the current one.
+      const target = operationDockerTarget() ?? (await targets.current());
       try {
         return await channels.refresh(target, environments);
       } catch (error) {

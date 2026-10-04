@@ -68,11 +68,15 @@ import {
   newCleanupLabel,
   OP_LIST_CONFIGURATIONS,
   OP_STOP,
+  OP_WINDOW_STATE,
   parseListConfigurationsParams,
   parseListConfigurationsValue,
   parseStopParams,
   parseStopValue,
+  parseWindowStateParams,
+  parseWindowStateValue,
   type FlowRefusal,
+  type WindowStateValue,
 } from '../helperChannel/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
@@ -119,7 +123,7 @@ import { namePair } from '../namePairs';
 import { imageBuildRecord, imageRecordLabels } from './imageRecord';
 import { isAvailableTo, ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
-import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -274,6 +278,8 @@ export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
  * Stop with more than about eight services that all hit their own time limit ends here (review round 1, A-R1-6).
  */
 export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
+/** Plan step 11C1: the longest read of an attached window in the worker (the branch read has 15 s of its own). */
+export const WINDOW_STATE_FLOW_TIMEOUT_MS = 30_000;
 /**
  * Plan step 11B3b: the longest listing of Select configuration in the worker: the wait for the lock (D3), the start of the
  * batch helper, and its step.
@@ -465,12 +471,11 @@ export interface EnvironmentServiceDeps {
    */
   analyzer: ConfigurationAnalyzer;
   /**
-   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target of the operation (HelperChannels.refresh).
-   * Undefined, or a result of undefined: outside of an operation (or in the unit tests); the states are read directly.
-   * Plan step 5, PR D (rule D1 of 2026-09-30): within an operation it makes the worker ready first, and rejects when it
-   * cannot (the refresh then fails; it is never read directly).
+   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target (HelperChannels.refresh). Plan step 5,
+   * PR D (rule D1 of 2026-09-30): it makes the worker ready first, and rejects when it cannot (the refresh then fails).
+   * Plan step 11C1: always, also outside of an operation (the current Docker target); the states are never read directly.
    */
-  workerRefresh?: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates | undefined>;
+  workerRefresh: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates>;
   /**
    * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
    * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
@@ -481,8 +486,10 @@ export interface EnvironmentServiceDeps {
    * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the Docker target of
    * the operation (Stop first); the worker takes the lock of the environment itself. Rejects with a HelperChannelError
    * when there is no worker, and with a HelperOperationError (`busy` for a lock held elsewhere) when the flow fails.
+   * Plan step 11C1, review round 1 (A-R1-1): `passive`, a read in the background: the worker is made ready as for the
+   * refresh (the helper image only checked, the wait after a failed open kept).
    */
-  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean }) => Promise<unknown>;
 }
 
 export interface RepositoryTarget {
@@ -6084,8 +6091,8 @@ export class EnvironmentService {
 
   /**
    * Plan step 5, PR C: the states of inspectStates and the branches of the running dev containers of `branchIds` (the
-   * sidebar: the environments of the account), in one worker operation (`refresh`); outside of an operation directly
-   * (readEnvironmentStates). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
+   * sidebar: the environments of the account), in one worker operation (`refresh`; plan step 11C1: also outside of an
+   * operation, never directly). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
    * never read directly: the refresh fails (logged, with the cause). `runtime` is `undefined` when Docker does not run or
    * the states could not be read; then there are no branches.
    */
@@ -6106,20 +6113,57 @@ export class EnvironmentService {
         folder: repositoryFolder(env.repository),
         branch: branchIds.has(env.id),
       }));
-      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below).
-      return (await this.deps.workerRefresh?.(environments)) ?? (await readEnvironmentStates(docker, environments));
+      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below). Plan step
+      // 11C1: only through the worker.
+      return await this.deps.workerRefresh(environments);
     } catch (error) {
       this.logger.warn(`The state of the environments could not be read: ${errorMessage(error)}`);
       return { runtime: undefined, branches: new Map() };
     }
   }
 
-  /** Current branch from the running container (`git branch --show-current` through `docker exec`). */
-  async currentBranch(environmentId: string): Promise<string | undefined> {
-    const env = await this.deps.registry.get(environmentId);
-    if (!env || !(await this.isOnCurrentHost(env))) return undefined;
-    const branch = await this.branchInContainer(env.containerName, env.remoteUser, repositoryFolder(env.repository));
-    return branch ?? undefined;
+  /**
+   * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): what an attached window reads of the dev container
+   * `containerName` of `environment`, by the worker of the Docker host of the operation (`windowState`): its state,
+   * whether it may be used as it is, and with `branch` the branch of its repository. `undefined` when it could not be read
+   * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
+   * Never throws. Review rounds 1 and 2 of 11C1 (A-R1-1, A-R2-M1, A-R2-M2): the worker is made ready passively (as for
+   * the refresh: never a build of the helper image, the wait after a failed open kept), and within
+   * WINDOW_STATE_FLOW_TIMEOUT_MS. Review round 3 (A-R3-M1): with `signal` (a read within an operation of the user, with
+   * its progress and Cancel), it is made ready in full, as for the pipeline, until `signal` aborts.
+   */
+  async windowStateInWorker(
+    environment: Environment,
+    containerName: string,
+    options: { branch?: boolean; signal?: AbortSignal } = {},
+  ): Promise<WindowStateValue | undefined> {
+    try {
+      // Unit 7: an environment of another Docker host is not read through the worker of this one.
+      if (!(await this.isOnCurrentHost(environment))) return undefined;
+      const params = parseWindowStateParams({
+        environmentId: environment.id,
+        containerName,
+        checks: hostAccessChecks(environment.repository, this.deps.settings()),
+        ...(options.branch
+          ? { branch: { folder: repositoryFolder(environment.repository), ...(environment.remoteUser !== undefined && environment.remoteUser !== '' ? { user: environment.remoteUser } : {}) } }
+          : {}),
+      });
+      if (params === undefined) throw new Error('its parameters are beyond the checks of the worker');
+      const value = parseWindowStateValue(
+        await this.deps.flow(
+          OP_WINDOW_STATE,
+          params,
+          options.signal !== undefined
+            ? { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, signal: options.signal }
+            : { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) },
+        ),
+      );
+      if (value === undefined) throw new Error('the worker answered with an invalid value');
+      return value;
+    } catch (error) {
+      this.logger.info(`The state of the container ${containerName} could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   /**

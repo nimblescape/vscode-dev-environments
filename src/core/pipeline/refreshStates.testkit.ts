@@ -4,8 +4,11 @@
 
 // Plan step 5, PR C: one Docker engine as a table of answers, for the refresh without the worker (a ContainerAdapter over
 // a fake ProcessRunner) and in it (the operation `refresh` over the fake Docker CLI of the server tests).
+import { mapContainerState } from '../docker/dockerObjects';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import type { ProcessRunner, RunOptions, RunResult } from '../ports';
+import type { DockerEngine } from '../worker/dockerEngine';
+import { unusedEngine } from '../worker/dockerEngine.testkit';
 import type { EnvironmentStates, StateEnvironment } from './refreshStates';
 
 export const ENV_API = '11111111-1111-4111-8111-111111111111';
@@ -139,4 +142,36 @@ export class FixtureRunner implements ProcessRunner {
     this.calls.push({ args: [...args], options });
     return { ...refreshFixture(args), timedOut: false };
   }
+}
+
+/**
+ * Plan step 11C1, review round 1 (B-R1-2): the same engine as a DockerEngine port (the refresh of the worker over
+ * EngineDocker); its exec answers as refreshFixture answers `docker exec`. Records the exec calls with their options.
+ */
+export function fixtureEngine(): { engine: DockerEngine; execs: { container: string; user?: string; signal?: AbortSignal }[] } {
+  const execs: { container: string; user?: string; signal?: AbortSignal }[] = [];
+  const info = (container: Container) => ({ id: container.id, name: container.name, state: mapContainerState(container.status), rawState: container.status, labels: container.labels, image: 'img' });
+  const engine: DockerEngine = {
+    ...unusedEngine(),
+    container: async (reference) => {
+      const found = CONTAINERS.find((container) => container.name === reference || container.id === reference);
+      return found === undefined ? undefined : info(found);
+    },
+    containers: async (label) =>
+      CONTAINERS.filter((container) => {
+        const [key, value] = label.split('=');
+        return key in container.labels && (value === undefined || container.labels[key] === value);
+      }).map(info),
+    volumeNames: async (filters) => (filters.label?.includes(LABEL_ENVIRONMENT_ID) ? Object.keys(LABELLED_VOLUMES) : []),
+    inspect: async (kind, reference) => {
+      if (kind !== 'volume') return undefined;
+      if (reference in LABELLED_VOLUMES) return { Name: reference, Labels: LABELLED_VOLUMES[reference] };
+      return UNLABELLED_VOLUMES.has(reference) ? { Name: reference, Labels: {} } : undefined;
+    },
+    exec: async (container, command, options = {}) => {
+      execs.push({ container, user: options.user, signal: options.signal });
+      return { ...refreshFixture(['exec', ...(options.user ? ['-u', options.user] : []), container, ...command]), timedOut: false };
+    },
+  };
+  return { engine, execs };
 }

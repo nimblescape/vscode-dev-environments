@@ -6,7 +6,6 @@
 // the calls that no operation covers yet) and `probe` (whether the Docker CLI of the container reaches its engine, and
 // which engine: plan step 5, PR A), `refresh` (the states and branches of the environments: plan step 5, PR C). The
 // later steps add operations that run whole batches here, next to the engine, and report their progress.
-import { ContainerAdapter } from '../core/docker/containerAdapter';
 import {
   ENGINE_IDENTITY_ARGS,
   OP_DOCKER,
@@ -16,6 +15,7 @@ import {
   OP_PULL,
   OP_START_CONTAINERS,
   OP_LIST_CONFIGURATIONS,
+  OP_WINDOW_STATE,
   OP_STOP,
   OP_TOKEN_REMOVE,
   OP_REFRESH,
@@ -30,12 +30,12 @@ import {
   type RefreshValue,
 } from '../core/helperChannel/protocol';
 import { readEnvironmentStates } from '../core/pipeline/refreshStates';
-import { abortError, type ProcessRunner } from '../core/ports';
+import { EngineDocker } from '../core/worker/engineDocker';
 import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/batch';
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, listConfigurationsOperation, ownHelperOfEngine, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, listConfigurationsOperation, ownHelperOfEngine, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
@@ -97,53 +97,20 @@ export const sweepOperation: OperationHandler = async (params, context) => {
 };
 
 /**
- * Plan step 5, PR C: a ProcessRunner over the Docker CLI of the worker (OperationContext.docker), for a ContainerAdapter
- * in the worker. The program name is ignored (always `docker`); so are `env` and `cwd`: the worker never sets a
- * variable. It refuses an input (the refresh only reads, and never carries a secret). `timeoutMs` and `signal` end the
- * call alone; it resolves then with `timedOut`, or rejects with an AbortError, as NodeProcessRunner does.
+ * Plan step 5, PR C: `refresh`: readEnvironmentStates of the worker, the same code as in the pipeline. Plan step 11C1:
+ * over the port of its engine (EngineDocker; section 0 of the plan), no Docker CLI of its own. It only reads; it takes no
+ * secret.
  */
-export function contextRunner(context: OperationContext): ProcessRunner {
-  return {
-    run: async (_file, args, options = {}) => {
-      if (options.input !== undefined) throw new Error('The worker runs no Docker call with an input here.');
-      if (options.signal?.aborted || context.signal.aborted) throw abortError();
-      const controller = new AbortController();
-      let timedOut = false;
-      const timer =
-        options.timeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              timedOut = true;
-              controller.abort();
-            }, options.timeoutMs);
-      const onAbort = () => controller.abort();
-      options.signal?.addEventListener('abort', onAbort, { once: true });
-      try {
-        const result = await context.docker(args, { signal: controller.signal });
-        if (options.signal?.aborted || context.signal.aborted) throw abortError();
-        if (result.error !== undefined && !timedOut) throw new Error(result.error);
-        return { exitCode: timedOut ? null : result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut };
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-        options.signal?.removeEventListener('abort', onAbort);
-      }
-    },
+export function refreshOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    const checked = parseRefreshParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The refresh operation takes no secret.');
+    context.progress('refresh');
+    const value: RefreshValue = refreshValue(await readEnvironmentStates(new EngineDocker(engineOf(context), contextLogger(context)), checked.environments));
+    return value;
   };
 }
-
-/**
- * Plan step 5, PR C: `refresh`: readEnvironmentStates with a ContainerAdapter over the Docker CLI of the worker, the
- * same code as the refresh without the worker. It only reads; it takes no secret.
- */
-export const refreshOperation: OperationHandler = async (params, context) => {
-  const checked = parseRefreshParams(params);
-  if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');
-  if (!context.hasNoSecret()) throw new OperationError('invalid', 'The refresh operation takes no secret.');
-  context.progress('refresh');
-  const docker = new ContainerAdapter(contextRunner(context), 'docker', {}, contextLogger(context), 'linux');
-  const value: RefreshValue = refreshValue(await readEnvironmentStates(docker, checked.environments));
-  return value;
-};
 
 /** Plan step 10A: the Engine API of the worker's engine, over its socket. */
 const ENGINE = engineApi();
@@ -165,7 +132,7 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
   [OP_PROBE]: probeOperation,
   [OP_SWEEP]: sweepOperation,
-  [OP_REFRESH]: refreshOperation,
+  [OP_REFRESH]: refreshOperation(ENGINE_OF),
   // Plan step 5, PR B: the environment lock (lock.ts).
   [OP_LOCK]: lockOperation(),
   // Plan step 6, PR B: the batch helper of an operation (batch.ts).
@@ -181,4 +148,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_STOP]: stopOperation(ENGINE_OF),
   // Plan step 11B3b: the listing of Select configuration, by the worker's own pipeline.
   [OP_LIST_CONFIGURATIONS]: listConfigurationsOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
+  // Plan step 11C1: the reads of an attached window.
+  [OP_WINDOW_STATE]: windowStateOperation(ENGINE_OF),
 };

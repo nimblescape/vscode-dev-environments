@@ -290,6 +290,8 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       // was always granted, whose plain Docker calls ran directly): the real lock of the worker on the remote engine.
       environmentLock: locks.take,
     flow: (op, params, options) => locks.flow(op, params, options),
+    // Plan step 11C1: the refresh through the worker, as extension.ts.
+    workerRefresh: (environments) => locks.refresh(environments),
       docker,
       runner,
       helper,
