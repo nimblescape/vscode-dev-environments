@@ -36,6 +36,10 @@ import {
   parseServerMessage,
   refusedOperationId,
   StreamRedactor,
+  MAX_CONFIGURATION_PATH_LENGTH,
+  MAX_LISTED_CONFIGURATIONS,
+  parseListConfigurationsParams,
+  parseListConfigurationsValue,
 } from './protocol';
 
 describe('the protocol of the helper channel (user request 2026-09-28)', () => {
@@ -352,5 +356,46 @@ describe('StreamRedactor at every split (review round 4 of PR #80, B-R4-1)', () 
     redactor.push('ab y');
     redactor.flush();
     expect(forwarded.join('')).toBe('x *** y');
+  });
+});
+
+// Review round 1 of plan step 11B3b (B-R1-6): the checks of the listing's parameters and answer.
+describe('listConfigurations: its parameters and its answer (plan step 11B3b)', () => {
+  const PARAMS = { environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d', dockerHost: 'build-box', owner: { windowId: 'window-1', pid: 42 } };
+  it('takes its parameters only within their limits', () => {
+    expect(parseListConfigurationsParams(PARAMS)).toEqual(PARAMS);
+    expect(parseListConfigurationsParams({ ...PARAMS, dockerHost: 'h'.repeat(1024) })).toBeDefined();
+    for (const odd of [
+      { ...PARAMS, dockerHost: 'h'.repeat(1025) },
+      { ...PARAMS, dockerHost: 'a\nb' },
+      { ...PARAMS, owner: { ...PARAMS.owner, extra: 1 } },
+      { ...PARAMS, owner: { windowId: 'w/x', pid: 42 } },
+      { ...PARAMS, owner: { windowId: 'w', pid: 0 } },
+      { ...PARAMS, owner: { windowId: 'w', pid: 1.5 } },
+      { ...PARAMS, environmentId: '../x' },
+      { ...PARAMS, extra: true },
+    ]) {
+      expect(parseListConfigurationsParams(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
+    }
+  });
+
+  it('takes an answer of paths only within their limits, and never paths and a refusal together', () => {
+    const many = Array.from({ length: MAX_LISTED_CONFIGURATIONS }, (_, index) => `c${index}/devcontainer.json`);
+    expect(parseListConfigurationsValue({ configPaths: many })).toEqual({ configPaths: many });
+    expect(parseListConfigurationsValue({ configPaths: ['p'.repeat(MAX_CONFIGURATION_PATH_LENGTH)] })).toBeDefined();
+    for (const odd of [
+      { configPaths: ['a\nb'] },
+      { configPaths: ['a\u001bb'] },
+      { configPaths: [''] },
+      { configPaths: ['p'.repeat(MAX_CONFIGURATION_PATH_LENGTH + 1)] },
+      { configPaths: [...many, 'one/more.json'] },
+      { configPaths: [42] },
+      { configPaths: [], refused: { code: 'startFailed', message: 'm' } },
+      { refused: { code: 'unknown', message: 'm' } },
+      {},
+    ]) {
+      expect(parseListConfigurationsValue(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
+    }
+    expect(parseListConfigurationsValue({ refused: { code: 'startFailed', message: 'm' } })).toEqual({ refused: { code: 'startFailed', message: 'm' } });
   });
 });

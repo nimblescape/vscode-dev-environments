@@ -7,8 +7,11 @@
 // secret masked, `lost` and `close`.
 import { describe, expect, it } from 'vitest';
 import { MAX_BATCH_INPUT_CHARACTERS } from '../core/helperChannel/batch';
-import { HelperChannelError, HelperOperationError, type OperationOptions } from '../core/helperChannel/helperChannel';
-import { sessionOfHelper, type BatchHelperClient } from './batch';
+import { HelperChannelError, HelperOperationError, collectBatchStep, type OperationOptions } from '../core/helperChannel/helperChannel';
+import { OutputTooLargeError } from '../core/process';
+import { sessionOfHelper, workerBatchSession, type BatchHelperClient } from './batch';
+import { contextSecrets } from './operationContext.testkit';
+import type { ContextDockerOptions, ContextDockerResult, OperationContext } from './server';
 
 const SESSION = 'a'.repeat(24);
 
@@ -83,5 +86,99 @@ describe("the batch session of a flow in the worker (plan step 11B3b)", () => {
     // A finish that fails does not reject close.
     const failing = sessionOfHelper(SESSION, { channel: second.helper.channel, finish: async () => Promise.reject(new Error('gone')) });
     await expect(failing.close()).resolves.toBeUndefined();
+  });
+});
+
+// Review round 1 of 11B3b (B-R1-1, B-R1-3): the signal of a step, the cap of its output, and the collector itself.
+describe('the step of a batch session: its signal, its output cap, and the collector (review round 1 of 11B3b)', () => {
+  it('a cancel of the step reaches the helper and ends it with an AbortError', async () => {
+    const seen: (AbortSignal | undefined)[] = [];
+    const { helper } = fakeHelper((_op, _params, options) => {
+      seen.push(options.signal);
+      return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+    });
+    const controller = new AbortController();
+    const step = sessionOfHelper(SESSION, helper).step('listConfigs', { repository: 'acme/api' }, { signal: controller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await expect(step).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen[0]?.aborted).toBe(true);
+  });
+
+  it('a standard output over the cap ends the step with OutputTooLargeError', async () => {
+    const piece = 'x'.repeat(1024 * 1024);
+    const { helper } = fakeHelper(async (_op, _params, options) => {
+      for (let index = 0; index < 65 && !options.signal?.aborted; index++) options.onOutput?.('stdout', piece);
+      return { exitCode: 0 };
+    });
+    await expect(sessionOfHelper(SESSION, helper).step('listConfigs', { repository: 'acme/api' })).rejects.toBeInstanceOf(OutputTooLargeError);
+  });
+
+  it('collectBatchStep: passes the pieces on as they come, follows the signal of the step, refuses an invalid value', async () => {
+    const pieces: string[] = [];
+    const controller = new AbortController();
+    let given: AbortSignal | undefined;
+    const result = await collectBatchStep('listConfigs', { signal: controller.signal, onOutput: (stream, text) => pieces.push(`${stream} ${text}`) }, 1000, async (signal, onOutput) => {
+      given = signal;
+      onOutput('stdout', 'one ');
+      onOutput('stderr', 'two');
+      onOutput('stdout', 'three');
+      return { exitCode: 3 };
+    });
+    expect(result).toEqual({ exitCode: 3, stdout: 'one three', stderr: 'two', timedOut: false });
+    expect(pieces).toEqual(['stdout one ', 'stderr two', 'stdout three']);
+    controller.abort();
+    expect(given?.aborted).toBe(true);
+    await expect(collectBatchStep('listConfigs', {}, 1000, async () => ({ value: 'x' }))).rejects.toMatchObject({ code: 'protocol' });
+    await expect(collectBatchStep('listConfigs', {}, 3, async (_signal, onOutput) => (onOutput('stdout', 'four'), { exitCode: 0 }))).rejects.toBeInstanceOf(OutputTooLargeError);
+  });
+});
+
+// Review round 1 of 11B3b (B-R1-2): the start of the worker's own batch helper when it fails: what it started is ended
+// and removed by its label; a cancel is cancelled; a removal that fails is logged, never thrown.
+describe('the start of the batch helper of a flow when it fails (review round 1 of 11B3b)', () => {
+  function context(options: { psFails?: boolean } = {}) {
+    const calls: string[][] = [];
+    const logs: string[] = [];
+    const runSignals: AbortSignal[] = [];
+    const controller = new AbortController();
+    const docker = async (args: readonly string[], callOptions: ContextDockerOptions = {}): Promise<ContextDockerResult> => {
+      calls.push([...args]);
+      if (args[0] === 'volume') return { exitCode: 0, stdout: `${args[args.length - 1]}\n`, stderr: '' };
+      if (args[0] === 'run') {
+        // A helper that never says hello: it ends only when its call is ended.
+        callOptions.onInput?.({ write: () => true, end: () => {} });
+        if (callOptions.signal) runSignals.push(callOptions.signal);
+        return new Promise((resolve) => callOptions.signal?.addEventListener('abort', () => resolve({ exitCode: null, stdout: '', stderr: '', error: 'ended' })));
+      }
+      if (args[0] === 'ps') {
+        if (options.psFails) throw new Error('the engine is gone');
+        return { exitCode: 0, stdout: `${'f'.repeat(64)}\n`, stderr: '' };
+      }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const ctx = { signal: controller.signal, ...contextSecrets({}), progress: () => {}, log: (text: string) => logs.push(text), output: () => {}, docker } as unknown as OperationContext;
+    return { ctx, calls, logs, runSignals, controller };
+  }
+  const deps = () => ({ sessions: new Map(), readScript: () => 'script', openTimeoutMs: 100 });
+  const target = { volume: 'devenv-v', image: `sha256:${'b'.repeat(64)}`, socket: '/var/run/docker.sock' };
+
+  it('a helper that never answers is ended and removed by its label, and the start fails', async () => {
+    const { ctx, calls, runSignals } = context();
+    await expect(workerBatchSession(deps(), ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    expect(runSignals[0]?.aborted).toBe(true);
+    expect(calls.map((call) => call[0])).toEqual(['volume', 'run', 'ps', 'rm']);
+    expect(calls[3]).toEqual(['rm', '-f', 'f'.repeat(64)]);
+  });
+
+  it('a cancel during the start is cancelled; a removal that fails is logged and the start still fails as it did', async () => {
+    const cancelled = context();
+    const starting = workerBatchSession(deps(), cancelled.ctx, target);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    cancelled.controller.abort();
+    await expect(starting).rejects.toMatchObject({ code: 'cancelled' });
+    const failing = context({ psFails: true });
+    await expect(workerBatchSession(deps(), failing.ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    expect(failing.logs.some((line) => line.includes('could not be removed: the engine is gone'))).toBe(true);
   });
 });

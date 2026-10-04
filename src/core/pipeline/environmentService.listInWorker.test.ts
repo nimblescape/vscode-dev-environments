@@ -11,10 +11,13 @@ import { HelperChannelError, HelperOperationError } from '../helperChannel/helpe
 import { LOCK_BUSY_CODE, OP_LIST_CONFIGURATIONS } from '../helperChannel/protocol';
 import { LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts } from './environmentService';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
+import { runWithEnvironmentLock } from '../docker/environmentLock';
+import type { EnvironmentServiceDeps } from './environmentService';
 
-function harness(answer: (op: string, params: unknown) => Promise<unknown>) {
+function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps> = {}) {
   const sent: { op: string; params: unknown; timeoutMs?: number; signal?: AbortSignal }[] = [];
   const h = createHarness({
+    ...overrides,
     flow: async (op, params, options) => {
       sent.push({ op, params, timeoutMs: options.timeoutMs, signal: options.signal });
       return answer(op, params);
@@ -86,5 +89,29 @@ describe('the listing of Select configuration in the worker, from the extension 
     });
     await seedEnvironment(h, { container: 'stopped' });
     expect(await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress, signal: controller.signal }))).toMatchObject({ code: 'cancelled' });
+  });
+});
+
+// Review round 1 of 11B3b (B-R1-7, B-R1-13): the Docker host of the operation, a lock that this window holds, the detail.
+describe('the listing in the worker from the extension: review round 1 of 11B3b', () => {
+  it('sends the remote Docker host of the operation', async () => {
+    const { h, sent } = harness(async () => ({ configPaths: [] }), { dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
+    await seedEnvironment(h, { container: 'stopped' });
+    await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.dockerHost = 'build-box';
+    });
+    await h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress });
+    expect((sent[0].params as { dockerHost: string }).dockerHost).toBe('build-box');
+  });
+
+  it('never sends the listing under a lock of the environment that this window holds; a refusal keeps its detail', async () => {
+    const { h, sent } = harness(async () => ({ refused: { code: 'startFailed', message: 'm', detail: 'd' } }));
+    await seedEnvironment(h, { container: 'stopped' });
+    const held = await h.lock.take(ENV_ID);
+    const error = await rejection(runWithEnvironmentLock(held, () => h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress })));
+    expect((error as Error).message).toContain('under a lock of the environment that this window holds');
+    expect(sent).toEqual([]);
+    await held.release();
+    expect(await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'startFailed', message: 'm', detail: 'd' });
   });
 });

@@ -11,7 +11,8 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostAuth, hostSessionFiles, hostStore, hostUi, workerServices } from './workerServices';
+import { hostAuth, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, type WorkerServicesDeps } from './workerServices';
+import { SECRET_TOKEN } from '../helperChannel/protocol';
 
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
 
@@ -103,6 +104,13 @@ describe("the worker's own helper image (plan step 11B3b)", () => {
     asked.length = 0;
     await expect(readOwnHelper(engine, 'devenv-worker')).rejects.toThrow('is not the ID of its container');
     expect(asked).toEqual([]);
+    // Review round 1 of 11B3b (B-R1-9): only the bind mount at the socket's path is the socket; a full image ID and a
+    // reference are needed.
+    const state = { Type: 'bind', Source: '/srv/state', Destination: '/state' };
+    expect(ownHelperOf(inspect({ Mounts: [state, { Type: 'bind', Source: '/var/run/docker.sock', Destination: HELPER_DOCKER_SOCKET }] }))?.socket).toBe('/var/run/docker.sock');
+    expect(ownHelperOf(inspect({ Mounts: [state] }))).toBeUndefined();
+    expect(ownHelperOf(inspect({ Image: 'sha256:abc' }))).toBeUndefined();
+    expect(ownHelperOf(inspect({ Config: { Image: '' } }))).toBeUndefined();
   });
 });
 
@@ -175,5 +183,55 @@ describe('the core services in the worker (plan step 11B3b)', () => {
     const controller = new AbortController();
     controller.abort();
     await expect(helper.ensureImagePresent({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+// Review round 1 of 11B3b (B-R1-7, B-R1-8): the deps of the pipeline in the worker, one by one.
+describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () => {
+  function deps(overrides: Partial<WorkerServicesDeps> = {}) {
+    const { host, calls } = fakeHost({ windowStatuses: [{ windowId: 'w' }], confirmUntrustedRepository: false, recreateContainer: true });
+    const all = workerServiceDeps({
+      host,
+      engine: { ...unusedEngine(), version: async () => ({ apiVersion: '1.48', version: '29.0.0' }) },
+      secretOf: (name) => (name === SECRET_TOKEN ? 'ghp_x' : undefined),
+      logger: silentLogger,
+      ownHelper: { image: { tag: 'devenv-helper:abc', id: IMAGE_ID }, socket: '/s.sock' },
+      dockerHost: 'build-box',
+      owner: { windowId: 'w', pid: 1 },
+      environmentLock: async () => {
+        throw new Error('no lock in this test');
+      },
+      ...overrides,
+    });
+    return { all, calls };
+  }
+
+  it('fails closed where the worker has nothing yet: the analysis, the image check, a process, a flow, a helper container or build', async () => {
+    const { all } = deps();
+    await expect(all.analyzer.analyze({} as never)).rejects.toThrow('before plan step 11E');
+    await expect(all.imageChecker.check({} as never)).rejects.toThrow('before plan step 11E');
+    await expect(all.runner.run('docker', [])).rejects.toThrow('runs no process');
+    await expect(all.flow('stop', {}, {})).rejects.toThrow('sends no flow');
+    expect(() => all.settings()).toThrow('before plan step 11E');
+    const settings = { stopAfterMinutes: 5 } as never;
+    expect(deps({ settings }).all.settings()).toBe(settings);
+  });
+
+  it('the Docker host of the operation, the engine check, the window reads, the questions, and the secret of the operation', async () => {
+    const { all, calls } = deps();
+    expect(await all.dockerTarget!()).toEqual({ kind: 'remote', host: 'build-box', endpoint: '' });
+    expect(await deps({ dockerHost: '' }).all.dockerTarget!()).toEqual({ kind: 'local', host: '', endpoint: '' });
+    await all.startDocker!({ onStarting: () => {} });
+    const down = deps({ engine: { ...unusedEngine(), version: async () => Promise.reject(new Error('connect ENOENT')) } }).all;
+    await expect(down.startDocker!({ onStarting: () => {} })).rejects.toMatchObject({ code: 'dockerEngineNotRunning' });
+    // Every other process counts as alive: a busy mark of another window is never taken over here.
+    expect(all.isProcessAlive!(1)).toBe(true);
+    expect(await all.windowStatuses!()).toEqual([{ windowId: 'w' }]);
+    expect(await all.ui.confirmUntrustedRepository('acme/api')).toBe(false);
+    expect(await all.ui.recreateContainer('acme/api', { message: 'm', detail: 'd' })).toBe(true);
+    expect(calls).toEqual(['windowStatuses', 'confirmUntrustedRepository "acme/api"', 'recreateContainer "acme/api" {"message":"m","detail":"d"}']);
+    // The secret input of an exec must be the token of the operation (EngineDocker over secretOf).
+    await expect(all.docker.exec('c', ['cat'], { secretInput: 'other' })).rejects.toThrow('token secret of the operation');
+    await expect(all.helper.ensureImage()).resolves.toBe('devenv-helper:abc');
   });
 });

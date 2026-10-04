@@ -35,9 +35,9 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, listConfigurationsOperation, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, listConfigurationsOperation, ownHelperCache, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
-import { readOwnHelper, type OwnHelper } from '../core/worker/ownHelper';
+import { readOwnHelper } from '../core/worker/ownHelper';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -162,14 +162,7 @@ const BATCH = batchDeps();
  * so that one read that the engine never answers does not hold every later flow (it fails, and the next one reads again).
  */
 const OWN_HELPER_TIMEOUT_MS = 60_000;
-let ownHelper: Promise<OwnHelper> | undefined;
-const OWN_HELPER_OF: OwnHelperOf = (context) => {
-  const read = (ownHelper ??= readOwnHelper(ENGINE_OF(context), os.hostname(), AbortSignal.timeout(OWN_HELPER_TIMEOUT_MS)));
-  read.catch(() => {
-    if (ownHelper === read) ownHelper = undefined;
-  });
-  return read;
-};
+const OWN_HELPER_OF: OwnHelperOf = ownHelperCache((context) => readOwnHelper(ENGINE_OF(context), os.hostname(), AbortSignal.timeout(OWN_HELPER_TIMEOUT_MS)));
 
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,

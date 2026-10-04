@@ -119,6 +119,12 @@ export interface WorkerServicesDeps {
 
 /** The core services of one operation in the worker (see the module comment). */
 export function workerServices(deps: WorkerServicesDeps): { service: EnvironmentService; helper: WorkspaceHelper; docker: EngineDocker } {
+  const serviceDeps = workerServiceDeps(deps);
+  return { service: new EnvironmentService(serviceDeps), helper: serviceDeps.helper as WorkspaceHelper, docker: serviceDeps.docker as EngineDocker };
+}
+
+/** The deps of EnvironmentService in the worker (workerServices; review round 1 of 11B3b: apart, for their tests). */
+export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceDeps & { helper: WorkspaceHelper; docker: EngineDocker } {
   const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf);
   const helper = new WorkspaceHelper({
     docker: {
@@ -144,7 +150,7 @@ export function workerServices(deps: WorkerServicesDeps): { service: Environment
     engine: async () => ({ key: deps.dockerHost, socket: deps.ownHelper.socket }),
     ownImage: deps.ownHelper.image,
   });
-  const serviceDeps: EnvironmentServiceDeps = {
+  return {
     docker,
     runner: {
       run: async () => {
@@ -185,5 +191,4 @@ export function workerServices(deps: WorkerServicesDeps): { service: Environment
       throw new Error(`The pipeline of the worker sends no flow (${op}): it is the flow.`);
     },
   };
-  return { service: new EnvironmentService(serviceDeps), helper, docker };
 }

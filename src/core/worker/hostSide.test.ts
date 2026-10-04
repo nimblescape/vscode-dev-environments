@@ -163,6 +163,11 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
     }
     const noLogin = workerHostSide(async () => ({ id: '7' }), () => undefined);
     expect(await noLogin.state.account(false)).toEqual({ id: '7', login: '' });
+    // Review round 1 of 11B3b (B-R1-12): each side keeps only the id and the login.
+    const { handler, signal } = wired({ account: { id: '42', login: 'octo', accessToken: 'gho_x' } as unknown as GitHubAccount });
+    expect(await handler('local', { call: 'account', args: [true] }, signal)).toEqual({ value: { id: '42', login: 'octo' } });
+    const extra = workerHostSide(async () => ({ id: '42', login: 'octo', accessToken: 'gho_x' }), () => undefined);
+    expect(await extra.state.account(true)).toEqual({ id: '42', login: 'octo' });
   });
 
   it('gets a secret only through the secrets of the answer, never in its value', async () => {

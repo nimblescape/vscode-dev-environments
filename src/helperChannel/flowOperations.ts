@@ -152,6 +152,21 @@ export function flowRefusal(error: unknown, context: OperationContext): { refuse
 /** Plan step 11B3b: the worker's own helper image and socket, for the batch helpers of its flows (readOwnHelper). */
 export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
 
+/**
+ * Plan step 11B3b: the worker's own helper image, read once (`read`), and again after a failure (review round 1, B-R1-10:
+ * one failed read never holds every later flow).
+ */
+export function ownHelperCache(read: OwnHelperOf): OwnHelperOf {
+  let cached: Promise<OwnHelper> | undefined;
+  return (context) => {
+    const current = (cached ??= read(context));
+    current.catch(() => {
+      if (cached === current) cached = undefined;
+    });
+    return current;
+  };
+}
+
 /** Plan step 11B3b: opens a batch session of a flow in the worker (workerBatchSession of batch.ts). */
 export type OpenWorkerBatch = (context: OperationContext, p: { volume: string; image: string; socket: string }) => Promise<HelperBatchSession>;
 

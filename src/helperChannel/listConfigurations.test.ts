@@ -14,7 +14,9 @@ import type { Environment } from '../core/types';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import type { OwnHelper } from '../core/worker/ownHelper';
-import { listConfigurationsOperation, type OpenWorkerBatch } from './flowOperations';
+import { flowRefusal, listConfigurationsOperation, ownHelperCache, type OpenWorkerBatch } from './flowOperations';
+import { UserFacingError } from '../core/errors';
+import { MAX_REFUSAL_DETAIL_LENGTH, MAX_REFUSAL_MESSAGE_LENGTH, parseFlowRefusal } from '../core/helperChannel/protocol';
 import type { FlockProcess, LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import { OperationError, type OperationContext } from './server';
@@ -34,6 +36,8 @@ const ENVIRONMENT = {
 const OWN: OwnHelper = { image: { tag: 'devenv-helper:abc', id: `sha256:${'a'.repeat(64)}` }, socket: '/run/user/1000/docker.sock' };
 const PARAMS = { environmentId: ID, dockerHost: '', owner: { windowId: 'window-1', pid: 4242 } };
 const PATHS = ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'];
+const CONTEXT = () =>
+  ({ signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {}, docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }) }) as unknown as OperationContext;
 
 interface Setup {
   /** The record that `record get` answers (null: none). */
@@ -49,13 +53,17 @@ interface Setup {
   openFails?: Error;
   /** Called when the step runs (before its result). */
   onStep?: (controller: AbortController) => void;
+  /** The Docker host of the operation (default: the local one). */
+  dockerHost?: string;
+  /** The read of the worker's own helper image. */
+  ownHelper?: (controller: AbortController) => Promise<OwnHelper>;
 }
 
 function run(setup: Setup = {}) {
   const asks: { kind: AskKind; payload: unknown }[] = [];
   const events: string[] = [];
   const opened: { volume: string; image: string; socket: string }[] = [];
-  const steps: { kind: string; params: unknown }[] = [];
+  const steps: { kind: string; params: unknown; signal?: AbortSignal }[] = [];
   const controller = new AbortController();
   const context: OperationContext = {
     signal: controller.signal,
@@ -92,7 +100,7 @@ function run(setup: Setup = {}) {
       session: 'b'.repeat(24),
       lost: new Promise(() => {}),
       step: async (kind, params, options) => {
-        steps.push({ kind, params });
+        steps.push({ kind, params, signal: options?.signal });
         events.push(`step ${kind}`);
         setup.onStep?.(controller);
         // As the session: a cancel of the operation ends the step with an AbortError.
@@ -105,11 +113,11 @@ function run(setup: Setup = {}) {
   };
   const operation = listConfigurationsOperation(
     () => engine,
-    async () => OWN,
+    () => (setup.ownHelper ? setup.ownHelper(controller) : Promise.resolve(OWN)),
     openBatch,
     lockDeps,
   );
-  return { result: operation(PARAMS, context), asks, events, opened, steps, controller };
+  return { result: operation({ ...PARAMS, dockerHost: setup.dockerHost ?? '' }, context), asks, events, opened, steps, controller };
 }
 
 describe('listConfigurations in the worker (plan step 11B3b)', () => {
@@ -117,6 +125,8 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
     const { result, asks, events, opened, steps } = run();
     const value = await result;
     expect(value).toEqual({ configPaths: PATHS });
+    // Review round 1 of 11B3b (B-R1-4): the step runs with the signal of the operation.
+    expect(steps[0].signal).toBeDefined();
     expect(parseListConfigurationsValue(value)).toEqual({ configPaths: PATHS });
     expect(asks).toEqual([
       { kind: 'record', payload: { call: 'get', args: [ID] } },
@@ -124,7 +134,8 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
     ]);
     // The helper of the batch is the worker's own image (its ID) with its socket; nothing was built.
     expect(opened).toEqual([{ volume: VOLUME, image: OWN.image.id, socket: OWN.socket }]);
-    expect(steps).toEqual([{ kind: 'listConfigs', params: { repository: 'acme/api' } }]);
+    // Review round 1 of 11B3b (B-R1-4): changed expectation, the step with its signal.
+    expect(steps).toEqual([{ kind: 'listConfigs', params: { repository: 'acme/api' }, signal: expect.any(AbortSignal) }]);
     // The session closes before the lock is let go.
     expect(events).toEqual(['progress listConfigurations', `lock ${ID}`, 'step listConfigs', 'close batch', 'unlock']);
   });
@@ -198,5 +209,69 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
     );
     const context = { signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {}, docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }) } as unknown as OperationContext;
     await expect(operation(PARAMS, context)).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE, message: expect.stringContaining('no socket mount') });
+  });
+});
+
+// Review round 1 of 11B3b (mutation testing): the refusals, their limits, the Docker host, the cancel, and the cache.
+describe('listConfigurations in the worker: review round 1 of 11B3b', () => {
+  it('B-R1-7: an environment of the remote Docker host of the operation is listed there', async () => {
+    const { result } = run({ dockerHost: 'build-box', record: { ...ENVIRONMENT, dockerHost: 'build-box' } as Environment });
+    expect(await result).toEqual({ configPaths: PATHS });
+    // A local environment is not listed through a worker of another host.
+    expect(await run({ dockerHost: 'build-box' }).result).toMatchObject({ refused: { code: 'otherDockerHost' } });
+  });
+
+  it('B-R1-4: a cancel while the own image is read is cancelled; the step sees the cancel of the operation', async () => {
+    const reading = run({
+      ownHelper: async (controller) => {
+        controller.abort();
+        throw new Error('aborted');
+      },
+    });
+    await expect(reading.result).rejects.toMatchObject({ code: 'cancelled' });
+    const during = run({ onStep: (controller) => controller.abort() });
+    await expect(during.result).rejects.toMatchObject({ code: 'cancelled' });
+    expect(during.steps[0].signal?.aborted).toBe(true);
+  });
+
+  it('B-R1-4: flowRefusal: a cancel is cancelled, a failure of the operation keeps its code, other errors fail', () => {
+    const live = CONTEXT();
+    expect(() => flowRefusal(new UserFacingError('cancelled', 'The user dismissed it.'), live)).toThrow(expect.objectContaining({ code: 'cancelled' }));
+    const aborted = { ...live, signal: AbortSignal.abort() } as OperationContext;
+    expect(() => flowRefusal(new UserFacingError('helperFailed', 'x'), aborted)).toThrow(expect.objectContaining({ code: 'cancelled' }));
+    const busy = new OperationError('busy', 'x');
+    expect(() => flowRefusal(busy, live)).toThrow(busy);
+    expect(() => flowRefusal(new Error('boom'), live)).toThrow(expect.objectContaining({ code: 'failed', message: 'boom' }));
+    expect(flowRefusal(new UserFacingError('startFailed', 'm', 'd'), live)).toEqual({ refused: { code: 'startFailed', message: 'm', detail: 'd' } });
+  });
+
+  it('B-R1-5: a refusal is clipped to what the extension takes, and an empty message is its code', () => {
+    const { refused } = flowRefusal(new UserFacingError('helperFailed', 'm'.repeat(5000), 'd'.repeat(20000)), CONTEXT());
+    expect(parseFlowRefusal(refused)).toEqual(refused);
+    expect(refused.message).toHaveLength(MAX_REFUSAL_MESSAGE_LENGTH);
+    expect(refused.message.endsWith('…')).toBe(true);
+    expect(refused.detail).toHaveLength(MAX_REFUSAL_DETAIL_LENGTH);
+    expect(flowRefusal(new UserFacingError('startFailed', ''), CONTEXT()).refused.message).toBe('startFailed');
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm'.repeat(MAX_REFUSAL_MESSAGE_LENGTH) })).toBeDefined();
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm'.repeat(MAX_REFUSAL_MESSAGE_LENGTH + 1) })).toBeUndefined();
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm', detail: 42 })).toBeUndefined();
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm', detail: 'd'.repeat(MAX_REFUSAL_DETAIL_LENGTH + 1) })).toBeUndefined();
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm', detail: 'd'.repeat(MAX_REFUSAL_DETAIL_LENGTH) })).toBeDefined();
+    expect(parseFlowRefusal({ code: 'startFailed', message: 'm', batchHelperUnavailable: false })).toBeUndefined();
+  });
+
+  it('B-R1-10: the own image is read once, and again after a failure', async () => {
+    let reads = 0;
+    let fail = true;
+    const cache = ownHelperCache(async () => {
+      reads++;
+      if (fail) throw new Error('the engine did not answer');
+      return OWN;
+    });
+    await expect(cache(CONTEXT())).rejects.toThrow('did not answer');
+    fail = false;
+    expect(await cache(CONTEXT())).toBe(OWN);
+    expect(await cache(CONTEXT())).toBe(OWN);
+    expect(reads).toBe(2);
   });
 });
