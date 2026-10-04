@@ -82,6 +82,7 @@ import {
   LABEL_COMPOSE_SERVICE,
   LABEL_CONFIG_PATH,
   LABEL_ENVIRONMENT_ID,
+  LABEL_CHANNEL_STEP,
   LABEL_HELPER_RUN,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
@@ -266,7 +267,9 @@ export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
 export type EnvironmentDocker = Pick<
   ContainerAdapter,
   | 'isRunning'
-  | 'runChecked'
+  | 'imageConfig'
+  | 'runOnVolume'
+  | 'containerIdsWithLabel'
   | 'findContainer'
   | 'containerState'
   | 'imageLabels'
@@ -4997,11 +5000,7 @@ export class EnvironmentService {
 
   /** `Config` of `docker image inspect`. */
   private async imageConfig(image: string, signal: AbortSignal | undefined): Promise<unknown> {
-    const inspect = await this.deps.docker.runChecked(['image', 'inspect', '--format', '{{json .Config}}', image], {
-      timeoutMs: IMAGE_INSPECT_TIMEOUT_MS,
-      signal,
-    });
-    return JSON.parse(inspect.trim()) as unknown;
+    return this.deps.docker.imageConfig(image, { timeoutMs: IMAGE_INSPECT_TIMEOUT_MS, signal });
   }
 
   /**
@@ -5433,28 +5432,16 @@ export class EnvironmentService {
       // cancel or a failure removes the container before anything removes the volume, and `--init`, so that a SIGTERM
       // ends `sh` (as PID 1 it would ignore it) and the container does not keep the volume.
       cleanup = newCleanupLabel();
-      await docker.runChecked(
-        [
-          'run',
-          '--rm',
-          '--init',
-          '--pull',
-          'never',
-          '--network',
-          'none',
-          '--label',
-          `${LABEL_HELPER_RUN}=true`,
-          '--label',
-          channelStepLabel(cleanup),
-          '--user',
-          'root',
-          '--entrypoint',
-          shell,
-          '--mount',
-          `type=volume,source=${env.volumeName},target=${WORKSPACES_ROOT}`,
+      await docker.runOnVolume(
+        {
           image,
-          ...args,
-        ],
+          volume: env.volumeName,
+          target: WORKSPACES_ROOT,
+          entrypoint: shell,
+          args,
+          user: 'root',
+          labels: { [LABEL_HELPER_RUN]: 'true', [LABEL_CHANNEL_STEP]: cleanup },
+        },
         { timeoutMs: OWNERSHIP_TIMEOUT_MS, signal: ctx.signal },
       );
     } catch (error) {
@@ -5473,10 +5460,8 @@ export class EnvironmentService {
    */
   private async removeOwnershipContainers(cleanup: string): Promise<void> {
     await this.quietly('remove the container of the ownership fix', async () => {
-      const listed = await this.deps.docker.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(cleanup)}`], {
-        timeoutMs: IMAGE_INSPECT_TIMEOUT_MS,
-      });
-      for (const id of listed.split('\n').map((line) => line.trim()).filter((line) => line !== '')) await this.deps.docker.removeContainer(id);
+      const listed = await this.deps.docker.containerIdsWithLabel(channelStepLabel(cleanup), { timeoutMs: IMAGE_INSPECT_TIMEOUT_MS });
+      for (const id of listed) await this.deps.docker.removeContainer(id);
     });
   }
 

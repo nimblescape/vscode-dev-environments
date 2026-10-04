@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT } from '../git/gitSummary';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
-import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { isDevContainer, volumeRunArgs, type VolumeRun, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -36,6 +36,7 @@ import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/enviro
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
+import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunOptions, type RunResult } from '../ports';
 import { StoragePaths } from '../storage/paths';
@@ -236,6 +237,23 @@ export class FakeDocker implements EnvironmentDocker {
       container.rawState = 'running';
     }
     return '';
+  }
+
+  /** Plan step 11B3: like ContainerAdapter.imageConfig (the `image inspect` of runChecked). */
+  async imageConfig(reference: string): Promise<unknown> {
+    return JSON.parse((await this.runChecked(['image', 'inspect', '--format', '{{json .Config}}', reference])).trim()) as unknown;
+  }
+
+  /** Plan step 11B3: like ContainerAdapter.runOnVolume (the `run` of runChecked, with the same arguments). */
+  async runOnVolume(p: VolumeRun): Promise<void> {
+    await this.runChecked(volumeRunArgs(p));
+  }
+
+  /** Plan step 11B3: like ContainerAdapter.containerIdsWithLabel. */
+  async containerIdsWithLabel(label: string): Promise<string[]> {
+    // As ContainerAdapter: the `ps` of runChecked, so that the tests that answer it keep doing so.
+    const listed = await this.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${label}`]);
+    return listed.split('\n').map((line) => line.trim()).filter((line) => line !== '');
   }
 
   /** Plan step 10A: like ContainerAdapter.startContainer (recorded as the `start` of runChecked). */
@@ -1362,6 +1380,7 @@ export function fakeDockerEngine(docker: FakeDocker): DockerEngine {
   });
   const all = () => [...docker.containers.values()];
   return {
+    ...unusedEngine(),
     container: async (reference) => {
       const index = all().findIndex((c) => c.id === reference || c.name === reference);
       return index < 0 ? undefined : engineContainer(all()[index], index);

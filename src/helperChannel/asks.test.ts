@@ -28,6 +28,7 @@ import { batchChunkOperation, type BatchDeps } from './batch';
 import { batchHelperOperations } from './batchHelper';
 import { contextSecrets } from './operationContext.testkit';
 import type { DockerEngine } from '../core/worker/dockerEngine';
+import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { tokenRemoveOperation } from './flowOperations';
 import { dockerOperation } from './operations';
 import { ChannelServer, OperationError, type OperationContext, type OperationHandler, type ServerChild } from './server';
@@ -665,6 +666,7 @@ describe('the tokenRemove operation (plan step 11B1)', () => {
       image: 'img:1',
     };
     return {
+      ...unusedEngine(),
       container: async () => container,
       containers: async () => (running ? [container] : []),
       exec: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),

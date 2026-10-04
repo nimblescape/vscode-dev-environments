@@ -7,27 +7,44 @@
 // no `docker` process of our own behind it. The Docker CLI and Docker Compose run only as tools of the Dev Container CLI
 // in the batch helper, and in the extension only for the bootstrap. Pure types and checks; no I/O, no `vscode`.
 import { LABEL_COMPOSE_SERVICE } from '../names';
-import type { ContainerState } from '../types';
+import type { ContainerInfo } from '../docker/dockerObjects';
 
-/** A container as a flow needs it (the fields of `docker inspect` that the flows read). */
-export interface EngineContainer {
-  id: string;
-  /** Without the leading '/'. */
-  name: string;
-  state: ContainerState;
-  /** `State.Status`, for example `exited`. */
-  rawState: string;
+/**
+ * A container as a flow needs it: the pipeline's ContainerInfo (one shape, read by toContainerInfo of
+ * dockerObjects.ts, plan step 11B3), with what `docker inspect` adds for the flows.
+ */
+export interface EngineContainer extends ContainerInfo {
   exitCode?: number;
   restartCount?: number;
-  labels: Record<string, string>;
-  /** The image reference that the container was created from (`Config.Image`). */
-  image: string;
-  /** The full ID of that image (`Image`), which the reference may no longer name. */
-  imageId?: string;
-  /** The named volumes that the container mounts. */
-  volumes?: string[];
   /** When the daemon created it (`Created`, RFC 3339). */
   created?: string;
+}
+
+/** Plan step 11B3: the kinds of objects whose inspect JSON the port reads. */
+export type EngineObjectKind = 'container' | 'image' | 'volume' | 'network';
+
+/** Plan step 11B3: the filters of a list request of the Engine API (`label`, `reference`, `dangling`, …). */
+export type EngineFilters = Readonly<Record<string, readonly string[]>>;
+
+/** Plan step 11B3: an image of a list (`GET /images/json`). */
+export interface EngineImage {
+  /** Its full ID (`sha256:…`). */
+  id: string;
+  /** Its references `repository:tag` (none for a dangling image). */
+  repoTags: string[];
+  repoDigests: string[];
+  labels: Record<string, string>;
+  /** When it was created (RFC 3339). */
+  created: string;
+}
+
+/** Plan step 11B3: the registry login of a pull; the password or identity token is the secret `secretName` of the operation. */
+export interface EnginePullLogin {
+  serveraddress: string;
+  /** Absent for an identity token. */
+  username?: string;
+  identityToken?: boolean;
+  secretName: string;
 }
 
 /** What `exec` ran: the exit code of the process, and what it wrote. */
@@ -79,6 +96,58 @@ export interface DockerEngine {
   stop(container: string, timeoutSeconds?: number, signal?: AbortSignal): Promise<void>;
   /** Starts the container; one that runs already is left alone. */
   start(container: string, signal?: AbortSignal): Promise<void>;
+  /** Plan step 11B3: the API version (`GET /version`, for example `1.48`) and the version of the engine. */
+  version(signal?: AbortSignal): Promise<{ apiVersion: string; version: string }>;
+  /** Plan step 11B3: the inspect JSON of an object (the same as `docker inspect`), or undefined when it does not exist. */
+  inspect(kind: EngineObjectKind, reference: string, signal?: AbortSignal): Promise<unknown>;
+  /** Plan step 11B3: the full IDs of the containers that match `filters`, stopped ones included. */
+  containerIds(filters: EngineFilters, signal?: AbortSignal): Promise<string[]>;
+  /** Plan step 11B3: the images that match `filters` (`dangling` included only when asked for). */
+  images(filters: EngineFilters, signal?: AbortSignal): Promise<EngineImage[]>;
+  /** Plan step 11B3: the names of the volumes that match `filters`. */
+  volumeNames(filters: EngineFilters, signal?: AbortSignal): Promise<string[]>;
+  /** Plan step 11B3: the names of the networks that match `filters`. */
+  networkNames(filters: EngineFilters, signal?: AbortSignal): Promise<string[]>;
+  /** Plan step 11B3: removes a container, running or not (`docker rm -f`); a missing one is no failure. */
+  removeContainer(container: string, signal?: AbortSignal): Promise<void>;
+  /** Plan step 11B3: renames a container (`docker rename`). */
+  renameContainer(container: string, name: string, signal?: AbortSignal): Promise<void>;
+  /** Plan step 11B3: removes an image without force: `missing` and `inUse` (409) are answers, not failures. */
+  removeImage(reference: string, signal?: AbortSignal): Promise<'removed' | 'missing' | 'inUse'>;
+  /** Plan step 11B3: creates a volume with its labels; an existing one of the name is kept as it is (as `docker volume create`). */
+  createVolume(name: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void>;
+  /** Plan step 11B3: removes a volume; a missing one is no failure, one in use is (409). */
+  removeVolume(name: string, signal?: AbortSignal): Promise<void>;
+  /** Plan step 11B3: removes a network; a missing one is no failure, one in use is. */
+  removeNetwork(name: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Plan step 11B3: pulls `reference` (`POST /images/create`), the login only in the header X-Registry-Auth; each line
+   * of `docker pull` goes to `onLine`. Throws with the message of the engine when the pull fails.
+   */
+  pull(reference: string, options?: { login?: EnginePullLogin; onLine?: (line: string) => void; signal?: AbortSignal }): Promise<void>;
+  /**
+   * Plan step 11B3 (decision of 2026-10-03, no extra containers where the API suffices): gives the image `image` the
+   * labels `labels` without a build: a container is created from it (never started), committed under the same name with
+   * `LABEL` changes, and removed. Answers the ID of the new image.
+   */
+  labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<string>;
+  /**
+   * Plan step 11B3: runs a container to its end and removes it (`docker run --rm`): no pull, no network, `--init`. Only
+   * the ownership fix before the create uses it (runOnVolume), until plan step 11G makes it a step of the batch helper.
+   * Answers its exit code and its output (both streams, bounded); `timeoutMs` ends and removes it.
+   */
+  runContainer(spec: EngineRun, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
+}
+
+/** Plan step 11B3: a container of runContainer. */
+export interface EngineRun {
+  image: string;
+  entrypoint: string;
+  args: readonly string[];
+  user: string;
+  labels: Record<string, string>;
+  /** Named volumes, each at its target. */
+  volumes: ReadonlyArray<{ name: string; target: string }>;
 }
 
 /** A failure of the engine: its message, and the HTTP status that it answered with. */

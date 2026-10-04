@@ -10,7 +10,12 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parsePullParams, parseStartContainersParams, pullReference } from '../core/helperChannel/protocol';
 import { engineApi, engineErrorMessage, MAX_ENGINE_ANSWER_CHARACTERS, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
-import { pullLine, pullOperation, registryAuthHeader, startContainersOperation } from './engineOperations';
+import { pullOperation, startContainersOperation } from './engineOperations';
+import { dockerEngine, pullLine, registryAuthHeader } from './engineClient';
+import type { OperationContext as PullContext } from './server';
+
+/** Plan step 11B3: the pull runs through the port of the engine (DockerEngine.pull), over the fake Engine API. */
+const engineOf = (api: EngineApi) => (context: PullContext) => dockerEngine(api, undefined, (name) => context.secrets[name]);
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 
@@ -109,7 +114,7 @@ describe('pull (plan step 10A)', () => {
   it('pulls by POST /images/create without credentials, and prints the lines of docker pull without the progress bars', async () => {
     const { engine, requests } = fakeEngine(() => ({ status: 200, chunks: LINES }));
     const { context: ctx, out, logs } = context();
-    expect(await pullOperation(engine)({ reference: 'alpine:3.20' }, ctx)).toEqual({});
+    expect(await pullOperation(engineOf(engine))({ reference: 'alpine:3.20' }, ctx)).toEqual({});
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({ method: 'POST', path: '/images/create?fromImage=alpine%3A3.20', headers: {} });
     expect(out.join('')).toBe(
@@ -122,7 +127,7 @@ describe('pull (plan step 10A)', () => {
   it('sends the password only in X-Registry-Auth, never in the path or a log line', async () => {
     const { engine, requests } = fakeEngine(() => ({ status: 200, chunks: LINES }));
     const { context: ctx, logs } = context('s3cret-password');
-    await pullOperation(engine)({ reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, ctx);
+    await pullOperation(engineOf(engine))({ reference: 'ghcr.io/o/i:1', username: 'octo', serveraddress: 'ghcr.io' }, ctx);
     const header = requests[0].headers?.['X-Registry-Auth'];
     expect(header).toBe(registryAuthHeader({ username: 'octo', password: 's3cret-password', serveraddress: 'ghcr.io' }));
     expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ username: 'octo', password: 's3cret-password', serveraddress: 'ghcr.io' });
@@ -134,7 +139,7 @@ describe('pull (plan step 10A)', () => {
   // Review round 1 of PR #89 (B-R1-12): the last line of the stream counts also without a final line feed.
   it('fails with an error in the last line of the stream, also without a final line feed', async () => {
     const { engine } = fakeEngine(() => ({ status: 200, chunks: ['{"status":"x"}\n{"errorDetail":{"message":"denied"}}'] }));
-    await expect(pullOperation(engine)({ reference: 'alpine:1' }, context().context)).rejects.toMatchObject({ code: 'failed', message: expect.stringContaining('denied') });
+    await expect(pullOperation(engineOf(engine))({ reference: 'alpine:1' }, context().context)).rejects.toMatchObject({ code: 'failed', message: expect.stringContaining('denied') });
   });
 
   // Review round 1 of PR #89 (A-R1-1): the engine decodes the header with Go's base64.URLEncoding, which needs the padding.
@@ -151,15 +156,15 @@ describe('pull (plan step 10A)', () => {
   // Review round 1 of PR #89 (A-R1-3): an identity token of `docker login` goes as `identitytoken`.
   it('sends an identity token as identitytoken with the server, without a user', async () => {
     const { engine, requests } = fakeEngine(() => ({ status: 200, chunks: LINES }));
-    await pullOperation(engine)({ reference: 'reg.example/o/i:1', serveraddress: 'reg.example', identityToken: true }, context('refresh-token-1').context);
+    await pullOperation(engineOf(engine))({ reference: 'reg.example/o/i:1', serveraddress: 'reg.example', identityToken: true }, context('refresh-token-1').context);
     expect(JSON.parse(Buffer.from(requests[0].headers!['X-Registry-Auth'], 'base64url').toString('utf8'))).toEqual({ identitytoken: 'refresh-token-1', serveraddress: 'reg.example' });
   });
 
   it('fails with the error of the stream, and with the message of an error answer', async () => {
     const streamed = fakeEngine(() => ({ status: 200, chunks: ['{"status":"Pulling from o/i","id":"1"}\n{"errorDetail":{"message":"denied: no access"},"error":"denied"}\n'] }));
-    await expect(pullOperation(streamed.engine)({ reference: 'ghcr.io/o/i:1' }, context().context)).rejects.toThrow(/The pull of ghcr\.io\/o\/i:1 failed after \d+\.\d s: denied: no access/);
+    await expect(pullOperation(engineOf(streamed.engine))({ reference: 'ghcr.io/o/i:1' }, context().context)).rejects.toThrow(/The pull of ghcr\.io\/o\/i:1 failed after \d+\.\d s: denied: no access/);
     const refused = fakeEngine(() => ({ status: 404, chunks: ['{"message":"pull access denied for nope"}\n'] }));
-    const error = await pullOperation(refused.engine)({ reference: 'nope:1' }, context().context).catch((e: unknown) => e);
+    const error = await pullOperation(engineOf(refused.engine))({ reference: 'nope:1' }, context().context).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(OperationError);
     expect((error as OperationError).code).toBe('failed');
     expect((error as Error).message).toMatch(/pull access denied for nope$/);
@@ -170,7 +175,7 @@ describe('pull (plan step 10A)', () => {
     const { engine, requests } = fakeEngine(() => ({ status: 200 }));
     const ctx = context().context;
     const withToken = { ...ctx, ...contextSecrets({ token: 'tok-1234', registry: 'reg-5678' }) };
-    await expect(pullOperation(engine)({ reference: 'ghcr.io/o/i:1', username: 'u', serveraddress: 'ghcr.io' }, withToken)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(pullOperation(engineOf(engine))({ reference: 'ghcr.io/o/i:1', username: 'u', serveraddress: 'ghcr.io' }, withToken)).rejects.toMatchObject({ code: 'invalid' });
     expect(requests).toEqual([]);
   });
 
@@ -182,7 +187,7 @@ describe('pull (plan step 10A)', () => {
       [{ reference: 'alpine:1', username: 'u', serveraddress: 's' }, undefined],
       [{ reference: 'alpine:1', serveraddress: 's', identityToken: true }, undefined],
     ] as const) {
-      const error = await pullOperation(engine)(params, context(secret).context).catch((e: unknown) => e);
+      const error = await pullOperation(engineOf(engine))(params, context(secret).context).catch((e: unknown) => e);
       expect((error as OperationError).code).toBe('invalid');
     }
     expect(requests).toEqual([]);
@@ -191,7 +196,7 @@ describe('pull (plan step 10A)', () => {
   it('passes the signal of the operation to the request', async () => {
     const { engine, requests } = fakeEngine(() => ({ status: 200 }));
     const controller = new AbortController();
-    await pullOperation(engine)({ reference: 'alpine:1' }, context(undefined, controller.signal).context);
+    await pullOperation(engineOf(engine))({ reference: 'alpine:1' }, context(undefined, controller.signal).context);
     expect(requests[0].signal).toBe(controller.signal);
   });
 

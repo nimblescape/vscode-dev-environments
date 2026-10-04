@@ -475,4 +475,127 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     ).rejects.toBe(thrown);
     expect(calls).toBe(1);
   });
+
+  // Plan step 11B3: the requests of the pipeline's Docker over the port.
+  describe('the requests of the pipeline (plan step 11B3)', () => {
+    it('reads the version, an inspect (missing is undefined), and the lists with their filters', async () => {
+      const { engine, calls } = await serve((call) => {
+        if (call.url === '/version') return { status: 200, json: { ApiVersion: '1.48', Version: '29.0.0' } };
+        if (call.url.startsWith('/volumes/gone') || call.url.startsWith('/images/gone')) return { status: 404, json: { message: 'No such volume' } };
+        if (call.url.startsWith('/volumes/v1')) return { status: 200, json: { Name: 'v1', Labels: { a: 'b' } } };
+        if (call.url.startsWith('/containers/json')) return { status: 200, json: [{ Id: 'a'.repeat(64) }, { Id: '' }, {}] };
+        if (call.url.startsWith('/images/json')) {
+          return { status: 200, json: [{ Id: 'sha256:1', RepoTags: ['p-app:1', '<none>:<none>'], RepoDigests: ['<none>@<none>'], Labels: null, Created: 1759485600 }, { noId: true }] };
+        }
+        if (call.url.startsWith('/volumes?')) return { status: 200, json: { Volumes: [{ Name: 'v1' }, { Name: '' }] } };
+        if (call.url.startsWith('/networks?')) return { status: 200, json: [{ Name: 'n1' }, { Name: 'n1' }, { Name: 'n2' }] };
+        return { status: 500, json: { message: 'unexpected' } };
+      });
+      expect(await engine.version()).toEqual({ apiVersion: '1.48', version: '29.0.0' });
+      expect(await engine.inspect('volume', 'v1')).toEqual({ Name: 'v1', Labels: { a: 'b' } });
+      expect(await engine.inspect('volume', 'gone')).toBeUndefined();
+      expect(await engine.inspect('image', 'gone')).toBeUndefined();
+      expect(await engine.containerIds({ label: ['a=b'] })).toEqual(['a'.repeat(64)]);
+      expect(await engine.images({ reference: ['p-*'] })).toEqual([{ id: 'sha256:1', repoTags: ['p-app:1'], repoDigests: [], labels: {}, created: '2025-10-03T10:00:00.000Z' }]);
+      expect(await engine.volumeNames({ label: ['x'] })).toEqual(['v1']);
+      expect(await engine.networkNames({ label: ['x'] })).toEqual(['n1', 'n2']);
+      const urls = calls.map((call) => decodeURIComponent(call.url));
+      expect(urls).toContain('/containers/json?all=true&filters={"label":["a=b"]}');
+      expect(urls).toContain('/images/json?filters={"reference":["p-*"]}');
+      expect(urls).toContain('/volumes?filters={"label":["x"]}');
+      expect(urls).toContain('/networks?filters={"label":["x"]}');
+    });
+
+    it('refuses an inspect or a list that it cannot read', async () => {
+      const { engine } = await serve((call) => (call.url.startsWith('/images/json') ? { status: 200, json: { not: 'a list' } } : { status: 200, body: 'not json' }));
+      await expect(engine.inspect('container', 'c')).rejects.toBeInstanceOf(EngineError);
+      await expect(engine.images({})).rejects.toBeInstanceOf(EngineError);
+      await expect(engine.version()).rejects.toBeInstanceOf(EngineError);
+    });
+
+    it('removes, renames and creates with the answers of the engine', async () => {
+      const answers: Record<string, number> = {};
+      const { engine, calls } = await serve((call) => ({ status: answers[`${call.method} ${decodeURIComponent(call.url.split('?')[0])}`] ?? 500, json: { message: 'conflict: unable to remove' } }));
+      answers['DELETE /containers/c'] = 204;
+      answers['DELETE /containers/gone'] = 404;
+      await engine.removeContainer('c');
+      await engine.removeContainer('gone');
+      answers['POST /containers/c/rename'] = 204;
+      await engine.renameContainer('c', 'new name');
+      for (const [status, outcome] of [
+        [200, 'removed'],
+        [404, 'missing'],
+        [409, 'inUse'],
+      ] as const) {
+        answers['DELETE /images/img:1'] = status;
+        expect(await engine.removeImage('img:1')).toBe(outcome);
+      }
+      answers['DELETE /images/img:1'] = 500;
+      await expect(engine.removeImage('img:1')).rejects.toMatchObject({ status: 500 });
+      answers['POST /volumes/create'] = 201;
+      await engine.createVolume('v', { a: 'b' });
+      answers['DELETE /volumes/v'] = 404;
+      answers['DELETE /networks/n'] = 404;
+      await engine.removeVolume('v');
+      await engine.removeNetwork('n');
+      answers['DELETE /volumes/v'] = 409;
+      await expect(engine.removeVolume('v')).rejects.toMatchObject({ status: 409 });
+      answers['POST /containers/c/rename'] = 409;
+      await expect(engine.renameContainer('c', 'taken')).rejects.toMatchObject({ status: 409 });
+      expect(calls.find((call) => call.url.startsWith('/containers/c?'))?.url).toBe('/containers/c?force=true');
+      expect(decodeURIComponent(calls.find((call) => call.url.includes('rename'))!.url)).toBe('/containers/c/rename?name=new name');
+      expect(JSON.parse(calls.find((call) => call.url === '/volumes/create')!.body)).toEqual({ Name: 'v', Labels: { a: 'b' } });
+    });
+
+    it('labels an image by a commit of a created container with the image\'s configuration and the labels, and removes the container', async () => {
+      const { engine, calls } = await serve((call) => {
+        if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: { Cmd: ['node'], Labels: { keep: 'x' }, User: 'dev' } } };
+        if (call.url === '/containers/create') return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/commit')) return { status: 201, json: { Id: 'sha256:new' } };
+        return { status: 204 };
+      });
+      expect(await engine.labelImage('registry:5000/devenv-a:2', { add: 'y' })).toBe('sha256:new');
+      const commit = calls.find((call) => call.url.startsWith('/commit'))!;
+      expect(decodeURIComponent(commit.url)).toBe('/commit?container=tmp&repo=registry:5000/devenv-a&tag=2&pause=false');
+      expect(JSON.parse(commit.body)).toEqual({ Cmd: ['node'], Labels: { keep: 'x', add: 'y' }, User: 'dev' });
+      expect(calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true' });
+      // A commit that fails removes the container too.
+      const failing = await serve((call) => {
+        if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: {} } };
+        if (call.url === '/containers/create') return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/commit')) return { status: 500, json: { message: 'no space left on device' } };
+        return { status: 204 };
+      });
+      await expect(failing.engine.labelImage('img', {})).rejects.toThrow('no space left on device');
+      expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true' });
+      expect(decodeURIComponent(failing.calls.find((call) => call.url.startsWith('/commit'))!.url)).toContain('repo=img&tag=latest');
+    });
+
+    it('runs a container to its end: create, start, wait, the log only on a failure, the removal always', async () => {
+      let code = 0;
+      const { engine, calls } = await serve((call) => {
+        if (call.url === '/containers/create') return { status: 201, json: { Id: 'run1' } };
+        if (call.url.endsWith('/wait')) return { status: 200, json: { StatusCode: code } };
+        if (call.url.includes('/logs')) return { status: 200, body: 'chown: denied' };
+        return { status: 204 };
+      });
+      const spec = { image: 'img:1', entrypoint: 'sh', args: ['-c', 'x'], user: 'root', labels: { a: 'b' }, volumes: [{ name: 'v', target: '/workspaces' }] };
+      expect(await engine.runContainer(spec)).toEqual({ exitCode: 0, output: '', timedOut: false });
+      expect(JSON.parse(calls[0].body)).toEqual({
+        Image: 'img:1',
+        Entrypoint: ['sh'],
+        Cmd: ['-c', 'x'],
+        User: 'root',
+        Labels: { a: 'b' },
+        HostConfig: { Init: true, NetworkMode: 'none', Mounts: [{ Type: 'volume', Source: 'v', Target: '/workspaces' }] },
+      });
+      expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create', 'POST /containers/run1/start', 'POST /containers/run1/wait', 'DELETE /containers/run1?force=true']);
+      code = 2;
+      expect(await engine.runContainer(spec)).toEqual({ exitCode: 2, output: 'chown: denied', timedOut: false });
+      const hanging = await serve((call) => (call.url === '/containers/create' ? { status: 201, json: { Id: 'run2' } } : call.url.endsWith('/wait') ? undefined : { status: 204 }));
+      expect(await hanging.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
+      expect(hanging.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/run2?force=true' });
+    });
+  });
 });
+
