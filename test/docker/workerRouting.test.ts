@@ -17,7 +17,7 @@ import { preparingWorker } from '../../src/core/docker/workerPreparation';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { ENGINE_IDENTITY_ARGS, LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
+import { ENGINE_IDENTITY_ARGS, LABEL_HELPER_CHANNEL, OP_STOP } from '../../src/core/helperChannel/protocol';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
 import { EnvironmentService } from '../../src/core/pipeline/environmentService';
@@ -122,7 +122,10 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     dockerTarget: () => targets.current(),
     // Plan step 11B2: the flows in the worker of the current target, as extension.ts.
-    flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),
+    flow: async (op, params, options) => {
+      flows.push(op);
+      return channels.flow(await targets.current(), op, params, options);
+    },
     // Plan step 5, PR B (D1: no unlocked path): the real lock of the worker, as extension.ts. Under it the plain calls go
     // through the worker that holds the lock (not the router); they are recorded as routed too.
     environmentLock: async (environmentId, waitSeconds, signal) => {
@@ -149,6 +152,8 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
   /** The direct calls of the opens of the worker (the engine identity), which are not calls of the service. */
   const openCalls: string[] = [];
   const routed: string[][] = [];
+  /** Plan step 11B2: the flows that the service sent to the worker. */
+  const flows: string[] = [];
   let channels: HelperChannels;
 
   /** The worker containers of this run (the label of the run is added to each, as the helper channel test does). */
@@ -240,7 +245,10 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
 
     await targets.withOperation(() => service.stop(environmentId));
     expect(cli.container(name)?.State.Running).toBe(false);
-    expect(routed.some((args) => args[0] === 'stop')).toBe(true);
+    // Plan step 11B2: changed expectation (before: the `docker stop` of this window, routed through the worker that held
+    // the lock): Stop is the worker's operation `stop`, under the lock that it takes itself; no Docker call of this window.
+    expect(flows).toEqual([OP_STOP]);
+    expect(routed.some((args) => args[0] === 'stop')).toBe(false);
 
     await targets.withOperation(() => service.delete(environmentId, { progress: new RecordingProgress(), additionalVolumesToRemove: [] }));
     expect(cli.container(name)).toBeUndefined();
