@@ -34,7 +34,11 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
     removeDisconnectRequest: vi.fn(async () => {}),
   };
   const ui = { info: vi.fn(), warn: vi.fn(), registrySignIn: vi.fn() };
-  const auth = { getToken: vi.fn(async () => 'ghp_token'), getPackagesCredentials: vi.fn(async () => ({ username: 'octocat', password: 'gho_packages' })) };
+  const auth = {
+    getToken: vi.fn(async () => 'ghp_token'),
+    getPackagesCredentials: vi.fn(async () => ({ username: 'octocat', password: 'gho_packages' })),
+    getAccount: vi.fn(async (_options: { interactive: boolean }): Promise<{ id: string; login: string } | undefined> => ({ id: '42', login: 'octo' })),
+  };
   const credentials = { getForPull: vi.fn(async (_registry: string): Promise<{ username: string; password: string } | undefined> => undefined) };
   const all = {
     registry,
@@ -72,6 +76,17 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     expect(await host.secrets.registry('ghcr.io')).toBeUndefined();
     expect(await host.secrets.token()).toBe('ghp_token');
     expect(auth.getToken).toHaveBeenCalledWith({ interactive: false });
+  });
+
+  // Plan step 11B3b: the account of the sign-in, with the dialog only when the flow asks for it.
+  it('reads the signed-in account with the interactive flag of the flow', async () => {
+    const { all, auth } = deps();
+    const host = extensionHostSide(all);
+    expect(await host.state.account(true)).toEqual({ id: '42', login: 'octo' });
+    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: true });
+    auth.getAccount.mockResolvedValueOnce(undefined);
+    expect(await host.state.account(false)).toBeUndefined();
+    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: false });
   });
 
   it('changes a record through the registry, and writes the pending file of this window', async () => {

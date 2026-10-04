@@ -907,7 +907,7 @@ export class Controller implements vscode.Disposable {
         listed = await runWithProgress({
           title: ControllerTexts.readingConfigurations(repository),
           cancellable: true,
-          task: (progress, signal) => this.deps.service.listConfigurations(environment.id, { progress, signal }),
+          task: (progress, signal) => this.deps.service.listConfigurationsInWorker(environment.id, { progress, signal }),
         });
       });
       if (!listed) return;

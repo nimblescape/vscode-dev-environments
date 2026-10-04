@@ -105,6 +105,12 @@ export interface HelperDeps {
   engine?: () => Promise<HelperEngine>;
   /** Plan step 5, PR A: called after a build of the helper image succeeded (the worker can be opened again at once). */
   onImageBuilt?: () => void;
+  /**
+   * Plan step 11B3b: the helper image of the worker in which this helper runs (its tag and ID). With it, every helper
+   * image of an operation is that one (section 3b of the plan: the helper image of an open is the worker's own image):
+   * nothing is checked, built, maintained or recorded, and the Dockerfile is never read.
+   */
+  ownImage?: HelperImageUse;
 }
 
 /** The options of WorkspaceHelper.ensureImagePresent. */
@@ -380,6 +386,7 @@ export class WorkspaceHelper {
    * does not answer, is no failed build).
    */
   async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
+    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
     // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its calls
     // run without the worker (workerPreparation.ts).
     return runPreparingWorker(() => this.ensureImagePresentNow(options));
@@ -426,6 +433,7 @@ export class WorkspaceHelper {
    * use. An abort of `signal` passes through.
    */
   private async presentTag(signal: AbortSignal | undefined): Promise<HelperImageUse | undefined> {
+    if (this.deps.ownImage !== undefined) return this.ownImageUse(signal);
     if (signal?.aborted) throw abortError();
     let tag: string | undefined;
     let id: string | undefined;
@@ -988,6 +996,12 @@ export class WorkspaceHelper {
 
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
+  /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
+  private async ownImageUse(signal: AbortSignal | undefined): Promise<HelperImageUse> {
+    if (signal?.aborted) throw abortError();
+    return { ...(this.deps.ownImage as HelperImageUse) };
+  }
+
   /**
    * The helper image (HelperImageUse). `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older
    * than HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
@@ -997,6 +1011,7 @@ export class WorkspaceHelper {
    * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
   private image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
+    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
     // Plan step 5, PR D (rule D1 of 2026-09-30): the check and the build of the helper image run without the worker, which
     // is opened from it (workerPreparation.ts); so also the shared promise of the cache never waits for the worker.
     return runPreparingWorker(() => this.imageNow(options, recheck));

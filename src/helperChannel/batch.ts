@@ -22,11 +22,13 @@ import {
   parseBatchParams,
   parseBatchStepParams,
   parseBatchStepValue,
+  type BatchParams,
 } from '../core/helperChannel/batch';
-import { HelperChannel, HelperChannelError, HelperOperationError } from '../core/helperChannel/helperChannel';
-import { MAX_CLIENT_LINE, channelStepLabel } from '../core/helperChannel/protocol';
+import { HelperChannel, HelperChannelError, HelperOperationError, collectBatchStep, type HelperBatchSession } from '../core/helperChannel/helperChannel';
+import { MAX_CLIENT_LINE, channelStepLabel, newCleanupLabel } from '../core/helperChannel/protocol';
+import { MAX_CAPTURED_OUTPUT_BYTES } from '../core/helper/analysisLimits';
 import { bundleHash } from '../core/loader/pipeLoader';
-import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
+import { abortError, isAbortError, type Logger, type StartedProcess } from '../core/ports';
 import { abortedOrAfter } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
@@ -71,6 +73,94 @@ async function removeByLabel(context: OperationContext, session: string): Promis
   if (ids.length > 0) await context.docker(['rm', '-f', ...ids]);
 }
 
+/** A batch helper that runs, with the client of its ChannelServer. */
+interface StartedBatchHelper {
+  channel: HelperChannel;
+  /** Ends it: its input ends (it exits; `--rm`), and its containers are removed by the session label. Never rejects. */
+  finish(): Promise<void>;
+}
+
+/**
+ * Starts the batch helper of `p` (the volume must exist) and opens the client of its ChannelServer; on a failure,
+ * everything that it started is ended before it throws an OperationError. Its log lines go to `logTo()`. Plan step 11B3b:
+ * the `batch` operation and the worker's own batch session (workerBatchSession) start it the same way.
+ */
+async function startBatchHelper(deps: BatchDeps, context: OperationContext, p: BatchParams, logTo: () => Pick<OperationContext, 'log'>): Promise<StartedBatchHelper> {
+  const ended = new AbortController();
+  let call: Promise<unknown> | undefined;
+  let channel: HelperChannel | undefined;
+  const finish = async (): Promise<void> => {
+    // Its input ends: the helper cancels its step and exits (`--rm`); the call is ended after CHANNEL_CLOSE_KILL_MS.
+    channel?.close();
+    if (channel === undefined) ended.abort();
+    await call;
+    // On a cancel the server removes the containers of the session label; otherwise this does (once one was started).
+    // Plan step 11B3b: never rejects (a session that the worker's own flow closes must not fail it); a failure is logged.
+    if (call !== undefined && !context.signal.aborted) {
+      await removeByLabel(context, p.session).catch((error: unknown) => context.log(`The batch helper ${p.session.slice(0, 8)} could not be removed: ${(error as Error).message}`, 'warn'));
+    }
+  };
+  try {
+    // Never let `--mount` create an empty volume without our labels: the volume must exist.
+    const inspect = await context.docker(batchVolumeArgs(p.volume));
+    if (context.signal.aborted) throw new OperationError('cancelled', 'The batch operation was cancelled.');
+    if (inspect.exitCode !== 0 || inspect.stdout.trim() !== p.volume) {
+      throw new OperationError(BATCH_MISSING_VOLUME_CODE, `The volume ${p.volume} does not exist; the batch helper was not started.`);
+    }
+    let script: string;
+    try {
+      script = deps.readScript();
+    } catch (error) {
+      throw new OperationError('failed', `The script of the worker cannot be read: ${(error as Error).message}`);
+    }
+    let input: { write(text: string): boolean; end(): void } | undefined;
+    let onStdout: (text: string) => void = () => {};
+    let onStderr: (text: string) => void = () => {};
+    const run = context.docker(batchRunArgs({ ...p, scriptHash: bundleHash(script) }), {
+      cleanup: p.session,
+      discardStdout: true,
+      signal: ended.signal,
+      onInput: (writer) => (input = writer),
+      onStdout: (text) => onStdout(text),
+      onStderr: (text) => onStderr(text),
+    });
+    call = run;
+    const process: StartedProcess = {
+      write: (text) => input?.write(text) ?? false,
+      end: () => input?.end(),
+      kill: () => ended.abort(),
+      onStdout: (listener) => (onStdout = listener),
+      onStderr: (listener) => (onStderr = listener),
+      exited: run.then((result) => (result.error !== undefined && result.exitCode === null ? { exitCode: null, error: new Error(result.error) } : { exitCode: result.exitCode })),
+    };
+    const logger: Logger = {
+      info: (message) => logTo().log(message),
+      warn: (message) => logTo().log(message, 'warn'),
+      error: (message) => logTo().log(message, 'warn'),
+      output: () => {},
+    };
+    try {
+      // The steps of one operation can carry up to MAX_BATCH_INPUT_CHARACTERS of input over this local pipe. The helper
+      // is not lost for late answers: while the connection of the extension is slower than the output of a step, the
+      // server pauses the reading of the helper's output (and its pongs); a helper that ends is seen by its exit.
+      channel = await HelperChannel.open(process, script, {
+        logger,
+        name: `batch ${p.session.slice(0, 8)}`,
+        openTimeoutMs: deps.openTimeoutMs,
+        maxRequestBytes: 3 * MAX_CLIENT_LINE,
+        pongTimeoutMs: BATCH_HOLD_LIMIT_MS,
+      });
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The batch operation was cancelled.');
+      throw new OperationError('failed', (error as Error).message);
+    }
+    return { channel, finish };
+  } catch (error) {
+    await finish();
+    throw error;
+  }
+}
+
 /** The operation `batch` (see the module comment). */
 export function batchOperation(deps: BatchDeps): OperationHandler {
   return async (params, context) => {
@@ -82,66 +172,12 @@ export function batchOperation(deps: BatchDeps): OperationHandler {
     // Taken at once, so that two batches that start together count against the cap.
     const entry: BatchSession = { inputs: new Map(), inputSize: 0 };
     deps.sessions.set(p.session, entry);
-    const ended = new AbortController();
-    let call: Promise<unknown> | undefined;
+    let helper: StartedBatchHelper | undefined;
     try {
       context.progress('batch', p.volume);
-      // Never let `--mount` create an empty volume without our labels: the volume must exist.
-      const inspect = await context.docker(batchVolumeArgs(p.volume));
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The batch operation was cancelled.');
-      if (inspect.exitCode !== 0 || inspect.stdout.trim() !== p.volume) {
-        throw new OperationError(BATCH_MISSING_VOLUME_CODE, `The volume ${p.volume} does not exist; the batch helper was not started.`);
-      }
-      let script: string;
-      try {
-        script = deps.readScript();
-      } catch (error) {
-        throw new OperationError('failed', `The script of the worker cannot be read: ${(error as Error).message}`);
-      }
-      let input: { write(text: string): boolean; end(): void } | undefined;
-      let onStdout: (text: string) => void = () => {};
-      let onStderr: (text: string) => void = () => {};
-      const run = context.docker(batchRunArgs({ ...p, scriptHash: bundleHash(script) }), {
-        cleanup: p.session,
-        discardStdout: true,
-        signal: ended.signal,
-        onInput: (writer) => (input = writer),
-        onStdout: (text) => onStdout(text),
-        onStderr: (text) => onStderr(text),
-      });
-      call = run;
-      const process: StartedProcess = {
-        write: (text) => input?.write(text) ?? false,
-        end: () => input?.end(),
-        kill: () => ended.abort(),
-        onStdout: (listener) => (onStdout = listener),
-        onStderr: (listener) => (onStderr = listener),
-        exited: run.then((result) => (result.error !== undefined && result.exitCode === null ? { exitCode: null, error: new Error(result.error) } : { exitCode: result.exitCode })),
-      };
       // The log lines of the client go to the step that runs, else to this operation.
-      const target = () => entry.step ?? context;
-      const logger: Logger = {
-        info: (message) => target().log(message),
-        warn: (message) => target().log(message, 'warn'),
-        error: (message) => target().log(message, 'warn'),
-        output: () => {},
-      };
-      let channel: HelperChannel;
-      try {
-        // The steps of one operation can carry up to MAX_BATCH_INPUT_CHARACTERS of input over this local pipe. The helper
-        // is not lost for late answers: while the connection of the extension is slower than the output of a step, the
-        // server pauses the reading of the helper's output (and its pongs); a helper that ends is seen by its exit.
-        channel = await HelperChannel.open(process, script, {
-          logger,
-          name: `batch ${p.session.slice(0, 8)}`,
-          openTimeoutMs: deps.openTimeoutMs,
-          maxRequestBytes: 3 * MAX_CLIENT_LINE,
-          pongTimeoutMs: BATCH_HOLD_LIMIT_MS,
-        });
-      } catch (error) {
-        if (context.signal.aborted) throw new OperationError('cancelled', 'The batch operation was cancelled.');
-        throw new OperationError('failed', (error as Error).message);
-      }
+      helper = await startBatchHelper(deps, context, p, () => entry.step ?? context);
+      const channel = helper.channel;
       entry.channel = channel;
       const lost = new Promise<string>((resolve) => channel.onClose(resolve));
       context.progress(BATCH_READY_STEP, p.session);
@@ -151,13 +187,66 @@ export function batchOperation(deps: BatchDeps): OperationHandler {
       throw new OperationError('timeout', 'The batch helper was held for its longest time and was ended.');
     } finally {
       deps.sessions.delete(p.session);
-      // Its input ends: the helper cancels its step and exits (`--rm`); the call is ended after CHANNEL_CLOSE_KILL_MS.
-      entry.channel?.close();
-      if (entry.channel === undefined) ended.abort();
-      await call;
-      // On a cancel the server removes the containers of the session label; otherwise this does (once one was started).
-      if (call !== undefined && !context.signal.aborted) await removeByLabel(context, p.session);
+      await helper?.finish();
     }
+  };
+}
+
+/**
+ * Plan step 11B3b: a batch session of a flow that runs in this worker (the lock of its environment held here, see
+ * workerLock.ts): the helper starts as for `batch`, from the image and with the socket of `p` (the worker's own), and its
+ * steps go straight to it, with the same checks and the same result as through the extension (collectBatchStep). It ends
+ * with `close`, or with the operation of `context`. It never counts as a session of the `batch` operation, so no request
+ * of the extension reaches it. Review round 1 of 11B3b (A-R1-3): nor against MAX_CONCURRENT_BATCHES and its hold limit:
+ * there is one per held lock of an environment, and it ends with the operation (its time limit) at the latest.
+ */
+export async function workerBatchSession(deps: BatchDeps, context: OperationContext, p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> {
+  const session = newCleanupLabel();
+  const params = parseBatchParams({ session, volume: p.volume, image: p.image, socket: p.socket });
+  if (params === undefined) throw new HelperChannelError('unsendable', 'The batch request is invalid.');
+  context.progress('batch', p.volume);
+  return sessionOfHelper(session, await startBatchHelper(deps, context, params, () => context));
+}
+
+/** The client of a started batch helper that a session needs (review round 1 of 11B3b: apart, for its tests). */
+export interface BatchHelperClient {
+  channel: Pick<HelperChannel, 'operation' | 'onClose'>;
+  finish(): Promise<void>;
+}
+
+/**
+ * Plan step 11B3b: the HelperBatchSession over a started batch helper (workerBatchSession): each step checked as the
+ * extension's client checks it (parseBatchStepParams, MAX_BATCH_INPUT_CHARACTERS) and collected as it collects it
+ * (collectBatchStep); `lost` only for an end without `close`; `close` once, and never rejecting.
+ */
+export function sessionOfHelper(session: string, helper: BatchHelperClient): HelperBatchSession {
+  let closing = false;
+  const lost = new Promise<string>((resolve) => helper.channel.onClose((reason) => (closing ? undefined : resolve(reason))));
+  let closed: Promise<void> | undefined;
+  return {
+    session,
+    lost,
+    step: async (kind, stepParams, options = {}) => {
+      if (options.signal?.aborted) throw abortError();
+      const value = stepParams === undefined ? null : stepParams;
+      const request: Record<string, unknown> = { session, kind, params: value };
+      if (options.timeoutMs !== undefined) request.timeoutMs = options.timeoutMs;
+      if (parseBatchStepParams(request) === undefined) throw new HelperChannelError('unsendable', 'The batch step is invalid.');
+      if (JSON.stringify(value).length > MAX_BATCH_INPUT_CHARACTERS) throw new HelperChannelError('unsendable', `The input of the step ${kind} is too large for the batch helper.`);
+      return collectBatchStep(kind, options, MAX_CAPTURED_OUTPUT_BYTES, (signal, onOutput) =>
+        helper.channel.operation(kind, value, {
+          ...(options.secrets === undefined ? {} : { secrets: options.secrets }),
+          timeoutMs: options.timeoutMs,
+          signal,
+          onOutput,
+        }),
+      );
+    },
+    close: () => {
+      closing = true;
+      closed ??= helper.finish().catch(() => undefined);
+      return closed;
+    },
   };
 }
 

@@ -61,7 +61,19 @@ import {
 import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
-import { channelStepLabel, LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, newCleanupLabel, OP_STOP, parseStopParams, parseStopValue } from '../helperChannel/protocol';
+import {
+  channelStepLabel,
+  LOCK_BUSY_CODE,
+  LOCK_UNAVAILABLE_CODE,
+  newCleanupLabel,
+  OP_LIST_CONFIGURATIONS,
+  OP_STOP,
+  parseListConfigurationsParams,
+  parseListConfigurationsValue,
+  parseStopParams,
+  parseStopValue,
+  type FlowRefusal,
+} from '../helperChannel/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
@@ -262,6 +274,11 @@ export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
  * Stop with more than about eight services that all hit their own time limit ends here (review round 1, A-R1-6).
  */
 export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Plan step 11B3b: the longest listing of Select configuration in the worker: the wait for the lock (D3), the start of the
+ * batch helper, and its step.
+ */
+export const LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS = 5 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -6003,7 +6020,32 @@ export class EnvironmentService {
     return (await this.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
   }
 
-  /** Configuration paths in the volume (current branch), in the order of precedence. */
+  /**
+   * Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration in the worker of the Docker host of
+   * the operation, where its own pipeline runs listConfigurations (the record and the account through its requests, the
+   * lock and the batch helper there). A refusal of that pipeline is thrown here as it was before the move; a worker that
+   * cannot be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
+   */
+  async listConfigurationsInWorker(environmentId: string, options: OperationOptions): Promise<string[]> {
+    const env = await this.deps.registry.get(environmentId);
+    if (!env) return [];
+    try {
+      if (holdsEnvironmentLock(env.id)) throw new Error(`The listing of the configurations of ${env.repository} under a lock of the environment that this window holds.`);
+      const params = parseListConfigurationsParams({ environmentId: env.id, dockerHost: await this.currentDockerHost(), owner: this.deps.owner });
+      if (params === undefined) throw new Error(`The listing of the configurations of ${env.repository} cannot be sent to the worker.`);
+      const value = parseListConfigurationsValue(await this.workerFlow(env, OP_LIST_CONFIGURATIONS, params, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, options.signal));
+      if (value === undefined) throw new Error(`The worker answered the listing of the configurations of ${env.repository} with an invalid value.`);
+      if ('refused' in value) throw refusalError(value.refused);
+      return value.configPaths;
+    } catch (error) {
+      throw this.toUserError(error, options.signal);
+    }
+  }
+
+  /**
+   * Configuration paths in the volume (current branch), in the order of precedence. Plan step 11B3b: runs in the worker
+   * (listConfigurationsInWorker sends it there).
+   */
   async listConfigurations(environmentId: string, options: OperationOptions): Promise<string[]> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return [];
@@ -7103,6 +7145,11 @@ export class EnvironmentService {
       this.logger.warn(`Could not ${what}: ${errorMessage(error)}`);
     }
   }
+}
+
+/** Plan step 11B3b: the UserFacingError of a refusal that the worker's own pipeline answered (FlowRefusal). */
+function refusalError(refused: FlowRefusal): UserFacingError {
+  return refused.batchHelperUnavailable === true ? new BatchHelperUnavailableError(refused.message, refused.detail) : new UserFacingError(refused.code, refused.message, refused.detail);
 }
 
 /**

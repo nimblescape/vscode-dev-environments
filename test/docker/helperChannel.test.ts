@@ -34,6 +34,8 @@ import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from '
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
+    // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
+    define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
     entryPoints: [path.resolve(__dirname, '../../src/helperChannel/main.ts')],
     bundle: true,
     platform: 'node',

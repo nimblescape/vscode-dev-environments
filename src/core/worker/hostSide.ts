@@ -6,8 +6,8 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
-import type { Environment, RegistryFile, WindowStatus } from '../types';
+import { OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
 export interface HostQuestions {
@@ -30,6 +30,11 @@ export interface HostState {
   settings(): Promise<Record<string, unknown>>;
   /** True while the process `pid` of this computer runs. */
   processAlive(pid: number): Promise<boolean>;
+  /**
+   * Plan step 11B3b: the signed-in GitHub account (GitHubAuth.getAccount), its id and login, never a token; `interactive`
+   * lets the extension ask the user to sign in. `undefined`: no one is signed in.
+   */
+  account(interactive: boolean): Promise<GitHubAccount | undefined>;
 }
 
 /** The records of the user's computer that a flow changes (the registry and the session files). */
@@ -115,4 +120,6 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   [OP_TOKEN_REMOVE]: ['record get'],
   // Plan step 11B2: Stop needs nothing from this computer (its parameters carry what it needs; the extension records the Git state).
   [OP_STOP]: [],
+  // Plan step 11B3b: the listing of Select configuration reads the record and the account; no secret, no write.
+  [OP_LIST_CONFIGURATIONS]: ['record get', 'local account'],
 };

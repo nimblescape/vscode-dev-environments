@@ -179,7 +179,8 @@ interface Harness {
     /** Review round 11 (G3, G4). */
     repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
-    listConfigurations: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
+    // Plan step 11B3b (user decision of 2026-10-04): the controller lists through the worker (listConfigurationsInWorker).
+    listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
@@ -274,7 +275,7 @@ function createHarness(
     safetyCheck: vi.fn(async () => undefined),
     repositoryServiceData: vi.fn(async () => []),
     delete: vi.fn(async () => {}),
-    listConfigurations: vi.fn(async () => ['.devcontainer/devcontainer.json']),
+    listConfigurationsInWorker: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
     reconcileFromVolumes: vi.fn(async () => 0),
     // By default, Delete could remove every recorded volume (their labels make them the environment's own).
@@ -1582,7 +1583,7 @@ describe('Rebuild', () => {
   it('passes the selected configuration to the other window', async () => {
     await h.registry.add(environment());
     otherWindowConnected();
-    h.service.listConfigurations.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
+    h.service.listConfigurationsInWorker.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown[]) => items[1]);
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.rebuildNow);
     await run('selectConfiguration', row('acme/api', environment()));
@@ -1696,7 +1697,7 @@ describe('Rebuild', () => {
 describe('Select configuration…', () => {
   it('rebuilds an environment of no window with the selected configuration', async () => {
     await h.registry.add(environment());
-    h.service.listConfigurations.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
+    h.service.listConfigurationsInWorker.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; description: string }>) => {
       expect(items.map((item) => [item.label, item.description])).toEqual([
         ['default', '.devcontainer/devcontainer.json · current'],
@@ -1716,7 +1717,7 @@ describe('Select configuration…', () => {
     const env = environment();
     await h.registry.add(env);
     await connectHere(env);
-    h.service.listConfigurations.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
+    h.service.listConfigurationsInWorker.mockResolvedValue(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']);
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown[]) => items[1]);
     await run('selectConfiguration', row('acme/api', env));
     expect(await h.sessionFiles.readOperations()).toEqual([
@@ -1733,7 +1734,8 @@ describe('Select configuration…', () => {
     h.sidebar.infos.set('acme/api', info);
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown[]) => items[1]);
     await run('selectConfiguration', row('acme/api', undefined, info));
-    expect(h.service.listConfigurations).not.toHaveBeenCalled();
+    // Plan step 11B3b: changed expectation, the listing goes through the worker.
+    expect(h.service.listConfigurationsInWorker).not.toHaveBeenCalled();
     expect(h.service.open).toHaveBeenCalledWith(
       expect.objectContaining({ repository: 'acme/api' }),
       expect.objectContaining({ configPath: '.devcontainer/go/devcontainer.json' }),
@@ -2809,7 +2811,8 @@ describe('Accounts (concept 7.5)', () => {
         items.find((item) => item.configPath === '.devcontainer/python/devcontainer.json'),
       );
       await run('selectConfiguration', row('acme/api'));
-      expect(h.service.listConfigurations).not.toHaveBeenCalled();
+      // Plan step 11B3b: changed expectation, the listing goes through the worker.
+      expect(h.service.listConfigurationsInWorker).not.toHaveBeenCalled();
       expect(h.service.openEnvironment).not.toHaveBeenCalled();
       expect(h.service.open).toHaveBeenCalledWith(
         expect.objectContaining({ repository: 'acme/api' }),

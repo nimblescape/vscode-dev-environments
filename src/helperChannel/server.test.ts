@@ -143,7 +143,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(messages).toEqual([
       // Review round 4 (M1): with the sweep of never-started channel containers.
       // Plan step 5, PR B: changed expectation: `lock` too.
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations; plan step 10A: changed expectation, `pull` and `startContainers`; plan step 11B2: changed expectation, `stop`
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'listConfigurations', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations; plan step 10A: changed expectation, `pull` and `startContainers`; plan step 11B2: changed expectation, `stop`; plan step 11B3b: changed expectation, `listConfigurations`
       { t: 'pong', n: 7 },
     ]);
   });

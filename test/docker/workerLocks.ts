@@ -29,6 +29,8 @@ let bundled: Promise<string> | undefined;
 export function workerScript(): Promise<string> {
   bundled ??= esbuild
     .build({
+      // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
+      define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
       entryPoints: [path.resolve(__dirname, '../../src/helperChannel/main.ts')],
       bundle: true,
       platform: 'node',

@@ -4,28 +4,40 @@
 
 // Errors with a plain-language message for the user (NFR-02). Technical details go to the log.
 
-export type UserErrorCode =
-  | 'dockerNotInstalled'
-  | 'dockerStartFailed'
-  | 'dockerEngineNotRunning'
-  | 'helperFailed'
-  | 'cloneFailed'
-  | 'firstOpenOffline'
-  | 'noConfiguration'
-  | 'buildFailed'
-  | 'startFailed'
-  | 'filesMissing'
-  | 'signInRequired'
-  | 'hostAccess'
-  | 'unencryptedDockerConnection'
-  | 'otherAccount'
-  | 'dockerHostUnreachable'
-  | 'dockerEndpointUnsupported'
-  | 'otherDockerHost'
-  | 'sessionMonitorFailed'
+export const USER_ERROR_CODES = [
+  'dockerNotInstalled',
+  'dockerStartFailed',
+  'dockerEngineNotRunning',
+  'helperFailed',
+  'cloneFailed',
+  'firstOpenOffline',
+  'noConfiguration',
+  'buildFailed',
+  'startFailed',
+  'filesMissing',
+  'signInRequired',
+  'hostAccess',
+  'unencryptedDockerConnection',
+  'otherAccount',
+  'dockerHostUnreachable',
+  'dockerEndpointUnsupported',
+  'otherDockerHost',
+  'sessionMonitorFailed',
   /** Plan step 11B2 (review round 2, A-R2-2): the record of the environment holds a value that the worker refuses; no retry helps. */
-  | 'recordInvalid'
-  | 'cancelled';
+  'recordInvalid',
+  'cancelled',
+] as const;
+
+/**
+ * The kinds of a UserFacingError. Plan step 11B3b: also as a list (USER_ERROR_CODES), so that a refusal that the worker
+ * answers is checked against it.
+ */
+export type UserErrorCode = (typeof USER_ERROR_CODES)[number];
+
+/** Plan step 11B3b: true for a kind of UserFacingError. */
+export function isUserErrorCode(value: unknown): value is UserErrorCode {
+  return typeof value === 'string' && (USER_ERROR_CODES as readonly string[]).includes(value);
+}
 
 export class UserFacingError extends Error {
   constructor(

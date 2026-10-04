@@ -15,6 +15,7 @@ import {
   OP_PROBE,
   OP_PULL,
   OP_START_CONTAINERS,
+  OP_LIST_CONFIGURATIONS,
   OP_STOP,
   OP_TOKEN_REMOVE,
   OP_REFRESH,
@@ -29,12 +30,13 @@ import {
   type RefreshValue,
 } from '../core/helperChannel/protocol';
 import { readEnvironmentStates } from '../core/pipeline/refreshStates';
-import { abortError, type Logger, type ProcessRunner } from '../core/ports';
+import { abortError, type ProcessRunner } from '../core/ports';
 import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/batch';
-import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation } from './batch';
+import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { stopOperation, tokenRemoveOperation, type EngineOfOperation } from './flowOperations';
+import { contextLogger, listConfigurationsOperation, ownHelperOfEngine, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -129,16 +131,6 @@ export function contextRunner(context: OperationContext): ProcessRunner {
   };
 }
 
-/** Plan step 5, PR C: the log of the extension as the Logger of a ContainerAdapter in the worker. */
-function contextLogger(context: OperationContext): Logger {
-  return {
-    info: (message) => context.log(message),
-    warn: (message) => context.log(message, 'warn'),
-    error: (message) => context.log(message, 'warn'),
-    output: () => {},
-  };
-}
-
 /**
  * Plan step 5, PR C: `refresh`: readEnvironmentStates with a ContainerAdapter over the Docker CLI of the worker, the
  * same code as the refresh without the worker. It only reads; it takes no secret.
@@ -163,6 +155,12 @@ const ENGINE_OF: EngineOfOperation = (context) => dockerEngine(ENGINE, HIJACK, (
 /** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
 const BATCH = batchDeps();
 
+/**
+ * Plan step 11B3b: the worker's own helper image and socket, read once from the engine (the inspect of its own container,
+ * whose host name is its short ID), and again after a failure, each read within a time limit (ownHelperOfEngine).
+ */
+const OWN_HELPER_OF: OwnHelperOf = ownHelperOfEngine(ENGINE_OF, () => os.hostname());
+
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
   [OP_PROBE]: probeOperation,
@@ -181,4 +179,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_TOKEN_REMOVE]: tokenRemoveOperation(ENGINE_OF),
   // Plan step 11B2: Stop, under the lock that the operation takes itself.
   [OP_STOP]: stopOperation(ENGINE_OF),
+  // Plan step 11B3b: the listing of Select configuration, by the worker's own pipeline.
+  [OP_LIST_CONFIGURATIONS]: listConfigurationsOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
 };

@@ -106,6 +106,8 @@ describeUnix('the batch helper of the worker in Node.js processes (plan step 6, 
     fs.writeFileSync(path.join(dir, 'bin', 'docker'), FAKE_DOCKER, { mode: 0o755 });
     env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`, FAKE_DOCKER_LOG: path.join(dir, 'calls.log'), FAKE_DOCKER_DIR: dir };
     const result = await esbuild.build({
+      // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
+      define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
       entryPoints: [path.resolve(__dirname, 'main.ts')],
       bundle: true,
       platform: 'node',

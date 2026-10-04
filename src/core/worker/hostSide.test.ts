@@ -6,9 +6,9 @@
 // requests, hostSideHandler answers them. Here they are wired to each other, so one test covers both.
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import { OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
-import type { Environment, RegistryFile, WindowStatus } from '../types';
+import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { FLOW_REQUESTS, parseHostRequest, type HostCall, type HostSide } from './hostSide';
 import { hostSideHandler } from './hostSideHandler';
 import { workerHostSide } from './workerHostSide';
@@ -20,7 +20,7 @@ const ALL: readonly HostCall[] = [
   ...['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message', 'unknown', 'Bad-Call'].map(
     (call) => `question ${call}` as const,
   ),
-  ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'unknown'].map((call) => `local ${call}` as const),
+  ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
   ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile'].map((call) => `record ${call}` as const),
   'secret token',
   'secret registry',
@@ -48,6 +48,7 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       pendings: async () => (record('pendings'), of('pendings', [] as readonly { environmentId: string; windowId: string; createdAt: string }[])),
       settings: async () => (record('settings'), of('settings', { stopAfterMinutes: 10 })),
       processAlive: async (pid) => (record('processAlive', pid), of('processAlive', true)),
+      account: async (interactive) => (record('account', interactive), of('account', undefined as GitHubAccount | undefined)),
     },
     records: {
       read: async () => (record('read'), of('read', { version: 1, environments: [] } as RegistryFile)),
@@ -139,6 +140,34 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
     expect(requests.map((request) => request.kind)).toEqual(['local', 'local', 'local', 'record', 'record', 'record', 'record', 'record', 'record', 'record', 'record']);
     expect(calls.filter((call) => call.call === 'processAlive')).toEqual([{ call: 'processAlive', args: [42] }]);
     expect(calls.at(-1)).toEqual({ call: 'sessionFile', args: ['removePending', 'e1'] });
+  });
+
+  // Plan step 11B3b: the account of the sign-in, its id and login only, and only when it has an id.
+  it('reads the signed-in account, with the interactive flag, and nothing but its id and login', async () => {
+    const { worker, calls, requests } = wired({ account: { id: '42', login: 'octo', accessToken: 'gho_x' } as unknown as GitHubAccount });
+    expect(await worker.state.account(true)).toEqual({ id: '42', login: 'octo' });
+    expect(calls).toEqual([{ call: 'account', args: [true] }]);
+    expect(requests).toEqual([{ kind: 'local', call: 'account', args: [true] }]);
+    expect(JSON.stringify(requests)).not.toContain('gho_x');
+    const none = wired({ account: undefined });
+    expect(await none.worker.state.account(false)).toBeUndefined();
+    expect(none.calls).toEqual([{ call: 'account', args: [false] }]);
+    // A flag that is no boolean is refused before this computer is touched.
+    await expect(none.handler('local', { call: 'account', args: ['yes'] }, none.signal)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(none.handler('local', { call: 'account', args: [] }, none.signal)).rejects.toMatchObject({ code: 'invalid' });
+    expect(none.calls).toHaveLength(1);
+    // An answer without an id is no account (the worker side).
+    for (const answer of [{ id: '' }, { login: 'octo' }, 'octo', 42]) {
+      const odd = workerHostSide(async () => answer, () => undefined);
+      expect(await odd.state.account(false)).toBeUndefined();
+    }
+    const noLogin = workerHostSide(async () => ({ id: '7' }), () => undefined);
+    expect(await noLogin.state.account(false)).toEqual({ id: '7', login: '' });
+    // Review round 1 of 11B3b (B-R1-12): each side keeps only the id and the login.
+    const { handler, signal } = wired({ account: { id: '42', login: 'octo', accessToken: 'gho_x' } as unknown as GitHubAccount });
+    expect(await handler('local', { call: 'account', args: [true] }, signal)).toEqual({ value: { id: '42', login: 'octo' } });
+    const extra = workerHostSide(async () => ({ id: '42', login: 'octo', accessToken: 'gho_x' }), () => undefined);
+    expect(await extra.state.account(true)).toEqual({ id: '42', login: 'octo' });
   });
 
   it('gets a secret only through the secrets of the answer, never in its value', async () => {
@@ -259,6 +288,8 @@ describe('the handler of the requests on the side of the extension (plan step 11
     expect(FLOW_REQUESTS[OP_TOKEN_REMOVE]).toEqual(['record get']);
     // Plan step 11B2 (review round 1, B-R1-8): Stop asks for nothing.
     expect(FLOW_REQUESTS[OP_STOP]).toEqual([]);
+    // Plan step 11B3b: the listing reads the record and the account, nothing else.
+    expect(FLOW_REQUESTS[OP_LIST_CONFIGURATIONS]).toEqual(['record get', 'local account']);
     for (const [kind, call] of [
       ['secret', 'token'],
       ['record', 'remove'],

@@ -245,6 +245,65 @@ export class OutputTail {
   }
 }
 
+/**
+ * Plan step 11B3b: the result of one batch step as ProcessRunner.run gives it, from the step's output and value, for the
+ * extension's client of a batch session (HelperChannel.batch) and for the worker's own session (src/helperChannel
+ * /batch.ts) alike: the standard output, at most `maxStdoutBytes` (beyond: the step is cancelled and OutputTooLargeError
+ * thrown); the end of the standard error output; `timedOut` when the step ended at its time limit. Both streams are
+ * masked with the secrets of the step, also across pieces (the helper masks them before). `run` sends the step with the
+ * signal and the output listener it is given.
+ */
+export async function collectBatchStep(
+  kind: BatchStepKind,
+  options: BatchStepOptions,
+  maxStdoutBytes: number,
+  run: (signal: AbortSignal, onOutput: (stream: 'stdout' | 'stderr', piece: string) => void) => Promise<unknown>,
+): Promise<RunResult> {
+  let stdout = '';
+  let stdoutBytes = 0;
+  const stderr = new OutputTail(MAX_CAPTURED_STDERR_CHARACTERS);
+  let tooLarge = false;
+  const tooLargeAbort = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
+  const streams = {
+    stdout: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
+      if (tooLarge) return;
+      stdoutBytes += Buffer.byteLength(piece, 'utf8');
+      if (stdoutBytes > maxStdoutBytes) {
+        tooLarge = true;
+        stdout = '';
+        tooLargeAbort.abort();
+        return;
+      }
+      stdout += piece;
+      options.onOutput?.('stdout', piece);
+    }),
+    stderr: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
+      stderr.push(piece);
+      options.onOutput?.('stderr', piece);
+    }),
+  };
+  const flush = () => {
+    streams.stdout.flush();
+    streams.stderr.flush();
+  };
+  try {
+    const result = await run(signal, (stream, piece) => streams[stream].push(piece));
+    flush();
+    // Review round 2 of PR #80, B-R2-1: stdout beyond the cap never ends as a success with an empty stdout, also when
+    // the result came before the cancel took effect.
+    if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
+    const checked = parseBatchStepValue(result);
+    if (checked === undefined) throw new HelperChannelError('protocol', 'The helper answered the batch step with an invalid value.');
+    return { exitCode: checked.exitCode, stdout, stderr: stderr.text, timedOut: false };
+  } catch (error) {
+    flush();
+    if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
+    if (error instanceof HelperOperationError && (error.timedOut || error.code === 'timeout')) return { exitCode: null, stdout, stderr: stderr.text, timedOut: true };
+    throw error;
+  }
+}
+
 /** Live check of 2026-10-03: the abort reason of `release` of a held lock or batch helper (hold). */
 const HOLD_RELEASED = Symbol('released');
 
@@ -918,58 +977,16 @@ export class HelperChannel {
       delete request.params;
       request.input = input;
     }
-    let stdout = '';
-    let stdoutBytes = 0;
-    const maxStdoutBytes = this.options.maxCapturedOutputBytes ?? MAX_CAPTURED_OUTPUT_BYTES;
-    const stderr = new OutputTail(MAX_CAPTURED_STDERR_CHARACTERS);
-    let tooLarge = false;
-    const tooLargeAbort = new AbortController();
-    const signal = options.signal ? AbortSignal.any([options.signal, tooLargeAbort.signal]) : tooLargeAbort.signal;
-    // The output of the step, masked here too (the worker and the helper mask it before), also across pieces.
-    const streams = {
-      stdout: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
-        if (tooLarge) return;
-        stdoutBytes += Buffer.byteLength(piece, 'utf8');
-        if (stdoutBytes > maxStdoutBytes) {
-          tooLarge = true;
-          stdout = '';
-          tooLargeAbort.abort();
-          return;
-        }
-        stdout += piece;
-        options.onOutput?.('stdout', piece);
-      }),
-      stderr: new StreamRedactor(Object.values(options.secrets ?? {}), (piece) => {
-        stderr.push(piece);
-        options.onOutput?.('stderr', piece);
-      }),
-    };
-    const flush = () => {
-      streams.stdout.flush();
-      streams.stderr.flush();
-    };
-    try {
-      const result = await this.operation(OP_BATCH_STEP, request, {
+    return collectBatchStep(kind, options, this.options.maxCapturedOutputBytes ?? MAX_CAPTURED_OUTPUT_BYTES, (signal, onOutput) =>
+      this.operation(OP_BATCH_STEP, request, {
         secrets: options.secrets,
         // The helper ends the step at its time limit; the worker and this side wait longer for its result.
         timeoutMs: options.timeoutMs === undefined ? undefined : Math.min(options.timeoutMs + 2 * CHANNEL_RESULT_GRACE_MS, MAX_OPERATION_TIMEOUT_MS),
         reserved: true,
         signal,
-        onOutput: (stream, piece) => streams[stream].push(piece),
-      });
-      flush();
-      // Review round 2 of PR #80, B-R2-1: stdout beyond the cap never ends as a success with an empty stdout, also when
-      // the result came before the cancel took effect.
-      if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
-      const checked = parseBatchStepValue(result);
-      if (checked === undefined) throw new HelperChannelError('protocol', 'The helper answered the batch step with an invalid value.');
-      return { exitCode: checked.exitCode, stdout, stderr: stderr.text, timedOut: false };
-    } catch (error) {
-      flush();
-      if (tooLarge) throw new OutputTooLargeError(kind, maxStdoutBytes);
-      if (error instanceof HelperOperationError && (error.timedOut || error.code === 'timeout')) return { exitCode: null, stdout, stderr: stderr.text, timedOut: true };
-      throw error;
-    }
+        onOutput,
+      }),
+    );
   }
 
   /**
