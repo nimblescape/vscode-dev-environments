@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
 import { SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { scriptCommand } from '../core/worker/containerScripts';
-import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi } from './engineApi';
+import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
 import { dockerEngine, MAX_EXEC_OUTPUT_CHARACTERS } from './engineClient';
 
 interface Call {
@@ -577,6 +577,131 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       // Review round 1 of 11B3a (A-R1-1): the throwaway container goes with its anonymous volumes (`v=true`).
       expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
       expect(decodeURIComponent(failing.calls.find((call) => call.url.startsWith('/commit'))!.url)).toContain('repo=img&tag=latest');
+    });
+
+    // Review round 2 of 11B3a (mutation testing of reviewer B): the requests and the reading of the answers, exactly.
+    describe('the requests and answers, exactly (review round 2 of 11B3a, B-R2-1 to B-R2-10, B-R2-15)', () => {
+      type Route = (request: EngineRequest) => EngineAnswer | Promise<EngineAnswer> | undefined;
+      const ok = (value: unknown, status = 200): EngineAnswer => ({ status, body: typeof value === 'string' ? value : JSON.stringify(value), truncated: false });
+      function fake(route: Route): { engine: DockerEngine; requests: EngineRequest[] } {
+        const requests: EngineRequest[] = [];
+        const api: EngineApi = async (request) => {
+          requests.push(request);
+          return (await route(request)) ?? ok({ message: 'not routed' }, 500);
+        };
+        return { engine: dockerEngine(api, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket'))), requests };
+      }
+      const containerJson = (id: string) => ({ Id: id, Name: `/${id}`, State: { Status: 'running', Running: true }, Config: { Labels: {}, Image: 'img' }, Mounts: [] });
+
+      it('B-R2-1: the paths of the inspects and the encoded filters', async () => {
+        const { engine, requests } = fake((request) => (request.path.endsWith('/json') && request.path.startsWith('/images/') ? ok({ Id: 'sha256:1' }) : request.path.startsWith('/networks/') ? ok({ Name: 'n' }) : ok([])));
+        expect(await engine.inspect('image', 'x:1')).toEqual({ Id: 'sha256:1' });
+        expect(await engine.inspect('network', 'n')).toEqual({ Name: 'n' });
+        await engine.containerIds({ label: ['a=b'] });
+        expect(requests.map((request) => request.path)).toEqual(['/images/x%3A1/json', '/networks/n', `/containers/json?all=true&filters=%7B%22label%22%3A%5B%22a%3Db%22%5D%7D`]);
+      });
+
+      it('B-R2-3, B-R2-10: a container gone since the list is left out, the ones after it are not; an invalid inspect fails', async () => {
+        const { engine } = fake((request) => {
+          if (request.path.startsWith('/containers/json')) return ok([{ Id: 'a' }, { Id: 'gone' }, { Id: 'c' }]);
+          if (request.path === '/containers/gone/json') return ok({ message: 'No such container' }, 404);
+          if (request.path === '/containers/bad/json') return ok({ Id: 'bad' });
+          return ok(containerJson(request.path.split('/')[2]));
+        });
+        expect((await engine.containers('l')).map((container) => container.id)).toEqual(['a', 'c']);
+        await expect(engine.container('bad')).rejects.toBeInstanceOf(EngineError);
+        // An inspect answered with a list is no object (B-R2-15).
+        const listed = fake(() => ok([]));
+        await expect(listed.engine.inspect('image', 'x')).rejects.toThrow('invalid value');
+      });
+
+      it('B-R2-4, B-R2-5: the labels of an image, and a volume list of null', async () => {
+        const { engine } = fake((request) =>
+          request.path.startsWith('/images/json') ? ok([{ Id: 'sha256:1', RepoTags: ['a:1'], RepoDigests: [], Labels: { k: 'v', n: 1 }, Created: 0 }]) : ok({ Volumes: null, Warnings: null }),
+        );
+        expect((await engine.images({}))[0].labels).toEqual({ k: 'v' });
+        expect(await engine.volumeNames({})).toEqual([]);
+      });
+
+      it('B-R2-6: labelImage overrides an old label, creates with `Cmd [true]`, and splits a registry port from the tag', async () => {
+        const { engine, requests } = fake((request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: { Labels: { keep: 'x', add: 'old' } } });
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'tmp' }, 201);
+          if (request.path.startsWith('/commit')) return ok({ Id: 'sha256:new' }, 201);
+          return ok('', 204);
+        });
+        await engine.labelImage('registry:5000/name', { add: 'y' });
+        expect(requests.find((request) => request.path.startsWith('/containers/create'))?.json).toEqual({ Image: 'registry:5000/name', Cmd: ['true'], Entrypoint: [], Labels: {} });
+        const commit = requests.find((request) => request.path.startsWith('/commit'))!;
+        expect(commit.json).toEqual({ Labels: { keep: 'x', add: 'y' } });
+        expect(decodeURIComponent(commit.path)).toContain('repo=registry:5000/name&tag=latest');
+        // A cancel while the create is pending: the create is not cancelled (A-R1-7); the container is removed.
+        const controller = new AbortController();
+        const slow = fake(async (request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+          if (request.path.startsWith('/containers/create')) {
+            controller.abort();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            if (request.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            return ok({ Id: 'tmp2' }, 201);
+          }
+          if (request.path.startsWith('/commit')) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          return ok('', 204);
+        });
+        await expect(slow.engine.labelImage('img:1', {}, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+        expect(slow.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/tmp2?force=true&v=true' });
+        // A missing image is an EngineError 404 (B-R2-15).
+        const missing = fake(() => ok({ message: 'No such image' }, 404));
+        await expect(missing.engine.labelImage('img:1', {})).rejects.toMatchObject({ status: 404 });
+      });
+
+      it('B-R2-7, B-R2-8, B-R2-9: runContainer follows the cancel, reads the wait strictly, and cleans the log', async () => {
+        const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: {}, volumes: [] };
+        let wait: () => EngineAnswer | Promise<EngineAnswer> = () => ok({ StatusCode: 0 });
+        let log = '';
+        const { engine, requests } = fake((request) => {
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'r' }, 201);
+          if (request.path.endsWith('/wait')) return wait();
+          if (request.path.includes('/logs')) return ok(log);
+          return ok('', 204);
+        });
+        // B-R2-7: a cancel of the caller ends a hanging wait with an AbortError, not as timed out; the container goes.
+        wait = () =>
+          new Promise((_resolve, reject) => {
+            const signal = requests.at(-1)!.signal!;
+            signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+          });
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 20);
+        await expect(engine.runContainer(spec, { signal: controller.signal, timeoutMs: 60_000 })).rejects.toMatchObject({ name: 'AbortError' });
+        expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
+        // B-R2-8: a wait without a status code is no success; a wait that fails is a failure, and the container goes.
+        wait = () => ok({});
+        expect(await engine.runContainer(spec)).toMatchObject({ exitCode: null, timedOut: false });
+        wait = () => ok({ message: 'boom' }, 500);
+        await expect(engine.runContainer(spec)).rejects.toMatchObject({ status: 500 });
+        expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
+        // B-R2-9: the headers of the frames of the log are left out, and its end is kept.
+        wait = () => ok({ StatusCode: 1 });
+        const frame = (stream: number, text: string) => String.fromCharCode(stream, 0, 0, 0, 0, 0, 0, text.length) + text;
+        log = frame(1, 'out\n') + frame(2, 'err\n');
+        expect((await engine.runContainer(spec)).output).toBe('out\nerr\n');
+        log = 'a'.repeat(70 * 1024) + 'THE END';
+        const long = (await engine.runContainer(spec)).output;
+        expect(long.endsWith('THE END')).toBe(true);
+        expect(long.length).toBe(64 * 1024);
+      });
+
+      it('B-R2-15: a pull prints a line that is no JSON, fails with the first error, and needs the secret of its login', async () => {
+        const { engine } = fake((request) => {
+          request.onChunk?.('plain text\n{"error":"first"}\n{"error":"second"}\n');
+          return ok('');
+        });
+        const lines: string[] = [];
+        await expect(engine.pull('a:1', { onLine: (line) => lines.push(line) })).rejects.toThrow('first');
+        expect(lines).toEqual(['plain text']);
+        await expect(engine.pull('a:1', { login: { serveraddress: 'r', username: 'u', secretName: 'missing' } })).rejects.toThrow('holds no secret missing');
+      });
     });
 
     it('names the container of the commit, and removes it with a time limit of its own (review round 3 of 11B3a, A-R3-1, A-R3-3)', async () => {

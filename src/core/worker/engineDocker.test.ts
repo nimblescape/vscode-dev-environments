@@ -97,6 +97,10 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     names = { Id: 'sha256:old', RepoTags: ['other:1'], RepoDigests: [] };
     await docker.labelImage('img:1', { a: 'b' });
     expect(removed).toEqual(['sha256:old']);
+    // Review round 2 of 11B3a (B-R2-11): an image that a digest still names is kept too.
+    names = { Id: 'sha256:old', RepoTags: [], RepoDigests: [`r@sha256:${'d'.repeat(64)}`] };
+    await docker.labelImage('img:1', { a: 'b' });
+    expect(removed).toEqual(['sha256:old']);
     const missing: DockerEngine = { ...unusedEngine(), inspect: async () => undefined };
     await expect(new EngineDocker(missing).labelImage('img:1', {})).rejects.toThrow('The image img:1 does not exist.');
   });

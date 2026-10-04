@@ -19,6 +19,7 @@ import {
   sshDroppedReadCall,
   toLabels,
   type ImageInspection,
+  volumeRunArgs,
 } from './containerAdapter';
 import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 import { dockerTargetOf, remoteContextNames } from './dockerHost';
@@ -1971,5 +1972,41 @@ describe('ContainerAdapter.start (user request 2026-09-28: the helper channel)',
     expect(withoutStart.start(['ps'])).toBeUndefined();
     const withoutCli = new ContainerAdapter(runner, undefined, {}, silentLogger, 'linux');
     expect(withoutCli.start(['ps'])).toBeUndefined();
+  });
+});
+
+// Review round 2 of 11B3a (B-R2-14): the typed calls of plan step 11B3, with their exact arguments and options.
+describe('the typed calls of the ownership fix (plan step 11B3)', () => {
+  const run = { image: 'img:1', volume: 'v', target: '/workspaces', entrypoint: 'sh', args: ['-c', 'x'], user: 'root', labels: { a: 'b', c: 'd' } };
+
+  it('volumeRunArgs: a run that never pulls, without a network, with init, removed at its end', () => {
+    expect(volumeRunArgs(run)).toEqual([
+      'run', '--rm', '--init', '--pull', 'never', '--network', 'none',
+      '--label', 'a=b', '--label', 'c=d',
+      '--user', 'root', '--entrypoint', 'sh',
+      '--mount', 'type=volume,source=v,target=/workspaces',
+      'img:1', '-c', 'x',
+    ]);
+  });
+
+  it('imageConfig, runOnVolume, containerIdsWithLabel: their arguments, their options, and the parsing of the answers', async () => {
+    let answer = ok('{"User":"vscode"}\n');
+    const { docker, runner } = adapter(() => answer);
+    const signal = new AbortController().signal;
+    expect(await docker.imageConfig('img:1', { timeoutMs: 7, signal })).toEqual({ User: 'vscode' });
+    expect(runner.calls.at(-1)?.args).toEqual(['image', 'inspect', '--format', '{{json .Config}}', 'img:1']);
+    expect(runner.calls.at(-1)?.options).toMatchObject({ timeoutMs: 7, signal });
+    answer = ok('');
+    await docker.runOnVolume(run, { timeoutMs: 8, signal });
+    expect(runner.calls.at(-1)?.args).toEqual(volumeRunArgs(run));
+    expect(runner.calls.at(-1)?.options).toMatchObject({ timeoutMs: 8, signal });
+    answer = ok('');
+    expect(await docker.containerIdsWithLabel('k=v', { timeoutMs: 9, signal })).toEqual([]);
+    expect(runner.calls.at(-1)?.args).toEqual(['ps', '-aq', '--no-trunc', '--filter', 'label=k=v']);
+    expect(runner.calls.at(-1)?.options).toMatchObject({ timeoutMs: 9, signal });
+    answer = ok('a\n\nb\n');
+    expect(await docker.containerIdsWithLabel('k=v')).toEqual(['a', 'b']);
+    answer = fail('boom', 125);
+    await expect(docker.runOnVolume(run)).rejects.toBeInstanceOf(CommandError);
   });
 });

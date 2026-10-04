@@ -144,7 +144,8 @@ describe('pull (plan step 10A)', () => {
 
   // Review round 1 of PR #89 (A-R1-1): the engine decodes the header with Go's base64.URLEncoding, which needs the padding.
   it('registryAuthHeader is URL-safe Base64 with its padding, for every length', () => {
-    for (const password of ['p', 'pa', 'pas', 'pass+/?~']) {
+    // Review round 2 of 11B3a (B-R2-2): '???' and '~~~' give a `/` and a `+` in Base64, which must not stay.
+    for (const password of ['p', 'pa', 'pas', 'pass+/?~', '???', '~~~']) {
       const header = registryAuthHeader({ username: 'u', password, serveraddress: 'ghcr.io' });
       const json = JSON.stringify({ username: 'u', password, serveraddress: 'ghcr.io' });
       expect(header).toBe(Buffer.from(json, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_'));

@@ -31,6 +31,7 @@ import {
   HOST_ACCESS_UNRESTRICTED,
   LABEL_BUILD_RECORD,
   LABEL_CHANNEL_STEP,
+  LABEL_HELPER_RUN,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
@@ -413,11 +414,29 @@ describe('open: first open', () => {
     // Review round 1 of PR #82 (A-R1-1): `--init` and a cleanup label of its own (channelStepLabel, a new value per run).
     expect(run.all).toContain('--init');
     expect(run.all.filter((arg) => new RegExp(`^${LABEL_CHANNEL_STEP}=[0-9a-f]{24}$`).test(arg))).toHaveLength(1);
+    // Review round 2 of 11B3a (B-R2-13): the label of the helper runs.
+    expect(run.all).toContain(`${LABEL_HELPER_RUN}=true`);
     expect(run.args[0]).toBe('-c');
     expect(run.args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
     // The fix after up stays, for files that up itself creates as root.
     // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
     expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
+  });
+
+  // Review round 2 of 11B3a (B-R2-12): the time limits and the signal of the open on the read of the image and on the run.
+  it('reads the image and runs the fix before up with their time limits and the signal of the open', async () => {
+    const controller = new AbortController();
+    await h.service.open(TARGET, options({ signal: controller.signal }));
+    const calls = h.docker.typedCalls.filter((call) => call.method !== 'containerIdsWithLabel');
+    const signal = calls[0].options.signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(calls.filter((call) => call.method === 'runOnVolume')).toEqual([{ method: 'runOnVolume', options: { timeoutMs: 10 * 60_000, signal } }]);
+    const reads = calls.filter((call) => call.method === 'imageConfig');
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) expect(read.options).toEqual({ timeoutMs: 60_000, signal });
+    // It is the signal of the open (or one that follows it).
+    controller.abort();
+    expect(signal?.aborted).toBe(true);
   });
 
   it('gives the cloned files to the user of --user in runArgs when no remoteUser is set (rule of the Dev Container CLI)', async () => {
@@ -509,6 +528,8 @@ describe('open: first open', () => {
     expect(listed).toBeGreaterThanOrEqual(0);
     expect(removed).toBeGreaterThan(listed);
     expect(volumeRemoved).toBeGreaterThan(removed);
+    // Review round 2 of 11B3a (B-R2-12): the list of the cleanup has a time limit and never the aborted signal of the open.
+    expect(h.docker.typedCalls.filter((call) => call.method === 'containerIdsWithLabel')).toEqual([{ method: 'containerIdsWithLabel', options: { timeoutMs: 60_000 } }]);
     expect(await h.registry.list()).toEqual([]);
     expect(h.docker.volumes.size).toBe(0);
   });
