@@ -239,6 +239,8 @@ describe('listConfigurations in the worker: review round 1 of 11B3b', () => {
     expect(() => flowRefusal(new UserFacingError('cancelled', 'The user dismissed it.'), live)).toThrow(expect.objectContaining({ code: 'cancelled' }));
     const aborted = { ...live, signal: AbortSignal.abort() } as OperationContext;
     expect(() => flowRefusal(new UserFacingError('helperFailed', 'x'), aborted)).toThrow(expect.objectContaining({ code: 'cancelled' }));
+    // An AbortError of the pipeline is a cancel, also before the operation's signal says so.
+    expect(() => flowRefusal(Object.assign(new Error('aborted'), { name: 'AbortError' }), live)).toThrow(expect.objectContaining({ code: 'cancelled' }));
     const busy = new OperationError('busy', 'x');
     expect(() => flowRefusal(busy, live)).toThrow(busy);
     expect(() => flowRefusal(new Error('boom'), live)).toThrow(expect.objectContaining({ code: 'failed', message: 'boom' }));

@@ -64,6 +64,10 @@ describe("the batch session of a flow in the worker (plan step 11B3b)", () => {
     const session = sessionOfHelper(SESSION, helper);
     await expect(session.step('exec' as never, {})).rejects.toBeInstanceOf(HelperChannelError);
     await expect(session.step('listConfigs', { repository: 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS) })).rejects.toThrow('too large');
+    // A step without parameters goes with null (as the extension's client sends it).
+    await session.step('listConfigs', undefined).catch(() => undefined);
+    expect(calls.map((call) => call.params)).toEqual([null]);
+    calls.length = 0;
     const controller = new AbortController();
     controller.abort();
     await expect(session.step('listConfigs', { repository: 'acme/api' }, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
@@ -137,28 +141,35 @@ describe('the step of a batch session: its signal, its output cap, and the colle
 // Review round 1 of 11B3b (B-R1-2): the start of the worker's own batch helper when it fails: what it started is ended
 // and removed by its label; a cancel is cancelled; a removal that fails is logged, never thrown.
 describe('the start of the batch helper of a flow when it fails (review round 1 of 11B3b)', () => {
-  function context(options: { psFails?: boolean } = {}) {
+  function context(options: { psFails?: boolean; abortOnInspect?: boolean } = {}) {
     const calls: string[][] = [];
+    const order: string[] = [];
     const logs: string[] = [];
     const runSignals: AbortSignal[] = [];
     const controller = new AbortController();
     const docker = async (args: readonly string[], callOptions: ContextDockerOptions = {}): Promise<ContextDockerResult> => {
       calls.push([...args]);
-      if (args[0] === 'volume') return { exitCode: 0, stdout: `${args[args.length - 1]}\n`, stderr: '' };
+      if (args[0] === 'volume') {
+        if (options.abortOnInspect) controller.abort();
+        return { exitCode: 0, stdout: `${args[args.length - 1]}\n`, stderr: '' };
+      }
       if (args[0] === 'run') {
         // A helper that never says hello: it ends only when its call is ended.
         callOptions.onInput?.({ write: () => true, end: () => {} });
         if (callOptions.signal) runSignals.push(callOptions.signal);
-        return new Promise((resolve) => callOptions.signal?.addEventListener('abort', () => resolve({ exitCode: null, stdout: '', stderr: '', error: 'ended' })));
+        return new Promise((resolve) =>
+          callOptions.signal?.addEventListener('abort', () => setTimeout(() => (order.push('run ended'), resolve({ exitCode: null, stdout: '', stderr: '', error: 'ended' })), 10)),
+        );
       }
       if (args[0] === 'ps') {
+        order.push('ps');
         if (options.psFails) throw new Error('the engine is gone');
         return { exitCode: 0, stdout: `${'f'.repeat(64)}\n`, stderr: '' };
       }
       return { exitCode: 0, stdout: '', stderr: '' };
     };
     const ctx = { signal: controller.signal, ...contextSecrets({}), progress: () => {}, log: (text: string) => logs.push(text), output: () => {}, docker } as unknown as OperationContext;
-    return { ctx, calls, logs, runSignals, controller };
+    return { ctx, calls, logs, runSignals, controller, order };
   }
   const deps = () => ({ sessions: new Map(), readScript: () => 'script', openTimeoutMs: 100 });
   const target = { volume: 'devenv-v', image: `sha256:${'b'.repeat(64)}`, socket: '/var/run/docker.sock' };
@@ -169,6 +180,21 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
     expect(runSignals[0]?.aborted).toBe(true);
     expect(calls.map((call) => call[0])).toEqual(['volume', 'run', 'ps', 'rm']);
     expect(calls[3]).toEqual(['rm', '-f', 'f'.repeat(64)]);
+    // The helper runs from the image and with the socket of the request; the removal waits for the end of its call.
+    expect(calls[1]).toContain(target.image);
+    expect(calls[1].join(' ')).toContain(`source=${target.socket}`);
+  });
+
+  it('removes only after the call of the helper ended; refuses a request beyond the checks; a cancel during the volume check is cancelled', async () => {
+    const ordered = context();
+    await expect(workerBatchSession(deps(), ordered.ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    expect(ordered.order).toEqual(['run ended', 'ps']);
+    const invalid = context();
+    await expect(workerBatchSession(deps(), invalid.ctx, { ...target, socket: '/var/run/a,b.sock' })).rejects.toMatchObject({ code: 'unsendable' });
+    expect(invalid.calls).toEqual([]);
+    const cancelled = context({ abortOnInspect: true });
+    await expect(workerBatchSession(deps(), cancelled.ctx, target)).rejects.toMatchObject({ code: 'cancelled' });
+    expect(cancelled.calls.map((call) => call[0])).toEqual(['volume']);
   });
 
   it('a cancel during the start is cancelled; a removal that fails is logged and the start still fails as it did', async () => {
