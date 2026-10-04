@@ -1223,7 +1223,7 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     expect(h.state().images[OLD_TAG]?.removedAt).toBeUndefined();
   });
 
-  it('review round 1 of PR #101 (A-M1): keeps a helper tag with its monitor tag while a container uses its image', async () => {
+  it('review round 1 of PR #101 (A-M1): removes the monitor tag but keeps its helper tag while a container uses its image', async () => {
     const { h } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) } });
     const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
     const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
