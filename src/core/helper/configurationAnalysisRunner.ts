@@ -56,8 +56,12 @@ export const ANALYSIS_LIMITS: Readonly<AnalysisLimits> = {
  * something else; also the time limit before the worker was running).
  */
 export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
+  /**
+   * `script`: the path of the bundle of the thread (the extension: dist/configurationAnalysisWorker.js), or (plan step
+   * 11E2) its text, which the worker carries in its own bundle (`devenv:analysis-script`) and starts with `eval`.
+   */
   constructor(
-    private readonly scriptPath: string,
+    private readonly script: string | { code: string },
     private readonly logger?: Pick<Logger, 'warn'>,
     private readonly limits: Readonly<AnalysisLimits> = ANALYSIS_LIMITS,
     private readonly maxJobCharacters: number = MAX_ANALYSIS_JOB_CHARACTERS,
@@ -99,7 +103,10 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
         this.limits.timeoutMs,
       );
       try {
-        worker = new Worker(this.scriptPath, {
+        // A path, or (plan step 11E2) the text of the script, which `eval` runs.
+        const evaluated = typeof this.script !== 'string';
+        worker = new Worker(typeof this.script === 'string' ? this.script : this.script.code, {
+          eval: evaluated,
           resourceLimits: {
             maxOldGenerationSizeMb: this.limits.maxOldGenerationSizeMb,
             maxYoungGenerationSizeMb: this.limits.maxYoungGenerationSizeMb,
@@ -176,4 +183,27 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
     interval.unref?.();
     return interval;
   }
+}
+
+/**
+ * Plan step 11E2 (review round 1 of PR #103, A-L1): at most `max` jobs of the analyzers that share this limit run at once
+ * (each in a thread of up to its memory limit); the others wait in order. The worker's operations share one, so
+ * concurrent operations cannot add up threads without a bound.
+ */
+export function analysisSlots(max: number): <J extends AnalysisJob>(run: () => Promise<AnalysisResult<J>>) => Promise<AnalysisResult<J>> {
+  // Review round 2 of PR #103 (A-L2): with no slot at all, every job would wait forever.
+  if (!Number.isInteger(max) || max < 1) throw new RangeError(`The analysis needs at least one slot, not ${max}.`);
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return async (run) => {
+    if (running >= max) await new Promise<void>((resolve) => waiting.push(resolve));
+    else running++;
+    try {
+      return await run();
+    } finally {
+      const next = waiting.shift();
+      if (next !== undefined) next();
+      else running--;
+    }
+  };
 }

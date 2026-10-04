@@ -22,8 +22,9 @@ import {
   runAnalysisJob,
   transferableJob,
   type AnalysisJob,
+  type AnalysisResult,
 } from './configurationAnalysis';
-import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from './configurationAnalysisRunner';
+import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, analysisSlots, type AnalysisLimits } from './configurationAnalysisRunner';
 import type { ComposeAccessInput } from '../policy';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
@@ -335,6 +336,33 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect((await analyzer().analyze(other)).failure?.kind).toBe('internal');
   });
 
+  it('plan step 11E2: runs from the text of its script (the worker carries it) as from its path, with the same limits', async () => {
+    const code = fs.readFileSync(bundle, 'utf8');
+    const variables = helperCliVariables('acme/api');
+    const job: AnalysisJob = {
+      kind: 'hostAccess',
+      checksOn: true,
+      input: { ownVolume: OWN, variables, metadata: [{ mounts: ['source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind'] }] },
+    };
+    const fromText = await new WorkerConfigurationAnalyzer({ code }, warnings()).analyze(job);
+    expect(fromText.failure).toBeUndefined();
+    expect(fromText.report).toEqual((await analyzer().analyze(job)).report);
+    expect(fromText.report.hostAccess).toEqual(['bind mount /root/.ssh']);
+    // The time limit holds for a script from text too.
+    const slow = 'require("worker_threads").parentPort.on("message", () => { const t = Date.now(); while (Date.now() - t < 2000); });';
+    const result = await new WorkerConfigurationAnalyzer({ code: slow }, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 300 }).analyze(job);
+    expect(result.failure).toEqual({ kind: 'limit', reason: 'it took longer than 300 ms' });
+    // So does the memory limit.
+    const greedy = 'require("worker_threads").parentPort.on("message", () => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); });';
+    const memory = await new WorkerConfigurationAnalyzer({ code: greedy }, warnings(), { ...ANALYSIS_LIMITS, timeoutMs: 20_000, maxOldGenerationSizeMb: 32 }).analyze(job);
+    expect(memory.failure?.kind).toBe('limit');
+    expect(memory.report).toEqual(REFUSED);
+    // A text that does not compile is an internal failure, refused.
+    const broken = await new WorkerConfigurationAnalyzer({ code: 'this is not JavaScript' }, warnings()).analyze(job);
+    expect(broken.failure?.kind).toBe('internal');
+    expect(broken.report).toEqual({ hostAccess: [], unsupported: [analysisInternalItem(broken.failure!.reason)] });
+  });
+
   it('is built by esbuild.mjs and included in the package', () => {
     expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("entryPoints: ['src/core/helper/configurationAnalysisWorker.ts']");
     expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("'dist/configurationAnalysisWorker.js'");
@@ -342,5 +370,60 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect(fs.readFileSync(path.join(ROOT, 'src', 'vscode', 'extension.ts'), 'utf8')).toContain(
       "new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger)",
     );
+  });
+});
+
+describe('analysisSlots (plan step 11E2, review round 1 of PR #103, A-L1)', () => {
+  it('runs at most `max` jobs at once, the others in order, and frees a slot also when a job fails', async () => {
+    const slots = analysisSlots(2);
+    const started: string[] = [];
+    const finish = new Map<string, (fail?: boolean) => void>();
+    const job = (name: string) =>
+      slots(
+        () =>
+          new Promise<AnalysisResult<AnalysisJob>>((resolve, reject) => {
+            started.push(name);
+            finish.set(name, (fail) => (fail ? reject(new Error(name)) : resolve({ name } as never)));
+          }),
+      );
+    const a = job('a');
+    const b = job('b');
+    const c = job('c');
+    const d = job('d');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b']);
+    finish.get('a')!(true);
+    await expect(a).rejects.toThrow('a');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b', 'c']);
+    finish.get('b')!();
+    expect(await b).toEqual({ name: 'b' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b', 'c', 'd']);
+    finish.get('c')!();
+    finish.get('d')!();
+    await Promise.all([c, d]);
+    // Both slots are free again: two new jobs start at once.
+    const e = job('e');
+    const f = job('f');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started.slice(-2)).toEqual(['e', 'f']);
+    finish.get('e')!();
+    finish.get('f')!();
+    await Promise.all([e, f]);
+  });
+});
+
+describe('analysisSlots: its guards (review round 2 of PR #103, A-L2)', () => {
+  it('refuses fewer than one slot, and frees a slot when a job throws at once', async () => {
+    for (const max of [0, -1, 1.5, Number.NaN]) expect(() => analysisSlots(max)).toThrow(RangeError);
+    const slots = analysisSlots(1);
+    await expect(
+      slots((): Promise<AnalysisResult<AnalysisJob>> => {
+        throw new Error('at once');
+      }),
+    ).rejects.toThrow('at once');
+    // The slot is free again.
+    expect(await slots(async () => ({ ok: true }) as never)).toEqual({ ok: true });
   });
 });

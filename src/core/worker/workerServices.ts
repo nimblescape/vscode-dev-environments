@@ -140,7 +140,7 @@ export function hostUi(questions: HostSide['questions'], log: Logger): PipelineU
   };
 }
 
-/** Plan step 11E brings the host access analysis into the worker (its analysis thread); until then nothing is analyzed. */
+/** Without the analysis thread of the worker (WorkerServicesDeps.analyzer, plan step 11E2), nothing is analyzed. */
 const ANALYZER_NOT_IN_WORKER: ConfigurationAnalyzer = {
   analyze: async () => {
     throw notInWorker('The host access analysis', '11E');
@@ -165,6 +165,11 @@ export interface WorkerServicesDeps {
   settings?: ExtensionSettings;
   /** Plan step 11C2a: the id of the computer that sent the operation in the Session Monitor (Delete's `forget`). */
   monitorSource?: string;
+  /**
+   * Plan step 11E2: the host access analysis in the worker (its analysis thread, from the script in the worker's bundle,
+   * with its limits); without it, an analysis fails closed.
+   */
+  analyzer?: ConfigurationAnalyzer;
 }
 
 /** The core services of one operation in the worker (see the module comment). */
@@ -239,7 +244,7 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
       if (deps.settings === undefined) throw notInWorker('A read of the settings without them', '11E');
       return deps.settings;
     },
-    analyzer: ANALYZER_NOT_IN_WORKER,
+    analyzer: deps.analyzer ?? ANALYZER_NOT_IN_WORKER,
     dockerTarget: async () => ({ kind: deps.dockerHost === '' ? 'local' : 'remote', host: deps.dockerHost, endpoint: '' }),
     environmentLock: deps.environmentLock,
     // Plan step 11C1: the pipeline of the worker reads the states itself, over its engine.

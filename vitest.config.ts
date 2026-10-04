@@ -9,9 +9,14 @@ import { devcontainerCliVersion } from './scripts/cliVersion.mjs';
 export default defineConfig({
   // The same compile-time constants as in esbuild.mjs (src/types/globals.d.ts).
   define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(devcontainerCliVersion()) },
-  // Plan step 11D2: the script of the Session Monitor in the bundle of the worker; the tests that import the worker's
-  // code get a stub (a worker that a test bundles gets the real script, scripts/monitorScript.mjs).
-  resolve: { alias: [{ find: /^devenv:monitor-script$/, replacement: path.resolve(__dirname, 'src/helperChannel/monitorScript.stub.ts') }] },
+  // Plan step 11D2 (and 11E2): the scripts in the bundle of the worker; the tests that import the worker's code get stubs
+  // (a worker that a test bundles gets the real scripts, scripts/workerScripts.mjs).
+  resolve: {
+    alias: [
+      { find: /^devenv:monitor-script$/, replacement: path.resolve(__dirname, 'src/helperChannel/monitorScript.stub.ts') },
+      { find: /^devenv:analysis-script$/, replacement: path.resolve(__dirname, 'src/helperChannel/analysisScript.stub.ts') },
+    ],
+  },
   test: {
     include: ['src/**/*.test.ts'],
     environment: 'node',
