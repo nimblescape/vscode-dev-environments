@@ -129,6 +129,13 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw new HelperOperationError('invalid', 'The process id is invalid.', false);
       return host.state.processAlive(pid);
     }
+    case 'account': {
+      const interactive = args[0];
+      if (typeof interactive !== 'boolean') throw new HelperOperationError('invalid', 'The account request is invalid.', false);
+      const account = await host.state.account(interactive);
+      // Plan step 11B3b: the id and the login only.
+      return account === undefined ? null : { id: account.id, login: account.login };
+    }
     default:
       throw new HelperOperationError('invalid', `The state ${call} is unknown.`, false);
   }

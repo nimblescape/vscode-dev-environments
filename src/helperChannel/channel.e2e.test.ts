@@ -93,6 +93,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     fs.writeFileSync(path.join(dir, 'bin', 'docker'), FAKE_DOCKER, { mode: 0o755 });
     env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`, FAKE_DOCKER_LOG: path.join(dir, 'calls.log') };
     const result = await esbuild.build({
+      // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
+      define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
       entryPoints: [path.resolve(__dirname, 'main.ts')],
       bundle: true,
       platform: 'node',
@@ -119,7 +121,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     // Plan step 6, PR B: changed expectation: the batch operations too.
     // Plan step 10A: changed expectation (before: without `pull` and `startContainers`).
     // Plan step 11B1, 11B2: changed expectation, the flows that run in the worker (`tokenRemove`, `stop`).
-    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'docker', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove']);
+    // Plan step 11B3b: changed expectation, `listConfigurations`.
+    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'docker', 'listConfigurations', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove']);
     expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
     const result = await channel.docker(['cat'], { input: 'hello channel' });
     expect(result).toEqual({ exitCode: 0, stdout: 'hello channel', stderr: '', timedOut: false });

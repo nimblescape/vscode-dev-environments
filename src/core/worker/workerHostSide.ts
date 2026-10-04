@@ -5,7 +5,7 @@
 // Plan step 11B (decision of 2026-10-03, the worker is the deputy): the HostSide of a flow that runs in the worker. Every
 // call becomes a request of its kind to the extension (plan step 11A, `OperationContext.ask`), which answers it. Pure
 // over `ask`; no I/O of its own, no `vscode`.
-import type { Environment, RegistryFile, WindowStatus } from '../types';
+import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
 
 /** What the worker's operation context gives this module: one request to the extension, which resolves with its value. */
@@ -38,6 +38,12 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       pendings: async () => ((await call('local', 'pendings')) ?? []) as readonly { environmentId: string; windowId: string; createdAt: string }[],
       settings: async () => ((await call('local', 'settings')) ?? {}) as Record<string, unknown>,
       processAlive: async (pid) => (await call('local', 'processAlive', pid)) === true,
+      account: async (interactive) => {
+        const answer = (await call('local', 'account', interactive)) as { id?: unknown; login?: unknown } | null;
+        // Plan step 11B3b: only an account with its id; anything else counts as no one signed in.
+        if (answer === null || typeof answer !== 'object' || typeof answer.id !== 'string' || answer.id === '') return undefined;
+        return { id: answer.id, login: typeof answer.login === 'string' ? answer.login : '' } satisfies GitHubAccount;
+      },
     },
     records: {
       read: async () => (await call('record', 'read')) as RegistryFile,

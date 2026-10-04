@@ -14,7 +14,7 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_HELPER_CHANNEL, OP_STOP, OP_TOKEN_REMOVE, parseStopValue, parseTokenRemoveValue } from '../../src/core/helperChannel/protocol';
+import { LABEL_HELPER_CHANNEL, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue } from '../../src/core/helperChannel/protocol';
 import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
@@ -25,6 +25,8 @@ import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } fr
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
+    // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
+    define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
     entryPoints: [path.resolve(__dirname, '../../src/helperChannel/main.ts')],
     bundle: true,
     platform: 'node',
@@ -176,5 +178,47 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       failures: [],
     });
   });
+
+  // Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration by the worker's own pipeline: the
+  // record and the account from this computer, the volume and its labels from the engine, the lock taken in the worker,
+  // and the step listConfigs in a batch helper that the worker starts from its own image; it is gone afterwards. A lock
+  // held elsewhere is refused as busy after the wait of D3.
+  it('lists the configurations through the worker in a batch helper of its own image, and refuses while the lock is held elsewhere', async () => {
+    const id = newEnvironmentId();
+    const volume = `devenv-test-list-${crypto.randomBytes(4).toString('hex')}`;
+    const repository = 'devenv-test/worker-list';
+    cli.ok(['volume', 'create', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, volume]);
+    cli.ok([
+      'run', '--rm', '--label', runLabel, '--mount', `type=volume,source=${volume},target=/workspaces`, TEST_BASE_IMAGE, 'sh', '-c',
+      'mkdir -p /workspaces/worker-list/.devcontainer/python && echo \'{}\' > /workspaces/worker-list/.devcontainer/devcontainer.json && ' +
+        "echo '{}' > /workspaces/worker-list/.devcontainer/python/devcontainer.json && chown -R 1000:1000 /workspaces/worker-list",
+    ]);
+    const requests: string[] = [];
+    const environment = { id, repository, owner: { id: '42', login: 'octo' }, volumeName: volume, containerName: volume } as unknown as Environment;
+    const host = {
+      ...hostWith(undefined, requests),
+      records: { ...hostWith(undefined, requests).records, get: async (requested: string) => (requests.push(`get ${requested}`), requested === id ? environment : undefined) },
+      state: { ...hostWith(undefined, requests).state, account: async (interactive: boolean) => (requests.push(`account ${interactive}`), { id: '42', login: 'octo' }) },
+    } as HostSide;
+    const target = await targets.current();
+    const list = () =>
+      channels.flow(target, OP_LIST_CONFIGURATIONS, { environmentId: id, dockerHost: target.host, owner: { windowId: 'window-1', pid: process.pid } }, {
+        timeoutMs: 180_000,
+        onAsk: hostSideHandler(host, log, FLOW_REQUESTS[OP_LIST_CONFIGURATIONS]),
+      });
+    const value = parseListConfigurationsValue(await list());
+    expect(value).toEqual({ configPaths: expect.arrayContaining(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']) });
+    expect((value as { configPaths: string[] }).configPaths[0]).toBe('.devcontainer/devcontainer.json');
+    expect(requests).toEqual([`get ${id}`, 'account true']);
+    // The batch helper ran from the worker's own image and is gone: no container uses the volume any more.
+    expect(cli.lines(['ps', '-a', '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).toEqual([]);
+    // A lock held elsewhere: refused as busy (startFailed) after the wait, and nothing ran.
+    const held = await channels.lock(target, id, 5);
+    try {
+      expect(parseListConfigurationsValue(await list())).toMatchObject({ refused: { code: 'startFailed' } });
+    } finally {
+      await held.release();
+    }
+  }, 240_000);
 });
 

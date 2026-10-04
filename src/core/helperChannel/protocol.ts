@@ -31,6 +31,7 @@ import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshSta
 import { isStorageId } from '../storage/paths';
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
+import { isUserErrorCode, type UserErrorCode } from '../errors';
 
 export { LABEL_HELPER_CHANNEL };
 
@@ -1064,4 +1065,85 @@ export function parseStopValue(value: unknown): StopValue | undefined {
   if (!Array.isArray(failures) || failures.length > MAX_STOPPED_SERVICES + 1 || !failures.every((text) => typeof text === 'string' && text.length <= MAX_STOP_FAILURE_LENGTH)) return undefined;
   const summary = gitSummary === undefined ? undefined : (({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }: GitSummary) => ({ branch, uncommittedFiles, unpushedCommits, stashes, recordedAt }))(gitSummary);
   return { outcome, ...(summary !== undefined ? { gitSummary: summary } : {}), services: [...(services as string[])], failures: [...(failures as string[])] };
+}
+
+/**
+ * Plan step 11B3b (decision of 2026-10-03, the worker is the deputy; user decision of 2026-10-04): a refusal of the
+ * pipeline in the worker (a UserFacingError: not signed in, another Docker host, the volume missing, the lock busy, the
+ * helper that could not be opened, …), answered as the value of a flow so that the extension shows it as before the move.
+ * Never `cancelled` (a cancel ends the operation as such).
+ */
+export interface FlowRefusal {
+  code: Exclude<UserErrorCode, 'cancelled'>;
+  message: string;
+  detail?: string;
+  /** The refusal of the batch scope (BatchHelperUnavailableError). */
+  batchHelperUnavailable?: true;
+}
+
+/** The longest message and detail of a FlowRefusal. */
+export const MAX_REFUSAL_MESSAGE_LENGTH = 4000;
+export const MAX_REFUSAL_DETAIL_LENGTH = 16_000;
+
+/** The check of a FlowRefusal (the extension). */
+export function parseFlowRefusal(value: unknown): FlowRefusal | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['code', 'message'], ['detail', 'batchHelperUnavailable'])) return undefined;
+  const { code, message, detail, batchHelperUnavailable } = value;
+  if (!isUserErrorCode(code) || code === 'cancelled') return undefined;
+  if (typeof message !== 'string' || message === '' || message.length > MAX_REFUSAL_MESSAGE_LENGTH) return undefined;
+  if (detail !== undefined && (typeof detail !== 'string' || detail.length > MAX_REFUSAL_DETAIL_LENGTH)) return undefined;
+  if (batchHelperUnavailable !== undefined && batchHelperUnavailable !== true) return undefined;
+  return { code, message, ...(detail !== undefined ? { detail } : {}), ...(batchHelperUnavailable === true ? { batchHelperUnavailable } : {}) };
+}
+
+/**
+ * Plan step 11B3b (user decision of 2026-10-04): `listConfigurations`, the listing of Select configuration in the worker:
+ * the configuration paths in the volume of the environment, in the order of precedence (EnvironmentService
+ * .listConfigurations, as the worker's own service runs it: the record through `record get`, the account through `local
+ * account`, the lock that the worker takes itself, the batch helper on the worker's own image). Parameters
+ * ListConfigurationsParams; value ListConfigurationsValue; no secret.
+ */
+export const OP_LIST_CONFIGURATIONS = 'listConfigurations';
+
+export interface ListConfigurationsParams {
+  environmentId: string;
+  /** The Docker host of the operation as the extension resolved it ('' for the local Docker; DockerTargets.host). */
+  dockerHost: string;
+  /** The window that sends the operation (EnvironmentServiceDeps.owner). */
+  owner: { windowId: string; pid: number };
+}
+
+/** The paths, or the refusal of the pipeline. */
+export type ListConfigurationsValue = { configPaths: string[] } | { refused: FlowRefusal };
+
+/** The most configuration paths that a listing answers, and the longest path. */
+export const MAX_LISTED_CONFIGURATIONS = 1000;
+export const MAX_CONFIGURATION_PATH_LENGTH = 1024;
+/** The longest Docker host of the parameters of a flow. */
+const MAX_DOCKER_HOST_LENGTH = 1024;
+
+/** The strict check of ListConfigurationsParams (both sides). */
+export function parseListConfigurationsParams(value: unknown): ListConfigurationsParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'dockerHost', 'owner'])) return undefined;
+  const { environmentId, dockerHost, owner } = value;
+  if (!isStorageId(environmentId)) return undefined;
+  if (typeof dockerHost !== 'string' || dockerHost.length > MAX_DOCKER_HOST_LENGTH || /[\u0000-\u001f\u007f]/.test(dockerHost)) return undefined;
+  if (!isRecord(owner) || !hasOnlyKeys(owner, ['windowId', 'pid'])) return undefined;
+  const { windowId, pid } = owner;
+  if (!isStorageId(windowId) || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return { environmentId, dockerHost, owner: { windowId, pid } };
+}
+
+/** The check of ListConfigurationsValue (the extension). */
+export function parseListConfigurationsValue(value: unknown): ListConfigurationsValue | undefined {
+  if (!isRecord(value)) return undefined;
+  if (hasOnlyKeys(value, ['refused'])) {
+    const refused = parseFlowRefusal(value.refused);
+    return refused === undefined ? undefined : { refused };
+  }
+  if (!hasOnlyKeys(value, ['configPaths'])) return undefined;
+  const { configPaths } = value;
+  if (!Array.isArray(configPaths) || configPaths.length > MAX_LISTED_CONFIGURATIONS) return undefined;
+  if (!configPaths.every((path) => typeof path === 'string' && path !== '' && path.length <= MAX_CONFIGURATION_PATH_LENGTH && !/[\u0000-\u001f\u007f]/.test(path))) return undefined;
+  return { configPaths: [...(configPaths as string[])] };
 }

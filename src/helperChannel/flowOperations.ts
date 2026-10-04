@@ -6,7 +6,25 @@
 // Each one builds the seams of the flow from the requests of its operation (workerHostSide) and the port of its engine
 // (dockerEngine), runs the flow, and answers with its result. The first flow is the token removal; the flows of plan
 // steps 11B2 to 11E come here too.
-import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, parseStopParams, parseTokenRemoveParams, type StopValue, type TokenRemoveValue } from '../core/helperChannel/protocol';
+import {
+  LOCK_BUSY_CODE,
+  LOCK_UNAVAILABLE_CODE,
+  MAX_REFUSAL_DETAIL_LENGTH,
+  MAX_REFUSAL_MESSAGE_LENGTH,
+  parseListConfigurationsParams,
+  parseStopParams,
+  parseTokenRemoveParams,
+  type FlowRefusal,
+  type ListConfigurationsValue,
+  type StopValue,
+  type TokenRemoveValue,
+} from '../core/helperChannel/protocol';
+import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
+import { isAbortError, silentProgress, type Logger } from '../core/ports';
+import type { OwnHelper } from '../core/worker/ownHelper';
+import { workerServices } from '../core/worker/workerServices';
+import type { HelperBatchSession } from '../core/helperChannel/helperChannel';
+import { workerEnvironmentLock } from './workerLock';
 import { stopFlow } from '../core/worker/stopFlow';
 import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
@@ -14,6 +32,16 @@ import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
+
+/** Plan step 5, PR C: the log of the extension as the Logger of the worker's code (plan step 11B3b: shared here). */
+export function contextLogger(context: OperationContext): Logger {
+  return {
+    info: (message) => context.log(message),
+    warn: (message) => context.log(message, 'warn'),
+    error: (message) => context.log(message, 'warn'),
+    output: () => {},
+  };
+}
 
 /** The seams of a flow from the context of its operation: its requests to the extension and its secrets. */
 export function flowHost(context: OperationContext) {
@@ -95,6 +123,72 @@ export function stopOperation(engineOf: EngineOfOperation, lockDeps: LockDeps = 
       throw new OperationError('failed', error instanceof Error ? error.message : String(error));
     } finally {
       release();
+    }
+  };
+}
+
+/**
+ * Plan step 11B3b (user decision of 2026-10-04): the end of a flow that runs the worker's own pipeline. A refusal of the
+ * pipeline (a UserFacingError) is its value, `{ refused }`, so that the extension shows it as before the move; a cancel
+ * ends the operation as `cancelled`; anything else fails it.
+ */
+export function flowRefusal(error: unknown, context: OperationContext): { refused: FlowRefusal } {
+  if (context.signal.aborted || isAbortError(error) || (isUserFacingError(error) && error.code === 'cancelled')) {
+    throw new OperationError('cancelled', 'The operation was cancelled.');
+  }
+  if (error instanceof OperationError) throw error;
+  if (!isUserFacingError(error) || error.code === 'cancelled') throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+  const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+  return {
+    refused: {
+      code: error.code,
+      message: clip(error.message || error.code, MAX_REFUSAL_MESSAGE_LENGTH),
+      ...(error.detail !== undefined ? { detail: clip(error.detail, MAX_REFUSAL_DETAIL_LENGTH) } : {}),
+      ...(isBatchHelperUnavailable(error) ? { batchHelperUnavailable: true as const } : {}),
+    },
+  };
+}
+
+/** Plan step 11B3b: the worker's own helper image and socket, for the batch helpers of its flows (readOwnHelper). */
+export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
+
+/** Plan step 11B3b: opens a batch session of a flow in the worker (workerBatchSession of batch.ts). */
+export type OpenWorkerBatch = (context: OperationContext, p: { volume: string; image: string; socket: string }) => Promise<HelperBatchSession>;
+
+/**
+ * Plan step 11B3b (user decision of 2026-10-04): `listConfigurations`, the listing of Select configuration, run by the
+ * worker's own pipeline (workerServices): the record and the account through the requests of the operation, the lock
+ * and the batch helper (on the worker's own image) taken here.
+ */
+export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseListConfigurationsParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the listConfigurations operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The listConfigurations operation takes no secret.');
+    context.progress('listConfigurations', checked.environmentId);
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine: engineOf(context),
+      secretOf: (name) => context.secrets[name],
+      logger: contextLogger(context),
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+    });
+    try {
+      const configPaths = await service.listConfigurations(checked.environmentId, { progress: silentProgress, signal: context.signal });
+      return { configPaths } satisfies ListConfigurationsValue;
+    } catch (error) {
+      return flowRefusal(error, context) satisfies ListConfigurationsValue;
     }
   };
 }

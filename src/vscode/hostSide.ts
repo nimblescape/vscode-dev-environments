@@ -21,7 +21,7 @@ export interface HostSideDeps {
   registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
   sessionFiles: Pick<SessionFiles, 'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeDisconnectRequest'>;
   ui: PipelineUi;
-  auth: Pick<GitHubAuth, 'getToken' | 'getPackagesCredentials'>;
+  auth: Pick<GitHubAuth, 'getToken' | 'getPackagesCredentials' | 'getAccount'>;
   /** The registry logins that Docker stored on this computer (DockerCredentialStore.getForPull). */
   credentials: Pick<DockerCredentialStore, 'getForPull'>;
   settings: () => ExtensionSettings;
@@ -56,6 +56,7 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       pendings: async () => (await deps.sessionFiles.readPendings()).map((pending) => ({ ...pending })),
       settings: async () => ({ ...deps.settings() }) as unknown as Record<string, unknown>,
       processAlive: async (pid) => deps.isProcessAlive(pid),
+      account: (interactive) => deps.auth.getAccount({ interactive }),
     },
     records: {
       read: () => deps.registry.read(),
