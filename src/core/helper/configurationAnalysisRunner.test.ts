@@ -413,3 +413,17 @@ describe('analysisSlots (plan step 11E2, review round 1 of PR #103, A-L1)', () =
     await Promise.all([e, f]);
   });
 });
+
+describe('analysisSlots: its guards (review round 2 of PR #103, A-L2)', () => {
+  it('refuses fewer than one slot, and frees a slot when a job throws at once', async () => {
+    for (const max of [0, -1, 1.5, Number.NaN]) expect(() => analysisSlots(max)).toThrow(RangeError);
+    const slots = analysisSlots(1);
+    await expect(
+      slots((): Promise<AnalysisResult<AnalysisJob>> => {
+        throw new Error('at once');
+      }),
+    ).rejects.toThrow('at once');
+    // The slot is free again.
+    expect(await slots(async () => ({ ok: true }) as never)).toEqual({ ok: true });
+  });
+});

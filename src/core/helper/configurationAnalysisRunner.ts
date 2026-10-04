@@ -191,6 +191,8 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
  * concurrent operations cannot add up threads without a bound.
  */
 export function analysisSlots(max: number): <J extends AnalysisJob>(run: () => Promise<AnalysisResult<J>>) => Promise<AnalysisResult<J>> {
+  // Review round 2 of PR #103 (A-L2): with no slot at all, every job would wait forever.
+  if (!Number.isInteger(max) || max < 1) throw new RangeError(`The analysis needs at least one slot, not ${max}.`);
   let running = 0;
   const waiting: Array<() => void> = [];
   return async (run) => {

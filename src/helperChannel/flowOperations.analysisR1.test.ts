@@ -32,7 +32,7 @@ import {
   listConfigurationsOperation,
   reconcileOperation,
   recordGitStateOperation,
-  workerAnalyzer,
+  workerAnalyzer, workerThreadAnalyzer,
   type OpenWorkerBatch,
 } from './flowOperations';
 import { contextSecrets } from './operationContext.testkit';
@@ -67,8 +67,9 @@ beforeEach(() => {
 
 describe('the analyzer of the operations of the worker (review round 1 of PR #103, B)', () => {
   it('workerAnalyzer runs the text of the script with `eval`, with the limits of the extension', () => {
-    // Adapted to A-L1 of the same round (the shared slots wrap the analyzer): its `inner` is the thread's analyzer.
-    const analyzer = workerAnalyzer(context()).inner as unknown as { script: unknown; limits: unknown };
+    // Adapted to A-L1 and A-L3 of rounds 1 and 2 (the shared slots wrap the analyzer): the thread's analyzer of the
+    // operation is workerThreadAnalyzer.
+    const analyzer = workerThreadAnalyzer(context()) as unknown as { script: unknown; limits: unknown };
     expect(analyzer).toBeInstanceOf(WorkerConfigurationAnalyzer);
     expect(analyzer.script).toEqual({ code: analysisScriptStub });
     expect(analyzer.limits).toBe(ANALYSIS_LIMITS);
@@ -83,6 +84,8 @@ describe('the analyzer of the operations of the worker (review round 1 of PR #10
   ])('%s gives its pipeline the analysis thread of the worker', async (_name, operation, params) => {
     await operation()(params, context());
     expect(captured.deps).toHaveLength(1);
-    expect((captured.deps[0].analyzer as { inner?: unknown } | undefined)?.inner).toBeInstanceOf(WorkerConfigurationAnalyzer);
+    // Adapted to A-L1 and A-L3 of rounds 1 and 2: an analyzer through the shared slots (not the thread's own object).
+    expect(captured.deps[0].analyzer).toBeDefined();
+    expect(captured.deps[0].analyzer).not.toBeInstanceOf(WorkerConfigurationAnalyzer);
   });
 });

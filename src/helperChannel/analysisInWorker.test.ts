@@ -14,7 +14,9 @@ vi.mock('esbuild', () => ({ build: nested.build }));
 
 import { WORKER_SCRIPT_ENTRIES, workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { analysisInternalItem } from '../core/helper/configurationAnalysis';
-import { workerAnalyzer } from './flowOperations';
+import { MAX_WORKER_ANALYSIS_THREADS, workerAnalyzer } from './flowOperations';
+import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
+import type { AnalysisJob, AnalysisResult } from '../core/helper/configurationAnalysis';
 import { contextSecrets } from './operationContext.testkit';
 import type { OperationContext } from './server';
 
@@ -96,5 +98,50 @@ describe('the analysis thread in the worker (plan step 11E2)', () => {
     expect(result.failure?.reason).toContain('the analysis thread of the unit tests');
     expect(result.report).toEqual({ hostAccess: [], unsupported: [analysisInternalItem(result.failure!.reason)] });
     expect(lines).toEqual([expect.stringMatching(/^warn: The host access analysis of the configuration failed \(.*the analysis thread of the unit tests.*\); the configuration is refused\.$/)]);
+  });
+
+  /** An OperationContext for the analyzer, with its own cancel. */
+  function contextOf(controller = new AbortController()) {
+    return {
+      signal: controller.signal,
+      ...contextSecrets(),
+      progress: () => {},
+      log: () => {},
+      output: () => {},
+      docker: async () => {
+        throw new Error('No Docker CLI call.');
+      },
+    } satisfies OperationContext;
+  }
+
+  it('review round 2 of PR #103 (A-L4): the operations share MAX_WORKER_ANALYSIS_THREADS threads; a job of a cancelled one starts none', async () => {
+    const pending: Array<(value: AnalysisResult<AnalysisJob>) => void> = [];
+    const spy = vi.spyOn(WorkerConfigurationAnalyzer.prototype, 'analyze').mockImplementation(
+      () => new Promise((resolve) => pending.push(resolve as (value: AnalysisResult<AnalysisJob>) => void)) as never,
+    );
+    try {
+      const job: AnalysisJob = { kind: 'hostAccess', checksOn: true, input: { ownVolume: 'own' } };
+      const cancelled = new AbortController();
+      // Three operations, each with its own analyzer: only MAX_WORKER_ANALYSIS_THREADS threads start.
+      const first = workerAnalyzer(contextOf()).analyze(job);
+      const second = workerAnalyzer(contextOf()).analyze(job);
+      const third = workerAnalyzer(contextOf(cancelled)).analyze(job);
+      const fourth = workerAnalyzer(contextOf()).analyze(job);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(MAX_WORKER_ANALYSIS_THREADS).toBe(2);
+      expect(spy).toHaveBeenCalledTimes(2);
+      // The third operation is cancelled while it waits: its slot starts no thread, and goes on to the fourth.
+      cancelled.abort();
+      pending[0]({ report: { hostAccess: [], unsupported: [] } } as never);
+      await first;
+      expect(await third).toMatchObject({ failure: { kind: 'internal', reason: 'the operation was cancelled' } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(spy).toHaveBeenCalledTimes(3);
+      pending[1]({ report: { hostAccess: [], unsupported: [] } } as never);
+      pending[2]({ report: { hostAccess: [], unsupported: [] } } as never);
+      await Promise.all([second, fourth]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
