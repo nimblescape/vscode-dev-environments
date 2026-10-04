@@ -12,15 +12,10 @@ import {
   MAX_SERVER_LINE,
   OUTPUT_CHUNK_CHARACTERS,
   encodeMessage,
-  parseRefreshParams,
-  parseRefreshValue,
   type ClientMessage,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
-import { ContainerAdapter } from '../core/docker/containerAdapter';
-import { readEnvironmentStates } from '../core/pipeline/refreshStates';
-import { EXPECTED_STATES, FixtureRunner, REFRESH_ENVIRONMENTS, refreshFixture } from '../core/pipeline/refreshStates.testkit';
-import { silentLogger } from '../core/ports';
+import { REFRESH_ENVIRONMENTS, refreshFixture } from '../core/pipeline/refreshStates.testkit';
 import { OPERATIONS } from './operations';
 import {
   CLEANUP_SECOND_PASS_MS,
@@ -143,7 +138,7 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     expect(messages).toEqual([
       // Review round 4 (M1): with the sweep of never-started channel containers.
       // Plan step 5, PR B: changed expectation: `lock` too.
-      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'listConfigurations', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations; plan step 10A: changed expectation, `pull` and `startContainers`; plan step 11B2: changed expectation, `stop`; plan step 11B3b: changed expectation, `listConfigurations`
+      { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: process.version, ops: ['batch', 'batchChunk', 'batchStep', 'docker', 'listConfigurations', 'lock', 'probe', 'pull', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove', 'windowState'] }, // plan step 5, PR C: `refresh`; plan step 6, PR B: changed expectation, the batch operations; plan step 10A: changed expectation, `pull` and `startContainers`; plan step 11B2: changed expectation, `stop`; plan step 11B3b: changed expectation, `listConfigurations`; plan step 11C1: changed expectation, `windowState`
       { t: 'pong', n: 7 },
     ]);
   });
@@ -702,25 +697,6 @@ describe('the refresh operation over the fake Docker CLI (plan step 5, PR C)', (
     for (let round = 0; round < 200 && ctx.resultOf(1) === undefined; round++) await vi.advanceTimersByTimeAsync(0);
     return { result: ctx.resultOf(1), docker, messages: ctx.messages };
   }
-
-  it('gives the same states and branches as the refresh without the worker', async () => {
-    const params = parseRefreshParams({ environments: REFRESH_ENVIRONMENTS });
-    expect(params).toBeDefined();
-    const { result, docker } = await refresh(params);
-    expect(result).toMatchObject({ t: 'result', id: 1, ok: true });
-    const viaWorker = parseRefreshValue((result as { value: unknown }).value, params!);
-    const direct = await readEnvironmentStates(new ContainerAdapter(new FixtureRunner(), '/usr/bin/docker', {}, silentLogger, 'linux'), REFRESH_ENVIRONMENTS);
-    expect(viaWorker).toEqual(direct);
-    expect(viaWorker).toEqual(EXPECTED_STATES);
-    // It only reads: no call with an input, no exec -i, no variable.
-    expect(docker.children.length).toBeGreaterThan(0);
-    for (const child of docker.children) {
-      expect(child.input).toBeUndefined();
-      expect(['ps', 'container', 'volume', 'exec']).toContain(child.args[0]);
-      expect(child.args).not.toContain('-i');
-      expect(child.args).not.toContain('-e');
-    }
-  });
 
   it('ends one call when its own signal aborts (the time limit of a call of the refresh)', async () => {
     const docker = fakeDocker({ endsOnTerm: true });

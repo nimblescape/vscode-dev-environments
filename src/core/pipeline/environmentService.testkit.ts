@@ -37,6 +37,7 @@ import { HelperChannelError, HelperOperationError } from '../helperChannel/helpe
 import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, parseStopParams, parseWindowStateParams } from '../helperChannel/protocol';
 import { EngineDocker } from '../worker/engineDocker';
 import { windowStateFlow } from '../worker/windowStateFlow';
+import { readEnvironmentStates } from './refreshStates';
 import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
@@ -1540,6 +1541,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     environmentLock: h.lock.take,
     // Plan step 11B2: the flows of the worker against the same FakeDocker, under the lock of the service.
     flow: fakeWorkerFlow(h, overrides.environmentLock ?? h.lock.take),
+    // Plan step 11C1: the refresh of the worker, which reads the same FakeDocker.
+    workerRefresh: (environments) => readEnvironmentStates(h.docker, environments),
     ...overrides,
   });
   return h;

@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import type { EnvironmentStates } from './refreshStates';
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -4392,7 +4393,9 @@ describe('refreshStates (plan step 5, PR C)', () => {
     harness.docker.execHandler = () => ({ stdout: 'feature-q\n' });
   }
 
-  it('reads directly without a worker: the states, and the branches of the running environments that were asked for', async () => {
+  // Plan step 11C1: changed expectation, the states come from the worker of the test kit (it reads the fake engine; was:
+  // read directly without a worker).
+  it('reads through the worker: the states, and the branches of the running environments that were asked for', async () => {
     await seedTwo(h);
     expect(await h.service.refreshStates(new Set([ENV_ID, OTHER_ID]))).toEqual(direct);
     expect(h.docker.execs).toHaveLength(1);
@@ -4419,15 +4422,17 @@ describe('refreshStates (plan step 5, PR C)', () => {
   });
 
   // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation. Before, a failed worker refresh was read once more
-  // directly. Now only undefined (outside of an operation) reads directly; a failure fails the refresh, with its cause.
-  it('reads directly only when the worker gives undefined (outside of an operation); a failure fails the refresh (logged), never read directly', async () => {
-    const workerRefresh = vi.fn(async (): Promise<undefined> => undefined);
+  // directly. Plan step 11C1: changed expectation, never read directly (was: directly when the worker gave undefined
+  // outside of an operation); a failure fails the refresh, with its cause.
+  it('a failure of the worker fails the refresh (logged), never read directly', async () => {
+    const workerRefresh = vi.fn(async (): Promise<EnvironmentStates> => {
+      throw new Error('The Dev Environments worker on the Docker host could not be prepared (no helper image)');
+    });
     h = recreate({ workerRefresh });
     await seedTwo(h);
-    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual(direct);
-    workerRefresh.mockRejectedValueOnce(new Error('The Dev Environments worker on the Docker host could not be prepared (no helper image)'));
     expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
-    expect(workerRefresh).toHaveBeenCalledTimes(2);
+    expect(workerRefresh).toHaveBeenCalledTimes(1);
+    expect(h.docker.execs).toHaveLength(0);
     expect(h.logger.warnings.join('\n')).toContain(
       'The state of the environments could not be read: The Dev Environments worker on the Docker host could not be prepared (no helper image)',
     );
@@ -4435,7 +4440,7 @@ describe('refreshStates (plan step 5, PR C)', () => {
   });
 
   it('does not ask the worker when Docker does not run', async () => {
-    const workerRefresh = vi.fn(async (): Promise<undefined> => undefined);
+    const workerRefresh = vi.fn(async (): Promise<EnvironmentStates> => ({ runtime: new Map(), branches: new Map() }));
     h = recreate({ workerRefresh });
     await seedTwo(h);
     h.docker.running = false;

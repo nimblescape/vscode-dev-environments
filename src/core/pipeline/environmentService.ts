@@ -123,7 +123,7 @@ import { namePair } from '../namePairs';
 import { imageBuildRecord, imageRecordLabels } from './imageRecord';
 import { isAvailableTo, ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
-import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readEnvironmentStates, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -471,12 +471,11 @@ export interface EnvironmentServiceDeps {
    */
   analyzer: ConfigurationAnalyzer;
   /**
-   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target of the operation (HelperChannels.refresh).
-   * Undefined, or a result of undefined: outside of an operation (or in the unit tests); the states are read directly.
-   * Plan step 5, PR D (rule D1 of 2026-09-30): within an operation it makes the worker ready first, and rejects when it
-   * cannot (the refresh then fails; it is never read directly).
+   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target (HelperChannels.refresh). Plan step 5,
+   * PR D (rule D1 of 2026-09-30): it makes the worker ready first, and rejects when it cannot (the refresh then fails).
+   * Plan step 11C1: always, also outside of an operation (the current Docker target); the states are never read directly.
    */
-  workerRefresh?: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates | undefined>;
+  workerRefresh: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates>;
   /**
    * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
    * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
@@ -6112,8 +6111,9 @@ export class EnvironmentService {
         folder: repositoryFolder(env.repository),
         branch: branchIds.has(env.id),
       }));
-      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below).
-      return (await this.deps.workerRefresh?.(environments)) ?? (await readEnvironmentStates(docker, environments));
+      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below). Plan step
+      // 11C1: only through the worker.
+      return await this.deps.workerRefresh(environments);
     } catch (error) {
       this.logger.warn(`The state of the environments could not be read: ${errorMessage(error)}`);
       return { runtime: undefined, branches: new Map() };

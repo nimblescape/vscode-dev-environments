@@ -10,6 +10,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import type { ContainerInfo } from '../core/docker/containerAdapter';
+import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
+import { hostAccessChecks } from '../core/policy/hostAccessChecks';
+import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
@@ -181,7 +184,9 @@ interface Harness {
     delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     // Plan step 11B3b (user decision of 2026-10-04): the controller lists through the worker (listConfigurationsInWorker).
     listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
+    /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
+    windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean }) => Promise<WindowStateValue | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
@@ -277,6 +282,26 @@ function createHarness(
     delete: vi.fn(async () => {}),
     listConfigurationsInWorker: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
+    // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
+    // that fails is unknown (undefined, decision of 2026-10-04).
+    windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean } = {}) => {
+      try {
+        const state = (await docker.containerState(containerName)) as WindowStateValue['state'];
+        const value: WindowStateValue = { state };
+        const container = (await (docker.findContainer as (id: string, name: string) => Promise<unknown>)(env.id, env.containerName)) as ContainerInfo | undefined;
+        const checks = hostAccessChecks(env.repository, settings);
+        if (container !== undefined && !containerIsCurrent(container.labels, true, checks)) {
+          value.outdated = containerIsCurrent(container.labels, true, 'off') && isUnrestrictedContainer(container.labels) ? 'hostAccess' : 'version';
+        }
+        if (options.branch) {
+          const branch = await service.currentBranch(env.id);
+          if (branch !== undefined) value.branch = branch;
+        }
+        return value;
+      } catch {
+        return undefined;
+      }
+    }),
     reconcileFromVolumes: vi.fn(async () => 0),
     // By default, Delete could remove every recorded volume (their labels make them the environment's own).
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
@@ -2192,6 +2217,28 @@ describe('Connection of this window', () => {
     const connectedCalls = h.statusBar.showConnected.mock.calls.length;
     h.controller.onHeartbeat();
     await settle(() => h.statusBar.showConnected.mock.calls.length > connectedCalls, 'Connected');
+  });
+
+  // Decision of 2026-10-04 ("unknown"): a state that the worker cannot read changes nothing; a Reconnect of the user then
+  // is tried, and its failure leaves the window disconnected.
+  it('keeps its state when the state of the container cannot be read, and a Reconnect of the user then is tried', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const connectedCalls = h.statusBar.showConnected.mock.calls.length;
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read of the state');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnected.mock.calls.length).toBe(connectedCalls);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    // The Start of the user takes the unknown state as "not running": it reconnects through the pipeline.
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', 'The worker could not be reached.'));
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
   });
 
   it('closes its connection for the request of another window, and leaves the operation to its empty window', async () => {

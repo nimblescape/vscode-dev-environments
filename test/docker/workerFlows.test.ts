@@ -14,7 +14,7 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_HELPER_CHANNEL, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue } from '../../src/core/helperChannel/protocol';
+import { LABEL_HELPER_CHANNEL, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
 import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
@@ -177,6 +177,31 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       services: [],
       failures: [],
     });
+  });
+
+  // Plan step 11C1 (decisions of 2026-10-04): the reads of an attached window by the worker: the state of its dev
+  // container, whether it may be used as it is, and its branch; no request to this computer.
+  it('reads the state, the version and the branch of a dev container through the worker', async () => {
+    const id = newEnvironmentId();
+    const name = `devenv-test-window-${crypto.randomBytes(4).toString('hex')}`;
+    cli.ok(['run', '-d', '--name', name, '--network', 'none', '--init', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, helperTag, 'sleep', '600']);
+    cli.ok(['exec', name, 'git', 'init', '-q', '-b', 'feature/window', '/workspaces/window']);
+    const requests: string[] = [];
+    const read = async (containerName: string, branch: boolean) =>
+      parseWindowStateValue(
+        await channels.flow(
+          await targets.current(),
+          OP_WINDOW_STATE,
+          { environmentId: id, containerName, checks: 'on', ...(branch ? { branch: { folder: '/workspaces/window' } } : {}) },
+          { timeoutMs: 60_000, onAsk: hostSideHandler(hostWith(undefined, requests), log, FLOW_REQUESTS[OP_WINDOW_STATE]) },
+        ),
+      );
+    // A container without the version label of the extension is of an older version.
+    expect(await read(name, true)).toEqual({ state: 'running', outdated: 'version', branch: 'feature/window' });
+    expect(requests).toEqual([]);
+    cli.ok(['stop', '-t', '0', name]);
+    expect(await read(name, true)).toEqual({ state: 'stopped', outdated: 'version' });
+    expect(await read('devenv-test-window-missing', false)).toEqual({ state: 'missing' });
   });
 
   // Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration by the worker's own pipeline: the

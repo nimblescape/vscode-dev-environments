@@ -5,7 +5,7 @@
 // Plan step 5, PR A: the probe names the engine behind the socket of the worker.
 import { describe, expect, it } from 'vitest';
 import { parseProbeValue } from '../core/helperChannel/protocol';
-import { contextRunner, probeOperation } from './operations';
+import { probeOperation } from './operations';
 import type { OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 
@@ -43,28 +43,6 @@ describe('the probe operation (plan step 5, PR A)', () => {
       const { context: ctx } = context({ version: { exitCode: 0, stdout: '27.1.0\n' }, info });
       expect(parseProbeValue(await probeOperation({}, ctx))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
     }
-  });
-
-  it('plan step 5, PR C: the runner of the refresh ends a call at its time limit and refuses an input', async () => {
-    const seen: Array<AbortSignal | undefined> = [];
-    const ctx: OperationContext = {
-      ...context({}).context,
-      docker: (args, options = {}) =>
-        new Promise((resolve) => {
-          seen.push(options.signal);
-          options.signal?.addEventListener('abort', () => resolve({ exitCode: null, stdout: '', stderr: '' }));
-        }),
-    };
-    const runner = contextRunner(ctx);
-    await expect(runner.run('docker', ['exec', 'c', 'git', 'status'], { timeoutMs: 20 })).resolves.toEqual({
-      exitCode: null,
-      stdout: '',
-      stderr: '',
-      timedOut: true,
-    });
-    expect(seen).toHaveLength(1);
-    await expect(runner.run('docker', ['exec', '-i', 'c', 'cat'], { input: 'secret' })).rejects.toThrow(/input/);
-    expect(seen).toHaveLength(1);
   });
 
   it('does not ask for the engine when docker version fails', async () => {

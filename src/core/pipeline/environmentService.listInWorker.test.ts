@@ -8,8 +8,8 @@
 import { describe, expect, it } from 'vitest';
 import { BatchHelperUnavailableError, UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, OP_LIST_CONFIGURATIONS } from '../helperChannel/protocol';
-import { LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts } from './environmentService';
+import { LOCK_BUSY_CODE, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
+import { LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { EnvironmentServiceDeps } from './environmentService';
@@ -124,5 +124,33 @@ describe('the listing in the worker from the extension: review round 2 of 11B3b'
     await seedEnvironment(h, { container: 'stopped' });
     expect(await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ message: expect.stringContaining('cannot be sent to the worker') });
     expect(sent).toEqual([]);
+  });
+});
+
+// Plan step 11C1 (decisions of 2026-10-04): the reads of an attached window through the worker.
+describe('the reads of an attached window through the worker, from the extension (plan step 11C1)', () => {
+  it('sends the container, the host access checks of the repository, and with `branch` the Git user and folder', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running', branch: 'main' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    expect(await h.service.windowStateInWorker(env, 'devenv-x', { branch: true })).toEqual({ state: 'running', branch: 'main' });
+    expect(sent[0]).toMatchObject({
+      op: OP_WINDOW_STATE,
+      params: { environmentId: ENV_ID, containerName: 'devenv-x', checks: 'on', branch: { folder: '/workspaces/api', user: 'vscode' } },
+      timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS,
+    });
+    await h.service.windowStateInWorker(env, 'devenv-x');
+    expect(sent[1].params).toEqual({ environmentId: ENV_ID, containerName: 'devenv-x', checks: 'on' });
+  });
+
+  it('is unknown (undefined) when the worker cannot be reached, fails, or answers an invalid value; it never throws', async () => {
+    let answer: () => Promise<unknown> = async () => {
+      throw new HelperChannelError('unavailable', 'no worker');
+    };
+    const { h } = harness(() => answer());
+    const env = await seedEnvironment(h, { container: 'running' });
+    expect(await h.service.windowStateInWorker(env, 'devenv-x')).toBeUndefined();
+    answer = async () => ({ state: 'paused' });
+    expect(await h.service.windowStateInWorker(env, 'devenv-x')).toBeUndefined();
+    expect(h.logger.infos.some((line) => line.includes('The state of the container devenv-x could not be read'))).toBe(true);
   });
 });

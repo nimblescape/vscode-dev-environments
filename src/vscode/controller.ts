@@ -1214,8 +1214,16 @@ export class Controller implements vscode.Disposable {
       // opens in the same kind of window as the first try.
       { retry: retry ?? (async () => this.startTarget(await this.refreshedTarget(target, 'token'), { window: options.window })) },
     );
-    // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
-    if (!started && reconnecting && environment) await this.leaveDeletedEnvironment(environment.id);
+    if (!started && reconnecting && environment) {
+      // Reconnect: "Delete environment" for missing files (concept 7.12) removed the environment of this window.
+      if (await this.leaveDeletedEnvironment(environment.id)) return;
+      // Decision of 2026-10-04 ("unknown"): a Reconnect of the user that failed leaves the window disconnected, also when
+      // the state of its container could not be read before.
+      if (this.current?.environment.id === environment.id && !this.current.lost) {
+        this.current.lost = true;
+        this.updateStatusBar();
+      }
+    }
   }
 
   /**
