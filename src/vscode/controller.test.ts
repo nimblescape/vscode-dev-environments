@@ -4761,3 +4761,17 @@ describe('Delete: a recorded state older than the last use (review round 1 of PR
     expect(h.service.deleteInWorker).not.toHaveBeenCalled();
   });
 });
+
+// Review round 1 of plan step 11C2b (mutation tests, B-R1 CT5, CT6, CT8).
+describe('the Delete command sends the check to the worker (review round 1 of 11C2b)', () => {
+  it('CT5/CT6/CT8: the check runs cancellable, with the signal of its progress and the name that the user sees', async () => {
+    await h.registry.add(environment());
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
+    await run('delete', row('acme/api', environment(), repositoryInfo('Acme/API')));
+    const [, options] = h.service.deleteCheckInWorker.mock.calls[0];
+    expect(options).toMatchObject({ repository: 'Acme/API', otherWindow: false });
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    // The only progress: the check (the dismissed confirmation deletes nothing).
+    expect(fakeVscode.window.withProgress.mock.calls.map((call: unknown[]) => call[0])).toEqual([expect.objectContaining({ cancellable: true })]);
+  });
+});

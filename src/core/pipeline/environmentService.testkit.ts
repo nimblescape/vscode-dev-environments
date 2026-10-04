@@ -4,6 +4,7 @@
 
 // In-memory fakes for the tests of the environment service: Docker, workspace helper, image check, and user interface.
 // The registry and the session files are the real ones, in a temporary folder. Only test files import this module.
+import type { DeleteConfirmation } from './deleteCheck';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -1264,7 +1265,7 @@ export class FakeUi implements PipelineUi {
   additionalVolumesAnswer: 'remove' | 'keep' | undefined = 'keep';
   serviceDataAnswer: string[] | undefined = [];
 
-  async confirmDelete(repository: string): Promise<'delete' | 'open' | undefined> {
+  async confirmDelete(_repository: string, _confirmation?: DeleteConfirmation): Promise<'delete' | 'open' | undefined> {
     return this.deleteAnswer;
   }
 
