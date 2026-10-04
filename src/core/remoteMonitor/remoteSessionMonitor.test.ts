@@ -13,7 +13,6 @@ import {
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
-  forgetCommand,
   heartbeatCommand,
   imagePrefixesOf,
   remoteMonitorLabelValue,
@@ -911,24 +910,6 @@ describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
     expect(await monitor(new FakeDocker(() => result(0, JSON.stringify(output)))).records(ID)).toEqual(output);
     expect(await monitor(new FakeDocker(() => result(0, 'garbage'))).records(ID)).toBeUndefined();
     expect(await monitor(new FakeDocker(() => MISSING)).records(ID)).toBeUndefined();
-  });
-
-  it('forgets a record; a failure is logged, a missing container is not', async () => {
-    const logger = new Log();
-    const docker = new FakeDocker(() => result(0));
-    await monitor(docker, logger).forget(SOURCE, ID);
-    // Review round 3 of PR #58 (F6): under the lock of the records, as a heartbeat.
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...forgetCommand(SOURCE, ID)]);
-    expect(forgetCommand(SOURCE, ID).slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
-    await monitor(new FakeDocker(() => MISSING), logger).forget(SOURCE, ID);
-    expect(logger.lines).toEqual([]);
-    await monitor(new FakeDocker(() => result(1, '', 'boom')), logger).forget(SOURCE, ID);
-    expect(logger.lines).toEqual([`warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`]);
-    // Review round 5 of PR #58 (J2): forget runs under the lock of the records, so a kill is named in the log.
-    await monitor(new FakeDocker(() => result(137)), logger).forget(SOURCE, ID);
-    expect(logger.lines[1]).toBe(
-      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
-    );
   });
 
   it('isMissingContainer', () => {

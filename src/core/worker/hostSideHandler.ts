@@ -6,7 +6,9 @@
 // worker (plan step 11A, `OperationOptions.onAsk`). It checks every request, calls the HostSide of this computer, and
 // answers with its value; a `secret` request answers with the secret in `secrets`, never in the value. No `vscode` here:
 // the extension passes its own HostSide (src/vscode).
-import { HOST_SECRET_NAMES, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSide } from './hostSide';
+import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
+import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
+import type { BusyOperation } from '../types';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
 import type { AskKind, Secrets } from '../helperChannel/protocol';
 import { errorMessage } from '../errors';
@@ -33,14 +35,30 @@ function stringList(value: unknown): value is string[] {
  * step 11B1 (A-R1-8): only the requests in `allowed` (FLOW_REQUESTS of the operation) are answered; everything else is
  * refused before this computer is touched.
  */
-export function hostSideHandler(host: HostSide, logger: Logger, allowed: readonly HostCall[]): NonNullable<OperationOptions['onAsk']> {
+export function hostSideHandler(
+  host: HostSide,
+  logger: Logger,
+  allowed: readonly HostCall[],
+  // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS).
+  scope: { environmentId?: string } = {},
+): NonNullable<OperationOptions['onAsk']> {
   const permitted = new Set<string>(allowed);
   return async (kind, payload, signal) => {
     const request = parseHostRequest(payload, kind);
     if (request === undefined) throw new HelperOperationError('invalid', 'The request of the operation is invalid.', false);
-    if (!permitted.has(`${request.kind} ${request.call}`)) {
+    const name = `${request.kind} ${request.call}` as HostCall;
+    // Review round 1 of 11C2a (A-R1-L1, A-R1-L4): an allowance can name the kind of a request (its session file, its busy
+    // operation).
+    const detailAt = Object.hasOwn(DETAILED_REQUESTS, name) ? DETAILED_REQUESTS[name] : undefined;
+    const detail = detailAt !== undefined ? request.args[detailAt] : undefined;
+    if (!permitted.has(name) && !(typeof detail === 'string' && permitted.has(`${name}.${detail}`))) {
       logger.warn(`The worker sent the request ${request.kind} ${request.call}, which its operation may not send.`);
       throw new HelperOperationError('invalid', `The operation may not send the request ${request.kind} ${request.call}.`, false);
+    }
+    const scoped = Object.hasOwn(SCOPED_REQUESTS, name) ? SCOPED_REQUESTS[name] : undefined;
+    if (scoped !== undefined && (scope.environmentId === undefined || request.args[scoped] !== scope.environmentId)) {
+      logger.warn(`The worker sent the request ${request.kind} ${request.call} for another environment than the one of its operation.`);
+      throw new HelperOperationError('invalid', `The request ${request.kind} ${request.call} is for another environment than the one of the operation.`, false);
     }
     if (signal.aborted) throw new HelperOperationError('cancelled', 'The operation ended.', false);
     try {
@@ -188,11 +206,19 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
     }
     case 'sessionFile': {
       const [kind, environmentId] = strings(args, 2);
-      const kinds = ['writePending', 'removePending', 'removeOperation', 'removeReopen', 'removeDisconnectRequest'] as const;
-      if (!(kinds as readonly string[]).includes(kind)) throw new HelperOperationError('invalid', `The session file ${kind} is unknown.`, false);
-      await records.sessionFile(kind as (typeof kinds)[number], environmentId);
+      if (!(HOST_SESSION_FILES as readonly string[]).includes(kind)) throw new HelperOperationError('invalid', `The session file ${kind} is unknown.`, false);
+      await records.sessionFile(kind as HostSessionFile, environmentId);
       return null;
     }
+    // Plan step 11C2a (decision of 2026-10-04): the busy mark of the window that sent the operation.
+    case 'markBusy': {
+      const [environmentId, operation] = strings(args, 2);
+      if (!(BUSY_OPERATIONS as readonly string[]).includes(operation)) throw new HelperOperationError('invalid', `The busy operation ${operation} is unknown.`, false);
+      return (await records.markBusy(environmentId, operation as BusyOperation)) ?? null;
+    }
+    case 'clearBusy':
+      await records.clearBusy(strings(args, 1)[0]);
+      return null;
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);
   }

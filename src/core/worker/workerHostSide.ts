@@ -5,8 +5,37 @@
 // Plan step 11B (decision of 2026-10-03, the worker is the deputy): the HostSide of a flow that runs in the worker. Every
 // call becomes a request of its kind to the extension (plan step 11A, `OperationContext.ask`), which answers it. Pure
 // over `ask`; no I/O of its own, no `vscode`.
-import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
+import { BUSY_OPERATIONS, type BusyMarkResult } from '../pipeline/busyMarks';
+import type { BusyMark, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
+
+/**
+ * Plan step 11C2a: the answer of `record markBusy` as the pipeline uses it: the entry of `environmentId`, or a busy mark
+ * that keeps it, or undefined (no entry). Anything else is a failure of the request (never taken as "not busy").
+ */
+export function parseBusyMarkAnswer(value: unknown, environmentId: string): BusyMarkResult {
+  if (value === null) return undefined;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const { environment, conflict } = value as { environment?: unknown; conflict?: unknown };
+    if (environment !== undefined && conflict === undefined && typeof environment === 'object' && environment !== null && (environment as { id?: unknown }).id === environmentId) {
+      return { environment: environment as Environment };
+    }
+    if (conflict !== undefined && environment === undefined && isBusyMark(conflict)) return { conflict };
+  }
+  throw new Error('The extension answered the busy mark with an invalid value.');
+}
+
+function isBusyMark(value: unknown): value is BusyMark {
+  if (typeof value !== 'object' || value === null) return false;
+  const { operation, since, pid, windowId } = value as Record<string, unknown>;
+  return (
+    (BUSY_OPERATIONS as readonly unknown[]).includes(operation) &&
+    typeof since === 'string' &&
+    typeof pid === 'number' &&
+    Number.isSafeInteger(pid) &&
+    typeof windowId === 'string'
+  );
+}
 
 /** What the worker's operation context gives this module: one request to the extension, which resolves with its value. */
 export type AskHost = (request: HostRequest) => Promise<unknown>;
@@ -56,6 +85,8 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       remove: async (id, volumes) => void (await call('record', 'remove', id, volumes)),
       forgetKeptVolumes: async (names) => void (await call('record', 'forgetKeptVolumes', [...names])),
       sessionFile: async (kind, environmentId) => void (await call('record', 'sessionFile', kind, environmentId)),
+      markBusy: async (environmentId, operation) => parseBusyMarkAnswer(await call('record', 'markBusy', environmentId, operation), environmentId),
+      clearBusy: async (environmentId) => void (await call('record', 'clearBusy', environmentId)),
     },
     secrets: {
       token: async () => {

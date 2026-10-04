@@ -13,13 +13,18 @@ import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
+import { registryBusyMarks } from '../core/pipeline/busyMarks';
+import type { Clock } from '../core/ports';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { HelperChannels } from '../core/helperChannel/helperChannels';
 import type { DockerTarget } from '../core/docker/dockerHost';
 
 export interface HostSideDeps {
   registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
-  sessionFiles: Pick<SessionFiles, 'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeDisconnectRequest'>;
+  sessionFiles: Pick<
+    SessionFiles,
+    'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeReopenOf' | 'removeDisconnectRequest'
+  >;
   ui: PipelineUi;
   auth: Pick<GitHubAuth, 'getToken' | 'getPackagesCredentials' | 'getAccount'>;
   /** The registry logins that Docker stored on this computer (DockerCredentialStore.getForPull). */
@@ -27,6 +32,10 @@ export interface HostSideDeps {
   settings: () => ExtensionSettings;
   /** The window of this computer (its id, for the pending files that a flow writes). */
   windowId: string;
+  /** Plan step 11C2a: the extension host of this window (its process id), for the busy marks of a flow. */
+  pid: number;
+  /** Plan step 11C2a: the clock of the busy marks. */
+  clock: Clock;
   isProcessAlive: (pid: number) => boolean;
   /** Connects the window at the end of an open (plan step 11E; until then it is not called). */
   connect?: (data: { environmentId: string; container: string; user?: string; folder: string }) => Promise<void>;
@@ -38,6 +47,14 @@ const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
 
 /** Plan step 11B1: what a flow in the worker may ask this computer for. */
 export function extensionHostSide(deps: HostSideDeps): HostSide {
+  // Plan step 11C2a (decision of 2026-10-04): the same busy marks as the pipeline of this window sets itself.
+  const busyMarks = registryBusyMarks(deps.registry, {
+    owner: { windowId: deps.windowId, pid: deps.pid },
+    clock: deps.clock,
+    isAlive: (pid) => deps.isProcessAlive(pid),
+    windowStatuses: () => deps.sessionFiles.readWindowStatuses(),
+    logger: deps.logger,
+  });
   return {
     questions: {
       confirmUntrustedRepository: (repository) => deps.ui.confirmUntrustedRepository(repository),
@@ -65,15 +82,25 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       findForAccount: (repository, accountId, dockerHost) => deps.registry.findForAccount(repository, accountId, dockerHost),
       add: (environment) => deps.registry.add(environment),
       update: async (id, changes) => void (await deps.registry.updateEnvironment(id, (environment) => void Object.assign(environment, changes))),
-      remove: (id, volumes) => deps.registry.remove(id, volumes),
+      // Review round 1 of 11C2a (A-R1-L2): the volumes of a removal are the additional volumes of the entry, never the kept
+      // volumes of another environment or account.
+      remove: async (id, volumes) => {
+        const own = new Set((await deps.registry.get(id))?.additionalVolumes ?? []);
+        const odd = [...(volumes.kept ?? []), ...(volumes.removed ?? [])].filter((name) => !own.has(name));
+        if (odd.length > 0) throw new Error(`The volumes ${odd.join(', ')} are not additional volumes of the environment.`);
+        await deps.registry.remove(id, volumes);
+      },
       forgetKeptVolumes: (names) => deps.registry.forgetKeptVolumes(names),
       sessionFile: async (kind, environmentId) => {
         if (kind === 'writePending') await deps.sessionFiles.writePending(environmentId, deps.windowId);
         else if (kind === 'removePending') await deps.sessionFiles.removePending(environmentId);
         else if (kind === 'removeOperation') await deps.sessionFiles.removeOperation(environmentId);
         else if (kind === 'removeReopen') await deps.sessionFiles.removeReopen();
+        else if (kind === 'removeReopenOf') await deps.sessionFiles.removeReopenOf(environmentId);
         else await deps.sessionFiles.removeDisconnectRequest(environmentId);
       },
+      markBusy: (environmentId, operation) => busyMarks.mark(environmentId, operation),
+      clearBusy: (environmentId) => busyMarks.clear(environmentId),
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),
@@ -100,6 +127,13 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
   };
 }
 
+/** Plan step 11C2a: the environment of an operation, from its parameters (`environmentId`), for SCOPED_REQUESTS. */
+function environmentOf(params: unknown): string | undefined {
+  if (typeof params !== 'object' || params === null) return undefined;
+  const id = (params as { environmentId?: unknown }).environmentId;
+  return typeof id === 'string' ? id : undefined;
+}
+
 /**
  * Plan step 11B1: runs the flow `op` in the worker of the current engine; the HostSide of this computer answers its
  * requests, and only those that the operation may send (FLOW_REQUESTS; review round 2 of 11B1, B-R1-1: one place, tested).
@@ -116,6 +150,6 @@ export function extensionFlow(
       timeoutMs: options.timeoutMs,
       // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.
       ...(options.passive === true ? { passive: true } : {}),
-      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : []),
+      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], { environmentId: environmentOf(params) }),
     });
 }

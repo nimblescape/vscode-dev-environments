@@ -6,12 +6,13 @@
 // requests, hostSideHandler answers them. Here they are wired to each other, so one test covers both.
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import { OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
 import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
+import type { BusyMarkResult } from '../pipeline/busyMarks';
 import { FLOW_REQUESTS, parseHostRequest, type HostCall, type HostSide } from './hostSide';
 import { hostSideHandler } from './hostSideHandler';
-import { workerHostSide } from './workerHostSide';
+import { parseBusyMarkAnswer, workerHostSide } from './workerHostSide';
 
 const ENVIRONMENT = { id: 'e1', repository: 'acme/app', owner: { id: 'a1' } } as unknown as Environment;
 
@@ -21,7 +22,7 @@ const ALL: readonly HostCall[] = [
     (call) => `question ${call}` as const,
   ),
   ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
-  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile'].map((call) => `record ${call}` as const),
+  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy'].map((call) => `record ${call}` as const),
   'secret token',
   'secret registry',
   'secret unknown',
@@ -60,6 +61,9 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       remove: async (id, volumes) => void record('remove', id, volumes),
       forgetKeptVolumes: async (names) => void record('forgetKeptVolumes', names),
       sessionFile: async (kind, environmentId) => void record('sessionFile', kind, environmentId),
+      // Plan step 11C2a.
+      markBusy: async (environmentId, operation) => (record('markBusy', environmentId, operation), of('markBusy', undefined as BusyMarkResult)),
+      clearBusy: async (environmentId) => void record('clearBusy', environmentId),
     },
     secrets: {
       token: async () => (record('token'), of('token', undefined)),
@@ -76,9 +80,11 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
  * The worker's HostSide wired to the handler of the extension: every call goes through one request, and the secrets of an
  * answer are kept as the operation keeps them (plan step 11A).
  */
-function wired(answers: Partial<Record<string, unknown>> = {}, logger: Logger = silentLogger, allowed: readonly HostCall[] = ALL) {
+function wired(answers: Partial<Record<string, unknown>> = {}, logger: Logger = silentLogger, allowed: readonly HostCall[] = ALL, environmentId = 'e1') {
   const { host, calls } = fakeHost(answers);
-  const handler = hostSideHandler(host, logger, allowed);
+  // Plan step 11C2a: changed (before: no scope): the requests that change an environment are answered only for the
+  // environment of the operation (SCOPED_REQUESTS); the operation of these tests is the one of `e1`.
+  const handler = hostSideHandler(host, logger, allowed, { environmentId });
   const secrets: Record<string, string> = {};
   const signal = new AbortController().signal;
   const requests: { kind: string; call: string; args: unknown[] }[] = [];
@@ -350,12 +356,14 @@ describe('the handler of the requests on the side of the extension (plan step 11
   it('passes only the volumes of a removal, and the changes of an update that keep the identity', async () => {
     const { handler, signal, calls } = wired();
     await handler('record', { call: 'remove', args: ['e1', { kept: ['v1'], removed: ['v2'], other: 1 }] }, signal);
-    await handler('record', { call: 'remove', args: ['e2'] }, signal);
+    // Plan step 11C2a: changed expectation (before: the removal of `e2` passed): it is not the environment of the operation.
+    await expect(handler('record', { call: 'remove', args: ['e2'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await handler('record', { call: 'remove', args: ['e1'] }, signal);
     await handler('record', { call: 'update', args: ['e1', { lastUsedAt: 't' }] }, signal);
     await handler('record', { call: 'add', args: [ENVIRONMENT] }, signal);
     expect(calls).toEqual([
       { call: 'remove', args: ['e1', { kept: ['v1'], removed: ['v2'] }] },
-      { call: 'remove', args: ['e2', {}] },
+      { call: 'remove', args: ['e1', {}] },
       { call: 'update', args: ['e1', { lastUsedAt: 't' }] },
       { call: 'add', args: [ENVIRONMENT] },
     ]);
@@ -387,3 +395,96 @@ describe('the handler of the requests on the side of the extension (plan step 11
     expect(await notGiven.secrets.token()).toBeUndefined();
   });
 });
+
+// Plan step 11C2a (decision of 2026-10-04): the busy marks and the removal of a reopen record as specific requests, and
+// the requests that change an environment only for the environment of the operation.
+describe('the requests of Delete (plan step 11C2a)', () => {
+  const MARK = { operation: 'delete', since: '2026-10-04T10:00:00.000Z', pid: 7, windowId: 'w2' } as const;
+
+  it('marks and clears the busy mark of the window that sent the operation, and removes its reopen record', async () => {
+    const { worker, calls } = wired({ markBusy: { environment: ENVIRONMENT } });
+    expect(await worker.records.markBusy('e1', 'delete')).toEqual({ environment: ENVIRONMENT });
+    await worker.records.clearBusy('e1');
+    await worker.records.sessionFile('removeReopenOf', 'e1');
+    expect(calls).toEqual([
+      { call: 'markBusy', args: ['e1', 'delete'] },
+      { call: 'clearBusy', args: ['e1'] },
+      { call: 'sessionFile', args: ['removeReopenOf', 'e1'] },
+    ]);
+  });
+
+  it('gives the mark of another window as the conflict, and no entry as undefined', async () => {
+    expect(await wired({ markBusy: { conflict: MARK } }).worker.records.markBusy('e1', 'delete')).toEqual({ conflict: MARK });
+    expect(await wired({ markBusy: undefined }).worker.records.markBusy('e1', 'delete')).toBeUndefined();
+  });
+
+  it('refuses an unknown busy operation, and the requests for another environment than the one of the operation', async () => {
+    const lines: string[] = [];
+    const { handler, signal, calls } = wired({}, { ...silentLogger, warn: (text) => lines.push(text) });
+    for (const [call, args] of [
+      ['markBusy', ['e1', 'stop']],
+      ['markBusy', ['e2', 'delete']],
+      ['clearBusy', ['e2']],
+      ['sessionFile', ['removeReopenOf', 'e2']],
+      ['update', ['e2', { lastUsedAt: 't' }]],
+    ] as const) {
+      await expect(handler('record', { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
+    }
+    expect(calls).toEqual([]);
+    expect(lines.filter((line) => line.includes('another environment'))).toHaveLength(4);
+    // An operation without an environment changes none.
+    const { host } = fakeHost();
+    const unscoped = hostSideHandler(host, silentLogger, ALL);
+    await expect(unscoped('record', { call: 'clearBusy', args: ['e1'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  it('the worker never takes an odd answer of the busy mark as "not busy"', async () => {
+    for (const odd of [{}, { environment: { id: 'e2' } }, { conflict: { operation: 'stop', since: 't', pid: 1, windowId: 'w' } }, { environment: ENVIRONMENT, conflict: MARK }, 'x', 1]) {
+      await expect(parseBusyMarkAnswerOf(odd), JSON.stringify(odd)).rejects.toThrow('invalid value');
+    }
+    expect(parseBusyMarkAnswer(null, 'e1')).toBeUndefined();
+  });
+
+  // Review round 1 of 11C2a (A-R1-H1, A-R1-L1, A-R1-L4): changed expectation, `record read` (the volumes of the other
+  // environments), the busy mark for `delete` only, and only the session files of Delete.
+  it('Delete may send only its requests, its busy mark for delete only, and only its session files', async () => {
+    expect(FLOW_REQUESTS[OP_DELETE]).toEqual([
+      'record get',
+      'record list',
+      'record read',
+      'local account',
+      'record markBusy.delete',
+      'record clearBusy',
+      'record remove',
+      'record sessionFile.removePending',
+      'record sessionFile.removeOperation',
+      'record sessionFile.removeDisconnectRequest',
+      'record sessionFile.removeReopenOf',
+    ]);
+    const { handler, signal, calls } = wired({ markBusy: { environment: ENVIRONMENT } }, silentLogger, FLOW_REQUESTS[OP_DELETE]);
+    await handler('record', { call: 'markBusy', args: ['e1', 'delete'] }, signal);
+    await handler('record', { call: 'sessionFile', args: ['removeReopenOf', 'e1'] }, signal);
+    await handler('record', { call: 'read', args: [] }, signal);
+    for (const [call, args] of [
+      ['markBusy', ['e1', 'update']],
+      ['sessionFile', ['removeReopen', 'e1']],
+      ['sessionFile', ['writePending', 'e1']],
+      ['sessionFile', [1, 'e1']],
+      ['update', ['e1', { lastUsedAt: 't' }]],
+    ] as const) {
+      await expect(handler('record', { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
+    }
+    expect(calls.map((call) => call.call)).toEqual(['markBusy', 'sessionFile', 'read']);
+    // Review round 2 of 11C2a (A-R2, missing test 3): a detail is the whole kind, never a prefix of it.
+    await expect(handler('record', { call: 'sessionFile', args: ['removePending.x', 'e1'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(handler('record', { call: 'markBusy', args: ['e1', 'delete.x'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    // The bare allowance allows every kind of the request.
+    const bare = wired({}, silentLogger, ['record sessionFile']);
+    await bare.handler('record', { call: 'sessionFile', args: ['writePending', 'e1'] }, bare.signal);
+    expect(bare.calls).toEqual([{ call: 'sessionFile', args: ['writePending', 'e1'] }]);
+  });
+});
+
+async function parseBusyMarkAnswerOf(value: unknown): Promise<unknown> {
+  return parseBusyMarkAnswer(value, 'e1');
+}

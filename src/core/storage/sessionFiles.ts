@@ -197,6 +197,14 @@ export class SessionFiles {
   async removeReopen(): Promise<void> {
     await retryTransient(() => removeFile(this.paths.reopen));
   }
+
+  /**
+   * Plan step 11C2a: removes the reopen record when it names `environmentId` (Delete of that environment); another one
+   * stays.
+   */
+  async removeReopenOf(environmentId: string): Promise<void> {
+    if ((await this.readReopen())?.environmentId === environmentId) await this.removeReopen();
+  }
 }
 
 /** Reads all `*.json` files of a folder, in name order. Keeps a value only if it is valid and its key matches the file name. */

@@ -11,12 +11,14 @@ import {
   LOCK_UNAVAILABLE_CODE,
   MAX_REFUSAL_DETAIL_LENGTH,
   MAX_REFUSAL_MESSAGE_LENGTH,
+  parseDeleteParams,
   parseListConfigurationsParams,
   parseStopParams,
   parseTokenRemoveParams,
   parseWindowStateParams,
   type WindowStateValue,
   type FlowRefusal,
+  type DeleteValue,
   type ListConfigurationsValue,
   type StopValue,
   type TokenRemoveValue,
@@ -239,6 +241,46 @@ export function windowStateOperation(engineOf: EngineOfOperation): OperationHand
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The windowState operation was cancelled.');
       throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+    }
+  };
+}
+
+/**
+ * Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): `delete`, the Delete of an environment, run by the worker's
+ * own pipeline (workerServices, EnvironmentService.delete): the busy mark, the entry and the session files through the
+ * requests of the operation (each for its environment only), the lock taken here, the removal over the port of the
+ * engine, and the heartbeat record of the computer that sent it forgotten in the Session Monitor of the engine.
+ */
+export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseDeleteParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the delete operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The delete operation takes no secret.');
+    context.progress('delete', checked.environmentId);
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine: engineOf(context),
+      secretOf: (name) => context.secrets[name],
+      logger: contextLogger(context),
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      monitorSource: checked.monitorSource,
+    });
+    try {
+      await service.delete(checked.environmentId, { progress: silentProgress, signal: context.signal, additionalVolumesToRemove: checked.additionalVolumesToRemove });
+      return { deleted: true } satisfies DeleteValue;
+    } catch (error) {
+      return flowRefusal(error, context) satisfies DeleteValue;
     }
   };
 }

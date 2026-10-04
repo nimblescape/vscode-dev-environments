@@ -29,6 +29,7 @@ import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
+import { isSourceId } from '../remoteMonitor/protocol';
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
@@ -1146,6 +1147,55 @@ export function parseListConfigurationsValue(value: unknown): ListConfigurations
   if (!Array.isArray(configPaths) || configPaths.length > MAX_LISTED_CONFIGURATIONS) return undefined;
   if (!configPaths.every((path) => typeof path === 'string' && path !== '' && path.length <= MAX_CONFIGURATION_PATH_LENGTH && !/[\u0000-\u001f\u007f]/.test(path))) return undefined;
   return { configPaths: [...(configPaths as string[])] };
+}
+
+/**
+ * Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): `delete`, the Delete of an environment in the worker
+ * (EnvironmentService.delete, as the worker's own service runs it): the busy mark through `record markBusy`/`clearBusy`,
+ * the removal under the lock that the worker takes itself, the entry through `record remove`, the session files of the
+ * environment, and the heartbeat record of `monitorSource` in the Session Monitor of the engine, which the worker forgets
+ * itself. Parameters DeleteParams; value DeleteValue; no secret.
+ */
+export const OP_DELETE = 'delete';
+
+export interface DeleteParams {
+  environmentId: string;
+  /** The Docker host of the operation as the extension resolved it ('' for the local Docker; DockerTargets.host). */
+  dockerHost: string;
+  /** The window that sends the operation (EnvironmentServiceDeps.owner). */
+  owner: { windowId: string; pid: number };
+  /** The additional volumes that the user confirmed for removal (concept 7.14 step 4). */
+  additionalVolumesToRemove: string[];
+  /** The id of this computer in the Session Monitor (its heartbeat records; isSourceId). */
+  monitorSource: string;
+}
+
+/** Deleted, or the refusal of the pipeline. */
+export type DeleteValue = { deleted: true } | { refused: FlowRefusal };
+
+/** The most additional volumes of a Delete. */
+export const MAX_DELETE_VOLUMES = 1000;
+
+/** The strict check of DeleteParams (both sides). */
+export function parseDeleteParams(value: unknown): DeleteParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'dockerHost', 'owner', 'additionalVolumesToRemove', 'monitorSource'])) return undefined;
+  const base = parseListConfigurationsParams({ environmentId: value.environmentId, dockerHost: value.dockerHost, owner: value.owner });
+  if (base === undefined) return undefined;
+  const { additionalVolumesToRemove, monitorSource } = value;
+  if (!Array.isArray(additionalVolumesToRemove) || additionalVolumesToRemove.length > MAX_DELETE_VOLUMES) return undefined;
+  if (!additionalVolumesToRemove.every((name) => typeof name === 'string' && DOCKER_NAME.test(name))) return undefined;
+  if (!isSourceId(monitorSource)) return undefined;
+  return { ...base, additionalVolumesToRemove: [...(additionalVolumesToRemove as string[])], monitorSource };
+}
+
+/** The check of DeleteValue (the extension). */
+export function parseDeleteValue(value: unknown): DeleteValue | undefined {
+  if (!isRecord(value)) return undefined;
+  if (hasOnlyKeys(value, ['refused'])) {
+    const refused = parseFlowRefusal(value.refused);
+    return refused === undefined ? undefined : { refused };
+  }
+  return hasOnlyKeys(value, ['deleted']) && value.deleted === true ? { deleted: true } : undefined;
 }
 
 /**

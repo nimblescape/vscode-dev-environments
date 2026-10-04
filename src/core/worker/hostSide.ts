@@ -6,8 +6,9 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
-import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
+import { OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import type { BusyMarkResult } from '../pipeline/busyMarks';
+import type { BusyOperation, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
 export interface HostQuestions {
@@ -47,9 +48,23 @@ export interface HostRecords {
   update(id: string, changes: Partial<Environment>): Promise<void>;
   remove(id: string, volumes: { kept?: readonly string[]; removed?: readonly string[] }): Promise<void>;
   forgetKeptVolumes(names: readonly string[]): Promise<void>;
-  /** The session files of the environment (pending, operation, reopen, disconnect request). */
-  sessionFile(kind: 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeDisconnectRequest', environmentId: string): Promise<void>;
+  /**
+   * The session files of the environment (pending, operation, reopen, disconnect request). Plan step 11C2a:
+   * `removeReopenOf`, the reopen record only when it names the environment.
+   */
+  sessionFile(kind: HostSessionFile, environmentId: string): Promise<void>;
+  /**
+   * Plan step 11C2a (decision of 2026-10-04): the busy mark of the window that sent the operation, set by the extension
+   * with its clock and its view of the windows, under its registry lock (registryBusyMarks).
+   */
+  markBusy(environmentId: string, operation: BusyOperation): Promise<BusyMarkResult>;
+  /** Plan step 11C2a: removes the busy mark of the window that sent the operation. */
+  clearBusy(environmentId: string): Promise<void>;
 }
+
+/** The session files that a flow writes or removes (HostRecords.sessionFile). */
+export const HOST_SESSION_FILES = ['writePending', 'removePending', 'removeOperation', 'removeReopen', 'removeReopenOf', 'removeDisconnectRequest'] as const;
+export type HostSessionFile = (typeof HOST_SESSION_FILES)[number];
 
 /** The secrets that only the user's computer has. `undefined`: there is none (an anonymous pull, no sign-in). */
 export interface HostSecrets {
@@ -124,4 +139,44 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   [OP_LIST_CONFIGURATIONS]: ['record get', 'local account'],
   // Plan step 11C1: the reads of an attached window need nothing from this computer.
   [OP_WINDOW_STATE]: [],
+  // Plan step 11C2a: Delete reads the record, the registry (the volumes that other environments use or keep: review round
+  // 1 of 11C2a, A-R1-H1) and the account, marks the environment busy for `delete` only and clears the mark, removes the
+  // entry and the session files of the environment (each tied to the environment of the operation: SCOPED_REQUESTS;
+  // review round 1, A-R1-L1, A-R1-L4: only these kinds); no secret, no other write.
+  [OP_DELETE]: [
+    'record get',
+    'record list',
+    'record read',
+    'local account',
+    'record markBusy.delete',
+    'record clearBusy',
+    'record remove',
+    'record sessionFile.removePending',
+    'record sessionFile.removeOperation',
+    'record sessionFile.removeDisconnectRequest',
+    'record sessionFile.removeReopenOf',
+  ],
+};
+
+/**
+ * Review round 1 of 11C2a (A-R1-L1, A-R1-L4): the requests whose allowance can name one kind (`<kind> <call>.<detail>`
+ * in FLOW_REQUESTS), and the index of that kind in their arguments: the session file, the busy operation. The bare
+ * `<kind> <call>` allows every kind.
+ */
+export const DETAILED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
+  'record sessionFile': 0,
+  'record markBusy': 1,
+};
+
+/**
+ * Plan step 11C2a (review round 2 of 11B1, A-R2-2): the requests that change the record or the session files of one
+ * environment, and the index of its id in their arguments. The extension answers them only for the environment of the
+ * operation (`environmentId` of its parameters).
+ */
+export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
+  'record markBusy': 0,
+  'record clearBusy': 0,
+  'record remove': 0,
+  'record update': 0,
+  'record sessionFile': 1,
 };

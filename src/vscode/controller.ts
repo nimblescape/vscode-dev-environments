@@ -1434,7 +1434,8 @@ export class Controller implements vscode.Disposable {
     return runWithProgress({
       title: ControllerTexts.deleting(repository),
       repository,
-      task: (progress, signal) => this.deps.service.delete(environment.id, { progress, signal, additionalVolumesToRemove }),
+      // Plan step 11C2a: in the worker of the Docker host of the operation.
+      task: (progress, signal) => this.deps.service.deleteInWorker(environment.id, { progress, signal, additionalVolumesToRemove }),
     });
   }
 
