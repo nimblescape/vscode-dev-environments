@@ -723,6 +723,23 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       const removal = requests.at(-1)!;
       expect(removal).toMatchObject({ method: 'DELETE', path: '/containers/tmp?force=true&v=true' });
       expect(removal.signal?.aborted).toBe(false);
+      // Review round 4 of 11B3a (A-R4-1): the cancel signal of the operation never reaches the create.
+      const controller = new AbortController();
+      requests.length = 0;
+      await engine.labelImage('img:1', {}, controller.signal);
+      const limited = requests.find((request) => request.path.startsWith('/containers/create'))!;
+      expect(limited.signal).toBeDefined();
+      expect(limited.signal).not.toBe(controller.signal);
+      // A create whose answer fails (A-R4-2): the container is removed by its name, and the failure stays as it is.
+      const broken = dockerEngine(async (request) => {
+        requests.push({ method: request.method, path: request.path, signal: request.signal });
+        if (request.path.startsWith('/containers/create')) throw new Error('socket hang up');
+        return fakeApi(request);
+      }, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
+      requests.length = 0;
+      await expect(broken.labelImage('img:1', {})).rejects.toThrow('socket hang up');
+      const brokenName = requests.find((request) => request.path.startsWith('/containers/create'))!.path.split('name=')[1];
+      expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${brokenName}?force=true&v=true` });
       // An answer without an ID: the container is removed by its name.
       createdId = '';
       requests.length = 0;

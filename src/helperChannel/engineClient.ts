@@ -248,8 +248,11 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       try {
         created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
       } catch (error) {
-        if (!limit.aborted) throw error;
+        // Review round 4 of 11B3a (A-R4-2, A-R4-3): the engine may have created it although the answer failed; the name is
+        // ours, so it goes in every case. A create that the engine ends only after this removal stays behind, never
+        // started, findable by the `devenv-label-` name.
         await removeByName();
+        if (!limit.aborted) throw error;
         throw new EngineError(`The engine did not answer the create of a container for the labels of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
       }
       if (created.status !== 201) fail(created);
