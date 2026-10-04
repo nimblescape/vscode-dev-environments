@@ -118,7 +118,9 @@ function deleteConfirmation(value: unknown): DeleteConfirmation {
     counts = { uncommittedFiles: uncommittedFiles as number, unpushedCommits: unpushedCommits as number, ...(stashes !== undefined ? { stashes: stashes as number } : {}) };
   }
   for (const time of [recordedAt, lastSeenInUse]) if (time !== undefined && !plainText(time, 64)) throw invalid();
-  if (!Array.isArray(repositoryData) || repositoryData.length > MAX_QUESTION_NAMES || !repositoryData.every((folder) => plainText(folder) && folder !== '')) throw invalid();
+  // Review round 2 of 11C2b (A-R2-L-a): folders of the repository, as paths of normal length without `..`.
+  const isFolder = (folder: unknown) => plainText(folder, 255) && folder !== '' && !(folder as string).split('/').includes('..');
+  if (!Array.isArray(repositoryData) || repositoryData.length > MAX_QUESTION_NAMES || !repositoryData.every(isFolder)) throw invalid();
   return {
     ...(counts !== undefined ? { changes: counts } : {}),
     ...(recordedAt !== undefined ? { recordedAt: recordedAt as string } : {}),

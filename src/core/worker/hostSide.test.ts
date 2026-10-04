@@ -535,6 +535,9 @@ describe('the requests of the check of Delete (plan step 11C2b)', () => {
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, recordedAt: 'a\nb' }]],
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: [''] }]],
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: 'data' }]],
+      // Review round 2 of 11C2b (A-R2-L-a): folders of normal length, without `..`.
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: ['../../etc'] }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: ['d'.repeat(256)] }]],
       ['question', 'confirmDelete', ['r', null]],
       ['question', 'deleteAdditionalVolumes', [['../x']]],
       ['question', 'deleteServiceData', [['v'], 'v']],
@@ -572,5 +575,8 @@ describe('the questions of a flow name its repository, and their answers are obs
     expect(calls).toEqual([]);
     await handler('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
     expect(observed).toEqual([['confirmDelete', ['acme/api', confirmation], 'delete']]);
+    // Review round 2 of 11C2b: a question whose arguments are refused is not observed.
+    await expect(handler('question', { call: 'deleteAdditionalVolumes', args: [['../x']] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    expect(observed).toHaveLength(1);
   });
 });

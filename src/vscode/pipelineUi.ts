@@ -77,7 +77,8 @@ export class VsCodePipelineUi implements PipelineUi {
 
   /** Plan step 11C2b: the additional volumes that Delete may remove (moved from the controller's Delete). */
   async deleteAdditionalVolumes(volumes: readonly string[]): Promise<'remove' | 'keep' | undefined> {
-    const choice = await vscode.window.showWarningMessage(Messages.deleteAdditionalVolumes(volumes.join(', ')), { modal: true }, Actions.remove, Actions.keep);
+    // Review round 2 of 11C2b (A-R2-L-a): a list of normal length (the names come from the worker).
+    const choice = await vscode.window.showWarningMessage(Messages.deleteAdditionalVolumes(listSome(volumes)), { modal: true }, Actions.remove, Actions.keep);
     return choice === Actions.remove ? 'remove' : choice === Actions.keep ? 'keep' : undefined;
   }
 

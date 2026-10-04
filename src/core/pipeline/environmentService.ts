@@ -6051,23 +6051,26 @@ export class EnvironmentService {
       });
       if (params === undefined) throw new Error(`The check of the Delete of ${environment.repository} cannot be sent to the worker.`);
       // Review round 1 of 11C2b (A-R1-M1): the decision of the worker counts only as far as the user gave it here.
-      const given = { confirm: undefined as unknown, volumes: [] as string[], volumesAnswer: undefined as unknown, serviceData: [] as string[], picked: [] as string[] };
+      const given = { confirm: undefined as unknown, volumes: [] as string[], volumesAnswer: undefined as unknown, serviceData: [] as string[], picked: [] as string[], cancelled: false };
       const onAnswer = (call: string, args: unknown[], value: unknown) => {
         if (call === 'confirmDelete') given.confirm = value;
         if (call === 'deleteAdditionalVolumes') {
           given.volumes = Array.isArray(args[0]) ? (args[0] as string[]) : [];
           given.volumesAnswer = value;
+          // Review round 2 of 11C2b (A-R2-M1): Escape at a later question cancels the Delete.
+          if (value !== 'remove' && value !== 'keep') given.cancelled = true;
         }
         if (call === 'deleteServiceData') {
           given.serviceData = Array.isArray(args[0]) ? (args[0] as string[]) : [];
           given.picked = Array.isArray(value) ? (value as string[]) : [];
+          if (!Array.isArray(value)) given.cancelled = true;
         }
       };
       const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer));
       if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with an invalid value.`);
       if ('refused' in value) throw refusalError(value.refused);
       if (value.decision === 'cancel') return value;
-      if (value.decision !== given.confirm) {
+      if (value.decision !== given.confirm || (value.decision === 'delete' && given.cancelled)) {
         throw new Error(`The worker answered the check of the Delete of ${environment.repository} with a decision that the user did not give.`);
       }
       if (value.decision === 'delete') {

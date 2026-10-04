@@ -421,6 +421,18 @@ describe('the check of Delete in the worker, from the extension (plan step 11C2b
       return { decision: 'delete', additionalVolumesToRemove: ['api-logs'] };
     };
     expect(((await check()) as Error).message).toContain('volumes that the user did not choose: api-logs');
+    // Review round 2 of 11C2b (A-R2-M1): Escape at a later question cancels, so a Delete is refused then.
+    for (const [call, args] of [
+      ['deleteAdditionalVolumes', [['api-cache']]],
+      ['deleteServiceData', [['api-db']]],
+    ] as const) {
+      answer = (options) => {
+        options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');
+        options.onAnswer?.(call, [...args], null);
+        return { decision: 'delete', additionalVolumesToRemove: [] };
+      };
+      expect(((await check()) as Error).message, call).toContain('a decision that the user did not give');
+    }
     // What the user gave passes; a cancel always does.
     answer = (options) => {
       options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');
