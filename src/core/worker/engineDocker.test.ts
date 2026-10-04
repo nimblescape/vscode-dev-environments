@@ -308,6 +308,12 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
       ['r.example/i:1', { serveraddress: 'r.example', identityToken: true, secretName: SECRET_REGISTRY }],
     ]);
     expect(output).toEqual(['1: Pulling\n']);
+    // Review round 2 of 11B3a (A-R2-1): a reference without a tag is pulled as `:latest`; one with a digest as it is.
+    await docker.pullImage('node', { onOutput: () => {} });
+    await docker.pullImage('ghcr.io/o/i', { onOutput: () => {} });
+    await docker.pullImage(`node@sha256:${'a'.repeat(64)}`, { onOutput: () => {} });
+    expect(pulls.slice(3).map((pull) => (pull as unknown[])[0])).toEqual(['node:latest', 'ghcr.io/o/i:latest', `node@sha256:${'a'.repeat(64)}`]);
+    pulls.splice(3);
     // A password that is not the secret of the operation is refused before anything is sent.
     await expect(docker.pullImage('ghcr.io/o/i:1', { credentials: { registry: 'ghcr.io', username: 'octo', password: 'other' } })).rejects.toThrow('registry secret of the operation');
     expect(pulls).toHaveLength(3);

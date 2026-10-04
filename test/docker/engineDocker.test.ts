@@ -95,9 +95,12 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     const anonymous = (): Set<string> => new Set(cli.lines(['volume', 'ls', '-q', '--filter', 'dangling=true']).filter((volume) => /^[0-9a-f]{64}$/.test(volume)));
     const before = anonymous();
     const labels = { [TEST_RUN_LABEL]: run.runId };
-    await apiDocker.runOnVolume({ image: withVolume, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo x > /data/x'], user: 'root', labels });
+    await apiDocker.runOnVolume({ image: withVolume, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo x > /data/x; echo kept > /w/kept'], user: 'root', labels });
     await apiDocker.labelImage(withVolume, { 'nimblescape.devenv.test': 'yes' });
     expect([...anonymous()].filter((volume) => !before.has(volume))).toEqual([]);
+    // Review round 2 of 11B3a (missing test 2 of reviewer A): the named volume of the workspace is kept, with its files.
+    expect(cli.ok(['exec', name, 'cat', '/workspaces/run-marker'])).toBe('done');
+    expect(cli.ok(['exec', name, 'cat', '/workspaces/kept'])).toBe('kept');
   });
 
   it('exec: a refusal of the engine is a result, over the API as over the Docker CLI (review round 1 of 11B3a, A-R1-3)', async () => {

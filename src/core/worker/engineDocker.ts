@@ -10,7 +10,7 @@
 import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS, type ImageInspection, type ImageNames, type VolumeRun } from '../docker/containerAdapter';
 import { errorMessage } from '../errors';
-import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
 import type { PullCredentials } from '../pipeline/pullCredentials';
@@ -383,7 +383,9 @@ export class EngineDocker implements EnvironmentDocker {
       throw new EngineError(`The pull of ${reference} with the credentials for ${login.registry} needs them as the registry secret of the operation.`, 0);
     }
     this.logger.info(login === undefined ? `Pulling image ${reference}.` : `Pulling image ${reference} with the credentials for ${login.registry}.`);
-    await this.engine.pull(reference, {
+    // Review round 2 of 11B3a (A-R2-1): as ContainerAdapter.pullThroughWorker, a reference without a tag is pulled as
+    // `:latest`, never as every tag of the repository.
+    await this.engine.pull(pullReference(reference), {
       ...(login !== undefined
         ? {
             login:

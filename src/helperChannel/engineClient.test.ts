@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
 import { SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { scriptCommand } from '../core/worker/containerScripts';
-import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES } from './engineApi';
+import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi } from './engineApi';
 import { dockerEngine, MAX_EXEC_OUTPUT_CHARACTERS } from './engineClient';
 
 interface Call {
@@ -606,6 +606,61 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       expect(await hanging.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
       // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; the named volume of the workspace is kept by the engine.
       expect(hanging.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/run2?force=true&v=true' });
+    });
+
+    it('the time limit of a run covers its create, ends with its wait, and a slow log keeps the exit code (review round 2 of 11B3a, A-R2-2, A-R2-4)', async () => {
+      // The create does not answer: the run ends at its limit; there is no container ID to remove (the caller removes it by label).
+      const slowCreate = await serve(() => undefined);
+      const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: { a: 'b' }, volumes: [] };
+      expect(await slowCreate.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
+      expect(slowCreate.calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create']);
+      // The run fails and its log comes after the limit of the run: the exit code and the log are the answer.
+      const answerAfter = (ms: number, answer: EngineAnswer, signal?: AbortSignal): Promise<EngineAnswer> =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve(answer), ms);
+          signal?.addEventListener('abort', () => (clearTimeout(timer), reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+        });
+      const requests: string[] = [];
+      const fakeApi: EngineApi = async (request) => {
+        requests.push(`${request.method} ${request.path}`);
+        if (request.path === '/containers/create') return { status: 201, body: JSON.stringify({ Id: 'run3' }), truncated: false };
+        if (request.path.endsWith('/wait')) return { status: 200, body: JSON.stringify({ StatusCode: 4 }), truncated: false };
+        if (request.path.includes('/logs')) return answerAfter(120, { status: 200, body: 'late reason', truncated: false }, request.signal);
+        return { status: 204, body: '', truncated: false };
+      };
+      const fake = dockerEngine(fakeApi, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
+      expect(await fake.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: 4, output: 'late reason', timedOut: false });
+      expect(requests.at(-1)).toBe('DELETE /containers/run3?force=true&v=true');
+      // A cancel of the operation ends the read of the log; the container is still removed.
+      const controller = new AbortController();
+      const cancelled = fake.runContainer(spec, { signal: controller.signal });
+      setTimeout(() => controller.abort(), 30);
+      await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+      expect(requests.at(-1)).toBe('DELETE /containers/run3?force=true&v=true');
+      // A log read that throws (the connection broke) is no output either; the exit code stays.
+      const brokenLog = dockerEngine(async (request) => {
+        if (request.path.includes('/logs')) throw new Error('socket hang up');
+        return fakeApi(request);
+      }, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
+      expect(await brokenLog.runContainer(spec)).toEqual({ exitCode: 4, output: '', timedOut: false });
+      // A log that fails is no output; the exit code stays.
+      const failedLog = await serve((call) => {
+        if (call.url === '/containers/create') return { status: 201, json: { Id: 'run4' } };
+        if (call.url.endsWith('/wait')) return { status: 200, json: { StatusCode: 5 } };
+        if (call.url.includes('/logs')) return { status: 500, json: { message: 'busy' } };
+        return { status: 204 };
+      });
+      expect(await failedLog.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: 5, output: '', timedOut: false });
+    });
+
+    it('never pulls a reference without a tag or a digest (review round 2 of 11B3a, A-R2-1)', async () => {
+      const { engine, calls } = await serve(() => ({ status: 200, body: '' }));
+      for (const reference of ['node', 'ghcr.io/o/i', 'registry:5000/i', 'node:']) {
+        await expect(engine.pull(reference)).rejects.toThrow(`The pull of ${reference} needs a tag or a digest.`);
+      }
+      expect(calls).toEqual([]);
+      await engine.pull('registry:5000/i:1');
+      expect(calls.map((call) => decodeURIComponent(call.url))).toEqual(['/images/create?fromImage=registry:5000/i:1']);
     });
   });
 });

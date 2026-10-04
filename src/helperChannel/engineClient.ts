@@ -19,6 +19,7 @@ import {
   type EngineRun,
 } from '../core/worker/dockerEngine';
 import { abortError } from '../core/ports';
+import { hasTagOrDigest } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
 import { engineApi, engineErrorMessage, engineHijack, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
@@ -235,6 +236,7 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       // A commit of an image without a command gives it this container's `Cmd ['true']` (the engine merges the
       // container's command into an empty one, A-R1-5); the images of an environment have one, or Dev Containers sets it.
       // On the classic image store the commit is a child of the previous image, which is then kept (A-R1-6).
+      // Review round 2 of 11B3a (A-R2-3): no label of ours on it; the commit would copy it into the image.
       const created = await api({ method: 'POST', path: '/containers/create', json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} } });
       if (created.status !== 201) fail(created);
       const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
@@ -254,12 +256,19 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
         return id;
       } finally {
         // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes (`VOLUME` of the image), as `docker run --rm`.
-        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true` }).catch(() => undefined);
+        // Review round 2 of 11B3a (A-R2-2): within a time limit of its own, never the cancel signal.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
       }
     },
     runContainer: (spec, options = {}) => runContainer(api, spec, options),
   };
 }
+
+/**
+ * Review round 2 of 11B3a (A-R2-2, A-R2-4): the time limit of the removal of a container of labelImage or runContainer,
+ * and of the read of the log of a failed run.
+ */
+export const RUN_CLEANUP_TIMEOUT_MS = 60_000;
 
 /** The most of the output of runContainer that is kept. */
 const MAX_RUN_OUTPUT_CHARACTERS = 64 * 1024;
@@ -274,43 +283,59 @@ async function runContainer(
   options: { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<{ exitCode: number | null; output: string; timedOut: boolean }> {
   if (options.signal?.aborted) throw abortError();
-  const created = await api({
-    method: 'POST',
-    path: '/containers/create',
-    signal: options.signal,
-    json: {
-      Image: spec.image,
-      Entrypoint: [spec.entrypoint],
-      Cmd: [...spec.args],
-      User: spec.user,
-      Labels: spec.labels,
-      HostConfig: {
-        Init: true,
-        NetworkMode: 'none',
-        Mounts: spec.volumes.map((volume) => ({ Type: 'volume', Source: volume.name, Target: volume.target })),
-      },
-    },
-  });
-  if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
-  const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
-  if (typeof id !== 'string' || id === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
   const ended = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
   let timedOut = false;
-  const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
+  // Review round 2 of 11B3a (A-R2-2): the time limit covers the create too. A container whose create it cut may still
+  // come to exist; the caller removes it by its labels (EnvironmentService.removeOwnershipContainers).
+  let timer = options.timeoutMs === undefined ? undefined : setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
+  let id: string | undefined;
   try {
+    const created = await api({
+      method: 'POST',
+      path: '/containers/create',
+      signal,
+      json: {
+        Image: spec.image,
+        Entrypoint: [spec.entrypoint],
+        Cmd: [...spec.args],
+        User: spec.user,
+        Labels: spec.labels,
+        HostConfig: {
+          Init: true,
+          NetworkMode: 'none',
+          Mounts: spec.volumes.map((volume) => ({ Type: 'volume', Source: volume.name, Target: volume.target })),
+        },
+      },
+    });
+    if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
+    const createdId = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+    if (typeof createdId !== 'string' || createdId === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+    id = createdId;
     const started = await api({ method: 'POST', path: `/containers/${id}/start`, signal });
     if (started.status !== 204 && started.status !== 304) throw new EngineError(engineErrorMessage({ ...started, truncated: false }), started.status);
     const waited = await api({ method: 'POST', path: `/containers/${id}/wait`, signal });
     if (waited.status !== 200) throw new EngineError(engineErrorMessage({ ...waited, truncated: false }), waited.status);
+    // Review round 2 of 11B3a (A-R2-4): the time limit ends with the run; the log has a limit of its own, and without it
+    // the exit code is still the answer.
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
     const code = (json(waited.body) as { StatusCode?: unknown } | undefined)?.StatusCode;
     const exitCode = typeof code === 'number' ? code : null;
     let output = '';
     if (exitCode !== 0) {
       // Review round 1 of 11B3a (A-R1-8): the end of the log, where the reason is.
-      const logs = await api({ method: 'GET', path: `/containers/${id}/logs?stdout=true&stderr=true&tail=200`, signal });
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      const logs = await api({
+        method: 'GET',
+        path: `/containers/${id}/logs?stdout=true&stderr=true&tail=200`,
+        signal: options.signal ? AbortSignal.any([options.signal, limit]) : limit,
+      }).catch((error: unknown) => {
+        if (options.signal?.aborted) throw error;
+        return undefined;
+      });
       // The frames of the log of a container without a terminal: their headers are left out.
-      output = logs.status === 200 ? logs.body.replace(/[\u0000-\u0002]\u0000\u0000\u0000[\s\S]{4}/g, '').slice(-MAX_RUN_OUTPUT_CHARACTERS) : '';
+      output = logs?.status === 200 ? logs.body.replace(/[\u0000-\u0002]\u0000\u0000\u0000[\s\S]{4}/g, '').slice(-MAX_RUN_OUTPUT_CHARACTERS) : '';
     }
     return { exitCode, output, timedOut: false };
   } catch (error) {
@@ -318,9 +343,10 @@ async function runContainer(
     throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
-    // Removed in every case, also after a cancel (without its signal).
+    // Removed in every case, also after a cancel (without its signal; review round 2 of 11B3a, A-R2-2: within a time
+    // limit of its own).
     // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; a named volume (the workspace) is kept.
-    await api({ method: 'DELETE', path: `/containers/${id}?force=true&v=true` }).catch(() => undefined);
+    if (id !== undefined) await api({ method: 'DELETE', path: `/containers/${id}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
   }
 }
 
@@ -338,6 +364,8 @@ async function pullImage(
   reference: string,
   options: { login?: EnginePullLogin; onLine?: (line: string) => void; signal?: AbortSignal },
 ): Promise<void> {
+  // Review round 2 of 11B3a (A-R2-1): never a pull of every tag of a repository (`fromImage` without a tag).
+  if (!hasTagOrDigest(reference)) throw new EngineError(`The pull of ${reference} needs a tag or a digest.`, 0);
   const headers: Record<string, string> = {};
   const login = options.login;
   if (login !== undefined) {
