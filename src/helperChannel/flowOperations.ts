@@ -6,7 +6,9 @@
 // Each one builds the seams of the flow from the requests of its operation (workerHostSide) and the port of its engine
 // (dockerEngine), runs the flow, and answers with its result. The first flow is the token removal; the flows of plan
 // steps 11B2 to 11E come here too.
-import { parseTokenRemoveParams, type TokenRemoveValue } from '../core/helperChannel/protocol';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, parseStopParams, parseTokenRemoveParams, type StopValue, type TokenRemoveValue } from '../core/helperChannel/protocol';
+import { stopFlow } from '../core/worker/stopFlow';
+import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { workerHostSide } from '../core/worker/workerHostSide';
@@ -51,6 +53,48 @@ export function tokenRemoveOperation(engineOf: EngineOfOperation): OperationHand
     } catch (error) {
       if (error instanceof OperationError) throw error;
       throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+    }
+  };
+}
+
+/**
+ * Plan step 11B2: `stop`, the Stop of an environment (stopFlow) under its lock, which the operation takes itself (the
+ * one way: takeEnvironmentLock) and lets go at its end. A lock held elsewhere for the whole wait is `busy`.
+ */
+export function stopOperation(engineOf: EngineOfOperation, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseStopParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the stop operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The stop operation takes no secret.');
+    context.progress('lock', checked.environmentId);
+    let release: () => void;
+    try {
+      release = await takeEnvironmentLock(lockDeps, checked.environmentId, checked.waitSeconds, context.signal);
+    } catch (error) {
+      // Review round 1 (A-R1-3): a lock that could not be taken for another reason than a holder elsewhere changed
+      // nothing; the extension says so (environmentLockUnavailable), as for the lock before the move.
+      if (error instanceof OperationError && error.code !== LOCK_BUSY_CODE && error.code !== 'cancelled') throw new OperationError(LOCK_UNAVAILABLE_CODE, error.message);
+      throw error;
+    }
+    try {
+      context.progress('stop', checked.containerName);
+      const result = await stopFlow({
+        environmentId: checked.environmentId,
+        containerName: checked.containerName,
+        folder: checked.folder,
+        ...(checked.user !== undefined ? { user: checked.user } : {}),
+        engine: engineOf(context),
+        log: (line) => context.log(line),
+        now: () => new Date().toISOString(),
+        signal: context.signal,
+      });
+      return result satisfies StopValue;
+    } catch (error) {
+      if (error instanceof OperationError) throw error;
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The stop operation was cancelled.');
+      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+    } finally {
+      release();
     }
   };
 }

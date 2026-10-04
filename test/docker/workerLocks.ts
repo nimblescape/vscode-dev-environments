@@ -46,6 +46,8 @@ export interface WorkerLocks {
   readonly channels: HelperChannels;
   /** EnvironmentServiceDeps.environmentLock: the lock of the worker of the current Docker target. */
   take(environmentId: string, waitSeconds: number, signal: AbortSignal | undefined): Promise<HeldEnvironmentLock>;
+  /** Plan step 11B2: EnvironmentServiceDeps.flow, a flow in the worker of the current Docker target (as extension.ts). */
+  flow(op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown>;
   /** The batch helper sessions opened through the locks of `take`, per environment ID, in order. */
   readonly batches: Map<string, string[]>;
   /** The worker and batch helper containers of this object that still exist. */
@@ -95,6 +97,7 @@ export function workerLocks(
     channels,
     batches,
     leftovers,
+    flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),
     take: async (environmentId, waitSeconds, signal) => {
       const lock = await channels.lock(await targets.current(), environmentId, waitSeconds, signal);
       return {

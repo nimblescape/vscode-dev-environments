@@ -438,6 +438,17 @@ export function configOwnershipFixCommand(folder: string, uid: string, gid: stri
 }
 
 /**
+ * The check of a GitSummary as the registry keeps it, and as the worker answers it after a Stop (plan step 11B2): one
+ * definition for both.
+ */
+export function isGitSummary(value: unknown): value is GitSummary {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt } = value as Record<string, unknown>;
+  const isCount = (count: unknown) => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+  return (branch === null || typeof branch === 'string') && isCount(uncommittedFiles) && isCount(unpushedCommits) && isCount(stashes) && typeof recordedAt === 'string';
+}
+
+/**
  * Parses the output of GIT_SUMMARY_SCRIPT. Uses the last 4 lines, so that a banner before them does no harm.
  * Throws when the output does not have this form.
  */

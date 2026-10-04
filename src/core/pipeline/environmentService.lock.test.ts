@@ -196,10 +196,12 @@ describe('Delete under the environment lock (plan step 5, PR B)', () => {
 });
 
 describe('Stop under the environment lock (plan step 5, PR B)', () => {
+  // Plan step 11B2: changed expectation (before: `docker stop (locked)`, a call of this window through the worker that
+  // held the lock): the Stop runs in the worker under the lock that it took itself, so no lock is held in this window.
   it('stops under the lock and releases it', async () => {
     await seedEnvironment(h, { container: 'running' });
     await h.service.stop(ENV_ID);
-    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop (locked)', 'release']);
+    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop', 'release']);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
   });
 
@@ -233,7 +235,8 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
       return new Promise(() => {});
     };
     await h.service.stop(ENV_ID);
-    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop (locked)', 'release']);
+    // Plan step 11B2: changed expectation (`docker stop`, not `(locked)`), as above.
+    expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop', 'release']);
     expect(h.helper.calls).toContain('ensureImagePresent');
     expect(h.helper.calls).not.toContain('ensureImage');
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
@@ -258,14 +261,9 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
 });
 
 describe('no unlocked path (plan step 5, PR B, D1: no unlocked path)', () => {
-  // The mutant that drops only the re-entrance check (holdsEnvironmentLock) takes a second lock here and fails.
-  it('Stop within a held lock of the environment takes no second lock and runs under the held one', async () => {
-    await seedEnvironment(h, { container: 'running' });
-    await runWithEnvironmentLock(heldLock(ENV_ID), () => h.service.stop(ENV_ID));
-    expect(events).toEqual(['docker stop (locked)']);
-    expect(releases).toBe(0);
-  });
-
+  // Plan step 11B2: the test "Stop within a held lock of the environment takes no second lock" is removed with the code
+  // that it tested: Stop no longer takes the lock in this window (withEnvironmentLock); the worker takes it. The
+  // re-entrance of withEnvironmentLock stays covered by "is re-entrant" (Delete) above.
   it('the default lock of the testkit is taken and released by Stop and Delete (the lock is required)', async () => {
     const plain = createHarness();
     try {

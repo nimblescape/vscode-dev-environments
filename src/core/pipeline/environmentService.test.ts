@@ -44,10 +44,15 @@ import {
   resourceName,
 } from '../names';
 import { abortError } from '../ports';
+import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
+import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
+  ENVIRONMENT_LOCK_WAIT_SECONDS,
   MAX_REFUSED_ITEMS_LENGTH,
   PipelineTexts,
+  STOP_FLOW_TIMEOUT_MS,
   afterUpClause,
   kindSwitchFailure,
   lifecycleMarkClears,
@@ -3811,6 +3816,116 @@ describe('stop', () => {
     h.alivePids.delete(999);
     await h.service.stop(ENV_ID);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
+  });
+  // Plan step 11B2: Stop runs in the worker (the testkit serves it as the worker does, fakeWorkerFlow).
+  describe('in the worker (plan step 11B2)', () => {
+    function withFlow(flow: (op: string, params: unknown) => Promise<unknown>): { sent: { op: string; params: unknown; options: unknown }[] } {
+      const sent: { op: string; params: unknown; options: unknown }[] = [];
+      h.cleanup();
+      h = createHarness({ flow: async (op, params, options) => (sent.push({ op, params, options }), flow(op, params)) });
+      return { sent };
+    }
+
+    it('sends the environment, the repository folder, the remote user and the wait for the lock, with its time limit', async () => {
+      const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      expect(sent).toEqual([
+        {
+          op: OP_STOP,
+          params: { environmentId: ENV_ID, containerName: (await entry())!.containerName, folder: '/workspaces/api', user: 'vscode', waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS },
+          options: { signal: undefined, timeoutMs: STOP_FLOW_TIMEOUT_MS },
+        },
+      ]);
+      expect(parseStopParams(sent[0].params)).toEqual(sent[0].params);
+      expect(STOP_FLOW_TIMEOUT_MS).toBe(600_000);
+      // Review round 1 (B-R1-19): an empty remote user is no user.
+      await h.registry.updateEnvironment(ENV_ID, (env) => {
+        env.remoteUser = '';
+      });
+      await h.service.stop(ENV_ID);
+      expect(sent[1].params).not.toHaveProperty('user');
+    });
+
+    it('records the Git state that the worker answers with the time of this computer, and nothing when it answers none (review round 1, A-R1-1)', async () => {
+      // The clock of the Docker host is an hour ahead: its time is not the one recorded.
+      const summary = { branch: 'topic', uncommittedFiles: 9, unpushedCommits: 0, stashes: 0, recordedAt: new Date(T0 + 3_600_000).toISOString() };
+      withFlow(async () => ({ outcome: 'stopped', gitSummary: summary, services: [], failures: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      const recorded = (await entry())?.gitSummary;
+      expect(recorded).toMatchObject({ branch: 'topic', uncommittedFiles: 9 });
+      expect(Date.parse(recorded!.recordedAt)).toBeLessThan(T0 + 60_000);
+      withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      await h.service.stop(ENV_ID);
+      expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
+    });
+
+    it('records the Git state, then reports the containers that could not be stopped (review round 1, A-R1-2)', async () => {
+      const summary = { branch: 'topic', uncommittedFiles: 4, unpushedCommits: 0, stashes: 0, recordedAt: '2026-10-03T23:00:00.000Z' };
+      withFlow(async () => ({ outcome: 'stopped', gitSummary: summary, services: [], failures: ['The container a could not be stopped: x.', 'The container b did not stop within 60 s.'] }));
+      await seedEnvironment(h, { container: 'running' });
+      const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+      expect(thrown.message).toBe('The container a could not be stopped: x. The container b did not stop within 60 s.');
+      expect((await entry())?.gitSummary).toMatchObject({ branch: 'topic', uncommittedFiles: 4 });
+    });
+
+    it('keeps the recorded Git state when the worker answers none, and reports the failures (review round 2)', async () => {
+      withFlow(async () => ({ outcome: 'stopped', services: [], failures: ['The container a could not be stopped: x.'] }));
+      await seedEnvironment(h, { container: 'running' });
+      const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+      expect(thrown.message).toBe('The container a could not be stopped: x.');
+      expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
+    });
+
+    it('refuses before the worker: under a lock that this window holds, and parameters the worker would refuse (review round 1, A-R1-4, A-R1-5)', async () => {
+      const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      const held = (await runWithEnvironmentLock(
+        { environmentId: ENV_ID, lost: new Promise(() => {}), docker: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }), release: async () => {} },
+        () => h.service.stop(ENV_ID).catch((e: unknown) => e),
+      )) as Error;
+      expect(held.message).toBe(`Stop of ${REPO} under a lock of the environment that this window holds.`);
+      await h.registry.updateEnvironment(ENV_ID, (env) => {
+        env.remoteUser = '-u root';
+      });
+      const refused = await rejection(h.service.stop(ENV_ID));
+      expect(refused.message).toBe(PipelineTexts.stopRefused(REPO));
+      // Review round 2 (A-R2-2): no Try again for a refusal that a retry cannot change.
+      expect(refused.code).toBe('recordInvalid');
+      expect(sent).toEqual([]);
+    });
+
+    it('refuses as before the move: busy, no worker; any other failure as it is; an invalid answer is a failure', async () => {
+      for (const [error, expected] of [
+        [new HelperOperationError(LOCK_BUSY_CODE, 'held', false), PipelineTexts.environmentLockBusy(REPO)],
+        [new HelperChannelError('unavailable', 'no image'), PipelineTexts.environmentLockUnavailable(REPO, 'no image')],
+        // Review round 1 (A-R1-3): a lock that could not be taken; a channel lost while the flow ran is no "not changed".
+        [new HelperOperationError(LOCK_UNAVAILABLE_CODE, 'flock failed', false), PipelineTexts.environmentLockUnavailable(REPO, 'flock failed')],
+        [new HelperChannelError('lost', 'The worker ended.'), 'The worker ended.'],
+        // Review round 2 (A-R2-1): a channel that closed before the flow was sent changed nothing.
+        [new HelperChannelError('closed', 'closed'), PipelineTexts.environmentLockUnavailable(REPO, 'closed')],
+        // Review round 2 (B-R2-3): the other refusals before the flow, and one during it thrown as it is.
+        [new HelperChannelError('unsendable', 'u'), PipelineTexts.environmentLockUnavailable(REPO, 'u')],
+        [new HelperChannelError('open', 'o'), PipelineTexts.environmentLockUnavailable(REPO, 'o')],
+        [new HelperChannelError('protocol', 'The worker answered with an invalid line.'), 'The worker answered with an invalid line.'],
+        [new HelperOperationError('failed', 'The container x could not be stopped: permission denied', false), 'The container x could not be stopped: permission denied'],
+      ] as const) {
+        withFlow(async () => {
+          throw error;
+        });
+        await seedEnvironment(h, { container: 'running' });
+        // A failed stop is no UserFacingError (as the CommandError of `docker stop` before the move).
+        const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+        expect(thrown.message, expected).toBe(expected);
+        // Review round 2 (B-R2-6): the refusals before the flow keep their code of before the move.
+        if (expected.startsWith(`${REPO} was not changed:`)) expect((thrown as UserFacingError).code).toBe('helperFailed');
+      }
+      withFlow(async () => ({ outcome: 'stopped', gitSummary: { branch: 1 }, services: [], failures: [] }));
+      await seedEnvironment(h, { container: 'running' });
+      expect(((await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error).message).toBe(`The worker answered the Stop of ${REPO} with an invalid value.`);
+    });
   });
 });
 

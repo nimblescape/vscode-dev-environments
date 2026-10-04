@@ -14,8 +14,8 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_HELPER_CHANNEL, OP_TOKEN_REMOVE, parseTokenRemoveValue } from '../../src/core/helperChannel/protocol';
-import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
+import { LABEL_HELPER_CHANNEL, OP_STOP, OP_TOKEN_REMOVE, parseStopValue, parseTokenRemoveValue } from '../../src/core/helperChannel/protocol';
+import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
 import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';
@@ -148,4 +148,33 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     expect(value).toEqual({ outcome: 'notRunning' });
     expect(requests).toEqual([]);
   });
+
+  // Plan step 11B2: Stop in the worker, under the lock that it takes itself: the Git state as the folder's user, then
+  // the dev container and the running service of Docker Compose; no request to this computer.
+  it('stops the dev container and its running service through the worker, with the Git state', async () => {
+    const id = newEnvironmentId();
+    const name = `devenv-test-stop-${crypto.randomBytes(4).toString('hex')}`;
+    const common = ['--network', 'none', '--init', '--stop-timeout', '2', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`];
+    cli.ok(['run', '-d', '--name', name, ...common, helperTag, 'sleep', '600']);
+    cli.ok(['exec', name, 'git', 'init', '-q', '-b', 'feature/stop', '/workspaces/stop']);
+    cli.ok(['run', '-d', '--name', `${name}-db-1`, ...common, '--label', `${LABEL_COMPOSE_SERVICE}=db`, TEST_BASE_IMAGE, 'sleep', '600']);
+    const requests: string[] = [];
+    const value = await channels.flow(
+      await targets.current(),
+      OP_STOP,
+      { environmentId: id, containerName: name, folder: '/workspaces/stop', waitSeconds: 10 },
+      { timeoutMs: 120_000, onAsk: hostSideHandler(hostWith(undefined, requests), log, FLOW_REQUESTS[OP_STOP]) },
+    );
+    expect(parseStopValue(value)).toMatchObject({ outcome: 'stopped', gitSummary: { branch: 'feature/stop', uncommittedFiles: 0 }, services: [`${name}-db-1`], failures: [] });
+    expect(requests).toEqual([]);
+    expect(cli.container(name)?.State.Running).toBe(false);
+    expect(cli.container(`${name}-db-1`)?.State.Running).toBe(false);
+    // Nothing runs any more: a second Stop finds no running container and stops nothing.
+    expect(parseStopValue(await channels.flow(await targets.current(), OP_STOP, { environmentId: id, containerName: name, folder: '/workspaces/stop', waitSeconds: 10 }, { timeoutMs: 60_000 }))).toEqual({
+      outcome: 'notRunning',
+      services: [],
+      failures: [],
+    });
+  });
 });
+

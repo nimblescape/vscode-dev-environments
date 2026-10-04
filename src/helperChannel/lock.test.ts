@@ -4,14 +4,18 @@
 
 // Plan step 5, PR B: the operation `lock` of the worker. First with a fake `flock` (the order of the steps, the exit
 // codes, the cancel), then with real processes as in heartbeatLock.test.ts: `flock` as in the helper image, the kernel
-// lock, a killed holder, and a lock file that is a symbolic link.
+// lock, a killed holder, and a lock file that is a symbolic link. Plan step 11B2: the operation `stop` under its own lock.
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, lockFilePath, lockFolder } from '../core/helperChannel/protocol';
-import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, type FlockProcess, type LockDeps } from './lock';
+import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
+import { LABEL_ENVIRONMENT_ID } from '../core/names';
+import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions } from '../core/worker/dockerEngine';
+import { scriptCommand } from '../core/worker/containerScripts';
+import { stopOperation } from './flowOperations';
+import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 
@@ -341,5 +345,202 @@ describe('abortedOrAfter (review round 3 of PR #80, B-R3-1)', () => {
       new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 2_000)),
     ]);
     expect(outcome).toBe('resolved');
+  });
+});
+
+// Plan step 11B2: `stop` takes the lock of the environment itself (takeEnvironmentLock, the one way), runs Stop under it,
+// and lets go of it at its end, whatever the end.
+describe('the stop operation under its own lock (plan step 11B2)', () => {
+  const NAME = 'devenv-acme-api-brave-noether';
+  const PARAMS = { environmentId: ID, containerName: NAME, folder: '/workspaces/api', user: 'dev', waitSeconds: 10 };
+
+  function engineOf(stop: () => Promise<void> = async () => {}, events: string[] = [], execs: { command: readonly string[]; options: EngineExecOptions }[] = []): DockerEngine {
+    const dev: EngineContainer = { id: 'd'.repeat(64), name: NAME, state: 'running', rawState: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ID }, image: 'img:1' };
+    return {
+      container: async () => undefined,
+      containers: async () => (events.push('list'), [dev]),
+      exec: async (_c, command, options = {}) => (events.push('git'), execs.push({ command, options }), { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: '', timedOut: false }),
+      stop: async () => (events.push('docker stop'), stop()),
+      start: async () => {},
+    };
+  }
+
+  it('takes the lock with the wait of its parameters, stops under it, answers the Git state, and lets go', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const h = harness();
+    const seen: OperationContext[] = [];
+    const done = stopOperation((context) => (seen.push(context), engineOf(undefined, events)), deps)(PARAMS, h.context);
+    await settle();
+    expect(events).toEqual(['open /state ' + ID, `flock -w 10 -E ${LOCK_BUSY_EXIT} ${FLOCK_FD} fd=42`]);
+    flocks[0].exit(0);
+    const value = await done;
+    expect(value).toMatchObject({ outcome: 'stopped', services: [], failures: [], gitSummary: { branch: 'main', uncommittedFiles: 0 } });
+    expect(parseStopValue(value)).toBeDefined();
+    expect(events.slice(2)).toEqual(['list', 'git', 'docker stop', 'close 42']);
+    expect(h.progress).toEqual(['lock', 'stop']);
+    expect(seen).toEqual([h.context]);
+  });
+
+  it('a lock held elsewhere is busy and stops nothing; one that cannot be taken is lockUnavailable; a failed stop is answered; the lock is let go', async () => {
+    const busy = fakeDeps();
+    const stops: string[] = [];
+    const first = stopOperation(() => engineOf(undefined, stops), busy.deps)(PARAMS, harness().context);
+    await settle();
+    busy.flocks[0].exit(LOCK_BUSY_EXIT);
+    await expect(first).rejects.toMatchObject({ code: 'busy' });
+    expect(stops).toEqual([]);
+    expect(busy.events.at(-1)).toBe('close 42');
+    // Review round 1 (A-R1-3): another failure of the lock changed nothing either.
+    const broken = fakeDeps();
+    const second = stopOperation(() => engineOf(undefined, stops), broken.deps)(PARAMS, harness().context);
+    await settle();
+    broken.flocks[0].exit(1, 'flock: bad file');
+    await expect(second).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE, message: 'flock failed (exit code 1): flock: bad file' });
+    const unopened = fakeDeps({ openFails: true });
+    await expect(stopOperation(() => engineOf(undefined, stops), unopened.deps)(PARAMS, harness().context)).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE });
+    expect(stops).toEqual([]);
+    // Review round 1 (A-R1-2): a stop that failed is answered with the Git state, not thrown.
+    const failing = fakeDeps();
+    const third = stopOperation(
+      () =>
+        engineOf(async () => {
+          throw new EngineError('permission denied', 500);
+        }),
+      failing.deps,
+    )(PARAMS, harness().context);
+    await settle();
+    failing.flocks[0].exit(0);
+    expect(await third).toMatchObject({ outcome: 'stopped', gitSummary: { branch: 'main' }, failures: [`The container ${NAME} could not be stopped: permission denied`] });
+    expect(failing.events.at(-1)).toBe('close 42');
+  });
+
+  it('a cancel while it waits for the lock is cancelled, not lockUnavailable (review round 2, B-R2-4)', async () => {
+    const { deps, events } = fakeDeps();
+    const h = harness();
+    const done = stopOperation(() => engineOf(), deps)(PARAMS, h.context);
+    await settle();
+    h.controller.abort();
+    await expect(done).rejects.toMatchObject({ code: 'cancelled' });
+    expect(events.at(-1)).toBe('close 42');
+  });
+
+  it('a cancel under the lock is cancelled, and lets go of it', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const h = harness();
+    const done = stopOperation(
+      () =>
+        engineOf(async () => {
+          // As the port: a cancel ends the request with an AbortError.
+          h.controller.abort();
+          throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+        }),
+      deps,
+    )(PARAMS, h.context);
+    await settle();
+    flocks[0].exit(0);
+    await expect(done).rejects.toMatchObject({ code: 'cancelled' });
+    expect(events.at(-1)).toBe('close 42');
+  });
+
+  it('refuses invalid parameters and any secret, before the lock', async () => {
+    for (const params of [{}, { ...PARAMS, waitSeconds: 0 }, { ...PARAMS, folder: '/etc' }, { ...PARAMS, user: '-u' }, { ...PARAMS, extra: 1 }]) {
+      const { deps, events } = fakeDeps();
+      await expect(stopOperation(() => engineOf(), deps)(params, harness().context), JSON.stringify(params)).rejects.toMatchObject({ code: 'invalid' });
+      expect(events).toEqual([]);
+    }
+    const { deps, events } = fakeDeps();
+    await expect(stopOperation(() => engineOf(), deps)(PARAMS, harness('abcd1234').context)).rejects.toMatchObject({ code: 'invalid' });
+    expect(events).toEqual([]);
+  });
+
+  it('takeEnvironmentLock closes the file when the lock is not taken, and its release closes it once', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const controller = new AbortController();
+    const taking = takeEnvironmentLock(deps, ID, 5, controller.signal);
+    await settle();
+    flocks[0].exit(0);
+    const release = await taking;
+    expect(events).not.toContain('close 42');
+    release();
+    expect(events.filter((event) => event === 'close 42')).toHaveLength(1);
+    const failed = fakeDeps();
+    const refused = takeEnvironmentLock(failed.deps, ID, 5, new AbortController().signal);
+    await settle();
+    failed.flocks[0].exit(1, 'flock: bad file');
+    await expect(refused).rejects.toMatchObject({ code: 'failed', message: 'flock failed (exit code 1): flock: bad file' });
+    expect(failed.events.at(-1)).toBe('close 42');
+  });
+
+  it('reads the Git state in the folder, as the user, with the cancel of the operation; waits as asked; logs (review round 1, B-R1-3 to B-R1-5, B-R1-15, B-R1-16)', async () => {
+    const { deps, events, flocks } = fakeDeps();
+    const h = harness();
+    const lines: string[] = [];
+    h.context.log = (line) => lines.push(line);
+    const execs: { command: readonly string[]; options: EngineExecOptions }[] = [];
+    const done = stopOperation(() => engineOf(undefined, [], execs), deps)({ ...PARAMS, waitSeconds: 7 }, h.context);
+    await settle();
+    expect(events[1]).toBe(`flock -w 7 -E ${LOCK_BUSY_EXIT} ${FLOCK_FD} fd=42`);
+    flocks[0].exit(0);
+    await done;
+    expect(execs).toHaveLength(1);
+    expect(execs[0].command).toEqual(scriptCommand('gitSummary', ['/workspaces/api']));
+    expect(execs[0].options).toMatchObject({ user: 'dev', signal: h.context.signal });
+    expect(lines).toContain(`Stopping the container ${NAME}.`);
+  });
+
+  it('flock that cannot start names why (review round 1, B-R1-18)', async () => {
+    const { deps } = fakeDeps();
+    deps.startFlock = () => ({ exited: Promise.resolve({ exitCode: null, error: 'ENOENT flock' }), kill: () => {} });
+    await expect(takeEnvironmentLock(deps, ID, 5, new AbortController().signal)).rejects.toMatchObject({ code: 'failed', message: 'flock could not be started: ENOENT flock' });
+  });
+});
+
+describe('the checks of stop (plan step 11B2)', () => {
+  const PARAMS = { environmentId: ID, containerName: 'devenv-acme-api-brave-noether', folder: '/workspaces/api', waitSeconds: 10 };
+  it('takes the parameters of a Stop, and nothing else', () => {
+    expect(parseStopParams(PARAMS)).toEqual(PARAMS);
+    expect(parseStopParams({ ...PARAMS, user: 'dev' })).toEqual({ ...PARAMS, user: 'dev' });
+    for (const value of [null, { ...PARAMS, waitSeconds: 61 }, { ...PARAMS, waitSeconds: 1.5 }, { ...PARAMS, folder: '/workspaces/..' }, { ...PARAMS, environmentId: 'a b' }, { ...PARAMS, containerName: '-x' }, { ...PARAMS, user: 'a b' }]) {
+      expect(parseStopParams(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+
+  it('takes the value of a Stop, the Git state only after a stop, and only its fields', () => {
+    const summary = { branch: null, uncommittedFiles: 0, unpushedCommits: 0, stashes: 1, recordedAt: '2026-10-03T23:00:00.000Z' };
+    expect(parseStopValue({ outcome: 'stopped', gitSummary: { ...summary, extra: 'x' }, services: ['db-1'], failures: ['no'] })).toEqual({
+      outcome: 'stopped',
+      gitSummary: summary,
+      services: ['db-1'],
+      failures: ['no'],
+    });
+    expect(parseStopValue({ outcome: 'notRunning', services: [], failures: [] })).toEqual({ outcome: 'notRunning', services: [], failures: [] });
+    // Review round 1 (B-R1-13, B-R1-14, B-R1-17): the limits, exactly, and the check of the Git state.
+    expect(MAX_STOPPED_SERVICES).toBe(256);
+    // Review round 2 (B-R2-2): a reason of exactly the longest length, as the worker clips one, is accepted.
+    expect(MAX_STOP_FAILURE_LENGTH).toBe(1000);
+    expect(parseStopValue({ outcome: 'stopped', services: [], failures: ['x'.repeat(MAX_STOP_FAILURE_LENGTH)] })?.failures).toHaveLength(1);
+    const all = Array.from({ length: MAX_STOPPED_SERVICES }, (_, i) => `s${i}`);
+    expect(parseStopValue({ outcome: 'notRunning', services: all, failures: [] })?.services).toHaveLength(MAX_STOPPED_SERVICES);
+    for (const gitSummary of [{ ...summary, branch: 1 }, { ...summary, uncommittedFiles: 1.5 }, { branch: 'x', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0 }]) {
+      expect(parseStopValue({ outcome: 'stopped', gitSummary, services: [], failures: [] }), JSON.stringify(gitSummary)).toBeUndefined();
+    }
+    for (const value of [
+      { outcome: 'notRunning', gitSummary: summary, services: [], failures: [] },
+      { outcome: 'stopped', gitSummary: { ...summary, stashes: -1 }, services: [], failures: [] },
+      { outcome: 'stopped', services: ['-x'], failures: [] },
+      { outcome: 'stopped', services: Array.from({ length: MAX_STOPPED_SERVICES + 1 }, (_, i) => `s${i}`), failures: [] },
+      { outcome: 'stopped', services: [], failures: Array.from({ length: MAX_STOPPED_SERVICES + 2 }, () => 'x') },
+      { outcome: 'stopped', services: [], failures: ['x'.repeat(MAX_STOP_FAILURE_LENGTH + 1)] },
+      // Review round 2 (B-R2-7): the type of the failures and of the list.
+      { outcome: 'stopped', services: [], failures: [[]] },
+      { outcome: 'stopped', services: [], failures: 'x' },
+      { outcome: 'stopped', services: [], failures: [1] },
+      { outcome: 'stopped', services: [] },
+      { outcome: 'stopped', failures: [] },
+      { outcome: 'maybe', services: [], failures: [] },
+      { outcome: 'stopped', services: [], failures: [], more: 1 },
+    ]) {
+      expect(parseStopValue(value), JSON.stringify(value).slice(0, 80)).toBeUndefined();
+    }
   });
 });

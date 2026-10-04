@@ -15,6 +15,7 @@ import {
   OP_PROBE,
   OP_PULL,
   OP_START_CONTAINERS,
+  OP_STOP,
   OP_TOKEN_REMOVE,
   OP_REFRESH,
   OP_SWEEP,
@@ -33,7 +34,7 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { tokenRemoveOperation, type EngineOfOperation } from './flowOperations';
+import { stopOperation, tokenRemoveOperation, type EngineOfOperation } from './flowOperations';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -178,4 +179,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_START_CONTAINERS]: startContainersOperation(ENGINE),
   // Plan step 11B1: the flows that run in the worker (flowOperations.ts).
   [OP_TOKEN_REMOVE]: tokenRemoveOperation(ENGINE_OF),
+  // Plan step 11B2: Stop, under the lock that the operation takes itself.
+  [OP_STOP]: stopOperation(ENGINE_OF),
 };

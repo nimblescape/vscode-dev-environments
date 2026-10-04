@@ -32,7 +32,11 @@ import {
   environmentImageName,
   resourceName,
 } from '../names';
-import type { HeldEnvironmentLock } from '../docker/environmentLock';
+import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
+import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
+import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
+import { stopFlow } from '../worker/stopFlow';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunOptions, type RunResult } from '../ports';
 import { StoragePaths } from '../storage/paths';
 import { EnvironmentRegistry } from '../storage/registry';
@@ -1342,6 +1346,89 @@ export class FakeEnvironmentLock {
   };
 }
 
+/**
+ * Plan step 11B2: the port of the engine of the flows over the FakeDocker of the tests, so that a flow of the worker runs
+ * against the same state as the rest of the pipeline. The order of insertion is the order of creation.
+ */
+export function fakeDockerEngine(docker: FakeDocker): DockerEngine {
+  const engineContainer = (container: ContainerInfo, index: number): EngineContainer => ({
+    id: container.id,
+    name: container.name,
+    state: container.state === 'running' ? 'running' : 'stopped',
+    rawState: container.rawState ?? container.state,
+    labels: { ...container.labels },
+    image: container.image ?? '',
+    created: new Date(T0 + index * 1000).toISOString(),
+  });
+  const all = () => [...docker.containers.values()];
+  return {
+    container: async (reference) => {
+      const index = all().findIndex((c) => c.id === reference || c.name === reference);
+      return index < 0 ? undefined : engineContainer(all()[index], index);
+    },
+    containers: async (label) => {
+      const [key, value] = label.split('=', 2);
+      return all()
+        .map((container, index) => ({ container, index }))
+        .filter(({ container }) => (value === undefined ? key in container.labels : container.labels[key] === value))
+        .map(({ container, index }) => engineContainer(container, index));
+    },
+    exec: async (container, command, options = {}) => {
+      const result = await docker.exec(container, command, { user: options.user, signal: options.signal, timeoutMs: options.timeoutMs, input: options.input });
+      return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut ?? false };
+    },
+    stop: async (container) => docker.stopContainer(container),
+    start: async (container) => docker.startContainer(container),
+  };
+}
+
+/**
+ * Plan step 11B2: EnvironmentServiceDeps.flow as the worker serves it, for the unit tests: the helper image of the
+ * worker first (as HelperChannels opens it), the lock of the environment through `lock` (as the operation takes it
+ * itself), then the flow over fakeDockerEngine. The refusals are those of the channel and the worker.
+ */
+export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' | 'clock'>, lock: EnvironmentServiceDeps['environmentLock']): EnvironmentServiceDeps['flow'] {
+  return async (op, params, options) => {
+    if (op !== OP_STOP) throw new HelperChannelError('unsendable', `The worker of the tests does not know the operation ${op}.`);
+    try {
+      await h.helper.ensureImagePresent({ signal: options.signal });
+    } catch (error) {
+      const cause = error instanceof UserFacingError && error.detail ? `${error.message} ${error.detail}` : (error as Error).message;
+      throw new HelperChannelError('unavailable', cause);
+    }
+    const checked = parseStopParams(params);
+    if (checked === undefined) throw new HelperOperationError('invalid', 'The parameters of the stop operation are invalid.', false);
+    let held: HeldEnvironmentLock;
+    try {
+      held = await lock(checked.environmentId, checked.waitSeconds, options.signal);
+    } catch (error) {
+      if (error instanceof EnvironmentLockError) {
+        if (error.kind === 'busy') throw new HelperOperationError(LOCK_BUSY_CODE, error.message, false);
+        // As the worker (review round 1 of 11B2, A-R1-3): a lock that could not be taken otherwise.
+        throw new HelperOperationError(LOCK_UNAVAILABLE_CODE, error.message, false);
+      }
+      throw error;
+    }
+    try {
+      return await stopFlow({
+        environmentId: checked.environmentId,
+        containerName: checked.containerName,
+        folder: checked.folder,
+        ...(checked.user !== undefined ? { user: checked.user } : {}),
+        engine: fakeDockerEngine(h.docker),
+        log: (line) => h.logger.info(line),
+        now: () => new Date(h.clock.now()).toISOString(),
+        signal: options.signal,
+      });
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw new HelperOperationError('failed', (error as Error).message, false);
+    } finally {
+      await held.release();
+    }
+  };
+}
+
 export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const paths = new StoragePaths(root);
@@ -1415,6 +1502,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     analyzer: inProcessAnalyzer,
     // Plan step 5, PR B (D1: no unlocked path): a lock that is always granted, for the tests that are not about it.
     environmentLock: h.lock.take,
+    // Plan step 11B2: the flows of the worker against the same FakeDocker, under the lock of the service.
+    flow: fakeWorkerFlow(h, overrides.environmentLock ?? h.lock.take),
     ...overrides,
   });
   return h;

@@ -21,6 +21,7 @@ import type {
   RefusedUpdate,
   RegistryFile,
 } from '../types';
+import { isGitSummary } from '../git/gitSummary';
 import { writeJsonAtomic } from './atomicJson';
 import { errorCode, isStorageId, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
 
@@ -528,17 +529,6 @@ function normalizeEnvironment(value: unknown): Environment | undefined {
     if (key in value && !check(value[key])) delete value[key];
   }
   return value as unknown as Environment;
-}
-
-function isGitSummary(value: unknown): value is GitSummary {
-  return (
-    isRecord(value) &&
-    (value.branch === null || isString(value.branch)) &&
-    isCount(value.uncommittedFiles) &&
-    isCount(value.unpushedCommits) &&
-    isCount(value.stashes) &&
-    isString(value.recordedAt)
-  );
 }
 
 export function isBuildRecord(value: unknown): value is BuildRecord {
