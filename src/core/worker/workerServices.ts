@@ -21,7 +21,7 @@ import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import { REMOTE_MONITOR_CONTAINER, forgetCommand, monitorExecFailure } from '../remoteMonitor/protocol';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
-import { isMissing, type DockerEngine } from './dockerEngine';
+import { EngineError, isMissing, type DockerEngine } from './dockerEngine';
 import { EngineDocker } from './engineDocker';
 import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
@@ -110,7 +110,9 @@ export function workerSessionMonitor(engine: DockerEngine, source: string | unde
           log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${detail}`);
         }
       } catch (error) {
-        if (isMissing(error)) return;
+        // Review round 1 of 11C2a (A-R1-L3): a monitor that does not exist, or does not run (it exits when it is idle),
+        // holds no record that matters, as RemoteSessionMonitor read it (isMissingContainer).
+        if (isMissing(error) || (error instanceof EngineError && error.status === 409 && /is not running/i.test(error.message))) return;
         log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${errorMessage(error)}`);
       }
     },
@@ -225,8 +227,8 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),
     sessionFiles: hostSessionFiles(deps.host),
     windowStatuses: () => deps.host.state.windowStatuses(),
-    // The pipeline asks synchronously; until the busy marks move (plan step 11C), every other process counts as alive, so
-    // a mark of another window is never taken over here.
+    // The pipeline asks synchronously, so every other process counts as alive here. Plan step 11C2a: the busy marks that
+    // Delete sets and waits for are decided by the extension (busyMarks); the opens follow with plan step 11E.
     isProcessAlive: () => true,
     imageChecker: {
       check: async () => {

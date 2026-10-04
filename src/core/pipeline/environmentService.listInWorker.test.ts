@@ -299,3 +299,47 @@ describe('the Delete in the worker, from the extension (plan step 11C2a)', () =>
     expect([...sent, ...withSource.sent, ...other.sent]).toEqual([]);
   });
 });
+
+// Review round 1 of 11C2a (A-R1-M1): a worker that ended without an answer may have left the busy mark of this window.
+describe('the Delete in the worker: review round 1 of 11C2a', () => {
+  const SOURCE = '0123456789abcdef0123456789abcdef';
+  const OWN_MARK = { operation: 'delete' as const, since: '2026-10-04T10:00:00.000Z', pid: PID, windowId: WINDOW_ID };
+  const OTHER_MARK = { operation: 'update' as const, since: '2026-10-04T10:00:00.000Z', pid: PID + 1, windowId: 'window-2' };
+
+  it('clears the busy mark of this window when the worker ended without an answer, never the mark of another window', async () => {
+    let mark = OWN_MARK as typeof OWN_MARK | typeof OTHER_MARK;
+    let failure: Error = new HelperChannelError('lost', 'the channel was lost while the operation ran');
+    const { h } = harness(
+      async () => {
+        // As the worker: it marked the environment, then its channel ended.
+        await h.registry.updateEnvironment(ENV_ID, (entry) => {
+          entry.busy = mark;
+        });
+        throw failure;
+      },
+      { monitorSource: () => SOURCE },
+    );
+    await seedEnvironment(h, { container: 'stopped' });
+    expect(await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }))).toBeInstanceOf(Error);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    mark = OTHER_MARK;
+    failure = new HelperChannelError('lost', 'lost again');
+    await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }));
+    expect((await h.registry.get(ENV_ID))?.busy).toEqual(OTHER_MARK);
+  });
+
+  it('leaves the mark to the worker when it answered with a refusal', async () => {
+    const { h } = harness(
+      async () => {
+        await h.registry.updateEnvironment(ENV_ID, (entry) => {
+          entry.busy = OWN_MARK;
+        });
+        return { refused: { code: 'startFailed', message: 'm' } };
+      },
+      { monitorSource: () => SOURCE },
+    );
+    await seedEnvironment(h, { container: 'stopped' });
+    expect(await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }))).toMatchObject({ code: 'startFailed' });
+    expect((await h.registry.get(ENV_ID))?.busy).toEqual(OWN_MARK);
+  });
+});

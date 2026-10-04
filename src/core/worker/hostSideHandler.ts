@@ -6,7 +6,7 @@
 // worker (plan step 11A, `OperationOptions.onAsk`). It checks every request, calls the HostSide of this computer, and
 // answers with its value; a `secret` request answers with the secret in `secrets`, never in the value. No `vscode` here:
 // the extension passes its own HostSide (src/vscode).
-import { HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
+import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
 import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
 import type { BusyOperation } from '../types';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
@@ -47,7 +47,11 @@ export function hostSideHandler(
     const request = parseHostRequest(payload, kind);
     if (request === undefined) throw new HelperOperationError('invalid', 'The request of the operation is invalid.', false);
     const name = `${request.kind} ${request.call}` as HostCall;
-    if (!permitted.has(name)) {
+    // Review round 1 of 11C2a (A-R1-L1, A-R1-L4): an allowance can name the kind of a request (its session file, its busy
+    // operation).
+    const detailAt = Object.hasOwn(DETAILED_REQUESTS, name) ? DETAILED_REQUESTS[name] : undefined;
+    const detail = detailAt !== undefined ? request.args[detailAt] : undefined;
+    if (!permitted.has(name) && !(typeof detail === 'string' && permitted.has(`${name}.${detail}`))) {
       logger.warn(`The worker sent the request ${request.kind} ${request.call}, which its operation may not send.`);
       throw new HelperOperationError('invalid', `The operation may not send the request ${request.kind} ${request.call}.`, false);
     }

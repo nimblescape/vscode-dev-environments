@@ -82,7 +82,14 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       findForAccount: (repository, accountId, dockerHost) => deps.registry.findForAccount(repository, accountId, dockerHost),
       add: (environment) => deps.registry.add(environment),
       update: async (id, changes) => void (await deps.registry.updateEnvironment(id, (environment) => void Object.assign(environment, changes))),
-      remove: (id, volumes) => deps.registry.remove(id, volumes),
+      // Review round 1 of 11C2a (A-R1-L2): the volumes of a removal are the additional volumes of the entry, never the kept
+      // volumes of another environment or account.
+      remove: async (id, volumes) => {
+        const own = new Set((await deps.registry.get(id))?.additionalVolumes ?? []);
+        const odd = [...(volumes.kept ?? []), ...(volumes.removed ?? [])].filter((name) => !own.has(name));
+        if (odd.length > 0) throw new Error(`The volumes ${odd.join(', ')} are not additional volumes of the environment.`);
+        await deps.registry.remove(id, volumes);
+      },
       forgetKeptVolumes: (names) => deps.registry.forgetKeptVolumes(names),
       sessionFile: async (kind, environmentId) => {
         if (kind === 'writePending') await deps.sessionFiles.writePending(environmentId, deps.windowId);

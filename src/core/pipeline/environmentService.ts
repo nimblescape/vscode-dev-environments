@@ -5985,7 +5985,17 @@ export class EnvironmentService {
           monitorSource,
         });
         if (params === undefined) throw new Error(`The Delete of ${environment.repository} cannot be sent to the worker.`);
-        const value = parseDeleteValue(await this.workerFlow(environment, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, options.signal));
+        let answer: unknown;
+        try {
+          answer = await this.workerFlow(environment, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, options.signal);
+        } catch (error) {
+          // Review round 1 of 11C2a (A-R1-M1): a worker that ended without an answer (its channel lost, its time limit, a
+          // cancel) may have marked the environment busy for this window and could not clear it; this window clears its
+          // own mark (never the mark of another window). A refusal (the value) was cleared by the worker.
+          await this.clearOwnMark(environment.id);
+          throw error;
+        }
+        const value = parseDeleteValue(answer);
         if (value === undefined) throw new Error(`The worker answered the Delete of ${environment.repository} with an invalid value.`);
         if ('refused' in value) throw refusalError(value.refused);
       } catch (error) {

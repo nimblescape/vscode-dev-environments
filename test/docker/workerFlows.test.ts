@@ -15,7 +15,7 @@ import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
-import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
+import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
 import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';
@@ -252,14 +252,17 @@ describe('the flows through a real worker (plan step 11B1)', () => {
   // Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): the Delete by the worker's own pipeline against the real
   // engine: the busy mark, the entry and the session files of the environment from this computer (each for its
   // environment), the lock in the worker, the dev container and the workspace volume removed over the port of the engine.
-  it('deletes an environment through the worker: its dev container and its volume, with the requests of Delete only', async () => {
+  // Review round 1 of 11C2a (A-R1-H1): with an additional volume that the user confirmed.
+  it('deletes an environment through the worker: its dev container, its volume and a confirmed additional volume, with the requests of Delete only', async () => {
     const id = newEnvironmentId();
     const name = `devenv-test-delete-${crypto.randomBytes(4).toString('hex')}`;
+    const extra = `${name}-cache`;
     const repository = 'devenv-test/worker-delete';
     cli.ok(['volume', 'create', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, name]);
+    cli.ok(['volume', 'create', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, '--label', `${LABEL_OWNER_ID}=42`, extra]);
     cli.ok(['run', '-d', '--init', '--name', name, '--network', 'none', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, '--mount', `type=volume,source=${name},target=/workspaces`, TEST_BASE_IMAGE, 'sleep', '600']);
     const requests: string[] = [];
-    const environment = { id, repository, owner: { id: '42', login: 'octo' }, volumeName: name, containerName: name } as unknown as Environment;
+    const environment = { id, repository, owner: { id: '42', login: 'octo' }, volumeName: name, containerName: name, additionalVolumes: [extra] } as unknown as Environment;
     const base = hostWith(undefined, requests);
     const host = {
       ...base,
@@ -267,6 +270,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
         ...base.records,
         get: async (requested: string) => (requests.push(`get ${requested}`), requested === id ? environment : undefined),
         list: async () => (requests.push('list'), [environment]),
+        read: async () => (requests.push('read'), { version: 1, environments: [environment] }),
         markBusy: async (requested: string, operation: string) => (requests.push(`markBusy ${requested} ${operation}`), { environment }),
         clearBusy: async (requested: string) => void requests.push(`clearBusy ${requested}`),
         remove: async (requested: string, volumes: unknown) => void requests.push(`remove ${requested} ${JSON.stringify(volumes)}`),
@@ -275,20 +279,22 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       state: { ...base.state, account: async (interactive: boolean) => (requests.push(`account ${interactive}`), { id: '42', login: 'octo' }) },
     } as HostSide;
     const target = await targets.current();
-    const params = { environmentId: id, dockerHost: target.host, owner: { windowId: 'window-1', pid: process.pid }, additionalVolumesToRemove: [], monitorSource: '0123456789abcdef0123456789abcdef' };
+    const params = { environmentId: id, dockerHost: target.host, owner: { windowId: 'window-1', pid: process.pid }, additionalVolumesToRemove: [extra], monitorSource: '0123456789abcdef0123456789abcdef' };
     const value = parseDeleteValue(
       await channels.flow(target, OP_DELETE, params, { timeoutMs: 180_000, onAsk: hostSideHandler(host, log, FLOW_REQUESTS[OP_DELETE], { environmentId: id }) }),
     );
     expect(value).toEqual({ deleted: true });
     expect(cli.lines(['ps', '-a', '--filter', `name=^${name}$`, '--format', '{{.Names}}'])).toEqual([]);
     expect(cli.lines(['volume', 'ls', '--filter', `name=^${name}$`, '--format', '{{.Name}}'])).toEqual([]);
+    expect(cli.lines(['volume', 'ls', '--filter', `name=^${extra}$`, '--format', '{{.Name}}'])).toEqual([]);
     expect(requests).toEqual([
       // Read before and within the queue of the repository (as the Delete of the extension read it).
       `get ${id}`,
       `get ${id}`,
       'account true',
       `markBusy ${id} delete`,
-      `remove ${id} {"kept":[],"removed":[]}`,
+      'read',
+      `remove ${id} {"kept":[],"removed":["${extra}"]}`,
       `sessionFile removePending ${id}`,
       `sessionFile removeOperation ${id}`,
       `sessionFile removeDisconnectRequest ${id}`,

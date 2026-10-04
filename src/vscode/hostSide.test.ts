@@ -193,3 +193,24 @@ describe('the busy marks and the reopen record of a flow (plan step 11C2a)', () 
     await expect(onAsk('record', { call: 'remove', args: ['e2', {}] }, signal)).rejects.toMatchObject({ code: 'invalid' });
   });
 });
+
+// Review round 1 of 11C2a (A-R1-L2): the volumes of a removal are the additional volumes of the entry.
+describe('the volumes of a removal from a flow (review round 1 of 11C2a)', () => {
+  it('passes the additional volumes of the entry, and refuses any other volume before the registry changes', async () => {
+    const { all, registry, environment } = deps();
+    (environment as { additionalVolumes?: string[] }).additionalVolumes = ['api-cache', 'api-db'];
+    const host = extensionHostSide(all);
+    await host.records.remove('e1', { kept: ['api-db'], removed: ['api-cache'] });
+    expect(registry.remove).toHaveBeenCalledWith('e1', { kept: ['api-db'], removed: ['api-cache'] });
+    registry.remove.mockClear();
+    await expect(host.records.remove('e1', { removed: ['other-account-data'] })).rejects.toThrow('not additional volumes');
+    await expect(host.records.remove('e1', { kept: ['devenv-other'] })).rejects.toThrow('not additional volumes');
+    registry.get.mockResolvedValueOnce(undefined as unknown as Environment);
+    await expect(host.records.remove('e2', { removed: ['api-cache'] })).rejects.toThrow('not additional volumes');
+    expect(registry.remove).not.toHaveBeenCalled();
+    // A removal without volumes needs none.
+    registry.get.mockResolvedValueOnce(undefined as unknown as Environment);
+    await host.records.remove('e2', {});
+    expect(registry.remove).toHaveBeenCalledWith('e2', {});
+  });
+});

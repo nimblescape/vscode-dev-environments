@@ -287,12 +287,14 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     await workerSessionMonitor(engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'boom', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
     await workerSessionMonitor(engineWith(async () => ({ exitCode: RECORDS_RUN_LIMIT_EXIT, stdout: '', stderr: '', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
     await workerSessionMonitor(engineWith(async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true })).engine, SOURCE, logger).forget!(TARGET, ID);
-    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('container is not running', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
+    // Review round 1 of 11C2a (A-R1-L3): changed expectation, a monitor that does not run (idle) is not logged either.
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('Container abc is not running', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('conflict', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
     expect(lines).toEqual([
       `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`,
       `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
       `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: docker exec did not end within ${MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`,
-      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: container is not running`,
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: conflict`,
     ]);
   });
 

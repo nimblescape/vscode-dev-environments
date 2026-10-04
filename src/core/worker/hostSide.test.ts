@@ -445,8 +445,36 @@ describe('the requests of Delete (plan step 11C2a)', () => {
     expect(parseBusyMarkAnswer(null, 'e1')).toBeUndefined();
   });
 
-  it('Delete may send only its requests', () => {
-    expect(FLOW_REQUESTS[OP_DELETE]).toEqual(['record get', 'record list', 'local account', 'record markBusy', 'record clearBusy', 'record remove', 'record sessionFile']);
+  // Review round 1 of 11C2a (A-R1-H1, A-R1-L1, A-R1-L4): changed expectation, `record read` (the volumes of the other
+  // environments), the busy mark for `delete` only, and only the session files of Delete.
+  it('Delete may send only its requests, its busy mark for delete only, and only its session files', async () => {
+    expect(FLOW_REQUESTS[OP_DELETE]).toEqual([
+      'record get',
+      'record list',
+      'record read',
+      'local account',
+      'record markBusy.delete',
+      'record clearBusy',
+      'record remove',
+      'record sessionFile.removePending',
+      'record sessionFile.removeOperation',
+      'record sessionFile.removeDisconnectRequest',
+      'record sessionFile.removeReopenOf',
+    ]);
+    const { handler, signal, calls } = wired({ markBusy: { environment: ENVIRONMENT } }, silentLogger, FLOW_REQUESTS[OP_DELETE]);
+    await handler('record', { call: 'markBusy', args: ['e1', 'delete'] }, signal);
+    await handler('record', { call: 'sessionFile', args: ['removeReopenOf', 'e1'] }, signal);
+    await handler('record', { call: 'read', args: [] }, signal);
+    for (const [call, args] of [
+      ['markBusy', ['e1', 'update']],
+      ['sessionFile', ['removeReopen', 'e1']],
+      ['sessionFile', ['writePending', 'e1']],
+      ['sessionFile', [1, 'e1']],
+      ['update', ['e1', { lastUsedAt: 't' }]],
+    ] as const) {
+      await expect(handler('record', { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
+    }
+    expect(calls.map((call) => call.call)).toEqual(['markBusy', 'sessionFile', 'read']);
   });
 });
 

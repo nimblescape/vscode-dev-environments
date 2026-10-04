@@ -139,10 +139,33 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   [OP_LIST_CONFIGURATIONS]: ['record get', 'local account'],
   // Plan step 11C1: the reads of an attached window need nothing from this computer.
   [OP_WINDOW_STATE]: [],
-  // Plan step 11C2a: Delete reads the record and the records of the other environments (the volumes they use) and the
-  // account, marks the environment busy and clears the mark, removes the entry and the session files of the environment
-  // (each tied to the environment of the operation: SCOPED_REQUESTS); no secret, no other write.
-  [OP_DELETE]: ['record get', 'record list', 'local account', 'record markBusy', 'record clearBusy', 'record remove', 'record sessionFile'],
+  // Plan step 11C2a: Delete reads the record, the registry (the volumes that other environments use or keep: review round
+  // 1 of 11C2a, A-R1-H1) and the account, marks the environment busy for `delete` only and clears the mark, removes the
+  // entry and the session files of the environment (each tied to the environment of the operation: SCOPED_REQUESTS;
+  // review round 1, A-R1-L1, A-R1-L4: only these kinds); no secret, no other write.
+  [OP_DELETE]: [
+    'record get',
+    'record list',
+    'record read',
+    'local account',
+    'record markBusy.delete',
+    'record clearBusy',
+    'record remove',
+    'record sessionFile.removePending',
+    'record sessionFile.removeOperation',
+    'record sessionFile.removeDisconnectRequest',
+    'record sessionFile.removeReopenOf',
+  ],
+};
+
+/**
+ * Review round 1 of 11C2a (A-R1-L1, A-R1-L4): the requests whose allowance can name one kind (`<kind> <call>.<detail>`
+ * in FLOW_REQUESTS), and the index of that kind in their arguments: the session file, the busy operation. The bare
+ * `<kind> <call>` allows every kind.
+ */
+export const DETAILED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
+  'record sessionFile': 0,
+  'record markBusy': 1,
 };
 
 /**

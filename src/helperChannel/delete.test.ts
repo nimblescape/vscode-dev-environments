@@ -5,8 +5,11 @@
 // Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): `delete`, run by the worker's own pipeline (workerServices)
 // with a small engine in memory, a fake extension (its requests), and a fake flock.
 import { describe, expect, it } from 'vitest';
-import { LOCK_BUSY_EXIT, parseDeleteValue, type AskKind } from '../core/helperChannel/protocol';
-import { LABEL_ENVIRONMENT_ID } from '../core/names';
+import { LOCK_BUSY_EXIT, OP_DELETE, parseDeleteValue, type AskKind } from '../core/helperChannel/protocol';
+import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID } from '../core/names';
+import { silentLogger } from '../core/ports';
+import { FLOW_REQUESTS } from '../core/worker/hostSide';
+import { hostSideHandler } from '../core/worker/hostSideHandler';
 import { REMOTE_MONITOR_CONTAINER, forgetCommand } from '../core/remoteMonitor/protocol';
 import type { BusyMark, Environment } from '../core/types';
 import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
@@ -15,6 +18,7 @@ import type { OwnHelper } from '../core/worker/ownHelper';
 import { deleteOperation } from './flowOperations';
 import type { FlockProcess, LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
+import type { HostSide } from '../core/worker/hostSide';
 import { OperationError, type OperationContext } from './server';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -51,6 +55,8 @@ interface Setup {
   volumeRemoveFails?: boolean;
   /** The Session Monitor command fails with this error. */
   forgetFails?: Error;
+  /** Review round 1 (A-R1-H1): an additional volume of the environment, its own by its labels. */
+  additional?: string;
 }
 
 function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
@@ -58,18 +64,26 @@ function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
   const engineCalls: string[] = [];
   const events: string[] = [];
   const controller = new AbortController();
+  const record = setup.record === undefined ? (setup.additional ? { ...ENVIRONMENT, additionalVolumes: [setup.additional] } : ENVIRONMENT) : setup.record;
+  // Review round 1 (A-R1-H1): the requests go through the handler of the extension with the requests of Delete and its
+  // environment, as they do in the extension.
+  const answer = (kind: AskKind, call: string, args: unknown[]): unknown => {
+    asks.push({ kind, call, args });
+    if (call === 'get') return record ?? undefined;
+    if (call === 'list') return record === null ? [] : [record];
+    if (call === 'read') return { version: 1, environments: record === null ? [] : [record] };
+    if (call === 'account') return setup.account === undefined ? { id: '42', login: 'octo' } : (setup.account ?? undefined);
+    if (call === 'markBusy') return setup.markBusy ? setup.markBusy() : { environment: { ...record, busy: { operation: 'delete', since: 't', pid: 4242, windowId: 'window-1' } } };
+    return undefined;
+  };
+  const host = {
+    records: Object.fromEntries(['get', 'list', 'read', 'markBusy', 'clearBusy', 'remove', 'sessionFile'].map((call) => [call, async (...args: unknown[]) => answer('record', call, args)])),
+    state: { account: async (...args: unknown[]) => answer('local', 'account', args) },
+  } as unknown as HostSide;
+  const handler = hostSideHandler(host, silentLogger, FLOW_REQUESTS[OP_DELETE], { environmentId: (params.environmentId as string | undefined) ?? ID });
   const context: OperationContext = {
     signal: controller.signal,
-    ...contextSecrets({}, async (kind, payload) => {
-      const { call, args } = payload as { call: string; args: unknown[] };
-      asks.push({ kind, call, args });
-      if (kind === 'record' && call === 'get') return setup.record === undefined ? ENVIRONMENT : setup.record;
-      if (kind === 'record' && call === 'list') return setup.record === null ? [] : [setup.record ?? ENVIRONMENT];
-      if (kind === 'local' && call === 'account') return setup.account === undefined ? { id: '42', login: 'octo' } : setup.account;
-      if (kind === 'record' && call === 'markBusy') return setup.markBusy ? setup.markBusy() : { environment: { ...ENVIRONMENT, busy: { operation: 'delete', since: 't', pid: 4242, windowId: 'window-1' } } };
-      if (kind === 'record' && (call === 'clearBusy' || call === 'remove' || call === 'sessionFile')) return null;
-      throw new OperationError('invalid', `The operation may not send the request ${kind} ${call}.`);
-    }),
+    ...contextSecrets({}, async (kind, payload) => (await handler(kind, payload, new AbortController().signal)).value),
     progress: (step) => events.push(`progress ${step}`),
     log: () => {},
     output: () => {},
@@ -96,7 +110,11 @@ function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
     removeImage: async (reference) => (engineCalls.push(`removeImage ${reference}`), 'missing'),
     volumeNames: async () => [],
     networkNames: async () => [],
-    inspect: async (kind, reference) => (kind === 'volume' && reference === NAME && volumeLabels !== null ? { Name: NAME, Labels: volumeLabels } : undefined),
+    inspect: async (kind, reference) => {
+      if (kind !== 'volume') return undefined;
+      if (reference === NAME && volumeLabels !== null) return { Name: NAME, Labels: volumeLabels };
+      return reference === setup.additional ? { Name: reference, Labels: { [LABEL_ENVIRONMENT_ID]: ID, [LABEL_OWNER_ID]: '42' } } : undefined;
+    },
     removeVolume: async (name) => {
       engineCalls.push(`removeVolume ${name}`);
       if (setup.volumeRemoveFails) throw new EngineError('volume is in use', 409);
@@ -194,6 +212,16 @@ describe('delete in the worker (plan step 11C2a)', () => {
     expect(calls(failing.asks)).toContain('record clearBusy');
     expect(calls(failing.asks)).not.toContain('record remove');
     expect(failing.events.at(-1)).toBe('unlock');
+  });
+
+  // Review round 1 of 11C2a (A-R1-H1): the additional volumes that the user confirmed are removed and the entry records
+  // them as removed; the registry is read for the volumes of the other environments.
+  it('removes a confirmed additional volume of the environment, with the requests that Delete may send', async () => {
+    const { result, asks, engineCalls } = run({ additional: 'api-cache' }, { additionalVolumesToRemove: ['api-cache'] });
+    expect(await result).toEqual({ deleted: true });
+    expect(engineCalls).toContain('removeVolume api-cache');
+    expect(asks.find((ask) => ask.call === 'remove')).toEqual({ kind: 'record', call: 'remove', args: [ID, { kept: [], removed: ['api-cache'] }] });
+    expect(calls(asks)).toContain('record read');
   });
 
   it('a Session Monitor that cannot forget does not fail the Delete', async () => {
