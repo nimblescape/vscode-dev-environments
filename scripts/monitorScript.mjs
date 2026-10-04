@@ -7,6 +7,7 @@
 // as the loader of the monitor gets it on its input). The module `devenv:monitor-script` is that script as its default
 // export; esbuild.mjs and the Docker tests give their builds of the worker this plugin, and the files of the monitor are
 // watched with the worker's own (a change of the monitor rebuilds the worker in watch mode).
+import * as fs from 'fs';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 
@@ -23,9 +24,10 @@ export function monitorScriptPlugin(root, define) {
     setup(build) {
       build.onResolve({ filter: /^devenv:monitor-script$/ }, () => ({ path: 'monitor-script', namespace: 'devenv-monitor-script' }));
       // Review round 1 of PR #100 (A-L2): the inputs of the metafile are relative to absWorkingDir, so it is the root; a
-      // failed build still watches the folder of the monitor, so its fix rebuilds the worker.
+      // failed build still watches the files of the monitor, so its fix rebuilds the worker (review round 2 of PR #100,
+      // A-L1: before any build succeeded, the .ts files of its folder and the files of the errors).
       const folder = path.join(root, 'src', 'remoteMonitor');
-      let watched = [folder];
+      let watched = [];
       build.onLoad({ filter: /.*/, namespace: 'devenv-monitor-script' }, async () => {
         let result;
         try {
@@ -43,7 +45,10 @@ export function monitorScriptPlugin(root, define) {
             define,
           });
         } catch (error) {
-          return { errors: error.errors ?? [{ text: String(error) }], watchFiles: watched, watchDirs: [folder] };
+          const errors = error.errors ?? [{ text: String(error) }];
+          const files = errors.flatMap((message) => (message.location?.file ? [path.resolve(root, message.location.file)] : []));
+          const fallback = watched.length > 0 ? watched : sourcesOf(folder);
+          return { errors, watchFiles: [...new Set([...fallback, ...files])], watchDirs: [folder] };
         }
         watched = Object.keys(result.metafile.inputs).map((file) => path.resolve(root, file));
         return {
@@ -54,4 +59,12 @@ export function monitorScriptPlugin(root, define) {
       });
     },
   };
+}
+
+/** The .ts files under `folder`. */
+function sourcesOf(folder) {
+  return fs
+    .readdirSync(folder, { recursive: true })
+    .filter((file) => String(file).endsWith('.ts'))
+    .map((file) => path.join(folder, String(file)));
 }
