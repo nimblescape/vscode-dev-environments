@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
-import { SECRET_TOKEN } from '../core/helperChannel/protocol';
+import { MIN_SECRET_LENGTH, SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { scriptCommand } from '../core/worker/containerScripts';
 import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
 import { dockerEngine, MAX_EXEC_OUTPUT_CHARACTERS } from './engineClient';
@@ -425,6 +425,21 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     // With the token as the input, the registry password of the operation is masked too.
     const withInput = await serve(execAnswers(), (socket) => socket.end(output), { secrets: { [SECRET_TOKEN]: token }, masked: [registry] });
     expect((await withInput.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).stdout).toBe(`${before}*** and ***`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+  });
+
+  it('review round 2 of PR #102 (A-M1): a frame that ends inside a secret, then the time limit, leaves no part of it', async () => {
+    const token = 'ghp_' + 'Z'.repeat(36);
+    const { engine } = await serve(execAnswers(), (socket) => {
+      // The rest of the token never comes.
+      socket.write(frame(1, `start ${token.slice(0, 39)}`));
+      socket.write(frame(2, `err ${token.slice(0, 20)}`));
+    }, { masked: [token] });
+    const seen: string[] = [];
+    const result = await engine.exec('c1', ['cat'], { timeoutMs: 300, onOutput: (_stream, text) => seen.push(text) });
+    expect(result).toMatchObject({ timedOut: true, stdout: 'start ***', stderr: 'err ***' });
+    for (const text of [result.stdout, result.stderr, seen.join('')]) {
+      for (let at = 0; at + MIN_SECRET_LENGTH <= token.length; at++) expect(text).not.toContain(token.slice(at, at + MIN_SECRET_LENGTH));
+    }
   });
 
   it('ends the exec when onOutput throws, never the process (review round 2, A-R2-1)', async () => {

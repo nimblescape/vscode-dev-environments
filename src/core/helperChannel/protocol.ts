@@ -292,7 +292,9 @@ export function redactValue(value: unknown, secrets: Iterable<string>): unknown 
 /**
  * Passes a stream on with the secrets masked, also when a chunk splits one: the last characters that could be the start
  * of a secret wait for the next chunk; flush passes them on. `secrets` is read at each piece, so a secret that an answer
- * added later (plan step 11A) is masked from then on.
+ * added later (plan step 11A) is masked from then on. Plan step 11E1 (review round 2 of PR #102, A-M1): a held-back tail
+ * of MIN_SECRET_LENGTH characters or more is the start of a secret whose rest never came (a stream cut by a time limit or
+ * a cancel); flush passes it on as `***`. A shorter one passes as it is (it says nothing; review round 1 of PR #80).
  */
 export class StreamRedactor {
   private buffer = '';
@@ -331,7 +333,7 @@ export class StreamRedactor {
   flush(): void {
     const rest = this.buffer;
     this.buffer = '';
-    if (rest !== '') this.forward(rest);
+    if (rest !== '') this.forward(rest.length >= MIN_SECRET_LENGTH ? '***' : rest);
   }
 }
 
