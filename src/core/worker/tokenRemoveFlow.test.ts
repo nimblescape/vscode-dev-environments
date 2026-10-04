@@ -9,6 +9,7 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import type { Environment } from '../types';
 import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
+import { unusedEngine } from './dockerEngine.testkit';
 import { removeTokenFlow, TOKEN_REMOVE_TIMEOUT_MS } from './tokenRemoveFlow';
 
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -40,6 +41,7 @@ function fakeEngine(listed: EngineContainer[], exec: (user: string | undefined, 
   const execs: { container: string; command: readonly string[]; options: EngineExecOptions }[] = [];
   const lists: { label: string; signal?: AbortSignal }[] = [];
   const engine: DockerEngine = {
+    ...unusedEngine(),
     container: async () => {
       throw new Error('The flow reads no container by its name.');
     },

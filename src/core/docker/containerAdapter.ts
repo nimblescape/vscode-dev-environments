@@ -40,86 +40,28 @@ import { pullReference } from '../helperChannel/protocol';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 
+import {
+  mapContainerState,
+  preferred,
+  publicInfo,
+  toContainerInfo,
+  toLabels,
+  toNetworkInfo,
+  toVolumeInfo,
+  type ContainerInfo,
+  type ImageInfo,
+  type InspectedContainer,
+  type MountTarget,
+  type NetworkInfo,
+  type VolumeInfo,
+  type VolumeSubpathMount,
+} from './dockerObjects';
+
+// Plan step 11B3: the Docker objects and their reading moved to dockerObjects.ts (one definition for both adapters).
+export { mapContainerState, toLabels, type ContainerInfo, type ImageInfo, type MountTarget, type NetworkInfo, type VolumeInfo, type VolumeSubpathMount };
+
 // Plan step 5, PR A: the classification moved to dockerRouting.ts.
 export { isReadOnlyDockerCall };
-
-export interface ContainerInfo {
-  id: string;
-  /** Without the leading '/'. */
-  name: string;
-  state: ContainerState;
-  /** `State.Status` of `docker inspect`, for example `exited`. */
-  rawState: string;
-  labels: Record<string, string>;
-  /** Image reference that the container was created from (`Config.Image`), for example `devenv-acme-api-brave-noether:2`. */
-  image: string;
-  /**
-   * Review round 1 of PR #88 (A-R1-1): the full ID of the image that the container was created from (`Image` of `docker
-   * inspect`); `image` is only a name, which may name another image by now.
-   */
-  imageId?: string;
-  /** Names of the named volumes that the container mounts (`Mounts` with `Type` volume). */
-  volumes?: string[];
-  /**
-   * Review round 11 (G3, G4): the subpaths of named volumes that the container mounts (`HostConfig.Mounts`, and
-   * `Mounts`, with `Type` volume and `VolumeOptions.Subpath`), as Docker Compose creates them for a bind mount of
-   * repository files that the pipeline rewrote to the workspace volume.
-   */
-  volumeSubpaths?: VolumeSubpathMount[];
-  /**
-   * Review round 12 (D12-2): the targets of the mounts of the container in it (`Mounts`: volumes, bind mounts, tmpfs;
-   * and the tmpfs of `HostConfig.Tmpfs`), for the ownership fix in the dev container (devMountFolders).
-   */
-  mountTargets?: MountTarget[];
-}
-
-/** Review round 12 (D12-2): a mount of a container (ContainerInfo.mountTargets). */
-export interface MountTarget {
-  /** `volume`, `bind`, `tmpfs`, … */
-  type: string;
-  /** The name of a named volume. */
-  volume?: string;
-  /** The path in the container (`Destination`). */
-  target: string;
-  /**
-   * Review round 14 (P14-1): the subpath of a named volume (`VolumeOptions.Subpath` of the entry of `HostConfig.Mounts`
-   * with the same volume and target; the top-level `Mounts` do not have it). Missing: the whole volume, or not known.
-   */
-  subpath?: string;
-}
-
-/** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
-export interface VolumeSubpathMount {
-  volume: string;
-  /** Relative to the root of the volume, as Docker has it (for example `api/data/postgres`). */
-  subpath: string;
-  readOnly: boolean;
-}
-
-export interface VolumeInfo {
-  name: string;
-  labels: Record<string, string>;
-}
-
-/** A network of `docker network inspect`. */
-export interface NetworkInfo {
-  name: string;
-  /** The full ID of the network (review round 2, S2-04: a configuration may name a network by its ID or a prefix). */
-  id: string;
-  labels: Record<string, string>;
-  /** The IDs of the containers attached to it. */
-  containers: string[];
-}
-
-/** A local image of `docker image ls`. */
-export interface ImageInfo {
-  /** Full image ID, for example `sha256:7a83…`. */
-  id: string;
-  /** References `repository:tag`; empty for a dangling image. */
-  tags: string[];
-  /** Creation time as Docker prints it, for example `2026-09-25 02:31:55 +0200 CEST`. */
-  createdAt: string;
-}
 
 /** Result of `docker info`. */
 export interface DaemonStatus {
@@ -244,21 +186,6 @@ const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /** Docker refuses to remove an image that a container or another image uses. */
 const IMAGE_IN_USE_PATTERN = /conflict|in use|being used|is using|dependent child images/i;
 
-/**
- * Maps `State.Status` to the simplified state: running|restarting|paused → 'running';
- * created|exited|dead|removing (and unknown values) → 'stopped'.
- */
-export function mapContainerState(rawState: string): ContainerState {
-  switch (rawState.toLowerCase()) {
-    case 'running':
-    case 'restarting':
-    case 'paused':
-      return 'running';
-    default:
-      return 'stopped';
-  }
-}
-
 /** Review round 9 (S9-3): an image as `docker image inspect` describes it: its ID, tags, and digests. */
 export interface ImageNames {
   id: string;
@@ -312,16 +239,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Labels object of `docker inspect` (may be `null`). Values that are not strings are ignored. */
-export function toLabels(value: unknown): Record<string, string> {
-  const labels: Record<string, string> = {};
-  if (!isRecord(value)) return labels;
-  for (const [key, labelValue] of Object.entries(value)) {
-    if (typeof labelValue === 'string') labels[key] = labelValue;
-  }
-  return labels;
-}
-
 /** Parses the JSON array that `docker inspect` prints. Empty output is an empty list. */
 function parseInspectArray(stdout: string): unknown[] | undefined {
   const text = stdout.trim();
@@ -345,134 +262,44 @@ function parseJsonOutput(stdout: string): unknown {
   }
 }
 
-interface InspectedContainer extends ContainerInfo {
-  created: string;
-}
-
-function toContainerInfo(value: unknown): InspectedContainer | undefined {
-  if (!isRecord(value)) return undefined;
-  const id = value.Id;
-  const name = value.Name;
-  const state = value.State;
-  const config = value.Config;
-  if (typeof id !== 'string' || !id || typeof name !== 'string' || !isRecord(state) || typeof state.Status !== 'string') {
-    return undefined;
-  }
-  const image = isRecord(config) && typeof config.Image === 'string' ? config.Image : '';
-  return {
-    id,
-    name: name.replace(/^\//, ''),
-    state: mapContainerState(state.Status),
-    rawState: state.Status,
-    labels: toLabels(isRecord(config) ? config.Labels : undefined),
-    image,
-    ...(typeof value.Image === 'string' && value.Image !== '' ? { imageId: value.Image } : {}),
-    volumes: mountedVolumes(value.Mounts),
-    volumeSubpaths: volumeSubpathMounts([
-      ...(Array.isArray(value.Mounts) ? value.Mounts : []),
-      ...(isRecord(value.HostConfig) && Array.isArray(value.HostConfig.Mounts) ? value.HostConfig.Mounts : []),
-    ]),
-    mountTargets: mountTargets(
-      value.Mounts,
-      isRecord(value.HostConfig) ? value.HostConfig.Tmpfs : undefined,
-      isRecord(value.HostConfig) ? value.HostConfig.Mounts : undefined,
-    ),
-    created: typeof value.Created === 'string' ? value.Created : '',
-  };
-}
-
-/** A target path as Docker compares it: normalized, without a trailing slash. */
-function cleanTarget(target: string): string {
-  const normal = path.posix.normalize(target);
-  return normal.length > 1 ? normal.replace(/\/+$/, '') : normal;
-}
-
-/**
- * Review round 12 (D12-2): the mounts of `docker container inspect` with their targets (ContainerInfo.mountTargets).
- * Review round 14 (P14-1): a volume mount with the subpath of the entry of `HostConfig.Mounts` (`hostMounts`) with the
- * same volume (`Source`) and target; with more than one such entry of different subpaths, none (not known).
- */
-function mountTargets(mounts: unknown, tmpfs: unknown, hostMounts: unknown): MountTarget[] {
-  const subpaths = new Map<string, string | null>();
-  for (const mount of Array.isArray(hostMounts) ? hostMounts : []) {
-    if (!isRecord(mount) || mount.Type !== 'volume' || typeof mount.Target !== 'string' || !mount.Target.startsWith('/')) continue;
-    if (typeof mount.Source !== 'string' || mount.Source === '' || !isRecord(mount.VolumeOptions)) continue;
-    const subpath = mount.VolumeOptions.Subpath;
-    if (typeof subpath !== 'string' || subpath === '') continue;
-    const key = `${mount.Source}\0${cleanTarget(mount.Target)}`;
-    subpaths.set(key, subpaths.has(key) && subpaths.get(key) !== subpath ? null : subpath);
-  }
-  const result: MountTarget[] = [];
-  for (const mount of Array.isArray(mounts) ? mounts : []) {
-    if (!isRecord(mount) || typeof mount.Destination !== 'string' || mount.Destination === '' || typeof mount.Type !== 'string') continue;
-    const volume = mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : undefined;
-    const subpath = volume !== undefined && mount.Destination.startsWith('/') ? subpaths.get(`${volume}\0${cleanTarget(mount.Destination)}`) : undefined;
-    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination, ...(typeof subpath === 'string' ? { subpath } : {}) });
-  }
-  if (isRecord(tmpfs)) for (const target of Object.keys(tmpfs)) if (target !== '') result.push({ type: 'tmpfs', target });
-  return result;
-}
-
-function mountedVolumes(mounts: unknown): string[] {
-  if (!Array.isArray(mounts)) return [];
-  return mounts
-    .filter((mount): mount is Record<string, unknown> => isRecord(mount) && mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '')
-    .map((mount) => mount.Name as string);
-}
-
-/**
- * Review round 11 (G3, G4): the volume mounts with a subpath of `docker container inspect` (`HostConfig.Mounts` has
- * `Source`, the name of the volume; `Mounts` has `Name`), without duplicates.
- */
-function volumeSubpathMounts(mounts: readonly unknown[]): VolumeSubpathMount[] {
-  const result = new Map<string, VolumeSubpathMount>();
-  for (const mount of mounts) {
-    if (!isRecord(mount) || mount.Type !== 'volume' || !isRecord(mount.VolumeOptions)) continue;
-    const subpath = mount.VolumeOptions.Subpath;
-    const volume = typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : mount.Source;
-    if (typeof subpath !== 'string' || subpath === '' || typeof volume !== 'string' || volume === '') continue;
-    const readOnly = mount.ReadOnly === true || mount.RW === false;
-    const key = `${volume}\0${subpath}\0${readOnly}`;
-    if (!result.has(key)) result.set(key, { volume, subpath, readOnly });
-  }
-  return [...result.values()];
-}
-
-function toVolumeInfo(value: unknown): VolumeInfo | undefined {
-  if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
-  return { name: value.Name, labels: toLabels(value.Labels) };
-}
-
-function toNetworkInfo(value: unknown): NetworkInfo | undefined {
-  if (!isRecord(value) || typeof value.Name !== 'string' || !value.Name) return undefined;
-  const containers = isRecord(value.Containers) ? Object.keys(value.Containers) : [];
-  return { name: value.Name, id: typeof value.Id === 'string' ? value.Id : '', labels: toLabels(value.Labels), containers };
-}
-
 // Plan step 11B1: isDevContainer lives with the port of the flows (src/core/worker/dockerEngine.ts), one definition.
 export { isDevContainer };
 
-function publicInfo(container: InspectedContainer): ContainerInfo {
-  const { id, name, state, rawState, labels, image, imageId, volumes, volumeSubpaths, mountTargets } = container;
-  return {
-    id,
-    name,
-    state,
-    rawState,
-    labels,
-    image,
-    // Review round 2 of PR #88 (B-R2-1): the ID of the container's image (containerImage, A-R1-1).
-    ...(imageId !== undefined ? { imageId } : {}),
-    ...(volumes && volumes.length > 0 ? { volumes } : {}),
-    ...(volumeSubpaths && volumeSubpaths.length > 0 ? { volumeSubpaths } : {}),
-    ...(mountTargets && mountTargets.length > 0 ? { mountTargets } : {}),
-  };
+/**
+ * Plan step 11B3: a container that runs `entrypoint args…` on a volume and is removed after it (the ownership fix before
+ * the create, review round 1 of PR #82: `--init`, so that a SIGTERM ends it, and a cleanup label by which a cancel
+ * removes it). Plan step 11G replaces it by a step of the batch helper.
+ */
+export interface VolumeRun {
+  image: string;
+  volume: string;
+  target: string;
+  entrypoint: string;
+  args: readonly string[];
+  user: string;
+  labels: Record<string, string>;
 }
 
-/** Newest first; a running container before a stopped one. */
-function preferred(a: InspectedContainer, b: InspectedContainer): number {
-  if (a.state !== b.state) return a.state === 'running' ? -1 : 1;
-  return b.created.localeCompare(a.created);
+/** The arguments of `docker run` of a VolumeRun: no pull, no network. */
+export function volumeRunArgs(p: VolumeRun): string[] {
+  return [
+    'run',
+    '--rm',
+    '--init',
+    '--pull',
+    'never',
+    '--network',
+    'none',
+    ...labelArgs(p.labels, '--label'),
+    '--user',
+    p.user,
+    '--entrypoint',
+    p.entrypoint,
+    '--mount',
+    `type=volume,source=${p.volume},target=${p.target}`,
+    p.image,
+    ...p.args,
+  ];
 }
 
 function chunks<T>(items: readonly T[], size: number): T[][] {
@@ -1144,6 +971,26 @@ export class ContainerAdapter {
       }
       throw new CommandError(commandText(args), null, '', `The connection to the worker that holds the lock of the environment failed; the outcome of docker ${command} is not known.`);
     }
+  }
+
+  /** Plan step 11B3: `Config` of `docker image inspect` (a typed call instead of runChecked). Throws CommandError. */
+  async imageConfig(reference: string, options: Pick<RunOptions, 'timeoutMs' | 'signal'> = {}): Promise<unknown> {
+    const inspect = await this.runChecked(['image', 'inspect', '--format', '{{json .Config}}', reference], options);
+    return JSON.parse(inspect.trim()) as unknown;
+  }
+
+  /**
+   * Plan step 11B3: `docker run --rm` of `entrypoint args…` from `image` with `volume` at `target` (a typed call instead
+   * of runChecked; volumeRunArgs). Throws CommandError when it fails.
+   */
+  async runOnVolume(p: VolumeRun, options: Pick<RunOptions, 'timeoutMs' | 'signal'> = {}): Promise<void> {
+    await this.runChecked(volumeRunArgs(p), options);
+  }
+
+  /** Plan step 11B3: the full IDs of the containers with the label `label` (`key=value`), stopped ones included. */
+  async containerIdsWithLabel(label: string, options: Pick<RunOptions, 'timeoutMs' | 'signal'> = {}): Promise<string[]> {
+    const listed = await this.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${label}`], options);
+    return listed.split('\n').map((line) => line.trim()).filter((line) => line !== '');
   }
 
   /** True if the volume exists. Throws CommandError if Docker fails for another reason. */

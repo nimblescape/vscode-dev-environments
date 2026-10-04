@@ -175,7 +175,7 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_BATCH_STEP]: batchStepOperation(BATCH),
   [OP_BATCH_CHUNK]: batchChunkOperation(BATCH),
   // Plan step 10A (decision of 2026-10-03): operations over the Engine API of the worker's engine (engineOperations.ts).
-  [OP_PULL]: pullOperation(ENGINE),
+  [OP_PULL]: pullOperation(ENGINE_OF),
   [OP_START_CONTAINERS]: startContainersOperation(ENGINE),
   // Plan step 11B1: the flows that run in the worker (flowOperations.ts).
   [OP_TOKEN_REMOVE]: tokenRemoveOperation(ENGINE_OF),

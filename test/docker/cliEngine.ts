@@ -12,6 +12,7 @@
 import type { DockerEngine, EngineContainer, EngineExecOptions, EngineExecResult } from '../../src/core/worker/dockerEngine';
 import { EngineError } from '../../src/core/worker/dockerEngine';
 import type { ContainerDetails, DockerCli } from './dockerRun';
+import { unusedEngine } from '../../src/core/worker/dockerEngine.testkit';
 
 function containerOf(details: ContainerDetails): EngineContainer {
   const container: EngineContainer = {
@@ -50,6 +51,8 @@ export function cliEngine(cli: DockerCli, secrets: Readonly<Record<string, strin
     return { exitCode: result.code, stdout: result.out, stderr: result.err, timedOut: false };
   };
   return {
+    // Plan step 11B3: the flows of these tests use only the methods below.
+    ...unusedEngine(),
     container: async (reference) => {
       const result = cli.run(['container', 'inspect', reference]);
       if (result.code !== 0) {
