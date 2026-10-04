@@ -96,13 +96,13 @@ export function hostSideHandler(
 /** Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. */
 const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
 
-/** The most names of a question of Delete, and the longest text of its facts. */
+/** The most names of a question of Delete. */
 const MAX_QUESTION_NAMES = 1000;
-const MAX_QUESTION_TEXT = 1024;
 /** A volume name as Docker takes it. */
 const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 
-function plainText(value: unknown, max = MAX_QUESTION_TEXT): value is string {
+// Review round 2 of 11C2b (B-R2 HH2): every caller names its limit.
+function plainText(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
