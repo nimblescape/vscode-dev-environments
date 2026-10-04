@@ -115,6 +115,8 @@ export interface DockerEngine {
   renameContainer(container: string, name: string, signal?: AbortSignal): Promise<void>;
   /** Plan step 11B3: removes an image without force: `missing` and `inUse` (409) are answers, not failures. */
   removeImage(reference: string, signal?: AbortSignal): Promise<'removed' | 'missing' | 'inUse'>;
+  /** Plan step 11D3: tags the image `image` (an ID) as `reference` (`repository:tag`); a tag of another image moves. */
+  tagImage(image: string, reference: string, signal?: AbortSignal): Promise<void>;
   /** Plan step 11B3: creates a volume with its labels; an existing one of the name is kept as it is (as `docker volume create`). */
   createVolume(name: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void>;
   /** Plan step 11B3: removes a volume; a missing one is no failure, one in use is (409). */

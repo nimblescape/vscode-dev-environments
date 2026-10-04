@@ -185,12 +185,13 @@ export class RemoteSessionMonitor {
    * #69, A-R1-2: never by its name). `socketPath`: the source of the socket mount on the host of the
    * engine (as for the workspace helper, rootless aware). `helperImage`: the image of the container when it is not
    * `helperTag`: the checked image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3
-   * of PR #64, P2); the label and the log lines keep the tag. Never throws, except an AbortError; a failure is logged as
+   * of PR #64, P2), or (plan step 11D3) its monitor tag, with `imageId`, the image ID that the created container must
+   * have (checked by the create before its start); the label and the log lines keep the tag. Never throws, except an AbortError; a failure is logged as
    * a warning.
    */
-  async ensure(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<EnsureOutcome> {
+  async ensure(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string, imageId?: string): Promise<EnsureOutcome> {
     try {
-      return await this.ensureOrThrow(helperTag, socketPath, signal, helperImage);
+      return await this.ensureOrThrow(helperTag, socketPath, signal, helperImage, imageId);
     } catch (error) {
       if (isAbortError(error)) throw error;
       this.options.logger.warn(`The Session Monitor on the Docker host could not be started: ${errorMessage(error)}`);
@@ -202,7 +203,7 @@ export class RemoteSessionMonitor {
    * Plan step 8, PR A (user decision Q3 of 2026-10-02): ensure, but a failure rejects with its cause (an Error) instead
    * of `failed`, so the open is refused. Nothing is logged for the failure here; the caller says it.
    */
-  async ensureOrThrow(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<Exclude<EnsureOutcome, 'failed'>> {
+  async ensureOrThrow(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string, imageId?: string): Promise<Exclude<EnsureOutcome, 'failed'>> {
     const { logger } = this.options;
     const script = await this.options.script();
     // Plan step 3 (user decision 2026-09-29): the memory guard of the loader, before an old monitor is removed.
@@ -217,7 +218,7 @@ export class RemoteSessionMonitor {
     const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
     // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
     const createId = randomUUID();
-    const spec = this.runSpec(helperImage ?? helperTag, socketPath, label, script, images, createId);
+    const spec = this.runSpec(helperImage ?? helperTag, socketPath, label, script, images, createId, imageId);
     let current = await this.inspect(signal);
     // Review round 4 of PR #69 (A-R4-1): a `created` container (of any label) may be the create of another window
     // between its create and its start: look again for a while before anything is decided.
@@ -505,9 +506,10 @@ export class RemoteSessionMonitor {
    * (S1). Plan step 3 (pipe loading): the command is the pipe loader with the path, the hash of `script`, and
    * REMOTE_MONITOR_ENTRY; the script itself goes over the input (ensure), never here. `createId`: the nonce of this create
    * (LABEL_MONITOR_CREATE; review round 1 of PR #69, A-R1-2), which ensure always passes. Review round 4 of PR #64 (R4-8):
-   * never a pull: the helper image exists only on the engine.
+   * never a pull: the helper image exists only on the engine. `imageId` (plan step 11D3): the image ID that the
+   * container of the tag `helperImage` must have (MonitorRunSpec.imageId).
    */
-  runSpec(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string): MonitorRunSpec {
+  runSpec(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string, imageId?: string): MonitorRunSpec {
     const imagePrefixes = images?.prefixes ?? [];
     const labels: Record<string, string> = { [LABEL_SESSION_MONITOR]: label };
     if (createId !== undefined) labels[LABEL_MONITOR_CREATE] = createId;
@@ -523,6 +525,7 @@ export class RemoteSessionMonitor {
     return {
       name: this.containerName,
       image: helperImage,
+      ...(imageId !== undefined ? { imageId } : {}),
       labels,
       // Our own container (the refusal of restart policies is for the containers of repositories). Plan step 8, PR B
       // (user decision Q5 of 2026-10-02): `on-failure`, no longer `unless-stopped`: the monitor exits with 0 when it is
