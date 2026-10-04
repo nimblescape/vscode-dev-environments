@@ -187,15 +187,17 @@ export function requestOpenRecords(
       },
       view,
     );
+  // Both kinds only over a create mark of this window (review round 2 of PR #105, A2-L1: `previous` too).
+  const onlyOverOwnCreateMark = (entry: Environment) => {
+    if (entry.busy && isOwnMark(entry.busy) && entry.busy.operation !== 'create') {
+      throw new HelperOperationError('invalid', 'The busy mark of this window is not a create mark.', false);
+    }
+  };
   return {
     createMark: (environmentId, kind, previous) =>
       kind === 'ended'
-        ? records((entry) => {
-            if (entry.busy && isOwnMark(entry.busy) && entry.busy.operation !== 'create') {
-              throw new HelperOperationError('invalid', 'The busy mark of this window is not a create mark.', false);
-            }
-          }).createMark(environmentId, 'ended')
-        : records().createMark(environmentId, 'previous', previous),
+        ? records(onlyOverOwnCreateMark).createMark(environmentId, 'ended')
+        : records(onlyOverOwnCreateMark).createMark(environmentId, 'previous', previous),
     takeStepMark: (environmentId, operation) => records().takeStepMark(environmentId, operation),
     releaseStepMark: async (environmentId, mark) => {
       if (!isOwnMark(mark)) throw new HelperOperationError('invalid', 'The busy mark of the request is not one of this window.', false);

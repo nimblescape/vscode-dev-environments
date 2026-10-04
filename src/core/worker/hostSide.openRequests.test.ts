@@ -313,4 +313,27 @@ describe('the registry writes of the open as requests (plan step 11E4b)', () => 
       await expect(ask('openFinished', ID, FINISH)).rejects.toMatchObject({ code: 'invalid' });
     });
   });
+
+  describe('review round 2 of PR #105 (A2-L1 and the missing tests)', () => {
+    it('createMark previous, with or without a mark, refuses over a non-create mark of this window and writes nothing', async () => {
+      for (const args of [[ID, 'previous'], [ID, 'previous', other({ operation: 'create' })]]) {
+        const { ask, entry } = setup({ busy: own({ operation: 'update' }) });
+        await expect(ask('createMark', ...args)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('not a create mark') });
+        expect(entry()?.busy).toEqual(own({ operation: 'update' }));
+      }
+    });
+
+    it('the fallback of an unknown previous mark leaves a create mark of another window as it is', async () => {
+      const theirs = other({ operation: 'create' });
+      const { ask, entry } = setup({ busy: theirs });
+      expect(await ask('createMark', ID, 'previous', other())).toMatchObject({ busy: theirs });
+      expect(entry()?.busy).toEqual(theirs);
+    });
+
+    it('openFinished takes a remote user with shell and URI characters, as `docker exec -u` takes it', async () => {
+      for (const remoteUser of ['a$b', 'a`b', 'a;b', 'node:node', 'a@b', 'a/b']) {
+        await expect(setup().ask('openFinished', ID, { ...FINISH, remoteUser })).resolves.toMatchObject({ remoteUser });
+      }
+    });
+  });
 });
