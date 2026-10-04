@@ -996,6 +996,12 @@ export class WorkspaceHelper {
 
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
+  /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
+  private async ownImageUse(signal: AbortSignal | undefined): Promise<HelperImageUse> {
+    if (signal?.aborted) throw abortError();
+    return { ...(this.deps.ownImage as HelperImageUse) };
+  }
+
   /**
    * The helper image (HelperImageUse). `recheck` (ensureImage): ensureHelperImage with the maintenance; a result older
    * than HELPER_IMAGE_RECHECK_MS, or one of a helper run, is not reused. The helper runs (`recheck` false) reuse any result
@@ -1004,12 +1010,6 @@ export class WorkspaceHelper {
    * a stop or a delete. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
    * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
-  /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
-  private async ownImageUse(signal: AbortSignal | undefined): Promise<HelperImageUse> {
-    if (signal?.aborted) throw abortError();
-    return { ...(this.deps.ownImage as HelperImageUse) };
-  }
-
   private image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
     // Plan step 5, PR D (rule D1 of 2026-09-30): the check and the build of the helper image run without the worker, which

@@ -89,6 +89,12 @@ describe("the lock of the worker's own pipeline (plan step 11B3b)", () => {
     const held = await first.lock(ID, 10, undefined);
     first.controller.abort();
     expect(await held.lost).toBe('the operation of the worker ended');
+    // Review round 2 of 11B3b (A-R2-1): the lock file stays open until the release (after the batch helper closed), which
+    // closes it once.
+    expect(first.events.filter((event) => event === 'close')).toEqual([]);
+    await held.release();
+    await held.release();
+    expect(first.events.filter((event) => event === 'close')).toEqual(['close']);
     const second = setup(async () => ({ exitCode: 0 }));
     const kept = await second.lock(ID, 10, undefined);
     await kept.release();

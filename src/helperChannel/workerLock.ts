@@ -32,7 +32,10 @@ export function workerEnvironmentLock(
       throw new EnvironmentLockError('unavailable', error instanceof Error ? error.message : String(error));
     }
     let released = false;
-    // The kernel lock lives with the open file of this worker: it is lost only when the operation ends without `release`.
+    // The kernel lock lives with the open file of this worker until `release`, or until the worker exits (review round 2
+    // of 11B3b, A-R2-1: the end of the operation alone does not let it go). The pipeline releases it in `finally`, after
+    // its batch helper was closed, also after a cancel (withEnvironmentLock); a cancel only marks the lock as lost, so
+    // that the batch scope ends its session first.
     const lost = new Promise<string>((resolve) => {
       const ended = () => {
         if (!released) resolve('the operation of the worker ended');
@@ -50,6 +53,8 @@ export function workerEnvironmentLock(
       // of its own; the listing has none narrower. Plan step 11E passes the signal of the open through.
       batch: (p) => openBatch(p),
       release: async () => {
+        // Once: a second close could close a file descriptor that the process has reused since.
+        if (released) return;
         released = true;
         release();
       },
