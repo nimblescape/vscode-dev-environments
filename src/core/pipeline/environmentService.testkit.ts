@@ -4,6 +4,7 @@
 
 // In-memory fakes for the tests of the environment service: Docker, workspace helper, image check, and user interface.
 // The registry and the session files are the real ones, in a temporary folder. Only test files import this module.
+import type { DeleteConfirmation } from './deleteCheck';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -1257,6 +1258,23 @@ export class FakeUi implements PipelineUi {
     this.prompts.push(`recreateContainer ${repository}`);
     this.recreateQuestions.push(question);
     return this.recreateAnswer;
+  }
+
+  // Plan step 11C2b: the questions of Delete; by default Delete, Keep, nothing ticked.
+  deleteAnswer: 'delete' | 'open' | undefined = 'delete';
+  additionalVolumesAnswer: 'remove' | 'keep' | undefined = 'keep';
+  serviceDataAnswer: string[] | undefined = [];
+
+  async confirmDelete(_repository: string, _confirmation?: DeleteConfirmation): Promise<'delete' | 'open' | undefined> {
+    return this.deleteAnswer;
+  }
+
+  async deleteAdditionalVolumes(): Promise<'remove' | 'keep' | undefined> {
+    return this.additionalVolumesAnswer;
+  }
+
+  async deleteServiceData(): Promise<string[] | undefined> {
+    return this.serviceDataAnswer;
   }
 
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {

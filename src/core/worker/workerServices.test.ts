@@ -46,6 +46,10 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       filesMissing: (repository) => answer('filesMissing', repository),
       recreateContainer: (repository, question) => answer('recreateContainer', repository, question),
       message: (kind, text) => answer('message', kind, text),
+      // Plan step 11C2b.
+      confirmDelete: (repository, confirmation) => answer('confirmDelete', repository, confirmation),
+      deleteAdditionalVolumes: (volumes) => answer('deleteAdditionalVolumes', volumes),
+      deleteServiceData: (volumes, possibly) => answer('deleteServiceData', volumes, possibly),
     },
     state: {
       windowStatuses: () => answer<readonly WindowStatus[]>('windowStatuses'),
@@ -67,6 +71,7 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       // Plan step 11C2a.
       markBusy: (environmentId, operation) => answer('markBusy', environmentId, operation),
       clearBusy: (environmentId) => answer('clearBusy', environmentId),
+      recordGitSummary: (environmentId, summary) => answer('recordGitSummary', environmentId, summary),
     },
     secrets: {
       token: () => answer('token'),

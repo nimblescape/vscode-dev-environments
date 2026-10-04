@@ -14,7 +14,7 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
+import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteCheckValue, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
 import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
@@ -300,6 +300,39 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       `sessionFile removeDisconnectRequest ${id}`,
       `sessionFile removeReopenOf ${id}`,
     ]);
+  }, 240_000);
+
+  // Plan step 11C2b: the check of Delete by the worker's own pipeline: the record and the account from this computer, the
+  // volume from the engine, and the confirmation asked as a request of the worker, whose answer is the decision.
+  it('checks a Delete through the worker and asks the confirmation as its request', async () => {
+    const id = newEnvironmentId();
+    const name = `devenv-test-check-${crypto.randomBytes(4).toString('hex')}`;
+    cli.ok(['volume', 'create', '--label', runLabel, '--label', `${LABEL_ENVIRONMENT_ID}=${id}`, name]);
+    const requests: string[] = [];
+    const environment = { id, repository: 'devenv-test/worker-check', owner: { id: '42', login: 'octo' }, volumeName: name, containerName: name } as unknown as Environment;
+    const base = hostWith(undefined, requests);
+    const host = {
+      ...base,
+      records: { ...base.records, get: async (requested: string) => (requests.push(`get ${requested}`), requested === id ? environment : undefined) },
+      state: { ...base.state, account: async (interactive: boolean) => (requests.push(`account ${interactive}`), { id: '42', login: 'octo' }) },
+      questions: {
+        ...base.questions,
+        confirmDelete: async (repository: string, confirmation: { changes?: unknown; otherWindow: boolean }) => (
+          requests.push(`confirmDelete ${repository} ${JSON.stringify(confirmation.changes ?? null)} ${confirmation.otherWindow}`), 'delete'
+        ),
+      },
+    } as unknown as HostSide;
+    const target = await targets.current();
+    const params = { environmentId: id, dockerHost: target.host, owner: { windowId: 'window-1', pid: process.pid }, repository: 'devenv-test/worker-check', otherWindow: false };
+    const value = parseDeleteCheckValue(
+      await channels.flow(target, OP_DELETE_CHECK, params, { timeoutMs: 120_000, onAsk: hostSideHandler(host, log, FLOW_REQUESTS[OP_DELETE_CHECK], { environmentId: id }) }),
+    );
+    expect(value).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
+    // Nothing was removed by the check.
+    expect(cli.lines(['volume', 'ls', '--filter', `name=^${name}$`, '--format', '{{.Name}}'])).toEqual([name]);
+    expect(requests).toContain('confirmDelete devenv-test/worker-check null false');
+    // Only the record, the account and the confirmation were asked for (any other call of this computer is refused).
+    expect(requests.filter((request) => !/^(get |account |confirmDelete )/.test(request))).toEqual([]);
   }, 240_000);
 });
 

@@ -62,6 +62,10 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       configurationKindChanged: (repository, message) => deps.ui.configurationKindChanged(repository, message),
       filesMissing: (repository) => deps.ui.filesMissing(repository),
       recreateContainer: (repository, question) => deps.ui.recreateContainer(repository, question),
+      // Plan step 11C2b: the questions of Delete.
+      confirmDelete: (repository, confirmation) => deps.ui.confirmDelete(repository, confirmation),
+      deleteAdditionalVolumes: (volumes) => deps.ui.deleteAdditionalVolumes(volumes),
+      deleteServiceData: (volumes, possibly) => deps.ui.deleteServiceData(volumes, possibly),
       message: async (kind, text) => {
         if (kind === 'info') deps.ui.info(text);
         else if (kind === 'warn') deps.ui.warn(text);
@@ -101,6 +105,11 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       },
       markBusy: (environmentId, operation) => busyMarks.mark(environmentId, operation),
       clearBusy: (environmentId) => busyMarks.clear(environmentId),
+      // Plan step 11C2b (decision of 2026-10-04): the Git state that the worker read, under the registry lock.
+      recordGitSummary: async (environmentId, summary) =>
+        void (await deps.registry.updateEnvironment(environmentId, (entry) => {
+          entry.gitSummary = summary;
+        })),
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),
@@ -134,6 +143,13 @@ function environmentOf(params: unknown): string | undefined {
   return typeof id === 'string' ? id : undefined;
 }
 
+/** Review round 1 of 11C2b (A-R1-M2): the name of the repository that the questions of the operation name. */
+function repositoryOf(params: unknown): string | undefined {
+  if (typeof params !== 'object' || params === null) return undefined;
+  const repository = (params as { repository?: unknown }).repository;
+  return typeof repository === 'string' ? repository : undefined;
+}
+
 /**
  * Plan step 11B1: runs the flow `op` in the worker of the current engine; the HostSide of this computer answers its
  * requests, and only those that the operation may send (FLOW_REQUESTS; review round 2 of 11B1, B-R1-1: one place, tested).
@@ -143,13 +159,29 @@ export function extensionFlow(
   current: () => Promise<DockerTarget>,
   host: HostSide,
   logger: Logger,
-): (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean }) => Promise<unknown> {
+): (
+  op: string,
+  params: unknown,
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    passive?: boolean;
+    onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+    onQuestion?: (state: 'asked' | 'settled') => void;
+  },
+) => Promise<unknown> {
   return async (op, params, options) =>
     channels.flow(await current(), op, params, {
       signal: options.signal,
       timeoutMs: options.timeoutMs,
       // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.
       ...(options.passive === true ? { passive: true } : {}),
-      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], { environmentId: environmentOf(params) }),
+      // Review round 1 of 11C2b (A-R1-M1, A-R1-M2): the repository that the questions name, and the observer of the answers.
+      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
+        environmentId: environmentOf(params),
+        repository: repositoryOf(params),
+        ...(options.onAnswer ? { onAnswer: options.onAnswer } : {}),
+        ...(options.onQuestion ? { onQuestion: options.onQuestion } : {}),
+      }),
     });
 }

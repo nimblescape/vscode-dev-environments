@@ -11,6 +11,7 @@ import {
   LOCK_UNAVAILABLE_CODE,
   MAX_REFUSAL_DETAIL_LENGTH,
   MAX_REFUSAL_MESSAGE_LENGTH,
+  parseDeleteCheckParams,
   parseDeleteParams,
   parseListConfigurationsParams,
   parseStopParams,
@@ -18,6 +19,7 @@ import {
   parseWindowStateParams,
   type WindowStateValue,
   type FlowRefusal,
+  type DeleteCheckValue,
   type DeleteValue,
   type ListConfigurationsValue,
   type StopValue,
@@ -281,6 +283,44 @@ export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHel
       return { deleted: true } satisfies DeleteValue;
     } catch (error) {
       return flowRefusal(error, context) satisfies DeleteValue;
+    }
+  };
+}
+
+/**
+ * Plan step 11C2b (decisions of 2026-10-03 and 2026-10-04): `deleteCheck`, the check of Delete and its questions, run
+ * by the worker's own pipeline (workerServices, EnvironmentService.deleteCheck): the record, the account and the
+ * registry through the requests of the operation, the Git state recorded through `record recordGitSummary`, the
+ * questions as `question` requests. No lock: it only reads on the engine.
+ */
+export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseDeleteCheckParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the deleteCheck operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The deleteCheck operation takes no secret.');
+    context.progress('deleteCheck', checked.environmentId);
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine: engineOf(context),
+      secretOf: (name) => context.secrets[name],
+      logger: contextLogger(context),
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+    });
+    try {
+      const decision = await service.deleteCheck(checked.environmentId, { progress: silentProgress, signal: context.signal, repository: checked.repository, otherWindow: checked.otherWindow });
+      return decision satisfies DeleteCheckValue;
+    } catch (error) {
+      return flowRefusal(error, context) satisfies DeleteCheckValue;
     }
   };
 }

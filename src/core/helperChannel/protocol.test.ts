@@ -43,6 +43,8 @@ import {
   MAX_DELETE_VOLUMES,
   parseDeleteParams,
   parseDeleteValue,
+  parseDeleteCheckParams,
+  parseDeleteCheckValue,
 } from './protocol';
 
 describe('the protocol of the helper channel (user request 2026-09-28)', () => {
@@ -436,6 +438,42 @@ describe('delete: its parameters and its answer (plan step 11C2a)', () => {
     expect(parseDeleteValue({ refused: { code: 'startFailed', message: 'm' } })).toEqual({ refused: { code: 'startFailed', message: 'm' } });
     for (const odd of [{}, { deleted: false }, { deleted: true, extra: 1 }, { refused: { code: 'cancelled', message: 'm' } }, { refused: { code: 'nope', message: 'm' } }, null, 'deleted']) {
       expect(parseDeleteValue(odd), JSON.stringify(odd)).toBeUndefined();
+    }
+  });
+});
+
+describe('deleteCheck: its parameters and its answer (plan step 11C2b)', () => {
+  const PARAMS = { environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d', dockerHost: '', owner: { windowId: 'window-1', pid: 42 }, repository: 'Acme/API', otherWindow: false };
+  it('takes its parameters only within their limits', () => {
+    expect(parseDeleteCheckParams(PARAMS)).toEqual(PARAMS);
+    expect(parseDeleteCheckParams({ ...PARAMS, repository: 'r'.repeat(256) })).toBeDefined();
+    for (const odd of [
+      { ...PARAMS, repository: '' },
+      { ...PARAMS, repository: 'r'.repeat(257) },
+      { ...PARAMS, repository: 'a\u007fb' },
+      { ...PARAMS, otherWindow: 'false' },
+      { ...PARAMS, owner: { windowId: 'w', pid: 0 } },
+      { ...PARAMS, extra: 1 },
+    ]) {
+      expect(parseDeleteCheckParams(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
+    }
+  });
+
+  it('answers the decision of the user, or a refusal of the pipeline', () => {
+    expect(parseDeleteCheckValue({ decision: 'delete', additionalVolumesToRemove: ['api-db'] })).toEqual({ decision: 'delete', additionalVolumesToRemove: ['api-db'] });
+    expect(parseDeleteCheckValue({ decision: 'open' })).toEqual({ decision: 'open' });
+    expect(parseDeleteCheckValue({ decision: 'cancel' })).toEqual({ decision: 'cancel' });
+    expect(parseDeleteCheckValue({ refused: { code: 'otherAccount', message: 'm' } })).toEqual({ refused: { code: 'otherAccount', message: 'm' } });
+    for (const odd of [
+      { decision: 'delete' },
+      { decision: 'delete', additionalVolumesToRemove: ['../x'] },
+      { decision: 'delete', additionalVolumesToRemove: Array.from({ length: MAX_DELETE_VOLUMES + 1 }, (_, i) => `v${i}`) },
+      { decision: 'open', additionalVolumesToRemove: [] },
+      { decision: 'maybe' },
+      { refused: { code: 'cancelled', message: 'm' } },
+      null,
+    ]) {
+      expect(parseDeleteCheckValue(odd), JSON.stringify(odd)?.slice(0, 80)).toBeUndefined();
     }
   });
 });

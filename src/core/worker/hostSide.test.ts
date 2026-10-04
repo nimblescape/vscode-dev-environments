@@ -6,7 +6,7 @@
 // requests, hostSideHandler answers them. Here they are wired to each other, so one test covers both.
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import { OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
 import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
@@ -18,11 +18,11 @@ const ENVIRONMENT = { id: 'e1', repository: 'acme/app', owner: { id: 'a1' } } as
 
 /** Every request of HostSide: the tests of the two sides run with all of them allowed (review round 1 of 11B1, A-R1-8). */
 const ALL: readonly HostCall[] = [
-  ...['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message', 'unknown', 'Bad-Call'].map(
+  ...['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message', 'confirmDelete', 'deleteAdditionalVolumes', 'deleteServiceData', 'unknown', 'Bad-Call'].map(
     (call) => `question ${call}` as const,
   ),
   ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
-  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy'].map((call) => `record ${call}` as const),
+  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy', 'recordGitSummary'].map((call) => `record ${call}` as const),
   'secret token',
   'secret registry',
   'secret unknown',
@@ -43,6 +43,10 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       filesMissing: async (repository) => (record('filesMissing', repository), of('filesMissing', undefined)),
       recreateContainer: async (repository, question) => (record('recreateContainer', repository, question), of('recreateContainer', false)),
       message: async (kind, text) => void record('message', kind, text),
+      // Plan step 11C2b.
+      confirmDelete: async (repository, confirmation) => (record('confirmDelete', repository, confirmation), of('confirmDelete', undefined as 'delete' | 'open' | undefined)),
+      deleteAdditionalVolumes: async (volumes) => (record('deleteAdditionalVolumes', volumes), of('deleteAdditionalVolumes', undefined as 'remove' | 'keep' | undefined)),
+      deleteServiceData: async (volumes, possibly) => (record('deleteServiceData', volumes, possibly), of('deleteServiceData', undefined as string[] | undefined)),
     },
     state: {
       windowStatuses: async () => (record('windowStatuses'), of('windowStatuses', [STATUS] as readonly WindowStatus[])),
@@ -64,6 +68,7 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       // Plan step 11C2a.
       markBusy: async (environmentId, operation) => (record('markBusy', environmentId, operation), of('markBusy', undefined as BusyMarkResult)),
       clearBusy: async (environmentId) => void record('clearBusy', environmentId),
+      recordGitSummary: async (environmentId, summary) => void record('recordGitSummary', environmentId, summary),
     },
     secrets: {
       token: async () => (record('token'), of('token', undefined)),
@@ -488,3 +493,97 @@ describe('the requests of Delete (plan step 11C2a)', () => {
 async function parseBusyMarkAnswerOf(value: unknown): Promise<unknown> {
   return parseBusyMarkAnswer(value, 'e1');
 }
+
+// Plan step 11C2b: the questions of Delete and the Git state, checked before this computer is touched.
+describe('the requests of the check of Delete (plan step 11C2b)', () => {
+  // Review round 1 of 11C2b (A-R1-M2): changed, the changes are counts.
+  const CONFIRMATION = { changes: { uncommittedFiles: 2, unpushedCommits: 0 }, recordedAt: '2026-10-04T10:00:00.000Z', lastSeenInUse: '2026-10-04T09:00:00.000Z', repositoryData: ['data/db'], otherWindow: false };
+  const SUMMARY = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 0, stashes: 0, recordedAt: '2026-10-04T10:00:00.000Z' };
+
+  it('asks the questions of Delete with their facts, and answers with the answer of the user', async () => {
+    const { worker, calls } = wired({ confirmDelete: 'open', deleteAdditionalVolumes: 'keep', deleteServiceData: ['api-db'] });
+    expect(await worker.questions.confirmDelete('Acme/API', CONFIRMATION)).toBe('open');
+    expect(await worker.questions.deleteAdditionalVolumes(['api-cache'])).toBe('keep');
+    expect(await worker.questions.deleteServiceData(['api-db', 'api-x'], ['api-x'])).toEqual(['api-db']);
+    await worker.records.recordGitSummary('e1', SUMMARY as never);
+    expect(calls).toEqual([
+      { call: 'confirmDelete', args: ['Acme/API', CONFIRMATION] },
+      { call: 'deleteAdditionalVolumes', args: [['api-cache']] },
+      { call: 'deleteServiceData', args: [['api-db', 'api-x'], ['api-x']] },
+      { call: 'recordGitSummary', args: ['e1', SUMMARY] },
+    ]);
+  });
+
+  it('a dismissed question, or an answer that is not one, is cancel on the side of the worker', async () => {
+    expect(await wired({ confirmDelete: undefined }).worker.questions.confirmDelete('r', CONFIRMATION)).toBeUndefined();
+    expect(await wired({ confirmDelete: 'yes' }).worker.questions.confirmDelete('r', CONFIRMATION)).toBeUndefined();
+    expect(await wired({ deleteAdditionalVolumes: 'all' }).worker.questions.deleteAdditionalVolumes(['v'])).toBeUndefined();
+    // A volume that was not offered makes the whole answer invalid (cancel).
+    expect(await wired({ deleteServiceData: ['other'] }).worker.questions.deleteServiceData(['v'], [])).toBeUndefined();
+    expect(await wired({ deleteServiceData: undefined }).worker.questions.deleteServiceData(['v'], [])).toBeUndefined();
+  });
+
+  it('refuses facts and Git states that do not fit, before this computer is touched', async () => {
+    const { handler, signal, calls } = wired();
+    for (const [kind, call, args] of [
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: '0 uncommitted, all pushed' }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: { uncommittedFiles: -1, unpushedCommits: 0 } }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: { uncommittedFiles: 1.5, unpushedCommits: 0 } }]],
+      ['question', 'confirmDelete', ['a\nb', CONFIRMATION]],
+      ['question', 'confirmDelete', ['', CONFIRMATION]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, otherWindow: 'no' }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, recordedAt: 'a\nb' }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: [''] }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: 'data' }]],
+      // Review round 2 of 11C2b (A-R2-L-a): folders of normal length, without `..`.
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: ['../../etc'] }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: ['d'.repeat(256)] }]],
+      ['question', 'confirmDelete', ['r', null]],
+      ['question', 'deleteAdditionalVolumes', [['../x']]],
+      ['question', 'deleteServiceData', [['v'], 'v']],
+      ['record', 'recordGitSummary', ['e1', { branch: 'main' }]],
+      ['record', 'recordGitSummary', ['e2', SUMMARY]],
+    ] as const) {
+      await expect(handler(kind, { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('the check of Delete may send only its requests', () => {
+    expect(FLOW_REQUESTS[OP_DELETE_CHECK]).toEqual([
+      'record get',
+      'record read',
+      'local account',
+      'record recordGitSummary',
+      'question confirmDelete',
+      'question deleteAdditionalVolumes',
+      'question deleteServiceData',
+    ]);
+  });
+});
+
+// Review round 1 of 11C2b (A-R1-M1, A-R1-M2): the questions name the repository of the operation, and each answer of the
+// user is observed by the extension.
+describe('the questions of a flow name its repository, and their answers are observed (review round 1 of 11C2b)', () => {
+  it('refuses a confirmation of another repository than the one of the operation, and observes each answer', async () => {
+    const { host, calls } = fakeHost({ confirmDelete: 'delete' });
+    const observed: unknown[] = [];
+    const handler = hostSideHandler(host, silentLogger, ALL, { environmentId: 'e1', repository: 'acme/api', onAnswer: (call, args, value) => observed.push([call, args, value]) });
+    const signal = new AbortController().signal;
+    const confirmation = { repositoryData: [], otherWindow: false };
+    await expect(handler('question', { call: 'confirmDelete', args: ['acme/other', confirmation] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    expect(calls).toEqual([]);
+    await handler('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
+    expect(observed).toEqual([['confirmDelete', ['acme/api', confirmation], 'delete']]);
+    // Review round 3 of 11C2b (A-R3-L1): each question is announced and settled, also one that fails.
+    const states: string[] = [];
+    const tracked = hostSideHandler(host, silentLogger, ALL, { environmentId: 'e1', repository: 'acme/api', onQuestion: (state) => states.push(state) });
+    await tracked('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
+    await expect(tracked('question', { call: 'deleteAdditionalVolumes', args: [['../x']] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await tracked('record', { call: 'get', args: ['e1'] }, signal);
+    expect(states).toEqual(['asked', 'settled', 'asked', 'settled']);
+    // Review round 2 of 11C2b: a question whose arguments are refused is not observed.
+    await expect(handler('question', { call: 'deleteAdditionalVolumes', args: [['../x']] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    expect(observed).toHaveLength(1);
+  });
+});

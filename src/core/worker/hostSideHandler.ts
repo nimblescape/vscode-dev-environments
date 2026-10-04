@@ -8,6 +8,8 @@
 // the extension passes its own HostSide (src/vscode).
 import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
 import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
+import { isGitSummary } from '../git/gitSummary';
+import type { DeleteConfirmation } from '../pipeline/deleteCheck';
 import type { BusyOperation } from '../types';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
 import type { AskKind, Secrets } from '../helperChannel/protocol';
@@ -39,8 +41,16 @@ export function hostSideHandler(
   host: HostSide,
   logger: Logger,
   allowed: readonly HostCall[],
-  // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS).
-  scope: { environmentId?: string } = {},
+  // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS). Review round 1
+  // of 11C2b (A-R1-M1, A-R1-M2): the name of the repository that the questions must name, and the observer of the answers
+  // of the user (the extension checks the decision of the flow against them).
+  scope: {
+    environmentId?: string;
+    repository?: string;
+    onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+    // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked (`asked`) and has its answer or failed (`settled`).
+    onQuestion?: (state: 'asked' | 'settled') => void;
+  } = {},
 ): NonNullable<OperationOptions['onAsk']> {
   const permitted = new Set<string>(allowed);
   return async (kind, payload, signal) => {
@@ -62,12 +72,73 @@ export function hostSideHandler(
     }
     if (signal.aborted) throw new HelperOperationError('cancelled', 'The operation ended.', false);
     try {
-      return await answer(host, request.kind, request.call, request.args);
+      // Review round 1 of 11C2b (A-R1-M2): a question names the repository of the operation, never a text of the worker.
+      if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
+        throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
+      }
+      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args);
+      scope.onQuestion?.('asked');
+      try {
+        const answered = await answer(host, request.kind, request.call, request.args);
+        scope.onAnswer?.(request.call, request.args, answered.value);
+        return answered;
+      } finally {
+        scope.onQuestion?.('settled');
+      }
     } catch (error) {
       if (error instanceof HelperOperationError) throw error;
       logger.warn(`The request ${request.kind} ${request.call} of the worker failed: ${errorMessage(error)}`);
       throw new HelperOperationError('failed', errorMessage(error), false);
     }
+  };
+}
+
+/** Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. */
+const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
+
+/** The most names of a question of Delete. */
+const MAX_QUESTION_NAMES = 1000;
+/** A volume name as Docker takes it. */
+const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
+
+// Review round 2 of 11C2b (B-R2 HH2): every caller names its limit.
+function plainText(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/** Plan step 11C2b: the volume names of a question of Delete. */
+function volumeNames(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_QUESTION_NAMES || !value.every((name) => typeof name === 'string' && VOLUME_NAME.test(name))) {
+    throw new HelperOperationError('invalid', 'The volumes of the question are invalid.', false);
+  }
+  return [...(value as string[])];
+}
+
+/** Plan step 11C2b: the facts of the confirmation of Delete (DeleteConfirmation), checked; nothing else is passed on. */
+function deleteConfirmation(value: unknown): DeleteConfirmation {
+  const invalid = () => new HelperOperationError('invalid', 'The confirmation of Delete is invalid.', false);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
+  const { changes, recordedAt, lastSeenInUse, repositoryData, otherWindow } = value as Record<string, unknown>;
+  if (typeof otherWindow !== 'boolean') throw invalid();
+  // Review round 1 of 11C2b (A-R1-M2): counts, never a text.
+  const count = (n: unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+  let counts: DeleteConfirmation['changes'];
+  if (changes !== undefined) {
+    if (typeof changes !== 'object' || changes === null || Array.isArray(changes)) throw invalid();
+    const { uncommittedFiles, unpushedCommits, stashes } = changes as Record<string, unknown>;
+    if (!count(uncommittedFiles) || !count(unpushedCommits) || (stashes !== undefined && !count(stashes))) throw invalid();
+    counts = { uncommittedFiles: uncommittedFiles as number, unpushedCommits: unpushedCommits as number, ...(stashes !== undefined ? { stashes: stashes as number } : {}) };
+  }
+  for (const time of [recordedAt, lastSeenInUse]) if (time !== undefined && !plainText(time, 64)) throw invalid();
+  // Review round 2 of 11C2b (A-R2-L-a): folders of the repository, as paths of normal length without `..`.
+  const isFolder = (folder: unknown) => plainText(folder, 255) && folder !== '' && !(folder as string).split('/').includes('..');
+  if (!Array.isArray(repositoryData) || repositoryData.length > MAX_QUESTION_NAMES || !repositoryData.every(isFolder)) throw invalid();
+  return {
+    ...(counts !== undefined ? { changes: counts } : {}),
+    ...(recordedAt !== undefined ? { recordedAt: recordedAt as string } : {}),
+    ...(lastSeenInUse !== undefined ? { lastSeenInUse: lastSeenInUse as string } : {}),
+    repositoryData: [...(repositoryData as string[])],
+    otherWindow,
   };
 }
 
@@ -119,6 +190,19 @@ async function question(host: HostSide, call: string, args: unknown[]): Promise<
         throw new HelperOperationError('invalid', 'The question of the recreate offer is invalid.', false);
       }
       return ui.recreateContainer(repository, { message: value.message, detail: value.detail });
+    }
+    // Plan step 11C2b: the questions of Delete, with their facts checked.
+    case 'confirmDelete': {
+      const [repository] = strings(args, 1);
+      if (!plainText(repository, 256) || repository === '') throw new HelperOperationError('invalid', 'The repository of the question is invalid.', false);
+      return (await ui.confirmDelete(repository, deleteConfirmation(args[1]))) ?? null;
+    }
+    case 'deleteAdditionalVolumes':
+      return (await ui.deleteAdditionalVolumes(volumeNames(args[0]))) ?? null;
+    case 'deleteServiceData': {
+      const volumes = volumeNames(args[0]);
+      const possibly = volumeNames(args[1]);
+      return (await ui.deleteServiceData(volumes, possibly)) ?? null;
     }
     case 'message': {
       const [kind, text] = strings(args, 2);
@@ -219,6 +303,18 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
     case 'clearBusy':
       await records.clearBusy(strings(args, 1)[0]);
       return null;
+    // Plan step 11C2b: the Git state, checked as the registry checks it.
+    case 'recordGitSummary': {
+      const [environmentId] = strings(args, 1);
+      if (!isGitSummary(args[1])) throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
+      // Review round 1 of 11C2b (A-R1-L2): its five fields only, a bounded branch and a valid time.
+      const { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt } = args[1];
+      if ((branch !== null && (branch.length > 255 || !plainText(branch, 255))) || !Number.isFinite(Date.parse(recordedAt)) || recordedAt.length > 64) {
+        throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
+      }
+      await records.recordGitSummary(environmentId, { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt });
+      return null;
+    }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);
   }

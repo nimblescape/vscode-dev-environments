@@ -4,6 +4,7 @@
 
 // Shared parts of the Docker test files: the run of the global setup, a log file per test file, the timings, and fakes
 // for the user interface, the GitHub session, and the network. Everything else is the real core modules.
+import type { DeleteConfirmation } from '../../src/core/pipeline/deleteCheck';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -232,6 +233,23 @@ export class FakeUi implements PipelineUi {
   async configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'> {
     this.events.push({ kind: 'configurationKindChanged', text: `${repository}: ${message}` });
     return 'later';
+  }
+
+  // Plan step 11C2b: the questions of Delete; by default Delete, Keep, nothing ticked.
+  deleteAnswer: 'delete' | 'open' | undefined = 'delete';
+  additionalVolumesAnswer: 'remove' | 'keep' | undefined = 'keep';
+  serviceDataAnswer: string[] | undefined = [];
+
+  async confirmDelete(_repository: string, _confirmation?: DeleteConfirmation): Promise<'delete' | 'open' | undefined> {
+    return this.deleteAnswer;
+  }
+
+  async deleteAdditionalVolumes(): Promise<'remove' | 'keep' | undefined> {
+    return this.additionalVolumesAnswer;
+  }
+
+  async deleteServiceData(): Promise<string[] | undefined> {
+    return this.serviceDataAnswer;
   }
 
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
