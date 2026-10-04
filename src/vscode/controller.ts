@@ -603,23 +603,28 @@ export class Controller implements vscode.Disposable {
    * Concept 7.5 "registry lost": entries for the volumes with the label nimblescape.devenv.environment-id, when
    * registry.json is missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
    * Plan step 11C3: by the worker of the Docker host; `passive` (the default, a call in the background): it is made ready
-   * as for the refresh.
+   * as for the refresh. Review round 2 of 11C3 (A-R2-M1): `adopt`, for a window whose container the registry did not know
+   * at activation (no open pipeline runs for it): it takes its environment also when the registry was restored already
+   * (by an earlier restore of this window whose answer came too late, or by another window).
    */
-  async reconcileIfRegistryLost(options: { passive: boolean } = { passive: true }): Promise<void> {
+  async reconcileIfRegistryLost(options: { passive: boolean; adopt?: boolean } = { passive: true }): Promise<void> {
     await this.withDockerTarget(() => this.reconcileIfRegistryLostNow(options));
   }
 
-  private async reconcileIfRegistryLostNow(options: { passive: boolean }): Promise<void> {
+  private async reconcileIfRegistryLostNow(options: { passive: boolean; adopt?: boolean }): Promise<void> {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
-    if (!(await this.deps.registryNeedsRestore())) return;
+    if (!(await this.deps.registryNeedsRestore())) {
+      if (options.adopt === true) await this.adoptWindowEnvironment();
+      return;
+    }
     // Review D2: reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH),
     // then whether Docker runs; no `docker info` here before that check. Plan step 11C3: by the worker of the Docker host.
     if (!docker.isInstalled()) return;
-    const added = await service.reconcileInWorker(options);
-    if (added === 0) return;
+    const added = await service.reconcileInWorker({ passive: options.passive });
+    if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowEnvironment();
-    await this.deps.sidebar.render();
+    if (added > 0) await this.deps.sidebar.render();
   }
 
   // -------------------------------------------------------------------------------------------------------------------

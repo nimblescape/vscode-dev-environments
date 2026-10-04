@@ -3032,6 +3032,34 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
   });
 
+  // Review round 2 of 11C3 (A-R2-M1): a window whose container the registry did not know at activation takes its
+  // environment also when the registry was restored already, or the restore added nothing.
+  it('adopt: the window takes its restored environment when the registry was restored already', async () => {
+    const env = environment();
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.docker.findContainer.mockResolvedValue(containerInfo(String(CONTAINER_VERSION)));
+    await h.registry.add(env);
+    await h.controller.reconcileIfRegistryLost({ passive: true });
+    expect(h.coordinator.setEnvironment).not.toHaveBeenCalled();
+    await h.controller.reconcileIfRegistryLost({ passive: true, adopt: true });
+    expect(h.service.reconcileInWorker).not.toHaveBeenCalled();
+    expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(env.id);
+  });
+
+  it('adopt: the window takes its environment when the restore added none (another window restored it)', async () => {
+    const env = environment();
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.docker.findContainer.mockResolvedValue(containerInfo(String(CONTAINER_VERSION)));
+    fs.rmSync(h.paths.registry, { force: true });
+    h.service.reconcileInWorker.mockImplementation(async () => {
+      await h.registry.add(env);
+      return 0;
+    });
+    await h.controller.reconcileIfRegistryLost({ passive: false, adopt: true });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false });
+    expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(env.id);
+  });
+
   it('role A: a window adopted after a restore of the registry leaves when the account changed during its checks', async () => {
     const env = environment();
     h.connection.currentContainerName.mockReturnValue(CONTAINER);

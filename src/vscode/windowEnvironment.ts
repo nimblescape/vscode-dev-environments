@@ -8,6 +8,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { HelperPrebuildOutcome } from '../core/helper/helperPrebuild';
 import type { EnvironmentService } from '../core/pipeline/environmentService';
 import type { Logger } from '../core/ports';
+import { errorMessage } from '../core/errors';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { Environment } from '../core/types';
 
@@ -39,8 +40,14 @@ export async function findWindowEnvironment(
     if (!docker.isInstalled()) return undefined;
     // Review round 1 of 11C3 (A-R1-M2): the activation waits at most WINDOW_RESTORE_TIMEOUT_MS for it; the restore in the
     // background of the activation, and the one after the build of the helper image, adopt the window later
-    // (reconcileIfRegistryLost).
-    if ((await service.reconcileInWorker({ passive: true, signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) })) === 0) return undefined;
+    // (reconcileIfRegistryLost with `adopt`).
+    try {
+      await service.reconcileInWorker({ passive: true, signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) });
+    } catch (error) {
+      logger.warn(`The environments could not be restored from the volumes while this window started: ${errorMessage(error)}`);
+    }
+    // Review round 2 of 11C3 (A-R2-M1): the registry is read again whatever the restore answered: it may have added the
+    // entry before its time limit ended, or another window restored it first (nothing added here).
     return await registry.findByContainerName(containerName);
   } catch (error) {
     logger.error('The environment of this window could not be found.', error);
@@ -50,8 +57,10 @@ export async function findWindowEnvironment(
 
 /**
  * Review round 1 of 11C3 (A-R1-M2): the restore at activation is passive (it never builds the helper image), so a lost
- * registry is restored again once the background build made the helper image (`restore` adopts a restored window).
+ * registry is restored again once the background preparation of the helper image ended with an image (`restore` adopts a
+ * restored window). Review round 2 of 11C3 (A-R2-L1): also when the image was there already or is not due (a passive
+ * restore may still have found no image, or no worker ready in time); `restore` makes the worker ready in full.
  */
 export async function restoreAfterPrebuild(outcome: HelperPrebuildOutcome, restore: () => Promise<void>): Promise<void> {
-  if (outcome === 'built') await restore();
+  if (outcome === 'built' || outcome === 'present' || outcome === 'notDue') await restore();
 }

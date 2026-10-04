@@ -14,6 +14,7 @@ const ENTRY = { id: 'e1', containerName: 'devenv-acme-api-x' } as Environment;
 function deps(options: { found?: Environment[]; needsRestore?: boolean; installed?: boolean; added?: number | Error } = {}) {
   const found = [...(options.found ?? [])];
   const errors: string[] = [];
+  const warnings: string[] = [];
   const all = {
     registry: { findByContainerName: vi.fn(async () => found.shift()) },
     needsRestore: async () => options.needsRestore ?? true,
@@ -24,9 +25,9 @@ function deps(options: { found?: Environment[]; needsRestore?: boolean; installe
         return options.added ?? 0;
       }),
     },
-    logger: { ...silentLogger, error: (text: string) => errors.push(text) },
+    logger: { ...silentLogger, error: (text: string) => errors.push(text), warn: (text: string) => warnings.push(text) },
   };
-  return { all, errors };
+  return { all, errors, warnings };
 }
 
 describe('the environment of the window at its activation (review round 1 of 11C3)', () => {
@@ -46,7 +47,10 @@ describe('the environment of the window at its activation (review round 1 of 11C
   });
 
   it('nothing restored, a valid registry, or no Docker: no environment', async () => {
-    expect(await findWindowEnvironment('c', deps({ added: 0 }).all)).toBeUndefined();
+    const none = deps({ added: 0 });
+    expect(await findWindowEnvironment('c', none.all)).toBeUndefined();
+    // Review round 2 of 11C3 (A-R2-M1): changed, read again also when nothing was added (before: once).
+    expect(none.all.registry.findByContainerName).toHaveBeenCalledTimes(2);
     const valid = deps({ needsRestore: false });
     expect(await findWindowEnvironment('c', valid.all)).toBeUndefined();
     expect(valid.all.service.reconcileInWorker).not.toHaveBeenCalled();
@@ -56,19 +60,43 @@ describe('the environment of the window at its activation (review round 1 of 11C
   });
 
   it('a restore that fails or times out never fails the activation (logged)', async () => {
-    const { all, errors } = deps({ added: new Error('The operation was aborted due to timeout') });
+    const { all, errors, warnings } = deps({ added: new Error('The operation was aborted due to timeout') });
+    expect(await findWindowEnvironment('c', all)).toBeUndefined();
+    // Review round 2 of 11C3 (A-R2-M1): changed, a failed restore is a warning, and the registry is read again (before: an
+    // error, and no second read).
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual(['The environments could not be restored from the volumes while this window started: The operation was aborted due to timeout']);
+    expect(all.registry.findByContainerName).toHaveBeenCalledTimes(2);
+  });
+
+  it('finds the entry that the restore added before its time limit ended (review round 2 of 11C3, A-R2-M1)', async () => {
+    const { all } = deps({ found: [undefined as unknown as Environment, ENTRY], added: new Error('The operation was aborted due to timeout') });
+    expect(await findWindowEnvironment('devenv-acme-api-x', all)).toBe(ENTRY);
+  });
+
+  it('finds the entry that another window restored first, when this restore added none (review round 2 of 11C3, A-R2-M1)', async () => {
+    const { all } = deps({ found: [undefined as unknown as Environment, ENTRY], added: 0 });
+    expect(await findWindowEnvironment('devenv-acme-api-x', all)).toBe(ENTRY);
+  });
+
+  it('an unreadable registry never fails the activation (logged)', async () => {
+    const { all, errors } = deps();
+    all.registry.findByContainerName.mockRejectedValue(new Error('EACCES'));
     expect(await findWindowEnvironment('c', all)).toBeUndefined();
     expect(errors).toEqual(['The environment of this window could not be found.']);
   });
 
-  it('the restore runs again only after the helper image was built', async () => {
-    for (const outcome of ['notDue', 'unsupported', 'dockerNotRunning', 'present', 'failed', 'cancelled'] as const) {
+  it('the restore runs again once the background preparation ended with a helper image', async () => {
+    for (const outcome of ['unsupported', 'dockerNotRunning', 'failed', 'cancelled'] as const) {
       const restore = vi.fn(async () => {});
       await restoreAfterPrebuild(outcome, restore);
       expect(restore, outcome).not.toHaveBeenCalled();
     }
-    const restore = vi.fn(async () => {});
-    await restoreAfterPrebuild('built', restore);
-    expect(restore).toHaveBeenCalledTimes(1);
+    // Review round 2 of 11C3 (A-R2-L1): changed, also `present` and `notDue` (before: only `built`).
+    for (const outcome of ['built', 'present', 'notDue'] as const) {
+      const restore = vi.fn(async () => {});
+      await restoreAfterPrebuild(outcome, restore);
+      expect(restore, outcome).toHaveBeenCalledTimes(1);
+    }
   });
 });
