@@ -676,12 +676,12 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
         graced.push(tag);
       } else if (age >= HELPER_UNUSED_LIMIT_MS) {
         m.logger.info(`The workspace helper image ${tag} was not used for ${Math.floor(age / DAY_MS)} days. It is removed.`);
-        if (await removeHelperImage(m, image, tag, currentId)) {
-          removed.push(tag);
-          // Plan step 11D3: its monitor tag goes with it.
-          const monitorTag = monitorImageTag(tag);
-          if (monitorTag !== undefined && image.tags.includes(monitorTag)) await removeHelperImage(m, image, monitorTag, currentId);
-        }
+        // Plan step 11D3: its monitor tag goes with it, first (review round 1 of PR #101, A-M1): Docker refuses only the
+        // removal of the last reference of an image that a container uses, so the helper tag, removed last, stays while a
+        // helper or a monitor runs from its image; the monitor tag is only its name, and the next ensure tags it again.
+        const monitorTag = monitorImageTag(tag);
+        if (monitorTag !== undefined && image.tags.includes(monitorTag)) await removeHelperImage(m, image, monitorTag, currentId);
+        if (await removeHelperImage(m, image, tag, currentId)) removed.push(tag);
       }
     }
     // Plan step 11D3: a monitor tag whose helper tag is not on its image (removed, or moved by a rebuild) is removed.

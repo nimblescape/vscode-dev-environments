@@ -447,12 +447,6 @@ export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf
 }
 
 /**
- * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the Session Monitor container of the worker's engine made
- * sure (RemoteSessionMonitor.ensureOrThrow over the Engine API, engineMonitor): with the worker's own helper image (the
- * image the worker runs from: its tag in the label, its ID as the image of the container), the socket that the worker
- * mounts, and `script` (the monitor of the worker's bundle). A failure fails the operation with its cause.
- */
-/**
  * Plan step 11D3 (option B of 2026-10-03): the image of the monitor container: the worker's own image (the pinned
  * helper image) by its monitor tag `devenv-monitor:<hash>`, tagged here, with the ID that the create checks; by the ID
  * itself (as before) when the tag of the worker is no helper tag or the tag fails (the name in the Containers view only).
@@ -473,6 +467,13 @@ export async function monitorImage(engine: DockerEngine, own: { tag: string; id?
   return { reference, id: own.id };
 }
 
+/**
+ * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the Session Monitor container of the worker's engine made
+ * sure (RemoteSessionMonitor.ensureOrThrow over the Engine API, engineMonitor): with the worker's own helper image (the
+ * image the worker runs from: its tag in the label, its ID as the image of the container; plan step 11D3: its monitor
+ * tag, monitorImage), the socket that the worker mounts, and `script` (the monitor of the worker's bundle). A failure
+ * fails the operation with its cause.
+ */
 export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, script: () => string): OperationHandler {
   return async (params, context) => {
     const checked = parseMonitorEnsureParams(params);

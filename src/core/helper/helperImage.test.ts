@@ -127,8 +127,10 @@ class FakeDocker implements HelperImageDocker {
     const id = this.idOf(reference);
     if (id === undefined) return false;
     if (this.failingRemovals.has(reference)) throw new CommandError(`docker image rm ${reference}`, 1, '', 'Cannot connect to the Docker daemon');
-    if (this.inUse.has(reference) || this.inUse.has(id)) return false;
     const image = this.images.get(id)!;
+    // Review round 1 of PR #101 (A-M1): like Docker, an image in use refuses only the removal of its last reference (its
+    // ID, or its only tag); another tag is untagged.
+    if ((this.inUse.has(reference) || this.inUse.has(id)) && (reference === id || image.tags.length <= 1)) return false;
     if (reference === id) {
       if (image.tags.length > 1) throw new CommandError(`docker image rm ${id}`, 1, '', 'conflict: unable to delete (must be forced)');
       this.images.delete(id);
@@ -1199,7 +1201,8 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     const orphanId = h.docker.addImage(['devenv-monitor:fedcba987654', 'mine:keep']);
     h.docker.images.get(currentId)!.tags.push(h.tag.replace('devenv-helper:', 'devenv-monitor:'));
     await h.ensure();
-    expect(h.docker.removals).toEqual([OLD_TAG, oldMonitor, 'devenv-monitor:fedcba987654']);
+    // Review round 1 of PR #101 (A-M1): the monitor tag first, then its helper tag.
+    expect(h.docker.removals).toEqual([oldMonitor, OLD_TAG, 'devenv-monitor:fedcba987654']);
     expect(h.docker.images.has(oldId)).toBe(false);
     expect(h.docker.images.get(otherId)?.tags).toEqual([OTHER_TAG, otherMonitor]);
     expect(h.docker.images.get(orphanId)?.tags).toEqual(['mine:keep']);
@@ -1209,14 +1212,45 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     expect(Object.keys(h.state().images).some((tag) => tag.startsWith('devenv-monitor:'))).toBe(false);
   });
 
-  it('plan step 11D3: keeps the monitor tag when the removal of its helper tag fails', async () => {
+  it('plan step 11D3: a helper tag whose removal fails stays, without its monitor tag (only a name; review round 1 of PR #101, A-M1)', async () => {
     const { h } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) } });
     const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
     const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
     h.docker.failingRemovals.add(OLD_TAG);
     await h.ensure();
-    expect(h.docker.removals).toEqual([OLD_TAG]);
-    expect(h.docker.images.get(oldId)?.tags).toEqual([OLD_TAG, oldMonitor]);
+    expect(h.docker.removals).toEqual([oldMonitor, OLD_TAG]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual([OLD_TAG]);
+    expect(h.state().images[OLD_TAG]?.removedAt).toBeUndefined();
+  });
+
+  it('review round 1 of PR #101 (A-M1): keeps a helper tag with its monitor tag while a container uses its image', async () => {
+    const { h } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) } });
+    const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
+    const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
+    h.docker.inUse.add(oldId);
+    await h.ensure();
+    // Docker untags the monitor tag (not the last reference) and refuses the helper tag (the last one).
+    expect(h.docker.removals).toEqual([oldMonitor, OLD_TAG]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual([OLD_TAG]);
+    // Not removed: no tombstone; a later cleanup tries again.
+    expect(h.state().images[OLD_TAG]?.removedAt).toBeUndefined();
+    h.docker.inUse.clear();
+    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    await h.ensure();
+    expect(h.docker.images.has(oldId)).toBe(false);
+  });
+
+  it('review round 1 of PR #101: an orphan monitor tag that is the only tag of an image in use stays, and goes at a later cleanup', async () => {
+    const { h } = current();
+    const orphanId = h.docker.addImage(['devenv-monitor:fedcba987654']);
+    h.docker.inUse.add(orphanId);
+    await h.ensure();
+    expect(h.docker.removals).toEqual(['devenv-monitor:fedcba987654']);
+    expect(h.docker.images.get(orphanId)?.tags).toEqual(['devenv-monitor:fedcba987654']);
+    h.docker.inUse.clear();
+    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    await h.ensure();
+    expect(h.docker.images.has(orphanId)).toBe(false);
   });
 
   it('gives an unknown helper tag a grace period of 7 days, then removes it', async () => {
