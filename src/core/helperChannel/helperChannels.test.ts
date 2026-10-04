@@ -874,6 +874,25 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     channels.dispose();
   });
 
+  // Review round 2 of 11C1 (missing test 2): the flow sent once more after `closed` is made ready passively too.
+  it('a passive flow sent once more after a closed channel checks the helper image and never prepares it', async () => {
+    const first = fakeChannel();
+    const second = fakeChannel();
+    const open = vi.fn().mockResolvedValueOnce(first as unknown as HelperChannel).mockResolvedValueOnce(second as unknown as HelperChannel);
+    const prepare = vi.fn(async () => {});
+    const checkPresent = vi.fn(async () => {});
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
+    first.flow.mockImplementationOnce(async () => {
+      first.close();
+      throw new HelperChannelError('closed', 'closed');
+    });
+    expect(await channels.flow(REMOTE, 'windowState', {}, { passive: true })).toEqual({ outcome: 'notRunning' });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(checkPresent).toHaveBeenCalledTimes(2);
+    expect(second.flow).toHaveBeenCalledTimes(1);
+    channels.dispose();
+  });
+
   it('rejects when the worker failed or answered with an invalid value', async () => {
     const lost = refreshChannel(['refresh'], async () => {
       throw new HelperChannelError('lost', 'lost');

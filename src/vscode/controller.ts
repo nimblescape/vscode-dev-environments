@@ -1160,8 +1160,10 @@ export class Controller implements vscode.Disposable {
             return;
           }
           this.logger.info(`This window is connected to ${repository}.`);
-          if (this.current?.lost) {
+          // Review round 2 of 11C1 (A-R2-L1): the read succeeded, so the state is known again.
+          if (this.current?.lost || this.current?.unknown) {
             this.current.lost = false;
+            this.current.unknown = false;
             this.updateStatusBar();
           }
           this.inform(ControllerTexts.alreadyConnected(repository));
@@ -2003,7 +2005,7 @@ export class Controller implements vscode.Disposable {
     if (this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
     this.checkingConnection = true;
     try {
-      const runs = await this.containerRuns(current.environment, current.containerName, true);
+      const runs = await this.containerRuns(current.environment, current.containerName);
       // Review round 1 of 11C1 (A-R1-4): the window or its operation may have changed while the worker read.
       if (this.current !== current || this.disposed || this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
       // Decision of 2026-10-04: a state that could not be read (the worker could not be reached) changes nothing but the
@@ -2029,8 +2031,8 @@ export class Controller implements vscode.Disposable {
     if (!current) return;
     await this.checkConnection();
     // Plan step 11C1: read by the worker.
-    // Review round 1 of 11C1 (A-R1-1): a read in the background, which never builds the helper image.
-    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true, background: true }))?.branch;
+    // Review round 1 of 11C1 (A-R1-1): a passive read, which never builds the helper image (windowStateInWorker).
+    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true }))?.branch;
     if (branch && this.current === current) {
       current.branch = branch;
       this.updateStatusBar();
@@ -2056,15 +2058,15 @@ export class Controller implements vscode.Disposable {
    * 2026-10-04: unknown). A Start or Reconnect of the user takes unknown as "not running" and tries; its failure leaves
    * the window disconnected.
    */
-  private async containerRuns(environment: Environment, containerName: string, background = false): Promise<boolean | undefined> {
+  private async containerRuns(environment: Environment, containerName: string): Promise<boolean | undefined> {
     if (!this.deps.docker.isInstalled()) return false;
-    const value = await this.deps.service.windowStateInWorker(environment, containerName, background ? { background: true } : {});
+    const value = await this.deps.service.windowStateInWorker(environment, containerName);
     return value === undefined ? undefined : value.state === 'running';
   }
 
   /**
    * Review round 1 of 11C1 (A-R1-2): the state of the container and whether it is outdated, in one read of the worker
-   * (made ready in full: a command of the user). `undefined` when it could not be read, or Docker is not installed.
+   * (passive and bounded, review round 2, A-R2-M2). `undefined` when it could not be read, or Docker is not installed.
    */
   private async windowState(environment: Environment, containerName: string): Promise<WindowStateValue | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;

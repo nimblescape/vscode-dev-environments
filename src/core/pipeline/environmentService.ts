@@ -6127,15 +6127,12 @@ export class EnvironmentService {
    * `containerName` of `environment`, by the worker of the Docker host of the operation (`windowState`): its state,
    * whether it may be used as it is, and with `branch` the branch of its repository. `undefined` when it could not be read
    * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
-   * Never throws. Review round 1 of 11C1 (A-R1-1): with `background` (the check of the connection, the branch of the
-   * window), the worker is made ready passively (as for the refresh: never a build of the helper image, the wait after a
-   * failed open kept), and within WINDOW_STATE_FLOW_TIMEOUT_MS; a read of a command of the user makes it ready in full.
+   * Never throws. Review rounds 1 and 2 of 11C1 (A-R1-1, A-R2-M1, A-R2-M2): the worker is made ready passively (as for
+   * the refresh: never a build of the helper image, the wait after a failed open kept), and within
+   * WINDOW_STATE_FLOW_TIMEOUT_MS, also for a Start of the user: unknown takes it to the open pipeline, which prepares the
+   * worker with its progress and Cancel.
    */
-  async windowStateInWorker(
-    environment: Environment,
-    containerName: string,
-    options: { branch?: boolean; background?: boolean } = {},
-  ): Promise<WindowStateValue | undefined> {
+  async windowStateInWorker(environment: Environment, containerName: string, options: { branch?: boolean } = {}): Promise<WindowStateValue | undefined> {
     try {
       // Unit 7: an environment of another Docker host is not read through the worker of this one.
       if (!(await this.isOnCurrentHost(environment))) return undefined;
@@ -6152,7 +6149,7 @@ export class EnvironmentService {
         await this.deps.flow(
           OP_WINDOW_STATE,
           params,
-          options.background ? { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) } : { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS },
+          { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) },
         ),
       );
       if (value === undefined) throw new Error('the worker answered with an invalid value');

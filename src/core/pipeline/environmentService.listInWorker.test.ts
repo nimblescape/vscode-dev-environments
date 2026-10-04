@@ -154,17 +154,17 @@ describe('the reads of an attached window through the worker, from the extension
     expect(h.logger.infos.some((line) => line.includes('The state of the container devenv-x could not be read'))).toBe(true);
   });
 
-  // Review round 1 of 11C1 (A-R1-1): a read in the background makes the worker ready passively and within its time limit;
-  // a read of a command of the user does not.
-  it('a read in the background is passive and bounded by its time limit; a read of a command of the user is not', async () => {
+  // Review round 1 of 11C1 (A-R1-1): a read makes the worker ready passively and within its time limit. Review round 2
+  // (A-R2-M1, A-R2-M2): changed expectation (before: a read of a command of the user made it ready in full): every read.
+  it('a read is passive and bounded by its time limit, with and without the branch', async () => {
     const { h, sent } = harness(async () => ({ state: 'running' }));
     const env = await seedEnvironment(h, { container: 'running' });
-    await h.service.windowStateInWorker(env, 'devenv-x', { background: true });
+    await h.service.windowStateInWorker(env, 'devenv-x', { branch: true });
     await h.service.windowStateInWorker(env, 'devenv-x');
-    expect(sent[0]).toMatchObject({ passive: true, timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS });
-    expect(sent[0].signal).toBeInstanceOf(AbortSignal);
-    expect(sent[1].passive).toBeUndefined();
-    expect(sent[1].signal).toBeUndefined();
+    for (const each of sent) {
+      expect(each).toMatchObject({ passive: true, timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS });
+      expect(each.signal).toBeInstanceOf(AbortSignal);
+    }
   });
 
   // Review round 1 of 11C1 (missing test): an environment of another Docker host is unknown, and no flow is sent.
@@ -174,7 +174,7 @@ describe('the reads of an attached window through the worker, from the extension
     const env = await h.registry.updateEnvironment(ENV_ID, (entry) => {
       entry.dockerHost = 'other-box';
     });
-    expect(await h.service.windowStateInWorker(env ?? (await h.registry.get(ENV_ID))!, 'devenv-x', { background: true })).toBeUndefined();
+    expect(await h.service.windowStateInWorker(env ?? (await h.registry.get(ENV_ID))!, 'devenv-x')).toBeUndefined();
     expect(sent).toEqual([]);
   });
 });

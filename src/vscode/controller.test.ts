@@ -186,7 +186,7 @@ interface Harness {
     listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
-    windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; background?: boolean }) => Promise<WindowStateValue | undefined>>>;
+    windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean }) => Promise<WindowStateValue | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
@@ -284,7 +284,7 @@ function createHarness(
     currentBranch: vi.fn(async () => undefined),
     // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
     // that fails is unknown (undefined, decision of 2026-10-04).
-    windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean; background?: boolean } = {}) => {
+    windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean } = {}) => {
       try {
         const state = (await docker.containerState(containerName)) as WindowStateValue['state'];
         const value: WindowStateValue = { state };
@@ -2252,8 +2252,8 @@ describe('Connection of this window', () => {
     // connected state again, with the tooltip that the state could not be read.
     expect(h.statusBar.showConnected.mock.calls.slice(connectedCalls)).toEqual([h.statusBar.showConnected.mock.calls[connectedCalls - 1]]);
     expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(true);
-    // Review round 1 of 11C1 (A-R1-1): the check in the background reads passively (never a build of the helper image).
-    expect(h.service.windowStateInWorker.mock.calls.slice(reads).map((call) => call[2])).toEqual([{ background: true }]);
+    // Review round 2 of 11C1 (A-R2-M1): every read is passive in windowStateInWorker (environmentService.listInWorker.test).
+    expect(h.service.windowStateInWorker.mock.calls.slice(reads).map((call) => call[2])).toEqual([undefined]);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     // The Start of the user takes the unknown state as "not running": it reconnects through the pipeline.
     h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', 'The worker could not be reached.'));
@@ -2300,6 +2300,20 @@ describe('Connection of this window', () => {
     await run('start', { environmentId: ENV_ID });
     expect(h.service.windowStateInWorker.mock.lastCall?.[1]).toBe('devenv-old');
     expect(env.containerName).not.toBe('devenv-old');
+  });
+
+  // Review round 2 of 11C1 (A-R2-L1): a Start whose read finds the container running removes the hint at once.
+  it('removes the hint of an unknown state when a Start of the user reads that the container runs', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showStateUnknown.mock.lastCall?.[0] === true, 'the hint');
+    h.docker.containerState.mockResolvedValue('running');
+    await run('start', { environmentId: ENV_ID });
+    expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(false);
+    expect(h.service.openEnvironment).not.toHaveBeenCalled();
   });
 
   // Review round 1 of 11C1 (A-R1-4): a read that ends after an operation of the environment started changes nothing.
