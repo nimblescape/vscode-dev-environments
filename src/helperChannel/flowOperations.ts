@@ -183,10 +183,10 @@ export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
  * the script in the worker's bundle (`devenv:analysis-script`) with the limits of the extension's (ANALYSIS_LIMITS), its
  * failures logged to the operation and refused (fail closed).
  */
-export function workerAnalyzer(context: OperationContext): ConfigurationAnalyzer {
-  const analyzer = new WorkerConfigurationAnalyzer({ code: analysisScript }, contextLogger(context));
+export function workerAnalyzer(context: OperationContext): ConfigurationAnalyzer & { readonly inner: WorkerConfigurationAnalyzer } {
+  const inner = new WorkerConfigurationAnalyzer({ code: analysisScript }, contextLogger(context));
   // Review round 1 of PR #103 (A-L1): the operations of the worker share MAX_WORKER_ANALYSIS_THREADS threads.
-  return { analyze: (job) => WORKER_ANALYSIS_SLOTS(() => analyzer.analyze(job)) };
+  return { inner, analyze: (job) => WORKER_ANALYSIS_SLOTS(() => inner.analyze(job)) };
 }
 
 /** Review round 1 of PR #103 (A-L1): the most analysis threads that the worker runs at once, for all its operations. */
