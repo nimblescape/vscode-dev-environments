@@ -7,11 +7,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DockerTarget } from '../core/docker/dockerHost';
 import type { OperationOptions } from '../core/helperChannel/helperChannel';
-import { OP_HEARTBEAT, OP_MONITOR_SETTINGS, OP_RECORD_GIT_STATE, OP_WINDOW_STATE } from '../core/helperChannel/protocol';
+import { OP_HEARTBEAT, OP_MONITOR_ENSURE, OP_MONITOR_SETTINGS, OP_RECORD_GIT_STATE, OP_WINDOW_STATE } from '../core/helperChannel/protocol';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
-import { MONITOR_FLOW_TIMEOUT_MS, workerMonitor, type TargetFlow } from './workerMonitor';
+import { MONITOR_ENSURE_FLOW_TIMEOUT_MS, MONITOR_FLOW_TIMEOUT_MS, workerMonitor, type TargetFlow } from './workerMonitor';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const TARGET = { kind: 'remote', host: 'ssh://box', endpoint: 'ssh://box', context: 'box' } as DockerTarget;
@@ -99,5 +99,19 @@ describe('the calls of a window to the Session Monitor, as operations of the wor
     // Without a target: the current engine.
     await flow(OP_HEARTBEAT, { heartbeat: HEARTBEAT }, {});
     expect(current).toHaveBeenCalledTimes(1);
+  });
+
+  it('plan step 11D2: the ensure of the monitor goes to the worker of its engine with the image maintenance; a failure rejects', async () => {
+    const images = { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'UTC' };
+    const signal = new AbortController().signal;
+    const { monitor, calls } = monitorWith(() => ({ outcome: 'created' }));
+    await expect(monitor.monitorEnsure(TARGET, images, signal)).resolves.toBeUndefined();
+    expect(calls).toEqual([[OP_MONITOR_ENSURE, { images }, { target: TARGET, timeoutMs: MONITOR_ENSURE_FLOW_TIMEOUT_MS, signal }]]);
+    expect(MONITOR_ENSURE_FLOW_TIMEOUT_MS).toBeGreaterThan(60_000 + 25_500);
+    await expect(monitorWith(() => new Error('docker run failed: No such image')).monitor.monitorEnsure(TARGET, images)).rejects.toThrow('docker run failed: No such image');
+    await expect(monitorWith(() => ({ outcome: 'failed' })).monitor.monitorEnsure(TARGET, images)).rejects.toThrow('invalid value');
+    const invalid = monitorWith(() => ({ outcome: 'created' }));
+    await expect(invalid.monitor.monitorEnsure(TARGET, { ...images, schedule: 'daily' })).rejects.toThrow('cannot be sent');
+    expect(invalid.calls).toEqual([]);
   });
 });

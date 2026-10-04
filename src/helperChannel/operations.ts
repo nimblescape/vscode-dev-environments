@@ -19,6 +19,7 @@ import {
   OP_RECONCILE,
   OP_HEARTBEAT,
   OP_MONITOR_SETTINGS,
+  OP_MONITOR_ENSURE,
   OP_RECORD_GIT_STATE,
   OP_LIST_CONFIGURATIONS,
   OP_WINDOW_STATE,
@@ -41,11 +42,12 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorSettingsOperation, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorSettingsOperation, monitorEnsureOperation, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
+import monitorScript from 'devenv:monitor-script';
 
 /** `docker <args>`: its output goes back as it comes; the value is its exit code. */
 export const dockerOperation: OperationHandler = async (params, context) => {
@@ -166,4 +168,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_HEARTBEAT]: heartbeatOperation(ENGINE_OF),
   [OP_MONITOR_SETTINGS]: monitorSettingsOperation(ENGINE_OF),
   [OP_RECORD_GIT_STATE]: recordGitStateOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
+  // Plan step 11D2: the ensure of the Session Monitor container, with the script of the monitor in this bundle.
+  [OP_MONITOR_ENSURE]: monitorEnsureOperation(ENGINE_OF, OWN_HELPER_OF, () => monitorScript),
 };

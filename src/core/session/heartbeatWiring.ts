@@ -10,7 +10,6 @@
 // is tested.
 // No `vscode`.
 import type { DockerTarget } from '../docker/dockerHost';
-import type { HelperImageUse } from '../helper/helperImage';
 import { heartbeatHelperImage, type HeartbeatHelperImageDeps } from './heartbeatHelperImage';
 import { HeartbeatPreparation } from './heartbeatPreparation';
 
@@ -23,24 +22,11 @@ export interface HeartbeatWiringDeps extends Omit<HeartbeatHelperImageDeps, 'pre
   preparation?: HeartbeatPreparation;
 }
 
-/** Starts the Session Monitor container of `target` with the helper image `image` (RemoteMonitor.ensureOrThrow). */
-export type EnsureMonitor = (image: HelperImageUse, target: DockerTarget, signal: AbortSignal) => Promise<void>;
-
-/** The Session Monitor container of an engine (RemoteSessionMonitor). */
-export interface MonitorStart {
-  ensureOrThrow(helperTag: string, socketPath: string, signal?: AbortSignal, helperImage?: string): Promise<unknown>;
-}
-
 /**
- * Review round 6 of PR #85 (B-R6-6): the EnsureMonitor of the repair that extension.ts had inline: the Session Monitor
- * container of `target` with the tag and the ID of the helper image, the socket mount of its engine and the repair's
- * signal.
+ * Starts the Session Monitor container of `target` again. Plan step 11D2: the operation `monitorEnsure` of the worker of
+ * `target`, which runs from the helper image (its preparation, below, gives it).
  */
-export function monitorEnsure(monitor: MonitorStart, socketPath: (target: DockerTarget) => Promise<string>): EnsureMonitor {
-  return async (image, target, signal) => {
-    await monitor.ensureOrThrow(image.tag, await socketPath(target), signal, image.id);
-  };
-}
+export type EnsureMonitor = (target: DockerTarget, signal: AbortSignal) => Promise<void>;
 
 export interface HeartbeatWiring {
   /** The preparation of the heartbeats (its scope for their send, repair and check). */
@@ -50,8 +36,9 @@ export interface HeartbeatWiring {
   /** HelperChannels' `prepare`: the helper image for the worker of `target`, through the preparation (its wait). */
   prepareWorker(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
   /**
-   * The repair of the Session Monitor container of a heartbeat: in the scope of a heartbeat and as an operation on
-   * `target`, the helper image through the preparation (its wait), then `ensureMonitor` with it.
+   * The repair of the Session Monitor container of a heartbeat: in the scope of a heartbeat, `ensureMonitor` on
+   * `target` (plan step 11D2: the worker's operation; its preparation is the helper image through the preparation and
+   * its wait, as for every operation of a heartbeat).
    */
   repair(ensureMonitor: EnsureMonitor): (target: DockerTarget, signal: AbortSignal) => Promise<void>;
 }
@@ -69,12 +56,6 @@ export function heartbeatWiring(deps: HeartbeatWiringDeps): HeartbeatWiring {
       else preparation.clearAll();
     },
     prepareWorker: (target, signal) => image.prepareWorker(target, signal),
-    repair: (ensureMonitor) => (target, signal) =>
-      preparation.scope(() =>
-        deps.inTarget(target, async () => {
-          const use = await image.repairImage(target, signal);
-          await ensureMonitor(use, target, signal);
-        }),
-      ),
+    repair: (ensureMonitor) => (target, signal) => preparation.scope(() => ensureMonitor(target, signal)),
   };
 }

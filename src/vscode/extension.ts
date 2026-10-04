@@ -32,7 +32,6 @@ import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/image
 import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
-import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
 import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
 import { MAX_IMAGE_REPOSITORIES, REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
@@ -41,7 +40,7 @@ import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials'
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { ClosingWork } from '../core/session/closingWork';
-import { heartbeatWiring, monitorEnsure } from '../core/session/heartbeatWiring';
+import { heartbeatWiring } from '../core/session/heartbeatWiring';
 import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { releaseEnvironment } from '../core/session/windowRelease';
@@ -70,7 +69,6 @@ import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
-import { sessionMonitorEnsure } from './sessionMonitorEnsure';
 import { affectsSettings, readSettings, warnInvalidHostAccessChecksOff } from './settings';
 import { Sidebar } from './sidebar';
 import { EnvironmentStatusBar } from './statusBar';
@@ -303,25 +301,11 @@ async function activateExtension(
       },
     }),
   );
-  // Unit 7, PR 2: the Session Monitor container of a Docker engine (plan step 8, PR A: every engine, local and remote).
-  // Its script is dist/remoteMonitor.js, read once.
-  const remoteMonitorScript = context.asAbsolutePath(path.join('dist', 'remoteMonitor.js'));
-  let remoteMonitorScriptText: Promise<string> | undefined;
-  const remoteMonitor = new RemoteSessionMonitor({
-    docker,
-    logger,
-    // User requests 2026-09-28: the image maintenance of the monitor (the settings imageUpdates and imageUpdateSchedule,
-    // in the time zone of this computer; plan step 8, PR A: on every engine).
-    imageMaintenance: () => imageMaintenance(),
-    script: () => {
-      remoteMonitorScriptText ??= fs.promises.readFile(remoteMonitorScript, 'utf8');
-      // A failed read is tried again at the next open.
-      remoteMonitorScriptText.catch(() => (remoteMonitorScriptText = undefined));
-      return remoteMonitorScriptText;
-    },
-  });
   // Plan step 11D1 (decision of 2026-10-03): the heartbeats, the image settings and list, the check of a container and the
   // Git state of a release, as operations of the worker of the engine (workerFlow is set below, before the first call).
+  // Plan step 11D2: also the ensure of the Session Monitor container (unit 7, PR 2; plan step 8, PR A: every engine), with
+  // the image maintenance of this computer (user requests 2026-09-28: the settings imageUpdates and imageUpdateSchedule,
+  // in its time zone); the worker holds the script of the monitor and runs from the helper image.
   const monitorCalls = workerMonitor({
     flow: (op, params, options) => workerFlow(op, params, options),
     owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
@@ -423,8 +407,8 @@ async function activateExtension(
   // #85 (A-R2-2): it ends only the wait for the helper image, whose build runs with the long signal of the preparation.
   // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it, the
   // repair goes on with the tag when it is present (heartbeatWiring.repair).
-  // Review round 6 of PR #85 (B-R6-6): its start of the monitor (monitorEnsure) is tested in core.
-  const repairSessionMonitor = heartbeats.repair(monitorEnsure(remoteMonitor, engineSocket));
+  // Plan step 11D2: the operation `monitorEnsure` of the worker of that engine.
+  const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(), signal));
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
   const windowHeartbeats = new WindowHeartbeats({
@@ -583,7 +567,9 @@ async function activateExtension(
     // Unit 7, PR 2: the Session Monitor of the engine, with the socket that the workspace helper mounts there. Plan step 8,
     // PR A: on every engine; its calls run in the operation (through its worker where they are plain Docker calls).
     sessionMonitor: {
-      ensure: sessionMonitorEnsure(remoteMonitor, engineSocket),
+      // Plan step 11D2: the operation `monitorEnsure` of the worker of the engine of the open, which runs from the helper
+      // image of the open (its tag and ID).
+      ensure: async (_target, _helperTag, signal) => monitorCalls.monitorEnsure(await callTarget(), imageMaintenance(), signal),
       // Plan step 11D1: the operation `heartbeat` of the worker of the engine of the open.
       heartbeat: async (_target, environmentId, keepRunning, seq) => {
         const result = await monitorCalls.heartbeat(await callTarget(), {

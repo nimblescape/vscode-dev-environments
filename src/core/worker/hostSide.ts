@@ -6,7 +6,7 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MONITOR_SETTINGS, OP_RECONCILE, OP_RECORD_GIT_STATE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MONITOR_ENSURE, OP_MONITOR_SETTINGS, OP_RECONCILE, OP_RECORD_GIT_STATE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import type { BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
@@ -189,6 +189,8 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   // Plan step 11D1: the commands of the Session Monitor need nothing from this computer (their parameters carry them).
   [OP_HEARTBEAT]: [],
   [OP_MONITOR_SETTINGS]: [],
+  // Plan step 11D2: the ensure of the monitor needs nothing from this computer either.
+  [OP_MONITOR_ENSURE]: [],
   // Plan step 11D1: the Git state of a release reads the record and records the state of its environment (SCOPED_REQUESTS).
   [OP_RECORD_GIT_STATE]: ['record get', 'record recordGitSummary'],
 };

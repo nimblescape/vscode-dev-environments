@@ -8,6 +8,7 @@
 // in the batch helper, and in the extension only for the bootstrap. Pure types and checks; no I/O, no `vscode`.
 import { LABEL_COMPOSE_SERVICE } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
+import type { MonitorCreated, MonitorRunSpec } from '../remoteMonitor/monitorEngine';
 
 /**
  * A container as a flow needs it: the pipeline's ContainerInfo (one shape, read by toContainerInfo of
@@ -137,6 +138,16 @@ export interface DockerEngine {
    * Answers its exit code and its output (both streams, bounded); `timeoutMs` ends and removes it.
    */
   runContainer(spec: EngineRun, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
+  /** Plan step 11D2: the clock of the daemon (`GET /info`, its SystemTime as Docker writes it). */
+  systemTime(signal?: AbortSignal): Promise<string>;
+  /**
+   * Plan step 11D2 (the Session Monitor container, plan step 3 pipe loading): creates the container of `spec` with an open
+   * input, attaches to it, starts it, writes `input`, and waits for `readyText` on its output, its end, `timeoutMs`, or
+   * the cancellation; then its input is closed (the container goes on alone). A create that the engine refuses is
+   * `exited` (`conflict`: the name is in use); any failure after the create request was sent is `exited` too, so the
+   * caller removes the container of this create by its labels. Rejects only when nothing was sent.
+   */
+  createAttached(spec: MonitorRunSpec, options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal }): Promise<MonitorCreated>;
 }
 
 /** Plan step 11B3: a container of runContainer. */

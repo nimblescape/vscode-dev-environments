@@ -34,5 +34,7 @@ export function unusedEngine(): DockerEngine {
     pull: unused('pull'),
     labelImage: unused('labelImage'),
     runContainer: unused('runContainer'),
+    systemTime: unused('systemTime'),
+    createAttached: unused('createAttached'),
   };
 }

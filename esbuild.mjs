@@ -3,8 +3,10 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import * as fs from 'fs';
+import { fileURLToPath } from 'url';
 import * as esbuild from 'esbuild';
 import { devcontainerCliVersion } from './scripts/cliVersion.mjs';
+import { monitorScriptPlugin } from './scripts/monitorScript.mjs';
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -51,7 +53,6 @@ const outfiles = [
   'dist/extension.js',
   'dist/groupsPreviewWorker.js',
   'dist/configurationAnalysisWorker.js',
-  'dist/remoteMonitor.js',
   'dist/helperChannel.js',
 ];
 
@@ -81,25 +82,18 @@ const contexts = await Promise.all([
     entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
     outfile: outfiles[2],
   }),
-  // Unit 7, PR 2: the Session Monitor on a remote Docker host. The extension sends it over SSH as the first input line of
-  // the pipe loader of its container (plan step 3, src/core/loader/pipeLoader.ts), so it is always minified (less data
-  // over SSH) and has no source map.
-  esbuild.context({
-    ...shared,
-    entryPoints: ['src/remoteMonitor/main.ts'],
-    outfile: outfiles[3],
-    minify: true,
-    sourcemap: false,
-  }),
   // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it over SSH as
   // the first input line of the pipe loader of the channel container (plan step 3, src/core/loader/pipeLoader.ts), so it
-  // is always minified (less data over SSH) and has no source map.
+  // is always minified (less data over SSH) and has no source map. Plan step 11D2: it holds the script of the Session
+  // Monitor (the module `devenv:monitor-script`, scripts/monitorScript.mjs), which it gives the monitor container it
+  // creates; before, the extension read dist/remoteMonitor.js for it.
   esbuild.context({
     ...shared,
     entryPoints: ['src/helperChannel/main.ts'],
-    outfile: outfiles[4],
+    outfile: outfiles[3],
     minify: true,
     sourcemap: false,
+    plugins: [...shared.plugins, monitorScriptPlugin(fileURLToPath(new URL('.', import.meta.url)), shared.define)],
   }),
 ]);
 

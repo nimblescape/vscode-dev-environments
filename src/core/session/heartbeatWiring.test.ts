@@ -12,7 +12,7 @@ import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import type { PresentImageOptions } from '../helper/workspaceHelper';
 import { isAbortError } from '../ports';
 import { HeartbeatPreparation } from './heartbeatPreparation';
-import { heartbeatWiring, monitorEnsure } from './heartbeatWiring';
+import { heartbeatWiring } from './heartbeatWiring';
 
 /** Lets the promises that are ready run (no timers). */
 const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
@@ -120,11 +120,15 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
     preparation.dispose();
   });
 
-  it('the repair goes through the preparation in the scope of a heartbeat, on its engine, then starts the monitor with the image (E05)', async () => {
+  // Plan step 11D2: changed, the repair is the worker's operation `monitorEnsure` on its engine; its worker is prepared as
+  // the flow prepares it (prepareWorker, here in the fake ensure), in the scope of the heartbeat. Before, the repair built
+  // the image itself and started the monitor with it.
+  it('the repair runs the ensure on its engine in the scope of a heartbeat, whose worker goes through the preparation (E05)', async () => {
     const { preparation, state, builds, signals, wiring } = setup();
-    const started: [HelperImageUse, DockerTarget, AbortSignal][] = [];
-    const repair = wiring.repair(async (image, target, signal) => {
-      started.push([image, target, signal]);
+    const started: [DockerTarget, AbortSignal][] = [];
+    const repair = wiring.repair(async (target, signal) => {
+      await wiring.prepareWorker(target, signal);
+      started.push([target, signal]);
     });
     const caller = new AbortController();
     // Outside the scope of a heartbeat too: the repair is always one of a heartbeat (the long signal, the wait).
@@ -136,7 +140,7 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
     state.buildFails = false;
     await repair(LOCAL, caller.signal);
     expect(builds).toEqual([REMOTE, LOCAL]);
-    expect(started).toEqual([[IMAGE, LOCAL, caller.signal]]);
+    expect(started).toEqual([[LOCAL, caller.signal]]);
     preparation.dispose();
   });
 
@@ -234,7 +238,9 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     const { preparation, builds, wiring } = setupBuilds();
     const started: DockerTarget[] = [];
     const deadline = new AbortController();
-    const repairing = wiring.repair(async (_image, target) => {
+    // Plan step 11D2: changed, the ensure prepares its worker (as the flow does), then starts the monitor.
+    const repairing = wiring.repair(async (target, signal) => {
+      await wiring.prepareWorker(target, signal);
       started.push(target);
     })(LOCAL, deadline.signal);
     repairing.catch(() => undefined);
@@ -268,11 +274,14 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     preparation.dispose();
   });
 
-  it('the monitor is started as an operation on the engine of the repair (B-R6-3)', async () => {
-    const { operation, preparation, builds, wiring } = setupBuilds();
-    const seen: (DockerTarget | undefined)[] = [];
-    const repairing = wiring.repair(async () => {
-      seen.push(operation.getStore());
+  // Plan step 11D2: changed, the ensure gets the engine of the repair as its target (the flow goes to that engine);
+  // before, it ran as an operation on it (runWithDockerTarget).
+  it('the monitor is started on the engine of the repair (B-R6-3)', async () => {
+    const { preparation, builds, wiring } = setupBuilds();
+    const seen: DockerTarget[] = [];
+    const repairing = wiring.repair(async (target, signal) => {
+      await wiring.prepareWorker(target, signal);
+      seen.push(target);
     })(REMOTE, new AbortController().signal);
     await settle();
     expect(builds[0].target).toBe(REMOTE);
@@ -286,7 +295,9 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     const { preparation, builds, wiring } = setupBuilds();
     const monitor = deferred<void>();
     let called = 0;
-    const repair = wiring.repair(() => {
+    // Plan step 11D2: changed, the ensure prepares its worker first (as the flow does).
+    const repair = wiring.repair(async (target, signal) => {
+      await wiring.prepareWorker(target, signal);
       called += 1;
       return monitor.promise;
     });
@@ -302,7 +313,10 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     await expect(repairing).rejects.toBe(failure);
     // And a monitor that starts: the repair ends only then.
     const second = deferred<void>();
-    const repairingAgain = wiring.repair(() => second.promise)(LOCAL, new AbortController().signal);
+    const repairingAgain = wiring.repair(async (target, signal) => {
+      await wiring.prepareWorker(target, signal);
+      return second.promise;
+    })(LOCAL, new AbortController().signal);
     await settle();
     builds[1].done.resolve(IMAGE);
     await settle();
@@ -347,40 +361,11 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     preparation.dispose();
   });
 
-  it('monitorEnsure starts the monitor with the tag and ID of the image, the socket of the engine and the signal (B-R6-6: X05, X08)', async () => {
-    const calls: unknown[][] = [];
-    const sockets: DockerTarget[] = [];
-    const failure = new Error('docker run failed');
-    let fail = false;
-    const ensure = monitorEnsure(
-      {
-        ensureOrThrow: async (...args: unknown[]) => {
-          calls.push(args);
-          if (fail) throw failure;
-          return 'started';
-        },
-      },
-      async (target) => {
-        sockets.push(target);
-        return '/run/user/1000/docker.sock';
-      },
-    );
-    const signal = new AbortController().signal;
-    await expect(ensure(IMAGE, REMOTE, signal)).resolves.toBeUndefined();
-    expect(sockets).toEqual([REMOTE]);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toHaveLength(4);
-    expect(calls[0][0]).toBe(IMAGE.tag);
-    expect(calls[0][1]).toBe('/run/user/1000/docker.sock');
-    expect(calls[0][2]).toBe(signal);
-    expect(calls[0][3]).toBe(IMAGE.id);
-    fail = true;
-    await expect(ensure(IMAGE, LOCAL, signal)).rejects.toBe(failure);
-  });
-
   it('extension.ts starts the monitor of a repair through monitorEnsure and retries the workers after a build (B-R6-6: X05, X06, X08)', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', 'vscode', 'extension.ts'), 'utf8');
-    expect(source).toContain('const repairSessionMonitor = heartbeats.repair(monitorEnsure(remoteMonitor, engineSocket));');
+    // Plan step 11D2: changed, the operation `monitorEnsure` of the worker of the repair's engine (before:
+    // monitorEnsure(remoteMonitor, engineSocket), removed with its test).
+    expect(source).toContain('const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(), signal));');
     expect(source).not.toContain('ensureOrThrow(image.tag');
     expect(source).toMatch(/onImageBuilt: \(\) => \{\s*helperChannels\?\.clearFailures\(\);\s*heartbeats\.imageBuilt\(\);\s*\}/);
   });
