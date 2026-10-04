@@ -295,6 +295,9 @@ export function redactValue(value: unknown, secrets: Iterable<string>): unknown 
  * added later (plan step 11A) is masked from then on. Plan step 11E1 (review round 2 of PR #102, A-M1): a held-back tail
  * of MIN_SECRET_LENGTH characters or more is the start of a secret whose rest never came (a stream cut by a time limit or
  * a cancel); flush passes it on as `***`. A shorter one passes as it is (it says nothing; review round 1 of PR #80).
+ * Review round 3 of PR #102 (A-L1): flush cannot tell a cut stream from one that ended normally, so a normal end whose
+ * last 4 or more characters start a secret ends in `***` too (output without a final line feed); kept on purpose, a
+ * stream's end is masked toward the secret.
  */
 export class StreamRedactor {
   private buffer = '';
