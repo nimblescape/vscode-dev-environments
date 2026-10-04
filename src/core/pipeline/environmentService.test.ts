@@ -6414,3 +6414,42 @@ describe('lifecycle token (user decision 2026-09-27): up --skip-post-create, the
     expect(h.ui.warnings).toEqual([]);
   });
 });
+
+// Review round 1 of PR #104 (plan step 11E4a, A-L3): every registry write of the open goes through its ports
+// (OpenRecords, the busy marks), so that the worker's pipeline can send them as requests (11E4b/c).
+describe('the registry writes of the open go through the ports (plan step 11E4a)', () => {
+  it('a first open and a later open write the registry only through OpenRecords and the busy marks', async () => {
+    type Port = Record<string, unknown>;
+    const service = h.service as unknown as { openRecords: Port; busyMarks: Port };
+    let throughPort = 0;
+    for (const port of [service.openRecords, service.busyMarks]) {
+      for (const [name, method] of Object.entries(port)) {
+        if (typeof method !== 'function') continue;
+        port[name] = async (...args: unknown[]) => {
+          throughPort++;
+          try {
+            return await (method as (...a: unknown[]) => Promise<unknown>)(...args);
+          } finally {
+            throughPort--;
+          }
+        };
+      }
+    }
+    const direct: string[] = [];
+    const registry = h.registry as unknown as Record<string, unknown>;
+    for (const name of ['updateEnvironment', 'add', 'remove']) {
+      const original = (registry[name] as (...a: unknown[]) => Promise<unknown>).bind(h.registry);
+      registry[name] = async (...args: unknown[]) => {
+        if (throughPort === 0) direct.push(name);
+        return original(...args);
+      };
+    }
+    h.docker.execHandler = (_container, command) =>
+      command[0] === 'sh' && command[2]?.includes('rev-list') ? { stdout: gitExecOutput('main') } : {};
+    await h.service.open(TARGET, options());
+    const env = await h.registry.findForAccount(REPO, ACCOUNT.id);
+    expect(env?.remoteWorkspaceFolder).toBeDefined();
+    await h.service.openEnvironment(env!.id, options());
+    expect(direct).toEqual([]);
+  });
+});

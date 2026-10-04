@@ -111,7 +111,11 @@ export interface OpenFinish {
   remoteUser?: string;
   remoteWorkspaceFolder: string;
   gitSummary?: GitSummary;
-  /** Read by the caller before it wrote its pending connection file (the busy mark goes after that file). */
+  /**
+   * Read by the caller before it wrote its pending connection file (the busy mark goes after that file). Review round 1
+   * of PR #104 (A-L2): this is the window's own reading; when the worker sends the finish (11E4b), the extension reads
+   * the liveness itself under its request and never takes it from the worker.
+   */
   liveness: MarkLiveness;
 }
 
