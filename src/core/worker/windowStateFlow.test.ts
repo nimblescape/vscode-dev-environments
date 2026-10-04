@@ -5,7 +5,7 @@
 // Plan step 11C1: what an attached window reads of its dev container, as the worker reads it (windowStateFlow), and the
 // checks of its parameters and value.
 import { describe, expect, it } from 'vitest';
-import { LABEL_CONTAINER_VERSION, LABEL_ENVIRONMENT_ID, LABEL_HOST_ACCESS, CONTAINER_VERSION, HOST_ACCESS_UNRESTRICTED } from '../names';
+import { LABEL_COMPOSE_SERVICE, LABEL_CONTAINER_VERSION, LABEL_ENVIRONMENT_ID, LABEL_HOST_ACCESS, CONTAINER_VERSION, HOST_ACCESS_UNRESTRICTED } from '../names';
 import { MAX_BRANCH_LENGTH, parseWindowStateParams, parseWindowStateValue } from '../helperChannel/protocol';
 import { silentLogger } from '../ports';
 import type { DockerEngine, EngineContainer } from './dockerEngine';
@@ -21,12 +21,12 @@ function container(labels: Record<string, string>, state: 'running' | 'stopped' 
 }
 
 function engine(found: EngineContainer | undefined, branch: { exitCode: number; stdout: string } = { exitCode: 0, stdout: 'main\n' }) {
-  const execs: { container: string; command: readonly string[]; user?: string }[] = [];
+  const execs: { container: string; command: readonly string[]; user?: string; signal?: AbortSignal }[] = [];
   const port: DockerEngine = {
     ...unusedEngine(),
     container: async (reference) => (reference === NAME ? found : undefined),
     containers: async () => (found ? [found] : []),
-    exec: async (name, command, options = {}) => (execs.push({ container: name, command, user: options.user }), { ...branch, stderr: '', timedOut: false }),
+    exec: async (name, command, options = {}) => (execs.push({ container: name, command, user: options.user, signal: options.signal }), { ...branch, stderr: '', timedOut: false }),
   };
   return { docker: new EngineDocker(port, silentLogger), execs };
 }
@@ -84,5 +84,42 @@ describe('the reads of an attached window in the worker (plan step 11C1)', () =>
       expect(parseWindowStateValue(odd), JSON.stringify(odd)).toBeUndefined();
     }
     expect(parseWindowStateValue({ state: 'running', branch: 'b'.repeat(MAX_BRANCH_LENGTH) })).toBeDefined();
+    // Review round 1 of 11C1 (B-R1-3, B-R1-12): a stopped or missing container is a state; odd keys of the branch and a
+    // DEL in its name are refused.
+    expect(parseWindowStateValue({ state: 'missing' })).toEqual({ state: 'missing' });
+    expect(parseWindowStateValue({ state: 'stopped' })).toEqual({ state: 'stopped' });
+    expect(parseWindowStateParams({ ...params, branch: { folder: '/workspaces/api', extra: 1 } })).toBeUndefined();
+    expect(parseWindowStateValue({ state: 'running', branch: 'a\u007fb' })).toBeUndefined();
+  });
+});
+
+// Review round 1 of plan step 11C1 (B-R1-4, B-R1-8, B-R1-9, B-R1-10).
+describe('the reads of an attached window in the worker: review round 1 of 11C1', () => {
+  it('rejects when the engine fails: never a state that it did not read', async () => {
+    const port: DockerEngine = { ...unusedEngine(), container: async () => Promise.reject(new Error('socket closed')), containers: async () => [] };
+    await expect(windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).rejects.toThrow();
+  });
+
+  it('a container of an older version that was made while the checks were off is `version`', async () => {
+    const old = container({ [LABEL_CONTAINER_VERSION]: '0', [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED });
+    expect((await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: engine(old).docker })).outdated).toBe('version');
+  });
+
+  it('the labels of the dev container decide, never those of a service of Docker Compose', async () => {
+    const dev = container(CURRENT);
+    const service: EngineContainer = { ...container({ [LABEL_CONTAINER_VERSION]: '0', [LABEL_COMPOSE_SERVICE]: 'db' }), id: 'b'.repeat(64), name: 'devenv-acme-api-db-1' };
+    const port: DockerEngine = {
+      ...unusedEngine(),
+      container: async (reference) => [dev, service].find((each) => each.name === reference),
+      containers: async () => [service, dev],
+    };
+    expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).toEqual({ state: 'running' });
+  });
+
+  it('the signal of the read reaches the read of the branch', async () => {
+    const { docker, execs } = engine(container(CURRENT));
+    const signal = new AbortController().signal;
+    await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker, signal });
+    expect(execs[0].signal).toBe(signal);
   });
 });

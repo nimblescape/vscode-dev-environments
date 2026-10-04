@@ -15,11 +15,11 @@ import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { EnvironmentServiceDeps } from './environmentService';
 
 function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps> = {}) {
-  const sent: { op: string; params: unknown; timeoutMs?: number; signal?: AbortSignal }[] = [];
+  const sent: { op: string; params: unknown; timeoutMs?: number; signal?: AbortSignal; passive?: boolean }[] = [];
   const h = createHarness({
     ...overrides,
     flow: async (op, params, options) => {
-      sent.push({ op, params, timeoutMs: options.timeoutMs, signal: options.signal });
+      sent.push({ op, params, timeoutMs: options.timeoutMs, signal: options.signal, passive: options.passive });
       return answer(op, params);
     },
   });
@@ -152,5 +152,55 @@ describe('the reads of an attached window through the worker, from the extension
     answer = async () => ({ state: 'paused' });
     expect(await h.service.windowStateInWorker(env, 'devenv-x')).toBeUndefined();
     expect(h.logger.infos.some((line) => line.includes('The state of the container devenv-x could not be read'))).toBe(true);
+  });
+
+  // Review round 1 of 11C1 (A-R1-1): a read in the background makes the worker ready passively and within its time limit;
+  // a read of a command of the user does not.
+  it('a read in the background is passive and bounded by its time limit; a read of a command of the user is not', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    await h.service.windowStateInWorker(env, 'devenv-x', { background: true });
+    await h.service.windowStateInWorker(env, 'devenv-x');
+    expect(sent[0]).toMatchObject({ passive: true, timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS });
+    expect(sent[0].signal).toBeInstanceOf(AbortSignal);
+    expect(sent[1].passive).toBeUndefined();
+    expect(sent[1].signal).toBeUndefined();
+  });
+
+  // Review round 1 of 11C1 (missing test): an environment of another Docker host is unknown, and no flow is sent.
+  it('an environment of another Docker host than the current one is unknown, and nothing is sent', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running' }), { dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
+    await seedEnvironment(h, { container: 'running' });
+    const env = await h.registry.updateEnvironment(ENV_ID, (entry) => {
+      entry.dockerHost = 'other-box';
+    });
+    expect(await h.service.windowStateInWorker(env ?? (await h.registry.get(ENV_ID))!, 'devenv-x', { background: true })).toBeUndefined();
+    expect(sent).toEqual([]);
+  });
+});
+
+// Review round 1 of plan step 11C1 (B-R1-5, B-R1-6, B-R1-11): the parameters of the window reads.
+describe('the reads of an attached window through the worker: review round 1 of 11C1', () => {
+  it('sends the host access checks of the repository when they are off', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    h.settings = { ...h.settings, hostAccessChecksOff: [REPO] };
+    await h.service.windowStateInWorker(env, 'devenv-x');
+    expect((sent[0].params as { checks: string }).checks).toBe('off');
+  });
+
+  it('parameters that the worker would refuse are unknown, and nothing is sent', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    expect(await h.service.windowStateInWorker(env, '-x')).toBeUndefined();
+    expect(sent).toEqual([]);
+    expect(h.logger.infos.some((line) => line.includes('The state of the container -x could not be read'))).toBe(true);
+  });
+
+  it('an empty remote user is not sent: the branch is read as the default user', async () => {
+    const { h, sent } = harness(async () => ({ state: 'missing' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    expect(await h.service.windowStateInWorker({ ...env, remoteUser: '' }, 'devenv-x', { branch: true })).toEqual({ state: 'missing' });
+    expect((sent[0].params as { branch: unknown }).branch).toEqual({ folder: '/workspaces/api' });
   });
 });

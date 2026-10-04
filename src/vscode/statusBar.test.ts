@@ -39,6 +39,18 @@ describe('EnvironmentStatusBar (concept 6.3)', () => {
     expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api');
   });
 
+  // Plan step 11C1, review round 1 (A-R1-3): the decision of 2026-10-04 (unknown): the tooltip says it, the state stays.
+  it('says in the tooltip of the connected environment that the state of its container could not be read', () => {
+    const { bar, item } = create();
+    bar.showConnected('acme-university/api', 'main');
+    bar.showStateUnknown(true);
+    expect(item.text).toBe('$(devenv-monitor-connected) acme-university/api · main');
+    expect(item.tooltip).toContain('could not be read');
+    expect(item.command).toBe('devEnvironments.switchEnvironment');
+    bar.showStateUnknown(false);
+    expect(item.tooltip).toBe('Connected to acme-university/api. Select to switch the environment.');
+  });
+
   it('shows Updating over the current state until the operation ends; a click shows the details', () => {
     const { bar, item } = create();
     bar.showConnected('acme-university/api', 'main');

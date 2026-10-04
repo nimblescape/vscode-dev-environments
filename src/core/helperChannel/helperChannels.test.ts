@@ -843,6 +843,37 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     noWait.dispose();
   });
 
+  // Plan step 11C1, review round 1 (A-R1-1): a passive flow (a read of a window in the background) is made ready as the
+  // refresh: the helper image only checked, never built, and the wait after a failed open kept; `passive` is not sent on.
+  it('a passive flow checks the helper image, never builds it, and keeps the wait after a failed open', async () => {
+    const channel = fakeChannel();
+    let fail = true;
+    const open = vi.fn(async (): Promise<HelperChannel> => {
+      if (fail) throw new HelperChannelError('open', 'The worker on build-box could not be started.');
+      return channel as unknown as HelperChannel;
+    });
+    const prepare = vi.fn(async () => {});
+    const checkPresent = vi.fn(async () => {});
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger });
+    for (let i = 0; i < 3; i++) {
+      await expect(channels.flow(REMOTE, 'windowState', {}, { passive: true, timeoutMs: 30_000 })).rejects.toMatchObject({
+        code: 'unavailable',
+        message: 'The worker on build-box could not be started.',
+      });
+    }
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(checkPresent).toHaveBeenCalledTimes(3);
+    // A flow of a command of the user prepares the helper image and opens it in full, also within the wait.
+    fail = false;
+    expect(await channels.flow(REMOTE, 'windowState', {}, { timeoutMs: 30_000 })).toEqual({ outcome: 'notRunning' });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledTimes(2);
+    await channels.flow(REMOTE, 'windowState', {}, { passive: true, timeoutMs: 30_000 });
+    expect(channel.flow.mock.calls.map((call) => call[2])).toEqual([{ timeoutMs: 30_000 }, { timeoutMs: 30_000 }]);
+    channels.dispose();
+  });
+
   it('rejects when the worker failed or answered with an invalid value', async () => {
     const lost = refreshChannel(['refresh'], async () => {
       throw new HelperChannelError('lost', 'lost');

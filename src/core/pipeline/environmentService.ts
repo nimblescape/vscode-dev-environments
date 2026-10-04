@@ -486,8 +486,10 @@ export interface EnvironmentServiceDeps {
    * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the Docker target of
    * the operation (Stop first); the worker takes the lock of the environment itself. Rejects with a HelperChannelError
    * when there is no worker, and with a HelperOperationError (`busy` for a lock held elsewhere) when the flow fails.
+   * Plan step 11C1, review round 1 (A-R1-1): `passive`, a read in the background: the worker is made ready as for the
+   * refresh (the helper image only checked, the wait after a failed open kept).
    */
-  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean }) => Promise<unknown>;
 }
 
 export interface RepositoryTarget {
@@ -6089,8 +6091,8 @@ export class EnvironmentService {
 
   /**
    * Plan step 5, PR C: the states of inspectStates and the branches of the running dev containers of `branchIds` (the
-   * sidebar: the environments of the account), in one worker operation (`refresh`); outside of an operation directly
-   * (readEnvironmentStates). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
+   * sidebar: the environments of the account), in one worker operation (`refresh`; plan step 11C1: also outside of an
+   * operation, never directly). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
    * never read directly: the refresh fails (logged, with the cause). `runtime` is `undefined` when Docker does not run or
    * the states could not be read; then there are no branches.
    */
@@ -6125,9 +6127,15 @@ export class EnvironmentService {
    * `containerName` of `environment`, by the worker of the Docker host of the operation (`windowState`): its state,
    * whether it may be used as it is, and with `branch` the branch of its repository. `undefined` when it could not be read
    * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
-   * Never throws.
+   * Never throws. Review round 1 of 11C1 (A-R1-1): with `background` (the check of the connection, the branch of the
+   * window), the worker is made ready passively (as for the refresh: never a build of the helper image, the wait after a
+   * failed open kept), and within WINDOW_STATE_FLOW_TIMEOUT_MS; a read of a command of the user makes it ready in full.
    */
-  async windowStateInWorker(environment: Environment, containerName: string, options: { branch?: boolean } = {}): Promise<WindowStateValue | undefined> {
+  async windowStateInWorker(
+    environment: Environment,
+    containerName: string,
+    options: { branch?: boolean; background?: boolean } = {},
+  ): Promise<WindowStateValue | undefined> {
     try {
       // Unit 7: an environment of another Docker host is not read through the worker of this one.
       if (!(await this.isOnCurrentHost(environment))) return undefined;
@@ -6140,7 +6148,13 @@ export class EnvironmentService {
           : {}),
       });
       if (params === undefined) throw new Error('its parameters are beyond the checks of the worker');
-      const value = parseWindowStateValue(await this.deps.flow(OP_WINDOW_STATE, params, { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS }));
+      const value = parseWindowStateValue(
+        await this.deps.flow(
+          OP_WINDOW_STATE,
+          params,
+          options.background ? { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) } : { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS },
+        ),
+      );
       if (value === undefined) throw new Error('the worker answered with an invalid value');
       return value;
     } catch (error) {

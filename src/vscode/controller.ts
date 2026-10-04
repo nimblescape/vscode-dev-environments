@@ -16,7 +16,7 @@ import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
-import { OP_TOKEN_REMOVE, parseTokenRemoveValue } from '../core/helperChannel/protocol';
+import { OP_TOKEN_REMOVE, parseTokenRemoveValue, type WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
@@ -216,6 +216,8 @@ interface WindowEnvironment {
   lost: boolean;
   /** Branch read from the container. */
   branch?: string;
+  /** Plan step 11C1, review round 1 (A-R1-3): the last check of the connection could not read the state (unknown). */
+  unknown?: boolean;
 }
 
 /**
@@ -1140,11 +1142,13 @@ export class Controller implements vscode.Disposable {
       if (this.isConnectedHere(environment)) {
         // "Already connected → nothing" only while the container runs; otherwise this is Reconnect (concept 6.3, 7.12).
         const containerName = this.current?.containerName ?? environment.containerName;
-        if ((await this.containerRuns(environment, containerName)) === true) {
+        // Review round 1 of 11C1 (A-R1-2): one read of the worker gives whether it runs and whether it is outdated.
+        const value = await this.windowState(environment, containerName);
+        if (value?.state === 'running') {
           // Concept section 9: a container of an older version lacks the current setup. The pipeline must not
           // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
           // The same for a container made while the host access checks were off, when they are on now.
-          const outdated = await this.containerOutdated(environment);
+          const outdated = value.outdated;
           if (outdated) {
             this.logger.info(this.outdatedTexts(outdated, repository).log);
             await this.leaveEnvironment(this.outdatedTexts(outdated, repository).message, {
@@ -1999,8 +2003,15 @@ export class Controller implements vscode.Disposable {
     if (this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
     this.checkingConnection = true;
     try {
-      const runs = await this.containerRuns(current.environment, current.containerName);
-      // Decision of 2026-10-04: a state that could not be read (the worker could not be reached) changes nothing.
+      const runs = await this.containerRuns(current.environment, current.containerName, true);
+      // Review round 1 of 11C1 (A-R1-4): the window or its operation may have changed while the worker read.
+      if (this.current !== current || this.disposed || this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
+      // Decision of 2026-10-04: a state that could not be read (the worker could not be reached) changes nothing but the
+      // tooltip (review round 1 of 11C1, A-R1-3).
+      if ((runs === undefined) !== (current.unknown === true)) {
+        current.unknown = runs === undefined;
+        this.updateStatusBar();
+      }
       if (runs === undefined) return;
       const lost = !runs;
       if (lost === current.lost) return;
@@ -2018,7 +2029,8 @@ export class Controller implements vscode.Disposable {
     if (!current) return;
     await this.checkConnection();
     // Plan step 11C1: read by the worker.
-    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true }))?.branch;
+    // Review round 1 of 11C1 (A-R1-1): a read in the background, which never builds the helper image.
+    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true, background: true }))?.branch;
     if (branch && this.current === current) {
       current.branch = branch;
       this.updateStatusBar();
@@ -2026,9 +2038,9 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The state of the container as the Docker of the window reports it, or why it could not be read. Plan step 11C1: it
-   * stays direct, as the check of the attach (readyForWindow; section 0 of the plan: the attach diagnostics check what the
-   * local Docker CLI sees).
+   * The state of the container as the Docker port of the window reports it, or why it could not be read: the check of the
+   * attach (readyForWindow). Plan step 11C1 (review round 1, A-R1-5): it is not a window read of 11C1; within an operation
+   * the Docker port sends it through the worker (its generic `docker` operation).
    */
   private async containerStateText(containerName: string): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
@@ -2044,10 +2056,19 @@ export class Controller implements vscode.Disposable {
    * 2026-10-04: unknown). A Start or Reconnect of the user takes unknown as "not running" and tries; its failure leaves
    * the window disconnected.
    */
-  private async containerRuns(environment: Environment, containerName: string): Promise<boolean | undefined> {
+  private async containerRuns(environment: Environment, containerName: string, background = false): Promise<boolean | undefined> {
     if (!this.deps.docker.isInstalled()) return false;
-    const value = await this.deps.service.windowStateInWorker(environment, containerName);
+    const value = await this.deps.service.windowStateInWorker(environment, containerName, background ? { background: true } : {});
     return value === undefined ? undefined : value.state === 'running';
+  }
+
+  /**
+   * Review round 1 of 11C1 (A-R1-2): the state of the container and whether it is outdated, in one read of the worker
+   * (made ready in full: a command of the user). `undefined` when it could not be read, or Docker is not installed.
+   */
+  private async windowState(environment: Environment, containerName: string): Promise<WindowStateValue | undefined> {
+    if (!this.deps.docker.isInstalled()) return undefined;
+    return this.deps.service.windowStateInWorker(environment, containerName);
   }
 
   private updateStatusBar(): void {
@@ -2055,10 +2076,12 @@ export class Controller implements vscode.Disposable {
     const { statusBar } = this.deps;
     this.updateConnectedContext(current !== undefined);
     if (!current) {
+      statusBar.showStateUnknown(false);
       statusBar.showNotConnected();
       return;
     }
     const repository = this.displayName({ repository: current.environment.repository });
+    statusBar.showStateUnknown(current.unknown === true);
     if (current.lost) statusBar.showConnectionLost(repository, current.environment.id);
     else statusBar.showConnected(repository, current.branch ?? current.environment.gitSummary?.branch ?? undefined);
   }

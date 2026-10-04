@@ -411,16 +411,19 @@ export class HelperChannels {
 
   /**
    * Plan step 11B1: a flow in the worker of `target` (HelperChannel.flow). Made ready and sent once more after `closed`
-   * as docker(); never the way without the worker.
+   * as docker(); never the way without the worker. Plan step 11C1, review round 1 (A-R1-1): with `passive` (a read in the
+   * background, as the refresh), the worker is made ready as for the refresh: the helper image is only checked, never
+   * built, and the wait after a failed open is kept (ready).
    */
-  async flow(target: DockerTarget, op: string, params: unknown, options: Parameters<HelperChannel['flow']>[2] = {}): Promise<unknown> {
-    return this.withChannel(target, options.signal, (channel) => channel.flow(op, params, options));
+  async flow(target: DockerTarget, op: string, params: unknown, options: Parameters<HelperChannel['flow']>[2] & { passive?: boolean } = {}): Promise<unknown> {
+    const { passive, ...flowOptions } = options;
+    return this.withChannel(target, options.signal, (channel) => channel.flow(op, params, flowOptions), passive === true);
   }
 
   /** Plan step 10A: `call` with the channel of `target` (ready), once more through a new channel when it was `closed`. */
-  private async withChannel<T>(target: DockerTarget, signal: AbortSignal | undefined, call: (channel: HelperChannel) => Promise<T>): Promise<T> {
+  private async withChannel<T>(target: DockerTarget, signal: AbortSignal | undefined, call: (channel: HelperChannel) => Promise<T>, passive = false): Promise<T> {
     for (let attempt = 0; ; attempt++) {
-      const channel = await this.ready(target, signal);
+      const channel = await this.ready(target, signal, passive);
       try {
         return await call(channel);
       } catch (error) {

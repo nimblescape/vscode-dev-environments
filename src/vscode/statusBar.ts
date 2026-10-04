@@ -21,6 +21,9 @@ export const StatusBarTexts = {
   updating: (repository: string) => `Updating ${repository}…`,
   reconnect: (repository: string) => `Reconnect ${repository}`,
   connectedTooltip: (repository: string) => `Connected to ${repository}. Select to switch the environment.`,
+  // Plan step 11C1, review round 1 (A-R1-3; decision of 2026-10-04: the window shows that the state could not be read).
+  stateUnknownTooltip: (repository: string) =>
+    `Connected to ${repository}. The state of its container could not be read; details are in the log. Select to switch the environment.`,
   notConnectedTooltip: 'Select to open an environment in this window.',
   connectionLostTooltip: (repository: string) => `The connection to ${repository} was lost. Select to reconnect.`,
 } as const;
@@ -38,6 +41,7 @@ export class EnvironmentStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
   private base: BaseState = { kind: 'notConnected' };
   private busyRepository: string | undefined;
+  private stateUnknown = false;
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(STATUS_BAR_ITEM_ID, vscode.StatusBarAlignment.Left, PRIORITY);
@@ -49,6 +53,16 @@ export class EnvironmentStatusBar implements vscode.Disposable {
   /** `$(devenv-monitor-connected) owner/name · branch`; select → switcher. */
   showConnected(repository: string, branch: string | undefined): void {
     this.base = { kind: 'connected', repository, branch: branch?.trim() || undefined };
+    this.render();
+  }
+
+  /**
+   * Plan step 11C1, review round 1 (A-R1-3): whether the state of the container of the connected environment could not be
+   * read (decision of 2026-10-04: "unknown"); its tooltip says so. The state shown stays as it is.
+   */
+  showStateUnknown(unknown: boolean): void {
+    if (this.stateUnknown === unknown) return;
+    this.stateUnknown = unknown;
     this.render();
   }
 
@@ -97,7 +111,7 @@ export class EnvironmentStatusBar implements vscode.Disposable {
         item.text = state.branch
           ? `$(${MonitorIcons.connected}) ${state.repository} · ${state.branch}`
           : `$(${MonitorIcons.connected}) ${state.repository}`;
-        item.tooltip = StatusBarTexts.connectedTooltip(state.repository);
+        item.tooltip = this.stateUnknown ? StatusBarTexts.stateUnknownTooltip(state.repository) : StatusBarTexts.connectedTooltip(state.repository);
         item.command = SWITCH_ENVIRONMENT_COMMAND;
         return;
       case 'notConnected':

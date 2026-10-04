@@ -101,7 +101,7 @@ export const sweepOperation: OperationHandler = async (params, context) => {
  * over the port of its engine (EngineDocker; section 0 of the plan), no Docker CLI of its own. It only reads; it takes no
  * secret.
  */
-function refreshOperation(engineOf: EngineOfOperation): OperationHandler {
+export function refreshOperation(engineOf: EngineOfOperation): OperationHandler {
   return async (params, context) => {
     const checked = parseRefreshParams(params);
     if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');

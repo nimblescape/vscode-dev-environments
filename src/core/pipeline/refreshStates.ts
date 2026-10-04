@@ -3,8 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 5, PR C: the states of the environments and the branches of their running dev containers, read in one go.
-// The same code runs directly (EnvironmentService.refreshStates) and in the worker (the operation `refresh`,
-// src/helperChannel/operations.ts), so both give the same result. It only reads. Pure: no `vscode`, and nothing of the
+// It runs in the worker (the operation `refresh`, src/helperChannel/operations.ts; plan step 11C1: only there, never
+// directly in the extension). It only reads. Pure: no `vscode`, and nothing of the
 // service, so that the script of the worker stays small.
 import { Semaphore } from '../concurrency';
 import { isDevContainer, type ContainerAdapter } from '../docker/containerAdapter';

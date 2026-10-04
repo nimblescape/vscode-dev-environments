@@ -186,7 +186,7 @@ interface Harness {
     listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
-    windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean }) => Promise<WindowStateValue | undefined>>>;
+    windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; background?: boolean }) => Promise<WindowStateValue | undefined>>>;
     reconcileFromVolumes: ReturnType<typeof vi.fn<() => Promise<number>>>;
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
@@ -224,7 +224,7 @@ interface Harness {
     onSessionChanged: ReturnType<typeof vi.fn>;
     refreshDiscovery: ReturnType<typeof vi.fn>;
   };
-  statusBar: Record<'showConnected' | 'showNotConnected' | 'showBusy' | 'clearBusy' | 'showConnectionLost', ReturnType<typeof vi.fn>>;
+  statusBar: Record<'showConnected' | 'showNotConnected' | 'showBusy' | 'clearBusy' | 'showConnectionLost' | 'showStateUnknown', ReturnType<typeof vi.fn>>;
   logger: Record<'info' | 'warn' | 'error' | 'output' | 'show', ReturnType<typeof vi.fn>>;
   progressTitles: string[];
   alive: Set<number>;
@@ -284,7 +284,7 @@ function createHarness(
     currentBranch: vi.fn(async () => undefined),
     // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
     // that fails is unknown (undefined, decision of 2026-10-04).
-    windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean } = {}) => {
+    windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean; background?: boolean } = {}) => {
       try {
         const state = (await docker.containerState(containerName)) as WindowStateValue['state'];
         const value: WindowStateValue = { state };
@@ -364,6 +364,7 @@ function createHarness(
     showBusy: vi.fn(),
     clearBusy: vi.fn(),
     showConnectionLost: vi.fn(),
+    showStateUnknown: vi.fn(),
   };
   const settings = { ...SETTINGS };
   const flow = vi.fn(async (op: string, _params: unknown): Promise<unknown> => (op === OP_TOKEN_REMOVE ? { outcome: 'removed', container: 'c0ffeec0ffee' } : {}));
@@ -1937,6 +1938,21 @@ describe('Window roles', () => {
     });
   }
 
+  // Review round 1 of 11C1 (A-R1-2, missing test): the decision of 2026-10-04 (unknown: the window never leaves its
+  // container because the worker could not read it): an outdated state that could not be read leaves nothing.
+  it('role A: keeps the window attached with Reconnect when the failed pipeline is followed by a read that is unknown', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    h.docker.findContainer.mockResolvedValue(containerInfo('0'));
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
+    await pause(20);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    expect(warningMessages()).not.toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+  });
+
   it('Start: leaves a running container of an older version instead of saying that the window is connected', async () => {
     const env = environment();
     await h.registry.add(env);
@@ -2232,13 +2248,82 @@ describe('Connection of this window', () => {
     await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read of the state');
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
-    expect(h.statusBar.showConnected.mock.calls.length).toBe(connectedCalls);
+    // Review round 1 of 11C1 (A-R1-3): changed expectation (before: the status bar was not touched): it shows the same
+    // connected state again, with the tooltip that the state could not be read.
+    expect(h.statusBar.showConnected.mock.calls.slice(connectedCalls)).toEqual([h.statusBar.showConnected.mock.calls[connectedCalls - 1]]);
+    expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(true);
+    // Review round 1 of 11C1 (A-R1-1): the check in the background reads passively (never a build of the helper image).
+    expect(h.service.windowStateInWorker.mock.calls.slice(reads).map((call) => call[2])).toEqual([{ background: true }]);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     // The Start of the user takes the unknown state as "not running": it reconnects through the pipeline.
     h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', 'The worker could not be reached.'));
     await run('start', { environmentId: ENV_ID });
     expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
+  });
+
+  // Review round 1 of 11C1 (A-R1-3, missing test): a read that succeeds again removes the hint; a Reconnect of the user
+  // from the unknown state that succeeds leaves the window connected.
+  it('removes the hint of an unknown state when the state can be read again, and a Reconnect from it that succeeds connects', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showStateUnknown.mock.calls.some((call) => call[0] === true), 'the hint');
+    // The Start of the user reads unknown once more and reconnects through the pipeline, which succeeds.
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.docker.containerState.mockResolvedValue('running');
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.windowStateInWorker.mock.calls.length).toBeGreaterThan(reads);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    h.controller.onHeartbeat();
+    await settle(() => h.statusBar.showStateUnknown.mock.lastCall?.[0] === false, 'the hint removed');
+    expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+    expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', expect.anything());
+  });
+
+  // Review round 1 of 11C1 (B-R1-7): the window reads its own container (from its folder URI), not the one of the record.
+  it('reads the container of its folder, also when the record names another one', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const reads = h.service.currentBranch.mock.calls.length;
+    await h.controller.openAttachedWindow(env, 'devenv-old', { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) });
+    await settle(() => h.service.currentBranch.mock.calls.length > reads, 'the branch of the window');
+    const before = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > before, 'the read of the state');
+    expect(h.service.windowStateInWorker.mock.calls.slice(before).map((call) => call[1])).toEqual(['devenv-old']);
+    h.docker.containerState.mockResolvedValue('running');
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.windowStateInWorker.mock.lastCall?.[1]).toBe('devenv-old');
+    expect(env.containerName).not.toBe('devenv-old');
+  });
+
+  // Review round 1 of 11C1 (A-R1-4): a read that ends after an operation of the environment started changes nothing.
+  it('ignores a read of the state that ends after an operation of its environment started', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const read = deferred<WindowStateValue | undefined>();
+    h.service.windowStateInWorker.mockImplementationOnce(() => read.promise);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read in the background');
+    // A Start of the user meanwhile: the container does not run, the pipeline reconnects and is still running.
+    const pipeline = deferred<Awaited<ReturnType<typeof h.service.openEnvironment>>>();
+    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.docker.containerState.mockResolvedValue('stopped');
+    const starting = run('start', { environmentId: ENV_ID });
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    read.resolve({ state: 'stopped' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+    expect(h.logger.info.mock.calls.some(([line]) => String(line) === 'The container of acme/api does not run.')).toBe(false);
+    pipeline.reject(new UserFacingError('cancelled', PipelineTexts.cancelled));
+    await starting;
   });
 
   it('closes its connection for the request of another window, and leaves the operation to its empty window', async () => {
