@@ -5972,7 +5972,7 @@ export class EnvironmentService {
    * container as its user (gitSummaryInContainer, as `remoteUser`), on the Docker engine of the caller's operation. Nothing
    * is done when the environment is not in the registry or not on that engine, or its container does not run. Never
    * starts Docker, takes no lock, and never throws (a failure is logged; the recorded state stays). True when a new state
-   * was recorded.
+   * was recorded. Plan step 11D1: runs in the worker (the operation `recordGitState`).
    */
   async recordGitState(environmentId: string, signal?: AbortSignal): Promise<boolean> {
     try {
@@ -5984,9 +5984,8 @@ export class EnvironmentService {
       if (!container || container.state !== 'running' || signal?.aborted) return false;
       const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
       if (!summary || signal?.aborted) return false;
-      await this.deps.registry.updateEnvironment(env.id, (entry) => {
-        entry.gitSummary = summary;
-      });
+      // Plan step 11D1: in the worker, through `record recordGitSummary` (the operation `recordGitState`).
+      await this.recordGitSummary(env.id, summary);
       return true;
     } catch (error) {
       this.logger.info(`The Git state could not be recorded: ${errorMessage(error)}`);

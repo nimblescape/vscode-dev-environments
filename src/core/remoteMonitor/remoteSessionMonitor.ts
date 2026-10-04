@@ -646,49 +646,6 @@ export class RemoteSessionMonitor {
   }
 
   /**
-   * One heartbeat (`monitor.js heartbeat <json>` under the lock of the records, heartbeatCommand). Review round 1 of PR
-   * #85 (A-R1-2): `signal` ends the `docker exec` (the deadline of the window's attempt); the result is then a failure.
-   */
-  async heartbeat(input: HeartbeatInput, signal?: AbortSignal): Promise<MonitorExecResult> {
-    return this.exec(heartbeatCommand(input), signal);
-  }
-
-  /** The records of an environment (`monitor.js records <id>`); undefined when they cannot be read. */
-  async records(environmentId: string): Promise<RecordsOutput | undefined> {
-    const result = await this.exec(recordsCommand(environmentId));
-    return result.ok ? parseRecordsOutput(result.stdout) : undefined;
-  }
-
-  /**
-   * User request 2026-09-28 ("all images"): stores the repositories that the extension read from the registry, for the
-   * image maintenance of the monitor (`monitor.js images -`, the list on stdin). Best effort: a failure is logged.
-   */
-  async images(repositories: readonly string[]): Promise<boolean> {
-    return this.execWithInput(imagesCommand(), JSON.stringify({ repositories }), 'The image list');
-  }
-
-  /**
-   * Review round 1 of PR #57 (C): stores the settings of the image maintenance of this computer in the monitor (`monitor.js
-   * settings -`, on stdin); it uses them from its next check on. Best effort: a failure is logged. Review round 1 (D):
-   * resolves with false on a failure, so the caller tries again at the next open.
-   */
-  async imageSettings(settings: ImageMaintenanceSettings): Promise<boolean> {
-    const input: ImageSettings = { prefixes: [...settings.prefixes], schedule: settings.schedule, timeZone: settings.timeZone };
-    return this.execWithInput(imageSettingsCommand(), JSON.stringify(input), 'The image settings');
-  }
-
-  private async execWithInput(command: readonly string[], input: string, what: string): Promise<boolean> {
-    try {
-      const result = await this.options.docker.run(['exec', '-i', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, input });
-      if (result.exitCode === 0 && !result.timedOut) return true;
-      this.options.logger.warn(`${what} could not be given to the Session Monitor: ${result.timedOut ? 'no answer in time' : result.stderr.trim() || `exit code ${result.exitCode}`}`);
-    } catch (error) {
-      this.options.logger.warn(`${what} could not be given to the Session Monitor: ${errorMessage(error)}`);
-    }
-    return false;
-  }
-
-  /**
    * The arguments of `docker run` for the monitor container. `helperImage`: the helper tag, or an image ID (S1). Plan
    * step 3 (pipe loading): attached with an open input (`-i`, no `-d`) and without passing signals on
    * (`--sig-proxy=false`), so ending the client leaves the container running; the command is the pipe loader with the
@@ -733,19 +690,6 @@ export class RemoteSessionMonitor {
     }
     args.push(helperImage, ...loaderCommand({ path: REMOTE_MONITOR_SCRIPT_PATH, hash: bundleHash(script), entry: REMOTE_MONITOR_ENTRY }));
     return args;
-  }
-
-  private async exec(command: readonly string[], signal?: AbortSignal): Promise<MonitorExecResult> {
-    try {
-      const result = await this.options.docker.run(['exec', this.containerName, ...command], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, ...(signal ? { signal } : {}) });
-      if (result.exitCode === 0 && !result.timedOut) return { ok: true, stdout: result.stdout };
-      const detail = result.timedOut
-        ? `docker exec did not end within ${REMOTE_MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`
-        : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '', isUnderRecordsLock(command));
-      return { ok: false, missing: isMissingContainer(result), detail };
-    } catch (error) {
-      return { ok: false, missing: false, detail: errorMessage(error) };
-    }
   }
 
   private async inspect(signal: AbortSignal | undefined): Promise<Inspected> {

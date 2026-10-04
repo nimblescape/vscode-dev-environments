@@ -29,7 +29,7 @@ import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
-import { isSourceId } from '../remoteMonitor/protocol';
+import { isSourceId, parseHeartbeatInput, parseImageListInput, parseImageSettingsInput, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
@@ -1343,4 +1343,103 @@ export function parseReconcileValue(value: unknown): ReconcileValue | undefined 
   if (!isRecord(value) || !hasOnlyKeys(value, ['added'])) return undefined;
   const { added } = value;
   return typeof added === 'number' && Number.isSafeInteger(added) && added >= 0 && added <= MAX_RESTORE_ENTRIES ? { added } : undefined;
+}
+
+/**
+ * Plan step 11D1 (decisions of 2026-10-03, "every remote action is a worker operation"): `heartbeat`, one heartbeat of
+ * this computer to the Session Monitor container of the worker's engine (`monitor.js heartbeat` under the lock of the
+ * records, heartbeatCommand), over the Engine API. The window decides what it sends (its environments, their keep
+ * flags, the limit); the worker sends it. No request to the extension, no secret. Parameters HeartbeatParams; value
+ * HeartbeatValue.
+ */
+export const OP_HEARTBEAT = 'heartbeat';
+
+export interface HeartbeatParams {
+  heartbeat: HeartbeatInput;
+}
+
+/** `missing`: the monitor container does not exist or does not run (the window starts it again). */
+export type HeartbeatValue = { ok: true } | { ok: false; missing: boolean; detail: string };
+
+/** The longest detail of a failed heartbeat or monitor command. */
+export const MAX_MONITOR_DETAIL_LENGTH = 2000;
+
+/** The strict check of HeartbeatParams (both sides): the heartbeat as the monitor takes it (parseHeartbeatInput). */
+export function parseHeartbeatParams(value: unknown): HeartbeatParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['heartbeat'])) return undefined;
+  const heartbeat = parseHeartbeatInput(JSON.stringify(value.heartbeat) ?? '');
+  return heartbeat === undefined ? undefined : { heartbeat };
+}
+
+/** The check of HeartbeatValue (the extension). */
+export function parseHeartbeatValue(value: unknown): HeartbeatValue | undefined {
+  if (!isRecord(value)) return undefined;
+  if (hasOnlyKeys(value, ['ok']) && value.ok === true) return { ok: true };
+  if (!hasOnlyKeys(value, ['ok', 'missing', 'detail']) || value.ok !== false || typeof value.missing !== 'boolean') return undefined;
+  if (typeof value.detail !== 'string' || value.detail.length > MAX_MONITOR_DETAIL_LENGTH) return undefined;
+  return { ok: false, missing: value.missing, detail: value.detail };
+}
+
+/**
+ * Plan step 11D1: `monitorSettings`, what the Session Monitor of the worker's engine needs for its image maintenance: the
+ * settings of this computer (`monitor.js settings -`) or the image repositories that the extension read from GitHub
+ * (`monitor.js images -`), on the input of the command. Best effort; no request, no secret. Parameters
+ * MonitorSettingsParams; value MonitorSettingsValue.
+ */
+export const OP_MONITOR_SETTINGS = 'monitorSettings';
+
+export type MonitorSettingsParams = { settings: ImageSettings } | { repositories: string[] };
+
+/** `sent`: the monitor took them (else the extension sends them again at the next open). */
+export interface MonitorSettingsValue {
+  sent: boolean;
+}
+
+/** The strict check of MonitorSettingsParams (both sides): as the monitor reads its input. */
+export function parseMonitorSettingsParams(value: unknown): MonitorSettingsParams | undefined {
+  if (!isRecord(value)) return undefined;
+  if (hasOnlyKeys(value, ['settings'])) {
+    const settings = parseImageSettingsInput(JSON.stringify(value.settings) ?? '');
+    return settings === undefined ? undefined : { settings };
+  }
+  if (hasOnlyKeys(value, ['repositories'])) {
+    const repositories = parseImageListInput(JSON.stringify({ repositories: value.repositories }));
+    return repositories === undefined ? undefined : { repositories };
+  }
+  return undefined;
+}
+
+/** The check of MonitorSettingsValue (the extension). */
+export function parseMonitorSettingsValue(value: unknown): MonitorSettingsValue | undefined {
+  return isRecord(value) && hasOnlyKeys(value, ['sent']) && typeof value.sent === 'boolean' ? { sent: value.sent } : undefined;
+}
+
+/**
+ * Plan step 11D1 (user decisions Q2 of 2026-10-02 and of 2026-10-04): `recordGitState`, the Git state of the running dev
+ * container of an environment that a window releases (EnvironmentService.recordGitState), read by the worker and
+ * recorded through `record recordGitSummary`. Parameters RecordGitStateParams; value RecordGitStateValue.
+ */
+export const OP_RECORD_GIT_STATE = 'recordGitState';
+
+export interface RecordGitStateParams {
+  environmentId: string;
+  /** The Docker host of the operation ('' for the local Docker). */
+  dockerHost: string;
+  /** The window that sends the operation. */
+  owner: { windowId: string; pid: number };
+}
+
+/** `recorded`: the Git state was read and recorded. */
+export interface RecordGitStateValue {
+  recorded: boolean;
+}
+
+/** The strict check of RecordGitStateParams (both sides). */
+export function parseRecordGitStateParams(value: unknown): RecordGitStateParams | undefined {
+  return parseListConfigurationsParams(value);
+}
+
+/** The check of RecordGitStateValue (the extension). */
+export function parseRecordGitStateValue(value: unknown): RecordGitStateValue | undefined {
+  return isRecord(value) && hasOnlyKeys(value, ['recorded']) && typeof value.recorded === 'boolean' ? { recorded: value.recorded } : undefined;
 }

@@ -14,11 +14,12 @@
 // `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
 // replaces the container (review round 1 of PR #69, A-R1-1: with the restart policy kept); a monitor whose first load
 // was cut off is replaced too. Plan step 8, PR A: a heartbeat of the window (WindowHeartbeats, also sendFor of Close and
-// Keep Running) and Delete's forget through a real worker on the local engine, as extension.ts routes them. Plan step 8,
+// Keep Running); plan step 11D1: with the image settings, the image list and Delete's forget, as the worker sends them
+// over the Engine API (monitorFlow), to the monitor of this run. Plan step 8,
 // PR B: the restart policy `on-failure` (Q5); an automatic stop waits for the environment lock that a worker holds, and
 // a monitor killed during its stop under the lock leaves no lock held (D2); the monitor exits with 0 when idle and stays
 // exited until ensure starts it (Q5). Plan step 8, PR C (Q1, Q2): a window that closes records the Git state and sends
-// its short release through its worker, whose input then ends; the monitor stops the environment after the short limit,
+// its short release; the monitor stops the environment after the short limit,
 // and keeps one whose window reloaded within the waiting time.
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
@@ -26,20 +27,24 @@ import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets, runWithDockerTarget } from '../../src/core/docker/dockerTargets';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
-import type { ProcessRunner, RunOptions, RunResult, StartOptions, StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { LOADER_EXIT_CODE, PIPE_LOADER, bundleHash } from '../../src/core/loader/pipeLoader';
 import {
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
-  forgetCommand,
   heartbeatFileName,
+  parseRecordsOutput,
+  recordsCommand,
   remoteMonitorLabelValue,
+  type RecordsOutput,
 } from '../../src/core/remoteMonitor/protocol';
+import { forgetRecord, sendHeartbeat, sendMonitorSettings } from '../../src/core/worker/monitorFlow';
+import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
+import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
 import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
 import { SWITCH_RELEASE_BOUNDS, releaseEnvironment, releaseLimitSeconds } from '../../src/core/session/windowRelease';
@@ -74,19 +79,6 @@ async function bundleScript(): Promise<string> {
     logLevel: 'silent',
   });
   return result.outputFiles[0].text;
-}
-
-/** Plan step 8, PR A: records the Docker calls that run directly (not through the worker). */
-class SpyRunner implements ProcessRunner {
-  readonly calls: string[][] = [];
-  constructor(private readonly inner: NodeProcessRunner) {}
-  run(file: string, args: readonly string[], options?: RunOptions): Promise<RunResult> {
-    this.calls.push([...args]);
-    return this.inner.run(file, args, options);
-  }
-  start(file: string, args: readonly string[], options?: StartOptions): StartedProcess {
-    return this.inner.start(file, args, options);
-  }
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 90_000): Promise<void> {
@@ -141,6 +133,13 @@ describe('the Session Monitor container of a remote Docker host', () => {
   }
 
   const running = (name: string): boolean => cli.container(name)?.State.Running === true;
+  // Plan step 11D1: the commands of the monitor as the worker sends them (monitorFlow over the Engine API of the local
+  // engine), to the monitor container of this run; the operations of the worker name the real one.
+  const engine = dockerEngine(engineApi(helperDockerSocket(env, process.platform)), engineHijack(helperDockerSocket(env, process.platform)));
+  const records = async (environmentId: string): Promise<RecordsOutput | undefined> => {
+    const result = await docker.run(['exec', containerName, ...recordsCommand(environmentId)]);
+    return result.exitCode === 0 ? parseRecordsOutput(result.stdout) : undefined;
+  };
 
   beforeAll(async () => {
     script = await timings.measure('bundle the script', bundleScript);
@@ -196,7 +195,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const longAgo = Date.now() - 30 * 60_000;
     writeRecord(SOURCE, ids.stale, { at: longAgo, keepRunning: false, limitSeconds: 60, seq: longAgo });
     writeRecord(OTHER_SOURCE, ids.kept, { at: longAgo, keepRunning: true, limitSeconds: 60, seq: longAgo });
-    const heartbeat = await monitor.heartbeat({ source: SOURCE, limitSeconds: 60, environments: [{ id: ids.fresh, keepRunning: false, seq: Date.now() }] });
+    // Plan step 11D1: changed, the heartbeat of the worker (monitorFlow.sendHeartbeat; before: RemoteSessionMonitor.heartbeat).
+    const heartbeat = await sendHeartbeat(engine, { source: SOURCE, limitSeconds: 60, environments: [{ id: ids.fresh, keepRunning: false, seq: Date.now() }] }, undefined, containerName);
     expect(heartbeat.ok).toBe(true);
 
     await timings.measure('stop of the stale container', () => waitUntil(() => !running(names.stale), 'the stop of the stale container'));
@@ -214,13 +214,13 @@ describe('the Session Monitor container of a remote Docker host', () => {
   });
 
   it('prints the records of an environment, forgets one, and writes nothing for an invalid heartbeat', async () => {
-    const records = await monitor.records(ids.fresh);
-    expect(records?.records).toEqual([{ source: SOURCE, at: expect.any(Number), keepRunning: false }]);
-    expect(Math.abs(records!.now - records!.records[0].at)).toBeLessThan(5 * 60_000);
-    // Plan step 11C2a: RemoteSessionMonitor.forget is removed (Delete's `forget` is the worker's); the command of the
-    // monitor script is the same.
-    expect((await docker.run(['exec', containerName, ...forgetCommand(SOURCE, ids.fresh)])).exitCode).toBe(0);
-    expect((await monitor.records(ids.fresh))?.records).toEqual([]);
+    // Plan step 11D1: changed, the records read by the test itself (RemoteSessionMonitor.records is removed: no caller).
+    const recorded = await records(ids.fresh);
+    expect(recorded?.records).toEqual([{ source: SOURCE, at: expect.any(Number), keepRunning: false }]);
+    expect(Math.abs(recorded!.now - recorded!.records[0].at)).toBeLessThan(5 * 60_000);
+    // Plan step 11C2a: Delete's `forget` is the worker's. Plan step 11D1: changed, as the worker sends it (monitorFlow).
+    expect(await forgetRecord(engine, SOURCE, ids.fresh, containerName)).toEqual({ ok: true });
+    expect((await records(ids.fresh))?.records).toEqual([]);
 
     const invalid = await docker.run(['exec', containerName, 'node', '/opt/devenv/monitor.js', 'heartbeat', '{"source":"../x"}']);
     expect(invalid.exitCode).toBe(2);
@@ -243,10 +243,10 @@ describe('the Session Monitor container of a remote Docker host', () => {
     }
     expect(cli.container(containerName)!.Id).not.toBe(before);
     // The new container writes its script at its start; the records of the volume stay.
-    let records: Awaited<ReturnType<typeof monitor.records>>;
+    let kept: RecordsOutput | undefined;
     const deadline = Date.now() + 30_000;
-    while ((records = await monitor.records(ids.kept)) === undefined && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(records?.records.map((record) => record.source)).toEqual([OTHER_SOURCE]);
+    while ((kept = await records(ids.kept)) === undefined && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(kept?.records.map((record) => record.source)).toEqual([OTHER_SOURCE]);
   });
 
   // Plan step 3 (pipe loading, user decisions 2026-09-29): a restart starts the stored script without new input.
@@ -264,7 +264,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(cli.run(['logs', containerName]).err).not.toContain('devenv loader:');
     expect(await monitor.ensure(helperTag, socket)).toBe('running');
     // It still answers the subcommands of `docker exec` from the stored script.
-    expect(await monitor.records(ids.kept)).toBeDefined();
+    expect(await records(ids.kept)).toBeDefined();
   });
 
   it('exits with 3 after a restart when the stored script was changed, and ensure then creates it again', async () => {
@@ -331,26 +331,14 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(details.HostConfig.RestartPolicy?.Name).toBe('on-failure');
     expect(cli.run(['exec', containerName, 'sha256sum', REMOTE_MONITOR_SCRIPT_PATH]).out.split(' ')[0]).toBe(bundleHash(script));
   });
-  // Plan step 8, PR A (user decisions Q1 and Q4 of 2026-10-02): the heartbeats of a window go through this window's
-  // worker of the engine (a routed `docker exec` on the monitor container, without `-i`), on the local engine too; so does
-  // the forget of Delete.
-  it('takes a heartbeat of the window and a forget through a real worker on the local engine (plan step 8, PR A)', async () => {
+  // Plan step 8, PR A (user decisions Q1 and Q4 of 2026-10-02): the heartbeats of a window, on the local engine too. Plan
+  // step 11D1: changed, they are the operation `heartbeat` of the worker of the engine (its unit tests cover the channel);
+  // here WindowHeartbeats sends them as that operation does (monitorFlow over the Engine API), to the monitor of this run.
+  // Before: a routed `docker exec` through a real worker, checked here for its arguments. The image settings and list go
+  // on the input of their command (`docker exec -i` before, run directly by the extension).
+  it('takes the heartbeats of a window, and the image settings and list, as the worker sends them (plan step 8, PR A; 11D1)', async () => {
     expect(['created', 'running', 'started']).toContain(await monitor.ensure(helperTag, socket));
     await waitUntil(() => running(containerName), 'the monitor');
-    const spy = new SpyRunner(new NodeProcessRunner());
-    const windowDocker = new ContainerAdapter(spy, run.dockerPath, env, log);
-    const targets = new DockerTargets(windowDocker, env, log);
-    const locks = workerLocks({ run, cli, log }, windowDocker, targets, 'remoteMonitor-window', async (target) =>
-      helperDockerSocket(env, process.platform, target.endpoint),
-    );
-    const routed: string[][] = [];
-    windowDocker.setRouter(async (target, args, options) => {
-      routed.push([...args]);
-      return locks.channels.docker(target, args, options);
-    });
-    const windowMonitor = new RemoteSessionMonitor({ docker: windowDocker, logger: log, script: async () => script, containerName, volumeName });
-    const target = await targets.resolve();
-    expect(target.kind).toBe('local');
     const windowSource = crypto.randomBytes(16).toString('hex');
     const environment = {
       id: crypto.randomUUID(),
@@ -368,11 +356,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
       registry: { list: async () => [{ ...environment }] },
       settings: () => ({ stopOnClose: true, respectShutdownActionNone: false, stopAfterMinutes: 10 }),
       sourceId: () => windowSource,
-      engineFor: async () => target,
-      send: async (engine, input) => {
-        const result = await runWithDockerTarget(engine, () => windowMonitor.heartbeat(input));
-        return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
-      },
+      engineFor: async () => ({ kind: 'local', host: '', endpoint: '', context: 'default' }) as never,
+      send: (_engine, input, signal) => sendHeartbeat(engine, input, signal, containerName),
       repair: async () => {
         throw new Error('the monitor runs; no repair is expected');
       },
@@ -383,25 +368,23 @@ describe('the Session Monitor container of a remote Docker host', () => {
       logger: log,
     });
     try {
-      await timings.measure('a heartbeat of the window through the worker', () => heartbeats.tick());
-      expect((await monitor.records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: false }]);
+      await timings.measure('a heartbeat of the window', () => heartbeats.tick());
+      expect((await records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: false }]);
       // Close and Keep Running: one heartbeat with the flag at once.
       environment.keepRunningOnce = true;
       expect(await heartbeats.sendFor(environment.id)).toEqual({ ok: true });
-      expect((await monitor.records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: true }]);
-      // Plan step 11C2a: changed (before: Delete's `forget` went through the routed Docker of the window too): Delete runs
-      // in the worker, which forgets the record itself (test/docker/workerFlows.test.ts).
+      expect((await records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: true }]);
       expect(warnings).toEqual([]);
-      // Both went through the worker, never directly, and carried no `-i` and no variable.
-      const execs = routed.filter((args) => args[0] === 'exec' && args.includes(containerName));
-      expect(execs.map((args) => args.find((arg) => arg === 'heartbeat' || arg === 'forget'))).toEqual(['heartbeat', 'heartbeat']);
-      expect(execs.every((args) => !args.includes('-i') && !args.includes('-e'))).toBe(true);
-      expect(spy.calls.filter((args) => args.includes('exec') && args.includes(containerName))).toEqual([]);
     } finally {
       heartbeats.dispose();
-      windowDocker.setRouter(undefined);
-      expect(await locks.dispose()).toEqual([]);
     }
+    // The image settings and the image list, on the input of their commands (the monitor stores them in its volume).
+    const settings = { prefixes: ['ghcr.io/devenv-test'], schedule: '0 3 * * *', timeZone: 'UTC' };
+    expect(await sendMonitorSettings(engine, { settings }, undefined, containerName)).toEqual({ ok: true });
+    expect(await sendMonitorSettings(engine, { repositories: ['ghcr.io/devenv-test/app'] }, undefined, containerName)).toEqual({ ok: true });
+    expect(JSON.parse(cli.run(['exec', containerName, 'cat', '/state/image-settings.json']).out)).toMatchObject(settings);
+    // A monitor container that does not exist: `missing` (the window starts it again).
+    expect(await sendHeartbeat(engine, { source: windowSource, limitSeconds: 60, environments: [] }, undefined, `${containerName}-none`)).toMatchObject({ ok: false, missing: true });
   });
 
   // Plan step 8, PR C (user decisions Q1 and Q2 of 2026-10-02): a window that closes records the Git state, sends its
@@ -420,14 +403,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const reloadedName = `devenv-test-monitor-reloaded-${run.runId}`;
     startEnvironmentContainer(closedName, closedId);
     startEnvironmentContainer(reloadedName, reloadedId);
-    const windowDocker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
-    const targets = new DockerTargets(windowDocker, env, log);
-    const locks = workerLocks({ run, cli, log }, windowDocker, targets, 'remoteMonitor-release', async (target) =>
-      helperDockerSocket(env, process.platform, target.endpoint),
-    );
-    windowDocker.setRouter(async (target, args, options) => locks.channels.docker(target, args, options));
-    const windowMonitor = new RemoteSessionMonitor({ docker: windowDocker, logger: log, script: async () => script, containerName, volumeName });
-    const target = await targets.resolve();
+    // Plan step 11D1: changed, the heartbeats and the release as the worker sends them (monitorFlow; before: a routed
+    // `docker exec` through real workers, whose end the test awaited).
     const windowSource = crypto.randomBytes(16).toString('hex');
     const environmentOf = (id: string, name: string): Environment =>
       ({
@@ -448,11 +425,8 @@ describe('the Session Monitor container of a remote Docker host', () => {
         registry: { list: async () => environments.map((item) => ({ ...item })) },
         settings: () => settings,
         sourceId: () => windowSource,
-        engineFor: async () => target,
-        send: async (engine, input, signal) => {
-          const result = await runWithDockerTarget(engine, () => windowMonitor.heartbeat(input, signal));
-          return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
-        },
+        engineFor: async () => ({ kind: 'local', host: '', endpoint: '', context: 'default' }) as never,
+        send: (_engine, input, signal) => sendHeartbeat(engine, input, signal, containerName),
         repair: async () => {
           throw new Error('the monitor runs; no repair is expected');
         },
@@ -481,7 +455,6 @@ describe('the Session Monitor container of a remote Docker host', () => {
       );
     const closedWindow = windowOf(closedId);
     const reloadingWindow = windowOf(reloadedId);
-    let workersClosed = false;
     try {
       // Both windows use their environments: the long limit.
       await closedWindow.tick();
@@ -499,10 +472,6 @@ describe('the Session Monitor container of a remote Docker host', () => {
       const reloadedWindow = windowOf(reloadedId);
       await reloadedWindow.tick();
       reloadedWindow.dispose();
-      // The workers of the closed windows end (their input ends).
-      windowDocker.setRouter(undefined);
-      workersClosed = true;
-      expect(await locks.dispose()).toEqual([]);
       // Not before the release limit (review round 1 of PR #87, A-R1-1: with the release margin), and long before the long
       // one (stopAfterMinutes: 10).
       await timings.measure('stop after the release', () => waitUntil(() => !running(closedName), 'the stop after the release', RELEASE_STOP_WAIT_MS));
@@ -516,8 +485,6 @@ describe('the Session Monitor container of a remote Docker host', () => {
     } finally {
       closedWindow.dispose();
       reloadingWindow.dispose();
-      windowDocker.setRouter(undefined);
-      if (!workersClosed) await locks.dispose();
       cli.run(['rm', '-f', closedName, reloadedName]);
     }
   });
