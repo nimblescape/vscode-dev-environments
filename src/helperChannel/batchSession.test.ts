@@ -64,6 +64,14 @@ describe("the batch session of a flow in the worker (plan step 11B3b)", () => {
     const session = sessionOfHelper(SESSION, helper);
     await expect(session.step('exec' as never, {})).rejects.toBeInstanceOf(HelperChannelError);
     await expect(session.step('listConfigs', { repository: 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS) })).rejects.toThrow('too large');
+    // Review round 2 of 11B3b (B-R2-6): a time limit beyond the checks is refused; an input of exactly the limit goes.
+    await expect(session.step('listConfigs', { repository: 'acme/api' }, { timeoutMs: -1 })).rejects.toBeInstanceOf(HelperChannelError);
+    await expect(session.step('listConfigs', { repository: 'acme/api' }, { timeoutMs: Number.MAX_SAFE_INTEGER })).rejects.toBeInstanceOf(HelperChannelError);
+    expect(calls).toEqual([]);
+    const exact = 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS - JSON.stringify({ repository: '' }).length);
+    await session.step('listConfigs', { repository: exact }).catch(() => undefined);
+    expect(calls).toHaveLength(1);
+    calls.length = 0;
     // A step without parameters goes with null (as the extension's client sends it).
     await session.step('listConfigs', undefined).catch(() => undefined);
     expect(calls.map((call) => call.params)).toEqual([null]);
@@ -168,8 +176,16 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
       }
       return { exitCode: 0, stdout: '', stderr: '' };
     };
-    const ctx = { signal: controller.signal, ...contextSecrets({}), progress: () => {}, log: (text: string) => logs.push(text), output: () => {}, docker } as unknown as OperationContext;
-    return { ctx, calls, logs, runSignals, controller, order };
+    const progress: string[] = [];
+    const ctx = {
+      signal: controller.signal,
+      ...contextSecrets({}),
+      progress: (step: string, detail?: string) => progress.push(`${step} ${detail ?? ''}`),
+      log: (text: string, level?: string) => logs.push(`${level ?? 'info'} ${text}`),
+      output: () => {},
+      docker,
+    } as unknown as OperationContext;
+    return { ctx, calls, logs, runSignals, controller, order, progress };
   }
   const deps = () => ({ sessions: new Map(), readScript: () => 'script', openTimeoutMs: 100 });
   const target = { volume: 'devenv-v', image: `sha256:${'b'.repeat(64)}`, socket: '/var/run/docker.sock' };
@@ -205,6 +221,8 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
     await expect(starting).rejects.toMatchObject({ code: 'cancelled' });
     const failing = context({ psFails: true });
     await expect(workerBatchSession(deps(), failing.ctx, target)).rejects.toMatchObject({ code: 'failed' });
-    expect(failing.logs.some((line) => line.includes('could not be removed: the engine is gone'))).toBe(true);
+    // Review round 2 of 11B3b (B-R2-9): as a warning, and the start is reported as the progress step `batch`.
+    expect(failing.logs.some((line) => line.startsWith('warn ') && line.includes('could not be removed: the engine is gone'))).toBe(true);
+    expect(failing.progress).toEqual([`batch ${target.volume}`]);
   });
 });

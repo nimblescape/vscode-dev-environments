@@ -102,8 +102,13 @@ describe("the worker's own helper image (plan step 11B3b)", () => {
     await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect({ Id: `ffff${'0'.repeat(60)}` }) }, short)).rejects.toThrow('with another container');
     await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect() }, short)).rejects.toThrow('with another container');
     asked.length = 0;
-    await expect(readOwnHelper(engine, 'devenv-worker')).rejects.toThrow('is not the ID of its container');
+    // Review round 2 of 11B3b (B-R2-5): only 12 to 64 hex characters, the whole host name.
+    for (const name of ['devenv-worker', 'abc', 'x0123456789ab', '0123456789abX', 'ABC123DEF456', 'a'.repeat(65)]) {
+      await expect(readOwnHelper(engine, name), name).rejects.toThrow('is not the ID of its container');
+    }
     expect(asked).toEqual([]);
+    // An ID that contains the host name but does not start with it is another container.
+    await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect({ Id: `ff${short}${'0'.repeat(50)}` }) }, short)).rejects.toThrow('with another container');
     // Review round 1 of 11B3b (B-R1-9): only the bind mount at the socket's path is the socket; a full image ID and a
     // reference are needed.
     const state = { Type: 'bind', Source: '/srv/state', Destination: '/state' };

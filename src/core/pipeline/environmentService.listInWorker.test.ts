@@ -58,7 +58,8 @@ describe('the listing of Select configuration in the worker, from the extension 
     refused = { code: 'helperFailed', message: 'The helper could not be opened.', detail: 'no image', batchHelperUnavailable: true };
     const second = await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress }));
     expect(second).toBeInstanceOf(BatchHelperUnavailableError);
-    expect(second).toMatchObject({ code: 'helperFailed', detail: 'no image' });
+    // Review round 2 of 11B3b (B-R2-8): changed expectation, with its message.
+    expect(second).toMatchObject({ code: 'helperFailed', message: 'The helper could not be opened.', detail: 'no image' });
     // A refusal that is not one (an unknown code, `cancelled`) is an invalid answer, never a UserFacingError of the worker.
     for (const odd of [{ code: 'rootAccess', message: 'x' }, { code: 'cancelled', message: 'x' }, { code: 'startFailed', message: '' }]) {
       refused = odd;
@@ -113,5 +114,15 @@ describe('the listing in the worker from the extension: review round 1 of 11B3b'
     expect(sent).toEqual([]);
     await held.release();
     expect(await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'startFailed', message: 'm', detail: 'd' });
+  });
+});
+
+// Review round 2 of 11B3b (B-R2-8): parameters that the worker would refuse are never sent.
+describe('the listing in the worker from the extension: review round 2 of 11B3b', () => {
+  it('a window without a valid owner sends nothing', async () => {
+    const { h, sent } = harness(async () => ({ configPaths: [] }), { owner: { windowId: 'window-1', pid: 0 } });
+    await seedEnvironment(h, { container: 'stopped' });
+    expect(await rejection(h.service.listConfigurationsInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ message: expect.stringContaining('cannot be sent to the worker') });
+    expect(sent).toEqual([]);
   });
 });

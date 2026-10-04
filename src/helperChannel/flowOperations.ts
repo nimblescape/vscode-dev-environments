@@ -21,7 +21,7 @@ import {
 } from '../core/helperChannel/protocol';
 import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
 import { isAbortError, silentProgress, type Logger } from '../core/ports';
-import type { OwnHelper } from '../core/worker/ownHelper';
+import { readOwnHelper, type OwnHelper } from '../core/worker/ownHelper';
 import { workerServices } from '../core/worker/workerServices';
 import type { HelperBatchSession } from '../core/helperChannel/helperChannel';
 import { workerEnvironmentLock } from './workerLock';
@@ -165,6 +165,18 @@ export function ownHelperCache(read: OwnHelperOf): OwnHelperOf {
     });
     return current;
   };
+}
+
+/** Review round 1 of 11B3b (A-R1-2): the time limit of a read of the worker's own helper image. */
+export const OWN_HELPER_TIMEOUT_MS = 60_000;
+
+/**
+ * Plan step 11B3b: the worker's own helper image over the port of its engine: the inspect of the container of `hostname`
+ * (its short ID), within OWN_HELPER_TIMEOUT_MS (review round 1, A-R1-2), cached (ownHelperCache). Review round 2 (B-R2-1):
+ * apart, for its tests.
+ */
+export function ownHelperOfEngine(engineOf: EngineOfOperation, hostname: () => string, timeoutMs = OWN_HELPER_TIMEOUT_MS): OwnHelperOf {
+  return ownHelperCache((context) => readOwnHelper(engineOf(context), hostname(), AbortSignal.timeout(timeoutMs)));
 }
 
 /** Plan step 11B3b: opens a batch session of a flow in the worker (workerBatchSession of batch.ts). */

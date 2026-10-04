@@ -14,7 +14,7 @@ import type { Environment } from '../core/types';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import type { OwnHelper } from '../core/worker/ownHelper';
-import { flowRefusal, listConfigurationsOperation, ownHelperCache, type OpenWorkerBatch } from './flowOperations';
+import { OWN_HELPER_TIMEOUT_MS, flowRefusal, listConfigurationsOperation, ownHelperCache, ownHelperOfEngine, type OpenWorkerBatch } from './flowOperations';
 import { UserFacingError } from '../core/errors';
 import { MAX_REFUSAL_DETAIL_LENGTH, MAX_REFUSAL_MESSAGE_LENGTH, parseFlowRefusal } from '../core/helperChannel/protocol';
 import type { FlockProcess, LockDeps } from './lock';
@@ -275,5 +275,38 @@ describe('listConfigurations in the worker: review round 1 of 11B3b', () => {
     expect(await cache(CONTEXT())).toBe(OWN);
     expect(await cache(CONTEXT())).toBe(OWN);
     expect(reads).toBe(2);
+  });
+});
+
+// Review round 2 of 11B3b (B-R2-1): the read of the worker's own image over its engine: the host name, a time limit, the cache.
+describe("the read of the worker's own image (review round 2 of 11B3b)", () => {
+  it('inspects the container of the host name within its time limit, and reads again after a failure', async () => {
+    expect(OWN_HELPER_TIMEOUT_MS).toBe(60_000);
+    const asked: { reference: string; signal?: AbortSignal }[] = [];
+    let hang = true;
+    const short = 'abc123def456';
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      inspect: (_kind, reference, signal) => {
+        asked.push({ reference, signal });
+        if (!hang) {
+          return Promise.resolve({
+            Id: `${short}${'0'.repeat(52)}`,
+            Image: OWN.image.id,
+            Config: { Image: OWN.image.tag },
+            Mounts: [{ Type: 'bind', Source: OWN.socket, Destination: '/var/run/docker.sock' }],
+          });
+        }
+        return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
+      },
+    };
+    const read = ownHelperOfEngine(() => engine, () => short, 30);
+    await expect(read(CONTEXT())).rejects.toMatchObject({ name: 'AbortError' });
+    expect(asked[0].reference).toBe(short);
+    expect(asked[0].signal?.aborted).toBe(true);
+    hang = false;
+    expect(await read(CONTEXT())).toEqual(OWN);
+    expect(await read(CONTEXT())).toEqual(OWN);
+    expect(asked).toHaveLength(2);
   });
 });

@@ -35,9 +35,8 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, listConfigurationsOperation, ownHelperCache, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, listConfigurationsOperation, ownHelperOfEngine, stopOperation, tokenRemoveOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
-import { readOwnHelper } from '../core/worker/ownHelper';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -158,11 +157,9 @@ const BATCH = batchDeps();
 
 /**
  * Plan step 11B3b: the worker's own helper image and socket, read once from the engine (the inspect of its own container,
- * whose host name is its short ID), and again after a failure. Review round 1 (A-R1-2): within a time limit of its own,
- * so that one read that the engine never answers does not hold every later flow (it fails, and the next one reads again).
+ * whose host name is its short ID), and again after a failure, each read within a time limit (ownHelperOfEngine).
  */
-const OWN_HELPER_TIMEOUT_MS = 60_000;
-const OWN_HELPER_OF: OwnHelperOf = ownHelperCache((context) => readOwnHelper(ENGINE_OF(context), os.hostname(), AbortSignal.timeout(OWN_HELPER_TIMEOUT_MS)));
+const OWN_HELPER_OF: OwnHelperOf = ownHelperOfEngine(ENGINE_OF, () => os.hostname());
 
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DOCKER]: dockerOperation,
