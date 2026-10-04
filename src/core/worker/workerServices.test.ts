@@ -72,6 +72,8 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       markBusy: (environmentId, operation) => answer('markBusy', environmentId, operation),
       clearBusy: (environmentId) => answer('clearBusy', environmentId),
       recordGitSummary: (environmentId, summary) => answer('recordGitSummary', environmentId, summary),
+      // Plan step 11C3.
+      restore: (entries) => answer('restore', entries.map((entry) => entry.id)),
     },
     secrets: {
       token: () => answer('token'),
@@ -130,16 +132,19 @@ describe("the worker's own helper image (plan step 11B3b)", () => {
 });
 
 describe('the core services in the worker (plan step 11B3b)', () => {
-  it('the registry goes through the record requests; a write by a function fails closed until plan step 11C', async () => {
-    const { host, calls } = fakeHost({ get: { id: 'e1' } });
+  it('the registry goes through the record requests; a write by a function fails closed until plan steps 11D and 11E', async () => {
+    const { host, calls } = fakeHost({ get: { id: 'e1' }, restore: { added: 1, skipped: [] } });
     const store = hostStore(host.records);
     expect(await store.get('e1')).toEqual({ id: 'e1' });
     await store.findForAccount('acme/api', '42');
     await store.remove('e1');
-    expect(calls).toEqual(['get "e1"', 'findForAccount "acme/api" "42" ""', 'remove "e1" {}']);
-    await expect(store.updateEnvironment('e1', () => {})).rejects.toThrow('before plan step 11C');
-    await expect(store.update(() => {})).rejects.toThrow('before plan step 11C');
-    expect(calls).toHaveLength(3);
+    // Plan step 11C3: the entries rebuilt from the volumes go as `record restore`.
+    expect(await store.restore([{ id: 'e2' } as Environment])).toEqual({ added: 1, skipped: [] });
+    expect(calls).toEqual(['get "e1"', 'findForAccount "acme/api" "42" ""', 'remove "e1" {}', 'restore ["e2"]']);
+    // Plan step 11C3: changed, the changes of an entry by a function come with the flows of plan steps 11D and 11E
+    // (EnvironmentStore.update, the change of the whole registry by a function, is removed with its test).
+    await expect(store.updateEnvironment('e1', () => {})).rejects.toThrow('before plan step 11D or 11E');
+    expect(calls).toHaveLength(4);
   });
 
   it('the session files and the reads of the window go to the extension; the reopen record fails closed', async () => {

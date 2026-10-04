@@ -182,6 +182,31 @@ export class EnvironmentRegistry {
   }
 
   /**
+   * Concept 7.5 "registry lost", plan step 11C3 (decision of 2026-10-04, `record restore`): adds the entries that were
+   * rebuilt from the labels of their volumes, under the lock. An entry whose ID or volume the registry has is left out
+   * (it was never lost); one of a repository of which its owner account has an environment on its Docker host already is
+   * left out too (one environment per repository and account, concept D-3) and named in `skipped` (its volume name).
+   */
+  async restore(entries: readonly Environment[]): Promise<{ added: number; skipped: string[] }> {
+    return this.update((file) => {
+      let added = 0;
+      const skipped: string[] = [];
+      for (const entry of entries) {
+        // Review round 1 of 11C3 (A-R1-L3): a volume or container of the same name in another case is the same one.
+        const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+        if (file.environments.some((e) => e.id === entry.id || same(e.volumeName, entry.volumeName) || same(e.containerName, entry.containerName))) continue;
+        if (file.environments.some((e) => isEnvironmentOf(e, entry.repository, entry.owner.id, dockerHostOf(entry)))) {
+          skipped.push(entry.volumeName);
+          continue;
+        }
+        file.environments.push(entry);
+        added++;
+      }
+      return { added, skipped };
+    });
+  }
+
+  /**
    * Changes one environment under the lock. Returns the changed environment, or `undefined` if the ID does not exist.
    * An async mutator is awaited before the write (TypeScript accepts one also for a `void` return type).
    */

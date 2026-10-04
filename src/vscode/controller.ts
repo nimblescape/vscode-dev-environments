@@ -245,6 +245,14 @@ export class Controller implements vscode.Disposable {
   private readonly isAlive: (pid: number) => boolean;
   private readonly timers = new Set<NodeJS.Timeout>();
   private current: WindowEnvironment | undefined;
+  /**
+   * Review round 3 of 11C3 (A-R3-L1, A-R3-L2): this window runs the open pipeline of role A (openAttachedWindow), so a
+   * restore of the registry never adopts an environment for it; `adoption`: the adoption that runs; `adopted`: an
+   * adoption found the environment of this window (it took it or left it), so no later restore adopts it again.
+   */
+  private attaching = false;
+  private adoption: Promise<void> | undefined;
+  private adopted = false;
   /** See `LeftEnvironment`; checked until the window has closed its connection (`checkLeftConnection`). */
   private left: LeftEnvironment | undefined;
   private checkingLeft = false;
@@ -421,6 +429,7 @@ export class Controller implements vscode.Disposable {
     containerName: string,
     pending: PendingConnection | undefined,
   ): Promise<void> {
+    this.attaching = true;
     // Concept 7.5: the environment of another account runs no pipeline and starts no container; the window closes.
     const environment = await this.ownWindowEnvironment(attached, containerName);
     if (!environment) return;
@@ -602,22 +611,29 @@ export class Controller implements vscode.Disposable {
   /**
    * Concept 7.5 "registry lost": entries for the volumes with the label nimblescape.devenv.environment-id, when
    * registry.json is missing, not valid, or has invalid entries. Only when Docker runs; Docker is not started for this.
+   * Plan step 11C3: by the worker of the Docker host; `passive` (the default, a call in the background): it is made ready
+   * as for the refresh. Review round 2 of 11C3 (A-R2-M1): `adopt`, for a window whose container the registry did not know
+   * at activation (no open pipeline runs for it): it takes its environment also when the registry was restored already
+   * (by an earlier restore of this window whose answer came too late, or by another window).
    */
-  async reconcileIfRegistryLost(): Promise<void> {
-    await this.withDockerTarget(() => this.reconcileIfRegistryLostNow());
+  async reconcileIfRegistryLost(options: { passive: boolean; adopt?: boolean } = { passive: true }): Promise<void> {
+    await this.withDockerTarget(() => this.reconcileIfRegistryLostNow(options));
   }
 
-  private async reconcileIfRegistryLostNow(): Promise<void> {
+  private async reconcileIfRegistryLostNow(options: { passive: boolean; adopt?: boolean }): Promise<void> {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
-    if (!(await this.deps.registryNeedsRestore())) return;
-    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
-    // then whether Docker runs; no `docker info` here before that check.
+    if (!(await this.deps.registryNeedsRestore())) {
+      if (options.adopt === true) await this.adoptWindowEnvironment();
+      return;
+    }
+    // Review D2: reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH),
+    // then whether Docker runs; no `docker info` here before that check. Plan step 11C3: by the worker of the Docker host.
     if (!docker.isInstalled()) return;
-    const added = await service.reconcileFromVolumes();
-    if (added === 0) return;
+    const added = await service.reconcileInWorker({ passive: options.passive });
+    if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowEnvironment();
-    await this.deps.sidebar.render();
+    if (added > 0) await this.deps.sidebar.render();
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -935,7 +951,8 @@ export class Controller implements vscode.Disposable {
   async refresh(): Promise<void> {
     if (await this.deps.auth.isSignedIn()) await this.deps.sidebar.refreshDiscovery({ again: true });
     else await this.signIn();
-    await this.reconcileIfRegistryLost().catch((error: unknown) =>
+    // Plan step 11C3: the user asked for it, so the worker is made ready in full (as for an operation of the user).
+    await this.reconcileIfRegistryLost({ passive: false }).catch((error: unknown) =>
       this.logger.warn(`The environments could not be restored from the volumes: ${errorMessage(error)}`),
     );
     await this.deps.sidebar.refreshStates();
@@ -1734,18 +1751,30 @@ export class Controller implements vscode.Disposable {
   // -------------------------------------------------------------------------------------------------------------------
   // Connection of this window
 
-  /** Registry restored from the volumes: this window may be attached to one of the restored environments. */
+  /**
+   * Registry restored from the volumes: this window may be attached to one of the restored environments. Review round 3
+   * of 11C3 (A-R3-L1, A-R3-L2): never in a window of role A; one adoption at a time, and once per window.
+   */
   private async adoptWindowEnvironment(): Promise<void> {
-    if (this.current) return;
+    if (this.attaching || this.adopted || this.current) return;
+    this.adoption ??= this.adoptWindowEnvironmentNow().finally(() => {
+      this.adoption = undefined;
+    });
+    await this.adoption;
+  }
+
+  private async adoptWindowEnvironmentNow(): Promise<void> {
     const containerName = this.deps.connection.currentContainerName();
     if (!containerName) return;
     const restored = await this.deps.registry.findByContainerName(containerName);
-    if (!restored) return;
+    if (!restored || this.attaching || this.adopted) return;
+    this.adopted = true;
     const environment = await this.ownWindowEnvironment(restored, containerName);
     if (!environment || this.current) return;
     // No pipeline runs here, so a container of an older version is not made again: the window leaves it (section 9), and
     // so it does a container made while the host access checks were off, when they are on now.
     const outdated = await this.containerOutdated(environment);
+    if (this.current) return;
     if (outdated) {
       const repository = this.displayName({ repository: environment.repository });
       this.logger.info(this.outdatedTexts(outdated, repository).log);

@@ -71,6 +71,7 @@ import {
   OP_DELETE,
   OP_DELETE_CHECK,
   OP_LIST_CONFIGURATIONS,
+  OP_RECONCILE,
   OP_STOP,
   OP_WINDOW_STATE,
   parseDeleteCheckParams,
@@ -78,6 +79,8 @@ import {
   parseDeleteParams,
   parseDeleteValue,
   parseListConfigurationsParams,
+  parseReconcileParams,
+  parseReconcileValue,
   parseListConfigurationsValue,
   parseStopParams,
   parseStopValue,
@@ -303,6 +306,8 @@ export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
  * which wait for the user.
  */
 export const DELETE_CHECK_FLOW_TIMEOUT_MS = 60 * 60_000;
+/** Plan step 11C3: the longest rebuild of the registry in the worker (it lists and inspects the volumes and containers). */
+export const RECONCILE_FLOW_TIMEOUT_MS = 2 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -372,7 +377,7 @@ export type EnvironmentHelper = Pick<
 /** The part of EnvironmentRegistry that the service uses. */
 export type EnvironmentStore = Pick<
   EnvironmentRegistry,
-  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'add' | 'update' | 'updateEnvironment' | 'remove'
+  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'add' | 'restore' | 'updateEnvironment' | 'remove'
 >;
 
 /** The part of SessionFiles that the service uses. */
@@ -6387,6 +6392,8 @@ export class EnvironmentService {
    * Environments that it mounts (protectedMountedVolumes), which protect them from other accounts and from the Delete
    * of the other environments; Delete removes only the own ones. The entries have no build record, so the next
    * connection with internet access rebuilds the container. Returns the number of added entries. Does not start Docker.
+   * Plan step 11C3: runs in the worker (reconcileInWorker sends it there), and in the first open until it moves there
+   * (plan step 11E).
    */
   async reconcileFromVolumes(): Promise<number> {
     const { docker } = this.deps;
@@ -6409,7 +6416,8 @@ export class EnvironmentService {
       const id = volume.labels[LABEL_ENVIRONMENT_ID];
       const repository = volume.labels[LABEL_REPOSITORY];
       const ownerId = volume.labels[LABEL_OWNER_ID];
-      if (!isStorageId(id) || !isRepositoryName(repository) || !isStorageId(ownerId)) {
+      // Review round 1 of 11C3 (A-R1-M1): a repository as `record restore` takes it (no control characters, at most 256).
+      if (!isStorageId(id) || !isRepositoryName(repository) || repository.length > 256 || /[\u0000-\u001f\u007f]/.test(repository) || !isStorageId(ownerId)) {
         this.logger.warn(`The volume ${volume.name} has invalid labels and is skipped.`);
         continue;
       }
@@ -6481,25 +6489,34 @@ export class EnvironmentService {
         else this.logger.warn(`The containers of the volume ${candidate.volumeName} name the configuration ${JSON.stringify(labelledPath)}, which is no configuration path. The default configuration is used.`);
       }
     }
-    const skipped: string[] = [];
-    const added = await this.deps.registry.update((file) => {
-      let count = 0;
-      for (const candidate of candidates) {
-        if (file.environments.some((e) => e.id === candidate.id || e.volumeName === candidate.volumeName)) continue;
-        if (file.environments.some((e) => isEnvironmentOf(e, candidate.repository, candidate.owner.id, dockerHost))) {
-          skipped.push(candidate.volumeName);
-          continue;
-        }
-        file.environments.push(candidate);
-        count++;
-      }
-      return count;
-    });
+    // Plan step 11C3 (decision of 2026-10-04): the registry adds them under its lock (`record restore` in the worker).
+    const { added, skipped } = await this.deps.registry.restore(candidates);
     for (const name of skipped) {
       this.logger.warn(`The volume ${name} belongs to a repository that has another environment of the same owner. It is not added.`);
     }
     if (added > 0) this.logger.info(`${added} environments were restored from the labels of their volumes.`);
     return added;
+  }
+
+  /**
+   * Plan step 11C3 (decisions of 2026-10-03 and 2026-10-04): concept 7.5 "registry lost" by the worker of the Docker host
+   * of the operation (`reconcile`, where reconcileFromVolumes runs; the entries come back as `record restore`, which this
+   * computer adds under its registry lock). Returns the number of added entries. Does not start Docker: 0 when it does not
+   * run, and on an endpoint that is neither local nor SSH (review D2). `passive`: a call in the background; the worker is
+   * made ready as for the refresh (the helper image only checked, the wait after a failed open kept). Throws when the
+   * worker could not be reached or failed (nothing is added then).
+   */
+  async reconcileInWorker(options: { passive: boolean; signal?: AbortSignal }): Promise<number> {
+    const readable = await this.readableDockerHost();
+    if (readable === undefined) return 0;
+    if (!(await this.deps.docker.isRunning())) return 0;
+    const params = parseReconcileParams({ dockerHost: readable, owner: this.deps.owner });
+    if (params === undefined) throw new Error('The rebuild of the registry cannot be sent to the worker.');
+    const value = parseReconcileValue(
+      await this.deps.flow(OP_RECONCILE, params, { timeoutMs: RECONCILE_FLOW_TIMEOUT_MS, ...(options.passive ? { passive: true } : {}), ...(options.signal ? { signal: options.signal } : {}) }),
+    );
+    if (value === undefined) throw new Error('The worker answered the rebuild of the registry with an invalid value.');
+    return value.added;
   }
 
   /**

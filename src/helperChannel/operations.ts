@@ -16,6 +16,7 @@ import {
   OP_START_CONTAINERS,
   OP_DELETE,
   OP_DELETE_CHECK,
+  OP_RECONCILE,
   OP_LIST_CONFIGURATIONS,
   OP_WINDOW_STATE,
   OP_STOP,
@@ -37,7 +38,7 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
@@ -156,4 +157,6 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_DELETE_CHECK]: deleteCheckOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
   // Plan step 11C1: the reads of an attached window.
   [OP_WINDOW_STATE]: windowStateOperation(ENGINE_OF),
+  // Plan step 11C3: the registry rebuilt from the volumes, by the worker's own pipeline.
+  [OP_RECONCILE]: reconcileOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
 };

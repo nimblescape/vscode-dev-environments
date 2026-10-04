@@ -6,7 +6,7 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_RECONCILE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import type { BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
@@ -70,6 +70,12 @@ export interface HostRecords {
    * worker read it in its running dev container.
    */
   recordGitSummary(environmentId: string, summary: GitSummary): Promise<void>;
+  /**
+   * Plan step 11C3 (decision of 2026-10-04): adds the entries that the worker rebuilt from the labels of the volumes of
+   * its engine (EnvironmentRegistry.restore), under the registry lock, with the clock of the extension; `skipped`: the
+   * volumes whose repository has an environment of the same owner already.
+   */
+  restore(entries: readonly Environment[]): Promise<{ added: number; skipped: string[] }>;
 }
 
 /** The session files that a flow writes or removes (HostRecords.sessionFile). */
@@ -177,6 +183,9 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
     'question deleteAdditionalVolumes',
     'question deleteServiceData',
   ],
+  // Plan step 11C3: the rebuild of the registry adds the entries of the volumes of its engine, and nothing else; it reads
+  // no record (the registry adds only what it lacks).
+  [OP_RECONCILE]: ['record restore'],
 };
 
 /**

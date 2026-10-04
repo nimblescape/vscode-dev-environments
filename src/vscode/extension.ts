@@ -48,6 +48,7 @@ import { releaseEnvironment } from '../core/session/windowRelease';
 import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
+import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
@@ -782,7 +783,9 @@ async function activateExtension(
   background(sidebar.initialize(), 'show the repository list');
   if (view.visible) background(sidebar.refreshStates(), 'update the sidebar');
   // Concept 7.5: a lost registry is rebuilt from the volume labels (only when Docker runs).
-  background(controller.reconcileIfRegistryLost(), 'restore the environments from the volumes');
+  // Review round 2 of 11C3 (A-R2-M1): a window whose container the registry did not know takes its restored environment.
+  const adopt = Boolean(containerName) && currentEnvironment === undefined;
+  background(controller.reconcileIfRegistryLost({ passive: true, adopt }), 'restore the environments from the volumes');
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
   // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
@@ -801,7 +804,16 @@ async function activateExtension(
   });
   context.subscriptions.push(helperPrebuild);
   background(
-    targets.current().then((target) => helperPrebuild.start(target)),
+    targets
+      .current()
+      .then((target) => helperPrebuild.start(target))
+      // Review round 1 of 11C3 (A-R1-M2): a lost registry is restored again once the helper image was built.
+      .then((outcome) =>
+        // Review round 3 of 11C3 (A-R3-L3): a failed restore is logged as such, not as a failed preparation.
+        restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt })).catch((error: unknown) =>
+          logger.error('Could not restore the environments from the volumes after the helper image was prepared.', error),
+        ),
+      ),
     'prepare the workspace helper image in the background',
   );
 
@@ -832,35 +844,4 @@ async function activateExtension(
   background(started, 'start the window session');
   // Role B: pending operations, then the reopen rule. Role C (a local folder or another remote): nothing else.
   if (connection.isEmptyWindow()) background(controller.runEmptyWindowTasks(activatedAt), 'run the tasks of the empty window');
-}
-
-/**
- * The registry entry of the container that this window is attached to. When the registry lost its content (concept 7.5
- * "registry lost": the file is missing, not valid, or has invalid entries), it is restored from the volume labels first,
- * so that the open pipeline of role A can run for a restored window; this needs a running Docker, which is not started
- * for it. Never throws.
- */
-async function findWindowEnvironment(
-  containerName: string,
-  deps: {
-    registry: EnvironmentRegistry;
-    needsRestore: () => Promise<boolean>;
-    docker: ContainerAdapter;
-    service: EnvironmentService;
-    logger: Logger;
-  },
-): Promise<Environment | undefined> {
-  const { registry, needsRestore, docker, service, logger } = deps;
-  try {
-    const environment = await registry.findByContainerName(containerName);
-    if (environment || !(await needsRestore())) return environment;
-    // Review D2: reconcileFromVolumes checks the Docker target first (never an endpoint that is neither local nor SSH),
-    // then whether Docker runs.
-    if (!docker.isInstalled()) return undefined;
-    if ((await service.reconcileFromVolumes()) === 0) return undefined;
-    return await registry.findByContainerName(containerName);
-  } catch (error) {
-    logger.error('The environment of this window could not be found.', error);
-    return undefined;
-  }
 }
