@@ -7,9 +7,9 @@
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the
 // pipeline can run again at any time.
 import * as path from 'path';
-import { registryBusyMarks, type EnvironmentBusyMarks } from './busyMarks';
+import { registryBusyMarks, type BusyMarkView, type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision } from './deleteCheck';
-import { isBusyMarkLive, otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
+import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
@@ -249,11 +249,15 @@ import {
   nonEmptyString,
   recordDigests,
   refusedUpdateOf,
+  lifecycleMarkClears,
+  sameContainer,
+  sameContainerId,
   MAX_REFUSED_ITEMS_LENGTH,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
 } from './pipelineRules';
+import { otherWindowMarkIsLive, readLiveness, registryOpenRecords, sameBusyMark, type MarkLiveness, type OpenRecords } from './openRecords';
 import type { PullCredentials, PullCredentialsProvider } from './pullCredentials';
 
 // User-visible texts that messages.ts lacks (plain language, NFR-02); to be moved there.
@@ -483,6 +487,12 @@ export interface EnvironmentServiceDeps {
    */
   busyMarks?: EnvironmentBusyMarks;
   /**
+   * Plan step 11E4a (decision of 2026-10-04): the registry writes of the open, as specific operations. Default: over
+   * `registry` with this service's owner, clock, and view of the windows (registryOpenRecords); the worker's pipeline will
+   * send them to the extension (plan steps 11E4b/c).
+   */
+  openRecords?: OpenRecords;
+  /**
    * Plan step 11C2a: the id of this computer in the Session Monitor (its heartbeat records), which Delete sends to the
    * worker for its `forget`. Without it, deleteInWorker refuses.
    */
@@ -592,20 +602,6 @@ const LIFECYCLE_MARK_RETRY_MS = 500;
  */
 const NOT_RUNNING_STATES: ReadonlySet<string> = new Set(['exited', 'created']);
 
-/**
- * PR #78 review round 2 (A-R2-1): a mark that isBusyMarkLive counts as ended (older than BUSY_MARK_MAX_AGE_MS; the epoch,
- * so a clock correction cannot make it live again), with its operation kept: the create mark of an unfinished clone of
- * this window then blocks nothing (the sidebar of every window, other windows' Start and Delete), like the mark of an
- * ended window, and the next open of any window still completes the clone.
- */
-function endedMark(mark: BusyMark): BusyMark {
-  return { ...mark, since: new Date(0).toISOString() };
-}
-
-/** Review round 4 of PR #68 (A-R4-6): the busy marks are the same mark (all four fields). */
-function sameBusyMark(a: BusyMark, b: BusyMark): boolean {
-  return a.operation === b.operation && a.since === b.since && a.pid === b.pid && a.windowId === b.windowId;
-}
 const DEFAULT_BUSY_WAIT_MS = 10_000;
 // A pending connection file counts for 2 minutes (concept 7.9 rule 1). A helper image build, `up` with long lifecycle
 // commands, or an open prompt can take longer; a refresh well within the waiting time keeps the container in use.
@@ -1058,32 +1054,8 @@ function environmentBusy(repository: string, mark: BusyMark): UserFacingError {
   );
 }
 
-/** Docker and the Dev Container CLI name a container by its full ID or by a prefix of it. */
-function sameContainerId(a: string, b: string): boolean {
-  return a !== '' && b !== '' && (a.startsWith(b) || b.startsWith(a));
-}
-
-/**
- * Review round 2 of PR #68: the same container. Two full IDs (64 hexadecimal digits) are compared exactly; only a short
- * one is compared as a prefix (sameContainerId), so that no ID that merely starts with another one matches.
- */
-function sameContainer(a: string, b: string): boolean {
-  if (a === b) return true;
-  const full = /^[0-9a-f]{64}$/;
-  return full.test(a) !== full.test(b) && sameContainerId(a, b);
-}
-
-/**
- * Review round 4 of PR #68 (A-R4-1): whether finish clears the mark Environment.lifecycleIncomplete (`mark`, as the
- * registry holds it under the lock): only when it is the value this run decided with (`read`), or when it names the
- * container whose `up` and run-user-commands this run completed (`ranFor`). A mark that another window set after this run
- * read the entry (for example for the container that this run opened as it is) stays.
- */
-export function lifecycleMarkClears(mark: string | undefined, read: string | undefined, ranFor: string | undefined): boolean {
-  if (mark === undefined) return false;
-  if (read !== undefined && sameContainer(mark, read)) return true;
-  return ranFor !== undefined && sameContainer(mark, ranFor);
-}
+/** Plan step 11E4a: moved to ./pipelineRules (the open's registry writes, ./openRecords, use it too). */
+export { lifecycleMarkClears };
 
 /** The workspace helper could not be prepared, or the helper image of the open is gone (UserFacingError helperFailed). */
 function isHelperFailed(error: unknown): boolean {
@@ -1345,6 +1317,9 @@ export class EnvironmentService {
   private readonly startDockerFn: DockerStarter;
   private readonly isAlive: (pid: number) => boolean;
   private readonly busyMarks: EnvironmentBusyMarks;
+  /** Plan step 11E4a: the owner, clock, and view of the windows with which this window decides busy marks. */
+  private readonly markView: BusyMarkView;
+  private readonly openRecords: OpenRecords;
   private readonly busyWaitMs: number;
   private readonly pendingRefreshMs: number;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -1353,9 +1328,9 @@ export class EnvironmentService {
   constructor(private readonly deps: EnvironmentServiceDeps) {
     this.startDockerFn = deps.startDocker ?? defaultDockerStarter(deps);
     this.isAlive = deps.isProcessAlive ?? processExists;
-    this.busyMarks =
-      deps.busyMarks ??
-      registryBusyMarks(deps.registry, { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger });
+    this.markView = { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger };
+    this.busyMarks = deps.busyMarks ?? registryBusyMarks(deps.registry, this.markView);
+    this.openRecords = deps.openRecords ?? registryOpenRecords(deps.registry, this.markView);
     this.busyWaitMs = Math.max(0, deps.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
     this.pendingRefreshMs = Math.max(1, deps.pendingRefreshMs ?? DEFAULT_PENDING_REFRESH_MS);
     this.sleepFn = deps.sleep ?? defaultSleep;
@@ -1450,7 +1425,7 @@ export class EnvironmentService {
       ...dockerHostField(dockerHost),
     };
     try {
-      await this.deps.registry.add(environment);
+      await this.openRecords.createEnvironment(environment);
     } catch (error) {
       // One environment per repository and account (concept D-3): another window of the account may have created it
       // right now.
@@ -1505,11 +1480,7 @@ export class EnvironmentService {
           if (!(await this.removeFailedFirstOpen(ctx.env, ctx.compose === true))) {
             ctx.busy = false;
             // PR #78 review round 2 (A-R2-1): kept as ended, so it blocks nothing while this window lives.
-            await this.quietly('keep the create mark as ended', () =>
-              this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
-                if (entry.busy && this.isOwnMark(entry.busy)) entry.busy = endedMark(entry.busy);
-              }),
-            );
+            await this.quietly('keep the create mark as ended', () => this.openRecords.createMark(ctx.env.id, 'ended'));
           }
           throw error;
         }
@@ -1528,7 +1499,7 @@ export class EnvironmentService {
    * without the lock.
    */
   private async removeRefusedFirstOpen(env: Environment): Promise<void> {
-    await this.quietly('remove the registry entry', () => this.deps.registry.remove(env.id, { kept: [] }));
+    await this.quietly('remove the registry entry', () => this.openRecords.dropCreated(env.id));
   }
 
   /**
@@ -1625,9 +1596,7 @@ export class EnvironmentService {
     const { account } = session;
     const current = this.availableEntry(environment, account);
     if (current.owner.login === account.login) return current;
-    const updated = await this.deps.registry.updateEnvironment(current.id, (entry) => {
-      if (entry.owner.id === account.id) entry.owner = ownerOf(account);
-    });
+    const updated = await this.openRecords.ownerLogin(current.id, account);
     return updated ?? current;
   }
 
@@ -1688,18 +1657,12 @@ export class EnvironmentService {
       }
       if (!removed) {
         ctx.busy = false;
-        await this.quietly('keep the create mark as ended', () =>
-          this.deps.registry.updateEnvironment(env.id, (entry) => {
-            if (entry.busy && this.isOwnMark(entry.busy)) entry.busy = endedMark(entry.busy);
-          }),
-        );
+        await this.quietly('keep the create mark as ended', () => this.openRecords.createMark(env.id, 'ended'));
       }
       throw error;
     }
     ctx.cloned = true;
-    await this.updateEntry(ctx, (entry) => {
-      delete entry.gitSummary;
-    });
+    this.entryUpdated(ctx, await this.openRecords.configuration(ctx.env.id, { cloned: true }));
   }
 
   /**
@@ -1721,15 +1684,9 @@ export class EnvironmentService {
       // would count as live: the environment would show as busy without Start and Delete, and other windows could
       // not use it, as long as this window lives; so it comes back as ended (PR #78 review round 2, A-R2-1).
       ctx.busy = false;
-      await this.quietly('restore the busy mark', () =>
-        this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
-          if (!entry.busy || !this.isOwnMark(entry.busy)) return;
-          // PR #78 review round 1 (A-R1-1): the create mark of a failed first open of this window (kept because its
-          // volume could not be removed) comes back too, so a resume that fails again does not lose the clone.
-          if (interrupted) entry.busy = this.isOwnMark(interrupted) ? endedMark(interrupted) : interrupted;
-          else delete entry.busy;
-        }),
-      );
+      // PR #78 review round 1 (A-R1-1): the create mark of a failed first open of this window (kept because its volume
+      // could not be removed) comes back too, so a resume that fails again does not lose the clone (createMark).
+      await this.quietly('restore the busy mark', () => this.openRecords.createMark(ctx.env.id, 'previous', interrupted));
       throw error;
     }
     ctx.cloned = true;
@@ -1857,10 +1814,8 @@ export class EnvironmentService {
         // starts the environment with the configuration that it had (its containers are of that one).
         if (ctx.env.configPath !== previousConfigPath) {
           this.logger.info(`The configuration ${ctx.env.configPath} of ${ctx.env.repository} could not be started; ${previousConfigPath} stays selected.`);
-          await this.quietly('restore the configuration path', () =>
-            this.updateEntry(ctx, (entry) => {
-              entry.configPath = previousConfigPath;
-            }),
+          await this.quietly('restore the configuration path', async () =>
+            this.entryUpdated(ctx, await this.openRecords.configuration(ctx.env.id, { select: previousConfigPath })),
           );
         }
         throw error;
@@ -2579,27 +2534,21 @@ export class EnvironmentService {
     // (recordedVolumes); the others are never recorded.
     const additionalVolumes = await this.recordedVolumes(loaded.mountedVolumes, ctx.env);
     const configPath = loaded.fallback && record !== undefined ? ctx.configPath : loaded.configPath;
-    await this.updateEntry(ctx, (entry) => {
-      entry.configPath = configPath;
-      entry.shutdownActionNone = loaded.config.shutdownAction === 'none';
+    // Plan step 11E4a: the services' volumes are read from the model here, before the write; it only adds them.
+    const serviceVolumes = loaded.compose ? composeServiceVolumeNames(loaded.compose.output.model, loaded.compose.project, loaded.compose.service) : undefined;
+    const updated = await this.openRecords.configuration(ctx.env.id, {
+      select: configPath,
+      shutdownActionNone: loaded.config.shutdownAction === 'none',
       // Volumes recorded before stay: the pipeline adds those that it creates before `up` (createAdditionalVolumes), and
       // a volume that the environment used may still hold its data.
-      const recorded = entry.additionalVolumes ?? [];
-      const added = additionalVolumes.filter((name) => !recorded.includes(name));
-      if (added.length > 0) entry.additionalVolumes = [...recorded, ...added];
+      addVolumes: additionalVolumes,
       // Review round 1 (D1): the volumes of the other services of Docker Compose, for the question of Delete (kept once
       // recorded: a volume that a service used holds its data).
-      if (loaded.compose) {
-        const services = entry.serviceVolumes ?? [];
-        const used = composeServiceVolumeNames(loaded.compose.output.model, loaded.compose.project, loaded.compose.service).filter((name) => !services.includes(name));
-        if (used.length > 0) entry.serviceVolumes = [...services, ...used];
-      }
+      ...(serviceVolumes !== undefined ? { addServiceVolumes: serviceVolumes } : {}),
       // A refused update of another configuration is not tried again anyway.
-      const refused = refusedUpdateOf(entry);
-      if ('refusedUpdate' in entry && (refused?.configPath !== loaded.configPath || refused.configHash !== loaded.configHash)) {
-        delete entry.refusedUpdate;
-      }
+      keepRefusedFor: { configPath: loaded.configPath, configHash: loaded.configHash },
     });
+    this.entryUpdated(ctx, updated);
   }
 
   /**
@@ -2615,12 +2564,10 @@ export class EnvironmentService {
     this.logger.info(
       `The Docker Compose plugin of the workspace helper is now ${current.version} and prints the unchanged files of ${ctx.env.repository} as another model. That is no change of the configuration.`,
     );
-    await this.updateEntry(ctx, (entry) => {
-      const compose = composeRecordOf(entry.buildRecord);
-      if (!entry.buildRecord || !compose || entry.buildRecord.environmentImage !== record.environmentImage) return;
-      entry.buildRecord.configHash = current.configHash;
-      entry.buildRecord.compose = { ...compose, version: current.version };
-    });
+    this.entryUpdated(
+      ctx,
+      await this.openRecords.build(ctx.env.id, { kind: 'rebaseline', environmentImage: record.environmentImage, configHash: current.configHash, version: current.version }),
+    );
     return false;
   }
 
@@ -2757,10 +2704,7 @@ export class EnvironmentService {
       return undefined;
     }
     const record: BuildRecord = { ...found, imageId: id };
-    await this.updateEntry(ctx, (entry) => {
-      entry.buildRecord = record;
-      entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, record.buildNumber);
-    });
+    this.entryUpdated(ctx, await this.openRecords.build(ctx.env.id, { kind: 'record', record, dropRefused: false }));
     this.logger.info(`The build record of ${env.repository} was taken from its environment image ${newest.tag} (${id}).`);
     return record;
   }
@@ -2864,9 +2808,7 @@ export class EnvironmentService {
     ctx.steps.step('preparing');
     const buildNumber = await this.nextBuildNumber(env);
     const imageName = environmentImageName(env.repository, env.id, buildNumber);
-    await this.updateEntry(ctx, (entry) => {
-      entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);
-    });
+    this.entryUpdated(ctx, await this.openRecords.build(ctx.env.id, { kind: 'number', buildNumber }));
     // User decisions 2026-10-03: the build record of the new image, before the build, so that the image carries it
     // (imageRecordLabels); its pinned ID follows after the labels (option 1).
     const current = plan.check.kind === 'checked' ? plan.check.outcome : undefined;
@@ -3127,11 +3069,7 @@ export class EnvironmentService {
 
     // Concept 7.7 step 4: the new build record (with the ID of the labelled image), then the old images go.
     const newRecord: BuildRecord = { ...builtRecord, imageId: builtImageId };
-    await this.updateEntry(ctx, (entry) => {
-      entry.buildRecord = newRecord;
-      entry.lastBuildNumber = Math.max(entry.lastBuildNumber ?? 0, buildNumber);
-      delete entry.refusedUpdate;
-    });
+    this.entryUpdated(ctx, await this.openRecords.build(ctx.env.id, { kind: 'record', record: newRecord, dropRefused: true }));
     this.logger.info(`New environment image of ${env.repository}: ${imageName}.`);
     await this.removeEnvironmentImages(ctx.env, imageName, record, newRecord.compose?.images ?? []);
     return { result, created: true };
@@ -3172,9 +3110,7 @@ export class EnvironmentService {
     this.deps.ui.warn(reason === 'size' ? Messages.updateTooLarge(items) : Messages.updateRefused(items));
     if (check.kind !== 'checked') return;
     const refusedUpdate: RefusedUpdate = { ...this.updateKey(ctx, loaded, record, check.outcome), items, ...(reason !== undefined ? { reason } : {}) };
-    await this.updateEntry(ctx, (entry) => {
-      entry.refusedUpdate = refusedUpdate;
-    });
+    this.entryUpdated(ctx, await this.openRecords.build(ctx.env.id, { kind: 'refused', refusedUpdate }));
   }
 
   /**
@@ -4389,29 +4325,20 @@ export class EnvironmentService {
    * is used (`busy`; `known: false` when the registry could not be written, logged).
    */
   private async takeStepMark(ctx: PipelineContext, operation: BusyOperation): Promise<{ mark: BusyMark } | { user: WindowUse }> {
-    const mark = this.busyMark(operation);
-    const state: { conflict?: BusyMark } = {};
     try {
-      // Read before the lock: the mutator does no I/O.
-      const blocks = await this.markBlocker();
-      const updated = await this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
-        if (entry.busy && (blocks(entry.busy) || this.isOwnMark(entry.busy) || entry.busy.pid === this.deps.owner.pid)) {
-          state.conflict = entry.busy;
-          return;
-        }
-        entry.busy = mark;
-      });
-      if (!updated) {
+      // Plan step 11E4a: the mark of this window, with its clock and its view of the windows (OpenRecords.takeStepMark).
+      const taken = await this.openRecords.takeStepMark(ctx.env.id, operation);
+      if (!taken) {
         this.logger.warn(`The registry entry of ${ctx.env.repository} is missing; no busy mark was set.`);
         return { user: { known: false, text: `It is not known whether another window uses ${ctx.env.repository}.` } };
       }
-      ctx.env = updated;
-      if (state.conflict) {
-        const other = state.conflict;
+      ctx.env = taken.environment;
+      if ('conflict' in taken) {
+        const other = taken.conflict;
         return { user: { known: true, use: 'busy', text: `The window ${other.windowId} (process ${other.pid}) holds the busy mark ${other.operation} since ${other.since}.` } };
       }
       this.logger.info(`${ctx.env.repository} is marked as busy (${operation}).`);
-      return { mark };
+      return { mark: taken.mark };
     } catch (error) {
       this.logger.warn(`The busy mark of ${ctx.env.repository} could not be set: ${errorMessage(error)}.`);
       return { user: { known: false, text: `It is not known whether another window uses ${ctx.env.repository}.` } };
@@ -4491,9 +4418,7 @@ export class EnvironmentService {
   private async releaseStepMark(ctx: PipelineContext, mark: BusyMark): Promise<boolean> {
     let gone = false;
     await this.quietly('clear the busy mark', async () => {
-      const updated = await this.deps.registry.updateEnvironment(ctx.env.id, (entry) => {
-        if (entry.busy !== undefined && sameBusyMark(entry.busy, mark)) delete entry.busy;
-      });
+      const updated = await this.openRecords.releaseStepMark(ctx.env.id, mark);
       if (updated) {
         ctx.env = updated;
         gone = updated.busy === undefined || !sameBusyMark(updated.busy, mark);
@@ -4511,9 +4436,7 @@ export class EnvironmentService {
     // is written.
     for (let attempt = 1; ; attempt++) {
       try {
-        await this.updateEntry(ctx, (entry) => {
-          entry.lifecycleIncomplete = id;
-        });
+        this.entryUpdated(ctx, await this.openRecords.lifecycleMark(ctx.env.id, { set: id }));
         this.logger.warn(`The container ${name} runs without its lifecycle commands. The next open runs them.`);
         return true;
       } catch (error) {
@@ -4620,10 +4543,8 @@ export class EnvironmentService {
     if (unrecorded !== undefined && sameContainer(unrecorded, containerId)) this.unrecordedLifecycle.delete(ctx.env.id);
     const mark = ctx.env.lifecycleIncomplete;
     if (mark === undefined || !sameContainer(mark, containerId)) return;
-    await this.quietly('clear the mark of the container whose lifecycle commands did not run', () =>
-      this.updateEntry(ctx, (entry) => {
-        delete entry.lifecycleIncomplete;
-      }),
+    await this.quietly('clear the mark of the container whose lifecycle commands did not run', async () =>
+      this.entryUpdated(ctx, await this.openRecords.lifecycleMark(ctx.env.id, 'clear')),
     );
   }
 
@@ -4812,12 +4733,7 @@ export class EnvironmentService {
     const own = ctx.env.serviceFolders ?? [];
     const sameOverflow = (ctx.env.serviceFoldersOverflow === true) === facts.overflow;
     if (sameOverflow && own.length === next.length && own.every((folder, i) => folder === next[i])) return;
-    await this.updateEntry(ctx, (entry) => {
-      if (next.length > 0) entry.serviceFolders = [...next];
-      else delete entry.serviceFolders;
-      if (facts.overflow) entry.serviceFoldersOverflow = true;
-      else delete entry.serviceFoldersOverflow;
-    });
+    this.entryUpdated(ctx, await this.openRecords.configuration(ctx.env.id, { serviceFolders: { folders: next, overflow: facts.overflow } }));
   }
 
   /**
@@ -5225,10 +5141,7 @@ export class EnvironmentService {
   private async recordAdditionalVolumes(ctx: PipelineContext, names: readonly string[]): Promise<void> {
     const added = names.filter((name) => name !== ctx.env.volumeName && !(ctx.env.additionalVolumes ?? []).includes(name));
     if (added.length === 0) return;
-    await this.updateEntry(ctx, (entry) => {
-      const current = entry.additionalVolumes ?? [];
-      entry.additionalVolumes = [...current, ...added.filter((name) => !current.includes(name))];
-    });
+    this.entryUpdated(ctx, await this.openRecords.configuration(ctx.env.id, { addVolumes: added }));
   }
 
   /**
@@ -5448,26 +5361,20 @@ export class EnvironmentService {
     this.throwIfCancelled(ctx.signal);
     const remoteWorkspaceFolder = nonEmptyString(outcome.result?.remoteWorkspaceFolder) ?? env.remoteWorkspaceFolder ?? folder;
     const now = isoTime(this.deps.clock);
-    // Read before the lock: the mutator does no I/O.
-    const blocks = await this.markBlocker();
+    // Read before the lock: the mutator does no I/O. Plan step 11E4a: and before the pending file, as it was.
+    const liveness = await this.markLiveness();
     // First the pending file, then the busy mark goes: the container stays in use without a gap (concept 7.9).
     await this.deps.sessionFiles.writePending(env.id, this.deps.owner.windowId);
-    await this.updateEntry(ctx, (entry) => {
-      entry.lastUsedAt = now;
-      // Unit 7, PR 2: Close and Keep Running holds only until a window connects again.
-      delete entry.keepRunningOnce;
-      // Review round 3 of PR #68 (A-R3-5): the container that opens ran its lifecycle commands now (or runs as it ran
-      // before, and a mark of another container names one that this open replaced or that is gone). Review round 4
-      // (A-R4-1): only the mark that this run decided with, or one that names the container whose lifecycle commands this
-      // run ran; a mark that another window set meanwhile (Step 9 holds no busy mark) stays.
-      if (lifecycleMarkClears(entry.lifecycleIncomplete, ctx.lifecycleMarkRead, ctx.lifecycleRanFor)) delete entry.lifecycleIncomplete;
-      if (remoteUser) entry.remoteUser = remoteUser;
-      entry.remoteWorkspaceFolder = remoteWorkspaceFolder;
-      if (gitSummary) entry.gitSummary = gitSummary;
-      // The own mark, and a mark that an ended window left behind (it protects nothing, see markBlocker). A live mark of
-      // another window stays.
-      if (entry.busy && (this.isOwnMark(entry.busy) || !blocks(entry.busy))) delete entry.busy;
+    const finished = await this.openRecords.openFinished(ctx.env.id, {
+      lastUsedAt: now,
+      ...(ctx.lifecycleMarkRead !== undefined ? { lifecycleMarkRead: ctx.lifecycleMarkRead } : {}),
+      ...(ctx.lifecycleRanFor !== undefined ? { lifecycleRanFor: ctx.lifecycleRanFor } : {}),
+      ...(remoteUser ? { remoteUser } : {}),
+      remoteWorkspaceFolder,
+      ...(gitSummary ? { gitSummary } : {}),
+      liveness,
     });
+    this.entryUpdated(ctx, finished);
     ctx.busy = false;
     // Review round 4 of PR #68 (B-R4-2): the mark that this window remembers goes once the lifecycle commands of its
     // container ran.
@@ -7219,29 +7126,19 @@ export class EnvironmentService {
     return { operation, since: isoTime(this.deps.clock), pid: this.deps.owner.pid, windowId: this.deps.owner.windowId };
   }
 
-  private isOwnMark(mark: BusyMark): boolean {
-    return mark.windowId === this.deps.owner.windowId && mark.pid === this.deps.owner.pid;
-  }
-
   /**
    * Returns the test "a live mark of another window" (concept 7.9 rule 1, `isBusyMarkLive`): a mark of an ended process,
    * a mark older than 6 hours, and (with window status files) a mark whose window has no recent status file of that
    * process are ignored. Reads the window status files once per call.
    */
   private async markBlocker(): Promise<(mark: BusyMark) => boolean> {
-    let windowStatuses: readonly WindowStatus[] | undefined;
-    if (this.deps.windowStatuses) {
-      try {
-        windowStatuses = await this.deps.windowStatuses();
-      } catch (error) {
-        this.logger.warn(`The window status files could not be read: ${errorMessage(error)}`);
-      }
-    }
-    const now = this.deps.clock.now();
-    return (mark) =>
-      !this.isOwnMark(mark) &&
-      mark.pid !== this.deps.owner.pid &&
-      isBusyMarkLive(mark, { now, isAlive: this.isAlive, windowStatuses });
+    const liveness = await this.markLiveness();
+    return (mark) => otherWindowMarkIsLive(mark, this.markView, liveness);
+  }
+
+  /** Plan step 11E4a: what markBlocker decides with (the window status files, read once, and the time), as plain data. */
+  private markLiveness(): Promise<MarkLiveness> {
+    return readLiveness(this.markView);
   }
 
   /**
@@ -7372,8 +7269,8 @@ export class EnvironmentService {
 
   // --- General ---------------------------------------------------------------------------------------------------------
 
-  private async updateEntry(ctx: PipelineContext, mutator: (entry: Environment) => void): Promise<void> {
-    const updated = await this.deps.registry.updateEnvironment(ctx.env.id, mutator);
+  /** Plan step 11E4a: the entry that an OpenRecords write returned becomes ctx.env; a missing one is environmentMissing. */
+  private entryUpdated(ctx: PipelineContext, updated: Environment | undefined): void {
     if (!updated) throw environmentMissing(ctx.env.repository);
     ctx.env = updated;
   }
