@@ -6,6 +6,7 @@
 // call becomes a request of its kind to the extension (plan step 11A, `OperationContext.ask`), which answers it. Pure
 // over `ask`; no I/O of its own, no `vscode`.
 import { BUSY_OPERATIONS, type BusyMarkResult } from '../pipeline/busyMarks';
+import type { StepMarkResult } from '../pipeline/openRecords';
 import type { BusyMark, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
 
@@ -37,6 +38,34 @@ export function parseBusyMarkAnswer(value: unknown, environmentId: string): Busy
     if (conflict !== undefined && environment === undefined && isBusyMark(conflict)) return { conflict };
   }
   throw new Error('The extension answered the busy mark with an invalid value.');
+}
+
+/**
+ * Plan step 11E4b: the answer of a registry write of the open (`record createMark`, `record stepMark` `release`, `record
+ * ownerLogin`, `record lifecycleMark`, `record openFinished`): the entry of `environmentId`, or undefined (no entry).
+ * Anything else is a failure of the request.
+ */
+export function parseEntryAnswer(value: unknown, environmentId: string): Environment | undefined {
+  if (value === null) return undefined;
+  if (typeof value === 'object' && !Array.isArray(value) && (value as { id?: unknown }).id === environmentId) return value as Environment;
+  throw new Error('The extension answered the registry write with an invalid value.');
+}
+
+/**
+ * Plan step 11E4b: the answer of `record stepMark` `take` (OpenRecords.takeStepMark): the entry of `environmentId` with
+ * the mark that was set or the mark that keeps it, or undefined (no entry). Anything else is a failure of the request
+ * (never taken as a mark of this window).
+ */
+export function parseStepMarkAnswer(value: unknown, environmentId: string): StepMarkResult {
+  if (value === null) return undefined;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const { environment, mark, conflict } = value as { environment?: unknown; mark?: unknown; conflict?: unknown };
+    if (typeof environment === 'object' && environment !== null && !Array.isArray(environment) && (environment as { id?: unknown }).id === environmentId) {
+      if (mark !== undefined && conflict === undefined && isBusyMark(mark)) return { environment: environment as Environment, mark };
+      if (conflict !== undefined && mark === undefined && isBusyMark(conflict)) return { environment: environment as Environment, conflict };
+    }
+  }
+  throw new Error('The extension answered the step mark with an invalid value.');
 }
 
 function isBusyMark(value: unknown): value is BusyMark {
@@ -116,6 +145,17 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       clearBusy: async (environmentId) => void (await call('record', 'clearBusy', environmentId)),
       recordGitSummary: async (environmentId, summary) => void (await call('record', 'recordGitSummary', environmentId, summary)),
       restore: async (entries) => parseRestoreAnswer(await call('record', 'restore', entries)),
+      // Plan step 11E4b (decision of 2026-10-04): the registry writes of the open; the scope is the extension's (never sent).
+      createMark: async (environmentId, kind, previous) =>
+        parseEntryAnswer(
+          kind === 'previous' && previous !== undefined ? await call('record', 'createMark', environmentId, kind, previous) : await call('record', 'createMark', environmentId, kind),
+          environmentId,
+        ),
+      takeStepMark: async (environmentId, operation) => parseStepMarkAnswer(await call('record', 'stepMark', environmentId, 'take', operation), environmentId),
+      releaseStepMark: async (environmentId, mark) => parseEntryAnswer(await call('record', 'stepMark', environmentId, 'release', mark), environmentId),
+      ownerLogin: async (environmentId) => parseEntryAnswer(await call('record', 'ownerLogin', environmentId), environmentId),
+      lifecycleMark: async (environmentId, change) => parseEntryAnswer(await call('record', 'lifecycleMark', environmentId, change), environmentId),
+      openFinished: async (environmentId, finish) => parseEntryAnswer(await call('record', 'openFinished', environmentId, finish), environmentId),
     },
     secrets: {
       token: async () => {

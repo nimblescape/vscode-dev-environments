@@ -13,7 +13,8 @@ import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
-import { registryBusyMarks } from '../core/pipeline/busyMarks';
+import { registryBusyMarks, type BusyMarkView } from '../core/pipeline/busyMarks';
+import { requestOpenRecords, type OpenRequestScope, type OpenRequests } from '../core/worker/openRequests';
 import { isoTime, type Clock } from '../core/ports';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { HelperChannels } from '../core/helperChannel/helperChannels';
@@ -48,13 +49,23 @@ const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
 /** Plan step 11B1: what a flow in the worker may ask this computer for. */
 export function extensionHostSide(deps: HostSideDeps): HostSide {
   // Plan step 11C2a (decision of 2026-10-04): the same busy marks as the pipeline of this window sets itself.
-  const busyMarks = registryBusyMarks(deps.registry, {
+  const markView: BusyMarkView = {
     owner: { windowId: deps.windowId, pid: deps.pid },
     clock: deps.clock,
     isAlive: (pid) => deps.isProcessAlive(pid),
     windowStatuses: () => deps.sessionFiles.readWindowStatuses(),
     logger: deps.logger,
-  });
+  };
+  const busyMarks = registryBusyMarks(deps.registry, markView);
+  // Plan step 11E4b (decision of 2026-10-04): the registry writes of the open for a request of the worker, with the owner,
+  // clock and view of the windows of this window, only on an entry of the account signed in here (read now, never the
+  // worker's) on the Docker host of the operation (`scope`, from the handler).
+  const openRequests = async (scope: OpenRequestScope | undefined): Promise<OpenRequests> => {
+    if (scope === undefined) throw new Error('The registry write of the open names no Docker host of its operation.');
+    const account = await deps.auth.getAccount({ interactive: false });
+    if (account === undefined) throw new Error('No GitHub account is signed in in this window.');
+    return requestOpenRecords(deps.registry, markView, { account: { id: account.id, login: account.login }, dockerHost: scope.dockerHost });
+  };
   return {
     questions: {
       confirmUntrustedRepository: (repository) => deps.ui.confirmUntrustedRepository(repository),
@@ -103,7 +114,7 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         else if (kind === 'removeReopenOf') await deps.sessionFiles.removeReopenOf(environmentId);
         else await deps.sessionFiles.removeDisconnectRequest(environmentId);
       },
-      markBusy: (environmentId, operation) => busyMarks.mark(environmentId, operation),
+      markBusy: (environmentId, operation, onReplaced) => busyMarks.mark(environmentId, operation, onReplaced),
       clearBusy: (environmentId) => busyMarks.clear(environmentId),
       // Plan step 11C2b (decision of 2026-10-04): the Git state that the worker read, under the registry lock.
       recordGitSummary: async (environmentId, summary) =>
@@ -115,6 +126,13 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         const now = isoTime(deps.clock);
         return deps.registry.restore(entries.map((entry) => ({ ...entry, createdAt: now, lastUsedAt: now })));
       },
+      // Plan step 11E4b: the registry writes of the open (requestOpenRecords).
+      createMark: async (environmentId, kind, previous, scope) => (await openRequests(scope)).createMark(environmentId, kind, previous),
+      takeStepMark: async (environmentId, operation, scope) => (await openRequests(scope)).takeStepMark(environmentId, operation),
+      releaseStepMark: async (environmentId, mark, scope) => (await openRequests(scope)).releaseStepMark(environmentId, mark),
+      ownerLogin: async (environmentId, scope) => (await openRequests(scope)).ownerLogin(environmentId),
+      lifecycleMark: async (environmentId, change, scope) => (await openRequests(scope)).lifecycleMark(environmentId, change),
+      openFinished: async (environmentId, finish, scope) => (await openRequests(scope)).openFinished(environmentId, finish),
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),

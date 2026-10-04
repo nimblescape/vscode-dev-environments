@@ -71,6 +71,13 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       recordGitSummary: async (environmentId, summary) => void record('recordGitSummary', environmentId, summary),
       // Plan step 11C3.
       restore: async (entries) => (record('restore', entries), of('restore', { added: entries.length, skipped: [] as string[] })),
+      // Plan step 11E4b: the registry writes of the open (their tests: hostSide.openRequests.test.ts).
+      createMark: async (environmentId, kind, previous, scope) => (record('createMark', environmentId, kind, previous, scope), of('createMark', undefined)),
+      takeStepMark: async (environmentId, operation, scope) => (record('takeStepMark', environmentId, operation, scope), of('takeStepMark', undefined)),
+      releaseStepMark: async (environmentId, mark, scope) => (record('releaseStepMark', environmentId, mark, scope), of('releaseStepMark', undefined)),
+      ownerLogin: async (environmentId, scope) => (record('ownerLogin', environmentId, scope), of('ownerLogin', undefined)),
+      lifecycleMark: async (environmentId, change, scope) => (record('lifecycleMark', environmentId, change, scope), of('lifecycleMark', undefined)),
+      openFinished: async (environmentId, finish, scope) => (record('openFinished', environmentId, finish, scope), of('openFinished', undefined)),
     },
     secrets: {
       token: async () => (record('token'), of('token', undefined)),

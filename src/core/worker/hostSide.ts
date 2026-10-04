@@ -8,8 +8,10 @@
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
 import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MONITOR_ENSURE, OP_MONITOR_SETTINGS, OP_RECONCILE, OP_RECORD_GIT_STATE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
-import type { BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
+import type { BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
+import type { LifecycleMarkChange, StepMarkResult } from '../pipeline/openRecords';
+import type { HostOpenFinish, OpenRequestScope } from './openRequests';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
 export interface HostQuestions {
@@ -60,9 +62,11 @@ export interface HostRecords {
   sessionFile(kind: HostSessionFile, environmentId: string): Promise<void>;
   /**
    * Plan step 11C2a (decision of 2026-10-04): the busy mark of the window that sent the operation, set by the extension
-   * with its clock and its view of the windows, under its registry lock (registryBusyMarks).
+   * with its clock and its view of the windows, under its registry lock (registryBusyMarks). Plan step 11E4b:
+   * `onReplaced` hears the mark that the new mark replaced (the extension's handler remembers it for `record createMark`
+   * `previous`); the worker's side never passes it.
    */
-  markBusy(environmentId: string, operation: BusyOperation): Promise<BusyMarkResult>;
+  markBusy(environmentId: string, operation: BusyOperation, onReplaced?: (mark: BusyMark) => void): Promise<BusyMarkResult>;
   /** Plan step 11C2a: removes the busy mark of the window that sent the operation. */
   clearBusy(environmentId: string): Promise<void>;
   /**
@@ -76,6 +80,25 @@ export interface HostRecords {
    * volumes whose repository has an environment of the same owner already.
    */
   restore(entries: readonly Environment[]): Promise<{ added: number; skipped: string[] }>;
+  /**
+   * Plan step 11E4b (decision of 2026-10-04): the registry writes of the open (OpenRecords), each a request of its own
+   * that the extension applies under its registry lock with its owner, clock, account and view of the windows, only on the
+   * entry of the operation's environment of the signed-in account on the operation's Docker host (requestOpenRecords).
+   * `scope` is what the extension's handler takes from the operation, never from the request; the worker's side never
+   * passes it, and the extension refuses without it. `record createMark`: `previous` only as a mark that a `record
+   * markBusy` of the same operation replaced.
+   */
+  createMark(environmentId: string, kind: 'ended' | 'previous', previous: BusyMark | undefined, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /** Plan step 11E4b: `record stepMark` `take`; the extension builds the mark (its owner and clock). */
+  takeStepMark(environmentId: string, operation: BusyOperation, scope?: OpenRequestScope): Promise<StepMarkResult>;
+  /** Plan step 11E4b: `record stepMark` `release`, only a mark of the window that sent the operation. */
+  releaseStepMark(environmentId: string, mark: BusyMark, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /** Plan step 11E4b: `record ownerLogin`, the login of the account signed in in the extension (never the worker's). */
+  ownerLogin(environmentId: string, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /** Plan step 11E4b: `record lifecycleMark`. */
+  lifecycleMark(environmentId: string, change: LifecycleMarkChange, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /** Plan step 11E4b: `record openFinished`; the time and the liveness are the extension's. */
+  openFinished(environmentId: string, finish: HostOpenFinish, scope?: OpenRequestScope): Promise<Environment | undefined>;
 }
 
 /** The session files that a flow writes or removes (HostRecords.sessionFile). */
@@ -203,6 +226,9 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
 export const DETAILED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record sessionFile': 0,
   'record markBusy': 1,
+  // Plan step 11E4b: the kind of the create mark (`ended`, `previous`) and of the step mark (`take`, `release`).
+  'record createMark': 1,
+  'record stepMark': 1,
 };
 
 /**
@@ -217,4 +243,10 @@ export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record update': 0,
   'record sessionFile': 1,
   'record recordGitSummary': 0,
+  // Plan step 11E4b: the registry writes of the open (OpenRecords); no operation sends them before plan step 11E6.
+  'record createMark': 0,
+  'record stepMark': 0,
+  'record ownerLogin': 0,
+  'record lifecycleMark': 0,
+  'record openFinished': 0,
 };

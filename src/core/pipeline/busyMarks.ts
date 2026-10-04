@@ -24,8 +24,11 @@ export type BusyMarkResult = { environment: Environment } | { conflict: BusyMark
 
 /** The busy marks of the window that runs the operation. */
 export interface EnvironmentBusyMarks {
-  /** Sets the mark of this window for `operation`, unless a live mark of another window keeps the environment. */
-  mark(environmentId: string, operation: BusyOperation): Promise<BusyMarkResult>;
+  /**
+   * Sets the mark of this window for `operation`, unless a live mark of another window keeps the environment. Plan step
+   * 11E4b: `onReplaced` hears the mark that the new mark replaced, once it is written.
+   */
+  mark(environmentId: string, operation: BusyOperation, onReplaced?: (mark: BusyMark) => void): Promise<BusyMarkResult>;
   /** Removes the mark of this window; a mark of another window stays. */
   clear(environmentId: string): Promise<void>;
 }
@@ -44,7 +47,7 @@ export interface BusyMarkView {
 export function registryBusyMarks(registry: Pick<EnvironmentRegistry, 'updateEnvironment'>, view: BusyMarkView): EnvironmentBusyMarks {
   const isOwnMark = (mark: BusyMark) => mark.windowId === view.owner.windowId && mark.pid === view.owner.pid;
   return {
-    async mark(environmentId, operation) {
+    async mark(environmentId, operation, onReplaced) {
       let windowStatuses: readonly WindowStatus[] | undefined;
       if (view.windowStatuses) {
         try {
@@ -56,15 +59,18 @@ export function registryBusyMarks(registry: Pick<EnvironmentRegistry, 'updateEnv
       const now = view.clock.now();
       const mark: BusyMark = { operation, since: isoTime(view.clock), pid: view.owner.pid, windowId: view.owner.windowId };
       let conflict: BusyMark | undefined;
+      let replaced: BusyMark | undefined;
       // Read before the lock: the mutator does no I/O.
       const updated = await registry.updateEnvironment(environmentId, (entry) => {
         if (entry.busy && !isOwnMark(entry.busy) && isBlockingBusyMark(entry.busy, view.owner, { now, isAlive: view.isAlive, windowStatuses })) {
           conflict = entry.busy;
           return;
         }
+        replaced = entry.busy === undefined ? undefined : { ...entry.busy };
         entry.busy = mark;
       });
       if (updated === undefined) return undefined;
+      if (conflict === undefined && replaced !== undefined) onReplaced?.(replaced);
       return conflict !== undefined ? { conflict } : { environment: updated };
     },
     async clear(environmentId) {

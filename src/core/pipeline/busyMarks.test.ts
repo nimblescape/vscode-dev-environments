@@ -75,3 +75,18 @@ describe('the busy marks of the window that runs the operation (plan step 11C2a)
     await expect(marks.clear('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b')).resolves.toBeUndefined();
   });
 });
+
+// Plan step 11E4b: the mark that a new mark replaced, which the extension remembers for `record createMark` `previous`.
+describe('the mark that a busy mark replaced (plan step 11E4b)', () => {
+  it('is heard once the new mark is written; nothing for no mark, a conflict or a missing entry', async () => {
+    const heard: BusyMark[] = [];
+    const listen = (mark: BusyMark) => void heard.push(mark);
+    const ended = other({ since: new Date(NOW - BUSY_MARK_MAX_AGE_MS - 1).toISOString() });
+    await setup(ended).marks.mark(ID, 'create', listen);
+    expect(heard).toEqual([ended]);
+    await setup().marks.mark(ID, 'create', listen);
+    await setup(other()).marks.mark(ID, 'create', listen);
+    await setup().marks.mark('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b', 'create', listen);
+    expect(heard).toEqual([ended]);
+  });
+});
