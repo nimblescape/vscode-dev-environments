@@ -3,6 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Interfaces through which code in src/core receives what it needs. Code in src/core never imports `vscode`.
+import type { DeleteConfirmation } from './pipeline/deleteCheck';
 import type { ProgressStep } from './messages';
 import type { GitHubAccount } from './types';
 
@@ -177,6 +178,19 @@ export interface PipelineUi {
    * lost). `true` only when the user chooses Recreate; a dismissed question changes nothing.
    */
   recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean>;
+  /**
+   * Plan step 11C2b (moved from the controller): the confirmation of Delete (concept 7.14 step 1) with its facts
+   * (DeleteConfirmation of deleteCheck.ts, which the extension words). `open`: Open environment (offered with changes);
+   * `undefined`: cancel.
+   */
+  confirmDelete(repository: string, confirmation: DeleteConfirmation): Promise<'delete' | 'open' | undefined>;
+  /** Plan step 11C2b: the additional volumes that Delete may remove too (Remove or Keep); `undefined`: cancel. */
+  deleteAdditionalVolumes(volumes: readonly string[]): Promise<'remove' | 'keep' | undefined>;
+  /**
+   * Plan step 11C2b (D-19): the volumes with the data of services, none ticked; the ticked ones are removed;
+   * `possibly`: those that may hold data of services (review round 3, P3-4). `undefined`: cancel.
+   */
+  deleteServiceData(volumes: readonly string[], possibly: readonly string[]): Promise<string[] | undefined>;
   /** Non-blocking information message. */
   info(message: string): void;
   /** Non-blocking warning message. */

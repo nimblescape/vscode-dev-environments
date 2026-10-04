@@ -143,6 +143,10 @@ export function hostUi(questions: HostSide['questions'], log: Logger): PipelineU
     configurationKindChanged: (repository, text) => questions.configurationKindChanged(repository, text),
     filesMissing: (repository) => questions.filesMissing(repository),
     recreateContainer: (repository, question) => questions.recreateContainer(repository, question),
+    // Plan step 11C2b: the questions of Delete.
+    confirmDelete: (repository, confirmation) => questions.confirmDelete(repository, confirmation),
+    deleteAdditionalVolumes: (volumes) => questions.deleteAdditionalVolumes(volumes),
+    deleteServiceData: (volumes, possibly) => questions.deleteServiceData(volumes, possibly),
     info: (text) => message('info', text),
     warn: (text) => message('warn', text),
     registrySignIn: (registry) => message('registrySignIn', registry),
@@ -224,6 +228,8 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     registry: hostStore(deps.host.records),
     // Plan step 11C2a (decision of 2026-10-04): the busy marks are set and cleared by the extension.
     busyMarks: hostBusyMarks(deps.host.records),
+    // Plan step 11C2b (decision of 2026-10-04): the Git state is recorded by the extension.
+    recordGitSummary: (environmentId, summary) => deps.host.records.recordGitSummary(environmentId, summary),
     sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),
     sessionFiles: hostSessionFiles(deps.host),
     windowStatuses: () => deps.host.state.windowStatuses(),

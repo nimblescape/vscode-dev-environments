@@ -8,8 +8,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BatchHelperUnavailableError, UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, OP_DELETE, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
-import { DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
+import { LOCK_BUSY_CODE, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
+import { DELETE_CHECK_FLOW_TIMEOUT_MS, DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { EnvironmentServiceDeps } from './environmentService';
@@ -362,5 +362,53 @@ describe('the Delete in the worker: review round 1 of 11C2a', () => {
     await seedEnvironment(h, { container: 'stopped' });
     expect(await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }))).toMatchObject({ code: 'startFailed' });
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(OWN_MARK);
+  });
+});
+
+// Plan step 11C2b (decisions of 2026-10-03 and 2026-10-04): the check of Delete and its questions from the extension's
+// side: it sends `deleteCheck` to the worker and gives back the decision of the user, or throws the refusal.
+describe('the check of Delete in the worker, from the extension (plan step 11C2b)', () => {
+  it('sends the environment, the Docker host, this window, the name that the user sees and the other window; gives back the decision', async () => {
+    const { h, sent } = harness(async () => ({ decision: 'delete', additionalVolumesToRemove: ['api-cache'] }));
+    await seedEnvironment(h, { container: 'running' });
+    const controller = new AbortController();
+    expect(await h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, repository: 'Acme/API', otherWindow: true })).toEqual({
+      decision: 'delete',
+      additionalVolumesToRemove: ['api-cache'],
+    });
+    expect(sent).toEqual([
+      {
+        op: OP_DELETE_CHECK,
+        params: { environmentId: ENV_ID, dockerHost: '', owner: { windowId: WINDOW_ID, pid: PID }, repository: 'Acme/API', otherWindow: true },
+        timeoutMs: DELETE_CHECK_FLOW_TIMEOUT_MS,
+        signal: controller.signal,
+        passive: undefined,
+      },
+    ]);
+    // Nothing is read here: no helper step, no Docker call.
+    expect(h.helper.calls).toEqual([]);
+  });
+
+  it('throws the refusal of the worker, refuses as for Stop without a worker, and an answer that is not a decision', async () => {
+    let answer: () => Promise<unknown> = async () => ({ refused: { code: 'otherAccount', message: 'Another account.' } });
+    const { h } = harness(() => answer());
+    await seedEnvironment(h, { container: 'stopped' });
+    const check = () => rejection(h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: 'acme/api', otherWindow: false }));
+    expect(await check()).toMatchObject({ code: 'otherAccount', message: 'Another account.' });
+    answer = async () => {
+      throw new HelperChannelError('unavailable', 'no worker');
+    };
+    expect(await check()).toMatchObject({ code: 'helperFailed' });
+    answer = async () => ({ decision: 'maybe' });
+    expect(((await check()) as Error).message).toContain('with an invalid value');
+  });
+
+  it('an environment that is not in the registry, or of another Docker host, sends nothing', async () => {
+    const { h, sent } = harness(async () => ({ decision: 'delete', additionalVolumesToRemove: [] }));
+    expect(await h.service.deleteCheckInWorker('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b', { progress: h.progress, repository: 'acme/api', otherWindow: false })).toEqual({ decision: 'cancel' });
+    const other = harness(async () => ({ decision: 'delete', additionalVolumesToRemove: [] }), { dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
+    await seedEnvironment(other.h, { container: 'stopped' });
+    expect(await rejection(other.h.service.deleteCheckInWorker(ENV_ID, { progress: other.h.progress, repository: 'acme/api', otherWindow: false }))).toMatchObject({ code: 'otherDockerHost' });
+    expect([...sent, ...other.sent]).toEqual([]);
   });
 });

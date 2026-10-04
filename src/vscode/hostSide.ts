@@ -62,6 +62,10 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       configurationKindChanged: (repository, message) => deps.ui.configurationKindChanged(repository, message),
       filesMissing: (repository) => deps.ui.filesMissing(repository),
       recreateContainer: (repository, question) => deps.ui.recreateContainer(repository, question),
+      // Plan step 11C2b: the questions of Delete.
+      confirmDelete: (repository, confirmation) => deps.ui.confirmDelete(repository, confirmation),
+      deleteAdditionalVolumes: (volumes) => deps.ui.deleteAdditionalVolumes(volumes),
+      deleteServiceData: (volumes, possibly) => deps.ui.deleteServiceData(volumes, possibly),
       message: async (kind, text) => {
         if (kind === 'info') deps.ui.info(text);
         else if (kind === 'warn') deps.ui.warn(text);
@@ -101,6 +105,11 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       },
       markBusy: (environmentId, operation) => busyMarks.mark(environmentId, operation),
       clearBusy: (environmentId) => busyMarks.clear(environmentId),
+      // Plan step 11C2b (decision of 2026-10-04): the Git state that the worker read, under the registry lock.
+      recordGitSummary: async (environmentId, summary) =>
+        void (await deps.registry.updateEnvironment(environmentId, (entry) => {
+          entry.gitSummary = summary;
+        })),
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),

@@ -60,6 +60,19 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
         return answer === 'cloneAgain' || answer === 'deleteEnvironment' ? answer : undefined;
       },
       recreateContainer: async (repository, question) => (await call('question', 'recreateContainer', repository, question)) === true,
+      // Plan step 11C2b: the questions of Delete; anything but a known answer is cancel.
+      confirmDelete: async (repository, confirmation) => {
+        const answer = await call('question', 'confirmDelete', repository, confirmation);
+        return answer === 'delete' || answer === 'open' ? answer : undefined;
+      },
+      deleteAdditionalVolumes: async (volumes) => {
+        const answer = await call('question', 'deleteAdditionalVolumes', [...volumes]);
+        return answer === 'remove' || answer === 'keep' ? answer : undefined;
+      },
+      deleteServiceData: async (volumes, possibly) => {
+        const answer = await call('question', 'deleteServiceData', [...volumes], [...possibly]);
+        return Array.isArray(answer) && answer.every((name) => typeof name === 'string' && volumes.includes(name)) ? (answer as string[]) : undefined;
+      },
       message: async (kind, text) => void (await call('question', 'message', kind, text)),
     },
     state: {
@@ -87,6 +100,7 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       sessionFile: async (kind, environmentId) => void (await call('record', 'sessionFile', kind, environmentId)),
       markBusy: async (environmentId, operation) => parseBusyMarkAnswer(await call('record', 'markBusy', environmentId, operation), environmentId),
       clearBusy: async (environmentId) => void (await call('record', 'clearBusy', environmentId)),
+      recordGitSummary: async (environmentId, summary) => void (await call('record', 'recordGitSummary', environmentId, summary)),
     },
     secrets: {
       token: async () => {

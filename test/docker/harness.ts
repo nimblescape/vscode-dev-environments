@@ -234,6 +234,23 @@ export class FakeUi implements PipelineUi {
     return 'later';
   }
 
+  // Plan step 11C2b: the questions of Delete; by default Delete, Keep, nothing ticked.
+  deleteAnswer: 'delete' | 'open' | undefined = 'delete';
+  additionalVolumesAnswer: 'remove' | 'keep' | undefined = 'keep';
+  serviceDataAnswer: string[] | undefined = [];
+
+  async confirmDelete(repository: string): Promise<'delete' | 'open' | undefined> {
+    return this.deleteAnswer;
+  }
+
+  async deleteAdditionalVolumes(): Promise<'remove' | 'keep' | undefined> {
+    return this.additionalVolumesAnswer;
+  }
+
+  async deleteServiceData(): Promise<string[] | undefined> {
+    return this.serviceDataAnswer;
+  }
+
   async filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined> {
     this.events.push({ kind: 'filesMissing', text: repository });
     return undefined;

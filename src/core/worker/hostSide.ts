@@ -6,9 +6,10 @@
 // computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_DELETE, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
-import type { BusyOperation, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
+import type { BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
+import type { DeleteConfirmation } from '../pipeline/deleteCheck';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
 export interface HostQuestions {
@@ -17,6 +18,10 @@ export interface HostQuestions {
   configurationKindChanged(repository: string, message: string): Promise<'rebuildNow' | 'later'>;
   filesMissing(repository: string): Promise<'cloneAgain' | 'deleteEnvironment' | undefined>;
   recreateContainer(repository: string, question: { message: string; detail: string }): Promise<boolean>;
+  /** Plan step 11C2b: the questions of Delete (PipelineUi), with their facts; `undefined`: cancel. */
+  confirmDelete(repository: string, confirmation: DeleteConfirmation): Promise<'delete' | 'open' | undefined>;
+  deleteAdditionalVolumes(volumes: readonly string[]): Promise<'remove' | 'keep' | undefined>;
+  deleteServiceData(volumes: readonly string[], possibly: readonly string[]): Promise<string[] | undefined>;
   /** A message without a question: info, warn, or the sign-in hint of a registry. */
   message(kind: 'info' | 'warn' | 'registrySignIn', text: string): Promise<void>;
 }
@@ -60,6 +65,11 @@ export interface HostRecords {
   markBusy(environmentId: string, operation: BusyOperation): Promise<BusyMarkResult>;
   /** Plan step 11C2a: removes the busy mark of the window that sent the operation. */
   clearBusy(environmentId: string): Promise<void>;
+  /**
+   * Plan step 11C2b (decision of 2026-10-04): records the Git state of the environment (Environment.gitSummary), as the
+   * worker read it in its running dev container.
+   */
+  recordGitSummary(environmentId: string, summary: GitSummary): Promise<void>;
 }
 
 /** The session files that a flow writes or removes (HostRecords.sessionFile). */
@@ -156,6 +166,17 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
     'record sessionFile.removeDisconnectRequest',
     'record sessionFile.removeReopenOf',
   ],
+  // Plan step 11C2b: the check of Delete reads the record, the registry (the volumes of the other environments) and the
+  // account, records the Git state of its environment (SCOPED_REQUESTS), and asks the questions of Delete; no secret.
+  [OP_DELETE_CHECK]: [
+    'record get',
+    'record read',
+    'local account',
+    'record recordGitSummary',
+    'question confirmDelete',
+    'question deleteAdditionalVolumes',
+    'question deleteServiceData',
+  ],
 };
 
 /**
@@ -179,4 +200,5 @@ export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record remove': 0,
   'record update': 0,
   'record sessionFile': 1,
+  'record recordGitSummary': 0,
 };

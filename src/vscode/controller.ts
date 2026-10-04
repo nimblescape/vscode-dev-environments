@@ -15,14 +15,14 @@ import { operationDockerTarget, outsideOperation, type DockerTargets } from '../
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
-import { Actions, Messages, formatChanges, lastSeenInUse, listSome, recordedStateNote } from '../core/messages';
+import { Actions, Messages } from '../core/messages';
 import { OP_TOKEN_REMOVE, parseTokenRemoveValue, type WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
-import { containerIsCurrent, isUnrestrictedContainer, repositoryServiceDataFolders } from '../core/pipeline/pipelineRules';
+import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -785,88 +785,18 @@ export class Controller implements vscode.Disposable {
       repository,
       'Delete',
       async () => {
-        const summary = await runWithProgress({
+        // Plan step 11C2b: the check of Delete and its questions run in the worker of the Docker host (deleteCheck.ts:
+        // the Git state, the data of services, the volumes that Delete may remove); the coordination of the windows
+        // below stays here.
+        const otherWindow = await this.connectedInOtherWindow(environment.id);
+        const decision = await runWithProgress({
           title: ControllerTexts.checkingChanges(repository),
           cancellable: true,
-          task: (progress, signal) => this.deps.service.safetyCheck(environment.id, { progress, signal }),
+          task: (progress, signal) => this.deps.service.deleteCheckInWorker(environment.id, { progress, signal, repository, otherWindow }),
         });
-        const otherWindow = (await this.connectedInOtherWindow(environment.id))
-          ? ` ${ControllerTexts.otherWindowClosesConnection(repository)}`
-          : '';
-        // User decision 2026-10-02 ("No git needs delete. ... we may flag uncommitted changes though, but that does not
-        // hinder deletion."): the summary is the recorded Git state (refreshed when the dev container runs); changes in it
-        // are named with "Delete anyway". Without a summary (nothing recorded, or the volume is missing), the plain
-        // confirmation follows at once. Either way the user can delete.
-        const changes = summary ? formatChanges(summary) : '';
-        // Review round 1 of PR #87 (A-R1-4): the state is recorded when the dev container runs (here, and when a window
-        // releases the environment), but not when that failed or the Session Monitor stopped it by the long limit. When
-        // the state is older than the last use of the environment (or none was recorded), the dialog says that later
-        // changes are not known. Only a message: Delete runs nothing in the container for it.
-        // Review round 2 of PR #87 (A-R2-2): the last use is the last time a window was seen using it (lastSeenInUse: also
-        // a reload and the start of a release, not only the open pipeline).
-        const used = (await this.deps.registry.get(environment.id).catch(() => undefined)) ?? environment;
-        const stateNote = recordedStateNote(summary ?? used.gitSummary, lastSeenInUse(used));
-        // Review round 9 (D9-2): the data of services in folders of the repository go with the workspace volume; the
-        // confirmation names them, as the question about the data volumes of the services (D-19) names those.
-        // Review round 11 (G3, G4): also the paths that the existing containers of the other services mount (for example
-        // of an entry that was restored from its volumes, without a record).
-        const repositoryData = [
-          ...new Set([
-            ...repositoryServiceDataFolders((await this.deps.registry.get(environment.id)) ?? environment),
-            ...(await this.deps.service.repositoryServiceData(environment.id).catch(() => [])),
-          ]),
-        ];
-        const repositoryDataText = repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(repositoryData))}` : '';
-        if (changes !== '') {
-          const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteUnsaved(repository, changes)}${stateNote}${repositoryDataText}${otherWindow}`,
-            { modal: true },
-            Actions.openEnvironment,
-            Actions.deleteAnyway,
-          );
-          if (choice === Actions.openEnvironment) openInstead = true;
-          if (choice !== Actions.deleteAnyway) return;
-        } else {
-          const choice = await vscode.window.showWarningMessage(
-            `${Messages.deleteConfirm(repository)}${stateNote}${repositoryDataText}${otherWindow}`,
-            { modal: true },
-            Actions.delete,
-          );
-          if (choice !== Actions.delete) return;
-        }
-        const confirmed = (await this.deps.registry.get(environment.id)) ?? environment;
-        // Only the volumes that Delete would remove (their labels make them the environment's own); the others are kept
-        // anyway, with a line in the log, so the question does not offer them.
-        const volumes = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableAdditionalVolumes(confirmed.id) : [];
-        let additionalVolumesToRemove: string[] = [];
-        if (volumes.length > 0) {
-          const choice = await vscode.window.showWarningMessage(
-            Messages.deleteAdditionalVolumes(volumes.join(', ')),
-            { modal: true },
-            Actions.remove,
-            Actions.keep,
-          );
-          if (choice === undefined) return;
-          additionalVolumesToRemove = choice === Actions.remove ? [...volumes] : [];
-        }
-        // D-19: the volumes of a Docker Compose project hold the data of its services (for example a database). They are
-        // listed apart, none ticked: only the ticked ones are removed, and Escape cancels the Delete.
-        const serviceData = (confirmed.additionalVolumes ?? []).length > 0 ? await this.deps.service.removableServiceDataVolumes(confirmed.id) : [];
-        if (serviceData.length > 0) {
-          // Review round 3 (P3-4): an environment whose services are not known lists its additional volumes as possible data.
-          const possibly = await this.deps.service.possibleServiceDataVolumes(confirmed.id);
-          const placeHolder = possibly.length > 0 ? Messages.deleteServiceDataPossiblePlaceholder : Messages.deleteServiceDataPlaceholder;
-          const picked = await vscode.window.showQuickPick(
-            serviceData.map((name) => ({
-              label: name,
-              description: possibly.includes(name) ? Messages.deleteServiceDataPossibleItem : Messages.deleteServiceDataItem,
-              picked: false,
-            })),
-            { title: Messages.deleteServiceDataTitle, placeHolder, canPickMany: true, ignoreFocusOut: true },
-          );
-          if (picked === undefined) return;
-          additionalVolumesToRemove = [...additionalVolumesToRemove, ...picked.map((item) => item.label)];
-        }
+        if (decision.decision === 'open') openInstead = true;
+        if (decision.decision !== 'delete') return;
+        const additionalVolumesToRemove = decision.additionalVolumesToRemove;
         // Concept 7.15: Delete is possible in every state; during an operation of another window it runs afterwards.
         if (!(await this.waitForOtherWindowOperation(repository, environment.id))) return;
         const current = await this.deps.registry.get(environment.id);

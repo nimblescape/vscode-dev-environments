@@ -1199,6 +1199,59 @@ export function parseDeleteValue(value: unknown): DeleteValue | undefined {
 }
 
 /**
+ * Plan step 11C2b (decisions of 2026-10-03 and 2026-10-04): `deleteCheck`, the check of Delete and its questions in the
+ * worker (EnvironmentService.deleteCheck, deleteCheck.ts): the Git state (refreshed in the running dev container and
+ * recorded through `record recordGitSummary`), the data of services and the volumes that Delete may remove, and the
+ * questions as `question` requests. Parameters DeleteCheckParams; value DeleteCheckValue; no secret.
+ */
+export const OP_DELETE_CHECK = 'deleteCheck';
+
+export interface DeleteCheckParams {
+  environmentId: string;
+  /** The Docker host of the operation as the extension resolved it ('' for the local Docker; DockerTargets.host). */
+  dockerHost: string;
+  /** The window that sends the operation (EnvironmentServiceDeps.owner). */
+  owner: { windowId: string; pid: number };
+  /** The name of the repository that the user sees (the questions name it). */
+  repository: string;
+  /** A window of this computer is connected to the environment (the confirmation says it closes its connection). */
+  otherWindow: boolean;
+}
+
+/** The decision of the user (DeleteDecision of deleteCheck.ts), or the refusal of the pipeline. */
+export type DeleteCheckValue =
+  | { decision: 'delete'; additionalVolumesToRemove: string[] }
+  | { decision: 'open' }
+  | { decision: 'cancel' }
+  | { refused: FlowRefusal };
+
+/** The strict check of DeleteCheckParams (both sides). */
+export function parseDeleteCheckParams(value: unknown): DeleteCheckParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'dockerHost', 'owner', 'repository', 'otherWindow'])) return undefined;
+  const base = parseListConfigurationsParams({ environmentId: value.environmentId, dockerHost: value.dockerHost, owner: value.owner });
+  if (base === undefined) return undefined;
+  const { repository, otherWindow } = value;
+  if (typeof repository !== 'string' || repository === '' || repository.length > 256 || /[\u0000-\u001f\u007f]/.test(repository)) return undefined;
+  if (typeof otherWindow !== 'boolean') return undefined;
+  return { ...base, repository, otherWindow };
+}
+
+/** The check of DeleteCheckValue (the extension). */
+export function parseDeleteCheckValue(value: unknown): DeleteCheckValue | undefined {
+  if (!isRecord(value)) return undefined;
+  if (hasOnlyKeys(value, ['refused'])) {
+    const refused = parseFlowRefusal(value.refused);
+    return refused === undefined ? undefined : { refused };
+  }
+  if (hasOnlyKeys(value, ['decision']) && (value.decision === 'open' || value.decision === 'cancel')) return { decision: value.decision };
+  if (!hasOnlyKeys(value, ['decision', 'additionalVolumesToRemove']) || value.decision !== 'delete') return undefined;
+  const { additionalVolumesToRemove } = value;
+  if (!Array.isArray(additionalVolumesToRemove) || additionalVolumesToRemove.length > MAX_DELETE_VOLUMES) return undefined;
+  if (!additionalVolumesToRemove.every((name) => typeof name === 'string' && DOCKER_NAME.test(name))) return undefined;
+  return { decision: 'delete', additionalVolumesToRemove: [...(additionalVolumesToRemove as string[])] };
+}
+
+/**
  * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): `windowState`, what an attached window reads of its dev
  * container, by the worker: its state, why it must not be used as it is (`outdated`, with `checks`, the host access
  * checks of its repository), and with `branch` the branch of the repository (the Git user and folder). It only reads;

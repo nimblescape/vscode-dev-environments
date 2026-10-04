@@ -8,6 +8,7 @@
 // pipeline can run again at any time.
 import * as path from 'path';
 import { registryBusyMarks, type EnvironmentBusyMarks } from './busyMarks';
+import { deleteCheck, type DeleteDecision } from './deleteCheck';
 import { isBusyMarkLive, otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
@@ -68,9 +69,12 @@ import {
   LOCK_UNAVAILABLE_CODE,
   newCleanupLabel,
   OP_DELETE,
+  OP_DELETE_CHECK,
   OP_LIST_CONFIGURATIONS,
   OP_STOP,
   OP_WINDOW_STATE,
+  parseDeleteCheckParams,
+  parseDeleteCheckValue,
   parseDeleteParams,
   parseDeleteValue,
   parseListConfigurationsParams,
@@ -294,6 +298,11 @@ export const LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS = 5 * 60_000;
  * stop and removal of the containers, the images, the volumes with their retries. Delete is not cancellable.
  */
 export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
+/**
+ * Plan step 11C2b: the longest check of Delete in the worker: the Git state (GIT_EXEC_TIMEOUT_MS) and the questions,
+ * which wait for the user.
+ */
+export const DELETE_CHECK_FLOW_TIMEOUT_MS = 60 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -473,6 +482,11 @@ export interface EnvironmentServiceDeps {
    * worker for its `forget`. Without it, deleteInWorker refuses.
    */
   monitorSource?: () => string;
+  /**
+   * Plan step 11C2b (decision of 2026-10-04): records the Git state of an environment (Environment.gitSummary). Default:
+   * through `registry`; the worker's pipeline sends it to the extension (`record recordGitSummary`).
+   */
+  recordGitSummary?: (environmentId: string, summary: GitSummary) => Promise<void>;
   /**
    * All window status files (SessionFiles.readWindowStatuses). When given, a busy mark of another window counts only
    * while that window also has a recent status file of the same process (see `isBusyMarkLive`), so a process ID that
@@ -5901,11 +5915,8 @@ export class EnvironmentService {
       const refreshed = await this.gitSummaryBeforeDelete(env, options.signal);
       this.throwIfCancelled(options.signal);
       if (refreshed === undefined) return env.gitSummary;
-      await this.quietly('record the Git state', () =>
-        this.deps.registry.updateEnvironment(env.id, (entry) => {
-          entry.gitSummary = refreshed;
-        }),
-      );
+      // Plan step 11C2b: one specific write (record recordGitSummary from the worker).
+      await this.quietly('record the Git state', () => this.recordGitSummary(env.id, refreshed));
       return refreshed;
     } catch (error) {
       throw this.toUserError(error, options.signal);
@@ -5955,6 +5966,79 @@ export class EnvironmentService {
     } catch (error) {
       this.logger.info(`The Git state could not be recorded: ${errorMessage(error)}`);
       return false;
+    }
+  }
+
+  /** Plan step 11C2b: records the Git state of an environment (EnvironmentServiceDeps.recordGitSummary). */
+  private async recordGitSummary(environmentId: string, summary: GitSummary): Promise<void> {
+    if (this.deps.recordGitSummary) {
+      await this.deps.recordGitSummary(environmentId, summary);
+      return;
+    }
+    await this.deps.registry.updateEnvironment(environmentId, (entry) => {
+      entry.gitSummary = summary;
+    });
+  }
+
+  /**
+   * Plan step 11C2b (moved from the controller's Delete): the check of Delete and its questions (deleteCheck.ts): the
+   * Git state (safetyCheck), the data of services in the repository, and the volumes that Delete may remove; the questions
+   * go to the user (PipelineUi, from the worker as its requests). `repository` is the name that the user sees; `otherWindow`:
+   * a window of this computer is connected to the environment. Runs in the worker (deleteCheckInWorker sends it there).
+   * An environment that is not in the registry is not deleted (cancel).
+   */
+  async deleteCheck(environmentId: string, options: OperationOptions & { repository: string; otherWindow: boolean }): Promise<DeleteDecision> {
+    const environment = await this.deps.registry.get(environmentId);
+    if (!environment) {
+      this.logger.info(`The environment ${environmentId} does not exist anymore. Nothing is deleted.`);
+      return { decision: 'cancel' };
+    }
+    const decision = await deleteCheck(
+      {
+        summary: () => this.safetyCheck(environmentId, options),
+        environment: () => this.deps.registry.get(environmentId),
+        repositoryServiceData: () => this.repositoryServiceData(environmentId),
+        removableAdditionalVolumes: () => this.removableAdditionalVolumes(environmentId),
+        removableServiceDataVolumes: () => this.removableServiceDataVolumes(environmentId),
+        possibleServiceDataVolumes: () => this.possibleServiceDataVolumes(environmentId),
+        ui: this.deps.ui,
+      },
+      environment,
+      options.repository,
+      options.otherWindow,
+    );
+    this.throwIfCancelled(options.signal);
+    return decision;
+  }
+
+  /**
+   * Plan step 11C2b (decisions of 2026-10-03 and 2026-10-04): the check of Delete and its questions in the worker of the
+   * Docker host of the operation (`deleteCheck`), which asks them through its requests. A refusal of its pipeline is
+   * thrown as before the move; a worker that cannot be reached is refused as for Stop (workerFlow). An environment that
+   * is not in the registry is not deleted (cancel); nothing is sent then.
+   */
+  async deleteCheckInWorker(environmentId: string, options: OperationOptions & { repository: string; otherWindow: boolean }): Promise<DeleteDecision> {
+    const environment = await this.deps.registry.get(environmentId);
+    if (!environment) {
+      this.logger.info(`The environment ${environmentId} does not exist anymore. Nothing is deleted.`);
+      return { decision: 'cancel' };
+    }
+    await this.requireCurrentHost(environment);
+    try {
+      const params = parseDeleteCheckParams({
+        environmentId: environment.id,
+        dockerHost: await this.currentDockerHost(),
+        owner: this.deps.owner,
+        repository: options.repository,
+        otherWindow: options.otherWindow,
+      });
+      if (params === undefined) throw new Error(`The check of the Delete of ${environment.repository} cannot be sent to the worker.`);
+      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal));
+      if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with an invalid value.`);
+      if ('refused' in value) throw refusalError(value.refused);
+      return value;
+    } catch (error) {
+      throw this.toUserError(error, options.signal);
     }
   }
 

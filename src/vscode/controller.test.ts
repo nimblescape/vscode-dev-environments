@@ -6,6 +6,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { deleteCheck as runDeleteCheck, type DeleteDecision } from '../core/pipeline/deleteCheck';
+import { VsCodePipelineUi } from './pipelineUi';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
@@ -182,6 +184,8 @@ interface Harness {
     /** Review round 11 (G3, G4). */
     repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     deleteInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
+    /** Plan step 11C2b: the check of Delete and its questions in the worker (the fake runs deleteCheck.ts, below). */
+    deleteCheckInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { repository: string; otherWindow: boolean }) => Promise<DeleteDecision>>>;
     // Plan step 11B3b (user decision of 2026-10-04): the controller lists through the worker (listConfigurationsInWorker).
     listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
@@ -309,6 +313,27 @@ function createHarness(
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
     // No volumes of a Docker Compose project, unless a test gives them (D-19).
     removableServiceDataVolumes: vi.fn(async () => []),
+    // Plan step 11C2b: the check of Delete runs in the worker; this fake runs the same function there (deleteCheck.ts)
+    // over the reads of this fake service and the questions of VsCodePipelineUi, so the tests of the dialogs of Delete
+    // below stay as they were (before: the controller asked them itself).
+    deleteCheckInWorker: vi.fn(async (id: string, options: OperationOptions & { repository: string; otherWindow: boolean }): Promise<DeleteDecision> => {
+      const entry = await registry.get(id);
+      if (!entry) return { decision: 'cancel' };
+      return runDeleteCheck(
+        {
+          summary: () => service.safetyCheck(id, options),
+          environment: () => registry.get(id),
+          repositoryServiceData: () => service.repositoryServiceData(id),
+          removableAdditionalVolumes: () => service.removableAdditionalVolumes(id),
+          removableServiceDataVolumes: () => service.removableServiceDataVolumes(id),
+          possibleServiceDataVolumes: () => service.possibleServiceDataVolumes(id),
+          ui: new VsCodePipelineUi({} as never, silentLogger, () => {}),
+        },
+        entry,
+        options.repository,
+        options.otherWindow,
+      );
+    }),
     // Review round 3 (P3-4): none of an environment whose services are not known, unless a test gives them.
     possibleServiceDataVolumes: vi.fn(async () => []),
   };

@@ -8,6 +8,8 @@
 // the extension passes its own HostSide (src/vscode).
 import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
 import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
+import { isGitSummary } from '../git/gitSummary';
+import type { DeleteConfirmation } from '../pipeline/deleteCheck';
 import type { BusyOperation } from '../types';
 import { HelperOperationError, type OperationOptions } from '../helperChannel/helperChannel';
 import type { AskKind, Secrets } from '../helperChannel/protocol';
@@ -71,6 +73,41 @@ export function hostSideHandler(
   };
 }
 
+/** The most names of a question of Delete, and the longest text of its facts. */
+const MAX_QUESTION_NAMES = 1000;
+const MAX_QUESTION_TEXT = 1024;
+/** A volume name as Docker takes it. */
+const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
+
+function plainText(value: unknown, max = MAX_QUESTION_TEXT): value is string {
+  return typeof value === 'string' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/** Plan step 11C2b: the volume names of a question of Delete. */
+function volumeNames(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_QUESTION_NAMES || !value.every((name) => typeof name === 'string' && VOLUME_NAME.test(name))) {
+    throw new HelperOperationError('invalid', 'The volumes of the question are invalid.', false);
+  }
+  return [...(value as string[])];
+}
+
+/** Plan step 11C2b: the facts of the confirmation of Delete (DeleteConfirmation), checked; nothing else is passed on. */
+function deleteConfirmation(value: unknown): DeleteConfirmation {
+  const invalid = () => new HelperOperationError('invalid', 'The confirmation of Delete is invalid.', false);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
+  const { changes, recordedAt, lastSeenInUse, repositoryData, otherWindow } = value as Record<string, unknown>;
+  if (!plainText(changes, 200) || typeof otherWindow !== 'boolean') throw invalid();
+  for (const time of [recordedAt, lastSeenInUse]) if (time !== undefined && !plainText(time, 64)) throw invalid();
+  if (!Array.isArray(repositoryData) || repositoryData.length > MAX_QUESTION_NAMES || !repositoryData.every((folder) => plainText(folder) && folder !== '')) throw invalid();
+  return {
+    changes,
+    ...(recordedAt !== undefined ? { recordedAt: recordedAt as string } : {}),
+    ...(lastSeenInUse !== undefined ? { lastSeenInUse: lastSeenInUse as string } : {}),
+    repositoryData: [...(repositoryData as string[])],
+    otherWindow,
+  };
+}
+
 function strings(args: unknown[], count: number): string[] {
   const values = args.slice(0, count);
   if (values.length !== count || !values.every((value) => typeof value === 'string')) {
@@ -119,6 +156,16 @@ async function question(host: HostSide, call: string, args: unknown[]): Promise<
         throw new HelperOperationError('invalid', 'The question of the recreate offer is invalid.', false);
       }
       return ui.recreateContainer(repository, { message: value.message, detail: value.detail });
+    }
+    // Plan step 11C2b: the questions of Delete, with their facts checked.
+    case 'confirmDelete':
+      return (await ui.confirmDelete(strings(args, 1)[0], deleteConfirmation(args[1]))) ?? null;
+    case 'deleteAdditionalVolumes':
+      return (await ui.deleteAdditionalVolumes(volumeNames(args[0]))) ?? null;
+    case 'deleteServiceData': {
+      const volumes = volumeNames(args[0]);
+      const possibly = volumeNames(args[1]);
+      return (await ui.deleteServiceData(volumes, possibly)) ?? null;
     }
     case 'message': {
       const [kind, text] = strings(args, 2);
@@ -219,6 +266,13 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
     case 'clearBusy':
       await records.clearBusy(strings(args, 1)[0]);
       return null;
+    // Plan step 11C2b: the Git state, checked as the registry checks it.
+    case 'recordGitSummary': {
+      const [environmentId] = strings(args, 1);
+      if (!isGitSummary(args[1])) throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
+      await records.recordGitSummary(environmentId, args[1]);
+      return null;
+    }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);
   }
