@@ -2508,6 +2508,96 @@ describe('Connection of this window', () => {
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
   });
 
+  // Review round 5 of 11C1 (A-R5 missing tests): the pending outdated check and the reads of Start.
+  async function attachUnknown(env: Environment): Promise<void> {
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  }
+
+  async function heartbeatRead(value: WindowStateValue): Promise<void> {
+    h.service.windowStateInWorker.mockResolvedValue(value);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  it('the pending outdated check leaves a container of an older version, also when the host access checks changed (A-R5)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await attachUnknown(env);
+    h.settings.hostAccessChecksOff = ['acme/api'];
+    await heartbeatRead({ state: 'running', outdated: 'version' });
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    expect(warningMessages()).toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+  });
+
+  it('a Start whose first read finds the container current ends the pending outdated check (A-R5, A-R4-L2)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await attachUnknown(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
+    await run('start', { environmentId: ENV_ID });
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+    await heartbeatRead({ state: 'running', outdated: 'hostAccess' });
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  // Review round 5 of 11C1 (B-R5 K2): the read in the operation of Start is a known read too.
+  it('a Start whose read in the operation finds the container current ends the pending outdated check', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await attachUnknown(env);
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
+    await run('start', { environmentId: ENV_ID });
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+    await heartbeatRead({ state: 'running', outdated: 'hostAccess' });
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  it('a first read of Start that ends after the window left its environment leaves nothing more (A-R5-2)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const read = deferred<WindowStateValue | undefined>();
+    h.service.windowStateInWorker.mockImplementationOnce(() => read.promise);
+    const starting = run('start', { environmentId: ENV_ID });
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > 0 && h.service.windowStateInWorker.mock.lastCall?.[2] === undefined, 'the read of Start');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    read.resolve({ state: 'running', outdated: 'version' });
+    await starting;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+    expect(warningMessages()).not.toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+  });
+
+  it('a read in the operation of Start that ends after the window left its environment says nothing (A-R5, A-R4-L1)', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const read = deferred<WindowStateValue | undefined>();
+    h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
+    h.service.windowStateInWorker.mockImplementationOnce(() => read.promise);
+    const starting = run('start', { environmentId: ENV_ID });
+    await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.signal !== undefined), 'the read in the operation');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
+    read.resolve({ state: 'running', outdated: 'version' });
+    await starting;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+    expect(warningMessages()).not.toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
+  });
+
   // Review round 3 of 11C1 (A-R3-M2): a container read as current when the window attached is not left by the check.
   it('does not leave a container that was current when the window attached, also when the check reads it outdated', async () => {
     const env = environment();

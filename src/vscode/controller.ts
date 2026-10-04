@@ -1163,6 +1163,12 @@ export class Controller implements vscode.Disposable {
         const containerName = this.current?.containerName ?? environment.containerName;
         // Review round 1 of 11C1 (A-R1-2): one read of the worker gives whether it runs and whether it is outdated.
         const value = await this.windowState(environment, containerName);
+        // Review round 5 of 11C1 (A-R5-2): an operation of this environment may have started, or the window may have left
+        // it, while the worker read.
+        if (this.gate.runningFor(repositoryKey(repository)) !== undefined || this.current?.environment.id !== environment.id) {
+          this.logger.info(`Start of ${repository} was not started: the window or its operation changed while the state of its container was read.`);
+          return;
+        }
         // Review round 4 of 11C1 (A-R4-L2): a known read decides here; the check of the connection need not read it again.
         if (value !== undefined && this.outdatedUncheckedFor?.environmentId === environment.id) this.outdatedUncheckedFor = undefined;
         if (value?.state === 'running') {
@@ -1263,6 +1269,8 @@ export class Controller implements vscode.Disposable {
     if (started && found !== undefined && environment && this.current?.environment.id === environment.id) {
       // Review round 3 of 11C1 (A-R3-M1): the container runs after all: as for a Start whose first read found it running.
       const containerName = recheck ?? environment.containerName;
+      // Review round 5 of 11C1 (B-R5, design question of A-R4-L2): this known read decides too.
+      if (this.outdatedUncheckedFor?.environmentId === environment.id) this.outdatedUncheckedFor = undefined;
       if (found.outdated) {
         this.logger.info(this.outdatedTexts(found.outdated, repository).log);
         await this.leaveEnvironment(this.outdatedTexts(found.outdated, repository).message, { environmentId: environment.id, containerName, repository, reason: 'outdated' });
