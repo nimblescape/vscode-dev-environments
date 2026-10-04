@@ -2302,6 +2302,25 @@ describe('Connection of this window', () => {
     expect(env.containerName).not.toBe('devenv-old');
   });
 
+  // Review round 2 of 11C1 (B-R2 C32): a read that ends after the window left its environment changes nothing.
+  it('ignores a read of the state that ends after the window left its environment', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    await connectHere(env);
+    const read = deferred<WindowStateValue | undefined>();
+    h.service.windowStateInWorker.mockImplementationOnce(() => read.promise);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read in the background');
+    h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close');
+    read.resolve({ state: 'stopped' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.logger.info.mock.calls.some(([line]) => String(line) === 'The container of acme/api does not run.')).toBe(false);
+    expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
+  });
+
   // Review round 2 of 11C1 (A-R2-L1): a Start whose read finds the container running removes the hint at once.
   it('removes the hint of an unknown state when a Start of the user reads that the container runs', async () => {
     const env = environment();

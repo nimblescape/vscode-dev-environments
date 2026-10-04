@@ -116,6 +116,18 @@ describe('the reads of an attached window in the worker: review round 1 of 11C1'
     expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).toEqual({ state: 'running' });
   });
 
+  // Review round 2 of 11C1 (B-R2 W15): the container of the window decides, not another dev container of the environment.
+  it('the labels of the container of the window decide, also when another dev container of the environment runs', async () => {
+    const own: EngineContainer = { ...container(CURRENT, 'stopped') };
+    const other: EngineContainer = { ...container({ [LABEL_CONTAINER_VERSION]: '0' }), id: 'c'.repeat(64), name: 'devenv-acme-api-other' };
+    const port: DockerEngine = {
+      ...unusedEngine(),
+      container: async (reference) => [own, other].find((each) => each.name === reference),
+      containers: async () => [other, own],
+    };
+    expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).toEqual({ state: 'stopped' });
+  });
+
   it('the signal of the read reaches the read of the branch', async () => {
     const { docker, execs } = engine(container(CURRENT));
     const signal = new AbortController().signal;

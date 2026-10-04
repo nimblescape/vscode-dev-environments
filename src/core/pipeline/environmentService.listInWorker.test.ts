@@ -5,7 +5,7 @@
 // Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration from the extension's side: it sends
 // `listConfigurations` to the worker of the Docker host of the operation and gives back its paths, or the refusal of the
 // worker's pipeline as the UserFacingError it was before the move. Nothing is listed here.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { BatchHelperUnavailableError, UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
@@ -164,6 +164,19 @@ describe('the reads of an attached window through the worker, from the extension
     for (const each of sent) {
       expect(each).toMatchObject({ passive: true, timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS });
       expect(each.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  // Review round 2 of 11C1 (B-R2 E5): the wait for the worker is bounded by the time limit of the read.
+  it('the signal of a read ends at the time limit of the read', async () => {
+    const timeout = vi.spyOn(AbortSignal, 'timeout');
+    try {
+      const { h } = harness(async () => ({ state: 'running' }));
+      const env = await seedEnvironment(h, { container: 'running' });
+      await h.service.windowStateInWorker(env, 'devenv-x');
+      expect(timeout).toHaveBeenCalledWith(WINDOW_STATE_FLOW_TIMEOUT_MS);
+    } finally {
+      timeout.mockRestore();
     }
   });
 
