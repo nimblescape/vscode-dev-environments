@@ -528,6 +528,9 @@ async function activateExtension(
       credentials,
       settings: getSettings,
       windowId: sessionCoordinator.windowId,
+      // Plan step 11C2a: the busy marks that a flow sets for this window, as its own pipeline sets them.
+      pid: process.pid,
+      clock: systemClock,
       isProcessAlive: (pid: number) => isProcessAlive(pid),
       logger,
     }),
@@ -565,6 +568,8 @@ async function activateExtension(
     platform,
     env,
     owner: { windowId: sessionCoordinator.windowId, pid: process.pid },
+    // Plan step 11C2a: the id of this computer in the Session Monitor, for the `forget` of Delete in the worker.
+    monitorSource: computerId,
     settings: getSettings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),
     // Concept 7.7: a private image on ghcr.io that the image check reads with the GitHub session is pulled with it too.
@@ -586,7 +591,6 @@ async function activateExtension(
         });
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },
-      forget: async (_target, environmentId) => remoteMonitor.forget(computerId(), environmentId),
       images: async (target) => sendImageList(target.host),
     },
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).

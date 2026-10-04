@@ -7,6 +7,7 @@
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the
 // pipeline can run again at any time.
 import * as path from 'path';
+import { registryBusyMarks, type EnvironmentBusyMarks } from './busyMarks';
 import { isBusyMarkLive, otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
@@ -66,9 +67,12 @@ import {
   LOCK_BUSY_CODE,
   LOCK_UNAVAILABLE_CODE,
   newCleanupLabel,
+  OP_DELETE,
   OP_LIST_CONFIGURATIONS,
   OP_STOP,
   OP_WINDOW_STATE,
+  parseDeleteParams,
+  parseDeleteValue,
   parseListConfigurationsParams,
   parseListConfigurationsValue,
   parseStopParams,
@@ -285,6 +289,11 @@ export const WINDOW_STATE_FLOW_TIMEOUT_MS = 30_000;
  * batch helper, and its step.
  */
 export const LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Plan step 11C2a: the longest Delete in the worker: the wait for the operation of another window and for the lock, the
+ * stop and removal of the containers, the images, the volumes with their retries. Delete is not cancellable.
+ */
+export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -360,7 +369,7 @@ export type EnvironmentStore = Pick<
 /** The part of SessionFiles that the service uses. */
 export type EnvironmentSessionFiles = Pick<
   SessionFiles,
-  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'readReopen' | 'removeReopen' | 'readPendings'
+  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'readReopen' | 'removeReopen' | 'removeReopenOf' | 'readPendings'
 >;
 
 /**
@@ -384,8 +393,11 @@ export interface EnvironmentSessionMonitor {
    * (HeartbeatEntry).
    */
   heartbeat(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, environmentId: string, keepRunning: boolean, seq: number): Promise<{ ok: true } | { ok: false; detail: string }>;
-  /** Removes the heartbeat record of this computer for a deleted environment (best effort). */
-  forget(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, environmentId: string): Promise<void>;
+  /**
+   * Removes the heartbeat record of this computer for a deleted environment (best effort). Plan step 11C2a: only the
+   * worker's Session Monitor has it (Delete runs there; decision of 2026-10-04).
+   */
+  forget?(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, environmentId: string): Promise<void>;
   /**
    * User requests 2026-09-28: gives the monitor of the engine the image repositories to update and clean (read from the
    * registry; at most once an hour per engine). Best effort: never throws, except an AbortError.
@@ -450,6 +462,17 @@ export interface EnvironmentServiceDeps {
   sessionMonitor?: EnvironmentSessionMonitor;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
+  /**
+   * Plan step 11C2a (decision of 2026-10-04): the busy marks of the window that runs the operation. Default: over
+   * `registry` with this service's owner, clock, and view of the windows (registryBusyMarks); the worker's pipeline sends
+   * them to the extension (`record markBusy`, `record clearBusy`).
+   */
+  busyMarks?: EnvironmentBusyMarks;
+  /**
+   * Plan step 11C2a: the id of this computer in the Session Monitor (its heartbeat records), which Delete sends to the
+   * worker for its `forget`. Without it, deleteInWorker refuses.
+   */
+  monitorSource?: () => string;
   /**
    * All window status files (SessionFiles.readWindowStatuses). When given, a busy mark of another window counts only
    * while that window also has a recent status file of the same process (see `isBusyMarkLive`), so a process ID that
@@ -1290,6 +1313,7 @@ export class EnvironmentService {
   private readonly identities = new Map<string, { identity: Promise<GitIdentity>; retryAfter?: number }>();
   private readonly startDockerFn: DockerStarter;
   private readonly isAlive: (pid: number) => boolean;
+  private readonly busyMarks: EnvironmentBusyMarks;
   private readonly busyWaitMs: number;
   private readonly pendingRefreshMs: number;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -1298,6 +1322,9 @@ export class EnvironmentService {
   constructor(private readonly deps: EnvironmentServiceDeps) {
     this.startDockerFn = deps.startDocker ?? defaultDockerStarter(deps);
     this.isAlive = deps.isProcessAlive ?? processExists;
+    this.busyMarks =
+      deps.busyMarks ??
+      registryBusyMarks(deps.registry, { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger });
     this.busyWaitMs = Math.max(0, deps.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
     this.pendingRefreshMs = Math.max(1, deps.pendingRefreshMs ?? DEFAULT_PENDING_REFRESH_MS);
     this.sleepFn = deps.sleep ?? defaultSleep;
@@ -5931,7 +5958,46 @@ export class EnvironmentService {
     }
   }
 
-  /** Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. */
+  /**
+   * Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): Delete (concept 7.14 steps 3 to 5) in the worker of the
+   * Docker host of the operation, where its own pipeline runs `delete` (the busy mark, the entry and the session files of
+   * the environment through its requests, the lock there, `forget` in the Session Monitor). The caller made the safety
+   * check and closed a connected window. An environment that is not in the registry has nothing on Docker: only its
+   * session files are removed here. A refusal of that pipeline is thrown as it was before the move; a worker that cannot
+   * be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
+   */
+  async deleteInWorker(environmentId: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }): Promise<void> {
+    const environment = await this.deps.registry.get(environmentId);
+    if (!environment) {
+      await this.removeEnvironmentFiles(environmentId);
+      return;
+    }
+    await this.requireCurrentHost(environment);
+    await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
+      try {
+        if (holdsEnvironmentLock(environment.id)) throw new Error(`The Delete of ${environment.repository} under a lock of the environment that this window holds.`);
+        const monitorSource = this.deps.monitorSource?.();
+        const params = parseDeleteParams({
+          environmentId: environment.id,
+          dockerHost: await this.currentDockerHost(),
+          owner: this.deps.owner,
+          additionalVolumesToRemove: [...options.additionalVolumesToRemove],
+          monitorSource,
+        });
+        if (params === undefined) throw new Error(`The Delete of ${environment.repository} cannot be sent to the worker.`);
+        const value = parseDeleteValue(await this.workerFlow(environment, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, options.signal));
+        if (value === undefined) throw new Error(`The worker answered the Delete of ${environment.repository} with an invalid value.`);
+        if ('refused' in value) throw refusalError(value.refused);
+      } catch (error) {
+        throw this.toUserError(error, options.signal);
+      }
+    });
+  }
+
+  /**
+   * Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. Plan step 11C2a:
+   * runs in the worker (deleteInWorker sends it there).
+   */
   async delete(environmentId: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }): Promise<void> {
     const environment = await this.deps.registry.get(environmentId);
     if (!environment) {
@@ -5961,10 +6027,10 @@ export class EnvironmentService {
     const { docker } = this.deps;
     const steps = new StepReporter(options.progress, this.logger);
     await this.startDocker(steps, options.signal);
-    let env = await this.waitForOtherOperation(environment, options.signal);
     this.throwIfCancelled(options.signal);
-    this.logger.info(`Deleting the environment of ${env.repository} (${env.id}).`);
-    env = await this.setBusyMark(env, 'delete');
+    this.logger.info(`Deleting the environment of ${environment.repository} (${environment.id}).`);
+    // Plan step 11C2a: the wait for the operation of another window and the mark in one (markBusyWaiting).
+    const env = await this.markBusyWaiting(environment, 'delete', options.signal);
     let removed = false;
     try {
       // Plan step 5, PR B: the busy mark first, then the lock of the environment on the Docker host (user decisions D1 to
@@ -6006,10 +6072,11 @@ export class EnvironmentService {
       await this.removeEnvironmentFiles(env.id);
       // Unit 7, PR 2: the heartbeat record of this computer in the Session Monitor of the engine (best effort). Plan step 8,
       // PR A: on every engine, local and remote.
-      const sessionMonitor = this.deps.sessionMonitor;
-      if (sessionMonitor) {
+      // Plan step 11C2a: the worker's Session Monitor (decision of 2026-10-04).
+      const forget = this.deps.sessionMonitor?.forget?.bind(this.deps.sessionMonitor);
+      if (forget) {
         const target = await this.dockerTarget();
-        await this.quietly('remove the heartbeat record from the Session Monitor', () => sessionMonitor.forget(target, env.id));
+        await this.quietly('remove the heartbeat record from the Session Monitor', () => forget(target, env.id));
       }
       this.logger.info(`The environment of ${env.repository} was deleted.`);
     } finally {
@@ -6877,10 +6944,8 @@ export class EnvironmentService {
     await this.quietly('remove the pending operation', () => files.removeOperation(environmentId));
     // Monitor cleanup, user decision 2026-09-29 (R7): a disconnect request of the deleted environment.
     await this.quietly('remove the disconnect request', () => files.removeDisconnectRequest(environmentId));
-    await this.quietly('remove the reopen record', async () => {
-      const record = await files.readReopen();
-      if (record?.environmentId === environmentId) await files.removeReopen();
-    });
+    // Plan step 11C2a: one request from the worker (the reopen record is read where it is).
+    await this.quietly('remove the reopen record', () => files.removeReopenOf(environmentId));
   }
 
   /**
@@ -7094,23 +7159,37 @@ export class EnvironmentService {
     }
   }
 
-  /** Sets a busy mark, unless another live window holds one (checked under the registry lock). */
+  /**
+   * Sets a busy mark, unless another live window holds one (checked under the registry lock). Plan step 11C2a: through
+   * the busy marks of the window that runs the operation (busyMarks).
+   */
   private async setBusyMark(env: Environment, operation: BusyOperation): Promise<Environment> {
-    const mark = this.busyMark(operation);
-    const state: { conflict?: BusyMark } = {};
-    // Read before the lock: the mutator does no I/O.
-    const blocks = await this.markBlocker();
-    const updated = await this.deps.registry.updateEnvironment(env.id, (entry) => {
-      if (entry.busy && blocks(entry.busy)) {
-        state.conflict = entry.busy;
-        return;
-      }
-      entry.busy = mark;
-    });
-    if (!updated) throw environmentMissing(env.repository);
-    if (state.conflict) throw environmentBusy(env.repository, state.conflict);
+    const result = await this.busyMarks.mark(env.id, operation);
+    if (result === undefined) throw environmentMissing(env.repository);
+    if ('conflict' in result) throw environmentBusy(env.repository, result.conflict);
     this.logger.info(`${env.repository} is marked as busy (${operation}).`);
-    return updated;
+    return result.environment;
+  }
+
+  /**
+   * Plan step 11C2a: setBusyMark, waiting while another live window holds a mark (as waitForOtherOperation, at most
+   * `busyWaitMs`), for the pipeline in the worker too: the window that runs the operation decides whether a mark is live.
+   */
+  private async markBusyWaiting(env: Environment, operation: BusyOperation, signal: AbortSignal | undefined): Promise<Environment> {
+    const attempts = Math.ceil(this.busyWaitMs / BUSY_POLL_MS);
+    for (let attempt = 0; ; attempt++) {
+      const result = await this.busyMarks.mark(env.id, operation);
+      if (result === undefined) throw environmentMissing(env.repository);
+      if (!('conflict' in result)) {
+        this.logger.info(`${env.repository} is marked as busy (${operation}).`);
+        return result.environment;
+      }
+      const mark = result.conflict;
+      if (attempt >= attempts) throw environmentBusy(env.repository, mark);
+      if (attempt === 0) this.logger.info(`${env.repository} is busy (${mark.operation}) in another window (process ${mark.pid}). Waiting.`);
+      await this.sleepFn(BUSY_POLL_MS, signal);
+      this.throwIfCancelled(signal);
+    }
   }
 
   private async markBusy(ctx: PipelineContext, operation: BusyOperation): Promise<void> {
@@ -7128,11 +7207,7 @@ export class EnvironmentService {
   }
 
   private async clearOwnMark(environmentId: string): Promise<void> {
-    await this.quietly('clear the busy mark', () =>
-      this.deps.registry.updateEnvironment(environmentId, (entry) => {
-        if (entry.busy && this.isOwnMark(entry.busy)) delete entry.busy;
-      }),
-    );
+    await this.quietly('clear the busy mark', () => this.busyMarks.clear(environmentId));
   }
 
   // --- General ---------------------------------------------------------------------------------------------------------

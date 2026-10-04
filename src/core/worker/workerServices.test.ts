@@ -11,7 +11,9 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostAuth, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, type WorkerServicesDeps } from './workerServices';
+import { MONITOR_EXEC_TIMEOUT_MS, hostAuth, hostBusyMarks, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { EngineError, type DockerEngine } from './dockerEngine';
+import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand } from '../remoteMonitor/protocol';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
@@ -62,6 +64,9 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       remove: (id, volumes) => answer('remove', id, volumes),
       forgetKeptVolumes: (names) => answer('forgetKeptVolumes', names),
       sessionFile: (kind, environmentId) => answer('sessionFile', kind, environmentId),
+      // Plan step 11C2a.
+      markBusy: (environmentId, operation) => answer('markBusy', environmentId, operation),
+      clearBusy: (environmentId) => answer('clearBusy', environmentId),
     },
     secrets: {
       token: () => answer('token'),
@@ -242,5 +247,79 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     await withExec.docker.exec('c', ['cat'], { secretInput: 'ghp_x' });
     expect(execs).toEqual([{ secretInputName: SECRET_TOKEN }]);
     await expect(all.helper.ensureImage()).resolves.toBe('devenv-helper:abc');
+  });
+});
+
+// Plan step 11C2a (decision of 2026-10-04: Delete's `forget` is the worker's). Ported from the test of the removed
+// RemoteSessionMonitor.forget ("forgets a record; a failure is logged, a missing container is not").
+describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
+  const SOURCE = '0123456789abcdef0123456789abcdef';
+  const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+  const TARGET = { kind: 'local', host: '', endpoint: '' } as const;
+
+  function engineWith(answer: () => Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }>) {
+    const execs: { container: string; command: readonly string[]; timeoutMs?: number }[] = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      exec: async (container, command, options = {}) => (execs.push({ container, command, timeoutMs: options.timeoutMs }), answer()),
+    };
+    return { engine, execs };
+  }
+
+  function log() {
+    const lines: string[] = [];
+    return { lines, logger: { ...silentLogger, warn: (text: string) => lines.push(`warn ${text}`) } as Logger };
+  }
+
+  it('forgets the record of the computer by the command of the monitor script, under the lock of its records, within its limit', async () => {
+    const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+    const { lines, logger } = log();
+    await workerSessionMonitor(engine, SOURCE, logger).forget!(TARGET, ID);
+    expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: forgetCommand(SOURCE, ID), timeoutMs: MONITOR_EXEC_TIMEOUT_MS }]);
+    expect(forgetCommand(SOURCE, ID).slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    expect(lines).toEqual([]);
+  });
+
+  it('a missing monitor container is not logged; a failure, a kill and no end in time are', async () => {
+    const { lines, logger } = log();
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('No such container', 404))).engine, SOURCE, logger).forget!(TARGET, ID);
+    expect(lines).toEqual([]);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'boom', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: RECORDS_RUN_LIMIT_EXIT, stdout: '', stderr: '', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true })).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('container is not running', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
+    expect(lines).toEqual([
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`,
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: docker exec did not end within ${MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`,
+      `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: container is not running`,
+    ]);
+  });
+
+  it('without the computer of the operation, it refuses; the rest of the monitor fails closed before plan step 11D', async () => {
+    const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+    const monitor = workerSessionMonitor(engine, undefined, silentLogger);
+    await expect(monitor.forget!(TARGET, ID)).rejects.toThrow('names no computer');
+    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('11D');
+    await expect(monitor.heartbeat(TARGET, ID, false, 1)).rejects.toThrow('11D');
+    expect(execs).toEqual([]);
+  });
+
+  it('the busy marks and the reopen record of the environment go to the extension as their requests', async () => {
+    const calls: { call: string; args: unknown[] }[] = [];
+    const records = {
+      markBusy: async (...args: unknown[]) => (calls.push({ call: 'markBusy', args }), undefined),
+      clearBusy: async (...args: unknown[]) => void calls.push({ call: 'clearBusy', args }),
+      sessionFile: async (...args: unknown[]) => void calls.push({ call: 'sessionFile', args }),
+    } as unknown as HostSide['records'];
+    const marks = hostBusyMarks(records);
+    expect(await marks.mark(ID, 'delete')).toBeUndefined();
+    await marks.clear(ID);
+    await hostSessionFiles({ records } as unknown as HostSide).removeReopenOf(ID);
+    expect(calls).toEqual([
+      { call: 'markBusy', args: [ID, 'delete'] },
+      { call: 'clearBusy', args: [ID] },
+      { call: 'sessionFile', args: ['removeReopenOf', ID] },
+    ]);
   });
 });

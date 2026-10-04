@@ -40,6 +40,9 @@ import {
   MAX_LISTED_CONFIGURATIONS,
   parseListConfigurationsParams,
   parseListConfigurationsValue,
+  MAX_DELETE_VOLUMES,
+  parseDeleteParams,
+  parseDeleteValue,
 } from './protocol';
 
 describe('the protocol of the helper channel (user request 2026-09-28)', () => {
@@ -397,5 +400,42 @@ describe('listConfigurations: its parameters and its answer (plan step 11B3b)', 
       expect(parseListConfigurationsValue(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
     }
     expect(parseListConfigurationsValue({ refused: { code: 'startFailed', message: 'm' } })).toEqual({ refused: { code: 'startFailed', message: 'm' } });
+  });
+});
+
+describe('delete: its parameters and its answer (plan step 11C2a)', () => {
+  const PARAMS = {
+    environmentId: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d',
+    dockerHost: 'build-box',
+    owner: { windowId: 'window-1', pid: 42 },
+    additionalVolumesToRemove: ['api-db', 'devenv-acme-api_data'],
+    monitorSource: '0123456789abcdef0123456789abcdef',
+  };
+  it('takes its parameters only within their limits', () => {
+    expect(parseDeleteParams(PARAMS)).toEqual(PARAMS);
+    expect(parseDeleteParams({ ...PARAMS, additionalVolumesToRemove: Array.from({ length: MAX_DELETE_VOLUMES }, (_, i) => `v${i}`) })).toBeDefined();
+    for (const odd of [
+      { ...PARAMS, additionalVolumesToRemove: Array.from({ length: MAX_DELETE_VOLUMES + 1 }, (_, i) => `v${i}`) },
+      { ...PARAMS, additionalVolumesToRemove: ['../etc'] },
+      { ...PARAMS, additionalVolumesToRemove: ['-v'] },
+      { ...PARAMS, additionalVolumesToRemove: [1] },
+      { ...PARAMS, additionalVolumesToRemove: 'api-db' },
+      { ...PARAMS, monitorSource: 'ABCDEF0123456789abcdef0123456789' },
+      { ...PARAMS, monitorSource: undefined },
+      { ...PARAMS, owner: { windowId: 'w', pid: 0 } },
+      { ...PARAMS, environmentId: '../x' },
+      { ...PARAMS, dockerHost: 'a\nb' },
+      { ...PARAMS, extra: true },
+    ]) {
+      expect(parseDeleteParams(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
+    }
+  });
+
+  it('answers deleted, or a refusal of the pipeline', () => {
+    expect(parseDeleteValue({ deleted: true })).toEqual({ deleted: true });
+    expect(parseDeleteValue({ refused: { code: 'startFailed', message: 'm' } })).toEqual({ refused: { code: 'startFailed', message: 'm' } });
+    for (const odd of [{}, { deleted: false }, { deleted: true, extra: 1 }, { refused: { code: 'cancelled', message: 'm' } }, { refused: { code: 'nope', message: 'm' } }, null, 'deleted']) {
+      expect(parseDeleteValue(odd), JSON.stringify(odd)).toBeUndefined();
+    }
   });
 });

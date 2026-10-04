@@ -36,6 +36,7 @@ import {
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
+  forgetCommand,
   heartbeatFileName,
   remoteMonitorLabelValue,
 } from '../../src/core/remoteMonitor/protocol';
@@ -216,7 +217,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const records = await monitor.records(ids.fresh);
     expect(records?.records).toEqual([{ source: SOURCE, at: expect.any(Number), keepRunning: false }]);
     expect(Math.abs(records!.now - records!.records[0].at)).toBeLessThan(5 * 60_000);
-    await monitor.forget(SOURCE, ids.fresh);
+    // Plan step 11C2a: RemoteSessionMonitor.forget is removed (Delete's `forget` is the worker's); the command of the
+    // monitor script is the same.
+    expect((await docker.run(['exec', containerName, ...forgetCommand(SOURCE, ids.fresh)])).exitCode).toBe(0);
     expect((await monitor.records(ids.fresh))?.records).toEqual([]);
 
     const invalid = await docker.run(['exec', containerName, 'node', '/opt/devenv/monitor.js', 'heartbeat', '{"source":"../x"}']);
@@ -386,13 +389,12 @@ describe('the Session Monitor container of a remote Docker host', () => {
       environment.keepRunningOnce = true;
       expect(await heartbeats.sendFor(environment.id)).toEqual({ ok: true });
       expect((await monitor.records(environment.id))?.records).toEqual([{ source: windowSource, at: expect.any(Number), keepRunning: true }]);
-      // Delete: the record of this computer is removed, through the worker too.
-      await runWithDockerTarget(target, () => windowMonitor.forget(windowSource, environment.id));
-      expect((await monitor.records(environment.id))?.records).toEqual([]);
+      // Plan step 11C2a: changed (before: Delete's `forget` went through the routed Docker of the window too): Delete runs
+      // in the worker, which forgets the record itself (test/docker/workerFlows.test.ts).
       expect(warnings).toEqual([]);
-      // All three went through the worker, never directly, and carried no `-i` and no variable.
+      // Both went through the worker, never directly, and carried no `-i` and no variable.
       const execs = routed.filter((args) => args[0] === 'exec' && args.includes(containerName));
-      expect(execs.map((args) => args.find((arg) => arg === 'heartbeat' || arg === 'forget'))).toEqual(['heartbeat', 'heartbeat', 'forget']);
+      expect(execs.map((args) => args.find((arg) => arg === 'heartbeat' || arg === 'forget'))).toEqual(['heartbeat', 'heartbeat']);
       expect(execs.every((args) => !args.includes('-i') && !args.includes('-e'))).toBe(true);
       expect(spy.calls.filter((args) => args.includes('exec') && args.includes(containerName))).toEqual([]);
     } finally {

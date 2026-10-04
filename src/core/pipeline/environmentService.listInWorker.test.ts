@@ -8,8 +8,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BatchHelperUnavailableError, UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
-import { LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
+import { LOCK_BUSY_CODE, OP_DELETE, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
+import { DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { EnvironmentServiceDeps } from './environmentService';
@@ -232,5 +232,70 @@ describe('the reads of an attached window through the worker: review round 1 of 
     const env = await seedEnvironment(h, { container: 'running' });
     expect(await h.service.windowStateInWorker({ ...env, remoteUser: '' }, 'devenv-x', { branch: true })).toEqual({ state: 'missing' });
     expect((sent[0].params as { branch: unknown }).branch).toEqual({ folder: '/workspaces/api' });
+  });
+});
+
+// Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): Delete from the extension's side: it sends `delete` to the
+// worker of the Docker host of the operation and throws its refusal as before the move. Nothing is removed here.
+describe('the Delete in the worker, from the extension (plan step 11C2a)', () => {
+  const SOURCE = '0123456789abcdef0123456789abcdef';
+
+  it('sends the environment, the Docker host, this window, the confirmed volumes and this computer; removes nothing here', async () => {
+    const { h, sent } = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE });
+    await seedEnvironment(h, { container: 'running' });
+    const changes = h.docker.log.length;
+    await h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: ['api-db'] });
+    expect(sent).toEqual([
+      {
+        op: OP_DELETE,
+        params: { environmentId: ENV_ID, dockerHost: '', owner: { windowId: WINDOW_ID, pid: PID }, additionalVolumesToRemove: ['api-db'], monitorSource: SOURCE },
+        timeoutMs: DELETE_FLOW_TIMEOUT_MS,
+        signal: undefined,
+        passive: undefined,
+      },
+    ]);
+    expect(h.docker.log.length).toBe(changes);
+    expect(h.helper.calls).toEqual([]);
+    expect(await h.registry.get(ENV_ID)).toBeDefined();
+  });
+
+  it('throws the refusal of the worker as the UserFacingError it was; a lock held elsewhere or no worker is refused as for Stop', async () => {
+    let answer: () => Promise<unknown> = async () => ({ refused: { code: 'otherAccount', message: 'Another account.' } });
+    const { h } = harness(() => answer(), { monitorSource: () => SOURCE });
+    await seedEnvironment(h, { container: 'stopped' });
+    const remove = () => rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }));
+    expect(await remove()).toMatchObject({ code: 'otherAccount', message: 'Another account.' });
+    answer = async () => {
+      throw new HelperOperationError(LOCK_BUSY_CODE, 'held', false);
+    };
+    expect(await remove()).toMatchObject({ code: 'startFailed', message: PipelineTexts.environmentLockBusy(REPO) });
+    answer = async () => {
+      throw new HelperChannelError('unavailable', 'no worker');
+    };
+    expect(await remove()).toMatchObject({ code: 'helperFailed' });
+    answer = async () => ({ deleted: false });
+    expect(((await remove()) as Error).message).toContain('with an invalid value');
+  });
+
+  it('an environment that is not in the registry only loses its session files here; nothing is sent', async () => {
+    const { h, sent } = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE });
+    await h.service.deleteInWorker('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b', { progress: h.progress, additionalVolumesToRemove: [] });
+    expect(sent).toEqual([]);
+  });
+
+  it('never sends without this computer, under a lock that this window holds, or for another Docker host', async () => {
+    const { h, sent } = harness(async () => ({ deleted: true }));
+    await seedEnvironment(h, { container: 'stopped' });
+    expect(((await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }))) as Error).message).toContain('cannot be sent to the worker');
+    const withSource = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE });
+    await seedEnvironment(withSource.h, { container: 'stopped' });
+    const held = await withSource.h.lock.take(ENV_ID);
+    const error = await rejection(runWithEnvironmentLock(held, () => withSource.h.service.deleteInWorker(ENV_ID, { progress: withSource.h.progress, additionalVolumesToRemove: [] })));
+    expect((error as Error).message).toContain('under a lock of the environment that this window holds');
+    await held.release();
+    const other = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE, dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
+    await seedEnvironment(other.h, { container: 'stopped' });
+    expect(await rejection(other.h.service.deleteInWorker(ENV_ID, { progress: other.h.progress, additionalVolumesToRemove: [] }))).toMatchObject({ code: 'otherDockerHost' });
+    expect([...sent, ...withSource.sent, ...other.sent]).toEqual([]);
   });
 });

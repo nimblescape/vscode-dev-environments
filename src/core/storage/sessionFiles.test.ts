@@ -323,6 +323,16 @@ describe('reopen record', () => {
     await expect(files.readReopen()).resolves.toBeUndefined();
   });
 
+  // Plan step 11C2a: the Delete of an environment removes the reopen record only when it names that environment.
+  it('removeReopenOf removes the record of the environment, and keeps another one', async () => {
+    files.writeReopenSync({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await files.removeReopenOf('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b');
+    await expect(files.readReopen()).resolves.toEqual({ environmentId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await files.removeReopenOf(ENV_A);
+    await expect(files.readReopen()).resolves.toBeUndefined();
+    await files.removeReopenOf(ENV_A);
+  });
+
   it('ignores an invalid record', async () => {
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(paths.reopen, JSON.stringify({ environmentId: ENV_A }));

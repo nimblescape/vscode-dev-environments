@@ -8,16 +8,20 @@
 // engine is the worker's own (EngineDocker), the helper image is the worker's own image, and the lock and the batch
 // helper are taken in the worker (`environmentLock`, given by the operation). What only the open runs (the host access
 // analysis, the image update check, the GitHub viewer, the variables of the computer) comes with plan step 11E; until
-// then it fails closed here, as do the record writes by a function (plan step 11C). Pure over its deps; no `vscode`.
-import { UserFacingError } from '../errors';
+// then it fails closed here, as do the record writes by a function (plan step 11C) and the Session Monitor beyond Delete's
+// `forget` (plan step 11D). Plan step 11C2a: the busy marks are specific requests to the extension (decision of
+// 2026-10-04). Pure over its deps; no `vscode`.
+import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
 import { WorkspaceHelper } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
-import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentStore } from '../pipeline/environmentService';
+import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
+import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
+import { REMOTE_MONITOR_CONTAINER, forgetCommand, monitorExecFailure } from '../remoteMonitor/protocol';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
-import type { DockerEngine } from './dockerEngine';
+import { isMissing, type DockerEngine } from './dockerEngine';
 import { EngineDocker } from './engineDocker';
 import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
@@ -56,9 +60,59 @@ export function hostSessionFiles(host: HostSide): EnvironmentSessionFiles {
     removeOperation: (environmentId) => host.records.sessionFile('removeOperation', environmentId),
     removeDisconnectRequest: (environmentId) => host.records.sessionFile('removeDisconnectRequest', environmentId),
     removeReopen: () => host.records.sessionFile('removeReopen', ''),
+    // Plan step 11C2a: the extension reads the reopen record and removes it when it names the environment.
+    removeReopenOf: (environmentId) => host.records.sessionFile('removeReopenOf', environmentId),
     readPendings: async () => [...(await host.state.pendings())],
     readReopen: async () => {
       throw notInWorker('The reopen record', '11E');
+    },
+  };
+}
+
+/**
+ * Plan step 11C2a (decision of 2026-10-04): the busy marks of the window that sent the operation, which the extension
+ * sets and clears (`record markBusy`, `record clearBusy`) with its clock and its view of the windows.
+ */
+export function hostBusyMarks(records: HostSide['records']): EnvironmentBusyMarks {
+  return {
+    mark: (environmentId, operation) => records.markBusy(environmentId, operation),
+    clear: (environmentId) => records.clearBusy(environmentId),
+  };
+}
+
+/** The time limit of a command in the Session Monitor container (as REMOTE_MONITOR_EXEC_TIMEOUT_MS of the extension). */
+export const MONITOR_EXEC_TIMEOUT_MS = 20_000;
+
+/**
+ * Plan step 11C2a (decision of 2026-10-04: Delete's `forget` is the worker's): the Session Monitor of the worker's engine,
+ * as Delete uses it: `forget` removes the heartbeat record of `source` (the computer that sent the operation) for the
+ * environment, by a command in the monitor container (forgetCommand). Best effort: a monitor container that does not
+ * exist has no record; any other failure is logged. The rest of the monitor comes with plan step 11D; until then it
+ * fails closed.
+ */
+export function workerSessionMonitor(engine: DockerEngine, source: string | undefined, log: Logger): EnvironmentSessionMonitor {
+  return {
+    ensure: async () => {
+      throw notInWorker('The ensure of the Session Monitor', '11D');
+    },
+    heartbeat: async () => {
+      throw notInWorker('A heartbeat to the Session Monitor', '11D');
+    },
+    forget: async (_target, environmentId) => {
+      if (source === undefined) throw new Error('The operation names no computer for the Session Monitor.');
+      try {
+        const result = await engine.exec(REMOTE_MONITOR_CONTAINER, forgetCommand(source, environmentId), { timeoutMs: MONITOR_EXEC_TIMEOUT_MS });
+        if (result.exitCode !== 0 || result.timedOut) {
+          // As RemoteSessionMonitor read the failures of its commands (monitorExecFailure: the lock of the records).
+          const detail = result.timedOut
+            ? `docker exec did not end within ${MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`
+            : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '', true);
+          log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${detail}`);
+        }
+      } catch (error) {
+        if (isMissing(error)) return;
+        log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${errorMessage(error)}`);
+      }
     },
   };
 }
@@ -116,6 +170,8 @@ export interface WorkerServicesDeps {
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
   /** The settings of the extension, when the operation read them (`local settings`); a read without them fails closed. */
   settings?: ExtensionSettings;
+  /** Plan step 11C2a: the id of the computer that sent the operation in the Session Monitor (Delete's `forget`). */
+  monitorSource?: string;
 }
 
 /** The core services of one operation in the worker (see the module comment). */
@@ -164,6 +220,9 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     },
     helper,
     registry: hostStore(deps.host.records),
+    // Plan step 11C2a (decision of 2026-10-04): the busy marks are set and cleared by the extension.
+    busyMarks: hostBusyMarks(deps.host.records),
+    sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),
     sessionFiles: hostSessionFiles(deps.host),
     windowStatuses: () => deps.host.state.windowStatuses(),
     // The pipeline asks synchronously; until the busy marks move (plan step 11C), every other process counts as alive, so

@@ -26,7 +26,6 @@ import {
   REMOTE_MONITOR_SCRIPT_PATH,
   REMOTE_MONITOR_STATE_DIR,
   REMOTE_MONITOR_VOLUME,
-  forgetCommand,
   heartbeatCommand,
   isUnderRecordsLock,
   monitorExecFailure,
@@ -687,14 +686,6 @@ export class RemoteSessionMonitor {
       this.options.logger.warn(`${what} could not be given to the Session Monitor: ${errorMessage(error)}`);
     }
     return false;
-  }
-
-  /** Removes the record of `source` for an environment (Delete). Best effort: a failure is logged. */
-  async forget(source: string, environmentId: string): Promise<void> {
-    const result = await this.exec(forgetCommand(source, environmentId));
-    if (!result.ok && !result.missing) {
-      this.options.logger.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${result.detail}`);
-    }
   }
 
   /**

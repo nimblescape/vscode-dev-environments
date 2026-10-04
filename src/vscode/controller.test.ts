@@ -181,7 +181,7 @@ interface Harness {
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
     /** Review round 11 (G3, G4). */
     repositoryServiceData: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
-    delete: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
+    deleteInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }) => Promise<void>>>;
     // Plan step 11B3b (user decision of 2026-10-04): the controller lists through the worker (listConfigurationsInWorker).
     listConfigurationsInWorker: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<string[]>>>;
     /** Plan step 11C1: the branch that the fake worker reads (windowStateInWorker with `branch`). */
@@ -279,7 +279,9 @@ function createHarness(
     stop: vi.fn(async () => {}),
     safetyCheck: vi.fn(async () => undefined),
     repositoryServiceData: vi.fn(async () => []),
-    delete: vi.fn(async () => {}),
+    // Plan step 11C2a: the controller sends Delete to the worker (deleteInWorker; before: delete). The expectations on it
+    // in this file are renamed only, nothing else changed.
+    deleteInWorker: vi.fn(async () => {}),
     listConfigurationsInWorker: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
     // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
@@ -1083,7 +1085,7 @@ describe('Stop', () => {
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
     await run('delete', row('acme/api', environment()));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
   });
@@ -1098,7 +1100,7 @@ describe('Stop', () => {
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
     await run('delete', row('acme/api', environment()));
     expect(h.coordinator.otherActiveWindows.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails, Actions.tryAgain);
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
   });
@@ -1277,7 +1279,7 @@ describe('Delete', () => {
       Actions.openEnvironment,
       Actions.deleteAnyway,
     ]);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
   it('user decision 2026-10-02: with nothing recorded, the plain confirmation follows and Delete deletes', async () => {
@@ -1288,7 +1290,7 @@ describe('Delete', () => {
     const call = fakeVscode.window.showWarningMessage.mock.calls[0];
     expect(call).toEqual([Messages.deleteConfirm('acme/api'), { modal: true }, Actions.delete]);
     expect(call).not.toContain(Actions.deleteAnyway);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
   it('names the unsaved changes, and deletes after Delete anyway while keeping the additional volumes on Keep', async () => {
@@ -1304,7 +1306,7 @@ describe('Delete', () => {
       Actions.deleteAnyway,
     ]);
     expect(calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
   it('names every folder that the containers of the services may mount in the confirmation of Delete (review round 10, D10-1)', async () => {
@@ -1347,7 +1349,7 @@ describe('Delete', () => {
       Actions.delete,
     ]);
     expect(Messages.deleteRepositoryServiceData('./data/postgres')).toBe('Service data in the repository will be deleted: ./data/postgres.');
-    expect(h.service.delete).toHaveBeenCalled();
+    expect(h.service.deleteInWorker).toHaveBeenCalled();
 
     // With unsaved changes too.
     fakeVscode.window.showWarningMessage.mockReset();
@@ -1386,15 +1388,15 @@ describe('Delete', () => {
     await run('delete', row('acme/api', environment()));
     expect(h.service.removableAdditionalVolumes).toHaveBeenCalledWith(ENV_ID);
     expect(fakeVscode.window.showWarningMessage.mock.calls[1]).toEqual([Messages.deleteAdditionalVolumes('api-db'), { modal: true }, Actions.remove, Actions.keep]);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
 
     fakeVscode.window.showWarningMessage.mockReset();
-    h.service.delete.mockClear();
+    h.service.deleteInWorker.mockClear();
     h.service.removableAdditionalVolumes.mockResolvedValueOnce([]);
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
     await run('delete', row('acme/api', environment()));
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
   // Unit 6, D-19: the volumes of a Docker Compose project (the data of its services) are asked about apart, none ticked.
@@ -1421,7 +1423,7 @@ describe('Delete', () => {
         expect.objectContaining({ canPickMany: true, title: Messages.deleteServiceDataTitle, placeHolder: Messages.deleteServiceDataPlaceholder }),
       );
       expect(h.service.removableServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
-      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+      expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
     });
 
     it('names the volumes of an environment whose services are not known as possible data (review round 3, P3-4)', async () => {
@@ -1438,17 +1440,17 @@ describe('Delete', () => {
         expect.objectContaining({ placeHolder: Messages.deleteServiceDataPossiblePlaceholder }),
       );
       expect(h.service.possibleServiceDataVolumes).toHaveBeenCalledWith(ENV_ID);
-      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+      expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
     });
 
     it('removes the ticked ones', async () => {
       await deleteWithServiceData((items) => [items[0]]);
-      expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db', DATA[0]] }));
+      expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db', DATA[0]] }));
     });
 
     it('cancels the Delete on Escape', async () => {
       await deleteWithServiceData(() => undefined);
-      expect(h.service.delete).not.toHaveBeenCalled();
+      expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     });
 
     it('asks nothing when the environment has none', async () => {
@@ -1456,7 +1458,7 @@ describe('Delete', () => {
       fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete);
       await run('delete', row('acme/api', environment()));
       expect(fakeVscode.window.showQuickPick).not.toHaveBeenCalled();
-      expect(h.service.delete).toHaveBeenCalled();
+      expect(h.service.deleteInWorker).toHaveBeenCalled();
     });
   });
 
@@ -1465,7 +1467,7 @@ describe('Delete', () => {
     h.service.safetyCheck.mockResolvedValue({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) });
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.openEnvironment);
     await run('delete', row('acme/api', environment()));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.connection.open).toHaveBeenCalled();
   });
@@ -1479,7 +1481,7 @@ describe('Delete', () => {
     await run('delete', row('acme/api', environment()));
     expect(warningMessages()).toHaveLength(1);
     expect(warningMessages()[0]).toBe(Messages.deleteUnsaved('acme/api', '1 uncommitted'));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
@@ -1492,7 +1494,7 @@ describe('Delete', () => {
       await run('delete', row('acme/api', environment()));
     }
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(h.service.openEnvironment).not.toHaveBeenCalled();
   });
 
@@ -1500,7 +1502,7 @@ describe('Delete', () => {
     await h.registry.add(environment());
     await run('delete', row('acme/api', environment()));
     expect(warningMessages()).toEqual([Messages.deleteConfirm('acme/api')]);
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
   });
 
   it('asks the connected other window to close its connection first; the delete continues there (concept 7.14)', async () => {
@@ -1511,7 +1513,7 @@ describe('Delete', () => {
     expect(warningMessages()[0]).toBe(
       `${Messages.deleteConfirm('acme/api')} ${ControllerTexts.otherWindowClosesConnection('acme/api')}`,
     );
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     expect(await h.disconnectRequests.read(ENV_ID)).toEqual(
       expect.objectContaining({ operation: 'delete', reason: 'manual', additionalVolumesToRemove: ['api-db'], requestedBy: WINDOW_ID }),
@@ -1527,13 +1529,13 @@ describe('Delete', () => {
     const command = run('delete', row('acme/api', env));
     await settle(() => h.progressTitles.some((title) => title.includes(ControllerTexts.waitingForOtherWindow('acme/api'))), 'the wait');
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     // The other window finishes its update.
     await h.registry.updateEnvironment(ENV_ID, (entry) => {
       delete entry.busy;
     });
     await command;
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: [] }));
   });
 
   it('does not wait and deletes nothing when the user cancels the wait', async () => {
@@ -1546,7 +1548,7 @@ describe('Delete', () => {
     await settle(() => h.progressTitles.some((title) => title.includes(ControllerTexts.waitingForOtherWindow('acme/api'))), 'the wait');
     progress.cancel();
     await command;
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect((await h.registry.get(ENV_ID))?.busy?.windowId).toBe(OTHER_WINDOW_ID);
   });
 
@@ -1560,7 +1562,7 @@ describe('Delete', () => {
     await run('delete', row('acme/api', env));
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyDeleting('acme/api'));
     expect(h.service.safetyCheck).not.toHaveBeenCalled();
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
   });
 
   it('hands the delete of the connected environment to the reloaded window', async () => {
@@ -1569,7 +1571,7 @@ describe('Delete', () => {
     await connectHere(env);
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.delete).mockResolvedValueOnce(Actions.remove);
     await run('delete', row('acme/api', env));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readOperations()).toEqual([
       expect.objectContaining({ environmentId: ENV_ID, operation: 'delete', additionalVolumesToRemove: ['api-db'] }),
     ]);
@@ -2120,7 +2122,7 @@ describe('Window roles', () => {
       reason: 'manual',
     });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.delete).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
+    expect(h.service.deleteInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ additionalVolumesToRemove: ['api-db'] }));
     expect(h.service.stop).toHaveBeenCalledWith('b1c2d3e4-0000-4000-8000-000000000002');
     expect(fs.readdirSync(h.paths.operationsDir)).toEqual([]);
     expect(h.connection.open).not.toHaveBeenCalled();
@@ -2777,7 +2779,7 @@ describe('Connection of this window', () => {
     ]);
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(expect.objectContaining({ operation: 'delete', windowId: WINDOW_ID }));
     expect(await h.disconnectRequests.read(ENV_ID)).toBeUndefined();
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
   });
 
   it('hands off a requested rebuild with its configuration, and a requested stop without a busy mark', async () => {
@@ -3064,7 +3066,7 @@ describe('Accounts (concept 7.5)', () => {
     });
     h.connection.isEmptyWindow.mockReturnValue(true);
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     // The operation stays until it expires (10 minutes), like an operation that no window takes.
     expect(fs.readdirSync(h.paths.operationsDir)).toEqual([`${ENV_ID}.json`]);
 
@@ -4681,7 +4683,7 @@ describe('Delete: a recorded state older than the last use (review round 1 of PR
       { modal: true },
       Actions.delete,
     ]);
-    expect(h.service.delete).toHaveBeenCalled();
+    expect(h.service.deleteInWorker).toHaveBeenCalled();
   });
 
   it('also with recorded changes, and without any recorded state since the last open', async () => {
@@ -4731,6 +4733,6 @@ describe('Delete: a recorded state older than the last use (review round 1 of PR
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(undefined);
     await run('delete', row('acme/api', environment()));
     expect(fakeVscode.window.showWarningMessage.mock.calls[0][0]).toBe(Messages.deleteConfirm('acme/api'));
-    expect(h.service.delete).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
   });
 });

@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
-import { OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
+import { OP_DELETE, OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
 import type { OperationOptions } from '../core/helperChannel/helperChannel';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
 
@@ -31,6 +31,7 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
     removePending: vi.fn(async () => {}),
     removeOperation: vi.fn(async () => {}),
     removeReopen: vi.fn(async () => {}),
+    removeReopenOf: vi.fn(async (_id: string) => {}),
     removeDisconnectRequest: vi.fn(async () => {}),
   };
   const ui = { info: vi.fn(), warn: vi.fn(), registrySignIn: vi.fn() };
@@ -48,6 +49,9 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
     credentials,
     settings: () => ({ stopAfterMinutes: 10 }) as unknown as ReturnType<HostSideDeps['settings']>,
     windowId: 'w1',
+    // Plan step 11C2a: the busy marks of a flow.
+    pid: 100,
+    clock: { now: () => Date.parse('2026-10-04T12:00:00.000Z') },
     isProcessAlive: () => true,
     logger: silentLogger,
     ...overrides,
@@ -145,5 +149,47 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
       await flow(op, {}, {});
       await expect(sent.at(-1)!.options.onAsk!('record', { call: 'get', args: ['e1'] }, open)).rejects.toMatchObject({ code: 'invalid' });
     }
+  });
+});
+
+// Plan step 11C2a (decision of 2026-10-04): the busy marks of a flow are this window's, set by this computer with its
+// clock and its view of the windows; the reopen record goes only with its environment.
+describe('the busy marks and the reopen record of a flow (plan step 11C2a)', () => {
+  it('marks the environment busy as this window, keeps the live mark of another window, and clears only its own', async () => {
+    const base = deps();
+    const environment = base.environment;
+    const registry = { ...base.registry, updateEnvironment: vi.fn(async (_id: string, change: (e: Environment) => void) => (change(environment), environment)) };
+    const host = extensionHostSide(deps({ registry } as never).all);
+    const mark = { operation: 'delete', since: '2026-10-04T12:00:00.000Z', pid: 100, windowId: 'w1' };
+    expect(await host.records.markBusy('e1', 'delete')).toEqual({ environment: expect.objectContaining({ busy: mark }) });
+    await host.records.clearBusy('e1');
+    expect(environment.busy).toBeUndefined();
+    // A live mark of another window (its status file is recent).
+    const other = { operation: 'update' as const, since: '2026-10-04T11:59:00.000Z', pid: 200, windowId: 'w2' };
+    environment.busy = other;
+    const { all: withWindows } = deps({ sessionFiles: { ...base.sessionFiles, readWindowStatuses: vi.fn(async () => [{ windowId: 'w2', pid: 200, updatedAt: '2026-10-04T11:59:50.000Z' }]) } as never, registry } as never);
+    expect(await extensionHostSide(withWindows).records.markBusy('e1', 'delete')).toEqual({ conflict: other });
+    await extensionHostSide(withWindows).records.clearBusy('e1');
+    expect(environment.busy).toEqual(other);
+  });
+
+  it('removes the reopen record of the environment through removeReopenOf', async () => {
+    const { all, sessionFiles } = deps();
+    await extensionHostSide(all).records.sessionFile('removeReopenOf', 'e1');
+    expect(sessionFiles.removeReopenOf).toHaveBeenCalledWith('e1');
+    expect(sessionFiles.removeReopen).not.toHaveBeenCalled();
+  });
+
+  it('answers the requests of a Delete only for the environment of the operation', async () => {
+    const { all } = deps();
+    const sent: OperationOptions[] = [];
+    const channels = { flow: vi.fn(async (_target: unknown, _op: string, _params: unknown, options: OperationOptions = {}) => (sent.push(options), { deleted: true })) };
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    await flow(OP_DELETE, { environmentId: 'e1' }, {});
+    const onAsk = sent[0].onAsk!;
+    const signal = new AbortController().signal;
+    await expect(onAsk('record', { call: 'clearBusy', args: ['e1'] }, signal)).resolves.toEqual({ value: null });
+    await expect(onAsk('record', { call: 'clearBusy', args: ['e2'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(onAsk('record', { call: 'remove', args: ['e2', {}] }, signal)).rejects.toMatchObject({ code: 'invalid' });
   });
 });
