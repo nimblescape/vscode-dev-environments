@@ -144,8 +144,9 @@ export interface DockerEngine {
    * Plan step 11D2 (the Session Monitor container, plan step 3 pipe loading): creates the container of `spec` with an open
    * input, attaches to it, starts it, writes `input`, and waits for `readyText` on its output, its end, `timeoutMs`, or
    * the cancellation; then its input is closed (the container goes on alone). A create that the engine refuses is
-   * `exited` (`conflict`: the name is in use); any failure after the create request was sent is `exited` too, so the
-   * caller removes the container of this create by its labels. Rejects only when nothing was sent.
+   * `exited` (`conflict`: the name is in use); any other failure after the create request was sent is `exited`, `timeout`
+   * (`timeoutMs` covers the create request too) or `aborted`, so the caller removes the container of this create by its
+   * labels. Rejects only when nothing was sent.
    */
   createAttached(spec: MonitorRunSpec, options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal }): Promise<MonitorCreated>;
 }

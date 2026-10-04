@@ -22,23 +22,34 @@ export function monitorScriptPlugin(root, define) {
     name: 'monitor-script',
     setup(build) {
       build.onResolve({ filter: /^devenv:monitor-script$/ }, () => ({ path: 'monitor-script', namespace: 'devenv-monitor-script' }));
+      // Review round 1 of PR #100 (A-L2): the inputs of the metafile are relative to absWorkingDir, so it is the root; a
+      // failed build still watches the folder of the monitor, so its fix rebuilds the worker.
+      const folder = path.join(root, 'src', 'remoteMonitor');
+      let watched = [folder];
       build.onLoad({ filter: /.*/, namespace: 'devenv-monitor-script' }, async () => {
-        const result = await esbuild.build({
-          entryPoints: [path.join(root, 'src', 'remoteMonitor', 'main.ts')],
-          bundle: true,
-          platform: 'node',
-          format: 'cjs',
-          target: 'node20',
-          minify: true,
-          write: false,
-          metafile: true,
-          logLevel: 'silent',
-          define,
-        });
+        let result;
+        try {
+          result = await esbuild.build({
+            absWorkingDir: root,
+            entryPoints: [path.join(root, 'src', 'remoteMonitor', 'main.ts')],
+            bundle: true,
+            platform: 'node',
+            format: 'cjs',
+            target: 'node20',
+            minify: true,
+            write: false,
+            metafile: true,
+            logLevel: 'silent',
+            define,
+          });
+        } catch (error) {
+          return { errors: error.errors ?? [{ text: String(error) }], watchFiles: watched, watchDirs: [folder] };
+        }
+        watched = Object.keys(result.metafile.inputs).map((file) => path.resolve(root, file));
         return {
           contents: `export default ${JSON.stringify(result.outputFiles[0].text)};`,
           loader: 'js',
-          watchFiles: Object.keys(result.metafile.inputs).map((file) => path.resolve(root, file)),
+          watchFiles: watched,
         };
       });
     },

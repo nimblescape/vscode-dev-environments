@@ -178,8 +178,10 @@ export class RemoteSessionMonitor {
    * message), and only when no container has the nonce of this create (a list that fails is a failure); a matching running container that Docker
    * restarted is accepted only with the stored script of this version (A-R4-3); a conflict that fails removes the
    * container of its nonce (none after a true conflict). Any other failure (no ready line in time, the container ended, a
-   * cancellation) removes the container of this create (plan step 11D2: the create of the engine has ended by then, so
-   * the wait for the end of the CLI client of review round 4 of PR #69, A-R4-1, is gone) (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
+   * cancellation) removes the container of this create (plan step 11D2: the wait for the end of the CLI client of review
+   * round 4 of PR #69, A-R4-1, is gone; review round 1 of PR #100, A-L1: a create request that the time limit or the
+   * cancel cut off may still make its container after this removal; that `created` container is replaced as abandoned
+   * after REMOTE_MONITOR_STALE_CREATED_MS) (by the nonce label LABEL_MONITOR_CREATE, best effort; review round 1 of PR
    * #69, A-R1-2: never by its name). `socketPath`: the source of the socket mount on the host of the
    * engine (as for the workspace helper, rootless aware). `helperImage`: the image of the container when it is not
    * `helperTag`: the checked image ID of the helper image of the open (review round 1 of PR #64, S1; review round 3
