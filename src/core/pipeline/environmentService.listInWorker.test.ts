@@ -156,6 +156,16 @@ describe('the reads of an attached window through the worker, from the extension
 
   // Review round 1 of 11C1 (A-R1-1): a read makes the worker ready passively and within its time limit. Review round 2
   // (A-R2-M1, A-R2-M2): changed expectation (before: a read of a command of the user made it ready in full): every read.
+  // Review round 3 of 11C1 (A-R3-M1): a read with the signal of an operation of the user makes the worker ready in full.
+  it('a read with the signal of an operation is not passive and ends with that signal', async () => {
+    const { h, sent } = harness(async () => ({ state: 'running' }));
+    const env = await seedEnvironment(h, { container: 'running' });
+    const signal = new AbortController().signal;
+    await h.service.windowStateInWorker(env, 'devenv-x', { signal });
+    expect(sent[0]).toMatchObject({ timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, signal });
+    expect(sent[0].passive).toBeUndefined();
+  });
+
   it('a read is passive and bounded by its time limit, with and without the branch', async () => {
     const { h, sent } = harness(async () => ({ state: 'running' }));
     const env = await seedEnvironment(h, { container: 'running' });
@@ -173,8 +183,13 @@ describe('the reads of an attached window through the worker, from the extension
     try {
       const { h } = harness(async () => ({ state: 'running' }));
       const env = await seedEnvironment(h, { container: 'running' });
+      const { h: h2, sent } = harness(async () => ({ state: 'running' }));
+      await seedEnvironment(h2, { container: 'running' });
       await h.service.windowStateInWorker(env, 'devenv-x');
+      await h2.service.windowStateInWorker(env, 'devenv-x');
       expect(timeout).toHaveBeenCalledWith(WINDOW_STATE_FLOW_TIMEOUT_MS);
+      // Review round 3 of 11C1 (B-R3 E5b): that signal is the one sent.
+      expect(sent[0].signal).toBe(timeout.mock.results[1].value);
     } finally {
       timeout.mockRestore();
     }

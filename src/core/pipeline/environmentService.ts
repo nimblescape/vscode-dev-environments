@@ -6129,10 +6129,14 @@ export class EnvironmentService {
    * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
    * Never throws. Review rounds 1 and 2 of 11C1 (A-R1-1, A-R2-M1, A-R2-M2): the worker is made ready passively (as for
    * the refresh: never a build of the helper image, the wait after a failed open kept), and within
-   * WINDOW_STATE_FLOW_TIMEOUT_MS, also for a Start of the user: unknown takes it to the open pipeline, which prepares the
-   * worker with its progress and Cancel.
+   * WINDOW_STATE_FLOW_TIMEOUT_MS. Review round 3 (A-R3-M1): with `signal` (a read within an operation of the user, with
+   * its progress and Cancel), it is made ready in full, as for the pipeline, until `signal` aborts.
    */
-  async windowStateInWorker(environment: Environment, containerName: string, options: { branch?: boolean } = {}): Promise<WindowStateValue | undefined> {
+  async windowStateInWorker(
+    environment: Environment,
+    containerName: string,
+    options: { branch?: boolean; signal?: AbortSignal } = {},
+  ): Promise<WindowStateValue | undefined> {
     try {
       // Unit 7: an environment of another Docker host is not read through the worker of this one.
       if (!(await this.isOnCurrentHost(environment))) return undefined;
@@ -6149,7 +6153,9 @@ export class EnvironmentService {
         await this.deps.flow(
           OP_WINDOW_STATE,
           params,
-          { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) },
+          options.signal !== undefined
+            ? { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, signal: options.signal }
+            : { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) },
         ),
       );
       if (value === undefined) throw new Error('the worker answered with an invalid value');
