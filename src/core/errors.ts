@@ -23,6 +23,8 @@ export type UserErrorCode =
   | 'dockerEndpointUnsupported'
   | 'otherDockerHost'
   | 'sessionMonitorFailed'
+  /** Plan step 11B2 (review round 2, A-R2-2): the record of the environment holds a value that the worker refuses; no retry helps. */
+  | 'recordInvalid'
   | 'cancelled';
 
 export class UserFacingError extends Error {

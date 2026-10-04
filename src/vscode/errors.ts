@@ -116,6 +116,8 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   otherDockerHost: ['showDetails'],
   // Plan step 8, PR A (Q3): the Session Monitor container could not be started at an open.
   sessionMonitorFailed: 'retry',
+  // Plan step 11B2 (review round 2, A-R2-2): a retry would be refused the same way.
+  recordInvalid: ['showDetails'],
 };
 
 /** Situations that the user can resolve, rather than failures. */

@@ -3871,6 +3871,14 @@ describe('stop', () => {
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'topic', uncommittedFiles: 4 });
     });
 
+    it('keeps the recorded Git state when the worker answers none, and reports the failures (review round 2)', async () => {
+      withFlow(async () => ({ outcome: 'stopped', services: [], failures: ['The container a could not be stopped: x.'] }));
+      await seedEnvironment(h, { container: 'running' });
+      const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+      expect(thrown.message).toBe('The container a could not be stopped: x.');
+      expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
+    });
+
     it('refuses before the worker: under a lock that this window holds, and parameters the worker would refuse (review round 1, A-R1-4, A-R1-5)', async () => {
       const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
@@ -3882,7 +3890,10 @@ describe('stop', () => {
       await h.registry.updateEnvironment(ENV_ID, (env) => {
         env.remoteUser = '-u root';
       });
-      expect((await rejection(h.service.stop(ENV_ID))).message).toBe(PipelineTexts.stopRefused(REPO));
+      const refused = await rejection(h.service.stop(ENV_ID));
+      expect(refused.message).toBe(PipelineTexts.stopRefused(REPO));
+      // Review round 2 (A-R2-2): no Try again for a refusal that a retry cannot change.
+      expect(refused.code).toBe('recordInvalid');
       expect(sent).toEqual([]);
     });
 
@@ -3893,6 +3904,8 @@ describe('stop', () => {
         // Review round 1 (A-R1-3): a lock that could not be taken; a channel lost while the flow ran is no "not changed".
         [new HelperOperationError(LOCK_UNAVAILABLE_CODE, 'flock failed', false), PipelineTexts.environmentLockUnavailable(REPO, 'flock failed')],
         [new HelperChannelError('lost', 'The worker ended.'), 'The worker ended.'],
+        // Review round 2 (A-R2-1): a channel that closed before the flow was sent changed nothing.
+        [new HelperChannelError('closed', 'closed'), PipelineTexts.environmentLockUnavailable(REPO, 'closed')],
         [new HelperOperationError('failed', 'The container x could not be stopped: permission denied', false), 'The container x could not be stopped: permission denied'],
       ] as const) {
         withFlow(async () => {

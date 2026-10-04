@@ -251,7 +251,7 @@ export const PipelineTexts = {
     `${repository} was not changed: the Dev Environments worker on the Docker host could not be prepared (${cause}). Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
   /** Plan step 11B2 (review round 1, A-R1-5): the record of the environment holds a name or user that Stop cannot use. */
   stopRefused: (repository: string) =>
-    `${repository} cannot be stopped from here: its container name or remote user is not one that Dev Environments can pass on. Stop it with Docker.`,
+    `${repository} cannot be stopped from here: its record holds a value (the container name, the remote user, or the repository folder) that Dev Environments cannot pass on. Stop it with Docker.`,
 } as const;
 
 /** Plan step 5, PR B, user decision D3: how long an operation waits for the lock of an environment that is held elsewhere. */
@@ -5671,7 +5671,7 @@ export class EnvironmentService {
         waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS,
       });
       if (params === undefined) {
-        throw new UserFacingError('startFailed', PipelineTexts.stopRefused(env.repository), `container ${env.containerName}, remote user ${JSON.stringify(env.remoteUser ?? '')}`);
+        throw new UserFacingError('recordInvalid', PipelineTexts.stopRefused(env.repository), `container ${env.containerName}, remote user ${JSON.stringify(env.remoteUser ?? '')}, repository ${env.repository}`);
       }
       const value = parseStopValue(await this.workerFlow(env, OP_STOP, params, STOP_FLOW_TIMEOUT_MS));
       if (value === undefined) throw new Error(`The worker answered the Stop of ${env.repository} with an invalid value.`);
@@ -5706,9 +5706,9 @@ export class EnvironmentService {
         throw new UserFacingError('startFailed', PipelineTexts.environmentLockBusy(env.repository), error.message);
       }
       // Review round 1 (A-R1-3): only a refusal before anything ran is "nothing is changed": the lock that could not be
-      // taken, or a worker that could not be reached or knows no such flow. A channel lost while the flow ran is thrown as
+      // taken, or a worker that could not be reached or knows no such flow (review round 2, A-R2-1: `closed` is not sent). A channel lost while the flow ran is thrown as
       // it is (the flow may have changed something).
-      if ((error instanceof HelperOperationError && error.code === LOCK_UNAVAILABLE_CODE) || (error instanceof HelperChannelError && (error.code === 'unavailable' || error.code === 'unsendable' || error.code === 'open'))) {
+      if ((error instanceof HelperOperationError && error.code === LOCK_UNAVAILABLE_CODE) || (error instanceof HelperChannelError && (error.code === 'unavailable' || error.code === 'unsendable' || error.code === 'open' || error.code === 'closed'))) {
         this.logger.warn(`${env.repository}: the worker on the Docker host could not be reached, so nothing is changed: ${errorMessage(error)}`);
         throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
       }
