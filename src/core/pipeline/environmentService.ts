@@ -68,11 +68,15 @@ import {
   newCleanupLabel,
   OP_LIST_CONFIGURATIONS,
   OP_STOP,
+  OP_WINDOW_STATE,
   parseListConfigurationsParams,
   parseListConfigurationsValue,
   parseStopParams,
   parseStopValue,
+  parseWindowStateParams,
+  parseWindowStateValue,
   type FlowRefusal,
+  type WindowStateValue,
 } from '../helperChannel/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
@@ -274,6 +278,8 @@ export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
  * Stop with more than about eight services that all hit their own time limit ends here (review round 1, A-R1-6).
  */
 export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
+/** Plan step 11C1: the longest read of an attached window in the worker (the branch read has 15 s of its own). */
+export const WINDOW_STATE_FLOW_TIMEOUT_MS = 30_000;
 /**
  * Plan step 11B3b: the longest listing of Select configuration in the worker: the wait for the lock (D3), the start of the
  * batch helper, and its step.
@@ -6114,12 +6120,33 @@ export class EnvironmentService {
     }
   }
 
-  /** Current branch from the running container (`git branch --show-current` through `docker exec`). */
-  async currentBranch(environmentId: string): Promise<string | undefined> {
-    const env = await this.deps.registry.get(environmentId);
-    if (!env || !(await this.isOnCurrentHost(env))) return undefined;
-    const branch = await this.branchInContainer(env.containerName, env.remoteUser, repositoryFolder(env.repository));
-    return branch ?? undefined;
+  /**
+   * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): what an attached window reads of the dev container
+   * `containerName` of `environment`, by the worker of the Docker host of the operation (`windowState`): its state,
+   * whether it may be used as it is, and with `branch` the branch of its repository. `undefined` when it could not be read
+   * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
+   * Never throws.
+   */
+  async windowStateInWorker(environment: Environment, containerName: string, options: { branch?: boolean } = {}): Promise<WindowStateValue | undefined> {
+    try {
+      // Unit 7: an environment of another Docker host is not read through the worker of this one.
+      if (!(await this.isOnCurrentHost(environment))) return undefined;
+      const params = parseWindowStateParams({
+        environmentId: environment.id,
+        containerName,
+        checks: hostAccessChecks(environment.repository, this.deps.settings()),
+        ...(options.branch
+          ? { branch: { folder: repositoryFolder(environment.repository), ...(environment.remoteUser !== undefined && environment.remoteUser !== '' ? { user: environment.remoteUser } : {}) } }
+          : {}),
+      });
+      if (params === undefined) throw new Error('its parameters are beyond the checks of the worker');
+      const value = parseWindowStateValue(await this.deps.flow(OP_WINDOW_STATE, params, { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS }));
+      if (value === undefined) throw new Error('the worker answered with an invalid value');
+      return value;
+    } catch (error) {
+      this.logger.info(`The state of the container ${containerName} could not be read: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   /**

@@ -14,6 +14,8 @@ import {
   parseListConfigurationsParams,
   parseStopParams,
   parseTokenRemoveParams,
+  parseWindowStateParams,
+  type WindowStateValue,
   type FlowRefusal,
   type ListConfigurationsValue,
   type StopValue,
@@ -23,6 +25,8 @@ import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
 import { isAbortError, silentProgress, type Logger } from '../core/ports';
 import { readOwnHelper, type OwnHelper } from '../core/worker/ownHelper';
 import { workerServices } from '../core/worker/workerServices';
+import { EngineDocker } from '../core/worker/engineDocker';
+import { windowStateFlow } from '../core/worker/windowStateFlow';
 import type { HelperBatchSession } from '../core/helperChannel/helperChannel';
 import { workerEnvironmentLock } from './workerLock';
 import { stopFlow } from '../core/worker/stopFlow';
@@ -216,6 +220,25 @@ export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelp
       return { configPaths } satisfies ListConfigurationsValue;
     } catch (error) {
       return flowRefusal(error, context) satisfies ListConfigurationsValue;
+    }
+  };
+}
+
+/**
+ * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): `windowState`, what an attached window reads of its dev
+ * container (windowStateFlow). It only reads: no lock, no secret, no request to the extension.
+ */
+export function windowStateOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    const checked = parseWindowStateParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the windowState operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The windowState operation takes no secret.');
+    try {
+      const value = await windowStateFlow({ ...checked, docker: new EngineDocker(engineOf(context), contextLogger(context)), signal: context.signal });
+      return value satisfies WindowStateValue;
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The windowState operation was cancelled.');
+      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
     }
   };
 }

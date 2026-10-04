@@ -94,7 +94,8 @@ describe('an environment of another Docker host is never acted on', () => {
   });
 
   it('reads nothing of it from Docker', async () => {
-    expect(await h.service.currentBranch(ENV_ID)).toBeUndefined();
+    // Plan step 11C1: changed expectation, the reads of the window go through windowStateInWorker (was: currentBranch).
+    expect(await h.service.windowStateInWorker((await h.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual([]);
     expect((await h.service.inspectStates())?.has(ENV_ID)).toBe(false);
@@ -196,7 +197,8 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
     u.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID.replace(/^./, 'f'), [LABEL_REPOSITORY]: 'acme/lost', [LABEL_OWNER_ID]: ACCOUNT.id });
     expect(await u.service.reconcileFromVolumes()).toBe(0);
     expect(await u.service.inspectStates()).toEqual(new Map());
-    expect(await u.service.currentBranch(ENV_ID)).toBeUndefined();
+    // Plan step 11C1: changed expectation, windowStateInWorker (was: currentBranch).
+    expect(await u.service.windowStateInWorker((await u.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
     expect(await u.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
     expect(await u.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
     expect(await u.service.repositoryServiceData(ENV_ID)).toEqual([]);

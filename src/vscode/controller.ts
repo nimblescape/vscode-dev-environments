@@ -1140,7 +1140,7 @@ export class Controller implements vscode.Disposable {
       if (this.isConnectedHere(environment)) {
         // "Already connected → nothing" only while the container runs; otherwise this is Reconnect (concept 6.3, 7.12).
         const containerName = this.current?.containerName ?? environment.containerName;
-        if (await this.containerRuns(containerName)) {
+        if ((await this.containerRuns(environment, containerName)) === true) {
           // Concept section 9: a container of an older version lacks the current setup. The pipeline must not
           // replace it under this window, so the window leaves it; a Start from the empty window makes a new container.
           // The same for a container made while the host access checks were off, when they are on now.
@@ -1166,7 +1166,7 @@ export class Controller implements vscode.Disposable {
         this.logger.info(`The container of ${repository} does not run. The window connects again.`);
         reconnecting = true;
       } else if ((otherWindow = await this.otherWindowOf(environment.id))) {
-        if (await this.containerRuns(environment.containerName)) {
+        if ((await this.containerRuns(environment, environment.containerName)) === true) {
           // The pipeline must not replace the container under the other window (an update would disconnect it).
           // Assumption (V-2): VS Code shows the window that has this folder open instead of opening it again (concept 7.11).
           // Also for Start in New Window: never two windows on one environment.
@@ -1963,16 +1963,8 @@ export class Controller implements vscode.Disposable {
    */
   private async containerOutdated(environment: Environment): Promise<'version' | 'hostAccess' | undefined> {
     if (!this.deps.docker.isInstalled()) return undefined;
-    try {
-      const container = await this.deps.docker.findContainer(environment.id, environment.containerName);
-      if (container === undefined) return undefined;
-      const checks = hostAccessChecks(environment.repository, this.deps.settings());
-      if (containerIsCurrent(container.labels, true, checks)) return undefined;
-      return containerIsCurrent(container.labels, true, 'off') && isUnrestrictedContainer(container.labels) ? 'hostAccess' : 'version';
-    } catch (error) {
-      this.logger.info(`The container of the environment ${environment.id} could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
+    // Plan step 11C1: read by the worker; unknown (undefined) when it cannot be read (decision of 2026-10-04).
+    return (await this.deps.service.windowStateInWorker(environment, environment.containerName))?.outdated;
   }
 
   /** The message and the log line when the window leaves a container for the reason of containerOutdated. */
@@ -1999,7 +1991,10 @@ export class Controller implements vscode.Disposable {
     if (this.gate.runningFor(repositoryKey(repository)) !== undefined) return;
     this.checkingConnection = true;
     try {
-      const lost = !(await this.containerRuns(current.containerName));
+      const runs = await this.containerRuns(current.environment, current.containerName);
+      // Decision of 2026-10-04: a state that could not be read (the worker could not be reached) changes nothing.
+      if (runs === undefined) return;
+      const lost = !runs;
       if (lost === current.lost) return;
       current.lost = lost;
       this.logger.info(lost ? `The container of ${repository} does not run.` : `The container of ${repository} runs again.`);
@@ -2014,14 +2009,19 @@ export class Controller implements vscode.Disposable {
     const current = this.current;
     if (!current) return;
     await this.checkConnection();
-    const branch = await this.deps.service.currentBranch(current.environment.id);
+    // Plan step 11C1: read by the worker.
+    const branch = (await this.deps.service.windowStateInWorker(current.environment, current.containerName, { branch: true }))?.branch;
     if (branch && this.current === current) {
       current.branch = branch;
       this.updateStatusBar();
     }
   }
 
-  /** The state of the container as Docker reports it, or why it could not be read. */
+  /**
+   * The state of the container as the Docker of the window reports it, or why it could not be read. Plan step 11C1: it
+   * stays direct, as the check of the attach (readyForWindow; section 0 of the plan: the attach diagnostics check what the
+   * local Docker CLI sees).
+   */
   private async containerStateText(containerName: string): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
     try {
@@ -2031,14 +2031,15 @@ export class Controller implements vscode.Disposable {
     }
   }
 
-  private async containerRuns(containerName: string): Promise<boolean> {
+  /**
+   * Whether the container runs, read by the worker (plan step 11C1); `undefined` when it could not be read (decision of
+   * 2026-10-04: unknown). A Start or Reconnect of the user takes unknown as "not running" and tries; its failure leaves
+   * the window disconnected.
+   */
+  private async containerRuns(environment: Environment, containerName: string): Promise<boolean | undefined> {
     if (!this.deps.docker.isInstalled()) return false;
-    try {
-      return (await this.deps.docker.containerState(containerName)) === 'running';
-    } catch (error) {
-      this.logger.info(`The state of the container ${containerName} could not be read: ${errorMessage(error)}`);
-      return false;
-    }
+    const value = await this.deps.service.windowStateInWorker(environment, containerName);
+    return value === undefined ? undefined : value.state === 'running';
   }
 
   private updateStatusBar(): void {
