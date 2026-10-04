@@ -475,6 +475,13 @@ describe('the requests of Delete (plan step 11C2a)', () => {
       await expect(handler('record', { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
     }
     expect(calls.map((call) => call.call)).toEqual(['markBusy', 'sessionFile', 'read']);
+    // Review round 2 of 11C2a (A-R2, missing test 3): a detail is the whole kind, never a prefix of it.
+    await expect(handler('record', { call: 'sessionFile', args: ['removePending.x', 'e1'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(handler('record', { call: 'markBusy', args: ['e1', 'delete.x'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    // The bare allowance allows every kind of the request.
+    const bare = wired({}, silentLogger, ['record sessionFile']);
+    await bare.handler('record', { call: 'sessionFile', args: ['writePending', 'e1'] }, bare.signal);
+    expect(bare.calls).toEqual([{ call: 'sessionFile', args: ['writePending', 'e1'] }]);
   });
 });
 

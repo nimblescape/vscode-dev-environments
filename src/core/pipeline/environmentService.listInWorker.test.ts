@@ -328,6 +328,27 @@ describe('the Delete in the worker: review round 1 of 11C2a', () => {
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(OTHER_MARK);
   });
 
+  // Review round 2 of 11C2a (A-R2, missing test 1): a cancel and the time limit of the worker clear it too.
+  it('clears the busy mark of this window after a cancel and after the time limit of the worker', async () => {
+    const controller = new AbortController();
+    let failure: () => Error = () => (controller.abort(), Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    const { h } = harness(
+      async () => {
+        await h.registry.updateEnvironment(ENV_ID, (entry) => {
+          entry.busy = OWN_MARK;
+        });
+        throw failure();
+      },
+      { monitorSource: () => SOURCE },
+    );
+    await seedEnvironment(h, { container: 'stopped' });
+    expect(await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, additionalVolumesToRemove: [] }))).toMatchObject({ code: 'cancelled' });
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+    failure = () => new HelperOperationError('timeout', 'The operation did not end in time.', false);
+    await rejection(h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }));
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
+
   it('leaves the mark to the worker when it answered with a refusal', async () => {
     const { h } = harness(
       async () => {
