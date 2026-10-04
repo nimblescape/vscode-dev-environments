@@ -911,7 +911,7 @@ const PULL_DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-
  * Review round 1 of PR #89 (A-R1-2): true when `reference` ends in a valid digest (`@<digest>`) or a valid tag after its
  * last `/`. An empty tag (`node:`) is none: the engine would take it for "pull every tag".
  */
-function hasTagOrDigest(reference: string): boolean {
+export function hasTagOrDigest(reference: string): boolean {
   const at = reference.indexOf('@');
   if (at >= 0) return PULL_DIGEST.test(reference.slice(at + 1));
   const colon = reference.lastIndexOf(':');

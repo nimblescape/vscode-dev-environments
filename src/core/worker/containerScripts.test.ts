@@ -10,10 +10,12 @@ import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToke
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { CONTAINER_SCRIPTS, runScript, scriptCommand, type ContainerScript } from './containerScripts';
 import type { DockerEngine, EngineExecOptions } from './dockerEngine';
+import { unusedEngine } from './dockerEngine.testkit';
 
 function fakeEngine() {
   const execs: { container: string; command: readonly string[]; options: EngineExecOptions }[] = [];
   const engine: DockerEngine = {
+    ...unusedEngine(),
     container: async () => undefined,
     containers: async () => [],
     exec: async (container, command, options = {}) => {

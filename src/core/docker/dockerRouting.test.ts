@@ -189,6 +189,9 @@ const CLASSIFICATION: Record<string, { routed: boolean; readOnly: boolean }> = {
   // Plan step 10A: `start` of startContainer runs directly only without a WorkerEngine (as here); within an operation it
   // is the worker operation `startContainers` (containerAdapter.engine.test.ts).
   start: { routed: false, readOnly: false },
+  // Plan step 11B3: the `docker run` of the ownership fix before the create (runOnVolume; under the lock it goes through
+  // the worker that holds it, as before; plan step 11G replaces it).
+  run: { routed: false, readOnly: false },
 };
 
 const OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context']);
@@ -298,6 +301,10 @@ describe('the classification of every Docker call of ContainerAdapter (plan step
       imageLabelsOf: (d) => d.imageLabelsOf(['i', 'j']),
       labelImage: (d) => d.labelImage('i', { a: 'b' }),
       startContainer: (d) => d.startContainer('c'),
+      // Plan step 11B3: the typed calls that replaced runChecked in the pipeline.
+      imageConfig: (d) => d.imageConfig('i'),
+      runOnVolume: (d) => d.runOnVolume({ image: 'i', volume: 'v', target: '/w', entrypoint: 'sh', args: ['-c', 'true'], user: 'root', labels: { a: 'b' } }),
+      containerIdsWithLabel: (d) => d.containerIdsWithLabel('a=b'),
     };
     const members = Object.getOwnPropertyNames(ContainerAdapter.prototype);
     const unknown = members.filter((name) => !NO_OWN_CALL.has(name) && !(name in exercised));

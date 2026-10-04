@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
+import { unusedEngine } from './dockerEngine.testkit';
 import { runningDevContainer, runningServices } from './environmentContainers';
 import { STOP_CONTAINER_TIMEOUT_MS, STOP_GIT_TIMEOUT_MS, stopFlow } from './stopFlow';
 import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, parseStopValue } from '../helperChannel/protocol';
@@ -31,6 +32,7 @@ function fakeEngine(listed: EngineContainer[], exec: () => EngineExecResult | Pr
   const execs: { container: string; command: readonly string[]; options: EngineExecOptions }[] = [];
   const stops: { container: string; timeout?: number; signal?: AbortSignal }[] = [];
   const engine: DockerEngine = {
+    ...unusedEngine(),
     container: async () => undefined,
     containers: async (label) => (calls.push(`list ${label}`), listed),
     exec: async (name, command, options = {}) => {

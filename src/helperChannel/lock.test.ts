@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions } from '../core/worker/dockerEngine';
+import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { scriptCommand } from '../core/worker/containerScripts';
 import { stopOperation } from './flowOperations';
 import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
@@ -357,6 +358,7 @@ describe('the stop operation under its own lock (plan step 11B2)', () => {
   function engineOf(stop: () => Promise<void> = async () => {}, events: string[] = [], execs: { command: readonly string[]; options: EngineExecOptions }[] = []): DockerEngine {
     const dev: EngineContainer = { id: 'd'.repeat(64), name: NAME, state: 'running', rawState: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ID }, image: 'img:1' };
     return {
+      ...unusedEngine(),
       container: async () => undefined,
       containers: async () => (events.push('list'), [dev]),
       exec: async (_c, command, options = {}) => (events.push('git'), execs.push({ command, options }), { exitCode: 0, stdout: 'main\n0\n0\n0\n', stderr: '', timedOut: false }),

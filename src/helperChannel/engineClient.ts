@@ -5,52 +5,37 @@
 // Plan step 11B1: the port `DockerEngine` of the flows in the worker (src/core/worker/dockerEngine.ts) over the Docker
 // Engine API (engineApi.ts). One request per call, no `docker` process; `exec` runs over a hijacked connection, so the
 // standard input of a script (its secret) never becomes an argument.
-import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from '../core/worker/dockerEngine';
+import { publicInfo, toContainerInfo, toLabels } from '../core/docker/dockerObjects';
+import {
+  EngineError,
+  type DockerEngine,
+  type EngineContainer,
+  type EngineExecOptions,
+  type EngineExecResult,
+  type EngineFilters,
+  type EngineImage,
+  type EngineObjectKind,
+  type EnginePullLogin,
+  type EngineRun,
+} from '../core/worker/dockerEngine';
 import { abortError } from '../core/ports';
-import type { ContainerState } from '../core/types';
+import * as crypto from 'crypto';
+import { hasTagOrDigest } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
-import { engineApi, engineErrorMessage, engineHijack, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
+import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
-/** The state of a container as the flows know it (ContainerState); `rawState` keeps the status of the engine. */
-function stateOf(running: boolean, paused: boolean): ContainerState {
-  return running || paused ? 'running' : 'stopped';
-}
-
-interface InspectAnswer {
-  Id?: unknown;
-  Name?: unknown;
-  Created?: unknown;
-  RestartCount?: unknown;
-  State?: { Status?: unknown; Running?: unknown; Paused?: unknown; ExitCode?: unknown };
-  Config?: { Labels?: unknown; Image?: unknown };
-  Image?: unknown;
-  Mounts?: unknown;
-}
-
-function containerOf(value: InspectAnswer): EngineContainer | undefined {
-  const id = value.Id;
-  if (typeof id !== 'string' || id === '') return undefined;
-  const status = typeof value.State?.Status === 'string' ? value.State.Status : '';
-  const container: EngineContainer = {
-    id,
-    name: typeof value.Name === 'string' ? value.Name.replace(/^\//, '') : '',
-    state: stateOf(value.State?.Running === true, value.State?.Paused === true),
-    rawState: status,
-    labels: typeof value.Config?.Labels === 'object' && value.Config.Labels !== null ? ({ ...value.Config.Labels } as Record<string, string>) : {},
-    image: typeof value.Config?.Image === 'string' ? value.Config.Image : '',
-  };
-  if (typeof value.Image === 'string') container.imageId = value.Image;
-  if (typeof value.State?.ExitCode === 'number') container.exitCode = value.State.ExitCode;
-  if (typeof value.RestartCount === 'number') container.restartCount = value.RestartCount;
-  if (typeof value.Created === 'string') container.created = value.Created;
-  const mounts = value.Mounts;
-  if (Array.isArray(mounts)) {
-    const volumes = mounts
-      .filter((mount): mount is { Type: string; Name: string } => typeof mount === 'object' && mount !== null && (mount as { Type?: unknown }).Type === 'volume')
-      .map((mount) => mount.Name)
-      .filter((name): name is string => typeof name === 'string');
-    if (volumes.length > 0) container.volumes = volumes;
-  }
+/**
+ * The container of an inspect answer, read as the pipeline reads `docker inspect` (toContainerInfo of dockerObjects.ts,
+ * plan step 11B3: one reading for both), with the exit code and the restarts.
+ */
+function containerOf(value: unknown): EngineContainer | undefined {
+  const inspected = toContainerInfo(value);
+  if (inspected === undefined) return undefined;
+  const raw = value as { State?: { ExitCode?: unknown }; RestartCount?: unknown };
+  const container: EngineContainer = publicInfo(inspected);
+  if (typeof raw.State?.ExitCode === 'number') container.exitCode = raw.State.ExitCode;
+  if (typeof raw.RestartCount === 'number') container.restartCount = raw.RestartCount;
+  if (inspected.created !== '') container.created = inspected.created;
   return container;
 }
 
@@ -66,39 +51,103 @@ function json(body: string): unknown {
 /** The hijacked start of an exec (engineHijack). */
 export type EngineHijack = (request: EngineHijackRequest) => Promise<EngineStream>;
 
+/** The path of an inspect of each kind. */
+const INSPECT_PATHS: Record<EngineObjectKind, (reference: string) => string> = {
+  container: (reference) => `/containers/${encodeURIComponent(reference)}/json`,
+  image: (reference) => `/images/${encodeURIComponent(reference)}/json`,
+  volume: (reference) => `/volumes/${encodeURIComponent(reference)}`,
+  network: (reference) => `/networks/${encodeURIComponent(reference)}`,
+};
+
+/** The query of the filters of a list request. */
+function filtersQuery(filters: EngineFilters): string {
+  return `filters=${encodeURIComponent(JSON.stringify(filters))}`;
+}
+
+/**
+ * The value of the header X-Registry-Auth: the credentials as JSON in URL-safe Base64 **with** its padding, as the
+ * Docker CLI sends them (Go's base64.URLEncoding). Review round 1 of PR #89 (A-R1-1): the engine decodes it strictly and
+ * ignores a header it cannot decode, so Node's `base64url` (without `=`) made it pull anonymously in 2 of 3 cases.
+ * `identitytoken`: an identity token of `docker login` instead of a user and password (A-R1-3).
+ */
+export function registryAuthHeader(credentials: { username: string; password: string; serveraddress: string } | { identitytoken: string; serveraddress: string }): string {
+  return Buffer.from(JSON.stringify(credentials), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+interface PullMessage {
+  status?: unknown;
+  id?: unknown;
+  progressDetail?: { current?: unknown };
+  error?: unknown;
+  errorDetail?: { message?: unknown };
+}
+
+/**
+ * The line of `docker pull` for one message of the engine's progress stream, or undefined for the progress bars of a
+ * layer (`Downloading`, `Extracting` with a current size), which `docker pull` without a terminal does not print either.
+ */
+export function pullLine(message: PullMessage): string | undefined {
+  if (typeof message.status !== 'string') return undefined;
+  if (message.progressDetail !== undefined && typeof message.progressDetail === 'object' && message.progressDetail !== null && message.progressDetail.current !== undefined) {
+    return undefined;
+  }
+  return typeof message.id === 'string' && message.id !== '' ? `${message.id}: ${message.status}` : message.status;
+}
+
+/** The time of the engine (seconds since 1970) as RFC 3339. */
+function isoOf(seconds: unknown): string {
+  return typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : '';
+}
+
+function texts(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
 /**
  * Plan step 11B1: the port over the Engine API of the worker's engine. `secretOf` gives the value of a secret that the
- * operation holds (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName);
- * the port of an operation is built with its own secrets (review round 1 of plan step 11B1, A-R1-3).
+ * operation holds (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName) and
+ * the login of a pull; the port of an operation is built with its own secrets (review round 1 of plan step 11B1, A-R1-3).
  */
 export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack = engineHijack(), secretOf: (name: string) => string | undefined = () => undefined): DockerEngine {
   const fail = (answer: { status: number; body: string }): never => {
     throw new EngineError(engineErrorMessage({ ...answer, truncated: false }), answer.status);
   };
+  const inspect = async (kind: EngineObjectKind, reference: string, signal?: AbortSignal): Promise<unknown> => {
+    const answer = await api({ method: 'GET', path: INSPECT_PATHS[kind](reference), signal });
+    if (answer.status === 404) return undefined;
+    if (answer.status !== 200) fail(answer);
+    const value = json(answer.body);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new EngineError(`The engine answered the inspect of the ${kind} ${reference} with an invalid value.`, answer.status);
+    return value;
+  };
+  const list = async (path: string, signal?: AbortSignal): Promise<unknown> => {
+    const answer = await api({ method: 'GET', path, signal });
+    if (answer.status !== 200) fail(answer);
+    if (answer.truncated) throw new EngineError(`The engine answered ${path.split('?')[0]} with more than can be read.`, answer.status);
+    const value = json(answer.body);
+    if (value === undefined) throw new EngineError(`The engine answered ${path.split('?')[0]} with an invalid value.`, answer.status);
+    return value;
+  };
+  const containerIds = async (filters: EngineFilters, signal?: AbortSignal): Promise<string[]> => {
+    const value = await list(`/containers/json?all=true&${filtersQuery(filters)}`, signal);
+    if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the containers with an invalid value.', 200);
+    return value.map((entry) => (entry as { Id?: unknown })?.Id).filter((id): id is string => typeof id === 'string' && id !== '');
+  };
   return {
     container: async (reference, signal) => {
-      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(reference)}/json`, signal });
-      if (answer.status === 404) return undefined;
-      if (answer.status !== 200) fail(answer);
-      const value = json(answer.body);
-      const container = typeof value === 'object' && value !== null ? containerOf(value as InspectAnswer) : undefined;
-      if (container === undefined) throw new EngineError('The engine answered the inspect of a container with an invalid value.', answer.status);
+      const value = await inspect('container', reference, signal);
+      if (value === undefined) return undefined;
+      const container = containerOf(value);
+      if (container === undefined) throw new EngineError('The engine answered the inspect of a container with an invalid value.', 200);
       return container;
     },
     containers: async (label, signal) => {
-      const filters = encodeURIComponent(JSON.stringify({ label: [label] }));
-      const answer = await api({ method: 'GET', path: `/containers/json?all=true&filters=${filters}`, signal });
-      if (answer.status !== 200) fail(answer);
-      const value = json(answer.body);
-      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the containers with an invalid value.', answer.status);
       const found: EngineContainer[] = [];
-      for (const entry of value as { Id?: unknown }[]) {
-        if (typeof entry?.Id !== 'string') continue;
-        const inspected = await api({ method: 'GET', path: `/containers/${encodeURIComponent(entry.Id)}/json`, signal });
-        if (inspected.status === 404) continue;
-        if (inspected.status !== 200) fail(inspected);
-        const parsed = json(inspected.body);
-        const container = typeof parsed === 'object' && parsed !== null ? containerOf(parsed as InspectAnswer) : undefined;
+      for (const id of await containerIds({ label: [label] }, signal)) {
+        const value = await inspect('container', id, signal);
+        // Removed since the list.
+        if (value === undefined) continue;
+        const container = containerOf(value);
         if (container !== undefined) found.push(container);
       }
       return found;
@@ -115,7 +164,277 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       // 204: started; 304: it runs already.
       if (answer.status !== 204 && answer.status !== 304) fail(answer);
     },
+    version: async (signal) => {
+      const value = (await list('/version', signal)) as { ApiVersion?: unknown; Version?: unknown };
+      return { apiVersion: typeof value?.ApiVersion === 'string' ? value.ApiVersion : '', version: typeof value?.Version === 'string' ? value.Version : '' };
+    },
+    inspect,
+    containerIds,
+    images: async (filters, signal) => {
+      const value = await list(`/images/json?${filtersQuery(filters)}`, signal);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the images with an invalid value.', 200);
+      const images: EngineImage[] = [];
+      for (const entry of value as Record<string, unknown>[]) {
+        if (typeof entry?.Id !== 'string' || entry.Id === '') continue;
+        images.push({
+          id: entry.Id,
+          // The engine names a dangling image `<none>:<none>` in older versions.
+          repoTags: texts(entry.RepoTags).filter((tag) => tag !== '<none>:<none>'),
+          repoDigests: texts(entry.RepoDigests).filter((digest) => digest !== '<none>@<none>'),
+          labels: toLabels(entry.Labels),
+          created: isoOf(entry.Created),
+        });
+      }
+      return images;
+    },
+    volumeNames: async (filters, signal) => {
+      const value = (await list(`/volumes?${filtersQuery(filters)}`, signal)) as { Volumes?: unknown };
+      if (value?.Volumes !== null && !Array.isArray(value?.Volumes)) throw new EngineError('The engine answered the list of the volumes with an invalid value.', 200);
+      return (value.Volumes ?? []).map((entry: unknown) => (entry as { Name?: unknown })?.Name).filter((name: unknown): name is string => typeof name === 'string' && name !== '');
+    },
+    networkNames: async (filters, signal) => {
+      const value = await list(`/networks?${filtersQuery(filters)}`, signal);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the networks with an invalid value.', 200);
+      return [...new Set(value.map((entry) => (entry as { Name?: unknown })?.Name).filter((name): name is string => typeof name === 'string' && name !== ''))];
+    },
+    removeContainer: async (container, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    renameContainer: async (container, name, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/rename?name=${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204) fail(answer);
+    },
+    removeImage: async (reference, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/images/${encodeURIComponent(reference)}`, signal });
+      if (answer.status === 200) return 'removed';
+      if (answer.status === 404) return 'missing';
+      // In use by a container, or the parent of another image.
+      if (answer.status === 409) return 'inUse';
+      return fail(answer);
+    },
+    createVolume: async (name, labels, signal) => {
+      const answer = await api({ method: 'POST', path: '/volumes/create', json: { Name: name, Labels: labels }, signal });
+      if (answer.status !== 201 && answer.status !== 200) fail(answer);
+    },
+    removeVolume: async (name, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/volumes/${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    removeNetwork: async (name, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/networks/${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    pull: (reference, options = {}) => pullImage(api, secretOf, reference, options),
+    labelImage: async (image, labels, signal) => {
+      const inspected = (await inspect('image', image, signal)) as { Config?: Record<string, unknown> } | undefined;
+      if (inspected === undefined) throw new EngineError(`The image ${image} does not exist.`, 404);
+      const config = { ...(inspected.Config ?? {}) };
+      config.Labels = { ...toLabels(config.Labels), ...labels };
+      // Created only to be committed: never started, and removed again; its command is never run.
+      if (signal?.aborted) throw abortError();
+      // Review round 1 of 11B3a (A-R1-7): without the signal, so that a cancel never leaves it behind created but unknown.
+      // A commit of an image without a command gives it this container's `Cmd ['true']` (the engine merges the
+      // container's command into an empty one, A-R1-5); the images of an environment have one, or Dev Containers sets it.
+      // On the classic image store the commit is a child of the previous image, which is then kept (A-R1-6).
+      // Review round 2 of 11B3a (A-R2-3): no label of ours on it; the commit would copy it into the image.
+      // Review round 3 of 11B3a (A-R3-1, A-R3-3): a name of its own (the commit does not copy it), by which it is removed
+      // also when its create did not answer within its time limit.
+      const name = `devenv-label-${crypto.randomBytes(6).toString('hex')}`;
+      const removeByName = () =>
+        api({ method: 'DELETE', path: `/containers/${name}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      let created: EngineAnswer;
+      try {
+        created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
+      } catch (error) {
+        // Review round 4 of 11B3a (A-R4-2, A-R4-3): the engine may have created it although the answer failed; the name is
+        // ours, so it goes in every case. A create that the engine ends only after this removal stays behind, never
+        // started, findable by the `devenv-label-` name.
+        await removeByName();
+        if (!limit.aborted) throw error;
+        throw new EngineError(`The engine did not answer the create of a container for the labels of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+      }
+      if (created.status !== 201) fail(created);
+      const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+      if (typeof container !== 'string' || container === '') {
+        await removeByName();
+        throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      }
+      try {
+        const [repository, tag] = splitTag(image);
+        // The body is the configuration of the new image: the one of the image with the labels, not the container's.
+        const committed = await api({
+          method: 'POST',
+          path: `/commit?container=${encodeURIComponent(container)}&repo=${encodeURIComponent(repository)}&tag=${encodeURIComponent(tag)}&pause=false`,
+          json: config,
+          signal,
+        });
+        if (committed.status !== 201) fail(committed);
+        const id = (json(committed.body) as { Id?: unknown } | undefined)?.Id;
+        if (typeof id !== 'string' || id === '') throw new EngineError('The engine answered the commit with an invalid value.', committed.status);
+        return id;
+      } finally {
+        // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes (`VOLUME` of the image), as `docker run --rm`.
+        // Review round 2 of 11B3a (A-R2-2): within a time limit of its own, never the cancel signal.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      }
+    },
+    runContainer: (spec, options = {}) => runContainer(api, spec, options),
   };
+}
+
+/**
+ * Review round 2 of 11B3a (A-R2-2, A-R2-4): the time limit of the removal of a container of labelImage or runContainer,
+ * and of the read of the log of a failed run; review round 3 (A-R3-3): also of the create of labelImage.
+ */
+export const RUN_CLEANUP_TIMEOUT_MS = 60_000;
+
+/** The most of the output of runContainer that is kept. */
+const MAX_RUN_OUTPUT_CHARACTERS = 64 * 1024;
+
+/**
+ * Plan step 11B3: `docker run --rm --init --pull never --network none` over the API: create, start, wait (within the
+ * time limit), the output for its result, and the removal in every case.
+ */
+async function runContainer(
+  api: EngineApi,
+  spec: EngineRun,
+  options: { timeoutMs?: number; signal?: AbortSignal },
+): Promise<{ exitCode: number | null; output: string; timedOut: boolean }> {
+  if (options.signal?.aborted) throw abortError();
+  const ended = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
+  let timedOut = false;
+  // Review round 2 of 11B3a (A-R2-2): the time limit covers the create too. A container whose create it cut may still
+  // come to exist; the caller removes it by its labels (EnvironmentService.removeOwnershipContainers).
+  let timer = options.timeoutMs === undefined ? undefined : setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
+  let id: string | undefined;
+  try {
+    const created = await api({
+      method: 'POST',
+      path: '/containers/create',
+      signal,
+      json: {
+        Image: spec.image,
+        Entrypoint: [spec.entrypoint],
+        Cmd: [...spec.args],
+        User: spec.user,
+        Labels: spec.labels,
+        HostConfig: {
+          Init: true,
+          NetworkMode: 'none',
+          Mounts: spec.volumes.map((volume) => ({ Type: 'volume', Source: volume.name, Target: volume.target })),
+        },
+      },
+    });
+    if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
+    const createdId = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+    if (typeof createdId !== 'string' || createdId === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+    id = createdId;
+    const started = await api({ method: 'POST', path: `/containers/${id}/start`, signal });
+    if (started.status !== 204 && started.status !== 304) throw new EngineError(engineErrorMessage({ ...started, truncated: false }), started.status);
+    const waited = await api({ method: 'POST', path: `/containers/${id}/wait`, signal });
+    if (waited.status !== 200) throw new EngineError(engineErrorMessage({ ...waited, truncated: false }), waited.status);
+    // Review round 2 of 11B3a (A-R2-4): the time limit ends with the run; the log has a limit of its own, and without it
+    // the exit code is still the answer.
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    const code = (json(waited.body) as { StatusCode?: unknown } | undefined)?.StatusCode;
+    const exitCode = typeof code === 'number' ? code : null;
+    let output = '';
+    if (exitCode !== 0) {
+      // Review round 1 of 11B3a (A-R1-8): the end of the log, where the reason is.
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      const logs = await api({
+        method: 'GET',
+        path: `/containers/${id}/logs?stdout=true&stderr=true&tail=200`,
+        signal: options.signal ? AbortSignal.any([options.signal, limit]) : limit,
+      }).catch((error: unknown) => {
+        if (options.signal?.aborted) throw error;
+        return undefined;
+      });
+      // The frames of the log of a container without a terminal: their headers are left out.
+      output = logs?.status === 200 ? logs.body.replace(/[\u0000-\u0002]\u0000\u0000\u0000[\s\S]{4}/g, '').slice(-MAX_RUN_OUTPUT_CHARACTERS) : '';
+    }
+    return { exitCode, output, timedOut: false };
+  } catch (error) {
+    if (timedOut) return { exitCode: null, output: '', timedOut: true };
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    // Removed in every case, also after a cancel (without its signal; review round 2 of 11B3a, A-R2-2: within a time
+    // limit of its own).
+    // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; a named volume (the workspace) is kept.
+    if (id !== undefined) await api({ method: 'DELETE', path: `/containers/${id}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+  }
+}
+
+/** `repository:tag` of a reference with a tag (`registry:5000/name:1` → `registry:5000/name`, `1`); `latest` without one. */
+function splitTag(reference: string): [string, string] {
+  const slash = reference.lastIndexOf('/');
+  const colon = reference.lastIndexOf(':');
+  return colon > slash ? [reference.slice(0, colon), reference.slice(colon + 1)] : [reference, 'latest'];
+}
+
+/** `POST /images/create?fromImage=<reference>`, the login only in its header; the lines of `docker pull` to `onLine`. */
+async function pullImage(
+  api: EngineApi,
+  secretOf: (name: string) => string | undefined,
+  reference: string,
+  options: { login?: EnginePullLogin; onLine?: (line: string) => void; signal?: AbortSignal },
+): Promise<void> {
+  // Review round 2 of 11B3a (A-R2-1): never a pull of every tag of a repository (`fromImage` without a tag).
+  if (!hasTagOrDigest(reference)) throw new EngineError(`The pull of ${reference} needs a tag or a digest.`, 0);
+  const headers: Record<string, string> = {};
+  const login = options.login;
+  if (login !== undefined) {
+    const password = secretOf(login.secretName);
+    if (password === undefined) throw new EngineError(`The operation holds no secret ${login.secretName} for the pull of ${reference}.`, 0);
+    headers['X-Registry-Auth'] = registryAuthHeader(
+      login.identityToken === true ? { identitytoken: password, serveraddress: login.serveraddress } : { username: login.username ?? '', password, serveraddress: login.serveraddress },
+    );
+  }
+  let pending = '';
+  // The start of the answer, for the message of an error answer (its body is one JSON object, not a stream).
+  let head = '';
+  let failure: string | undefined;
+  const handleLine = (line: string) => {
+    if (line.trim() === '') return;
+    let message: PullMessage;
+    try {
+      message = JSON.parse(line) as PullMessage;
+    } catch {
+      options.onLine?.(line);
+      return;
+    }
+    if (typeof message !== 'object' || message === null) return;
+    if (message.error !== undefined || message.errorDetail !== undefined) {
+      failure ??= typeof message.errorDetail?.message === 'string' ? message.errorDetail.message : String(message.error);
+      return;
+    }
+    const text = pullLine(message);
+    if (text !== undefined) options.onLine?.(text);
+  };
+  const answer = await api({
+    method: 'POST',
+    path: `/images/create?fromImage=${encodeURIComponent(reference)}`,
+    headers,
+    signal: options.signal,
+    onChunk: (chunk) => {
+      if (head.length < 2_000) head += chunk.slice(0, 2_000 - head.length);
+      pending += chunk;
+      let newline = pending.indexOf('\n');
+      while (newline >= 0) {
+        handleLine(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf('\n');
+      }
+    },
+  });
+  handleLine(pending);
+  if (answer.status !== 200) throw new EngineError(failure ?? engineErrorMessage({ ...answer, body: head }), answer.status);
+  if (failure !== undefined) throw new EngineError(failure, answer.status);
 }
 
 /** The most text of each stream of an exec that the result keeps (onOutput still gets all of it). */
