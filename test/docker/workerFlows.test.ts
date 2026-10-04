@@ -210,12 +210,15 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     expect(value).toEqual({ configPaths: expect.arrayContaining(['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json']) });
     expect((value as { configPaths: string[] }).configPaths[0]).toBe('.devcontainer/devcontainer.json');
     expect(requests).toEqual([`get ${id}`, 'account true']);
-    // The batch helper ran from the worker's own image and is gone: no container uses the volume any more.
+    // The batch helper is gone: no container uses the volume any more. (That it runs from the worker's own image ID is
+    // checked by the unit test of the operation; review round 1 of 11B3b.)
     expect(cli.lines(['ps', '-a', '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).toEqual([]);
     // A lock held elsewhere: refused as busy (startFailed) after the wait, and nothing ran.
     const held = await channels.lock(target, id, 5);
     try {
       expect(parseListConfigurationsValue(await list())).toMatchObject({ refused: { code: 'startFailed' } });
+      // Review round 1 of 11B3b (missing test): no batch helper was started for the refused listing.
+      expect(cli.lines(['ps', '-a', '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).toEqual([]);
     } finally {
       await held.release();
     }

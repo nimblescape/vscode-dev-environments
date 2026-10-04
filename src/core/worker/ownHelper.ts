@@ -35,11 +35,16 @@ export function ownHelperOf(inspect: unknown): OwnHelper | undefined {
 
 /**
  * The OwnHelper of the worker whose container is `container` (its host name, the short ID that Docker gives it). Throws
- * when the engine does not know it, or its inspect lacks what is needed.
+ * when the engine does not know it, when the container found is not the one of that ID (review round 1 of 11B3b, A-R1-1:
+ * the engine also finds a container by a name, so one named like the ID is never taken for the worker), or when its
+ * inspect lacks what is needed.
  */
 export async function readOwnHelper(engine: Pick<DockerEngine, 'inspect'>, container: string, signal?: AbortSignal): Promise<OwnHelper> {
+  if (!/^[0-9a-f]{12,64}$/.test(container)) throw new Error(`The host name ${container} of the worker is not the ID of its container.`);
   const inspect = await engine.inspect('container', container, signal);
   if (inspect === undefined) throw new Error(`The container ${container} of the worker is not known to the engine.`);
+  const id = (inspect as { Id?: unknown }).Id;
+  if (typeof id !== 'string' || !id.startsWith(container)) throw new Error(`The engine answered the container ${container} of the worker with another container.`);
   const own = ownHelperOf(inspect);
   if (own === undefined) throw new Error(`The image or the socket mount of the worker's container ${container} cannot be read.`);
   return own;

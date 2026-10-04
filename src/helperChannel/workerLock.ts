@@ -46,6 +46,8 @@ export function workerEnvironmentLock(
       docker: async () => {
         throw new Error('A Docker call through the lock of the environment in the worker is not allowed: the pipeline of the worker uses its engine.');
       },
+      // Review round 1 of 11B3b (A-R1-4): the open ends with the operation (its signal and time limit), not with a signal
+      // of its own; the listing has none narrower. Plan step 11E passes the signal of the open through.
       batch: (p) => openBatch(p),
       release: async () => {
         released = true;

@@ -197,14 +197,29 @@ export function batchOperation(deps: BatchDeps): OperationHandler {
  * workerLock.ts): the helper starts as for `batch`, from the image and with the socket of `p` (the worker's own), and its
  * steps go straight to it, with the same checks and the same result as through the extension (collectBatchStep). It ends
  * with `close`, or with the operation of `context`. It never counts as a session of the `batch` operation, so no request
- * of the extension reaches it.
+ * of the extension reaches it. Review round 1 of 11B3b (A-R1-3): nor against MAX_CONCURRENT_BATCHES and its hold limit:
+ * there is one per held lock of an environment, and it ends with the operation (its time limit) at the latest.
  */
 export async function workerBatchSession(deps: BatchDeps, context: OperationContext, p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> {
   const session = newCleanupLabel();
   const params = parseBatchParams({ session, volume: p.volume, image: p.image, socket: p.socket });
   if (params === undefined) throw new HelperChannelError('unsendable', 'The batch request is invalid.');
   context.progress('batch', p.volume);
-  const helper = await startBatchHelper(deps, context, params, () => context);
+  return sessionOfHelper(session, await startBatchHelper(deps, context, params, () => context));
+}
+
+/** The client of a started batch helper that a session needs (review round 1 of 11B3b: apart, for its tests). */
+export interface BatchHelperClient {
+  channel: Pick<HelperChannel, 'operation' | 'onClose'>;
+  finish(): Promise<void>;
+}
+
+/**
+ * Plan step 11B3b: the HelperBatchSession over a started batch helper (workerBatchSession): each step checked as the
+ * extension's client checks it (parseBatchStepParams, MAX_BATCH_INPUT_CHARACTERS) and collected as it collects it
+ * (collectBatchStep); `lost` only for an end without `close`; `close` once, and never rejecting.
+ */
+export function sessionOfHelper(session: string, helper: BatchHelperClient): HelperBatchSession {
   let closing = false;
   const lost = new Promise<string>((resolve) => helper.channel.onClose((reason) => (closing ? undefined : resolve(reason))));
   let closed: Promise<void> | undefined;
@@ -229,7 +244,7 @@ export async function workerBatchSession(deps: BatchDeps, context: OperationCont
     },
     close: () => {
       closing = true;
-      closed ??= helper.finish();
+      closed ??= helper.finish().catch(() => undefined);
       return closed;
     },
   };

@@ -86,11 +86,23 @@ describe("the worker's own helper image (plan step 11B3b)", () => {
       expect(ownHelperOf(odd)).toBeUndefined();
     }
     const asked: string[] = [];
-    const engine = { ...unusedEngine(), inspect: async (kind: string, reference: string) => (asked.push(`${kind} ${reference}`), reference === 'abc123' ? inspect() : undefined) };
-    expect((await readOwnHelper(engine, 'abc123')).socket).toBe('/run/user/1000/docker.sock');
-    expect(asked).toEqual(['container abc123']);
-    await expect(readOwnHelper(engine, 'gone')).rejects.toThrow('is not known to the engine');
-    await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect({ Mounts: [] }) }, 'abc123')).rejects.toThrow('cannot be read');
+    const short = 'abc123def456';
+    const full = `${short}${'0'.repeat(52)}`;
+    const engine = {
+      ...unusedEngine(),
+      inspect: async (kind: string, reference: string) => (asked.push(`${kind} ${reference}`), reference === short ? inspect({ Id: full }) : undefined),
+    };
+    expect((await readOwnHelper(engine, short)).socket).toBe('/run/user/1000/docker.sock');
+    expect(asked).toEqual([`container ${short}`]);
+    await expect(readOwnHelper(engine, 'fedcba987654')).rejects.toThrow('is not known to the engine');
+    await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect({ Id: full, Mounts: [] }) }, short)).rejects.toThrow('cannot be read');
+    // Review round 1 of 11B3b (A-R1-1): a container found by a name like the ID is not the worker; a host name that is
+    // no container ID is never asked for.
+    await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect({ Id: `ffff${'0'.repeat(60)}` }) }, short)).rejects.toThrow('with another container');
+    await expect(readOwnHelper({ ...unusedEngine(), inspect: async () => inspect() }, short)).rejects.toThrow('with another container');
+    asked.length = 0;
+    await expect(readOwnHelper(engine, 'devenv-worker')).rejects.toThrow('is not the ID of its container');
+    expect(asked).toEqual([]);
   });
 });
 

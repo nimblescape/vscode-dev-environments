@@ -47,6 +47,8 @@ interface Setup {
   /** The result of the step listConfigs, or the failure of the session's open. */
   step?: RunResult;
   openFails?: Error;
+  /** Called when the step runs (before its result). */
+  onStep?: (controller: AbortController) => void;
 }
 
 function run(setup: Setup = {}) {
@@ -89,9 +91,12 @@ function run(setup: Setup = {}) {
     const session: HelperBatchSession = {
       session: 'b'.repeat(24),
       lost: new Promise(() => {}),
-      step: async (kind, params) => {
+      step: async (kind, params, options) => {
         steps.push({ kind, params });
         events.push(`step ${kind}`);
+        setup.onStep?.(controller);
+        // As the session: a cancel of the operation ends the step with an AbortError.
+        if (options?.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
         return setup.step ?? { exitCode: 0, stdout: `${JSON.stringify(PATHS)}\n`, stderr: '', timedOut: false };
       },
       close: async () => void events.push('close batch'),
@@ -135,10 +140,12 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
       [{ openFails: new Error('the helper did not start') }, 'helperFailed'],
     ];
     for (const [setup, code] of cases) {
-      const { result, steps } = run(setup);
+      const { result, steps, events } = run(setup);
       const value = await result;
       expect(parseListConfigurationsValue(value), JSON.stringify(setup)).toMatchObject({ refused: { code } });
-      if (code !== 'helperFailed' || setup.openFails === undefined) expect(steps).toEqual([]);
+      expect(steps).toEqual([]);
+      // Review round 1 of 11B3b (missing test): a lock that was taken is let go at the end of a refusal too.
+      if (events.includes(`lock ${ID}`) && setup.flockExit === undefined) expect(events.at(-1)).toBe('unlock');
     }
     // The refusal of the batch scope keeps its kind.
     expect(await run({ openFails: new Error('the helper did not start') }).result).toMatchObject({ refused: { code: 'helperFailed', batchHelperUnavailable: true } });
@@ -154,6 +161,13 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
     const cancelled = run();
     cancelled.controller.abort();
     await expect(cancelled.result).rejects.toMatchObject({ code: 'cancelled' });
+    // Review round 1 of 11B3b (missing test): a cancel during the step closes the batch helper, then lets go of the lock.
+    const during = run({ onStep: (controller) => controller.abort() });
+    await expect(during.result).rejects.toMatchObject({ code: 'cancelled' });
+    // (Closed when the lock is lost with the operation, and again at the end of the scope: close is idempotent.)
+    const afterStep = during.events.slice(during.events.indexOf('step listConfigs') + 1);
+    expect(afterStep.at(-1)).toBe('unlock');
+    expect(new Set(afterStep.slice(0, -1))).toEqual(new Set(['close batch']));
   });
 
   it('refuses parameters that do not fit, and any secret, before anything runs', async () => {

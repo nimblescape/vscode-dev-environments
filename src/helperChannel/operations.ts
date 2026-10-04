@@ -158,11 +158,13 @@ const BATCH = batchDeps();
 
 /**
  * Plan step 11B3b: the worker's own helper image and socket, read once from the engine (the inspect of its own container,
- * whose host name is its short ID), and again after a failure.
+ * whose host name is its short ID), and again after a failure. Review round 1 (A-R1-2): within a time limit of its own,
+ * so that one read that the engine never answers does not hold every later flow (it fails, and the next one reads again).
  */
+const OWN_HELPER_TIMEOUT_MS = 60_000;
 let ownHelper: Promise<OwnHelper> | undefined;
 const OWN_HELPER_OF: OwnHelperOf = (context) => {
-  const read = (ownHelper ??= readOwnHelper(ENGINE_OF(context), os.hostname()));
+  const read = (ownHelper ??= readOwnHelper(ENGINE_OF(context), os.hostname(), AbortSignal.timeout(OWN_HELPER_TIMEOUT_MS)));
   read.catch(() => {
     if (ownHelper === read) ownHelper = undefined;
   });
