@@ -8,6 +8,7 @@
 // with nothing, and one running whose branch is not asked for. No worker container is left over.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
+import { monitorScriptPlugin } from '../../scripts/monitorScript.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
@@ -24,6 +25,8 @@ async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
     // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
     define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
+    // Plan step 11D2: the script of the Session Monitor in the worker, as esbuild.mjs bundles it.
+    plugins: [monitorScriptPlugin(path.resolve(__dirname, '../..'), { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) })],
     entryPoints: [path.resolve(__dirname, '../../src/helperChannel/main.ts')],
     bundle: true,
     platform: 'node',
