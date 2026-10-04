@@ -72,7 +72,10 @@ export interface EngineExecOptions {
    * `secretInput` is a value); an exec fails when the operation holds no such secret.
    */
   secretInputName?: string;
-  /** The output as it comes, in addition to the result. */
+  /**
+   * The output as it comes, in addition to the result. Plan step 11E1 (review round 1 of PR #102, A-L1): masked with
+   * every secret of the operation, like the result; a tail that could start a secret comes with the next piece.
+   */
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
   timeoutMs?: number;
   signal?: AbortSignal;

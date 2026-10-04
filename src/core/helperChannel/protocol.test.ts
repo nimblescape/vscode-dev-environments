@@ -8,6 +8,7 @@ import { PIPE_LOADER, encodeBundle } from '../loader/pipeLoader';
 import type { StateEnvironment } from '../pipeline/refreshStates';
 import { ENV_API, ENV_WEB, EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 import {
+  MIN_SECRET_LENGTH,
   CHANNEL_ENTRY,
   CHANNEL_SCRIPT_PATH,
   CHANNEL_SILENCE_EXIT_MS,
@@ -310,6 +311,19 @@ describe('StreamRedactor (review round 1 of PR #80, B-R1-8)', () => {
     expect(forwarded.join('')).toBe('buildin');
     redactor.flush();
     expect(forwarded.join('')).toBe('building');
+  });
+});
+
+describe('StreamRedactor at the end of a cut stream (plan step 11E1, review round 2 of PR #102, A-M1)', () => {
+  it('flush masks a held-back start of a secret of MIN_SECRET_LENGTH characters or more; a shorter one passes', () => {
+    const secret = 'SUPERSECRETVALUE';
+    for (let held = 1; held < secret.length; held++) {
+      const forwarded: string[] = [];
+      const redactor = new StreamRedactor(secret, (text) => forwarded.push(text));
+      redactor.push(`abc ${secret.slice(0, held)}`);
+      redactor.flush();
+      expect(forwarded.join('')).toBe(held >= MIN_SECRET_LENGTH ? 'abc ***' : `abc ${secret.slice(0, held)}`);
+    }
   });
 });
 
