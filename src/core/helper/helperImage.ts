@@ -679,8 +679,10 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
         // Plan step 11D3: its monitor tag goes with it, first (review round 1 of PR #101, A-M1): Docker refuses only the
         // removal of the last reference of an image that a container uses, so the helper tag, removed last, stays while a
         // helper or a monitor runs from its image; the monitor tag is only its name, and the next ensure tags it again.
+        // Review round 2 of PR #101 (A2-L1): a monitor tag whose removal failed keeps its helper tag for a later cleanup
+        // (with both tags, the helper tag would not be the last reference).
         const monitorTag = monitorImageTag(tag);
-        if (monitorTag !== undefined && image.tags.includes(monitorTag)) await removeHelperImage(m, image, monitorTag, currentId);
+        if (monitorTag !== undefined && image.tags.includes(monitorTag) && !(await removeHelperImage(m, image, monitorTag, currentId))) continue;
         if (await removeHelperImage(m, image, tag, currentId)) removed.push(tag);
       }
     }

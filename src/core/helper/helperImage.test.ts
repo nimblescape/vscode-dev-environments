@@ -1240,6 +1240,24 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     expect(h.docker.images.has(oldId)).toBe(false);
   });
 
+  it('review round 2 of PR #101 (A2-L1): a monitor tag whose removal fails keeps its helper tag, without a tombstone, until a later cleanup', async () => {
+    const { h } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) } });
+    const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
+    const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
+    h.docker.inUse.add(oldId);
+    h.docker.failingRemovals.add(oldMonitor);
+    await h.ensure();
+    expect(h.docker.removals).toEqual([oldMonitor]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual([OLD_TAG, oldMonitor]);
+    expect(h.state().images[OLD_TAG]?.removedAt).toBeUndefined();
+    h.docker.failingRemovals.clear();
+    h.docker.inUse.clear();
+    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    await h.ensure();
+    expect(h.docker.images.has(oldId)).toBe(false);
+    expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h.iso() });
+  });
+
   it('review round 1 of PR #101: an orphan monitor tag that is the only tag of an image in use stays, and goes at a later cleanup', async () => {
     const { h } = current();
     const orphanId = h.docker.addImage(['devenv-monitor:fedcba987654']);
