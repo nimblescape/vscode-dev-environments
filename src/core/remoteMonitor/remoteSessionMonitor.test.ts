@@ -863,55 +863,9 @@ describe('RemoteSessionMonitor.ensure (review round 2 of PR #69, B-R2)', () => {
   });
 });
 
-describe('RemoteSessionMonitor: heartbeat, records, forget', () => {
-  it('sends a heartbeat with docker exec and a time limit', async () => {
-    const docker = new FakeDocker(() => result(0));
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 1 }] };
-    expect(await monitor(docker).heartbeat(heartbeat)).toEqual({ ok: true, stdout: '' });
-    // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records (heartbeatCommand).
-    expect(docker.calls[0].args).toEqual(['exec', 'devenv-session-monitor', ...heartbeatCommand(heartbeat)]);
-    expect(heartbeatCommand(heartbeat).slice(-4)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
-    expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
-  });
-
-  // Review round 1 of PR #85 (A-R1-2): the deadline of the window's attempt ends the docker exec.
-  it('passes the signal of the heartbeat to the docker exec', async () => {
-    const docker = new FakeDocker(() => result(0));
-    const controller = new AbortController();
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [] };
-    await monitor(docker).heartbeat(heartbeat, controller.signal);
-    expect(docker.calls[0].options?.signal).toBe(controller.signal);
-    expect(docker.calls[0].options?.timeoutMs).toBe(20_000);
-  });
-
-  it('tells a missing container from another failure', async () => {
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [] };
-    expect(await monitor(new FakeDocker(() => MISSING)).heartbeat(heartbeat)).toMatchObject({ ok: false, missing: true });
-    const stopped = result(1, '', 'Error response from daemon: container 1234 is not running');
-    expect(await monitor(new FakeDocker(() => stopped)).heartbeat(heartbeat)).toMatchObject({ ok: false, missing: true });
-    const invalid = result(2, '', 'Invalid heartbeat.');
-    expect(await monitor(new FakeDocker(() => invalid)).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Invalid heartbeat.' });
-    // Review round 3 of PR #58 (F7): a lock that stayed busy and the time limit are named.
-    expect(await monitor(new FakeDocker(() => result(75))).heartbeat(heartbeat)).toEqual({
-      ok: false,
-      missing: false,
-      detail: 'the heartbeat records stayed locked by another command for 5 s',
-    });
-    // Review round 4 (H2): 137 is any SIGKILL (a command without the lock gets the bare exit code: protocol.test.ts).
-    expect(await monitor(new FakeDocker(() => result(137))).heartbeat(heartbeat)).toMatchObject({
-      detail: 'the command was killed (its limit of 10 s, or a kill from outside)',
-    });
-    const thrown = new FakeDocker(() => Promise.reject(new Error('Docker Desktop is not installed.')));
-    expect(await monitor(thrown).heartbeat(heartbeat)).toEqual({ ok: false, missing: false, detail: 'Docker Desktop is not installed.' });
-  });
-
-  it('reads the records of an environment', async () => {
-    const output = { now: 5, records: [{ source: SOURCE, at: 4, keepRunning: false }] };
-    expect(await monitor(new FakeDocker(() => result(0, JSON.stringify(output)))).records(ID)).toEqual(output);
-    expect(await monitor(new FakeDocker(() => result(0, 'garbage'))).records(ID)).toBeUndefined();
-    expect(await monitor(new FakeDocker(() => MISSING)).records(ID)).toBeUndefined();
-  });
-
+// Plan step 11D1: the heartbeat, the records and the image commands of RemoteSessionMonitor are removed (the worker sends
+// them: monitorFlow.test.ts); isMissingContainer stays for the ensure.
+describe('RemoteSessionMonitor: isMissingContainer', () => {
   it('isMissingContainer', () => {
     expect(isMissingContainer(MISSING)).toBe(true);
     expect(isMissingContainer(result(1, '', 'Error: No such object: devenv-session-monitor'))).toBe(true);
@@ -1001,27 +955,6 @@ describe('RemoteSessionMonitor: images', () => {
     expect(short.join(' ').length).toBe(args.join(' ').length);
   });
 
-  it('gives the monitor the settings of this computer on stdin (docker exec -i settings -); false on a failure', async () => {
-    const docker = new FakeDocker(() => result(0));
-    const log = new Log();
-    expect(await monitor(docker, log).imageSettings(IMAGES)).toBe(true);
-    expect(docker.calls[0].args).toEqual(['exec', '-i', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-']);
-    expect(docker.calls[0].options?.input).toBe(JSON.stringify(IMAGES));
-    expect(await monitor(new FakeDocker(() => result(2, '', 'Invalid image settings.')), log).imageSettings(IMAGES)).toBe(false);
-    expect(log.lines).toEqual(['warn The image settings could not be given to the Session Monitor: Invalid image settings.']);
-  });
-
-  it('gives the monitor the list of repositories on stdin (docker exec -i), and logs a failure', async () => {
-    const docker = new FakeDocker(() => result(0));
-    const log = new Log();
-    // Review round 1 of PR #57 (D): true on success, false on a failure (the caller tries again at the next open).
-    expect(await monitor(docker, log).images(['ghcr.io/majikmate/devcontainer-dev'])).toBe(true);
-    expect(docker.calls[0].args).toEqual(['exec', '-i', 'devenv-session-monitor', 'node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-']);
-    expect(docker.calls[0].options?.input).toBe(JSON.stringify({ repositories: ['ghcr.io/majikmate/devcontainer-dev'] }));
-    const failing = new FakeDocker(() => result(2, '', 'Invalid image list.'));
-    expect(await monitor(failing, log).images([])).toBe(false);
-    expect(log.lines).toEqual(['warn The image list could not be given to the Session Monitor: Invalid image list.']);
-  });
 });
 
 // Review round 3 of PR #69 (A-R3-1, A-R3-2): two windows that replace or create the monitor at the same time. The `rm`

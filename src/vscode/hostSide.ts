@@ -180,10 +180,13 @@ export function extensionFlow(
     passive?: boolean;
     onAnswer?: (call: string, args: unknown[], value: unknown) => void;
     onQuestion?: (state: 'asked' | 'settled') => void;
+    // Plan step 11D1: the engine of the flow when it is not the current one (the heartbeats and the release of a window
+    // go to the engine that the window uses the environment on).
+    target?: DockerTarget;
   },
 ) => Promise<unknown> {
   return async (op, params, options) =>
-    channels.flow(await current(), op, params, {
+    channels.flow(options.target ?? (await current()), op, params, {
       signal: options.signal,
       timeoutMs: options.timeoutMs,
       // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.

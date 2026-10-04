@@ -15,6 +15,12 @@ import {
   parseDeleteParams,
   parseListConfigurationsParams,
   parseReconcileParams,
+  parseHeartbeatParams,
+  parseMonitorSettingsParams,
+  parseRecordGitStateParams,
+  type HeartbeatValue,
+  type MonitorSettingsValue,
+  type RecordGitStateValue,
   parseStopParams,
   parseTokenRemoveParams,
   parseWindowStateParams,
@@ -39,6 +45,7 @@ import { stopFlow } from '../core/worker/stopFlow';
 import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
+import { sendHeartbeat, sendMonitorSettings } from '../core/worker/monitorFlow';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -361,5 +368,74 @@ export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: Own
       if (context.signal.aborted) throw new OperationError('cancelled', 'The reconcile operation was cancelled.');
       throw new OperationError('failed', error instanceof Error ? error.message : String(error));
     }
+  };
+}
+
+/**
+ * Plan step 11D1 (decision of 2026-10-03): `heartbeat`, one heartbeat of a window to the Session Monitor container of
+ * the worker's engine (monitorFlow.sendHeartbeat). `missing` tells the window to start the monitor again.
+ */
+export function heartbeatOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    const checked = parseHeartbeatParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the heartbeat operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The heartbeat operation takes no secret.');
+    const value = await sendHeartbeat(engineOf(context), checked.heartbeat, context.signal).catch((error: unknown) => {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The heartbeat operation was cancelled.');
+      throw error;
+    });
+    return value satisfies HeartbeatValue;
+  };
+}
+
+/**
+ * Plan step 11D1: `monitorSettings`, the image settings or the image list for the Session Monitor of the worker's engine
+ * (monitorFlow.sendMonitorSettings). Best effort: a failure is logged and answered as not sent.
+ */
+export function monitorSettingsOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    const checked = parseMonitorSettingsParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the monitorSettings operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorSettings operation takes no secret.');
+    const what = 'settings' in checked ? 'The image settings' : 'The image list';
+    const result = await sendMonitorSettings(engineOf(context), checked, context.signal).catch((error: unknown) => {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorSettings operation was cancelled.');
+      throw error;
+    });
+    if (!result.ok) context.log(`${what} could not be given to the Session Monitor: ${result.detail}`, 'warn');
+    return { sent: result.ok } satisfies MonitorSettingsValue;
+  };
+}
+
+/**
+ * Plan step 11D1 (user decision Q2 of 2026-10-02): `recordGitState`, the Git state of the running dev container of an
+ * environment that a window releases, by the worker's own pipeline (EnvironmentService.recordGitState): the record
+ * through `record get`, the state recorded through `record recordGitSummary`. No lock: it only reads on the engine.
+ */
+export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseRecordGitStateParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the recordGitState operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The recordGitState operation takes no secret.');
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine: engineOf(context),
+      secretOf: (name) => context.secrets[name],
+      logger: contextLogger(context),
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+    });
+    const recorded = await service.recordGitState(checked.environmentId, context.signal);
+    if (context.signal.aborted) throw new OperationError('cancelled', 'The recordGitState operation was cancelled.');
+    return { recorded } satisfies RecordGitStateValue;
   };
 }

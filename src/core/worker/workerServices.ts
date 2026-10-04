@@ -18,10 +18,10 @@ import { WorkspaceHelper } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
-import { REMOTE_MONITOR_CONTAINER, forgetCommand, monitorExecFailure } from '../remoteMonitor/protocol';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
-import { EngineError, isMissing, type DockerEngine } from './dockerEngine';
+import type { DockerEngine } from './dockerEngine';
+import { forgetRecord } from './monitorFlow';
 import { EngineDocker } from './engineDocker';
 import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
@@ -83,41 +83,25 @@ export function hostBusyMarks(records: HostSide['records']): EnvironmentBusyMark
   };
 }
 
-/** The time limit of a command in the Session Monitor container (as REMOTE_MONITOR_EXEC_TIMEOUT_MS of the extension). */
-export const MONITOR_EXEC_TIMEOUT_MS = 20_000;
-
 /**
  * Plan step 11C2a (decision of 2026-10-04: Delete's `forget` is the worker's): the Session Monitor of the worker's engine,
  * as Delete uses it: `forget` removes the heartbeat record of `source` (the computer that sent the operation) for the
- * environment, by a command in the monitor container (forgetCommand). Best effort: a monitor container that does not
- * exist has no record; any other failure is logged. The rest of the monitor comes with plan step 11D; until then it
- * fails closed.
+ * environment (monitorFlow.forgetRecord). Best effort: a monitor container that does not exist or does not run has no
+ * record that matters (review round 1 of 11C2a, A-R1-L3); any other failure is logged. The ensure comes with plan step
+ * 11D2; until then it fails closed. Plan step 11D1: the heartbeats are their own operation (`heartbeat`).
  */
 export function workerSessionMonitor(engine: DockerEngine, source: string | undefined, log: Logger): EnvironmentSessionMonitor {
   return {
     ensure: async () => {
-      throw notInWorker('The ensure of the Session Monitor', '11D');
+      throw notInWorker('The ensure of the Session Monitor', '11D2');
     },
     heartbeat: async () => {
-      throw notInWorker('A heartbeat to the Session Monitor', '11D');
+      throw notInWorker('A heartbeat of the open to the Session Monitor', '11E');
     },
     forget: async (_target, environmentId) => {
       if (source === undefined) throw new Error('The operation names no computer for the Session Monitor.');
-      try {
-        const result = await engine.exec(REMOTE_MONITOR_CONTAINER, forgetCommand(source, environmentId), { timeoutMs: MONITOR_EXEC_TIMEOUT_MS });
-        if (result.exitCode !== 0 || result.timedOut) {
-          // As RemoteSessionMonitor read the failures of its commands (monitorExecFailure: the lock of the records).
-          const detail = result.timedOut
-            ? `docker exec did not end within ${MONITOR_EXEC_TIMEOUT_MS / 1000} seconds.`
-            : (result.stderr || result.stdout).trim() || monitorExecFailure(result.exitCode, '', true);
-          log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${detail}`);
-        }
-      } catch (error) {
-        // Review round 1 of 11C2a (A-R1-L3): a monitor that does not exist, or does not run (it exits when it is idle),
-        // holds no record that matters, as RemoteSessionMonitor read it (isMissingContainer).
-        if (isMissing(error) || (error instanceof EngineError && error.status === 409 && /is not running/i.test(error.message))) return;
-        log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${errorMessage(error)}`);
-      }
+      const result = await forgetRecord(engine, source, environmentId);
+      if (!result.ok && !result.missing) log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${result.detail}`);
     },
   };
 }

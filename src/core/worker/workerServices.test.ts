@@ -11,8 +11,10 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { MONITOR_EXEC_TIMEOUT_MS, hostAuth, hostBusyMarks, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { hostAuth, hostBusyMarks, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
 import { EngineError, type DockerEngine } from './dockerEngine';
+// Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
+import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
 import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand } from '../remoteMonitor/protocol';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 
@@ -312,8 +314,10 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
     const monitor = workerSessionMonitor(engine, undefined, silentLogger);
     await expect(monitor.forget!(TARGET, ID)).rejects.toThrow('names no computer');
-    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('11D');
-    await expect(monitor.heartbeat(TARGET, ID, false, 1)).rejects.toThrow('11D');
+    // Plan step 11D1: changed, the ensure comes with 11D2, the first heartbeat of the open with the open (11E); the
+    // heartbeats of a window are the operation `heartbeat` (before: both named 11D).
+    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11D2');
+    await expect(monitor.heartbeat(TARGET, ID, false, 1)).rejects.toThrow('before plan step 11E');
     expect(execs).toEqual([]);
   });
 

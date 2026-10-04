@@ -49,6 +49,7 @@ import { readOrCreateComputerId } from '../core/storage/computerId';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment';
+import { workerMonitor } from './workerMonitor';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { Environment, ExtensionSettings } from '../core/types';
@@ -319,6 +320,15 @@ async function activateExtension(
       return remoteMonitorScriptText;
     },
   });
+  // Plan step 11D1 (decision of 2026-10-03): the heartbeats, the image settings and list, the check of a container and the
+  // Git state of a release, as operations of the worker of the engine (workerFlow is set below, before the first call).
+  const monitorCalls = workerMonitor({
+    flow: (op, params, options) => workerFlow(op, params, options),
+    owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
+    logger,
+  });
+  // The engine of a call in an operation (its target), else the current one.
+  const callTarget = async (): Promise<DockerTarget> => operationDockerTarget() ?? (await targets.current());
   // User request 2026-09-28 ("all images"): the image repositories of the prefixes, read with the GitHub session (scope
   // read:packages) and given to the monitor of the host, at most once an hour per host. Without that scope, a question
   // once per window; the monitor then updates only the images that are on the host. Review round 1 of PR #57: first the
@@ -346,16 +356,18 @@ async function activateExtension(
     // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
     timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
   });
-  const sendImageSettings = async (host: string): Promise<void> => {
+  const sendImageSettings = async (target: DockerTarget): Promise<void> => {
+    const { host } = target;
     const settings = imageMaintenance();
     if (settings.prefixes.length === 0) return;
     const text = JSON.stringify(settings);
     const last = imageSettingsSent.get(host);
     if (last && last.text === text && Math.abs(Date.now() - last.at) < IMAGE_LIST_INTERVAL_MS) return;
-    if (await remoteMonitor.imageSettings(settings)) imageSettingsSent.set(host, { text, at: Date.now() });
+    if (await monitorCalls.monitorSettings(target, { settings })) imageSettingsSent.set(host, { text, at: Date.now() });
     else imageSettingsSent.delete(host);
   };
-  const sendRepositories = async (host: string, prefixes: string[], token: string): Promise<void> => {
+  const sendRepositories = async (target: DockerTarget, prefixes: string[], token: string): Promise<void> => {
+    const { host } = target;
     let repositories: string[];
     try {
       repositories = await ghcrRepositories(nodeHttpsTransport, token, prefixes, AbortSignal.timeout(PACKAGES_TIMEOUT_MS));
@@ -369,18 +381,19 @@ async function activateExtension(
       repositories = repositories.slice(0, MAX_IMAGE_REPOSITORIES);
     }
     logger.info(`The Session Monitor on ${engineName(host)} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
-    if (!(await remoteMonitor.images(repositories))) imageListSentAt.delete(host);
+    if (!(await monitorCalls.monitorSettings(target, { repositories }))) imageListSentAt.delete(host);
   };
-  const sendImageList = async (host: string): Promise<void> => {
+  const sendImageList = async (): Promise<void> => {
     const prefixes = usedImagePrefixes();
     if (prefixes.length === 0) return;
     // Review round 4 of PR #57 (L2): the background work keeps the Docker target of the open; after the open ended, its
-    // calls would read the current context again, and a switch to another host in the meantime sent there.
-    const target = operationDockerTarget();
-    const inTarget = (fn: () => Promise<void>) => void (target ? runWithDockerTarget(target, fn) : fn());
-    // Review round 2 of PR #57 (R6): in the background too (a docker exec of up to 20 s that Cancel could not end); a
+    // calls would read the current context again, and a switch to another host in the meantime sent there. Plan step
+    // 11D1: the operations of the worker of that engine.
+    const target = await callTarget();
+    const { host } = target;
+    // Review round 2 of PR #57 (R6): in the background too (a command of up to 20 s that Cancel could not end); a
     // failure is logged and the next open sends again.
-    inTarget(() => sendImageSettings(host));
+    void sendImageSettings(target);
     if (!prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
     const last = imageListSentAt.get(host);
     if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
@@ -397,7 +410,7 @@ async function activateExtension(
       return;
     }
     imageListSentAt.set(host, Date.now());
-    inTarget(() => sendRepositories(host, prefixes, credentials.password));
+    void sendRepositories(target, prefixes, credentials.password);
   };
   const connection = new ConnectionAdapter(logger);
   // The source of the heartbeats (computer.id); created by the first reader.
@@ -437,26 +450,12 @@ async function activateExtension(
           }),
       }),
     // A-R2-2: in the scope of a heartbeat, the worker's preparation runs with the long signal (heartbeatPreparation).
-    send: async (target, input, signal) => {
-      const result = await heartbeatPreparation.scope(() => runWithDockerTarget(target, () => remoteMonitor.heartbeat(input, signal)));
-      return result.ok ? { ok: true } : { ok: false, missing: result.missing, detail: result.detail };
-    },
+    // Plan step 11D1: the operation `heartbeat` of the worker of that engine.
+    send: (target, input, signal) => heartbeatPreparation.scope(() => monitorCalls.heartbeat(target, input, signal)),
     repair: repairSessionMonitor,
-    // Review round 2 of PR #85 (A-R2-1): the container of the environment (its name in the registry) on that engine, a
-    // routed `docker container inspect`; any failure counts as not there.
-    containerExists: async (target, environment, signal) => {
-      try {
-        const result = await heartbeatPreparation.scope(() =>
-          runWithDockerTarget(target, () =>
-            docker.run(['container', 'inspect', '--format', '{{.Id}}', environment.containerName], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS, signal }),
-          ),
-        );
-        return result.exitCode === 0 && result.stdout.trim() !== '';
-      } catch (error) {
-        logger.info(`The container of ${environment.repository} could not be checked on ${target.kind === 'local' ? 'the local Docker' : target.host}: ${errorMessage(error)}`);
-        return false;
-      }
-    },
+    // Review round 2 of PR #85 (A-R2-1): the container of the environment (its name in the registry) on that engine; any
+    // failure counts as not there. Plan step 11D1: the operation `windowState` of the worker of that engine.
+    containerExists: (target, environment, signal) => heartbeatPreparation.scope(() => monitorCalls.containerExists(target, environment, signal)),
     warn: (message) => {
       void vscode.window.showWarningMessage(message).then(undefined, (error: unknown) => logger.error('Could not show the message.', error));
     },
@@ -495,7 +494,8 @@ async function activateExtension(
           recordGitState: async (environment, signal) => {
             const target = await windowHeartbeats.connectedEngine(environment);
             if (target === undefined) return;
-            await heartbeatPreparation.scope(() => runWithDockerTarget(target, () => service.recordGitState(environment.id, signal)));
+            // Plan step 11D1: the operation `recordGitState` of the worker of that engine.
+            await heartbeatPreparation.scope(() => monitorCalls.recordGitState(target, environment, signal));
           },
           send: (id, limitSeconds, signal) => windowHeartbeats.release(id, limitSeconds, signal),
           // Review round 2 of PR #87 (A-R2-2): the last use, for Delete's note, at the start of every release.
@@ -584,15 +584,16 @@ async function activateExtension(
     // PR A: on every engine; its calls run in the operation (through its worker where they are plain Docker calls).
     sessionMonitor: {
       ensure: sessionMonitorEnsure(remoteMonitor, engineSocket),
+      // Plan step 11D1: the operation `heartbeat` of the worker of the engine of the open.
       heartbeat: async (_target, environmentId, keepRunning, seq) => {
-        const result = await remoteMonitor.heartbeat({
+        const result = await monitorCalls.heartbeat(await callTarget(), {
           source: computerId(),
           limitSeconds: limitSeconds(),
           environments: [{ id: environmentId, keepRunning, seq }],
         });
         return result.ok ? { ok: true } : { ok: false, detail: result.detail };
       },
-      images: async (target) => sendImageList(target.host),
+      images: async () => sendImageList(),
     },
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
