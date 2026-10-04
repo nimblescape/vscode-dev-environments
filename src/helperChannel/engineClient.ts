@@ -23,7 +23,7 @@ import { errorMessage } from '../core/errors';
 import { readableStderr } from '../core/loader/pipeLoader';
 import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
 import * as crypto from 'crypto';
-import { hasTagOrDigest } from '../core/helperChannel/protocol';
+import { hasTagOrDigest, redact } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
 import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
@@ -456,15 +456,21 @@ async function pullImage(
 /** The most text of each stream of an exec that the result keeps (onOutput still gets all of it). */
 export const MAX_EXEC_OUTPUT_CHARACTERS = 1024 * 1024;
 
-/** The output of an exec by stream, decoded across frames, each bounded (review round 1 of plan step 11B1, A-R1-13, A-R1-14). */
-function execOutput(onOutput: EngineExecOptions['onOutput']) {
+/**
+ * The output of an exec by stream, decoded across frames, each bounded (review round 1 of plan step 11B1, A-R1-13,
+ * A-R1-14). Plan step 11E (review round 2 of 11B1, A-R2-4): with the secret of its input, each stream keeps the length
+ * of the secret more, and is masked before it is cut, so a cut cannot leave a part of the secret.
+ */
+function execOutput(onOutput: EngineExecOptions['onOutput'], secret?: string) {
   const streams = { stdout: { decoder: new StringDecoder('utf8'), text: '' }, stderr: { decoder: new StringDecoder('utf8'), text: '' } };
+  const kept = MAX_EXEC_OUTPUT_CHARACTERS + (secret?.length ?? 0);
   const add = (name: 'stdout' | 'stderr', text: string) => {
     if (text === '') return;
     const stream = streams[name];
-    if (stream.text.length < MAX_EXEC_OUTPUT_CHARACTERS) stream.text += text.slice(0, MAX_EXEC_OUTPUT_CHARACTERS - stream.text.length);
+    if (stream.text.length < kept) stream.text += text.slice(0, kept - stream.text.length);
     onOutput?.(name, text);
   };
+  const final = (text: string) => (secret === undefined ? text : redact(text, secret).slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
   return {
     frame: (kind: 1 | 2, data: Buffer) => {
       const name = kind === 2 ? 'stderr' : 'stdout';
@@ -473,7 +479,7 @@ function execOutput(onOutput: EngineExecOptions['onOutput']) {
     result: () => {
       add('stdout', streams.stdout.decoder.end());
       add('stderr', streams.stderr.decoder.end());
-      return { stdout: streams.stdout.text, stderr: streams.stderr.text };
+      return { stdout: final(streams.stdout.text), stderr: final(streams.stderr.text) };
     },
   };
 }
@@ -510,7 +516,7 @@ async function execInContainer(
           timedOut = true;
           ended.abort();
         }, options.timeoutMs);
-  const output = execOutput(options.onOutput);
+  const output = execOutput(options.onOutput, options.secretInputName !== undefined ? input : undefined);
   try {
     const created = await api({
       method: 'POST',

@@ -332,8 +332,12 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       },
       { secrets: { [SECRET_TOKEN]: 'ghp_value' } },
     );
-    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN });
-    expect(result.stdout).toBe('in:ghp_value');
+    const seen: string[] = [];
+    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    expect(seen.join('')).toBe('in:ghp_value');
+    // Changed expectation, plan step 11E (review round 2 of 11B1, A-R2-4): the kept output masks the secret of the input
+    // (before: 'in:ghp_value').
+    expect(result.stdout).toBe('in:***');
     expect(JSON.parse(calls[0].body)).toMatchObject({ AttachStdin: true });
     expect(JSON.stringify(calls)).not.toContain('ghp_value');
     // A secret that the operation does not hold is a failure, never an empty input.
@@ -366,6 +370,23 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     const result = await engine.exec('c1', ['true'], { onOutput: (_stream, text) => (seen += text.length) });
     expect(result.stdout).toHaveLength(MAX_EXEC_OUTPUT_CHARACTERS);
     expect(seen).toBe(big.length);
+  });
+
+  it('plan step 11E (review round 2 of 11B1, A-R2-4): masks the secret of the input before the cut of each stream', async () => {
+    const secret = 'ghp_' + 'S'.repeat(36);
+    // The secret starts 10 characters before the limit, so a plain cut would keep its first 10 characters.
+    const before = 'a'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 10);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, before), frame(1, `${secret}tail`), frame(2, `${secret} on stderr`)])), {
+      secrets: { [SECRET_TOKEN]: secret },
+    });
+    const result = await engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN });
+    // Masked, the stream is shorter than the limit: nothing of it is cut.
+    expect(result.stdout).toBe(`${before}***tail`);
+    expect(result.stdout).not.toContain('ghp_');
+    expect(result.stderr).toBe('*** on stderr');
+    // Without a secret input, nothing is masked and the cut is as before.
+    const plain = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, before), frame(1, `${secret}tail`)])));
+    expect((await plain.engine.exec('c1', ['cat'])).stdout).toBe(`${before}${secret}`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
   });
 
   it('ends the exec when onOutput throws, never the process (review round 2, A-R2-1)', async () => {
