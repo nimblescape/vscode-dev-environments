@@ -385,6 +385,12 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(JSON.parse(cli.run(['exec', containerName, 'cat', '/state/image-settings.json']).out)).toMatchObject(settings);
     // A monitor container that does not exist: `missing` (the window starts it again).
     expect(await sendHeartbeat(engine, { source: windowSource, limitSeconds: 60, environments: [] }, undefined, `${containerName}-none`)).toMatchObject({ ok: false, missing: true });
+    // Review round 1 of 11D1 (A-R1, missing test): a stopped monitor (it exits when idle), as the engine answers it (409
+    // "is not running"): `missing` too; ensure starts it again.
+    cli.ok(['stop', containerName]);
+    expect(await sendHeartbeat(engine, { source: windowSource, limitSeconds: 60, environments: [] }, undefined, containerName)).toMatchObject({ ok: false, missing: true });
+    expect(['started', 'created']).toContain(await monitor.ensure(helperTag, socket));
+    await waitUntil(() => running(containerName), 'the monitor');
   });
 
   // Plan step 8, PR C (user decisions Q1 and Q2 of 2026-10-02): a window that closes records the Git state, sends its
