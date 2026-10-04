@@ -32,8 +32,14 @@ export type MonitorCreated = { kind: 'ready' } | { kind: 'exited'; detail: strin
 /** The container of the monitor as its create makes it (RemoteSessionMonitor.runSpec). */
 export interface MonitorRunSpec {
   name: string;
-  /** The helper tag, or the checked image ID of the helper image (never pulled). */
+  /** The helper tag, or the checked image ID of the helper image, or its monitor tag (plan step 11D3; never pulled). */
   image: string;
+  /**
+   * Plan step 11D3 (option B of 2026-10-03): the image ID that the container must have when `image` is a tag (the
+   * monitor tag of the pinned helper image). The create checks it before the start; another image is a failure of the
+   * create (`exited`), and the caller removes the container by its labels.
+   */
+  imageId?: string;
   labels: Record<string, string>;
   /** Plan step 8, PR B (Q5): `on-failure`. */
   restartPolicy: string;

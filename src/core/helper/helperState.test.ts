@@ -7,7 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { helperImageTag } from './helperImage';
-import { emptyHelperState, isHelperImageTag, parseHelperState, readHelperState, updateHelperState } from './helperState';
+import { emptyHelperState, isHelperImageTag, isMonitorImageTag, monitorImageTag, parseHelperState, readHelperState, updateHelperState } from './helperState';
 
 const TAG = 'devenv-helper:0123456789ab';
 const TIME = '2026-09-24T12:00:00.000Z';
@@ -30,6 +30,18 @@ describe('isHelperImageTag', () => {
     expect(isHelperImageTag(TAG)).toBe(true);
     for (const tag of ['devenv-helper:latest', 'devenv-helper:0123456789AB', 'devenv-helper:0123456789a', 'mine:1', '__proto__', '']) {
       expect(isHelperImageTag(tag)).toBe(false);
+    }
+  });
+});
+
+describe('monitorImageTag and isMonitorImageTag (plan step 11D3)', () => {
+  it('the monitor tag of a helper tag has its hash; nothing for another tag', () => {
+    expect(monitorImageTag(TAG)).toBe(TAG.replace('devenv-helper:', 'devenv-monitor:'));
+    expect(monitorImageTag('devenv-helper:0123456789ab')).toBe('devenv-monitor:0123456789ab');
+    for (const tag of ['devenv-helper:latest', 'devenv-monitor:0123456789ab', 'x-devenv-helper:0123456789ab', 'mine:1', '']) expect(monitorImageTag(tag)).toBeUndefined();
+    expect(isMonitorImageTag('devenv-monitor:0123456789ab')).toBe(true);
+    for (const tag of ['devenv-monitor:latest', 'devenv-monitor:0123456789AB', 'devenv-monitor:0123456789a', 'devenv-monitor:0123456789abc', 'x-devenv-monitor:0123456789ab', 'devenv-helper:0123456789ab', '']) {
+      expect(isMonitorImageTag(tag)).toBe(false);
     }
   });
 });

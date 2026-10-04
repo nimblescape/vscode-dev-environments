@@ -268,6 +268,8 @@ const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const OLD_TAG = 'devenv-helper:0123456789ab';
 const OTHER_TAG = 'devenv-helper:abcdef012345';
+/** Plan step 11D3: a time relative to START, as Harness.iso gives it before a harness exists. */
+const h0iso = (offsetMs: number): string => new Date(START + offsetMs).toISOString();
 
 type LookupAnswer = string | 'unreachable' | undefined;
 
@@ -831,6 +833,52 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     expect(h.docker.images.get(oldId)?.tags).toEqual(['mine:backup']);
   });
 
+  it('plan step 11D3: a rebuild removes the previous image whose only tag left is its monitor tag', async () => {
+    const { h, oldId } = existing(8 * DAY);
+    const monitorTag = h.tag.replace('devenv-helper:', 'devenv-monitor:');
+    h.docker.images.get(oldId)!.tags.push(monitorTag);
+    h.answer = async () => DIGEST_B;
+    await h.ensure();
+    await h.settled();
+    // The check asks the next ensure to rebuild.
+    await h.ensure();
+    expect(h.docker.builds).toHaveLength(1);
+    expect(h.docker.removals).toEqual([monitorTag]);
+    expect(h.docker.images.has(oldId)).toBe(false);
+  });
+
+  it('plan step 11D3: keeps a previous image with its monitor tag while the monitor runs, and removes it at a later cleanup', async () => {
+    const { h, oldId } = existing(8 * DAY);
+    const monitorTag = h.tag.replace('devenv-helper:', 'devenv-monitor:');
+    h.docker.images.get(oldId)!.tags.push(monitorTag);
+    h.docker.inUse.add(oldId);
+    h.answer = async () => DIGEST_B;
+    await h.ensure();
+    await h.settled();
+    // The check asks the next ensure to rebuild.
+    await h.ensure();
+    expect(h.docker.removals).toEqual([monitorTag]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual([monitorTag]);
+    h.docker.inUse.clear();
+    h.advance(HELPER_CLEANUP_INTERVAL_MS);
+    await h.ensure();
+    expect(h.docker.images.has(oldId)).toBe(false);
+    // Never a tag of the current image.
+    expect(h.docker.images.get(h.docker.idOf(h.tag)!)?.tags).toEqual([h.tag]);
+  });
+
+  it('plan step 11D3: a previous image with a monitor tag and another tag keeps both', async () => {
+    const { h, oldId } = existing(8 * DAY);
+    h.docker.images.get(oldId)!.tags.push('devenv-monitor:fedcba987654', 'mine:backup');
+    h.answer = async () => DIGEST_B;
+    await h.ensure();
+    await h.settled();
+    // The check asks the next ensure to rebuild.
+    await h.ensure();
+    expect(h.docker.removals).toEqual([]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual(['devenv-monitor:fedcba987654', 'mine:backup']);
+  });
+
   it('keeps a previous image that a running helper uses, and removes it at the next cleanup', async () => {
     const { h, oldId } = await changed();
     h.docker.inUse.add(oldId);
@@ -1140,6 +1188,35 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
     await h.ensure();
     expect(h.docker.removals).toEqual([]);
     expect(h.docker.images.get(currentId)?.tags).toEqual([h.tag, OLD_TAG]);
+  });
+
+  it('plan step 11D3: removes the monitor tag with its helper tag, and a monitor tag without its helper tag; keeps the others', async () => {
+    const { h, currentId } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) }, [OTHER_TAG]: { lastUsedAt: h0iso(-HOUR) } });
+    const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
+    const otherMonitor = OTHER_TAG.replace('devenv-helper:', 'devenv-monitor:');
+    const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
+    const otherId = h.docker.addImage([OTHER_TAG, otherMonitor]);
+    const orphanId = h.docker.addImage(['devenv-monitor:fedcba987654', 'mine:keep']);
+    h.docker.images.get(currentId)!.tags.push(h.tag.replace('devenv-helper:', 'devenv-monitor:'));
+    await h.ensure();
+    expect(h.docker.removals).toEqual([OLD_TAG, oldMonitor, 'devenv-monitor:fedcba987654']);
+    expect(h.docker.images.has(oldId)).toBe(false);
+    expect(h.docker.images.get(otherId)?.tags).toEqual([OTHER_TAG, otherMonitor]);
+    expect(h.docker.images.get(orphanId)?.tags).toEqual(['mine:keep']);
+    expect(h.docker.images.get(currentId)?.tags).toEqual([h.tag, h.tag.replace('devenv-helper:', 'devenv-monitor:')]);
+    expect(h.state().images[OLD_TAG]).toEqual({ removedAt: h.iso() });
+    // Monitor tags are no records of the state.
+    expect(Object.keys(h.state().images).some((tag) => tag.startsWith('devenv-monitor:'))).toBe(false);
+  });
+
+  it('plan step 11D3: keeps the monitor tag when the removal of its helper tag fails', async () => {
+    const { h } = current({ [OLD_TAG]: { lastUsedAt: h0iso(-HELPER_UNUSED_LIMIT_MS) } });
+    const oldMonitor = OLD_TAG.replace('devenv-helper:', 'devenv-monitor:');
+    const oldId = h.docker.addImage([OLD_TAG, oldMonitor]);
+    h.docker.failingRemovals.add(OLD_TAG);
+    await h.ensure();
+    expect(h.docker.removals).toEqual([OLD_TAG]);
+    expect(h.docker.images.get(oldId)?.tags).toEqual([OLD_TAG, oldMonitor]);
   });
 
   it('gives an unknown helper tag a grace period of 7 days, then removes it', async () => {

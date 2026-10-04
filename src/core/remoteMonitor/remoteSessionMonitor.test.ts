@@ -28,7 +28,7 @@ import {
 // Plan step 11D2: the ensure asks a MonitorEngine; these tests drive it through the CLI-shaped fake as before
 // (cliMonitorEngine, the CLI reading of the extension that the worker's Engine API replaced).
 import { CLI_CLIENT_EXIT_WAIT_MS as REMOTE_MONITOR_CLIENT_EXIT_WAIT_MS, cliMonitorEngine, cliRunArgs, isMissingContainer } from './cliMonitorEngine.testkit';
-import { parseDockerTime } from './monitorEngine';
+import { parseDockerTime, type MonitorEngine, type MonitorRunSpec } from './monitorEngine';
 
 const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';
@@ -2293,5 +2293,33 @@ describe('RemoteSessionMonitor.ensure: remote monitor restart check (known gap o
     expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('started');
     expect(docker.commands()).toEqual(['inspect', 'start', 'exec', 'inspect']);
     expect(docker.calls.some((call) => call.args[0] === 'rm')).toBe(false);
+  });
+});
+
+describe('the image ID of a monitor tag (plan step 11D3)', () => {
+  it('the spec carries the image ID only when it is given, and the ensure passes it to the create', async () => {
+    const plain = monitor(new FakeDocker(() => result(0)));
+    expect(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT)).not.toHaveProperty('imageId');
+    const id = `sha256:${'b'.repeat(64)}`;
+    expect(plain.runSpec('devenv-monitor:0123456789ab', SOCKET, LABEL, SCRIPT, undefined, 'nonce', id)).toMatchObject({ image: 'devenv-monitor:0123456789ab', imageId: id });
+    const specs: MonitorRunSpec[] = [];
+    const engine: MonitorEngine = {
+      inspect: async () => ({ exists: false }),
+      daemonTime: async () => Date.now(),
+      remove: async () => {},
+      start: async () => {},
+      storedScript: async () => 'none',
+      idsWithLabel: async () => [],
+      create: async (spec) => {
+        specs.push(spec);
+        return { kind: 'ready' };
+      },
+    };
+    const ensuring = new RemoteSessionMonitor({ engine, logger: new Log(), script: async () => SCRIPT });
+    expect(await ensuring.ensureOrThrow(TAG, SOCKET, undefined, 'devenv-monitor:0123456789ab', id)).toBe('created');
+    expect(specs[0]).toMatchObject({ image: 'devenv-monitor:0123456789ab', imageId: id });
+    expect(specs[0].labels[LABEL_SESSION_MONITOR]).toBe(remoteMonitorLabelValue(SCRIPT, TAG));
+    expect(await new RemoteSessionMonitor({ engine, logger: new Log(), script: async () => SCRIPT }).ensure(TAG, SOCKET, undefined, 'devenv-monitor:0123456789ab', id)).toBe('created');
+    expect(specs[1]).toMatchObject({ imageId: id });
   });
 });

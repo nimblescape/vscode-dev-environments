@@ -216,6 +216,13 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       if (answer.status === 409) return 'inUse';
       return fail(answer);
     },
+    tagImage: async (image, reference, signal) => {
+      const at = reference.lastIndexOf(':');
+      if (at <= 0 || reference.includes('/') || reference.includes('@')) throw new Error(`The reference ${JSON.stringify(reference)} is not a local repository:tag.`);
+      const query = `repo=${encodeURIComponent(reference.slice(0, at))}&tag=${encodeURIComponent(reference.slice(at + 1))}`;
+      const answer = await api({ method: 'POST', path: `/images/${encodeURIComponent(image)}/tag?${query}`, signal });
+      if (answer.status !== 201 && answer.status !== 200) fail(answer);
+    },
     createVolume: async (name, labels, signal) => {
       const answer = await api({ method: 'POST', path: '/volumes/create', json: { Name: name, Labels: labels }, signal });
       if (answer.status !== 201 && answer.status !== 200) fail(answer);
@@ -616,6 +623,16 @@ async function createAttached(
     const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
     if (typeof id !== 'string' || id === '') return { kind: 'exited', detail: 'The engine answered the create of a container with an invalid value.', conflict: false };
     try {
+      // Plan step 11D3 (option B of 2026-10-03): a container of a tag runs only from the pinned image; the tag may have
+      // moved between its tag and this create (another window). Checked before the start.
+      if (spec.imageId !== undefined) {
+        const inspected = await api({ method: 'GET', path: `/containers/${encodeURIComponent(id)}/json`, signal });
+        if (inspected.status !== 200) return { kind: 'exited', detail: engineErrorMessage({ ...inspected, truncated: false }), conflict: false };
+        const image = (json(inspected.body) as { Image?: unknown } | undefined)?.Image;
+        if (image !== spec.imageId) {
+          return { kind: 'exited', detail: `the container was created from the image ${typeof image === 'string' ? image : 'that cannot be read'}, not from ${spec.imageId}`, conflict: false };
+        }
+      }
       stream = await hijack({
         path: `/containers/${encodeURIComponent(id)}/attach?stream=1&stdin=1&stdout=1&stderr=1`,
         signal,

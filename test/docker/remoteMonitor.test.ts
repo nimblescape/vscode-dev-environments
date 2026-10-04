@@ -499,6 +499,35 @@ describe('the Session Monitor container of a remote Docker host', () => {
       cli.run(['rm', '-f', closedName, reloadedName]);
     }
   });
+
+  // Plan step 11D3 (option B of 2026-10-03): the monitor runs from a second tag of the pinned helper image, and its create
+  // checks the image ID before the start. A tag of this run, so that the monitor tag of a real installation stays.
+  it('runs from a tag of the pinned image, and a create from another image is removed before its start (plan step 11D3)', async () => {
+    const imageId = cli.ok(['image', 'inspect', '-f', '{{.Id}}', helperTag]);
+    const tag = `devenv-test-monitor-${run.runId}:0123456789ab`.toLowerCase();
+    try {
+      await engine.tagImage(imageId, tag);
+      expect(cli.ok(['image', 'inspect', '-f', '{{.Id}}', tag])).toBe(imageId);
+      cli.ok(['rm', '-f', containerName]);
+      expect(await monitor.ensure(helperTag, socket, undefined, tag, imageId)).toBe('created');
+      const details = cli.container(containerName) as unknown as { Image: string; Config: { Image: string; Labels: Record<string, string> }; State: { Running: boolean } };
+      expect(details.Config.Image).toBe(tag);
+      expect(details.Image).toBe(imageId);
+      expect(details.State.Running).toBe(true);
+      // The label still names the helper tag: an ensure by the image ID finds it running.
+      expect(await monitor.ensure(helperTag, socket, undefined, imageId)).toBe('running');
+
+      // The tag moved to another image (another window between its tag and this create): the create fails and leaves nothing.
+      cli.ok(['rm', '-f', containerName]);
+      const otherId = cli.ok(['image', 'inspect', '-f', '{{.Id}}', TEST_BASE_IMAGE]);
+      await engine.tagImage(otherId, tag);
+      await expect(monitor.ensureOrThrow(helperTag, socket, undefined, tag, imageId)).rejects.toThrow(`not from ${imageId}`);
+      expect(cli.container(containerName)).toBeUndefined();
+    } finally {
+      cli.run(['image', 'rm', tag]);
+      expect(await monitor.ensure(helperTag, socket)).not.toBe('failed');
+    }
+  });
 });
 
 // Plan step 8, PR B (user decisions D2 of 2026-09-30 and Q5 of 2026-10-02): the automatic stops of the monitor take the

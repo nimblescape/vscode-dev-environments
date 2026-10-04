@@ -71,6 +71,22 @@ export function isHelperImageTag(tag: string): boolean {
   return HELPER_TAG.test(tag);
 }
 
+const MONITOR_TAG = /^devenv-monitor:[0-9a-f]{12}$/;
+
+/**
+ * Plan step 11D3 (option B of 2026-10-03): the second tag of a helper image that the Session Monitor container runs
+ * from, so that it shows as `devenv-monitor:<hash>` (the hash of its helper tag) instead of an image ID. Undefined for
+ * a tag that is not a helper tag.
+ */
+export function monitorImageTag(helperTag: string): string | undefined {
+  return isHelperImageTag(helperTag) ? `devenv-monitor:${helperTag.slice('devenv-helper:'.length)}` : undefined;
+}
+
+/** True for a tag that `monitorImageTag` returns; the helper cleanup removes such tags with their helper tag. */
+export function isMonitorImageTag(tag: string): boolean {
+  return MONITOR_TAG.test(tag);
+}
+
 const RECORD_FIELDS = [
   'baseImage',
   'baseDigest',

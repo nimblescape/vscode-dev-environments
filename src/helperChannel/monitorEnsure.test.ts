@@ -38,12 +38,17 @@ function contextOf(secrets: Record<string, string> = {}) {
   return { context, controller, lines };
 }
 
-function engineWith(state: { existing?: unknown; created?: MonitorCreated }) {
+function engineWith(state: { existing?: unknown; created?: MonitorCreated; tagFails?: boolean }) {
   const specs: MonitorRunSpec[] = [];
   const inputs: string[] = [];
   const removed: string[] = [];
+  const tagged: string[] = [];
   const engine: DockerEngine = {
     ...unusedEngine(),
+    tagImage: async (image, reference) => {
+      if (state.tagFails) throw new Error('no such image');
+      tagged.push(`${image} ${reference}`);
+    },
     inspect: async () => state.existing,
     createAttached: async (spec, options) => {
       specs.push(spec);
@@ -53,18 +58,21 @@ function engineWith(state: { existing?: unknown; created?: MonitorCreated }) {
     containerIds: async () => ['c0ffee'.padEnd(64, '0')],
     removeContainer: async (id) => void removed.push(id),
   };
-  return { engine, specs, inputs, removed };
+  return { engine, specs, inputs, removed, tagged };
 }
 
 describe('the ensure of the Session Monitor in the worker (plan step 11D2)', () => {
   it('creates a missing monitor with the worker\'s helper image, its socket and the script of its bundle', async () => {
-    const { engine, specs, inputs } = engineWith({});
+    const { engine, specs, inputs, tagged } = engineWith({});
     const value = await monitorEnsureOperation(() => engine, async () => OWN, () => SCRIPT)({ images: IMAGES }, contextOf().context);
     expect(parseMonitorEnsureValue(value)).toEqual({ outcome: 'created' });
     expect(specs).toHaveLength(1);
     const [spec] = specs;
-    // The label names the tag; the container runs from the checked image ID.
-    expect(spec.image).toBe(OWN.image.id);
+    // The label names the tag. Plan step 11D3 (option B of 2026-10-03): the container runs from the monitor tag of the
+    // pinned image (before: from its ID), tagged first, and the create checks that ID.
+    expect(tagged).toEqual([`${OWN.image.id} devenv-monitor:0123456789ab`]);
+    expect(spec.image).toBe('devenv-monitor:0123456789ab');
+    expect(spec.imageId).toBe(OWN.image.id);
     expect(spec.labels[LABEL_SESSION_MONITOR]).toBe(remoteMonitorLabelValue(SCRIPT, OWN.image.tag, []));
     expect(spec.labels[LABEL_MONITOR_CREATE]).toMatch(/^[0-9a-f-]{36}$/);
     expect(spec.mounts).toEqual({ socket: OWN.socket, volume: 'devenv-session-monitor', volumeTarget: '/state' });
@@ -121,5 +129,45 @@ describe('the ensure of the Session Monitor in the worker (plan step 11D2)', () 
     expect(parseMonitorEnsureParams({ images: { ...IMAGES, prefixes: ['docker.io/library'] } })).toBeUndefined();
     expect(parseMonitorEnsureValue({ outcome: 'started' })).toEqual({ outcome: 'started' });
     for (const odd of [{ outcome: 'failed' }, { outcome: 'running', more: 1 }, null]) expect(parseMonitorEnsureValue(odd)).toBeUndefined();
+  });
+});
+
+describe('the image of the monitor container (plan step 11D3, option B of 2026-10-03)', () => {
+  it('a tag that fails: the monitor runs from the image ID, with a warning', async () => {
+    const { engine, specs } = engineWith({ tagFails: true });
+    const { context, lines } = contextOf();
+    expect(parseMonitorEnsureValue(await monitorEnsureOperation(() => engine, async () => OWN, () => SCRIPT)({ images: IMAGES }, context))).toEqual({ outcome: 'created' });
+    expect(specs[0].image).toBe(OWN.image.id);
+    expect(specs[0].imageId).toBeUndefined();
+    expect(lines.some((line) => line.includes('could not be tagged as devenv-monitor:0123456789ab') && line.includes('no such image'))).toBe(true);
+  });
+
+  it('a worker whose tag is no helper tag: the image ID, nothing tagged', async () => {
+    const { engine, specs, tagged } = engineWith({});
+    const own: OwnHelper = { ...OWN, image: { ...OWN.image, tag: 'something:else' } };
+    await monitorEnsureOperation(() => engine, async () => own, () => SCRIPT)({ images: IMAGES }, contextOf().context);
+    expect(tagged).toEqual([]);
+    expect(specs[0].image).toBe(OWN.image.id);
+    expect(specs[0].imageId).toBeUndefined();
+  });
+
+  it('a worker without an image ID: its tag, nothing tagged', async () => {
+    const { engine, specs, tagged } = engineWith({});
+    const own: OwnHelper = { ...OWN, image: { tag: OWN.image.tag } };
+    await monitorEnsureOperation(() => engine, async () => own, () => SCRIPT)({ images: IMAGES }, contextOf().context);
+    expect(tagged).toEqual([]);
+    expect(specs[0].image).toBe(OWN.image.tag);
+    expect(specs[0].imageId).toBeUndefined();
+  });
+
+  it('a cancel during the tag cancels the operation; nothing is created', async () => {
+    const { context, controller } = contextOf();
+    const { engine, specs } = engineWith({});
+    engine.tagImage = async (_image, _reference, signal) =>
+      new Promise<void>((_resolve, reject) => signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }));
+    const running = monitorEnsureOperation(() => engine, async () => OWN, () => SCRIPT)({ images: IMAGES }, context);
+    setTimeout(() => controller.abort(), 20);
+    await expect(running).rejects.toMatchObject({ code: 'cancelled' });
+    expect(specs).toEqual([]);
   });
 });

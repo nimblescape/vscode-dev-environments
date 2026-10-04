@@ -193,6 +193,55 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     expect(await engine.createAttached(SPEC, { input: 'x\n', readyText: READY, timeoutMs: 300 })).toEqual({ kind: 'timeout' });
   });
 
+  it('plan step 11D3: a container of a tag is checked for the pinned image ID before its start', async () => {
+    const PINNED = 'sha256:' + 'b'.repeat(64);
+    const answers = (image: string, status = 200) => (call: Call) => {
+      if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: ID } };
+      if (call.url === `/containers/${ID}/json`) return { status, json: status === 200 ? { Id: ID, Image: image } : { message: 'no such container' } };
+      if (call.url.endsWith('/start')) return { status: 204 };
+      return { status: 404, json: { message: 'unexpected' } };
+    };
+    const spec = { ...SPEC, image: 'devenv-monitor:0123456789ab', imageId: PINNED };
+    const same = await serve(answers(PINNED), (socket, given) => {
+      if (given.endsWith('\n')) socket.write(frame(1, READY));
+    });
+    expect(await same.engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toEqual({ kind: 'ready' });
+    expect(same.calls.map((call) => `${call.method} ${call.url.split('?')[0]}`)).toEqual([
+      'POST /containers/create',
+      `GET /containers/${ID}/json`,
+      `POST /containers/${ID}/attach`,
+      `POST /containers/${ID}/start`,
+    ]);
+    // The ID is no field of the create.
+    expect(JSON.parse(same.calls[0].body).Image).toBe('devenv-monitor:0123456789ab');
+    expect(JSON.parse(same.calls[0].body)).not.toHaveProperty('imageId');
+    const other = await serve(answers('sha256:' + 'c'.repeat(64)));
+    expect(await other.engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toEqual({
+      kind: 'exited',
+      detail: `the container was created from the image sha256:${'c'.repeat(64)}, not from ${PINNED}`,
+      conflict: false,
+    });
+    // Never attached or started: the caller removes it by its labels.
+    expect(other.calls.map((call) => call.url.split('?')[0])).toEqual(['/containers/create', `/containers/${ID}/json`]);
+    const unreadable = await serve(answers('', 404));
+    expect(await unreadable.engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toMatchObject({ kind: 'exited', detail: 'no such container' });
+    expect(unreadable.calls).toHaveLength(2);
+    const noImage = await serve((call) => (call.url === `/containers/${ID}/json` ? { status: 200, json: { Id: ID } } : answers(PINNED)(call)));
+    expect(await noImage.engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toMatchObject({ kind: 'exited', detail: `the container was created from the image that cannot be read, not from ${PINNED}` });
+  });
+
+  it('plan step 11D3: tags an image by its ID; a refusal fails; only a local repository:tag', async () => {
+    const good = await serve(() => ({ status: 201 }));
+    await good.engine.tagImage('sha256:' + 'a'.repeat(64), 'devenv-monitor:0123456789ab');
+    expect(good.calls).toEqual([{ method: 'POST', url: `/images/sha256%3A${'a'.repeat(64)}/tag?repo=devenv-monitor&tag=0123456789ab`, body: '' }]);
+    const refused = await serve(() => ({ status: 404, json: { message: 'No such image: sha256:aaa' } }));
+    await expect(refused.engine.tagImage('sha256:aaa', 'devenv-monitor:0123456789ab')).rejects.toThrow('No such image');
+    for (const reference of ['devenv-monitor', ':x', 'ghcr.io/acme/x:1', 'devenv-monitor@sha256:aa']) {
+      await expect(refused.engine.tagImage('sha256:aaa', reference)).rejects.toThrow('is not a local repository:tag');
+    }
+    expect(refused.calls).toHaveLength(1);
+  });
+
   it('reads the clock of the daemon; an answer without it is a failure', async () => {
     const good = await serve(() => ({ status: 200, json: { SystemTime: '2026-10-04T12:00:00.123456789Z', Containers: 3 } }));
     expect(await good.engine.systemTime()).toBe('2026-10-04T12:00:00.123456789Z');

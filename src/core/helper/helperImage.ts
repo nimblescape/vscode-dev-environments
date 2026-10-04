@@ -18,7 +18,7 @@ import { parseImageReference } from '../imageCheck/reference';
 import type { RegistryClient } from '../imageCheck/registryClient';
 import { LABEL_HELPER } from '../names';
 import { abortError, isAbortError, isoTime, silentLogger, systemClock, type Clock, type Logger } from '../ports';
-import { isHelperImageTag, readHelperState, updateHelperState, type HelperImageRecord, type HelperState } from './helperState';
+import { isHelperImageTag, isMonitorImageTag, monitorImageTag, readHelperState, updateHelperState, type HelperImageRecord, type HelperState } from './helperState';
 
 /**
  * Version of `@devcontainers/cli` in the helper image. It comes from the exact devDependency in package.json:
@@ -613,7 +613,14 @@ async function listHelperImages(m: Maintenance): Promise<ImageInfo[] | undefined
 async function removePreviousImage(m: Maintenance, previousId: string, currentId: string): Promise<void> {
   const images = await listHelperImages(m);
   const previous = images?.find((image) => image.id === previousId);
-  if (previous && previous.tags.length === 0) await removeHelperImage(m, previous, previous.id, currentId);
+  if (previous === undefined) return;
+  // Plan step 11D3: the monitor tag of the rebuilt tag can stay on the previous image (the monitor runs from it); it
+  // does not keep the image. Its removal removes the image with its last tag (Docker refuses while the monitor runs).
+  if (previous.tags.length > 0 && previous.tags.every(isMonitorImageTag)) {
+    for (const tag of previous.tags) await removeHelperImage(m, previous, tag, currentId);
+    return;
+  }
+  if (previous.tags.length === 0) await removeHelperImage(m, previous, previous.id, currentId);
 }
 
 /**
@@ -669,8 +676,20 @@ async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
         graced.push(tag);
       } else if (age >= HELPER_UNUSED_LIMIT_MS) {
         m.logger.info(`The workspace helper image ${tag} was not used for ${Math.floor(age / DAY_MS)} days. It is removed.`);
-        if (await removeHelperImage(m, image, tag, currentId)) removed.push(tag);
+        if (await removeHelperImage(m, image, tag, currentId)) {
+          removed.push(tag);
+          // Plan step 11D3: its monitor tag goes with it.
+          const monitorTag = monitorImageTag(tag);
+          if (monitorTag !== undefined && image.tags.includes(monitorTag)) await removeHelperImage(m, image, monitorTag, currentId);
+        }
       }
+    }
+    // Plan step 11D3: a monitor tag whose helper tag is not on its image (removed, or moved by a rebuild) is removed.
+    for (const tag of image.tags.filter(isMonitorImageTag)) {
+      const helperTag = `devenv-helper:${tag.slice('devenv-monitor:'.length)}`;
+      if (image.tags.includes(helperTag)) continue;
+      m.logger.info(`The tag ${tag} of the Session Monitor is no longer on its workspace helper image. It is removed.`);
+      await removeHelperImage(m, image, tag, currentId);
     }
   }
 

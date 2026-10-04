@@ -37,6 +37,7 @@ import {
 } from '../core/helperChannel/protocol';
 import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
 import { isAbortError, silentProgress, type Logger } from '../core/ports';
+import { errorMessage } from '../core/errors';
 import { readOwnHelper, type OwnHelper } from '../core/worker/ownHelper';
 import { workerServices } from '../core/worker/workerServices';
 import { EngineDocker } from '../core/worker/engineDocker';
@@ -48,8 +49,9 @@ import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { sendHeartbeat, sendMonitorSettings } from '../core/worker/monitorFlow';
-import { engineMonitor } from '../core/worker/engineMonitor';
-import { RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
+import { engineMonitor, limited } from '../core/worker/engineMonitor';
+import { monitorImageTag } from '../core/helper/helperState';
+import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -450,6 +452,27 @@ export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf
  * image the worker runs from: its tag in the label, its ID as the image of the container), the socket that the worker
  * mounts, and `script` (the monitor of the worker's bundle). A failure fails the operation with its cause.
  */
+/**
+ * Plan step 11D3 (option B of 2026-10-03): the image of the monitor container: the worker's own image (the pinned
+ * helper image) by its monitor tag `devenv-monitor:<hash>`, tagged here, with the ID that the create checks; by the ID
+ * itself (as before) when the tag of the worker is no helper tag or the tag fails (the name in the Containers view only).
+ */
+export async function monitorImage(engine: DockerEngine, own: { tag: string; id?: string }, logger: Logger, signal: AbortSignal): Promise<{ reference: string; id?: string }> {
+  // Without an ID, its tag (as before; readOwnHelper always reads one).
+  if (own.id === undefined) return { reference: own.tag };
+  const reference = monitorImageTag(own.tag);
+  if (reference === undefined) return { reference: own.id };
+  try {
+    const id = own.id;
+    await limited(REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal, (limit) => engine.tagImage(id, reference, limit));
+  } catch (error) {
+    if (signal.aborted) throw error;
+    logger.warn(`The image of the Session Monitor could not be tagged as ${reference}; it runs from ${own.id}: ${errorMessage(error)}`);
+    return { reference: own.id };
+  }
+  return { reference, id: own.id };
+}
+
 export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, script: () => string): OperationHandler {
   return async (params, context) => {
     const checked = parseMonitorEnsureParams(params);
@@ -457,8 +480,11 @@ export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf:
     if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorEnsure operation takes no secret.');
     try {
       const own = await ownHelperOf(context);
-      const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engineOf(context)), logger: contextLogger(context), script: async () => script(), imageMaintenance: () => checked.images });
-      const outcome = await monitor.ensureOrThrow(own.image.tag, own.socket, context.signal, own.image.id);
+      const engine = engineOf(context);
+      const logger = contextLogger(context);
+      const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engine), logger, script: async () => script(), imageMaintenance: () => checked.images });
+      const image = await monitorImage(engine, own.image, logger, context.signal);
+      const outcome = await monitor.ensureOrThrow(own.image.tag, own.socket, context.signal, image.reference, image.id);
       return { outcome } satisfies MonitorEnsureValue;
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorEnsure operation was cancelled.');
