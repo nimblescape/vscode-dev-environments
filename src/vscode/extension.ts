@@ -808,7 +808,12 @@ async function activateExtension(
       .current()
       .then((target) => helperPrebuild.start(target))
       // Review round 1 of 11C3 (A-R1-M2): a lost registry is restored again once the helper image was built.
-      .then((outcome) => restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt }))),
+      .then((outcome) =>
+        // Review round 3 of 11C3 (A-R3-L3): a failed restore is logged as such, not as a failed preparation.
+        restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt })).catch((error: unknown) =>
+          logger.error('Could not restore the environments from the volumes after the helper image was prepared.', error),
+        ),
+      ),
     'prepare the workspace helper image in the background',
   );
 

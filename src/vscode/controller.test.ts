@@ -3060,6 +3060,46 @@ describe('Accounts (concept 7.5)', () => {
     expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(env.id);
   });
 
+  // Review round 3 of 11C3 (A-R3-L1, A-R3-L2): one adoption at a time, once per window, never in a window of role A.
+  it('two restores at the same time adopt the window once', async () => {
+    const env = environment();
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    h.docker.findContainer.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return containerInfo(String(CONTAINER_VERSION));
+    });
+    await h.registry.add(env);
+    await Promise.all([h.controller.reconcileIfRegistryLost({ passive: true, adopt: true }), h.controller.reconcileIfRegistryLost({ passive: false, adopt: true })]);
+    expect(h.coordinator.setEnvironment.mock.calls.filter(([id]) => id === env.id)).toHaveLength(1);
+  });
+
+  it('a window that left the environment of another account after a restore does not leave it again', async () => {
+    const env = environment({ owner: OTHER_ACCOUNT });
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    await h.registry.add(env);
+    await h.controller.reconcileIfRegistryLost({ passive: true, adopt: true });
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    await h.controller.reconcileIfRegistryLost({ passive: false, adopt: true });
+    expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('a window of role A is never adopted by a restore', async () => {
+    const env = environment({ owner: OTHER_ACCOUNT });
+    h.connection.currentContainerName.mockReturnValue(CONTAINER);
+    await h.registry.add(env);
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    fs.rmSync(h.paths.registry, { force: true });
+    h.service.reconcileInWorker.mockImplementation(async () => {
+      await h.registry.add(env);
+      return 1;
+    });
+    await h.controller.reconcileIfRegistryLost({ passive: false });
+    expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalledTimes(1);
+  });
+
   it('role A: a window adopted after a restore of the registry leaves when the account changed during its checks', async () => {
     const env = environment();
     h.connection.currentContainerName.mockReturnValue(CONTAINER);

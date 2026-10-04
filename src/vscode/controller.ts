@@ -245,6 +245,14 @@ export class Controller implements vscode.Disposable {
   private readonly isAlive: (pid: number) => boolean;
   private readonly timers = new Set<NodeJS.Timeout>();
   private current: WindowEnvironment | undefined;
+  /**
+   * Review round 3 of 11C3 (A-R3-L1, A-R3-L2): this window runs the open pipeline of role A (openAttachedWindow), so a
+   * restore of the registry never adopts an environment for it; `adoption`: the adoption that runs; `adopted`: an
+   * adoption found the environment of this window (it took it or left it), so no later restore adopts it again.
+   */
+  private attaching = false;
+  private adoption: Promise<void> | undefined;
+  private adopted = false;
   /** See `LeftEnvironment`; checked until the window has closed its connection (`checkLeftConnection`). */
   private left: LeftEnvironment | undefined;
   private checkingLeft = false;
@@ -421,6 +429,7 @@ export class Controller implements vscode.Disposable {
     containerName: string,
     pending: PendingConnection | undefined,
   ): Promise<void> {
+    this.attaching = true;
     // Concept 7.5: the environment of another account runs no pipeline and starts no container; the window closes.
     const environment = await this.ownWindowEnvironment(attached, containerName);
     if (!environment) return;
@@ -1742,18 +1751,30 @@ export class Controller implements vscode.Disposable {
   // -------------------------------------------------------------------------------------------------------------------
   // Connection of this window
 
-  /** Registry restored from the volumes: this window may be attached to one of the restored environments. */
+  /**
+   * Registry restored from the volumes: this window may be attached to one of the restored environments. Review round 3
+   * of 11C3 (A-R3-L1, A-R3-L2): never in a window of role A; one adoption at a time, and once per window.
+   */
   private async adoptWindowEnvironment(): Promise<void> {
-    if (this.current) return;
+    if (this.attaching || this.adopted || this.current) return;
+    this.adoption ??= this.adoptWindowEnvironmentNow().finally(() => {
+      this.adoption = undefined;
+    });
+    await this.adoption;
+  }
+
+  private async adoptWindowEnvironmentNow(): Promise<void> {
     const containerName = this.deps.connection.currentContainerName();
     if (!containerName) return;
     const restored = await this.deps.registry.findByContainerName(containerName);
-    if (!restored) return;
+    if (!restored || this.attaching || this.adopted) return;
+    this.adopted = true;
     const environment = await this.ownWindowEnvironment(restored, containerName);
     if (!environment || this.current) return;
     // No pipeline runs here, so a container of an older version is not made again: the window leaves it (section 9), and
     // so it does a container made while the host access checks were off, when they are on now.
     const outdated = await this.containerOutdated(environment);
+    if (this.current) return;
     if (outdated) {
       const repository = this.displayName({ repository: environment.repository });
       this.logger.info(this.outdatedTexts(outdated, repository).log);
