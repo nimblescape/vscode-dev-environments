@@ -16,7 +16,7 @@ import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
-import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION } from '../core/names';
+import { CONTAINER_VERSION, HOST_ACCESS_UNRESTRICTED, LABEL_CONTAINER_VERSION, LABEL_HOST_ACCESS } from '../core/names';
 import { OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/environmentService';
 import { PipelineTexts } from '../core/pipeline/environmentService';
@@ -2319,6 +2319,68 @@ describe('Connection of this window', () => {
     h.controller.onHeartbeat();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(warningMessages()).toContain(ControllerTexts.unrestrictedContainerClosed('acme/api'));
+  });
+
+  // Review round 4 of 11C1 (A-R4-M2): the host access checks turned on after the window attached apply from the next
+  // open: the check that reads the container later does not leave it for them.
+  it('does not leave a container that was current at the unknown attach when the host access checks are turned on later', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    h.settings.hostAccessChecksOff = ['acme/api'];
+    h.docker.findContainer.mockResolvedValue({ ...containerInfo(String(CONTAINER_VERSION)), labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
+    const read = h.service.windowStateInWorker.getMockImplementation()!;
+    h.service.windowStateInWorker.mockResolvedValue(undefined);
+    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    await h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    h.settings.hostAccessChecksOff = [];
+    h.service.windowStateInWorker.mockImplementation(read);
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    h.controller.onHeartbeat();
+    await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+  });
+
+  // Review round 4 of 11C1 (A-R4-M1): a Start while the open pipeline of the restored window runs reads and leaves nothing.
+  it('a Start during the open pipeline of the restored window neither leaves its container nor shows Reconnect', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const pipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.docker.containerState.mockResolvedValue('stopped');
+    h.docker.findContainer.mockResolvedValue(containerInfo('0'));
+    const opening = h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await run('start', { environmentId: ENV_ID });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const closes = h.connection.closeRemoteConnection.mock.calls.length;
+    const lost = h.statusBar.showConnectionLost.mock.calls.length;
+    h.docker.containerState.mockResolvedValue('running');
+    h.docker.findContainer.mockResolvedValue(containerInfo(String(CONTAINER_VERSION)));
+    pipeline.resolve(openResult(env));
+    await opening;
+    expect({ closes, lost }).toEqual({ closes: 0, lost: 0 });
+  });
+
+  // Review round 4 of 11C1 (A-R4-M1): also a running container of an older version, which the pipeline may replace.
+  it('a Start during the open pipeline of the restored window reads nothing, also when its container runs', async () => {
+    const env = environment();
+    await h.registry.add(env);
+    const pipeline = deferred<OpenResult>();
+    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.docker.findContainer.mockResolvedValue(containerInfo('0'));
+    const opening = h.controller.openAttachedWindow(env, CONTAINER, undefined);
+    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    const reads = h.service.windowStateInWorker.mock.calls.length;
+    await run('start', { environmentId: ENV_ID });
+    expect(h.service.windowStateInWorker.mock.calls.length).toBe(reads);
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    h.docker.findContainer.mockResolvedValue(containerInfo(String(CONTAINER_VERSION)));
+    pipeline.resolve(openResult(env));
+    await opening;
   });
 
   // Review round 3 of 11C1 (A-R3-M2): a container read as current when the window attached is not left by the check.
