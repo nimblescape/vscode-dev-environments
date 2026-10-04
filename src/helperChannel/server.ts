@@ -118,6 +118,11 @@ export interface OperationContext {
   /** Plan step 11A: true when the operation has no secret at all. */
   hasNoSecret(): boolean;
   /**
+   * Plan step 11E1 (review round 1 of PR #102, A-M1): every secret value that the operation ever held (also one that a
+   * later answer replaced), as the server masks them, for the output that an operation keeps of its own processes.
+   */
+  maskedValues(): readonly string[];
+  /**
    * Plan step 11A: a request to the extension (AskKind) that the operation waits for: resolves with the value of the
    * answer (its secrets join `secrets`); rejects with OperationError (the answer's failure, or `unsupported` when the
    * extension has no handler), or with an AbortError when the operation ends.
@@ -497,6 +502,7 @@ export class ChannelServer {
         return { ...run.secrets };
       },
       hasNoSecret: () => Object.keys(run.secrets).length === 0,
+      maskedValues: () => [...run.masked],
       ask: (kind, payload) => this.ask(run, kind, payload),
       progress: (step, detail) =>
         this.send(

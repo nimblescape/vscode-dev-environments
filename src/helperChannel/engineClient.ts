@@ -23,7 +23,7 @@ import { errorMessage } from '../core/errors';
 import { readableStderr } from '../core/loader/pipeLoader';
 import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
 import * as crypto from 'crypto';
-import { hasTagOrDigest, redact } from '../core/helperChannel/protocol';
+import { hasTagOrDigest, StreamRedactor } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
 import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
@@ -111,7 +111,13 @@ function texts(value: unknown): string[] {
  * operation holds (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName) and
  * the login of a pull; the port of an operation is built with its own secrets (review round 1 of plan step 11B1, A-R1-3).
  */
-export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack = engineHijack(), secretOf: (name: string) => string | undefined = () => undefined): DockerEngine {
+export function dockerEngine(
+  api: EngineApi = engineApi(),
+  hijack: EngineHijack = engineHijack(),
+  secretOf: (name: string) => string | undefined = () => undefined,
+  // Plan step 11E1 (review round 1 of PR #102, A-M1): every secret of the operation, masked in the output of an exec.
+  secrets: () => Iterable<string> = () => [],
+): DockerEngine {
   const fail = (answer: { status: number; body: string }): never => {
     throw new EngineError(engineErrorMessage({ ...answer, truncated: false }), answer.status);
   };
@@ -155,7 +161,7 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       }
       return found;
     },
-    exec: (container, command, options = {}) => execInContainer(api, hijack, secretOf, container, command, options),
+    exec: (container, command, options = {}) => execInContainer(api, hijack, secretOf, secrets, container, command, options),
     stop: async (container, timeoutSeconds, signal) => {
       const query = timeoutSeconds === undefined ? '' : `?t=${timeoutSeconds}`;
       const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/stop${query}`, signal });
@@ -458,28 +464,32 @@ export const MAX_EXEC_OUTPUT_CHARACTERS = 1024 * 1024;
 
 /**
  * The output of an exec by stream, decoded across frames, each bounded (review round 1 of plan step 11B1, A-R1-13,
- * A-R1-14). Plan step 11E (review round 2 of 11B1, A-R2-4): with the secret of its input, each stream keeps the length
- * of the secret more, and is masked before it is cut, so a cut cannot leave a part of the secret.
+ * A-R1-14). Plan step 11E1 (review round 2 of 11B1, A-R2-4; review round 1 of PR #102, A-H1, A-M1): masked as it comes,
+ * with every secret of the operation (`secrets`, the secret of the input among them), before anything of it is kept or
+ * handed to `onOutput`; the masker holds back a tail that could start a secret, so neither the cut nor a frame boundary
+ * leaves a part of one.
  */
-function execOutput(onOutput: EngineExecOptions['onOutput'], secret?: string) {
-  const streams = { stdout: { decoder: new StringDecoder('utf8'), text: '' }, stderr: { decoder: new StringDecoder('utf8'), text: '' } };
-  const kept = MAX_EXEC_OUTPUT_CHARACTERS + (secret?.length ?? 0);
-  const add = (name: 'stdout' | 'stderr', text: string) => {
-    if (text === '') return;
-    const stream = streams[name];
-    if (stream.text.length < kept) stream.text += text.slice(0, kept - stream.text.length);
-    onOutput?.(name, text);
+function execOutput(onOutput: EngineExecOptions['onOutput'], secrets: () => Iterable<string>) {
+  const stream = (name: 'stdout' | 'stderr') => {
+    const state = { decoder: new StringDecoder('utf8'), text: '', masker: undefined as unknown as StreamRedactor };
+    state.masker = new StreamRedactor(secrets, (masked) => {
+      if (state.text.length < MAX_EXEC_OUTPUT_CHARACTERS) state.text += masked.slice(0, MAX_EXEC_OUTPUT_CHARACTERS - state.text.length);
+      onOutput?.(name, masked);
+    });
+    return state;
   };
-  const final = (text: string) => (secret === undefined ? text : redact(text, secret).slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+  const streams = { stdout: stream('stdout'), stderr: stream('stderr') };
   return {
     frame: (kind: 1 | 2, data: Buffer) => {
-      const name = kind === 2 ? 'stderr' : 'stdout';
-      add(name, streams[name].decoder.write(data));
+      const state = streams[kind === 2 ? 'stderr' : 'stdout'];
+      state.masker.push(state.decoder.write(data));
     },
     result: () => {
-      add('stdout', streams.stdout.decoder.end());
-      add('stderr', streams.stderr.decoder.end());
-      return { stdout: final(streams.stdout.text), stderr: final(streams.stderr.text) };
+      for (const state of [streams.stdout, streams.stderr]) {
+        state.masker.push(state.decoder.end());
+        state.masker.flush();
+      }
+      return { stdout: streams.stdout.text, stderr: streams.stderr.text };
     },
   };
 }
@@ -496,6 +506,7 @@ async function execInContainer(
   api: EngineApi,
   hijack: EngineHijack,
   secretOf: (name: string) => string | undefined,
+  secrets: () => Iterable<string>,
   container: string,
   command: readonly string[],
   options: EngineExecOptions,
@@ -516,7 +527,8 @@ async function execInContainer(
           timedOut = true;
           ended.abort();
         }, options.timeoutMs);
-  const output = execOutput(options.onOutput, options.secretInputName !== undefined ? input : undefined);
+  const secretInput = options.secretInputName !== undefined ? input : undefined;
+  const output = execOutput(options.onOutput, () => (secretInput === undefined ? secrets() : [secretInput, ...secrets()]));
   try {
     const created = await api({
       method: 'POST',

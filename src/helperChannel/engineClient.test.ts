@@ -74,6 +74,8 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       /** The status of an exec start that the engine does not upgrade (review round 1 of 11B1, A-R1-10, B-R1-9). */
       refuse?: { status: number; json: unknown };
       secrets?: Record<string, string>;
+      /** Plan step 11E1: the values to mask, when not those of `secrets`. */
+      masked?: string[];
     } = {},
   ): Promise<{ engine: DockerEngine; calls: Call[] }> {
     folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-engine-'));
@@ -114,7 +116,8 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(socketPath, resolve));
     const secrets = more.secrets ?? {};
-    return { engine: dockerEngine(engineApi(socketPath), engineHijack(socketPath), (name) => secrets[name]), calls };
+    // Plan step 11E1: every secret of the operation is masked in the output of an exec (OperationContext.maskedValues).
+    return { engine: dockerEngine(engineApi(socketPath), engineHijack(socketPath), (name) => secrets[name], () => more.masked ?? Object.values(secrets)), calls };
   }
 
   it('reads a container with its state, labels, image and volumes; a missing one is undefined', async () => {
@@ -328,16 +331,14 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     const { engine, calls } = await serve(
       execAnswers(),
       (socket, input) => {
-        socket.end(frame(1, `in:${input.toString('utf8')}`));
+        // Changed (plan step 11E1, review round 1 of PR #102): the output of an exec masks every secret, so the engine
+        // answers whether the input was the secret (before: it echoed the input, and the test read the token in stdout).
+        socket.end(frame(1, `in:${input.toString('utf8') === 'ghp_value'}`));
       },
       { secrets: { [SECRET_TOKEN]: 'ghp_value' } },
     );
-    const seen: string[] = [];
-    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN, onOutput: (_stream, text) => seen.push(text) });
-    expect(seen.join('')).toBe('in:ghp_value');
-    // Changed expectation, plan step 11E (review round 2 of 11B1, A-R2-4): the kept output masks the secret of the input
-    // (before: 'in:ghp_value').
-    expect(result.stdout).toBe('in:***');
+    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN });
+    expect(result.stdout).toBe('in:true');
     expect(JSON.parse(calls[0].body)).toMatchObject({ AttachStdin: true });
     expect(JSON.stringify(calls)).not.toContain('ghp_value');
     // A secret that the operation does not hold is a failure, never an empty input.
@@ -387,6 +388,43 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     // Without a secret input, nothing is masked and the cut is as before.
     const plain = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, before), frame(1, `${secret}tail`)])));
     expect((await plain.engine.exec('c1', ['cat'])).stdout).toBe(`${before}${secret}`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+  });
+
+  it('review round 1 of PR #102 (A-H1): a repeated secret, the second one across the cut, leaves no part of itself', async () => {
+    const secret = 'ghp_' + 'R'.repeat(36);
+    // The second secret starts after the limit of the raw text, and its mask crosses the limit of the kept one.
+    const padding = 'p'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 5);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, `${secret}\n`), frame(1, padding), frame(1, `${secret}tail`)])), {
+      secrets: { [SECRET_TOKEN]: secret },
+    });
+    const seen: string[] = [];
+    const result = await engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    expect(result.stdout).toBe(`***\n${padding}***tail`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+    expect(result.stdout).not.toContain('ghp_');
+    // onOutput gets the masked output only, all of it.
+    expect(seen.join('')).toBe(`***\n${padding}***tail`);
+    // A secret repeated so often that the masked text is far shorter than the limit.
+    const many = await serve(execAnswers(), (socket) => socket.end(frame(1, secret.repeat(30_000))), { secrets: { [SECRET_TOKEN]: secret } });
+    expect((await many.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).stdout).toBe('***'.repeat(30_000));
+  });
+
+  it('review round 1 of PR #102 (A-M1): masks every secret of the operation, with and without a secret input, also across frames', async () => {
+    const registry = 'registry-password-' + 'Q'.repeat(20);
+    const token = 'ghp_' + 'T'.repeat(36);
+    const before = 'b'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 8);
+    const output = Buffer.concat([frame(1, before), frame(1, registry.slice(0, 5)), frame(1, `${registry.slice(5)} and ${token.slice(0, 10)}`), frame(1, token.slice(10)), frame(2, `${token}!`)]);
+    // Without a secret input: the secrets of the operation.
+    const plain = await serve(execAnswers(), (socket) => socket.end(output), { masked: [registry, token] });
+    const result = await plain.engine.exec('c1', ['env']);
+    expect(result.stdout).toBe(`${before}*** and ***`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+    expect(result.stderr).toBe('***!');
+    for (const text of [result.stdout, result.stderr]) {
+      expect(text).not.toContain('registry-pa');
+      expect(text).not.toContain('ghp_');
+    }
+    // With the token as the input, the registry password of the operation is masked too.
+    const withInput = await serve(execAnswers(), (socket) => socket.end(output), { secrets: { [SECRET_TOKEN]: token }, masked: [registry] });
+    expect((await withInput.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).stdout).toBe(`${before}*** and ***`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
   });
 
   it('ends the exec when onOutput throws, never the process (review round 2, A-R2-1)', async () => {

@@ -286,6 +286,25 @@ describe('requests of an operation to the extension, in the script (plan step 11
     expect(of(1).find((message) => message.t === 'log')).toMatchObject({ text: 'old *** new ***' });
   });
 
+  // Plan step 11E1 (review round 1 of PR #102, A-M1): the values that an operation masks in the output it keeps.
+  it('maskedValues gives every secret value the operation ever held, also one an answer replaced, as a copy', async () => {
+    let seen: { before: readonly string[]; after: readonly string[] } | undefined;
+    const { send } = setup({
+      asking: async (_params, context) => {
+        const before = context.maskedValues();
+        (before as string[]).push('not-a-secret');
+        await context.ask('secret', null);
+        seen = { before, after: context.maskedValues() };
+        return 'done';
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null, secrets: { token: 'oldtoken1' } });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null, secrets: { token: 'newtoken1', registry: 'reg-5678' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen?.after).toEqual(['oldtoken1', 'newtoken1', 'reg-5678']);
+  });
+
   // Review round 1 of plan step 11A (pre-existing gap): the value of a result is masked too.
   it('masks the secrets in the value of a result, and fails a result that cannot be sent', async () => {
     const { send, resultOf } = setup({

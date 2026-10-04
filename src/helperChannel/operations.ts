@@ -125,7 +125,8 @@ const ENGINE = engineApi();
 
 /** Plan step 11B1: the port of the engine for the flows that run in the worker (section 0 of the plan), per operation. */
 const HIJACK = engineHijack();
-const ENGINE_OF: EngineOfOperation = (context) => dockerEngine(ENGINE, HIJACK, (name) => context.secrets[name]);
+// Plan step 11E1 (review round 1 of PR #102, A-M1): the output of an exec masked with every secret of the operation.
+const ENGINE_OF: EngineOfOperation = (context) => dockerEngine(ENGINE, HIJACK, (name) => context.secrets[name], () => context.maskedValues());
 
 /** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
 const BATCH = batchDeps();
