@@ -184,3 +184,24 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
     return interval;
   }
 }
+
+/**
+ * Plan step 11E2 (review round 1 of PR #103, A-L1): at most `max` jobs of the analyzers that share this limit run at once
+ * (each in a thread of up to its memory limit); the others wait in order. The worker's operations share one, so
+ * concurrent operations cannot add up threads without a bound.
+ */
+export function analysisSlots(max: number): <J extends AnalysisJob>(run: () => Promise<AnalysisResult<J>>) => Promise<AnalysisResult<J>> {
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return async (run) => {
+    if (running >= max) await new Promise<void>((resolve) => waiting.push(resolve));
+    else running++;
+    try {
+      return await run();
+    } finally {
+      const next = waiting.shift();
+      if (next !== undefined) next();
+      else running--;
+    }
+  };
+}

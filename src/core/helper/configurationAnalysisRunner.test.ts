@@ -22,8 +22,9 @@ import {
   runAnalysisJob,
   transferableJob,
   type AnalysisJob,
+  type AnalysisResult,
 } from './configurationAnalysis';
-import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from './configurationAnalysisRunner';
+import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, analysisSlots, type AnalysisLimits } from './configurationAnalysisRunner';
 import type { ComposeAccessInput } from '../policy';
 
 const ROOT = path.join(__dirname, '..', '..', '..');
@@ -369,5 +370,46 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect(fs.readFileSync(path.join(ROOT, 'src', 'vscode', 'extension.ts'), 'utf8')).toContain(
       "new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger)",
     );
+  });
+});
+
+describe('analysisSlots (plan step 11E2, review round 1 of PR #103, A-L1)', () => {
+  it('runs at most `max` jobs at once, the others in order, and frees a slot also when a job fails', async () => {
+    const slots = analysisSlots(2);
+    const started: string[] = [];
+    const finish = new Map<string, (fail?: boolean) => void>();
+    const job = (name: string) =>
+      slots(
+        () =>
+          new Promise<AnalysisResult<AnalysisJob>>((resolve, reject) => {
+            started.push(name);
+            finish.set(name, (fail) => (fail ? reject(new Error(name)) : resolve({ name } as never)));
+          }),
+      );
+    const a = job('a');
+    const b = job('b');
+    const c = job('c');
+    const d = job('d');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b']);
+    finish.get('a')!(true);
+    await expect(a).rejects.toThrow('a');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b', 'c']);
+    finish.get('b')!();
+    expect(await b).toEqual({ name: 'b' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['a', 'b', 'c', 'd']);
+    finish.get('c')!();
+    finish.get('d')!();
+    await Promise.all([c, d]);
+    // Both slots are free again: two new jobs start at once.
+    const e = job('e');
+    const f = job('f');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started.slice(-2)).toEqual(['e', 'f']);
+    finish.get('e')!();
+    finish.get('f')!();
+    await Promise.all([e, f]);
   });
 });
