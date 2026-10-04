@@ -11,6 +11,8 @@ import { silentLogger, type Logger } from '../ports';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineImage } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { EngineDocker } from './engineDocker';
+import { engineHijack } from '../../helperChannel/engineApi';
+import { dockerEngine } from '../../helperChannel/engineClient';
 
 const ENV = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const NAME = 'devenv-acme-api-brave-noether';
@@ -314,6 +316,14 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     await docker.pullImage(`node@sha256:${'a'.repeat(64)}`, { onOutput: () => {} });
     expect(pulls.slice(3).map((pull) => (pull as unknown[])[0])).toEqual(['node:latest', 'ghcr.io/o/i:latest', `node@sha256:${'a'.repeat(64)}`]);
     pulls.splice(3);
+    // Review round 3 of 11B3a (missing test 2 of reviewer A): an empty tag stays one, and the port refuses it.
+    const requests: string[] = [];
+    const refusing = dockerEngine(async (request) => {
+      requests.push(request.path);
+      return { status: 200, body: '', truncated: false };
+    }, engineHijack('/nonexistent/docker.sock'));
+    await expect(new EngineDocker(refusing).pullImage('node:', { onOutput: () => {} })).rejects.toThrow('The pull of node: needs a tag or a digest.');
+    expect(requests).toEqual([]);
     // A password that is not the secret of the operation is refused before anything is sent.
     await expect(docker.pullImage('ghcr.io/o/i:1', { credentials: { registry: 'ghcr.io', username: 'octo', password: 'other' } })).rejects.toThrow('registry secret of the operation');
     expect(pulls).toHaveLength(3);

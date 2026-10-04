@@ -550,7 +550,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
     it('labels an image by a commit of a created container with the image\'s configuration and the labels, and removes the container', async () => {
       const { engine, calls } = await serve((call) => {
         if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: { Cmd: ['node'], Labels: { keep: 'x' }, User: 'dev' } } };
-        if (call.url === '/containers/create') return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'tmp' } };
         if (call.url.startsWith('/commit')) return { status: 201, json: { Id: 'sha256:new' } };
         return { status: 204 };
       });
@@ -565,11 +565,11 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       cancelled.abort();
       const before = calls.length;
       await expect(engine.labelImage('img', {}, cancelled.signal)).rejects.toMatchObject({ name: 'AbortError' });
-      expect(calls.slice(before).filter((call) => call.url === '/containers/create')).toEqual([]);
+      expect(calls.slice(before).filter((call) => call.url.startsWith('/containers/create'))).toEqual([]);
       // A commit that fails removes the container too.
       const failing = await serve((call) => {
         if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: {} } };
-        if (call.url === '/containers/create') return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'tmp' } };
         if (call.url.startsWith('/commit')) return { status: 500, json: { message: 'no space left on device' } };
         return { status: 204 };
       });
@@ -577,6 +577,33 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       // Review round 1 of 11B3a (A-R1-1): the throwaway container goes with its anonymous volumes (`v=true`).
       expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
       expect(decodeURIComponent(failing.calls.find((call) => call.url.startsWith('/commit'))!.url)).toContain('repo=img&tag=latest');
+    });
+
+    it('names the container of the commit, and removes it with a time limit of its own (review round 3 of 11B3a, A-R3-1, A-R3-3)', async () => {
+      const requests: { method: string; path: string; signal?: AbortSignal }[] = [];
+      let createdId: unknown = 'tmp';
+      const fakeApi: EngineApi = async (request) => {
+        requests.push({ method: request.method, path: request.path, signal: request.signal });
+        if (request.path.startsWith('/images/')) return { status: 200, body: JSON.stringify({ Id: 'sha256:old', Config: {} }), truncated: false };
+        if (request.path.startsWith('/containers/create')) return { status: 201, body: JSON.stringify({ Id: createdId }), truncated: false };
+        if (request.path.startsWith('/commit')) return { status: 201, body: JSON.stringify({ Id: 'sha256:new' }), truncated: false };
+        return { status: 204, body: '', truncated: false };
+      };
+      const engine = dockerEngine(fakeApi, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
+      expect(await engine.labelImage('img:1', { a: 'b' })).toBe('sha256:new');
+      const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+      expect(create.path).toMatch(/^\/containers\/create\?name=devenv-label-[0-9a-f]{12}$/);
+      // The create has a time limit, never the cancel signal of the operation.
+      expect(create.signal).toBeDefined();
+      const removal = requests.at(-1)!;
+      expect(removal).toMatchObject({ method: 'DELETE', path: '/containers/tmp?force=true&v=true' });
+      expect(removal.signal?.aborted).toBe(false);
+      // An answer without an ID: the container is removed by its name.
+      createdId = '';
+      requests.length = 0;
+      await expect(engine.labelImage('img:1', {})).rejects.toThrow('invalid value');
+      const name = requests.find((request) => request.path.startsWith('/containers/create'))!.path.split('name=')[1];
+      expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
     });
 
     it('runs a container to its end: create, start, wait, the log only on a failure, the removal always', async () => {

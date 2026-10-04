@@ -19,9 +19,10 @@ import {
   type EngineRun,
 } from '../core/worker/dockerEngine';
 import { abortError } from '../core/ports';
+import * as crypto from 'crypto';
 import { hasTagOrDigest } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
-import { engineApi, engineErrorMessage, engineHijack, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
+import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
 /**
  * The container of an inspect answer, read as the pipeline reads `docker inspect` (toContainerInfo of dockerObjects.ts,
@@ -237,10 +238,26 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
       // container's command into an empty one, A-R1-5); the images of an environment have one, or Dev Containers sets it.
       // On the classic image store the commit is a child of the previous image, which is then kept (A-R1-6).
       // Review round 2 of 11B3a (A-R2-3): no label of ours on it; the commit would copy it into the image.
-      const created = await api({ method: 'POST', path: '/containers/create', json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} } });
+      // Review round 3 of 11B3a (A-R3-1, A-R3-3): a name of its own (the commit does not copy it), by which it is removed
+      // also when its create did not answer within its time limit.
+      const name = `devenv-label-${crypto.randomBytes(6).toString('hex')}`;
+      const removeByName = () =>
+        api({ method: 'DELETE', path: `/containers/${name}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      let created: EngineAnswer;
+      try {
+        created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
+      } catch (error) {
+        if (!limit.aborted) throw error;
+        await removeByName();
+        throw new EngineError(`The engine did not answer the create of a container for the labels of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+      }
       if (created.status !== 201) fail(created);
       const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
-      if (typeof container !== 'string' || container === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      if (typeof container !== 'string' || container === '') {
+        await removeByName();
+        throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      }
       try {
         const [repository, tag] = splitTag(image);
         // The body is the configuration of the new image: the one of the image with the labels, not the container's.
@@ -266,7 +283,7 @@ export function dockerEngine(api: EngineApi = engineApi(), hijack: EngineHijack 
 
 /**
  * Review round 2 of 11B3a (A-R2-2, A-R2-4): the time limit of the removal of a container of labelImage or runContainer,
- * and of the read of the log of a failed run.
+ * and of the read of the log of a failed run; review round 3 (A-R3-3): also of the create of labelImage.
  */
 export const RUN_CLEANUP_TIMEOUT_MS = 60_000;
 
