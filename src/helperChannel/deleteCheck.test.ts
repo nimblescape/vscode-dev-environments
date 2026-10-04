@@ -110,7 +110,8 @@ describe('deleteCheck in the worker (plan step 11C2b)', () => {
     expect(recorded?.args[0]).toBe(ID);
     expect(recorded?.args[1]).toMatchObject({ branch: 'main', uncommittedFiles: 2, unpushedCommits: 1 });
     const confirm = asks.find((ask) => ask.call === 'confirmDelete');
-    expect(confirm?.args).toEqual(['Acme/API', expect.objectContaining({ changes: '2 uncommitted · 1 unpushed', otherWindow: true, repositoryData: [] })]);
+    // Review round 1 of 11C2b (A-R1-M2): changed, the counts.
+    expect(confirm?.args).toEqual(['Acme/API', expect.objectContaining({ changes: { uncommittedFiles: 2, unpushedCommits: 1, stashes: 0 }, otherWindow: true, repositoryData: [] })]);
     // Every request is one that the check of Delete may send.
     expect(new Set(calls(asks))).toEqual(new Set(['record get', 'local account', 'record recordGitSummary', 'question confirmDelete']));
   });

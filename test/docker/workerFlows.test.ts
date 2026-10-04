@@ -317,11 +317,11 @@ describe('the flows through a real worker (plan step 11B1)', () => {
       state: { ...base.state, account: async (interactive: boolean) => (requests.push(`account ${interactive}`), { id: '42', login: 'octo' }) },
       questions: {
         ...base.questions,
-        confirmDelete: async (repository: string, confirmation: { changes: string; otherWindow: boolean }) => (
-          requests.push(`confirmDelete ${repository} ${confirmation.changes} ${confirmation.otherWindow}`), 'delete'
+        confirmDelete: async (repository: string, confirmation: { changes?: unknown; otherWindow: boolean }) => (
+          requests.push(`confirmDelete ${repository} ${JSON.stringify(confirmation.changes ?? null)} ${confirmation.otherWindow}`), 'delete'
         ),
       },
-    } as HostSide;
+    } as unknown as HostSide;
     const target = await targets.current();
     const params = { environmentId: id, dockerHost: target.host, owner: { windowId: 'window-1', pid: process.pid }, repository: 'devenv-test/worker-check', otherWindow: false };
     const value = parseDeleteCheckValue(
@@ -330,7 +330,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     expect(value).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
     // Nothing was removed by the check.
     expect(cli.lines(['volume', 'ls', '--filter', `name=^${name}$`, '--format', '{{.Name}}'])).toEqual([name]);
-    expect(requests).toContain('confirmDelete devenv-test/worker-check  false');
+    expect(requests).toContain('confirmDelete devenv-test/worker-check null false');
     // Only the record, the account and the confirmation were asked for (any other call of this computer is refused).
     expect(requests.filter((request) => !/^(get |account |confirmDelete )/.test(request))).toEqual([]);
   }, 240_000);

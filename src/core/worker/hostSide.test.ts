@@ -496,7 +496,8 @@ async function parseBusyMarkAnswerOf(value: unknown): Promise<unknown> {
 
 // Plan step 11C2b: the questions of Delete and the Git state, checked before this computer is touched.
 describe('the requests of the check of Delete (plan step 11C2b)', () => {
-  const CONFIRMATION = { changes: '2 uncommitted', recordedAt: '2026-10-04T10:00:00.000Z', lastSeenInUse: '2026-10-04T09:00:00.000Z', repositoryData: ['data/db'], otherWindow: false };
+  // Review round 1 of 11C2b (A-R1-M2): changed, the changes are counts.
+  const CONFIRMATION = { changes: { uncommittedFiles: 2, unpushedCommits: 0 }, recordedAt: '2026-10-04T10:00:00.000Z', lastSeenInUse: '2026-10-04T09:00:00.000Z', repositoryData: ['data/db'], otherWindow: false };
   const SUMMARY = { branch: 'main', uncommittedFiles: 2, unpushedCommits: 0, stashes: 0, recordedAt: '2026-10-04T10:00:00.000Z' };
 
   it('asks the questions of Delete with their facts, and answers with the answer of the user', async () => {
@@ -525,7 +526,11 @@ describe('the requests of the check of Delete (plan step 11C2b)', () => {
   it('refuses facts and Git states that do not fit, before this computer is touched', async () => {
     const { handler, signal, calls } = wired();
     for (const [kind, call, args] of [
-      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: 'x'.repeat(201) }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: '0 uncommitted, all pushed' }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: { uncommittedFiles: -1, unpushedCommits: 0 } }]],
+      ['question', 'confirmDelete', ['r', { ...CONFIRMATION, changes: { uncommittedFiles: 1.5, unpushedCommits: 0 } }]],
+      ['question', 'confirmDelete', ['a\nb', CONFIRMATION]],
+      ['question', 'confirmDelete', ['', CONFIRMATION]],
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, otherWindow: 'no' }]],
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, recordedAt: 'a\nb' }]],
       ['question', 'confirmDelete', ['r', { ...CONFIRMATION, repositoryData: [''] }]],
@@ -551,5 +556,21 @@ describe('the requests of the check of Delete (plan step 11C2b)', () => {
       'question deleteAdditionalVolumes',
       'question deleteServiceData',
     ]);
+  });
+});
+
+// Review round 1 of 11C2b (A-R1-M1, A-R1-M2): the questions name the repository of the operation, and each answer of the
+// user is observed by the extension.
+describe('the questions of a flow name its repository, and their answers are observed (review round 1 of 11C2b)', () => {
+  it('refuses a confirmation of another repository than the one of the operation, and observes each answer', async () => {
+    const { host, calls } = fakeHost({ confirmDelete: 'delete' });
+    const observed: unknown[] = [];
+    const handler = hostSideHandler(host, silentLogger, ALL, { environmentId: 'e1', repository: 'acme/api', onAnswer: (call, args, value) => observed.push([call, args, value]) });
+    const signal = new AbortController().signal;
+    const confirmation = { repositoryData: [], otherWindow: false };
+    await expect(handler('question', { call: 'confirmDelete', args: ['acme/other', confirmation] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    expect(calls).toEqual([]);
+    await handler('question', { call: 'confirmDelete', args: ['acme/api', confirmation] }, signal);
+    expect(observed).toEqual([['confirmDelete', ['acme/api', confirmation], 'delete']]);
   });
 });

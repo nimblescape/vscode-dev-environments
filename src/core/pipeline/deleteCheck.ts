@@ -7,14 +7,17 @@
 // of the services that Delete removes with the repository, and the volumes that Delete may remove; the questions go to the
 // user as their requests (PipelineUi), with the facts, never with a text of the worker (the extension words them, in the
 // locale of the user). The answer is the decision of the user. Moved from the controller (Delete); pure over its deps.
-import { formatChanges, lastSeenInUse } from '../messages';
+import { lastSeenInUse } from '../messages';
 import { repositoryServiceDataFolders } from './pipelineRules';
 import type { Environment, GitSummary } from '../types';
 
 /** The confirmation of Delete (PipelineUi.confirmDelete): the facts that the extension words. */
 export interface DeleteConfirmation {
-  /** The changes in the repository (formatChanges), empty when there are none or none are known. */
-  changes: string;
+  /**
+   * The changes in the repository, as counts (review round 1 of 11C2b, A-R1-M2: the extension words them, formatChanges);
+   * absent when none are known.
+   */
+  changes?: { uncommittedFiles: number; unpushedCommits: number; stashes?: number };
   /** When the Git state that the confirmation names was recorded; absent when none was. */
   recordedAt?: string;
   /** The last time the environment was seen in use (lastSeenInUse); absent when it is not known. */
@@ -60,7 +63,7 @@ export async function deleteCheck(deps: DeleteCheckDeps, environment: Environmen
   // Review round 9 (D9-2), round 11 (G3, G4): the data of services in folders of the repository go with the volume.
   const repositoryData = [...new Set([...repositoryServiceDataFolders(used), ...(await deps.repositoryServiceData().catch(() => []))])];
   const answer = await deps.ui.confirmDelete(repository, {
-    changes: summary ? formatChanges(summary) : '',
+    ...(summary ? { changes: { uncommittedFiles: summary.uncommittedFiles, unpushedCommits: summary.unpushedCommits, ...(summary.stashes !== undefined ? { stashes: summary.stashes } : {}) } } : {}),
     ...(named !== undefined ? { recordedAt: named.recordedAt } : {}),
     ...(seen !== undefined ? { lastSeenInUse: seen } : {}),
     repositoryData,

@@ -526,7 +526,17 @@ export interface EnvironmentServiceDeps {
    * Plan step 11C1, review round 1 (A-R1-1): `passive`, a read in the background: the worker is made ready as for the
    * refresh (the helper image only checked, the wait after a failed open kept).
    */
-  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number; passive?: boolean }) => Promise<unknown>;
+  flow: (
+    op: string,
+    params: unknown,
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      passive?: boolean;
+      // Review round 1 of 11C2b (A-R1-M1): each answer of the user to a question of the flow.
+      onAnswer?: (call: string, args: unknown[], value: unknown) => void;
+    },
+  ) => Promise<unknown>;
 }
 
 export interface RepositoryTarget {
@@ -5746,9 +5756,16 @@ export class EnvironmentService {
    * lock held elsewhere is environmentLockBusy, no worker (or no helper image for it) is environmentLockUnavailable, and
    * nothing runs another way. Any other failure of the flow is thrown as it is.
    */
-  private async workerFlow(env: Environment, op: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+  private async workerFlow(
+    env: Environment,
+    op: string,
+    params: unknown,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    onAnswer?: (call: string, args: unknown[], value: unknown) => void,
+  ): Promise<unknown> {
     try {
-      return await this.deps.flow(op, params, { signal, timeoutMs });
+      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}) });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
@@ -6033,9 +6050,31 @@ export class EnvironmentService {
         otherWindow: options.otherWindow,
       });
       if (params === undefined) throw new Error(`The check of the Delete of ${environment.repository} cannot be sent to the worker.`);
-      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal));
+      // Review round 1 of 11C2b (A-R1-M1): the decision of the worker counts only as far as the user gave it here.
+      const given = { confirm: undefined as unknown, volumes: [] as string[], volumesAnswer: undefined as unknown, serviceData: [] as string[], picked: [] as string[] };
+      const onAnswer = (call: string, args: unknown[], value: unknown) => {
+        if (call === 'confirmDelete') given.confirm = value;
+        if (call === 'deleteAdditionalVolumes') {
+          given.volumes = Array.isArray(args[0]) ? (args[0] as string[]) : [];
+          given.volumesAnswer = value;
+        }
+        if (call === 'deleteServiceData') {
+          given.serviceData = Array.isArray(args[0]) ? (args[0] as string[]) : [];
+          given.picked = Array.isArray(value) ? (value as string[]) : [];
+        }
+      };
+      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer));
       if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with an invalid value.`);
       if ('refused' in value) throw refusalError(value.refused);
+      if (value.decision === 'cancel') return value;
+      if (value.decision !== given.confirm) {
+        throw new Error(`The worker answered the check of the Delete of ${environment.repository} with a decision that the user did not give.`);
+      }
+      if (value.decision === 'delete') {
+        const allowed = new Set([...(given.volumesAnswer === 'remove' ? given.volumes : []), ...given.picked.filter((name) => given.serviceData.includes(name))]);
+        const odd = value.additionalVolumesToRemove.filter((name) => !allowed.has(name));
+        if (odd.length > 0) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with volumes that the user did not choose: ${odd.join(', ')}.`);
+      }
       return value;
     } catch (error) {
       throw this.toUserError(error, options.signal);

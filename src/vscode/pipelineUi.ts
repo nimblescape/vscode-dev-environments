@@ -4,7 +4,7 @@
 
 // Decisions and messages of the open pipeline (PipelineUi) in VS Code (concept 6.5, 7.12, section 9).
 import * as vscode from 'vscode';
-import { Actions, Messages, listSome, recordedStateNote } from '../core/messages';
+import { Actions, Messages, formatChanges, listSome, recordedStateNote } from '../core/messages';
 import type { DeleteConfirmation } from '../core/pipeline/deleteCheck';
 import { ControllerTexts } from './controllerTexts';
 import { systemClock, type Clock, type Logger, type PipelineUi } from '../core/ports';
@@ -60,9 +60,11 @@ export class VsCodePipelineUi implements PipelineUi {
     const stateNote = recordedStateNote(confirmation.recordedAt !== undefined ? { recordedAt: confirmation.recordedAt } : undefined, confirmation.lastSeenInUse);
     const repositoryDataText = confirmation.repositoryData.length > 0 ? ` ${Messages.deleteRepositoryServiceData(listSome(confirmation.repositoryData))}` : '';
     const otherWindow = confirmation.otherWindow ? ` ${ControllerTexts.otherWindowClosesConnection(repository)}` : '';
-    if (confirmation.changes !== '') {
+    // Review round 1 of 11C2b (A-R1-M2): the counts, worded here.
+    const changes = confirmation.changes ? formatChanges(confirmation.changes) : '';
+    if (changes !== '') {
       const choice = await vscode.window.showWarningMessage(
-        `${Messages.deleteUnsaved(repository, confirmation.changes)}${stateNote}${repositoryDataText}${otherWindow}`,
+        `${Messages.deleteUnsaved(repository, changes)}${stateNote}${repositoryDataText}${otherWindow}`,
         { modal: true },
         Actions.openEnvironment,
         Actions.deleteAnyway,

@@ -37,7 +37,8 @@ describe('the check of Delete and its questions (plan step 11C2b)', () => {
     const { all, asked } = deps({ environment: async () => withServices, repositoryServiceData: async () => ['/workspaces/api/data/db', 'data/cache'] });
     expect(await deleteCheck(all, ENVIRONMENT, 'Acme/API', true)).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
     expect(asked.confirmDelete).toHaveBeenCalledWith('Acme/API', {
-      changes: '2 uncommitted · 1 unpushed',
+      // Review round 1 of 11C2b (A-R1-M2): changed, the counts (the extension words them).
+      changes: { uncommittedFiles: 2, unpushedCommits: 1 },
       recordedAt: SUMMARY.recordedAt,
       lastSeenInUse: ENVIRONMENT.lastUsedAt,
       repositoryData: expect.arrayContaining(['data/cache']),
@@ -50,11 +51,12 @@ describe('the check of Delete and its questions (plan step 11C2b)', () => {
     const recorded = { ...ENVIRONMENT, gitSummary: SUMMARY } as Environment;
     const { all, asked } = deps({ summary: async () => undefined, environment: async () => recorded, repositoryServiceData: async () => Promise.reject(new Error('no engine')) });
     await deleteCheck(all, ENVIRONMENT, 'acme/api', false);
-    expect(asked.confirmDelete).toHaveBeenCalledWith('acme/api', { changes: '', recordedAt: SUMMARY.recordedAt, lastSeenInUse: ENVIRONMENT.lastUsedAt, repositoryData: [], otherWindow: false });
+    // Review round 1 of 11C2b (A-R1-M2): changed, no changes are absent (before: an empty text).
+    expect(asked.confirmDelete).toHaveBeenCalledWith('acme/api', { recordedAt: SUMMARY.recordedAt, lastSeenInUse: ENVIRONMENT.lastUsedAt, repositoryData: [], otherWindow: false });
     // Nothing recorded and no time of use: only the plain facts.
     const bare = deps({ summary: async () => undefined, environment: async () => ({ id: 'e1', repository: 'acme/api' }) as Environment });
     await deleteCheck(bare.all, ENVIRONMENT, 'acme/api', false);
-    expect(bare.asked.confirmDelete).toHaveBeenCalledWith('acme/api', { changes: '', repositoryData: [], otherWindow: false });
+    expect(bare.asked.confirmDelete).toHaveBeenCalledWith('acme/api', { repositoryData: [], otherWindow: false });
   });
 
   it('Open environment and a dismissed confirmation ask nothing more', async () => {

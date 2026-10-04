@@ -41,8 +41,10 @@ export function hostSideHandler(
   host: HostSide,
   logger: Logger,
   allowed: readonly HostCall[],
-  // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS).
-  scope: { environmentId?: string } = {},
+  // Plan step 11C2a: the environment of the operation, for the requests that change one (SCOPED_REQUESTS). Review round 1
+  // of 11C2b (A-R1-M1, A-R1-M2): the name of the repository that the questions must name, and the observer of the answers
+  // of the user (the extension checks the decision of the flow against them).
+  scope: { environmentId?: string; repository?: string; onAnswer?: (call: string, args: unknown[], value: unknown) => void } = {},
 ): NonNullable<OperationOptions['onAsk']> {
   const permitted = new Set<string>(allowed);
   return async (kind, payload, signal) => {
@@ -64,7 +66,13 @@ export function hostSideHandler(
     }
     if (signal.aborted) throw new HelperOperationError('cancelled', 'The operation ended.', false);
     try {
-      return await answer(host, request.kind, request.call, request.args);
+      // Review round 1 of 11C2b (A-R1-M2): a question names the repository of the operation, never a text of the worker.
+      if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
+        throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
+      }
+      const answered = await answer(host, request.kind, request.call, request.args);
+      if (request.kind === 'question') scope.onAnswer?.(request.call, request.args, answered.value);
+      return answered;
     } catch (error) {
       if (error instanceof HelperOperationError) throw error;
       logger.warn(`The request ${request.kind} ${request.call} of the worker failed: ${errorMessage(error)}`);
@@ -72,6 +80,9 @@ export function hostSideHandler(
     }
   };
 }
+
+/** Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. */
+const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
 
 /** The most names of a question of Delete, and the longest text of its facts. */
 const MAX_QUESTION_NAMES = 1000;
@@ -96,11 +107,20 @@ function deleteConfirmation(value: unknown): DeleteConfirmation {
   const invalid = () => new HelperOperationError('invalid', 'The confirmation of Delete is invalid.', false);
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
   const { changes, recordedAt, lastSeenInUse, repositoryData, otherWindow } = value as Record<string, unknown>;
-  if (!plainText(changes, 200) || typeof otherWindow !== 'boolean') throw invalid();
+  if (typeof otherWindow !== 'boolean') throw invalid();
+  // Review round 1 of 11C2b (A-R1-M2): counts, never a text.
+  const count = (n: unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+  let counts: DeleteConfirmation['changes'];
+  if (changes !== undefined) {
+    if (typeof changes !== 'object' || changes === null || Array.isArray(changes)) throw invalid();
+    const { uncommittedFiles, unpushedCommits, stashes } = changes as Record<string, unknown>;
+    if (!count(uncommittedFiles) || !count(unpushedCommits) || (stashes !== undefined && !count(stashes))) throw invalid();
+    counts = { uncommittedFiles: uncommittedFiles as number, unpushedCommits: unpushedCommits as number, ...(stashes !== undefined ? { stashes: stashes as number } : {}) };
+  }
   for (const time of [recordedAt, lastSeenInUse]) if (time !== undefined && !plainText(time, 64)) throw invalid();
   if (!Array.isArray(repositoryData) || repositoryData.length > MAX_QUESTION_NAMES || !repositoryData.every((folder) => plainText(folder) && folder !== '')) throw invalid();
   return {
-    changes,
+    ...(counts !== undefined ? { changes: counts } : {}),
     ...(recordedAt !== undefined ? { recordedAt: recordedAt as string } : {}),
     ...(lastSeenInUse !== undefined ? { lastSeenInUse: lastSeenInUse as string } : {}),
     repositoryData: [...(repositoryData as string[])],
@@ -158,8 +178,11 @@ async function question(host: HostSide, call: string, args: unknown[]): Promise<
       return ui.recreateContainer(repository, { message: value.message, detail: value.detail });
     }
     // Plan step 11C2b: the questions of Delete, with their facts checked.
-    case 'confirmDelete':
-      return (await ui.confirmDelete(strings(args, 1)[0], deleteConfirmation(args[1]))) ?? null;
+    case 'confirmDelete': {
+      const [repository] = strings(args, 1);
+      if (!plainText(repository, 256) || repository === '') throw new HelperOperationError('invalid', 'The repository of the question is invalid.', false);
+      return (await ui.confirmDelete(repository, deleteConfirmation(args[1]))) ?? null;
+    }
     case 'deleteAdditionalVolumes':
       return (await ui.deleteAdditionalVolumes(volumeNames(args[0]))) ?? null;
     case 'deleteServiceData': {
@@ -270,7 +293,12 @@ async function record(host: HostSide, call: string, args: unknown[]): Promise<un
     case 'recordGitSummary': {
       const [environmentId] = strings(args, 1);
       if (!isGitSummary(args[1])) throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
-      await records.recordGitSummary(environmentId, args[1]);
+      // Review round 1 of 11C2b (A-R1-L2): its five fields only, a bounded branch and a valid time.
+      const { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt } = args[1];
+      if ((branch !== null && (branch.length > 255 || !plainText(branch, 255))) || !Number.isFinite(Date.parse(recordedAt)) || recordedAt.length > 64) {
+        throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
+      }
+      await records.recordGitSummary(environmentId, { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt });
       return null;
     }
     default:
