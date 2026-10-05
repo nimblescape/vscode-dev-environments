@@ -15,7 +15,8 @@ import { hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, 
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
-import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand } from '../remoteMonitor/protocol';
+import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand, heartbeatCommand } from '../remoteMonitor/protocol';
+import { stopAfterSeconds } from '../session/sessionRules';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
@@ -392,10 +393,92 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     const monitor = workerSessionMonitor(engine, undefined, silentLogger);
     await expect(monitor.forget!(TARGET, ID)).rejects.toThrow('names no computer');
     // Plan step 11D1: changed, the ensure comes with 11D2, the first heartbeat of the open with the open (11E); the
-    // heartbeats of a window are the operation `heartbeat` (before: both named 11D).
-    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11D2');
-    await expect(monitor.heartbeat(TARGET, ID, false, 1)).rejects.toThrow('before plan step 11E');
+    // heartbeats of a window are the operation `heartbeat` (before: both named 11D). Plan step 11E4e: changed again, the
+    // ensure fails closed without the ensure of its operation (until 11E6 gives it), and the first heartbeat is not sent
+    // without the computer (before: both threw "before plan step 11D2" and "before plan step 11E").
+    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
+    expect(await monitor.heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'The operation names no computer for the Session Monitor.' });
     expect(execs).toEqual([]);
+  });
+
+  describe("the open's Session Monitor in the worker (plan step 11E4e)", () => {
+    /** The ID of the computer of the operation, as computer.id makes it. */
+    const COMPUTER = 'c'.repeat(32);
+    it("the first heartbeat of the open: this computer's record with the time limit, by the command of the monitor script", async () => {
+      const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      const monitor = workerSessionMonitor(engine, COMPUTER, silentLogger, { limitSeconds: () => 900 });
+      expect(await monitor.heartbeat(TARGET, ID, true, 7)).toEqual({ ok: true });
+      expect(execs).toEqual([
+        { container: REMOTE_MONITOR_CONTAINER, command: heartbeatCommand({ source: COMPUTER, limitSeconds: 900, environments: [{ id: ID, keepRunning: true, seq: 7 }] }), timeoutMs: MONITOR_EXEC_TIMEOUT_MS },
+      ]);
+    });
+
+    it('a computer ID that the monitor would refuse is not sent (review round 1 of PR #108, A-L1); the limit is clamped', async () => {
+      const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      for (const source of ['', 'a b', '../x', 'x'.repeat(200)]) {
+        expect(await workerSessionMonitor(engine, source, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1), source).toEqual({
+          ok: false,
+          detail: 'The computer of the operation has no valid ID for the Session Monitor.',
+        });
+      }
+      expect(execs).toEqual([]);
+      // The time limit of odd settings is the clamped one that the window's heartbeats send too.
+      for (const minutes of [Number.NaN, -5, 1e9]) {
+        const limit = stopAfterSeconds(minutes);
+        expect(Number.isInteger(limit) && limit > 0, String(minutes)).toBe(true);
+      }
+    });
+
+    it('a failed heartbeat is answered as not sent, with its cause; without the time limit it is not sent', async () => {
+      const failing = engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'records locked', timedOut: false }));
+      expect(await workerSessionMonitor(failing.engine, COMPUTER, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'records locked' });
+      const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      expect(await workerSessionMonitor(engine, COMPUTER, silentLogger).heartbeat(TARGET, ID, false, 1)).toEqual({
+        ok: false,
+        detail: 'The operation has no settings for the time limit of the heartbeat.',
+      });
+      expect(execs).toEqual([]);
+    });
+
+    it("the ensure is the operation's, with the signal of the run; its failure refuses (it rejects with the cause)", async () => {
+      const { engine } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      const signals: (AbortSignal | undefined)[] = [];
+      const signal = new AbortController().signal;
+      await workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async (s) => void signals.push(s) }).ensure(TARGET, 'ignored-tag', signal, 'sha256:ignored');
+      expect(signals).toEqual([signal]);
+      const failing = workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async () => Promise.reject(new Error('no space left')) });
+      await expect(failing.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('no space left');
+    });
+
+    it('the deps of the pipeline: the ensure of the operation, and the time limit of its settings', async () => {
+      const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      const ensured: unknown[] = [];
+      const deps = (overrides: Partial<WorkerServicesDeps>) =>
+        workerServiceDeps({
+          host: {} as HostSide,
+          engine,
+          secretOf: () => undefined,
+          logger: silentLogger,
+          ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
+          dockerHost: '',
+          owner: { windowId: 'w', pid: 1 },
+          environmentLock: async () => Promise.reject(new Error('no lock in this test')),
+          ...overrides,
+        });
+      const all = deps({ monitorSource: COMPUTER, settings: { stopAfterMinutes: 30 } as never, monitorEnsure: async (s) => void ensured.push(s) });
+      await all.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined);
+      // Review round 1 of PR #108: the signal of the run goes to the ensure of the operation.
+      const run = new AbortController().signal;
+      await all.sessionMonitor!.ensure(TARGET, 'tag', run, undefined);
+      expect(ensured).toEqual([undefined, run]);
+      expect(await all.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toEqual({ ok: true });
+      expect(execs.map((exec) => exec.command)).toEqual([heartbeatCommand({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]);
+      // Without them, the ensure fails closed and no heartbeat is sent.
+      const bare = deps({});
+      await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
+      expect(await bare.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toMatchObject({ ok: false });
+      expect(execs).toHaveLength(1);
+    });
   });
 
   it('the busy marks and the reopen record of the environment go to the extension as their requests', async () => {

@@ -25,7 +25,9 @@ import type { LifecycleMemory } from '../pipeline/lifecycleMemory';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
-import { forgetRecord } from './monitorFlow';
+import { forgetRecord, sendHeartbeat } from './monitorFlow';
+import { isSourceId } from '../remoteMonitor/protocol';
+import { stopAfterSeconds } from '../session/sessionRules';
 import { EngineDocker } from './engineDocker';
 import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
@@ -133,16 +135,31 @@ export function hostOpenRecords(host: HostSide): OpenRecords {
  * Plan step 11C2a (decision of 2026-10-04: Delete's `forget` is the worker's): the Session Monitor of the worker's engine,
  * as Delete uses it: `forget` removes the heartbeat record of `source` (the computer that sent the operation) for the
  * environment (monitorFlow.forgetRecord). Best effort: a monitor container that does not exist or does not run has no
- * record that matters (review round 1 of 11C2a, A-R1-L3); any other failure is logged. The ensure comes with plan step
- * 11D2; until then it fails closed. Plan step 11D1: the heartbeats are their own operation (`heartbeat`).
+ * record that matters (review round 1 of 11C2a, A-R1-L3); any other failure is logged. Plan step 11D1: the heartbeats of
+ * the windows are their own operation (`heartbeat`). Plan step 11E4e: the open's ensure (`ensure`, given by the operation
+ * with its image maintenance, as `monitorEnsure` does it; without it, the ensure fails closed and the open is refused)
+ * and its first heartbeat for `source` with the time limit of the settings (`limitSeconds`; without the settings or the
+ * computer it is not sent, which the pipeline logs). The image list stays out until decision D (`images` is none).
  */
-export function workerSessionMonitor(engine: DockerEngine, source: string | undefined, log: Logger): EnvironmentSessionMonitor {
+export function workerSessionMonitor(
+  engine: DockerEngine,
+  source: string | undefined,
+  log: Logger,
+  open: { ensure?: (signal: AbortSignal | undefined) => Promise<unknown>; limitSeconds?: () => number } = {},
+): EnvironmentSessionMonitor {
   return {
-    ensure: async () => {
-      throw notInWorker('The ensure of the Session Monitor', '11D2');
+    // The worker's own helper image runs the monitor (the operation knows it), never the tag or ID of the pipeline's run.
+    ensure: async (_target, _helperTag, signal) => {
+      if (open.ensure === undefined) throw notInWorker('The ensure of the Session Monitor without the image maintenance of its operation', '11E6');
+      await open.ensure(signal);
     },
-    heartbeat: async () => {
-      throw notInWorker('A heartbeat of the open to the Session Monitor', '11E');
+    heartbeat: async (_target, environmentId, keepRunning, seq) => {
+      if (source === undefined) return { ok: false, detail: 'The operation names no computer for the Session Monitor.' };
+      // Review round 1 of PR #108 (A-L1): a computer ID that the monitor script would refuse is named as such.
+      if (!isSourceId(source)) return { ok: false, detail: 'The computer of the operation has no valid ID for the Session Monitor.' };
+      if (open.limitSeconds === undefined) return { ok: false, detail: 'The operation has no settings for the time limit of the heartbeat.' };
+      const result = await sendHeartbeat(engine, { source, limitSeconds: open.limitSeconds(), environments: [{ id: environmentId, keepRunning, seq }] });
+      return result.ok ? { ok: true } : { ok: false, detail: result.detail };
     },
     forget: async (_target, environmentId) => {
       if (source === undefined) throw new Error('The operation names no computer for the Session Monitor.');
@@ -224,6 +241,11 @@ export interface WorkerServicesDeps {
   /** Plan step 11C2a: the id of the computer that sent the operation in the Session Monitor (Delete's `forget`). */
   monitorSource?: string;
   /**
+   * Plan step 11E4e: the ensure of the Session Monitor of the worker's engine for the open (ensureWorkerMonitor, with the
+   * image maintenance of the operation); without it, the ensure fails closed.
+   */
+  monitorEnsure?: (signal: AbortSignal | undefined) => Promise<unknown>;
+  /**
    * Plan step 11E2: the host access analysis in the worker (its analysis thread, from the script in the worker's bundle,
    * with its limits); without it, an analysis fails closed.
    */
@@ -282,7 +304,11 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     openRecords: hostOpenRecords(deps.host),
     // Plan step 11C2b (decision of 2026-10-04): the Git state is recorded by the extension.
     recordGitSummary: (environmentId, summary) => deps.host.records.recordGitSummary(environmentId, summary),
-    sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),
+    // Plan step 11E4e: the open's ensure and first heartbeat too (the time limit of the settings of the operation).
+    sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger, {
+      ...(deps.monitorEnsure !== undefined ? { ensure: deps.monitorEnsure } : {}),
+      ...(deps.settings !== undefined ? { limitSeconds: () => stopAfterSeconds(deps.settings!.stopAfterMinutes) } : {}),
+    }),
     sessionFiles: hostSessionFiles(deps.host),
     windowStatuses: () => deps.host.state.windowStatuses(),
     // Plan step 11E4d: the processes of the user's computer are not the worker's; the pipeline asks the extension before
