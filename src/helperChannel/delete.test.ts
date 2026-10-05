@@ -149,7 +149,9 @@ describe('delete in the worker (plan step 11C2a)', () => {
     const { result, asks, engineCalls, events } = run();
     expect(parseDeleteValue(await result)).toEqual({ deleted: true });
     // The busy mark is the extension's (decision of 2026-10-04); the entry and the session files of this environment only.
-    expect(asks.find((ask) => ask.call === 'markBusy')).toEqual({ kind: 'record', call: 'markBusy', args: [ID, 'delete'] });
+    // Plan step 11E4b: changed, the handler of the extension passes the listener of the mark that the busy mark replaced
+    // (for `record createMark` `previous`) to its HostSide (before: the two arguments of the request only).
+    expect(asks.find((ask) => ask.call === 'markBusy')).toEqual({ kind: 'record', call: 'markBusy', args: [ID, 'delete', expect.any(Function)] });
     expect(asks.find((ask) => ask.call === 'remove')).toEqual({ kind: 'record', call: 'remove', args: [ID, { kept: [], removed: [] }] });
     expect(asks.filter((ask) => ask.call === 'sessionFile').map((ask) => ask.args)).toEqual([
       ['removePending', ID],

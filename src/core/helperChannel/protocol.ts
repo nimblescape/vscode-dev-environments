@@ -725,8 +725,8 @@ export interface RefreshValue {
 
 /** A container or volume name that Docker accepts, never an option. */
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
-/** The user of `docker exec -u`: no white space, never an option. */
-const EXEC_USER = /^[^\s\0-][^\s\0]{0,255}$/;
+/** The user of `docker exec -u`: no white space, never an option. Plan step 11E4b: also the remote user of an open. */
+export const EXEC_USER = /^[^\s\0-][^\s\0]{0,255}$/;
 /** repositoryFolder: `/workspaces/<name of the repository>`. */
 const REPOSITORY_FOLDER = new RegExp(`^${WORKSPACES_ROOT}/(?!\\.\\.?$)[^/\\s\\0]{1,255}$`);
 

@@ -5,7 +5,8 @@
 // Plan step 11E4a (decision of 2026-10-04, one operations interface in both directions): the registry writes of the open
 // (EnvironmentService) as specific operations, never a generic write. Each one takes plain data (JSON-able, no
 // functions); the window that runs it decides the rest with its own clock and view of the windows under its registry
-// lock (registryOpenRecords), so that the worker's pipeline can later send them to the extension as requests (11E4b/c).
+// lock (registryOpenRecords), so that the worker's pipeline can send them to the extension as requests (11E4b/c; the
+// extension's side of those requests: src/core/worker/openRequests.ts).
 // The mutators are those that EnvironmentService ran before, unchanged. Pure over its deps; no `vscode`.
 import { isBusyMarkLive } from '../busy';
 import { errorMessage } from '../errors';

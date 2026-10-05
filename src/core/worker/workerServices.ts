@@ -10,7 +10,7 @@
 // analysis, the image update check, the GitHub viewer, the variables of the computer) comes with plan step 11E; until
 // then it fails closed here, as do the record writes by a function (plan steps 11D, 11E) and the Session Monitor beyond Delete's
 // `forget` (plan step 11D). Plan step 11C2a: the busy marks are specific requests to the extension (decision of
-// 2026-10-04). Pure over its deps; no `vscode`.
+// 2026-10-04); plan step 11E4b: so are the registry writes of the open (hostOpenRecords). Pure over its deps; no `vscode`.
 import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
@@ -18,6 +18,7 @@ import { WorkspaceHelper } from '../helper/workspaceHelper';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
+import type { OpenRecords } from '../pipeline/openRecords';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
@@ -80,6 +81,44 @@ export function hostBusyMarks(records: HostSide['records']): EnvironmentBusyMark
   return {
     mark: (environmentId, operation) => records.markBusy(environmentId, operation),
     clear: (environmentId) => records.clearBusy(environmentId),
+  };
+}
+
+/**
+ * Plan step 11E4b (decision of 2026-10-04): the registry writes of the open as requests to the extension, which applies
+ * them with its owner, clock, account and view of the windows (`record createMark`, `record stepMark`, `record
+ * ownerLogin`, `record lifecycleMark`, `record openFinished`). The worker sends neither the account of the owner, nor
+ * the time of the last use, nor the liveness of the marks: the extension takes its own. The entry of a first open, the
+ * configuration and the build records follow with plan step 11E4c; until then they fail closed.
+ */
+export function hostOpenRecords(host: HostSide): OpenRecords {
+  const { records } = host;
+  return {
+    createEnvironment: async () => {
+      throw notInWorker('The entry of a first open', '11E4c');
+    },
+    dropCreated: async () => {
+      throw notInWorker('The removal of the entry of a refused first open', '11E4c');
+    },
+    createMark: (environmentId, kind, previous) => records.createMark(environmentId, kind, previous),
+    takeStepMark: (environmentId, operation) => records.takeStepMark(environmentId, operation),
+    releaseStepMark: (environmentId, mark) => records.releaseStepMark(environmentId, mark),
+    ownerLogin: (environmentId) => records.ownerLogin(environmentId),
+    configuration: async () => {
+      throw notInWorker('A change of the configuration of an entry', '11E4c');
+    },
+    build: async () => {
+      throw notInWorker('A change of the build records of an entry', '11E4c');
+    },
+    lifecycleMark: (environmentId, change) => records.lifecycleMark(environmentId, change),
+    openFinished: (environmentId, finish) =>
+      records.openFinished(environmentId, {
+        ...(finish.lifecycleMarkRead !== undefined ? { lifecycleMarkRead: finish.lifecycleMarkRead } : {}),
+        ...(finish.lifecycleRanFor !== undefined ? { lifecycleRanFor: finish.lifecycleRanFor } : {}),
+        ...(finish.remoteUser !== undefined ? { remoteUser: finish.remoteUser } : {}),
+        remoteWorkspaceFolder: finish.remoteWorkspaceFolder,
+        ...(finish.gitSummary !== undefined ? { gitSummary: finish.gitSummary } : {}),
+      }),
   };
 }
 
@@ -220,6 +259,8 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     registry: hostStore(deps.host.records),
     // Plan step 11C2a (decision of 2026-10-04): the busy marks are set and cleared by the extension.
     busyMarks: hostBusyMarks(deps.host.records),
+    // Plan step 11E4b (decision of 2026-10-04): the registry writes of the open are requests to the extension.
+    openRecords: hostOpenRecords(deps.host),
     // Plan step 11C2b (decision of 2026-10-04): the Git state is recorded by the extension.
     recordGitSummary: (environmentId, summary) => deps.host.records.recordGitSummary(environmentId, summary),
     sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),

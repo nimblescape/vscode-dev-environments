@@ -11,7 +11,7 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostAuth, hostBusyMarks, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
@@ -76,6 +76,13 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       recordGitSummary: (environmentId, summary) => answer('recordGitSummary', environmentId, summary),
       // Plan step 11C3.
       restore: (entries) => answer('restore', entries.map((entry) => entry.id)),
+      // Plan step 11E4b.
+      createMark: (environmentId, kind, previous) => answer('createMark', environmentId, kind, previous),
+      takeStepMark: (environmentId, operation) => answer('takeStepMark', environmentId, operation),
+      releaseStepMark: (environmentId, mark) => answer('releaseStepMark', environmentId, mark),
+      ownerLogin: (environmentId) => answer('ownerLogin', environmentId),
+      lifecycleMark: (environmentId, change) => answer('lifecycleMark', environmentId, change),
+      openFinished: (environmentId, finish) => answer('openFinished', environmentId, finish),
     },
     secrets: {
       token: () => answer('token'),
@@ -237,6 +244,36 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     expect(() => all.settings()).toThrow('before plan step 11E');
     const settings = { stopAfterMinutes: 5 } as never;
     expect(deps({ settings }).all.settings()).toBe(settings);
+  });
+
+  it("plan step 11E4b: the registry writes of the open go to the extension as their requests; the 11E4c ones fail closed", async () => {
+    const { all, calls } = deps();
+    const records = all.openRecords!;
+    const mark = { operation: 'update' as const, since: '2026-10-04T12:00:00.000Z', pid: 1, windowId: 'w' };
+    await records.createMark('e1', 'previous', mark);
+    await records.takeStepMark('e1', 'update');
+    await records.releaseStepMark('e1', mark);
+    // The worker sends no account, no time of the last use and no liveness: the extension takes its own.
+    await records.ownerLogin('e1', { id: '42', login: 'mallory' });
+    await records.lifecycleMark('e1', 'clear');
+    await records.openFinished('e1', { lastUsedAt: '2030-01-01T00:00:00.000Z', remoteWorkspaceFolder: '/workspaces/api', remoteUser: 'node', liveness: { now: 0, windowStatuses: [] } });
+    expect(calls).toEqual([
+      `createMark "e1" "previous" ${JSON.stringify(mark)}`,
+      'takeStepMark "e1" "update"',
+      `releaseStepMark "e1" ${JSON.stringify(mark)}`,
+      'ownerLogin "e1"',
+      'lifecycleMark "e1" "clear"',
+      'openFinished "e1" {"remoteUser":"node","remoteWorkspaceFolder":"/workspaces/api"}',
+    ]);
+    await expect(records.createEnvironment({} as Environment)).rejects.toThrow('before plan step 11E4c');
+    await expect(records.dropCreated('e1')).rejects.toThrow('before plan step 11E4c');
+    await expect(records.configuration('e1', { cloned: true })).rejects.toThrow('before plan step 11E4c');
+    await expect(records.build('e1', { kind: 'number', buildNumber: 2 })).rejects.toThrow('before plan step 11E4c');
+    expect(calls).toHaveLength(6);
+    // hostOpenRecords over the HostSide alone.
+    const alone = fakeHost();
+    await hostOpenRecords(alone.host).lifecycleMark('e2', { set: 'a'.repeat(12) });
+    expect(alone.calls).toEqual([`lifecycleMark "e2" {"set":"${'a'.repeat(12)}"}`]);
   });
 
   it('plan step 11E2: the analysis of the operation, when it brings one (the analysis thread of the worker)', () => {

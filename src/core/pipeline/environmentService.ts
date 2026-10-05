@@ -488,8 +488,8 @@ export interface EnvironmentServiceDeps {
   busyMarks?: EnvironmentBusyMarks;
   /**
    * Plan step 11E4a (decision of 2026-10-04): the registry writes of the open, as specific operations. Default: over
-   * `registry` with this service's owner, clock, and view of the windows (registryOpenRecords); the worker's pipeline will
-   * send them to the extension (plan steps 11E4b/c).
+   * `registry` with this service's owner, clock, and view of the windows (registryOpenRecords); the worker's pipeline
+   * sends them to the extension (hostOpenRecords, plan step 11E4b; the entry, configuration and build writes with 11E4c).
    */
   openRecords?: OpenRecords;
   /**

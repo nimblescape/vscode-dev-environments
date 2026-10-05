@@ -8,9 +8,10 @@
 // the extension passes its own HostSide (src/vscode).
 import { DETAILED_REQUESTS, HOST_SECRET_NAMES, HOST_SESSION_FILES, SCOPED_REQUESTS, parseHostRequest, type HostCall, type HostSecretAnswer, type HostSessionFile, type HostSide } from './hostSide';
 import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
-import { isGitSummary } from '../git/gitSummary';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
-import type { BusyOperation, Environment } from '../types';
+import { sameBusyMark } from '../pipeline/openRecords';
+import type { BusyMark, BusyOperation, Environment } from '../types';
+import { busyMarkFields, checkedBusyMark, checkedGitSummary, checkedLifecycleChange, checkedOpenFinish, type OpenRequestScope } from './openRequests';
 import { MAX_RESTORE_ENTRIES } from '../helperChannel/protocol';
 import { isConfigPathLabelValue, repositoryFolder, resourceName } from '../names';
 import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/pipelineRules';
@@ -63,6 +64,9 @@ export function hostSideHandler(
   const permitted = new Set<string>(allowed);
   // Review round 1 of 11C3 (A-R1-L1): the requests that an operation sends at most once.
   const sent = new Set<string>();
+  // Plan step 11E4b: the marks that a `record markBusy` of this operation replaced, the only ones that `record
+  // createMark` `previous` gives back.
+  const replaced: BusyMark[] = [];
   return async (kind, payload, signal) => {
     const request = parseHostRequest(payload, kind);
     if (request === undefined) throw new HelperOperationError('invalid', 'The request of the operation is invalid.', false);
@@ -93,7 +97,7 @@ export function hostSideHandler(
       if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
         throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
       }
-      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, scope.dockerHost, logger);
+      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, scope.dockerHost, logger, replaced);
       scope.onQuestion?.('asked');
       try {
         const answered = await answer(host, request.kind, request.call, request.args);
@@ -114,7 +118,14 @@ export function hostSideHandler(
  * Review round 1 of 11C3 (A-R1-L1): the requests that an operation sends at most once: the restore of the registry adds
  * the entries of one engine, so a worker cannot grow the registry without bound.
  */
-const ONCE_REQUESTS: ReadonlySet<string> = new Set(['record restore']);
+const ONCE_REQUESTS: ReadonlySet<string> = new Set([
+  'record restore',
+  // Plan step 11E4b: an open ends once.
+  'record openFinished',
+]);
+
+/** Plan step 11E4b: the most marks that the handler of an operation remembers as replaced by its `record markBusy`. */
+const MAX_REPLACED_MARKS = 8;
 
 /** Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. */
 const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
@@ -280,14 +291,14 @@ function strings(args: unknown[], count: number): string[] {
   return values as string[];
 }
 
-async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[], dockerHost?: string, logger?: Logger): Promise<Answer> {
+async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[], dockerHost?: string, logger?: Logger, replaced: BusyMark[] = []): Promise<Answer> {
   switch (kind) {
     case 'question':
       return { value: await question(host, call, args) };
     case 'local':
       return { value: await local(host, call, args) };
     case 'record':
-      return { value: await record(host, call, args, dockerHost, logger) };
+      return { value: await record(host, call, args, dockerHost, logger, replaced) };
     case 'secret':
       return secret(host, call, args);
     case 'connect': {
@@ -373,7 +384,18 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
   }
 }
 
-async function record(host: HostSide, call: string, args: unknown[], dockerHost: string | undefined, logger: Logger | undefined): Promise<unknown> {
+/** Plan step 11E4b: the arguments of a request of the open, exactly `count` of them (no field beyond its closed list). */
+function argumentCount(args: unknown[], count: number): void {
+  if (args.length !== count) throw new HelperOperationError('invalid', 'The arguments of the request are invalid.', false);
+}
+
+/** Plan step 11E4b: the scope of a request of the open, from the operation; an operation without a Docker host sends none. */
+function openScope(dockerHost: string | undefined): OpenRequestScope {
+  if (dockerHost === undefined) throw new HelperOperationError('invalid', 'The operation names no Docker host for the registry writes of the open.', false);
+  return { dockerHost };
+}
+
+async function record(host: HostSide, call: string, args: unknown[], dockerHost: string | undefined, logger: Logger | undefined, replaced: BusyMark[]): Promise<unknown> {
   const records = host.records;
   switch (call) {
     case 'read':
@@ -428,7 +450,12 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
     case 'markBusy': {
       const [environmentId, operation] = strings(args, 2);
       if (!(BUSY_OPERATIONS as readonly string[]).includes(operation)) throw new HelperOperationError('invalid', `The busy operation ${operation} is unknown.`, false);
-      return (await records.markBusy(environmentId, operation as BusyOperation)) ?? null;
+      // Plan step 11E4b: the mark that it replaced is remembered for `record createMark` `previous` of this operation.
+      const remember = (mark: BusyMark) => {
+        replaced.push(mark);
+        if (replaced.length > MAX_REPLACED_MARKS) replaced.shift();
+      };
+      return (await records.markBusy(environmentId, operation as BusyOperation, remember)) ?? null;
     }
     case 'clearBusy':
       await records.clearBusy(strings(args, 1)[0]);
@@ -436,13 +463,9 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
     // Plan step 11C2b: the Git state, checked as the registry checks it.
     case 'recordGitSummary': {
       const [environmentId] = strings(args, 1);
-      if (!isGitSummary(args[1])) throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
-      // Review round 1 of 11C2b (A-R1-L2): its five fields only, a bounded branch and a valid time.
-      const { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt } = args[1];
-      if ((branch !== null && (branch.length > 255 || !plainText(branch, 255))) || !Number.isFinite(Date.parse(recordedAt)) || recordedAt.length > 64) {
-        throw new HelperOperationError('invalid', 'The Git state is invalid.', false);
-      }
-      await records.recordGitSummary(environmentId, { branch, uncommittedFiles, unpushedCommits, stashes, recordedAt });
+      // Review round 1 of 11C2b (A-R1-L2): its five fields only, a bounded branch and a valid time (plan step 11E4b:
+      // checkedGitSummary, which `record openFinished` uses too).
+      await records.recordGitSummary(environmentId, checkedGitSummary(args[1]));
       return null;
     }
     // Plan step 11C3: the entries rebuilt from the volumes of the engine of the operation, each rebuilt here from its checked fields.
@@ -451,6 +474,57 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
       const entries = restoredEntries(args[0], dockerHost, logger);
       const { added, skipped } = await records.restore(entries);
       return { added, skipped: [...skipped] };
+    }
+    // Plan step 11E4b (decision of 2026-10-04): the registry writes of the open, each with its closed list of arguments;
+    // the extension applies them under its registry lock (requestOpenRecords).
+    case 'createMark': {
+      const [environmentId, kind] = strings(args, 2);
+      if (kind === 'ended') {
+        argumentCount(args, 2);
+        return (await records.createMark(environmentId, 'ended', undefined, openScope(dockerHost))) ?? null;
+      }
+      if (kind !== 'previous' || args.length > 3) throw new HelperOperationError('invalid', 'The create mark of the request is invalid.', false);
+      // `previous` only as a mark that a `record markBusy` of this operation replaced; the remembered one is given back,
+      // never the worker's object. Review round 1 of PR #105 (A-L1): it is found by its four fields as the registry held
+      // them (the worker read it there); one that is not found ends this window's create mark instead (`ended`), so the
+      // mark never stays live for the rest of the window.
+      let previous: BusyMark | undefined;
+      if (args.length === 3) {
+        const sent = busyMarkFields(args[2]);
+        previous = sent === undefined ? undefined : replaced.find((mark) => sameBusyMark(mark, sent));
+        if (previous === undefined) {
+          logger?.warn(`The previous busy mark of ${environmentId} is not one that the busy mark of this operation replaced; the create mark of this window is ended instead.`);
+          return (await records.createMark(environmentId, 'ended', undefined, openScope(dockerHost))) ?? null;
+        }
+      }
+      return (await records.createMark(environmentId, 'previous', previous, openScope(dockerHost))) ?? null;
+    }
+    case 'stepMark': {
+      const [environmentId, kind] = strings(args, 2);
+      argumentCount(args, 3);
+      if (kind === 'take') {
+        // Review round 1 of PR #105 (A-L3): the open takes only an `update` step mark.
+        if (args[2] !== 'update') throw new HelperOperationError('invalid', 'The busy operation of the step mark is not update.', false);
+        return (await records.takeStepMark(environmentId, 'update', openScope(dockerHost))) ?? null;
+      }
+      if (kind !== 'release') throw new HelperOperationError('invalid', 'The step mark of the request is invalid.', false);
+      return (await records.releaseStepMark(environmentId, checkedBusyMark(args[2]), openScope(dockerHost))) ?? null;
+    }
+    case 'ownerLogin': {
+      const [environmentId] = strings(args, 1);
+      // The account is the one signed in in the extension; the worker sends none.
+      argumentCount(args, 1);
+      return (await records.ownerLogin(environmentId, openScope(dockerHost))) ?? null;
+    }
+    case 'lifecycleMark': {
+      const [environmentId] = strings(args, 1);
+      argumentCount(args, 2);
+      return (await records.lifecycleMark(environmentId, checkedLifecycleChange(args[1]), openScope(dockerHost))) ?? null;
+    }
+    case 'openFinished': {
+      const [environmentId] = strings(args, 1);
+      argumentCount(args, 2);
+      return (await records.openFinished(environmentId, checkedOpenFinish(args[1]), openScope(dockerHost))) ?? null;
     }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);
