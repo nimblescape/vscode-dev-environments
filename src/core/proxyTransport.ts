@@ -56,7 +56,8 @@ export function bypassesProxy(host: string, port: number, noProxy: string | unde
     }
     if (entryPort !== undefined && entryPort !== port) continue;
     if (net.isIP(entry) !== 0) {
-      if (entry === name) return true;
+      // Review round 2 of PR #109 (B): addresses compared as addresses (`fd00:0::1` is `fd00::1`), as Go's ip.Equal.
+      if (sameAddress(entry, name)) return true;
       continue;
     }
     if (entry.startsWith('*.') || entry.startsWith('.')) {
@@ -70,10 +71,19 @@ export function bypassesProxy(host: string, port: number, noProxy: string | unde
   return false;
 }
 
-/** True for an address of the loopback (127.0.0.0/8, ::1). */
+/** True for an address of the loopback (127.0.0.0/8, ::1, and 127.0.0.0/8 mapped to IPv6, as Go's IsLoopback). */
 function isLoopback(address: string): boolean {
   if (net.isIPv4(address)) return address.startsWith('127.');
-  return net.isIPv6(address) && inCidr(address, '::1/128');
+  return net.isIPv6(address) && (inCidr(address, '::1/128') || inCidr(address, '::ffff:127.0.0.0/104'));
+}
+
+/** True when the two IP addresses are the same address in any spelling. */
+function sameAddress(a: string, b: string): boolean {
+  const family = net.isIP(a);
+  if (family === 0 || family !== net.isIP(b)) return false;
+  const list = new net.BlockList();
+  list.addAddress(a, family === 4 ? 'ipv4' : 'ipv6');
+  return list.check(b, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 function inCidr(address: string, cidr: string): boolean {

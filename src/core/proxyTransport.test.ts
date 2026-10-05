@@ -49,6 +49,12 @@ describe('bypassesProxy (NO_PROXY as Go reads it)', () => {
       ['127.8.9.10', 443, undefined, true],
       ['::1', 443, undefined, true],
       ['notlocalhost', 443, undefined, false],
+      // Review round 2 of PR #109 (B): the IPv4-mapped loopback, and addresses compared as addresses, as Go.
+      ['::ffff:127.0.0.1', 443, undefined, true],
+      ['::ffff:7f00:1', 443, undefined, true],
+      ['::ffff:10.0.0.1', 443, undefined, false],
+      ['fd00::1', 443, 'fd00:0:0::1', true],
+      ['fd00::2', 443, 'fd00:0:0::1', false],
       ['fd00::5', 443, 'fd00::/8', true],
       ['registry.example.com', 443, '10.0.0.0/8', false],
       ['10.1.2.3', 443, 'bad/cidr', false],
