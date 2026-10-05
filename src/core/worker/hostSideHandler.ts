@@ -11,7 +11,18 @@ import { BUSY_OPERATIONS } from '../pipeline/busyMarks';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
 import { sameBusyMark } from '../pipeline/openRecords';
 import type { BusyMark, BusyOperation, Environment } from '../types';
-import { busyMarkFields, checkedBusyMark, checkedGitSummary, checkedLifecycleChange, checkedOpenFinish, type OpenRequestScope } from './openRequests';
+import {
+  VOLUME_NAME,
+  busyMarkFields,
+  checkedBuildChange,
+  checkedBusyMark,
+  checkedConfigurationChange,
+  checkedCreateRequest,
+  checkedGitSummary,
+  checkedLifecycleChange,
+  checkedOpenFinish,
+  type OpenRequestScope,
+} from './openRequests';
 import { MAX_RESTORE_ENTRIES } from '../helperChannel/protocol';
 import { isConfigPathLabelValue, repositoryFolder, resourceName } from '../names';
 import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/pipelineRules';
@@ -30,8 +41,6 @@ type Answer = { value: unknown; secrets?: Secrets };
 const REGISTRY_HOST = /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$/i;
 /** The longest text of a message of a flow. */
 const MAX_MESSAGE_CHARACTERS = 2000;
-/** The fields of a record that a flow may not change: its identity and its owner (review round 1 of plan step 11B1, A-R1-8). */
-const FIXED_FIELDS = new Set(['id', 'owner', '__proto__', 'constructor', 'prototype']);
 
 function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
@@ -67,6 +76,9 @@ export function hostSideHandler(
   // Plan step 11E4b: the marks that a `record markBusy` of this operation replaced, the only ones that `record
   // createMark` `previous` gives back.
   const replaced: BusyMark[] = [];
+  // Plan step 11E4c: the environment of the operation; a first open has none until its `record createEnvironment` binds
+  // it (`created`: the entry that this operation created, the only one that `record dropCreated` removes).
+  const environment: OperationEnvironment = { id: scope.environmentId };
   return async (kind, payload, signal) => {
     const request = parseHostRequest(payload, kind);
     if (request === undefined) throw new HelperOperationError('invalid', 'The request of the operation is invalid.', false);
@@ -80,7 +92,7 @@ export function hostSideHandler(
       throw new HelperOperationError('invalid', `The operation may not send the request ${request.kind} ${request.call}.`, false);
     }
     const scoped = Object.hasOwn(SCOPED_REQUESTS, name) ? SCOPED_REQUESTS[name] : undefined;
-    if (scoped !== undefined && (scope.environmentId === undefined || request.args[scoped] !== scope.environmentId)) {
+    if (scoped !== undefined && (environment.id === undefined || request.args[scoped] !== environment.id)) {
       logger.warn(`The worker sent the request ${request.kind} ${request.call} for another environment than the one of its operation.`);
       throw new HelperOperationError('invalid', `The request ${request.kind} ${request.call} is for another environment than the one of the operation.`, false);
     }
@@ -97,7 +109,7 @@ export function hostSideHandler(
       if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
         throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
       }
-      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, scope.dockerHost, logger, replaced);
+      if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, { dockerHost: scope.dockerHost, repository: scope.repository, logger, replaced, environment });
       scope.onQuestion?.('asked');
       try {
         const answered = await answer(host, request.kind, request.call, request.args);
@@ -122,7 +134,24 @@ const ONCE_REQUESTS: ReadonlySet<string> = new Set([
   'record restore',
   // Plan step 11E4b: an open ends once.
   'record openFinished',
+  // Plan step 11E4c: an operation creates at most one environment.
+  'record createEnvironment',
 ]);
+
+/** Plan step 11E4c: the environment of an operation (SCOPED_REQUESTS), and the one that it created. */
+interface OperationEnvironment {
+  id?: string;
+  created?: string;
+}
+
+/** What the answer of a request of the extension's side knows of its operation (hostSideHandler). */
+interface RequestContext {
+  dockerHost?: string;
+  repository?: string;
+  logger?: Logger;
+  replaced: BusyMark[];
+  environment: OperationEnvironment;
+}
 
 /** Plan step 11E4b: the most marks that the handler of an operation remembers as replaced by its `record markBusy`. */
 const MAX_REPLACED_MARKS = 8;
@@ -132,8 +161,6 @@ const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
 
 /** The most names of a question of Delete. */
 const MAX_QUESTION_NAMES = 1000;
-/** A volume name as Docker takes it. */
-const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 
 // Review round 2 of 11C2b (B-R2 HH2): every caller names its limit.
 function plainText(value: unknown, max: number): value is string {
@@ -291,14 +318,14 @@ function strings(args: unknown[], count: number): string[] {
   return values as string[];
 }
 
-async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[], dockerHost?: string, logger?: Logger, replaced: BusyMark[] = []): Promise<Answer> {
+async function answer(host: HostSide, kind: AskKind, call: string, args: unknown[], context: RequestContext = { replaced: [], environment: {} }): Promise<Answer> {
   switch (kind) {
     case 'question':
       return { value: await question(host, call, args) };
     case 'local':
       return { value: await local(host, call, args) };
     case 'record':
-      return { value: await record(host, call, args, dockerHost, logger, replaced) };
+      return { value: await record(host, call, args, context) };
     case 'secret':
       return secret(host, call, args);
     case 'connect': {
@@ -395,7 +422,8 @@ function openScope(dockerHost: string | undefined): OpenRequestScope {
   return { dockerHost };
 }
 
-async function record(host: HostSide, call: string, args: unknown[], dockerHost: string | undefined, logger: Logger | undefined, replaced: BusyMark[]): Promise<unknown> {
+async function record(host: HostSide, call: string, args: unknown[], context: RequestContext): Promise<unknown> {
+  const { dockerHost, logger, replaced } = context;
   const records = host.records;
   switch (call) {
     case 'read':
@@ -407,23 +435,6 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
     case 'findForAccount': {
       const [repository, accountId, dockerHost] = strings(args, 3);
       return (await records.findForAccount(repository, accountId, dockerHost)) ?? null;
-    }
-    case 'add': {
-      const environment = args[0] as { id?: unknown; owner?: { id?: unknown } } | null;
-      if (typeof environment !== 'object' || environment === null || Array.isArray(environment) || typeof environment.id !== 'string' || typeof environment.owner?.id !== 'string') {
-        throw new HelperOperationError('invalid', 'The environment is invalid.', false);
-      }
-      await records.add(args[0] as Parameters<HostSide['records']['add']>[0]);
-      return null;
-    }
-    case 'update': {
-      const [id] = strings(args, 1);
-      const changes = args[1];
-      if (typeof changes !== 'object' || changes === null || Array.isArray(changes) || Object.keys(changes).some((key) => FIXED_FIELDS.has(key))) {
-        throw new HelperOperationError('invalid', 'The changes are invalid.', false);
-      }
-      await records.update(id, args[1] as Parameters<HostSide['records']['update']>[1]);
-      return null;
     }
     case 'remove': {
       const [id] = strings(args, 1);
@@ -525,6 +536,39 @@ async function record(host: HostSide, call: string, args: unknown[], dockerHost:
       const [environmentId] = strings(args, 1);
       argumentCount(args, 2);
       return (await records.openFinished(environmentId, checkedOpenFinish(args[1]), openScope(dockerHost))) ?? null;
+    }
+    // Plan step 11E4c (decision of 2026-10-04): the entry of a first open, the worker's ID and the repository of the
+    // operation; the extension builds the entry. The operation is bound to the environment of the answer.
+    case 'createEnvironment': {
+      argumentCount(args, 1);
+      if (context.environment.id !== undefined) throw new HelperOperationError('invalid', 'The operation has an environment already: it creates none.', false);
+      const request = checkedCreateRequest(args[0]);
+      if (context.repository !== undefined && request.repository !== context.repository) {
+        throw new HelperOperationError('invalid', 'The environment of the request is of another repository than the one of the operation.', false);
+      }
+      const entry = await records.createEnvironment(request.id, request.repository, request.configPath, openScope(dockerHost));
+      // The new entry, or the one of the repository of the account on the Docker host that another window created
+      // meanwhile (the open uses it, as openFirst does): every later request of the operation is for it.
+      context.environment.id = entry.id;
+      if (entry.id === request.id) context.environment.created = entry.id;
+      return entry;
+    }
+    case 'dropCreated': {
+      const [environmentId] = strings(args, 1);
+      argumentCount(args, 1);
+      if (environmentId !== context.environment.created) throw new HelperOperationError('invalid', 'The environment of the request is not the one that the operation created.', false);
+      await records.dropCreated(environmentId, openScope(dockerHost));
+      context.environment.created = undefined;
+      return null;
+    }
+    case 'configuration': {
+      const [environmentId] = strings(args, 1);
+      argumentCount(args, 2);
+      return (await records.configuration(environmentId, checkedConfigurationChange(args[1]), openScope(dockerHost))) ?? null;
+    }
+    case 'build': {
+      const [environmentId, kind] = strings(args, 2);
+      return (await records.build(environmentId, checkedBuildChange(kind, args.slice(2)), openScope(dockerHost))) ?? null;
     }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);

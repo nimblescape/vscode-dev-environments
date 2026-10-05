@@ -93,12 +93,13 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: false });
   });
 
-  it('changes a record through the registry, and writes the pending file of this window', async () => {
-    const { all, environment, registry, sessionFiles } = deps();
+  // Plan step 11E4c: changed (before: also the generic change of a record, `record update`, which is removed; the
+  // specific writes of the open: hostSide.openRequests.test.ts).
+  it('writes the pending file of this window', async () => {
+    const { all, sessionFiles } = deps();
     const host = extensionHostSide(all);
-    await host.records.update('e1', { lastUsedAt: 'new' });
-    expect(registry.updateEnvironment).toHaveBeenCalledWith('e1', expect.any(Function));
-    expect(environment.lastUsedAt).toBe('new');
+    expect(host.records).not.toHaveProperty('update');
+    expect(host.records).not.toHaveProperty('add');
     await host.records.sessionFile('writePending', 'e1');
     expect(sessionFiles.writePending).toHaveBeenCalledWith('e1', 'w1');
     await host.records.sessionFile('removeReopen', 'e1');

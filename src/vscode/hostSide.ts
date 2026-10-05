@@ -21,7 +21,8 @@ import type { HelperChannels } from '../core/helperChannel/helperChannels';
 import type { DockerTarget } from '../core/docker/dockerHost';
 
 export interface HostSideDeps {
-  registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'add' | 'restore' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
+  // Plan step 11E4c: changed (`add` is gone with `record add`; `update` for the writes of the open that read the whole registry).
+  registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'restore' | 'update' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
   sessionFiles: Pick<
     SessionFiles,
     'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeReopenOf' | 'removeDisconnectRequest'
@@ -95,8 +96,6 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       get: (id) => deps.registry.get(id),
       list: () => deps.registry.list(),
       findForAccount: (repository, accountId, dockerHost) => deps.registry.findForAccount(repository, accountId, dockerHost),
-      add: (environment) => deps.registry.add(environment),
-      update: async (id, changes) => void (await deps.registry.updateEnvironment(id, (environment) => void Object.assign(environment, changes))),
       // Review round 1 of 11C2a (A-R1-L2): the volumes of a removal are the additional volumes of the entry, never the kept
       // volumes of another environment or account.
       remove: async (id, volumes) => {
@@ -133,6 +132,11 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       ownerLogin: async (environmentId, scope) => (await openRequests(scope)).ownerLogin(environmentId),
       lifecycleMark: async (environmentId, change, scope) => (await openRequests(scope)).lifecycleMark(environmentId, change),
       openFinished: async (environmentId, finish, scope) => (await openRequests(scope)).openFinished(environmentId, finish),
+      // Plan step 11E4c: the entry of a first open, its removal, the configuration and the build records (requestOpenRecords).
+      createEnvironment: async (id, repository, configPath, scope) => (await openRequests(scope)).createEnvironment({ id, repository, configPath }),
+      dropCreated: async (environmentId, scope) => (await openRequests(scope)).dropCreated(environmentId),
+      configuration: async (environmentId, change, scope) => (await openRequests(scope)).configuration(environmentId, change),
+      build: async (environmentId, change, scope) => (await openRequests(scope)).build(environmentId, change),
     },
     secrets: {
       token: async () => deps.auth.getToken({ interactive: false }),

@@ -4,12 +4,14 @@
 
 // Plan step 11E4b (decision of 2026-10-04): the registry writes of the open in the extension: the HostSide of this window
 // applies them with its owner, clock, view of the windows and signed-in account (never the worker's), only on an entry of
-// that account on the Docker host of the operation. No operation sends them before plan step 11E6.
+// that account on the Docker host of the operation. No operation sends them before plan step 11E6. Plan step 11E4c: the
+// entry of a first open, its removal, the configuration and the build records too.
 import { describe, expect, it, vi } from 'vitest';
 import type { OperationOptions } from '../core/helperChannel/helperChannel';
 import { OP_DELETE } from '../core/helperChannel/protocol';
 import { silentLogger } from '../core/ports';
-import type { BusyMark, Environment, WindowStatus } from '../core/types';
+import type { EnvironmentRegistry } from '../core/storage/registry';
+import type { BusyMark, Environment, RegistryFile, WindowStatus } from '../core/types';
 import type { HostCall } from '../core/worker/hostSide';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
@@ -99,5 +101,95 @@ describe('the registry writes of the open in the extension (plan step 11E4b)', (
     const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), {})) };
     await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, host, silentLogger)(OP_DELETE, { environmentId: ID, dockerHost: HOST }, {});
     await expect(sent[0].onAsk!('record', { call: 'ownerLogin', args: [ID] }, new AbortController().signal)).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  describe('plan step 11E4c', () => {
+    const NEW = '6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b';
+    const DEFAULT = '.devcontainer/devcontainer.json';
+
+    /** This window's HostSide over a registry file (`update`), as the extension wires it. */
+    function filed(entries: Environment[] = [], account: { id: string; login: string } | null = { id: '42', login: 'octo' }) {
+      let file: RegistryFile = { version: 1, environments: structuredClone(entries) };
+      const update = (async <T>(mutator: (file: RegistryFile) => T | Promise<T>) => {
+        const copy = structuredClone(file);
+        const result = await mutator(copy);
+        file = copy;
+        return structuredClone(result);
+      }) as EnvironmentRegistry['update'];
+      const warnings: string[] = [];
+      const getAccount = vi.fn(async (_options: { interactive: boolean }) => account ?? undefined);
+      const deps = {
+        registry: {
+          update,
+          updateEnvironment: (id: string, mutator: (entry: Environment) => void | Promise<void>) =>
+            update(async (f) => {
+              const found = f.environments.find((candidate) => candidate.id === id);
+              if (found) await mutator(found);
+              return found;
+            }),
+        },
+        sessionFiles: { readWindowStatuses: async () => [] },
+        ui: {},
+        auth: { getAccount },
+        credentials: {},
+        settings: () => ({}),
+        windowId: 'w1',
+        pid: 100,
+        clock: { now: () => NOW },
+        isProcessAlive: () => true,
+        logger: { ...silentLogger, warn: (text: string) => warnings.push(text) },
+      } as unknown as HostSideDeps;
+      return { host: extensionHostSide(deps), file: () => file, warnings, getAccount };
+    }
+
+    it('the entry of a first open with the account signed in here, the clock and the create mark of this window', async () => {
+      const { host, file, getAccount } = filed();
+      const created = await host.records.createEnvironment(NEW, 'acme/api', DEFAULT, SCOPE);
+      expect(created).toMatchObject({
+        id: NEW,
+        owner: { id: '42', login: 'octo' },
+        dockerHost: HOST,
+        createdAt: new Date(NOW).toISOString(),
+        busy: { operation: 'create', since: new Date(NOW).toISOString(), pid: 100, windowId: 'w1' },
+      });
+      expect(getAccount).toHaveBeenCalledWith({ interactive: false });
+      expect(file().environments).toEqual([created]);
+      // Removed again only with the create mark of this window.
+      await host.records.dropCreated(NEW, SCOPE);
+      expect(file().environments).toEqual([]);
+      await expect(filed([], null).host.records.createEnvironment(NEW, 'acme/api', DEFAULT, SCOPE)).rejects.toThrow('No GitHub account');
+      // Without the scope of the handler (as the worker would call it), nothing is written.
+      const unscoped = filed();
+      await expect(unscoped.host.records.createEnvironment(NEW, 'acme/api', DEFAULT)).rejects.toThrow('names no Docker host');
+      expect(unscoped.file().environments).toEqual([]);
+    });
+
+    it('the configuration leaves out a volume of another account, logged by this window; the build only an image of the environment', async () => {
+      const own = { id: ID, repository: 'acme/api', volumeName: 'devenv-api', containerName: 'devenv-api', owner: { id: '42', login: 'octo' }, dockerHost: HOST } as Environment;
+      const theirs = { id: 'e7', repository: 'acme/api', volumeName: 'devenv-theirs', containerName: 'devenv-theirs', owner: { id: '7', login: 'x' }, additionalVolumes: ['their-data'], dockerHost: HOST } as Environment;
+      const { host, warnings, file } = filed([own, theirs]);
+      expect(await host.records.configuration(ID, { addVolumes: ['their-data', 'cache'] }, SCOPE)).toMatchObject({ additionalVolumes: ['cache'] });
+      expect(warnings).toEqual(['The worker recorded the volume their-data for acme/api, which is left out: an environment of another account uses it.']);
+      await expect(host.records.configuration('e7', { cloned: true }, SCOPE)).rejects.toThrow('another account');
+      expect(await host.records.build(ID, { kind: 'number', buildNumber: 4 }, SCOPE)).toMatchObject({ lastBuildNumber: 4 });
+      const record = { builtAt: '2026-10-04T12:00:00.000Z', environmentImage: 'devenv-other:4', buildNumber: 4, configPath: DEFAULT, configHash: 'h', images: {}, features: {} };
+      await expect(host.records.build(ID, { kind: 'record', record, dropRefused: false }, SCOPE)).rejects.toThrow('not one of an image of the environment');
+      expect(file().environments[0]).not.toHaveProperty('buildRecord');
+    });
+
+    it('no operation of extensionFlow may send them yet', async () => {
+      const { host } = filed();
+      const sent: OperationOptions[] = [];
+      const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), {})) };
+      await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, host, silentLogger)(OP_DELETE, { repository: 'acme/api', dockerHost: HOST }, {});
+      for (const payload of [
+        { call: 'createEnvironment', args: [{ id: NEW, repository: 'acme/api', configPath: DEFAULT }] },
+        { call: 'configuration', args: [NEW, { cloned: true }] },
+        { call: 'build', args: [NEW, 'number', 2] },
+        { call: 'dropCreated', args: [NEW] },
+      ]) {
+        await expect(sent[0].onAsk!('record', payload, new AbortController().signal)).rejects.toMatchObject({ code: 'invalid' });
+      }
+    });
   });
 });

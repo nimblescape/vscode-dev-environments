@@ -43,12 +43,16 @@ export function hostStore(records: HostSide['records']): EnvironmentStore {
     get: (id) => records.get(id),
     list: () => records.list(),
     findForAccount: (repository, accountId, dockerHost = '') => records.findForAccount(repository, accountId, dockerHost),
-    add: (environment) => records.add(environment),
+    // Plan step 11E4c: the entry of a first open is `record createEnvironment` (hostOpenRecords); no other entry is added.
+    add: async () => {
+      throw new Error('The worker adds a registry entry only as the entry of a first open (record createEnvironment).');
+    },
     remove: (id, volumes = {}) => records.remove(id, volumes),
     forgetKeptVolumes: (names) => records.forgetKeptVolumes(names),
     // Plan step 11C3: the entries rebuilt from the volumes of the engine.
     restore: (entries) => records.restore(entries),
-    // The changes of an entry by the flows that still make them become specific requests when they move (plan steps 11D, 11E).
+    // The changes of an entry by the flows that still make them become specific requests when they move (plan steps 11D,
+    // 11E); plan step 11E4c: those of the open are the requests of hostOpenRecords.
     updateEnvironment: async () => {
       throw notInWorker('A change of a registry entry by a function', '11D or 11E');
     },
@@ -88,28 +92,26 @@ export function hostBusyMarks(records: HostSide['records']): EnvironmentBusyMark
  * Plan step 11E4b (decision of 2026-10-04): the registry writes of the open as requests to the extension, which applies
  * them with its owner, clock, account and view of the windows (`record createMark`, `record stepMark`, `record
  * ownerLogin`, `record lifecycleMark`, `record openFinished`). The worker sends neither the account of the owner, nor
- * the time of the last use, nor the liveness of the marks: the extension takes its own. The entry of a first open, the
- * configuration and the build records follow with plan step 11E4c; until then they fail closed.
+ * the time of the last use, nor the liveness of the marks: the extension takes its own. Plan step 11E4c: the entry of a
+ * first open (`record createEnvironment`: its ID, repository and configuration; the extension builds the rest), its
+ * removal (`record dropCreated`), the configuration (`record configuration`) and the build records (`record build`).
  */
 export function hostOpenRecords(host: HostSide): OpenRecords {
   const { records } = host;
   return {
-    createEnvironment: async () => {
-      throw notInWorker('The entry of a first open', '11E4c');
+    createEnvironment: async (environment) => {
+      const entry = await records.createEnvironment(environment.id, environment.repository, environment.configPath);
+      // The extension answered the environment of the repository that another window of the account created meanwhile:
+      // the open finds it and uses it (openFirst), as when the registry refuses a second one.
+      if (entry.id !== environment.id) throw new Error(`An environment of ${environment.repository} of the GitHub account exists already.`);
     },
-    dropCreated: async () => {
-      throw notInWorker('The removal of the entry of a refused first open', '11E4c');
-    },
+    dropCreated: (environmentId) => records.dropCreated(environmentId),
     createMark: (environmentId, kind, previous) => records.createMark(environmentId, kind, previous),
     takeStepMark: (environmentId, operation) => records.takeStepMark(environmentId, operation),
     releaseStepMark: (environmentId, mark) => records.releaseStepMark(environmentId, mark),
     ownerLogin: (environmentId) => records.ownerLogin(environmentId),
-    configuration: async () => {
-      throw notInWorker('A change of the configuration of an entry', '11E4c');
-    },
-    build: async () => {
-      throw notInWorker('A change of the build records of an entry', '11E4c');
-    },
+    configuration: (environmentId, change) => records.configuration(environmentId, change),
+    build: (environmentId, change) => records.build(environmentId, change),
     lifecycleMark: (environmentId, change) => records.lifecycleMark(environmentId, change),
     openFinished: (environmentId, finish) =>
       records.openFinished(environmentId, {

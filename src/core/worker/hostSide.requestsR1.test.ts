@@ -25,6 +25,10 @@ const mark = (fields: Partial<BusyMark> = {}): BusyMark => ({ operation: 'update
 function setup(fields: Partial<Environment> = {}, options: { allowed?: readonly HostCall[]; scope?: { environmentId?: string; dockerHost?: string }; windowStatuses?: WindowStatus[] } = {}) {
   const entries = new Map<string, Environment>([[ID, { id: ID, repository: 'acme/api', owner: { id: ACCOUNT.id, login: 'old' }, dockerHost: HOST, lastUsedAt: '2020-01-01T00:00:00.000Z', ...fields } as Environment]]);
   const registry = {
+    // Plan step 11E4c: requestOpenRecords takes `update` too (createEnvironment, dropCreated, configuration); not used here.
+    update: async () => {
+      throw new Error('The registry file is not used by these requests.');
+    },
     updateEnvironment: async (id: string, mutator: (entry: Environment) => void | Promise<void>) => {
       const found = entries.get(id);
       if (!found) return undefined;
