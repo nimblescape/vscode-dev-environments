@@ -33,6 +33,7 @@ import type { Environment } from '../../src/core/types';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
 import { EnvironmentService, type EnvironmentServiceDeps } from '../../src/core/pipeline/environmentService';
 import { EnvironmentOperations, type EnvironmentOperationsDeps } from '../../src/core/pipeline/environmentOperations';
+import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
@@ -375,11 +376,13 @@ export type PipelineTestDeps = EnvironmentServiceDeps & Pick<EnvironmentOperatio
  * operations of the window (EnvironmentOperations: Stop, the refresh and the opens that it sends to the worker).
  */
 export function pipelineWithOperations(deps: PipelineTestDeps): EnvironmentService & { operations: EnvironmentOperations } {
+  // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
+  const shared = { ...deps, lifecycleMemory: deps.lifecycleMemory ?? windowLifecycleMemory() };
   const operations = new EnvironmentOperations({
-    ...deps,
+    ...shared,
     // The engine of the tests runs; nothing to start.
     startDocker: deps.startDocker ?? (async () => {}),
     dockerRunning: () => deps.docker.isRunning(),
   });
-  return Object.assign(new EnvironmentService(deps), { operations });
+  return Object.assign(new EnvironmentService(shared), { operations });
 }

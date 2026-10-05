@@ -6,6 +6,7 @@
 // The registry and the session files are the real ones, in a temporary folder. Only test files
 // import this module.
 import { EnvironmentOperations, type EnvironmentOperationsDeps, type OperationFlow } from './environmentOperations';
+import { windowLifecycleMemory } from './lifecycleMemory';
 import type { DeleteConfirmation } from './deleteCheck';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -1561,6 +1562,8 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
     analyzer: inProcessAnalyzer,
     // Plan step 5, PR B (D1: no unlocked path): a lock that is always granted, for the tests that are not about it.
     environmentLock: h.lock.take,
+    // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
+    lifecycleMemory: windowLifecycleMemory(),
   } satisfies EnvironmentServiceDeps;
   h.service = new EnvironmentService({ ...common, ...overrides });
   // Plan step 11F1: the operations of the window (the extension's side) on the same registry, files and FakeDocker.
