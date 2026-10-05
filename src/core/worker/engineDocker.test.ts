@@ -10,7 +10,8 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import { silentLogger, type Logger } from '../ports';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineImage } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
-import { EngineDocker } from './engineDocker';
+import { EngineDocker, type PullLogins } from './engineDocker';
+import { credentialServerName } from '../imageCheck/reference';
 import { engineHijack } from '../../helperChannel/engineApi';
 import { dockerEngine } from '../../helperChannel/engineClient';
 
@@ -292,6 +293,165 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     const other = container({ id: 'r'.repeat(64), name: 'running', created: '2026-10-03T12:00:00Z' });
     const engine: DockerEngine = { ...unusedEngine(), containers: async () => [other, named] };
     expect((await new EngineDocker(engine).findContainer(ENV, NAME))?.id).toBe(named.id);
+  });
+
+  describe('pullImage with the logins of the operation (plan step 11E3b, decision B1)', () => {
+    /** Logins as registryLogins gives them: the secret slot holds the password only during `use`. */
+    function logins(answers: Record<string, { username?: string; identityToken?: boolean; password: string } | undefined>) {
+      const state = { slot: undefined as string | undefined, events: [] as string[] };
+      const run: PullLogins = async (registry, use) => {
+        state.events.push(`ask ${registry}`);
+        const login = answers[registry];
+        state.slot = login?.password;
+        try {
+          return await use(login);
+        } finally {
+          state.slot = undefined;
+          state.events.push('forget');
+        }
+      };
+      return { run, state };
+    }
+
+    function engineWith(state: { slot: string | undefined; events: string[] }) {
+      const pulls: unknown[] = [];
+      const engine: DockerEngine = {
+        ...unusedEngine(),
+        pull: async (reference, options) => {
+          // The header is sent while the operation still holds the login.
+          state.events.push(`pull ${reference} ${options?.login ? `with ${state.slot}` : 'anonymous'}`);
+          pulls.push([reference, options?.login]);
+        },
+      };
+      return { engine, pulls };
+    }
+
+    it('asks for the login of the registry of the reference, pulls with it during its turn, and the operation forgets it after', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_x' }, 'registry-1.docker.io': { identityToken: true, password: 'tok_y' } });
+      const { engine, pulls } = engineWith(state);
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {} });
+      await docker.pullImage('node:22', { onOutput: () => {} });
+      expect(state.events).toEqual(['ask ghcr.io', 'pull ghcr.io/o/i:1 with gho_x', 'forget', 'ask registry-1.docker.io', 'pull node:22 with tok_y', 'forget']);
+      expect(pulls).toEqual([
+        ['ghcr.io/o/i:1', { serveraddress: 'ghcr.io', username: 'octo', secretName: SECRET_REGISTRY }],
+        ['node:22', { serveraddress: credentialServerName('registry-1.docker.io'), identityToken: true, secretName: SECRET_REGISTRY }],
+      ]);
+    });
+
+    it('without a login anonymously; a reference that the parser refuses is not asked for; given credentials are used as they are (review round 1 of PR #110, A-L4: reworded)', async () => {
+      const { run, state } = logins({});
+      const { engine, pulls } = engineWith(state);
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? 'gho_given' : undefined), run);
+      await docker.pullImage('r.example/i:1', { onOutput: () => {} });
+      await docker.pullImage('UPPER/Case:1', { onOutput: () => {} });
+      await docker.pullImage('ghcr.io/o/i:1', { credentials: { registry: 'ghcr.io', username: 'octo', password: 'gho_given' }, onOutput: () => {} });
+      expect(state.events).toEqual(['ask r.example', 'pull r.example/i:1 anonymous', 'forget', 'pull UPPER/Case:1 anonymous', 'pull ghcr.io/o/i:1 with undefined']);
+      expect(pulls[2]).toEqual(['ghcr.io/o/i:1', { serveraddress: 'ghcr.io', username: 'octo', secretName: SECRET_REGISTRY }]);
+    });
+
+    it('a login that the registry refuses: once more without it in the same turn, with a warning; any other failure is no retry (review round 1 of PR #110, A-M1)', async () => {
+      for (const [refusal, retried] of [
+        [new EngineError('unauthorized: incorrect username or password', 500), true],
+        [new EngineError('Head "https://ghcr.io/v2/o/i/manifests/1": unauthorized', 500), true],
+        [new EngineError('forbidden', 403), true],
+        [new EngineError('pull access denied', 401), true],
+        // Review round 2 of PR #110 (A2-L-3): the containerd image store, ghcr.io and ECR.
+        [new EngineError('failed to resolve reference "ghcr.io/o/i:1": failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://ghcr.io/token: 403 Forbidden', 500), true],
+        [new EngineError('Head "https://ghcr.io/v2/o/i/manifests/1": denied', 500), true],
+        [new EngineError('denied: Your authorization token has expired. Reauthenticate and try again.', 500), true],
+        [new EngineError('manifest unknown', 404), false],
+        [new EngineError('pull access for o/i is not possible: repository does not exist or may require login (denied later)', 500), false],
+        [new Error('no space left on device'), false],
+      ] as const) {
+        const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
+        const warnings: string[] = [];
+        const engine: DockerEngine = {
+          ...unusedEngine(),
+          pull: async (reference, options) => {
+            state.events.push(`pull ${reference} ${options?.login ? `with ${state.slot}` : 'anonymous'}`);
+            if (options?.login) throw refusal;
+          },
+        };
+        const docker = new EngineDocker(engine, { ...silentLogger, warn: (text) => void warnings.push(text) }, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+        const pulled = docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {} });
+        if (retried) {
+          await pulled;
+          expect(state.events).toEqual(['ask ghcr.io', 'pull ghcr.io/o/i:1 with gho_old', 'pull ghcr.io/o/i:1 anonymous', 'forget']);
+          expect(warnings.join('\n')).toContain('refused the login of this computer for ghcr.io/o/i:1');
+          expect(warnings.join('\n')).not.toContain('gho_old');
+        } else {
+          await expect(pulled).rejects.toThrow(refusal.message);
+          expect(state.events).toEqual(['ask ghcr.io', 'pull ghcr.io/o/i:1 with gho_old', 'forget']);
+        }
+      }
+    });
+
+    it('a pull cancelled during its authenticated try is not tried again (review round 2 of PR #110)', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
+      const cancel = new AbortController();
+      let pulls = 0;
+      const engine: DockerEngine = {
+        ...unusedEngine(),
+        pull: async () => {
+          pulls++;
+          cancel.abort();
+          throw new EngineError('unauthorized', 401);
+        },
+      };
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await expect(docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {}, signal: cancel.signal })).rejects.toThrow('unauthorized');
+      expect(pulls).toBe(1);
+      expect(state.events.at(-1)).toBe('forget');
+    });
+
+    it('the pull without the refused login keeps the output and the signal of the pull (review round 1 of PR #110, B)', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
+      const seen: { login: boolean; signal: AbortSignal | undefined }[] = [];
+      const engine: DockerEngine = {
+        ...unusedEngine(),
+        pull: async (_reference, options) => {
+          seen.push({ login: options?.login !== undefined, signal: options?.signal });
+          if (options?.login) throw new EngineError('unauthorized', 401);
+          options?.onLine?.('done');
+        },
+      };
+      const output: string[] = [];
+      const signal = new AbortController().signal;
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await docker.pullImage('ghcr.io/o/i:1', { onOutput: (text) => void output.push(text), signal });
+      expect(seen).toEqual([
+        { login: true, signal },
+        { login: false, signal },
+      ]);
+      expect(output).toEqual(['done\n']);
+    });
+
+    it('a login only for a registry that the daemon reads the same way; the Docker Hub aliases and a port (review round 1 of PR #110, A-L2)', async () => {
+      const { run, state } = logins({ 'registry-1.docker.io': { username: 'hub', password: 'hub_x' }, 'localhost:5000': { username: 'local', password: 'local_x' } });
+      const { engine, pulls } = engineWith(state);
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      // Review round 2 of PR #110 (A2-L-2): also an upper-case first part without a dot or a colon (a host to Docker).
+      for (const reference of ['Docker.io/library/node:22', 'INDEX.DOCKER.IO/library/node:22', ' node:22', 'node:22 ', 'MyHost/img:1', 'LOCALHOST/img:1']) {
+        await docker.pullImage(reference, { onOutput: () => {} }).catch(() => undefined);
+      }
+      expect(state.events.filter((event) => event.startsWith('ask'))).toEqual([]);
+      for (const reference of ['docker.io/library/node:22', 'index.docker.io/library/node:22', 'localhost:5000/team/app:1']) {
+        await docker.pullImage(reference, { onOutput: () => {} });
+      }
+      expect(state.events.filter((event) => event.startsWith('ask'))).toEqual(['ask registry-1.docker.io', 'ask registry-1.docker.io', 'ask localhost:5000']);
+      expect(pulls.at(-1)).toEqual(['localhost:5000/team/app:1', { serveraddress: credentialServerName('localhost:5000'), username: 'local', secretName: SECRET_REGISTRY }]);
+      expect(credentialServerName('localhost:5000')).toBe('localhost:5000');
+    });
+
+    it('a failed pull still ends its turn (the login is forgotten) and fails', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_x' } });
+      const engine: DockerEngine = { ...unusedEngine(), pull: async () => Promise.reject(new Error('manifest unknown')) };
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await expect(docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {} })).rejects.toThrow('manifest unknown');
+      expect(state.events).toEqual(['ask ghcr.io', 'forget']);
+      expect(state.slot).toBeUndefined();
+    });
   });
 
   it('pullImage: anonymous, or with the registry secret that the operation holds, and the lines as output', async () => {

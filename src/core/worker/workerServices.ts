@@ -27,7 +27,7 @@ import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessio
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import type { OpenRecords } from '../pipeline/openRecords';
 import type { LifecycleMemory } from '../pipeline/lifecycleMemory';
-import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
+import { abortError, systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
 import { forgetRecord, sendHeartbeat } from './monitorFlow';
@@ -204,23 +204,43 @@ export function registryLogins(
   let queue: Promise<unknown> = Promise.resolve();
   // `use` must not ask for a login itself (it would wait for its own turn).
   return (registry, use, signal) => {
-    const run = queue.then(async () => {
+    const previous = queue;
+    const run = (async () => {
+      // Review round 1 of PR #110 (A-L1): the wait for the turn ends with a cancel (an AbortError; review round 2 of PR
+      // #109, A2-L2: a login whose user gave up is not asked); nothing was asked then, so nothing is forgotten.
+      await turnOf(previous, signal);
       try {
         let login: RegistryLogin | undefined;
         try {
-          // Review round 2 of PR #109 (A2-L1): a login whose user gave up while it waited is not asked.
-          if (!signal?.aborted) login = await host.secrets.registry(registry);
+          login = await host.secrets.registry(registry);
         } catch (error) {
           log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
         }
+        if (signal?.aborted) throw abortError();
         return await use(login);
       } finally {
         forget();
       }
-    });
-    queue = run.catch(() => undefined);
+    })();
+    // The next turn waits for this one and for the one before it (a cancelled wait ends before the turn before it).
+    // Review round 2 of PR #110 (A2-L-1): the queue keeps no value of a turn (a login that `use` gave back).
+    queue = Promise.allSettled([previous, run]).then(() => undefined);
     return run;
   };
+}
+
+/** Review round 1 of PR #110 (A-L1): resolves when `previous` settled; rejects with an AbortError when `signal` aborts first. */
+function turnOf(previous: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  if (signal === undefined) return previous.then(() => undefined, () => undefined);
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(abortError());
+    signal.addEventListener('abort', aborted, { once: true });
+    previous.then(
+      () => (signal.removeEventListener('abort', aborted), resolve()),
+      () => (signal.removeEventListener('abort', aborted), resolve()),
+    );
+  });
 }
 
 /**
@@ -331,7 +351,10 @@ export function workerServices(deps: WorkerServicesDeps): { service: Environment
 
 /** The deps of EnvironmentService in the worker (workerServices; review round 1 of 11B3b: apart, for their tests). */
 export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceDeps & { helper: WorkspaceHelper; docker: EngineDocker } {
-  const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf);
+  // Plan step 11E3b: one queue of registry logins for the operation, shared by its pulls and its image check (they share the
+  // one registry secret; review round 1 of PR #109, A-H1).
+  const logins = registryLogins(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger);
+  const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf, logins);
   const helper = new WorkspaceHelper({
     docker: {
       run: async () => {
@@ -398,7 +421,7 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     },
     // Plan step 11E3a: the image update check in the worker, over its own HTTPS (through the proxy of the daemon, decision
     // C1) with the login of each registry asked when it is needed and forgotten after its use (decision B1).
-    imageChecker: workerImageChecker(deps),
+    imageChecker: workerImageChecker(deps, logins),
     auth: hostAuth(deps.host, deps.logger),
     ui: hostUi(deps.host.questions, deps.logger),
     logger: deps.logger,

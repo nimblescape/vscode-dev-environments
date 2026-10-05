@@ -546,7 +546,9 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       }, silentLogger);
       const provider = hostRegistryCredentials(logins);
       const both = Promise.all([provider('a.example'), provider('b.example')]);
-      await Promise.resolve();
+      // Review round 1 of PR #110 (A-L1): changed wait, the turn takes a few more steps (a cancelable wait; before: one).
+      for (let i = 0; i < 10 && events.length === 0; i++) await Promise.resolve();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
       // Only the first is asked while it is open.
       expect(events).toEqual(['ask a.example']);
       pending.shift()!();
@@ -559,7 +561,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       expect(events).toEqual(['ask a.example', 'forget', 'ask b.example', 'forget']);
     });
 
-    it('a login whose user gave up while it waited is not asked; its turn still ends with the forget (review round 2 of PR #109, A2-L1)', async () => {
+    it('a login whose user gave up while it waited is not asked, and nothing is forgotten (review round 2 of PR #109, A2-L1)', async () => {
       const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
       let forgotten = 0;
       const provider = hostRegistryCredentials(registryLogins(side.host, () => void forgotten++, silentLogger));
@@ -567,9 +569,108 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       gaveUp.abort();
       expect(await provider('ghcr.io', gaveUp.signal)).toBeUndefined();
       expect(side.asked).toEqual([]);
-      expect(forgotten).toBe(1);
+      // Review round 1 of PR #110 (A-L1): changed expectation, nothing was asked, so nothing is forgotten (before: 1).
+      expect(forgotten).toBe(0);
       expect(await provider('ghcr.io', new AbortController().signal)).toEqual({ username: 'octo', password: 'p1' });
       expect(side.asked).toEqual(['ghcr.io']);
+    });
+
+    it("the pipeline's pulls ask the login of their registry through the operation and forget the registry secret (plan step 11E3b)", async () => {
+      const asked: string[] = [];
+      const forgotten: string[] = [];
+      let slot: string | undefined;
+      const side = {
+        secrets: {
+          registry: async (registry: string) => {
+            asked.push(registry);
+            slot = 'gho_x';
+            return { username: 'octo', serveraddress: registry, password: 'gho_x' };
+          },
+        },
+      } as unknown as HostSide;
+      const logins: string[] = [];
+      const all = workerServiceDeps({
+        host: side,
+        engine: { ...unusedEngine(), pull: async (_reference, options) => void logins.push(`${options?.login?.secretName} ${slot}`) },
+        secretOf: (name) => (name === 'registry' ? slot : undefined),
+        forgetSecret: (name) => {
+          forgotten.push(name);
+          slot = undefined;
+        },
+        logger: silentLogger,
+        ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
+        dockerHost: '',
+        owner: { windowId: 'w', pid: 1 },
+        environmentLock: async () => Promise.reject(new Error('no lock in this test')),
+      });
+      await all.docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {} });
+      expect(asked).toEqual(['ghcr.io']);
+      expect(logins).toEqual(['registry gho_x']);
+      expect(forgotten).toEqual(['registry']);
+    });
+
+    it('a turn whose user cancels while it waits ends at once, without a request; the turns after it keep their order (review round 1 of PR #110, A-L1)', async () => {
+      const events: string[] = [];
+      let release: () => void = () => {};
+      const side = {
+        secrets: {
+          registry: (registry: string) =>
+            new Promise((resolve) => {
+              events.push(`ask ${registry}`);
+              release = () => resolve({ username: 'u', serveraddress: registry, password: `p-${registry}` });
+            }),
+        },
+      } as unknown as HostSide;
+      const logins = registryLogins(side, () => void events.push('forget'), silentLogger);
+      const first = logins('a.example', async (login) => login?.password);
+      const cancel = new AbortController();
+      const second = logins('b.example', async (login) => login?.password, cancel.signal);
+      const third = logins('c.example', async (login) => login?.password);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      cancel.abort();
+      await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+      // The first still holds its turn: the third waits for it.
+      expect(events).toEqual(['ask a.example']);
+      release();
+      expect(await first).toBe('p-a.example');
+      for (let i = 0; i < 20 && events.length < 3; i++) await Promise.resolve();
+      release();
+      expect(await third).toBe('p-c.example');
+      expect(events).toEqual(['ask a.example', 'forget', 'ask c.example', 'forget']);
+    });
+
+    it('an abort during the request of a login: AbortError, no use, and the login is forgotten (review round 2 of PR #110)', async () => {
+      const cancel = new AbortController();
+      let forgotten = 0;
+      let used = 0;
+      const side = {
+        secrets: {
+          registry: async (registry: string) => {
+            cancel.abort();
+            return { username: 'u', serveraddress: registry, password: 'p' };
+          },
+        },
+      } as unknown as HostSide;
+      const logins = registryLogins(side, () => void forgotten++, silentLogger);
+      await expect(logins('a.example', async () => void used++, cancel.signal)).rejects.toMatchObject({ name: 'AbortError' });
+      expect({ forgotten, used }).toEqual({ forgotten: 1, used: 0 });
+      // The next turn still runs.
+      expect(await logins('b.example', async (login) => login?.password)).toBe('p');
+    });
+
+    it("the worker never passes credentials of its own to a pull (they would bypass the turns; review round 1 of PR #110, A-L3)", () => {
+      const all = workerServiceDeps({
+        host: {} as HostSide,
+        engine: unusedEngine(),
+        secretOf: () => undefined,
+        forgetSecret: () => undefined,
+        logger: silentLogger,
+        ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
+        dockerHost: '',
+        owner: { windowId: 'w', pid: 1 },
+        environmentLock: async () => Promise.reject(new Error('no lock in this test')),
+      });
+      expect(all.pullCredentials).toBeUndefined();
     });
 
     it('a use that fails still forgets, and the next login is still asked', async () => {
