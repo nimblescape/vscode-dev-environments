@@ -100,7 +100,6 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       token: () => answer('token'),
       registry: (registry) => answer('registry', registry),
     },
-    connect: { connect: (data) => answer('connect', data) },
   };
   return { host, calls };
 }
@@ -180,16 +179,18 @@ describe('the core services in the worker (plan step 11B3b)', () => {
     await expect(files.readReopen()).rejects.toThrow('before plan step 11E');
   });
 
-  it('the account and the token of the sign-in come from the extension; a dialog for the token and a rejected token stay here', async () => {
+  // Plan step 11E6: changed, the token is asked without a dialog also for `interactive` (the extension signed in before it
+  // sent the open), so it is asked twice here.
+  it('the account and the token of the sign-in come from the extension; no dialog for the token; a rejected token stays here', async () => {
     const warnings: string[] = [];
     const logger: Logger = { ...silentLogger, warn: (text) => warnings.push(text) };
     const { host, calls } = fakeHost({ account: { id: '42', login: 'octo' }, token: 'ghp_x' });
     const auth = hostAuth(host, logger);
     expect(await auth.getAccount({ interactive: true })).toEqual({ id: '42', login: 'octo' });
     expect(await auth.getToken({ interactive: false })).toBe('ghp_x');
-    await expect(auth.getToken({ interactive: true })).rejects.toThrow('before plan step 11E');
+    expect(await auth.getToken({ interactive: true })).toBe('ghp_x');
     auth.reportRejectedToken?.('ghp_x');
-    expect(calls).toEqual(['account true', 'token']);
+    expect(calls).toEqual(['account true', 'token', 'token']);
     expect(warnings).toEqual(['GitHub rejected the token of the operation.']);
     expect(warnings.join()).not.toContain('ghp_x');
   });

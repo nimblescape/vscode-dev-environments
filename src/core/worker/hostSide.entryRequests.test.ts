@@ -9,7 +9,7 @@
 // environment that it created; and the removal of the generic `record update` and the loose `record add`. No operation
 // sends them before plan step 11E6, so the handler runs here with an explicit allowance.
 import { describe, expect, it } from 'vitest';
-import { OP_DELETE } from '../helperChannel/protocol';
+import { OP_DELETE, OP_OPEN } from '../helperChannel/protocol';
 import { composeProjectName, environmentImageName, resourceName } from '../names';
 import { registryBusyMarks, type BusyMarkView } from '../pipeline/busyMarks';
 import type { BuildChange, ConfigurationChange } from '../pipeline/openRecords';
@@ -127,9 +127,11 @@ function setup(
 const firstOpen = (entries: readonly Environment[] = [], options: { kept?: KeptVolume[] } = {}) => setup(entries, { ...options, scope: { repository: REPOSITORY, dockerHost: HOST } });
 
 describe('the entry of a first open, the configuration and the build records as requests (plan step 11E4c)', () => {
-  it('no operation may send them before plan step 11E6; `record update` and `record add` are gone', async () => {
-    for (const allowed of Object.values(FLOW_REQUESTS)) {
-      expect(allowed.filter((call) => /^record (createEnvironment|dropCreated|configuration|build|update|add)\b/.test(call))).toEqual([]);
+  // Plan step 11E6: changed, the operation `open` sends them (and no other operation); `update` and `add` none.
+  it('only the operation open may send them; `record update` and `record add` are gone', async () => {
+    for (const [op, allowed] of Object.entries(FLOW_REQUESTS)) {
+      const open = allowed.filter((call) => /^record (createEnvironment|dropCreated|configuration|build|update|add)\b/.test(call));
+      expect(open, op).toEqual(op === OP_OPEN ? ['record createEnvironment', 'record dropCreated', 'record configuration', 'record build'] : []);
     }
     expect(SCOPED_REQUESTS).not.toHaveProperty(['record update']);
     expect(SCOPED_REQUESTS).toMatchObject({ 'record dropCreated': 0, 'record configuration': 0, 'record build': 0 });

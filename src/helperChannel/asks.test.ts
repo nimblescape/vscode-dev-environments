@@ -102,7 +102,9 @@ describe('named secrets and requests in the protocol (plan step 11A)', () => {
     ]) {
       expect(parseClientMessage(line), line).toBeUndefined();
     }
-    expect(['question', 'local', 'record', 'secret', 'connect'].every(isAskKind)).toBe(true);
+    // Plan step 11E6 (decision A1 of 2026-10-05): changed, `connect` is no request kind any more.
+    expect(['question', 'local', 'record', 'secret'].every(isAskKind)).toBe(true);
+    expect(isAskKind('connect')).toBe(false);
     expect(isAskKind('docker')).toBe(false);
   });
 

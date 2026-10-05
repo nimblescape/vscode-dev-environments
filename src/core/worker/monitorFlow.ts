@@ -7,7 +7,7 @@
 // heartbeat, its image settings and image list (on the input of the command), and Delete's `forget`. Before, the
 // extension ran them as `docker exec` through the relay, and `docker exec -i` directly. Pure over the port; no `vscode`.
 import { errorMessage } from '../errors';
-import { MAX_MONITOR_DETAIL_LENGTH, type HeartbeatValue, type MonitorSettingsParams } from '../helperChannel/protocol';
+import { MAX_MONITOR_DETAIL_LENGTH, type HeartbeatValue } from '../helperChannel/protocol';
 import {
   REMOTE_MONITOR_CONTAINER,
   forgetCommand,
@@ -17,6 +17,7 @@ import {
   isUnderRecordsLock,
   monitorExecFailure,
   type HeartbeatInput,
+  type ImageSettings,
 } from '../remoteMonitor/protocol';
 import { EngineError, isMissing, type DockerEngine } from './dockerEngine';
 
@@ -56,8 +57,11 @@ export function sendHeartbeat(engine: DockerEngine, input: HeartbeatInput, signa
   return monitorCommand(engine, heartbeatCommand(input), { signal, ...(container !== undefined ? { container } : {}) });
 }
 
-/** The image settings or the image list for the monitor (`monitor.js settings -` or `images -`, JSON on the input). */
-export function sendMonitorSettings(engine: DockerEngine, params: MonitorSettingsParams, signal?: AbortSignal, container?: string): Promise<HeartbeatValue> {
+/**
+ * The image settings or the image list for the monitor (`monitor.js settings -` or `images -`, JSON on the input). Plan
+ * step 11E6 (decision D1 of 2026-10-05): the open gives them after its ensure (giveMonitorImages).
+ */
+export function sendMonitorSettings(engine: DockerEngine, params: { settings: ImageSettings } | { repositories: string[] }, signal?: AbortSignal, container?: string): Promise<HeartbeatValue> {
   const named = container !== undefined ? { container } : {};
   return 'settings' in params
     ? monitorCommand(engine, imageSettingsCommand(), { input: JSON.stringify(params.settings), signal, ...named })

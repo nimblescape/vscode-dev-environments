@@ -4,13 +4,15 @@
 
 // Review B, round 1 of plan step 11D1 (mutation probes): the requests that the monitor operations may send.
 import { describe, expect, it } from 'vitest';
-import { OP_HEARTBEAT, OP_MONITOR_SETTINGS, OP_RECORD_GIT_STATE } from '../helperChannel/protocol';
+import { OP_HEARTBEAT, OP_RECORD_GIT_STATE } from '../helperChannel/protocol';
 import { FLOW_REQUESTS } from './hostSide';
 
 describe('FLOW_REQUESTS of the monitor operations (review B-R1 probes, plan step 11D1)', () => {
-  it('heartbeat and monitorSettings send nothing; recordGitState only reads and records its environment (HS3, HS4, HS5)', () => {
+  // Plan step 11E6 (decision D1 of 2026-10-05): changed, `monitorSettings` is removed (its settings and list come with the
+  // open), so its line is gone.
+  it('heartbeat sends nothing; recordGitState only reads and records its environment (HS3, HS4, HS5)', () => {
     expect(FLOW_REQUESTS[OP_HEARTBEAT] ?? []).toEqual([]);
-    expect(FLOW_REQUESTS[OP_MONITOR_SETTINGS] ?? []).toEqual([]);
+    expect(FLOW_REQUESTS.monitorSettings).toBeUndefined();
     expect([...FLOW_REQUESTS[OP_RECORD_GIT_STATE]].sort()).toEqual(['record get', 'record recordGitSummary']);
   });
 });

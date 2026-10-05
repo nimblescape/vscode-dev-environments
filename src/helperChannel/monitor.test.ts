@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 11D1 (decisions of 2026-10-03 and 2026-10-04): the operations `heartbeat`, `monitorSettings` and
-// `recordGitState` of the worker, with a small engine in memory; `recordGitState` with a fake extension behind its handler
-// (the requests that it may send, for its environment only).
+// Plan step 11D1 (decisions of 2026-10-03 and 2026-10-04): the operations `heartbeat` and `recordGitState` of the worker
+// (plan step 11E6, decision D1 of 2026-10-05: the image settings and list of `monitorSettings` come with the open,
+// giveMonitorImages), with a small engine in memory; `recordGitState` with a fake extension behind its handler (the
+// requests that it may send, for its environment only).
 import { describe, expect, it } from 'vitest';
 import { OP_RECORD_GIT_STATE, type AskKind } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
@@ -16,7 +17,7 @@ import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { OwnHelper } from '../core/worker/ownHelper';
-import { heartbeatOperation, monitorSettingsOperation, recordGitStateOperation } from './flowOperations';
+import { contextLogger, giveMonitorImages, heartbeatOperation, recordGitStateOperation } from './flowOperations';
 import { contextSecrets } from './operationContext.testkit';
 import type { OperationContext } from './server';
 
@@ -90,23 +91,29 @@ describe('the operations of the Session Monitor in the worker (plan step 11D1)',
     await expect(heartbeatOperation(() => hanging.engine)({ heartbeat: HEARTBEAT }, aborting.context)).rejects.toMatchObject({ code: 'cancelled' });
   });
 
-  it('monitorSettings: gives the settings or the list to the monitor; a failure is logged and answered as not sent', async () => {
+  // Plan step 11E6 (decision D1 of 2026-10-05): changed, the operation `monitorSettings` is removed; the open gives the
+  // settings and the list after its ensure (giveMonitorImages), with the same commands and the same log lines.
+  it('the image settings and the list of an open go to the monitor; a failure is logged and the list counts as not sent', async () => {
     const { engine, execs } = engineOf(ok);
     const settings = { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'UTC' };
-    expect(await monitorSettingsOperation(() => engine)({ settings }, contextOf().context)).toEqual({ sent: true });
-    expect(execs[0].options?.input).toBe(JSON.stringify(settings));
+    const { context } = contextOf();
+    expect(await giveMonitorImages(engine, { images: settings, repositories: ['ghcr.io/acme/app'] }, contextLogger(context), context.signal)).toBe(true);
+    expect(execs.map((exec) => exec.options?.input)).toEqual([JSON.stringify(settings), JSON.stringify({ repositories: ['ghcr.io/acme/app'] })]);
+    // Without prefixes no settings, and without a list nothing more.
+    const none = engineOf(ok);
+    expect(await giveMonitorImages(none.engine, { images: { ...settings, prefixes: [] } }, contextLogger(context), context.signal)).toBe(false);
+    expect(none.execs).toEqual([]);
     const failing = engineOf(async () => ({ exitCode: 2, stdout: '', stderr: 'Invalid image list.', timedOut: false }));
-    const { context, lines } = contextOf();
-    expect(await monitorSettingsOperation(() => failing.engine)({ repositories: ['ghcr.io/acme/app'] }, context)).toEqual({ sent: false });
-    expect(lines).toEqual(['The image list could not be given to the Session Monitor: Invalid image list.']);
-    await expect(monitorSettingsOperation(() => engine)({ settings, repositories: [] }, contextOf().context)).rejects.toMatchObject({ code: 'invalid' });
+    const logged = contextOf();
+    expect(await giveMonitorImages(failing.engine, { images: { ...settings, prefixes: [] }, repositories: ['ghcr.io/acme/app'] }, contextLogger(logged.context), logged.context.signal)).toBe(false);
+    expect(logged.lines).toEqual(['The image list could not be given to the Session Monitor: Invalid image list.']);
   });
 
   function recordGitState(setup: { container?: 'running' | 'stopped' | 'missing'; record?: Environment | null; params?: Record<string, unknown> } = {}) {
     const asks: { kind: AskKind; call: string; args: unknown[] }[] = [];
     const record = setup.record === undefined ? ENVIRONMENT : setup.record;
     const answer = (kind: AskKind, call: string) => async (...args: unknown[]) => (asks.push({ kind, call, args }), call === 'get' ? (record ?? undefined) : undefined);
-    const host = { records: { get: answer('record', 'get'), recordGitSummary: answer('record', 'recordGitSummary') }, questions: {}, state: {}, secrets: {}, connect: {} } as unknown as HostSide;
+    const host = { records: { get: answer('record', 'get'), recordGitSummary: answer('record', 'recordGitSummary') }, questions: {}, state: {}, secrets: {} } as unknown as HostSide;
     const handler = hostSideHandler(host, silentLogger, FLOW_REQUESTS[OP_RECORD_GIT_STATE], { environmentId: ID });
     const { context } = contextOf(async (kind, payload) => (await handler(kind, payload, new AbortController().signal)).value);
     const state = setup.container ?? 'running';

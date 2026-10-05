@@ -7,6 +7,7 @@
 // over `ask`; no I/O of its own, no `vscode`.
 import { BUSY_OPERATIONS, type BusyMarkResult } from '../pipeline/busyMarks';
 import type { BuildChange, StepMarkResult } from '../pipeline/openRecords';
+import { LIFECYCLE_UNKNOWN } from '../pipeline/lifecycleMemory';
 import type { BusyMark, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
 import { isGitHubLogin, type GitHubViewer } from '../helper/containerGit';
@@ -172,7 +173,8 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       unrecordedLifecycle: async (environmentId) => {
         const answer = await call('local', 'unrecordedLifecycle', environmentId);
         if (answer === null) return undefined;
-        if (typeof answer !== 'string' || !/^[0-9a-f]{12,64}$/.test(answer)) throw new Error('The extension answered the remembered container with an invalid value.');
+        // Plan step 11E6: or LIFECYCLE_UNKNOWN, when the window does not know which container it is.
+        if (typeof answer !== 'string' || (answer !== LIFECYCLE_UNKNOWN && !/^[0-9a-f]{12,64}$/.test(answer))) throw new Error('The extension answered the remembered container with an invalid value.');
         return answer;
       },
       account: async (interactive) => {
@@ -234,9 +236,6 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
           password,
         };
       },
-    },
-    connect: {
-      connect: async (data) => void (await call('connect', 'connect', data)),
     },
   };
 }

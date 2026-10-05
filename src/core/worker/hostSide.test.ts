@@ -6,7 +6,7 @@
 // requests, hostSideHandler answers them. Here they are wired to each other, so one test covers both.
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
 import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import type { GitHubViewer } from '../helper/containerGit';
@@ -28,7 +28,7 @@ const ALL: readonly HostCall[] = [
   'secret token',
   'secret registry',
   'secret unknown',
-  'connect connect',
+  // Plan step 11E6 (decision A1 of 2026-10-05): changed, `connect connect` is gone with the request kind `connect`.
 ];
 const STATUS = { windowId: 'w1', environmentId: 'e1' } as unknown as WindowStatus;
 
@@ -93,9 +93,6 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
     secrets: {
       token: async () => (record('token'), of('token', undefined)),
       registry: async (registry) => (record('registry', registry), of('registry', undefined)),
-    },
-    connect: {
-      connect: async (data) => void record('connect', data),
     },
   };
   return { host, calls };
@@ -225,13 +222,6 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
     const { worker } = wired({ registry: { identityToken: true, serveraddress: 'reg.example', password: 'refresh-token' } });
     expect(await worker.secrets.registry('reg.example')).toEqual({ identityToken: true, serveraddress: 'reg.example', password: 'refresh-token' });
   });
-
-  it('connects the window at the end of an open', async () => {
-    const { worker, calls, requests } = wired();
-    await worker.connect.connect({ environmentId: 'e1', container: 'c1', user: 'dev', folder: '/workspaces/app' });
-    expect(requests.at(-1)).toMatchObject({ kind: 'connect', call: 'connect' });
-    expect(calls.at(-1)).toEqual({ call: 'connect', args: [{ environmentId: 'e1', container: 'c1', user: 'dev', folder: '/workspaces/app' }] });
-  });
 });
 
 describe('the handler of the requests on the side of the extension (plan step 11B)', () => {
@@ -248,6 +238,7 @@ describe('the handler of the requests on the side of the extension (plan step 11
       ['record', { call: 'forgetKeptVolumes', args: [[1]] }],
       ['record', { call: 'sessionFile', args: ['writeEverything', 'e1'] }],
       ['secret', { call: 'unknown', args: [] }],
+      // Plan step 11E6 (decision A1 of 2026-10-05): `connect` is no request kind any more (refused all the same).
       ['connect', { call: 'connect', args: ['x'] }],
       ['question', { call: 'Bad-Call', args: [] }],
       ['question', { args: [] }],
@@ -273,7 +264,7 @@ describe('the handler of the requests on the side of the extension (plan step 11
       ['question', { call: 'recreateContainer', args: ['acme/app', null] }],
       ['secret', { call: 'registry', args: [42] }],
     ] as const) {
-      const thrown = await handler(kind, payload, signal).catch((error: unknown) => error);
+      const thrown = await handler(kind as AskKind, payload, signal).catch((error: unknown) => error);
       expect((thrown as HelperOperationError).code, JSON.stringify(payload)).toBe('invalid');
     }
     expect(calls).toEqual([]);

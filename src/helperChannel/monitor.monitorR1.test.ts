@@ -2,7 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Review B, round 1 of plan step 11D1 (mutation probes): the operations monitorSettings and recordGitState.
+// Review B, round 1 of plan step 11D1 (mutation probes): the operations monitorSettings and recordGitState (plan step
+// 11E6, decision D1 of 2026-10-05: the image settings and list come with the open, giveMonitorImages).
 import { describe, expect, it } from 'vitest';
 import { LOCK_UNAVAILABLE_CODE, OP_RECORD_GIT_STATE, type AskKind } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
@@ -13,7 +14,7 @@ import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { OwnHelper } from '../core/worker/ownHelper';
-import { monitorSettingsOperation, recordGitStateOperation } from './flowOperations';
+import { contextLogger, giveMonitorImages, recordGitStateOperation } from './flowOperations';
 import { contextSecrets } from './operationContext.testkit';
 import type { OperationContext } from './server';
 
@@ -69,7 +70,7 @@ const aborted = () => Promise.reject(Object.assign(new Error('aborted'), { name:
 function recordGitState(setup: { secrets?: Record<string, string>; ownHelperOf?: (controller: AbortController) => Promise<OwnHelper>; exec?: (controller: AbortController) => Promise<Exec> } = {}) {
   const asks: { kind: AskKind; call: string }[] = [];
   const answer = (kind: AskKind, call: string) => async () => (asks.push({ kind, call }), call === 'get' ? ENVIRONMENT : undefined);
-  const host = { records: { get: answer('record', 'get'), recordGitSummary: answer('record', 'recordGitSummary') }, questions: {}, state: {}, secrets: {}, connect: {} } as unknown as HostSide;
+  const host = { records: { get: answer('record', 'get'), recordGitSummary: answer('record', 'recordGitSummary') }, questions: {}, state: {}, secrets: {} } as unknown as HostSide;
   const handler = hostSideHandler(host, silentLogger, FLOW_REQUESTS[OP_RECORD_GIT_STATE], { environmentId: ID });
   const { context, controller } = contextOf(async (kind, payload) => (await handler(kind, payload, new AbortController().signal)).value, setup.secrets);
   const containers: EngineContainer[] = [{ id: 'c'.repeat(64), name: NAME, state: 'running', rawState: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ID }, image: `${NAME}:1` }];
@@ -85,26 +86,22 @@ function recordGitState(setup: { secrets?: Record<string, string>; ownHelperOf?:
 }
 
 describe('the monitor operations (review B-R1 probes, plan step 11D1)', () => {
-  it('monitorSettings: refuses a secret before anything runs (FO7)', async () => {
-    const { engine, execs } = engineOf(ok);
-    await expect(monitorSettingsOperation(() => engine)({ settings: SETTINGS }, contextOf(undefined, { token: 'gho_x' }).context)).rejects.toMatchObject({ code: 'invalid' });
-    expect(execs).toEqual([]);
-  });
-
-  it('monitorSettings: passes the signal on; a cancel is cancelled (FO9, FO10)', async () => {
+  // Plan step 11E6 (decision D1 of 2026-10-05): changed, `monitorSettings` is removed (FO7, a secret, is the open's check
+  // now: openOperation refuses one); the open gives the settings and the list after its ensure (giveMonitorImages).
+  it('the images of an open: the signal is passed on; a cancel ends them (FO9, FO10)', async () => {
     const { engine, execs } = engineOf(ok);
     const { context } = contextOf();
-    await monitorSettingsOperation(() => engine)({ settings: SETTINGS }, context);
+    await giveMonitorImages(engine, { images: SETTINGS }, contextLogger(context), context.signal);
     expect(execs[0].options?.signal).toBe(context.signal);
     const aborting = contextOf();
     const hanging = engineOf(() => (aborting.controller.abort(), aborted()));
-    await expect(monitorSettingsOperation(() => hanging.engine)({ settings: SETTINGS }, aborting.context)).rejects.toMatchObject({ code: 'cancelled' });
+    await expect(giveMonitorImages(hanging.engine, { images: SETTINGS }, contextLogger(aborting.context), aborting.context.signal)).rejects.toMatchObject({ name: 'AbortError' });
   });
 
-  it('monitorSettings: a failure of the settings is logged as a warning that names them (FO8, FO12)', async () => {
+  it('the images of an open: a failure of the settings is logged as a warning that names them (FO8, FO12)', async () => {
     const failing = engineOf(async () => ({ exitCode: 2, stdout: '', stderr: 'Invalid settings.', timedOut: false }));
     const { context, lines } = contextOf();
-    expect(await monitorSettingsOperation(() => failing.engine)({ settings: SETTINGS }, context)).toEqual({ sent: false });
+    expect(await giveMonitorImages(failing.engine, { images: SETTINGS }, contextLogger(context), context.signal)).toBe(false);
     expect(lines).toEqual([{ text: 'The image settings could not be given to the Session Monitor: Invalid settings.', level: 'warn' }]);
   });
 

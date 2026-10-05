@@ -468,7 +468,7 @@ export class Controller implements vscode.Disposable {
             repository,
             cancellable: true,
             task: async (progress, signal) => {
-              await this.deps.service.openEnvironment(environment.id, { progress, signal });
+              await this.deps.service.openEnvironmentInWorker(environment.id, { progress, signal });
             },
           }),
         { retry: () => this.start({ kind: 'environment', environmentId: environment.id }) },
@@ -1194,10 +1194,10 @@ export class Controller implements vscode.Disposable {
                 }
               }
               if (environment) {
-                result = await service.openEnvironment(environment.id, { progress, signal, configPath: options.configPath });
+                result = await service.openEnvironmentInWorker(environment.id, { progress, signal, configPath: options.configPath });
               } else {
                 const trusted = await this.firstOpenTrust(repository);
-                result = await service.open(repositoryTarget(repository, target.info, trusted), {
+                result = await service.openInWorker(repositoryTarget(repository, target.info, trusted), {
                   progress,
                   signal,
                   configPath: options.configPath,
@@ -1416,7 +1416,7 @@ export class Controller implements vscode.Disposable {
           task: async (progress, signal) => {
             // The window is not connected to this environment, so it does not connect (the container runs until the
             // Session Monitor stops it).
-            await this.deps.service.openEnvironment(environment.id, {
+            await this.deps.service.openEnvironmentInWorker(environment.id, {
               progress,
               signal,
               forceRebuild: true,
@@ -1733,7 +1733,7 @@ export class Controller implements vscode.Disposable {
           cancellable: true,
           task: (progress, signal) =>
             this.connectingFlow(false, async (request) => {
-              const result = await this.deps.service.openEnvironment(environment.id, {
+              const result = await this.deps.service.openEnvironmentInWorker(environment.id, {
                 progress,
                 signal,
                 forceRebuild: true,

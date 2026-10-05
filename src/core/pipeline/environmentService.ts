@@ -71,6 +71,8 @@ import {
   OP_DELETE,
   OP_DELETE_CHECK,
   OP_LIST_CONFIGURATIONS,
+  OP_OPEN,
+  OPEN_PROGRESS_DETAIL,
   OP_RECONCILE,
   OP_STOP,
   OP_WINDOW_STATE,
@@ -82,13 +84,17 @@ import {
   parseReconcileParams,
   parseReconcileValue,
   parseListConfigurationsValue,
+  parseOpenParams,
+  parseOpenValue,
   parseStopParams,
   parseStopValue,
   parseWindowStateParams,
   parseWindowStateValue,
   type FlowRefusal,
+  type OpenParams,
   type WindowStateValue,
 } from '../helperChannel/protocol';
+import type { ImageSettings } from '../remoteMonitor/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
@@ -258,7 +264,7 @@ import {
   type ImageCheckState,
 } from './pipelineRules';
 import { otherWindowMarkIsLive, readLiveness, registryOpenRecords, sameBusyMark, type MarkLiveness, type OpenRecords } from './openRecords';
-import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
+import { LIFECYCLE_UNKNOWN, rememberedFor, windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
 import type { PullCredentials, PullCredentialsProvider } from './pullCredentials';
 
 // User-visible texts that messages.ts lacks (plain language, NFR-02); to be moved there.
@@ -313,6 +319,13 @@ export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
 export const DELETE_CHECK_FLOW_TIMEOUT_MS = 60 * 60_000;
 /** Plan step 11C3: the longest rebuild of the registry in the worker (it lists and inspects the volumes and containers). */
 export const RECONCILE_FLOW_TIMEOUT_MS = 2 * 60_000;
+/**
+ * Plan step 11E6: the longest open in the worker: the clone, the image check and pulls, the build of the image (a large
+ * one may take an hour or more), `up` with the lifecycle commands, and the questions to the user, which wait for an answer.
+ */
+export const OPEN_FLOW_TIMEOUT_MS = 4 * 60 * 60_000;
+/** Plan step 11E6: the longest detail of a step of the open that the worker reports (the progress notification). */
+const MAX_OPEN_DETAIL_LENGTH = 1000;
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -563,8 +576,16 @@ export interface EnvironmentServiceDeps {
       onAnswer?: (call: string, args: unknown[], value: unknown) => void;
       // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked, and has its answer (or failed).
       onQuestion?: (state: 'asked' | 'settled') => void;
+      // Plan step 11E6: a step of the flow began (the progress of the open).
+      onProgress?: (step: string, detail?: string) => void;
     },
   ) => Promise<unknown>;
+  /**
+   * Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance of this computer for the Session Monitor of the
+   * engine of an open (`dockerHost`), and the image list when there is one to give (read from GitHub at most once an hour
+   * per engine); `listSent` when the monitor took it. Without it, openInWorker refuses.
+   */
+  openMonitor?: (dockerHost: string) => { images: ImageSettings; repositories?: string[]; listSent: () => void };
 }
 
 export interface RepositoryTarget {
@@ -1368,7 +1389,8 @@ export class EnvironmentService {
 
   /**
    * Open pipeline for a repository: the environment of the repository of the signed-in account (concept 7.5, D-3). The
-   * first open of an account creates its environment; an environment of another account is neither used nor named.
+   * first open of an account creates its environment; an environment of another account is neither used nor named. Plan
+   * step 11E6: the worker's pipeline runs it (the operation `open`); the extension sends it with openInWorker.
    */
   async open(target: RepositoryTarget, options: OpenOptions): Promise<OpenResult> {
     splitRepository(target.repository);
@@ -1387,7 +1409,10 @@ export class EnvironmentService {
     });
   }
 
-  /** Open pipeline for an existing environment (reconnect, reopen, restored window, switch, rebuild). */
+  /**
+   * Open pipeline for an existing environment (reconnect, reopen, restored window, switch, rebuild). Plan step 11E6: the
+   * worker's pipeline runs it; the extension sends it with openEnvironmentInWorker.
+   */
   async openEnvironment(environmentId: string, options: OpenOptions): Promise<OpenResult> {
     const environment = await this.deps.registry.get(environmentId);
     if (!environment) throw environmentMissing();
@@ -1401,6 +1426,147 @@ export class EnvironmentService {
         throw this.toUserError(error, options.signal);
       }
     });
+  }
+
+  /**
+   * Plan step 11E6 (decisions of 2026-10-03 and 2026-10-04): the open of a repository (`open`) by the worker of the Docker
+   * target, as the operation `open` (openThroughWorker). The worker's pipeline finds the environment of the repository of
+   * the signed-in account, or creates it.
+   */
+  async openInWorker(target: RepositoryTarget, options: OpenOptions): Promise<OpenResult> {
+    splitRepository(target.repository);
+    return this.exclusive(repositoryKey(target.repository), options.signal, async () => {
+      try {
+        return await this.openThroughWorker(
+          target.repository,
+          { target: { ...(target.defaultBranch !== undefined ? { defaultBranch: target.defaultBranch } : {}), configPaths: [...target.configPaths], trusted: target.trusted } },
+          options,
+        );
+      } catch (error) {
+        throw this.toUserError(error, options.signal);
+      }
+    });
+  }
+
+  /** Plan step 11E6: the open of an existing environment (`openEnvironment`) by the worker of the Docker target (openThroughWorker). */
+  async openEnvironmentInWorker(environmentId: string, options: OpenOptions): Promise<OpenResult> {
+    const environment = await this.deps.registry.get(environmentId);
+    if (!environment) throw environmentMissing();
+    await this.requireCurrentHost(environment);
+    return this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
+      try {
+        const current = await this.deps.registry.get(environmentId);
+        if (!current) throw environmentMissing(environment.repository);
+        if (holdsEnvironmentLock(current.id)) throw new Error(`The open of ${current.repository} under a lock of the environment that this window holds.`);
+        return await this.openThroughWorker(current.repository, { environmentId: current.id }, options);
+      } catch (error) {
+        throw this.toUserError(error, options.signal);
+      }
+    });
+  }
+
+  /**
+   * Plan step 11E6 (decision A1 of 2026-10-05): sends the open to the worker and answers with what the window needs to
+   * connect, after the worker released the lock of the environment. Before it is sent: the sign-in of this window (with a
+   * dialog when needed: the worker asks for the token without one) and the start of the local Docker (concept 7.6). The
+   * steps of the worker are the progress of the open. Decision D1: the open carries the image maintenance of this
+   * computer and the image list. The answer names an environment of the signed-in account on the Docker host of the
+   * operation (and of the repository of the open), which the window takes from its own registry.
+   */
+  private async openThroughWorker(
+    repository: string,
+    what: Pick<OpenParams, 'environmentId'> | Pick<OpenParams, 'target'>,
+    options: OpenOptions,
+  ): Promise<OpenResult> {
+    const { signal } = options;
+    const session = await this.requireSession();
+    await this.startDocker(new StepReporter(options.progress, this.logger), signal);
+    this.throwIfCancelled(signal);
+    const dockerHost = await this.currentDockerHost();
+    const monitor = this.deps.openMonitor?.(dockerHost);
+    const settings = this.deps.settings();
+    const params = parseOpenParams({
+      dockerHost,
+      owner: this.deps.owner,
+      monitorSource: this.deps.monitorSource?.(),
+      settings: {
+        updateImagesOnConnect: settings.updateImagesOnConnect,
+        hostAccessChecks: hostAccessChecks(repository, settings),
+        waitingTimeSeconds: waitingTimeMs(settings) / 1000,
+        stopOnClose: settings.stopOnClose !== false,
+        respectShutdownActionNone: settings.respectShutdownActionNone === true,
+        ...(settings.stopAfterMinutes !== undefined ? { stopAfterMinutes: settings.stopAfterMinutes } : {}),
+      },
+      images: monitor?.images,
+      ...(monitor?.repositories !== undefined ? { repositories: monitor.repositories } : {}),
+      repository,
+      ...what,
+      ...(options.forceRebuild === true ? { forceRebuild: true } : {}),
+      ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
+    });
+    if (params === undefined) throw new Error(`The open of ${repository} cannot be sent to the worker.`);
+    // The steps of the worker's pipeline (it logs them itself); `starting`: its `up` may run from here on.
+    let started = false;
+    const onProgress = (step: string, detail?: string) => {
+      if (step === OPEN_PROGRESS_DETAIL) {
+        const text = detail ?? '';
+        options.progress.detail(text.length > MAX_OPEN_DETAIL_LENGTH ? `${text.slice(0, MAX_OPEN_DETAIL_LENGTH - 1)}…` : text);
+      } else if (Object.hasOwn(Steps, step)) {
+        if (step === 'starting') started = true;
+        options.progress.step(step as ProgressStep);
+      }
+    };
+    let answer: unknown;
+    try {
+      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress);
+    } catch (error) {
+      await this.afterLostWorkerOpen(repository, params, session.account, started);
+      throw error;
+    }
+    const value = parseOpenValue(answer);
+    if (value === undefined) {
+      await this.afterLostWorkerOpen(repository, params, session.account, started);
+      throw new Error(`The worker answered the open of ${repository} with an invalid value.`);
+    }
+    if (value.imageListSent === true) monitor?.listSent();
+    if ('refused' in value) throw refusalError(value.refused);
+    const { opened } = value;
+    const environment = await this.deps.registry.get(opened.environmentId);
+    const expected = params.environmentId ?? (await this.deps.registry.findForAccount(repository, session.account.id, dockerHost))?.id;
+    if (!environment || environment.id !== expected || !isAvailableTo(environment, session.account) || (environment.dockerHost ?? '') !== dockerHost) {
+      throw new Error(`The worker answered the open of ${repository} with an environment that is not the one of the open.`);
+    }
+    return { environment, containerName: opened.containerName, remoteWorkspaceFolder: opened.remoteWorkspaceFolder };
+  }
+
+  /**
+   * Plan step 11E6: a worker open that ended without its answer (a lost channel, its time limit, a cancel) could not
+   * clean up on this computer: its requests end with it. This window does it for the environment of the open (as the
+   * pipeline's own `finally` blocks did): the pending connection file goes; the busy mark of this window goes, and a
+   * create mark stays as ended (so the next open completes the clone, or Delete removes the environment: PR #78, A-R1-1);
+   * and when the worker had begun `up` (its step `starting`), this window remembers the lifecycle of the environment as
+   * unknown (review round 1 of PR #107, A-L2: the worker could record neither the lifecycle mark nor this window's
+   * memory), so its next open of the environment does not open a running container as it is (LIFECYCLE_UNKNOWN).
+   */
+  private async afterLostWorkerOpen(repository: string, params: OpenParams, account: GitHubAccount, started: boolean): Promise<void> {
+    const id =
+      params.environmentId ??
+      (await this.deps.registry.findForAccount(repository, account.id, params.dockerHost).catch((error: unknown) => {
+        this.logger.warn(`The environment of ${repository} could not be read after the open in the worker ended: ${errorMessage(error)}`);
+        return undefined;
+      }))?.id;
+    if (id === undefined) return;
+    await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(id));
+    await this.quietly('end the busy mark of this window', async () => {
+      const busy = (await this.deps.registry.get(id))?.busy;
+      if (busy === undefined || busy.windowId !== this.deps.owner.windowId || busy.pid !== this.deps.owner.pid) return;
+      if (busy.operation === 'create') await this.openRecords.createMark(id, 'ended');
+      else await this.busyMarks.clear(id);
+    });
+    if (started) {
+      await this.lifecycleMemory.remember(id, LIFECYCLE_UNKNOWN).catch((error: unknown) => this.logger.warn(`The window could not remember ${repository}: ${errorMessage(error)}`));
+      this.logger.warn(`The open of ${repository} in the worker ended while it started the container: the next open of this window runs its lifecycle commands again.`);
+    }
   }
 
   /**
@@ -4551,8 +4717,10 @@ export class EnvironmentService {
    */
   private lifecycleIncomplete(ctx: PipelineContext, container: ContainerInfo | undefined): boolean {
     if (container === undefined) return false;
-    // Review round 4 of PR #68 (B-R4-2): also a container that this window remembers because the mark could not be written.
-    return [ctx.env.lifecycleIncomplete, ctx.unrecordedLifecycle].some((mark) => mark !== undefined && sameContainer(mark, container.id));
+    // Review round 4 of PR #68 (B-R4-2): also a container that this window remembers because the mark could not be written
+    // (plan step 11E6: or any one, when the window does not know which: LIFECYCLE_UNKNOWN).
+    if (ctx.env.lifecycleIncomplete !== undefined && sameContainer(ctx.env.lifecycleIncomplete, container.id)) return true;
+    return ctx.unrecordedLifecycle !== undefined && rememberedFor(ctx.unrecordedLifecycle, container.id);
   }
 
   /**
@@ -4574,7 +4742,7 @@ export class EnvironmentService {
    */
   private async forgetUnrecordedLifecycle(ctx: PipelineContext, containerId: string): Promise<void> {
     const unrecorded = ctx.unrecordedLifecycle;
-    if (unrecorded === undefined || !sameContainer(unrecorded, containerId)) return;
+    if (unrecorded === undefined || !rememberedFor(unrecorded, containerId)) return;
     ctx.unrecordedLifecycle = undefined;
     await this.lifecycleMemory.forget(ctx.env.id, containerId).catch((error: unknown) => this.logger.warn(`The window could not forget the container ${containerId}: ${errorMessage(error)}`));
   }
@@ -5712,16 +5880,18 @@ export class EnvironmentService {
    * nothing runs another way. Any other failure of the flow is thrown as it is.
    */
   private async workerFlow(
-    env: Environment,
+    env: Pick<Environment, 'repository'>,
     op: string,
     params: unknown,
     timeoutMs: number,
     signal?: AbortSignal,
     onAnswer?: (call: string, args: unknown[], value: unknown) => void,
     onQuestion?: (state: 'asked' | 'settled') => void,
+    // Plan step 11E6: the progress of the flow (the open).
+    onProgress?: (step: string, detail?: string) => void,
   ): Promise<unknown> {
     try {
-      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}), ...(onQuestion ? { onQuestion } : {}) });
+      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}), ...(onQuestion ? { onQuestion } : {}), ...(onProgress ? { onProgress } : {}) });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
@@ -6558,8 +6728,12 @@ export class EnvironmentService {
    * container exists (`docker volume create` would take the existing volume, and a failed first open would remove it).
    */
   private async unusedEnvironmentId(repository: string): Promise<string> {
+    const file = await this.deps.registry.read();
+    // Plan step 11E6 (review round 5 of PR #106, A5-L1): nor a name that an entry records as an additional volume, or that
+    // the registry keeps for an account after a Delete (the extension refuses an entry of such a name: createEnvironment).
+    const recorded = new Set([...file.environments.flatMap((environment) => environment.additionalVolumes ?? []), ...(file.keptVolumes ?? []).map((kept) => kept.name)].map((name) => name.toLowerCase()));
     const known = [
-      ...(await this.deps.registry.list()).map((environment) => environment.id),
+      ...file.environments.map((environment) => environment.id),
       ...(await this.deps.docker.listEnvironmentVolumes()).map((volume) => volume.labels[LABEL_ENVIRONMENT_ID]).filter((id): id is string => id !== undefined),
     ];
     const used = new Set(known.map(namePair));
@@ -6567,7 +6741,7 @@ export class EnvironmentService {
     for (let attempt = 1; ; attempt++) {
       const id = create();
       const name = resourceName(repository, id);
-      if (!used.has(namePair(id)) && !(await this.deps.docker.volumeExists(name)) && (await this.deps.docker.containerState(name)) === 'missing') return id;
+      if (!used.has(namePair(id)) && !recorded.has(name.toLowerCase()) && !(await this.deps.docker.volumeExists(name)) && (await this.deps.docker.containerState(name)) === 'missing') return id;
       if (attempt >= ENVIRONMENT_ID_ATTEMPTS) throw new Error(`No unused environment ID was found for ${repository}.`);
     }
   }

@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
-import { OP_DELETE, OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
+import { OP_DELETE, OP_OPEN, OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
 import type { OperationOptions } from '../core/helperChannel/helperChannel';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
 
@@ -106,14 +106,15 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     expect(sessionFiles.removeReopen).toHaveBeenCalledWith();
   });
 
-  it('shows each kind of message, and refuses to connect a window without a way to', async () => {
+  // Plan step 11E6 (decision A1 of 2026-10-05): changed, the request `connect` is removed (the open answers with what the
+  // window needs), so only the messages are left here.
+  it('shows each kind of message', async () => {
     const { all, ui } = deps();
     const host = extensionHostSide(all);
     await host.questions.message('info', 'i');
     await host.questions.message('warn', 'w');
     await host.questions.message('registrySignIn', 'ghcr.io');
     expect([ui.info.mock.calls, ui.warn.mock.calls, ui.registrySignIn.mock.calls]).toEqual([[['i']], [['w']], [['ghcr.io']]]);
-    await expect(host.connect.connect({ environmentId: 'e1', container: 'c1', folder: '/workspaces/app' })).rejects.toThrow('connects no environment');
   });
 
   it('runs a flow in the worker of the current engine, answering only the requests of its operation (review round 2, B-R2-1, B-R2-2)', async () => {
@@ -213,5 +214,26 @@ describe('the volumes of a removal from a flow (review round 1 of 11C2a)', () =>
     registry.get.mockResolvedValueOnce(undefined as unknown as Environment);
     await host.records.remove('e2', {});
     expect(registry.remove).toHaveBeenCalledWith('e2', {});
+  });
+});
+
+// Plan step 11E6: the flow of an open passes its progress on; its requests are those of its environment and repository.
+describe('the flow of an open (plan step 11E6)', () => {
+  it('passes the progress of the open on; its questions name its repository, its writes its environment', async () => {
+    const { all } = deps();
+    const sent: OperationOptions[] = [];
+    const channels = { flow: vi.fn(async (_target: unknown, _op: string, _params: unknown, options: OperationOptions = {}) => (sent.push(options), { opened: {} })) };
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    const onProgress = vi.fn();
+    await flow(OP_OPEN, { environmentId: 'e1', repository: 'acme/app', dockerHost: '' }, { onProgress });
+    expect(sent[0].onProgress).toBe(onProgress);
+    const onAsk = sent[0].onAsk!;
+    const signal = new AbortController().signal;
+    await expect(onAsk('question', { call: 'confirmUntrustedRepository', args: ['acme/other'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(onAsk('record', { call: 'clearBusy', args: ['e1'] }, signal)).resolves.toEqual({ value: null });
+    await expect(onAsk('record', { call: 'clearBusy', args: ['e2'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
+    // Without one, none is passed.
+    await flow(OP_OPEN, { environmentId: 'e1', repository: 'acme/app', dockerHost: '' }, {});
+    expect(sent[1]).not.toHaveProperty('onProgress');
   });
 });

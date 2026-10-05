@@ -33,16 +33,15 @@ import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
 import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
-import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
-import { MAX_IMAGE_REPOSITORIES, REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
+import { PACKAGES_TIMEOUT_MS, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
+import { imageLists } from './imageLists';
+import { REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
-import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
 import { windowLifecycleMemory } from '../core/pipeline/lifecycleMemory';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { ClosingWork } from '../core/session/closingWork';
 import { heartbeatWiring } from '../core/session/heartbeatWiring';
-import { stopAfterSeconds } from '../core/session/sessionRules';
 import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { releaseEnvironment } from '../core/session/windowRelease';
 import { readOrCreateComputerId } from '../core/storage/computerId';
@@ -78,13 +77,6 @@ import { REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, type TreeNode } from '.
 
 /** A window that gets the focus refreshes the sidebar at most this often. */
 const FOCUS_REFRESH_INTERVAL_MS = 15_000;
-/** User requests 2026-09-28: the image list for the monitor of a host is sent at most this often. */
-export const IMAGE_LIST_INTERVAL_MS = 60 * 60_000;
-
-/** The name of an engine in the log and the messages: the remote host, or the local Docker (host ''). */
-function engineName(host: string): string {
-  return host === '' ? 'the local Docker' : host;
-}
 export const ImageListTexts = {
   // Plan step 8, PR A: the setting is "Image Updates", on every engine.
   signInQuestion: (engine: string) =>
@@ -312,17 +304,8 @@ async function activateExtension(
     owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
     logger,
   });
-  // The engine of a call in an operation (its target), else the current one.
-  const callTarget = async (): Promise<DockerTarget> => operationDockerTarget() ?? (await targets.current());
-  // User request 2026-09-28 ("all images"): the image repositories of the prefixes, read with the GitHub session (scope
-  // read:packages) and given to the monitor of the host, at most once an hour per host. Without that scope, a question
-  // once per window; the monitor then updates only the images that are on the host. Review round 1 of PR #57: first the
-  // settings of this computer (C: they are not part of the label anymore), when they changed or an hour passed; the list
-  // is read in the background with a time limit (B: it never delays Start); a failed send is tried again at the next open
-  // (D).
-  const imageListSentAt = new Map<string, number>();
-  const imageSettingsSent = new Map<string, { text: string; at: number }>();
-  let packagesSignInOffered = false;
+  // Plan step 11E6 (decision D1 of 2026-10-05): the open carries the image maintenance of this computer and the image list
+  // for the Session Monitor of its engine (imageLists).
   // Review round 9 of PR #57 (T2): patterns that are left out (invalid, or beyond the limits) are logged once.
   let warnedPatterns = '';
   const usedImagePrefixes = (): string[] => {
@@ -341,66 +324,19 @@ async function activateExtension(
     // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
     timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
   });
-  const sendImageSettings = async (target: DockerTarget): Promise<void> => {
-    const { host } = target;
-    const settings = imageMaintenance();
-    if (settings.prefixes.length === 0) return;
-    const text = JSON.stringify(settings);
-    const last = imageSettingsSent.get(host);
-    if (last && last.text === text && Math.abs(Date.now() - last.at) < IMAGE_LIST_INTERVAL_MS) return;
-    if (await monitorCalls.monitorSettings(target, { settings })) imageSettingsSent.set(host, { text, at: Date.now() });
-    else imageSettingsSent.delete(host);
-  };
-  const sendRepositories = async (target: DockerTarget, prefixes: string[], token: string): Promise<void> => {
-    const { host } = target;
-    let repositories: string[];
-    try {
-      repositories = await ghcrRepositories(nodeHttpsTransport, token, prefixes, AbortSignal.timeout(PACKAGES_TIMEOUT_MS));
-    } catch (error) {
-      imageListSentAt.delete(host);
-      logger.warn(`The image repositories could not be read from GitHub: ${errorMessage(error)}`);
-      return;
-    }
-    if (repositories.length > MAX_IMAGE_REPOSITORIES) {
-      logger.warn(`GitHub lists ${repositories.length} image repositories for ${prefixes.join(', ')}; the Session Monitor on ${engineName(host)} gets the first ${MAX_IMAGE_REPOSITORIES}.`);
-      repositories = repositories.slice(0, MAX_IMAGE_REPOSITORIES);
-    }
-    logger.info(`The Session Monitor on ${engineName(host)} keeps ${repositories.length} image repositories up to date: ${repositories.join(', ')}.`);
-    if (!(await monitorCalls.monitorSettings(target, { repositories }))) imageListSentAt.delete(host);
-  };
-  const sendImageList = async (): Promise<void> => {
-    const prefixes = usedImagePrefixes();
-    if (prefixes.length === 0) return;
-    // Review round 4 of PR #57 (L2): the background work keeps the Docker target of the open; after the open ended, its
-    // calls would read the current context again, and a switch to another host in the meantime sent there. Plan step
-    // 11D1: the operations of the worker of that engine.
-    const target = await callTarget();
-    const { host } = target;
-    // Review round 2 of PR #57 (R6): in the background too (a command of up to 20 s that Cancel could not end); a
-    // failure is logged and the next open sends again.
-    void sendImageSettings(target);
-    if (!prefixes.some((prefix) => ghcrOwnerOf(prefix) !== undefined)) return;
-    const last = imageListSentAt.get(host);
-    if (last !== undefined && Math.abs(Date.now() - last) < IMAGE_LIST_INTERVAL_MS) return;
-    const credentials = await auth.getPackagesCredentials({ interactive: false });
-    if (!credentials) {
-      logger.info(`The image list for ${engineName(host)} needs the GitHub sign-in for packages; the Session Monitor there updates only the images that it has.`);
-      if (!packagesSignInOffered) {
-        packagesSignInOffered = true;
-        void vscode.window.showInformationMessage(ImageListTexts.signInQuestion(engineName(host)), ImageListTexts.signIn).then(async (choice) => {
-          if (choice !== ImageListTexts.signIn) return;
-          if (await auth.getPackagesCredentials({ interactive: true })) imageListSentAt.delete(host);
-        });
-      }
-      return;
-    }
-    imageListSentAt.set(host, Date.now());
-    void sendRepositories(target, prefixes, credentials.password);
-  };
+  const imageListFor = imageLists({
+    prefixes: usedImagePrefixes,
+    packagesToken: async () => (await auth.getPackagesCredentials({ interactive: false }))?.password,
+    read: (token, prefixes) => ghcrRepositories(nodeHttpsTransport, token, prefixes, AbortSignal.timeout(PACKAGES_TIMEOUT_MS)),
+    offerSignIn: (engine) =>
+      void vscode.window.showInformationMessage(ImageListTexts.signInQuestion(engine), ImageListTexts.signIn).then(async (choice) => {
+        if (choice === ImageListTexts.signIn) await auth.getPackagesCredentials({ interactive: true });
+      }),
+    logger,
+  });
   const connection = new ConnectionAdapter(logger);
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
-  const limitSeconds = (): number => stopAfterSeconds(getSettings().stopAfterMinutes);
   // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
   // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
   // worker is made ready first, D1); a missing monitor is started again as the open starts it.
@@ -564,30 +500,14 @@ async function activateExtension(
     monitorSource: computerId,
     settings: getSettings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),
-    // Concept 7.7: a private image on ghcr.io that the image check reads with the GitHub session is pulled with it too.
-    pullCredentials: githubPackagesPullCredentials(credentials.provider(), auth),
     // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
     analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
     // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
     // neither local nor SSH is refused by every operation and never read.
     dockerTarget: () => targets.current(),
-    // Unit 7, PR 2: the Session Monitor of the engine, with the socket that the workspace helper mounts there. Plan step 8,
-    // PR A: on every engine; its calls run in the operation (through its worker where they are plain Docker calls).
-    sessionMonitor: {
-      // Plan step 11D2: the operation `monitorEnsure` of the worker of the engine of the open, which runs from the helper
-      // image of the open (its tag and ID).
-      ensure: async (_target, _helperTag, signal) => monitorCalls.monitorEnsure(await callTarget(), imageMaintenance(), signal),
-      // Plan step 11D1: the operation `heartbeat` of the worker of the engine of the open.
-      heartbeat: async (_target, environmentId, keepRunning, seq) => {
-        const result = await monitorCalls.heartbeat(await callTarget(), {
-          source: computerId(),
-          limitSeconds: limitSeconds(),
-          environments: [{ id: environmentId, keepRunning, seq }],
-        });
-        return result.ok ? { ok: true } : { ok: false, detail: result.detail };
-      },
-      images: async () => sendImageList(),
-    },
+    // Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list that an open carries for the
+    // Session Monitor of its engine (the worker makes sure that the monitor runs, and sends its first heartbeat).
+    openMonitor: (dockerHost) => ({ images: imageMaintenance(), ...imageListFor(dockerHost) }),
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
       startDockerFor(

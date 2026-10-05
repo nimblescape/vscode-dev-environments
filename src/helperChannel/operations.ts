@@ -18,7 +18,7 @@ import {
   OP_DELETE_CHECK,
   OP_RECONCILE,
   OP_HEARTBEAT,
-  OP_MONITOR_SETTINGS,
+  OP_OPEN,
   OP_MONITOR_ENSURE,
   OP_RECORD_GIT_STATE,
   OP_LIST_CONFIGURATIONS,
@@ -42,7 +42,7 @@ import { OP_BATCH, OP_BATCH_CHUNK, OP_BATCH_STEP } from '../core/helperChannel/b
 import { batchChunkOperation, batchDeps, batchOperation, batchStepOperation, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorSettingsOperation, monitorEnsureOperation, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorEnsureOperation, openOperation, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
@@ -165,10 +165,12 @@ export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
   [OP_WINDOW_STATE]: windowStateOperation(ENGINE_OF),
   // Plan step 11C3: the registry rebuilt from the volumes, by the worker's own pipeline.
   [OP_RECONCILE]: reconcileOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
-  // Plan step 11D1: the heartbeats, the image settings and list of the Session Monitor, and the Git state of a release.
+  // Plan step 11D1: the heartbeats of the Session Monitor, and the Git state of a release (plan step 11E6, decision D1 of
+  // 2026-10-05: the image settings and list come with the open).
   [OP_HEARTBEAT]: heartbeatOperation(ENGINE_OF),
-  [OP_MONITOR_SETTINGS]: monitorSettingsOperation(ENGINE_OF),
   [OP_RECORD_GIT_STATE]: recordGitStateOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p)),
   // Plan step 11D2: the ensure of the Session Monitor container, with the script of the monitor in this bundle.
   [OP_MONITOR_ENSURE]: monitorEnsureOperation(ENGINE_OF, OWN_HELPER_OF, () => monitorScript),
+  // Plan step 11E6: the open, by the worker's own pipeline, with the Session Monitor of this bundle.
+  [OP_OPEN]: openOperation(ENGINE_OF, OWN_HELPER_OF, (context, p) => workerBatchSession(BATCH, context, p), () => monitorScript),
 };

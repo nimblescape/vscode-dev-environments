@@ -6,13 +6,13 @@
 // core services of the pipeline as the worker constructs them for one operation. EnvironmentService and WorkspaceHelper
 // run unchanged; what they need from the user's computer goes through the requests of the operation (HostSide), the
 // engine is the worker's own (EngineDocker), the helper image is the worker's own image, and the lock and the batch
-// helper are taken in the worker (`environmentLock`, given by the operation). What only the open runs (the host access
-// analysis, the image update check, the variables of the computer) comes with plan step 11E; until
-// then it fails closed here, as do the record writes by a function (plan steps 11D, 11E) and the Session Monitor beyond Delete's
-// `forget` (plan step 11D). Plan step 11C2a: the busy marks are specific requests to the extension (decision of
-// 2026-10-04); plan step 11E4b: so are the registry writes of the open (hostOpenRecords); plan step 11E4d: the liveness of
-// the processes of the computer, the GitHub profile and the window's lifecycle memory are asked of the extension. Pure
-// over its deps; no `vscode`.
+// helper are taken in the worker (`environmentLock`, given by the operation). Plan step 11C2a: the busy marks are
+// specific requests to the extension (decision of 2026-10-04); plan step 11E4b: so are the registry writes of the open
+// (hostOpenRecords); plan step 11E4d: the liveness of the processes of the computer, the GitHub profile and the window's
+// lifecycle memory are asked of the extension. Plan step 11E6: the open runs here (the operation `open`), with the
+// analysis thread, the image check, the settings and the Session Monitor that its operation gives; without them, they
+// fail closed, as does a record write by a function. The variables of the computer (`${localEnv:…}`) are never passed
+// (localEnv.ts). Pure over its deps; no `vscode`.
 import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
@@ -144,15 +144,22 @@ export function hostOpenRecords(host: HostSide): OpenRecords {
  * the windows are their own operation (`heartbeat`). Plan step 11E4e: the open's ensure (`ensure`, given by the operation
  * with its image maintenance, as `monitorEnsure` does it; without it, the ensure fails closed and the open is refused)
  * and its first heartbeat for `source` with the time limit of the settings (`limitSeconds`; without the settings or the
- * computer it is not sent, which the pipeline logs). The image list stays out until decision D (`images` is none).
+ * computer it is not sent, which the pipeline logs). Plan step 11E6 (decision D1 of 2026-10-05): the image settings and
+ * the image list of the open (`images`, given by the operation; without it, none).
  */
 export function workerSessionMonitor(
   engine: DockerEngine,
   source: string | undefined,
   log: Logger,
-  open: { ensure?: (signal: AbortSignal | undefined) => Promise<unknown>; limitSeconds?: () => number } = {},
+  open: {
+    ensure?: (signal: AbortSignal | undefined) => Promise<unknown>;
+    limitSeconds?: () => number;
+    images?: (signal: AbortSignal | undefined) => Promise<void>;
+  } = {},
 ): EnvironmentSessionMonitor {
   return {
+    // Plan step 11E6 (decision D1 of 2026-10-05): the image settings and the image list of the open, given by its operation.
+    ...(open.images !== undefined ? { images: (_target: unknown, signal?: AbortSignal) => open.images!(signal) } : {}),
     // The worker's own helper image runs the monitor (the operation knows it), never the tag or ID of the pipeline's run.
     ensure: async (_target, _helperTag, signal) => {
       if (open.ensure === undefined) throw notInWorker('The ensure of the Session Monitor without the image maintenance of its operation', '11E6');
@@ -274,10 +281,9 @@ export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engi
 export function hostAuth(host: HostSide, log: Logger): Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'> {
   return {
     getAccount: ({ interactive }) => host.state.account(interactive),
-    getToken: async ({ interactive }) => {
-      if (interactive) throw notInWorker('A sign-in with a dialog for the token', '11E');
-      return host.secrets.token();
-    },
+    // Plan step 11E6: the worker shows no sign-in dialog; the extension made sure of the sign-in before it sent the open
+    // (requireSession), so a token is asked without one either way.
+    getToken: async () => host.secrets.token(),
     // The token never goes back over the channel; the report of a rejected token comes with the clone (plan step 11E).
     reportRejectedToken: () => log.warn('GitHub rejected the token of the operation.'),
   };
@@ -336,6 +342,11 @@ export interface WorkerServicesDeps {
    * image maintenance of the operation); without it, the ensure fails closed.
    */
   monitorEnsure?: (signal: AbortSignal | undefined) => Promise<unknown>;
+  /**
+   * Plan step 11E6 (decision D1 of 2026-10-05): gives the Session Monitor of the worker's engine the image settings and the
+   * image list of the open, after its ensure (best effort; never throws, except an AbortError).
+   */
+  monitorImages?: (signal: AbortSignal | undefined) => Promise<void>;
   /**
    * Plan step 11E2: the host access analysis in the worker (its analysis thread, from the script in the worker's bundle,
    * with its limits); without it, an analysis fails closed.
@@ -401,6 +412,7 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     // Plan step 11E4e: the open's ensure and first heartbeat too (the time limit of the settings of the operation).
     sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger, {
       ...(deps.monitorEnsure !== undefined ? { ensure: deps.monitorEnsure } : {}),
+      ...(deps.monitorImages !== undefined ? { images: deps.monitorImages } : {}),
       ...(deps.settings !== undefined ? { limitSeconds: () => stopAfterSeconds(deps.settings!.stopAfterMinutes) } : {}),
     }),
     sessionFiles: hostSessionFiles(deps.host),
