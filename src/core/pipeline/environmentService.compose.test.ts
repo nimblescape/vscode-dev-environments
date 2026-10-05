@@ -1297,14 +1297,14 @@ describe('existing Docker Compose environment', () => {
 describe('stop of a Docker Compose environment', () => {
   it('stops the dev container first, then the other services', async () => {
     await seedCompose({ dev: 'running', db: 'running' });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(h.docker.log.filter((line) => line.startsWith('stop'))).toEqual([`stop ${devContainer()?.id}`, `stop ${dbContainer()?.id}`]);
     expect(dbContainer()?.state).toBe('stopped');
   });
 
   it('stops a running side service also when the dev container does not run', async () => {
     await seedCompose({ dev: 'stopped', db: 'running' });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(h.docker.log.filter((line) => line.startsWith('stop'))).toEqual([`stop ${dbContainer()?.id}`]);
   });
 });
@@ -1949,7 +1949,7 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     const restored = await h.registry.get(ENV_ID);
     expect(restored?.additionalVolumes).toEqual([`${PROJECT}_pgdata`]);
     expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual([`${PROJECT}_pgdata`]);
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
 
     // Without a build record, the next open builds, and `up` creates the dev container again in the same project.
     await h.service.openEnvironment(ENV_ID, options());
@@ -2585,17 +2585,17 @@ describe('review round 7 of unit 6 (P7-1, P7-2, D7-1)', () => {
 
   it('takes the container state of an environment from its dev container, and marks running side services (P7-2)', async () => {
     await seedCompose({ dev: 'stopped', db: 'running' });
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true, servicesRunning: true });
-    await h.service.stop(ENV_ID);
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true, servicesRunning: true });
+    await h.operations.stop(ENV_ID);
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
   });
 
   it('reports a running dev container as running, and no dev container as missing (P7-2)', async () => {
     await seedCompose({ dev: 'running', db: 'stopped' });
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'running', volume: true });
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'running', volume: true });
     h.docker.containers.delete(devContainer()!.id);
     dbContainer()!.state = 'running';
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'missing', volume: true, servicesRunning: true });
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'missing', volume: true, servicesRunning: true });
   });
 
   /** The lines of the Docker log for `id`: `stop` must come before `rm`. */
@@ -4386,7 +4386,7 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       const web = byService('web')!;
       expect(web).toMatchObject({ name: NAME, state: 'running' });
 
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       expect(running()).toEqual([]);
 
       const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
@@ -4445,7 +4445,7 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       const app = byService('app')!;
       await h.service.openEnvironment(ENV_ID, { progress: h.progress, configPath: WEB_PATH });
       const web = byService('web')!;
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       // For example started by hand.
       await h.docker.runChecked(['start', app.id]);
       const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });

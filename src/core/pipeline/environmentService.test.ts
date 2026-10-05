@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import type { EnvironmentOperationsDeps, OperationFlow } from './environmentOperations';
 import type { EnvironmentStates } from './refreshStates';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -47,7 +48,7 @@ import {
 } from '../names';
 import { abortError } from '../ports';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, parseStopParams } from '../helperChannel/protocol';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_OPEN, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
@@ -63,6 +64,7 @@ import {
   type RepositoryTarget,
 } from './environmentService';
 import {
+  fakeWorkerFlow,
   ACCOUNT,
   BASE_IMAGE,
   OTHER_ACCOUNT,
@@ -121,7 +123,7 @@ afterEach(() => {
 });
 
 /** Replaces the harness of this test with one that has other dependencies. */
-function recreate(overrides: Partial<EnvironmentServiceDeps>): Harness {
+function recreate(overrides: Partial<EnvironmentServiceDeps & EnvironmentOperationsDeps>): Harness {
   h.cleanup();
   return createHarness(overrides);
 }
@@ -1348,7 +1350,7 @@ describe('open: existing environment', () => {
       return original();
     };
     await h.service.open(TARGET, options());
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     h.settings.updateImagesOnConnect = false;
     await h.service.open(TARGET, options());
     // PR #74 review round 1, A-R1-1: changed expectation: the Stop between the opens ensures the helper image before its
@@ -1703,7 +1705,7 @@ describe('open: existing environment', () => {
     expect(calls).toEqual(expect.arrayContaining(['clone', 'readConfigFiles', 'readConfiguration', 'build', 'up', 'runUserCommands', 'prepareGit']));
     expect(h.helper.helperImages.filter((entry) => JSON.stringify(entry.image) !== JSON.stringify(previous))).toEqual([]);
 
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     h.helper.helperImages.length = 0;
     h.helper.currentHelperImageId = `sha256:${'4'.repeat(64)}`;
     await h.service.open(TARGET, options());
@@ -3487,23 +3489,33 @@ describe('open: existing environment', () => {
     });
   });
 
+  // Plan step 11F1: changed, the open runs in the worker; the operations of the window on one repository (its open in
+  // the worker, then its Stop) run one after the other (EnvironmentOperations).
   it('runs operations on the same repository one after the other', async () => {
-    await seedEnvironment(h);
     const order: string[] = [];
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => (release = resolve));
-    h.helper.onBuild = async () => {
-      order.push('build start');
-      await blocked;
-      order.push('build end');
-    };
-    const first = h.service.openEnvironment(ENV_ID, options({ forceRebuild: true }));
+    let worker: OperationFlow | undefined;
+    h = createHarness({
+      monitorSource: () => '0123456789abcdef0123456789abcdef',
+      openMonitor: () => ({ images: { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, listSent: () => {} }),
+      flow: async (op, params, flowOptions) => {
+        if (op !== OP_OPEN) return worker!(op, params, flowOptions);
+        order.push('open start');
+        await blocked;
+        order.push('open end');
+        return { opened: { environmentId: ENV_ID, containerName: 'devenv-acme-api-c', remoteWorkspaceFolder: '/workspaces/api' } };
+      },
+    });
+    worker = fakeWorkerFlow(h, h.lock.take);
+    await seedEnvironment(h);
+    const first = h.operations.openEnvironmentInWorker(ENV_ID, options({ forceRebuild: true }));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const second = h.service.stop(ENV_ID).then(() => order.push('stop'));
+    const second = h.operations.stop(ENV_ID).then(() => order.push('stop'));
     await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     await Promise.all([first, second]);
-    expect(order).toEqual(['build start', 'build end', 'stop']);
+    expect(order).toEqual(['open start', 'open end', 'stop']);
   });
 });
 
@@ -3792,7 +3804,7 @@ describe('stop', () => {
   it('records the Git summary from the container, then stops it', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     const container = h.docker.containersOf(ENV_ID)[0];
     expect(h.docker.execs[0]).toMatchObject({ container: container.id, user: 'vscode' });
     expect(h.docker.execs[0].command.slice(-1)).toEqual(['/workspaces/api']);
@@ -3804,7 +3816,7 @@ describe('stop', () => {
   it('keeps the previous summary when Git fails, and stops anyway', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.docker.execHandler = () => ({ exitCode: 127, stderr: 'Git is not installed.' });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
   });
@@ -3812,7 +3824,7 @@ describe('stop', () => {
   it('does nothing when Docker does not run', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.docker.running = false;
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(h.docker.execs).toEqual([]);
     expect(h.docker.log).toEqual([]);
     expect(h.dockerStarts).toBe(0);
@@ -3820,8 +3832,8 @@ describe('stop', () => {
 
   it('does nothing for a stopped container or an unknown environment', async () => {
     await seedEnvironment(h, { container: 'stopped' });
-    await h.service.stop(ENV_ID);
-    await h.service.stop(OTHER_ID);
+    await h.operations.stop(ENV_ID);
+    await h.operations.stop(OTHER_ID);
     expect(h.docker.log).toEqual([]);
   });
 
@@ -3829,14 +3841,14 @@ describe('stop', () => {
     const busy = { operation: 'update' as const, since: '2026-09-24T15:39:00.000Z', pid: 999, windowId: 'window-2' };
     await seedEnvironment(h, { container: 'running', extra: { busy } });
     h.alivePids.add(999);
-    const error = await rejection(h.service.stop(ENV_ID));
+    const error = await rejection(h.operations.stop(ENV_ID));
     expect(error.message).toBe(PipelineTexts.environmentBusy(REPO));
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
     expect(h.docker.log).toEqual([]);
 
     // The mark of an ended process does not count.
     h.alivePids.delete(999);
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
   });
   // Plan step 11B2: Stop runs in the worker (the testkit serves it as the worker does, fakeWorkerFlow).
@@ -3851,7 +3863,7 @@ describe('stop', () => {
     it('sends the environment, the repository folder, the remote user and the wait for the lock, with its time limit', async () => {
       const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       expect(sent).toEqual([
         {
           op: OP_STOP,
@@ -3865,7 +3877,7 @@ describe('stop', () => {
       await h.registry.updateEnvironment(ENV_ID, (env) => {
         env.remoteUser = '';
       });
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       expect(sent[1].params).not.toHaveProperty('user');
     });
 
@@ -3874,13 +3886,13 @@ describe('stop', () => {
       const summary = { branch: 'topic', uncommittedFiles: 9, unpushedCommits: 0, stashes: 0, recordedAt: new Date(T0 + 3_600_000).toISOString() };
       withFlow(async () => ({ outcome: 'stopped', gitSummary: summary, services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       const recorded = (await entry())?.gitSummary;
       expect(recorded).toMatchObject({ branch: 'topic', uncommittedFiles: 9 });
       expect(Date.parse(recorded!.recordedAt)).toBeLessThan(T0 + 60_000);
       withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
-      await h.service.stop(ENV_ID);
+      await h.operations.stop(ENV_ID);
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
     });
 
@@ -3888,7 +3900,7 @@ describe('stop', () => {
       const summary = { branch: 'topic', uncommittedFiles: 4, unpushedCommits: 0, stashes: 0, recordedAt: '2026-10-03T23:00:00.000Z' };
       withFlow(async () => ({ outcome: 'stopped', gitSummary: summary, services: [], failures: ['The container a could not be stopped: x.', 'The container b did not stop within 60 s.'] }));
       await seedEnvironment(h, { container: 'running' });
-      const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+      const thrown = (await h.operations.stop(ENV_ID).catch((e: unknown) => e)) as Error;
       expect(thrown.message).toBe('The container a could not be stopped: x. The container b did not stop within 60 s.');
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'topic', uncommittedFiles: 4 });
     });
@@ -3896,7 +3908,7 @@ describe('stop', () => {
     it('keeps the recorded Git state when the worker answers none, and reports the failures (review round 2)', async () => {
       withFlow(async () => ({ outcome: 'stopped', services: [], failures: ['The container a could not be stopped: x.'] }));
       await seedEnvironment(h, { container: 'running' });
-      const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+      const thrown = (await h.operations.stop(ENV_ID).catch((e: unknown) => e)) as Error;
       expect(thrown.message).toBe('The container a could not be stopped: x.');
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
     });
@@ -3906,13 +3918,13 @@ describe('stop', () => {
       await seedEnvironment(h, { container: 'running' });
       const held = (await runWithEnvironmentLock(
         { environmentId: ENV_ID, lost: new Promise(() => {}), docker: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }), release: async () => {} },
-        () => h.service.stop(ENV_ID).catch((e: unknown) => e),
+        () => h.operations.stop(ENV_ID).catch((e: unknown) => e),
       )) as Error;
       expect(held.message).toBe(`Stop of ${REPO} under a lock of the environment that this window holds.`);
       await h.registry.updateEnvironment(ENV_ID, (env) => {
         env.remoteUser = '-u root';
       });
-      const refused = await rejection(h.service.stop(ENV_ID));
+      const refused = await rejection(h.operations.stop(ENV_ID));
       expect(refused.message).toBe(PipelineTexts.stopRefused(REPO));
       // Review round 2 (A-R2-2): no Try again for a refusal that a retry cannot change.
       expect(refused.code).toBe('recordInvalid');
@@ -3939,14 +3951,14 @@ describe('stop', () => {
         });
         await seedEnvironment(h, { container: 'running' });
         // A failed stop is no UserFacingError (as the CommandError of `docker stop` before the move).
-        const thrown = (await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error;
+        const thrown = (await h.operations.stop(ENV_ID).catch((e: unknown) => e)) as Error;
         expect(thrown.message, expected).toBe(expected);
         // Review round 2 (B-R2-6): the refusals before the flow keep their code of before the move.
         if (expected.startsWith(`${REPO} was not changed:`)) expect((thrown as UserFacingError).code).toBe('helperFailed');
       }
       withFlow(async () => ({ outcome: 'stopped', gitSummary: { branch: 1 }, services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
-      expect(((await h.service.stop(ENV_ID).catch((e: unknown) => e)) as Error).message).toBe(`The worker answered the Stop of ${REPO} with an invalid value.`);
+      expect(((await h.operations.stop(ENV_ID).catch((e: unknown) => e)) as Error).message).toBe(`The worker answered the Stop of ${REPO} with an invalid value.`);
     });
   });
 });
@@ -4346,7 +4358,7 @@ describe('inspectStates and currentBranch', () => {
   it('reports container and volume state per environment', async () => {
     await seedEnvironment(h, { container: 'running' });
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, volume: false });
-    const states = await h.service.inspectStates();
+    const states = await h.operations.inspectStates();
     expect(states?.get(ENV_ID)).toEqual({ container: 'running', volume: true });
     expect(states?.get(OTHER_ID)).toEqual({ container: 'missing', volume: false });
   });
@@ -4354,13 +4366,13 @@ describe('inspectStates and currentBranch', () => {
   it('finds a volume without labels by its name', async () => {
     await seedEnvironment(h, { container: 'stopped' });
     h.docker.volumes.set(NAME, {});
-    expect((await h.service.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
+    expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
   });
 
   it('returns undefined when Docker does not run, without starting it', async () => {
     await seedEnvironment(h);
     h.docker.running = false;
-    expect(await h.service.inspectStates()).toBeUndefined();
+    expect(await h.operations.inspectStates()).toBeUndefined();
     expect(h.dockerStarts).toBe(0);
   });
 
@@ -4369,12 +4381,12 @@ describe('inspectStates and currentBranch', () => {
   it('windowStateInWorker reads the branch from the container through the worker', async () => {
     const env = await seedEnvironment(h, { container: 'running' });
     h.docker.execHandler = () => ({ stdout: 'feature-q\n' });
-    expect((await h.service.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBe('feature-q');
+    expect((await h.operations.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBe('feature-q');
     expect(h.docker.execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
     h.docker.execHandler = () => ({ exitCode: 1, stderr: 'container is not running' });
-    expect((await h.service.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBeUndefined();
+    expect((await h.operations.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBeUndefined();
     h.docker.execHandler = () => ({ stdout: '\n' });
-    expect((await h.service.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBeNull();
+    expect((await h.operations.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBeNull();
   });
 });
 
@@ -4397,11 +4409,11 @@ describe('refreshStates (plan step 5, PR C)', () => {
   // read directly without a worker).
   it('reads through the worker: the states, and the branches of the running environments that were asked for', async () => {
     await seedTwo(h);
-    expect(await h.service.refreshStates(new Set([ENV_ID, OTHER_ID]))).toEqual(direct);
+    expect(await h.operations.refreshStates(new Set([ENV_ID, OTHER_ID]))).toEqual(direct);
     expect(h.docker.execs).toHaveLength(1);
     expect(h.docker.execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
     // No branch read for an environment whose branch was not asked for.
-    expect(await h.service.refreshStates(new Set())).toEqual({ ...direct, branches: new Map() });
+    expect(await h.operations.refreshStates(new Set())).toEqual({ ...direct, branches: new Map() });
     expect(h.docker.execs).toHaveLength(1);
   });
 
@@ -4410,7 +4422,7 @@ describe('refreshStates (plan step 5, PR C)', () => {
     const workerRefresh = vi.fn(async () => fromWorker);
     h = recreate({ workerRefresh });
     await seedTwo(h);
-    expect(await h.service.refreshStates(new Set([ENV_ID]))).toBe(fromWorker);
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toBe(fromWorker);
     expect(workerRefresh).toHaveBeenCalledTimes(1);
     expect(workerRefresh.mock.calls[0]).toEqual([
       [
@@ -4430,7 +4442,7 @@ describe('refreshStates (plan step 5, PR C)', () => {
     });
     h = recreate({ workerRefresh });
     await seedTwo(h);
-    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
     expect(workerRefresh).toHaveBeenCalledTimes(1);
     expect(h.docker.execs).toHaveLength(0);
     expect(h.logger.warnings.join('\n')).toContain(
@@ -4444,7 +4456,7 @@ describe('refreshStates (plan step 5, PR C)', () => {
     h = recreate({ workerRefresh });
     await seedTwo(h);
     h.docker.running = false;
-    expect(await h.service.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
     expect(workerRefresh).not.toHaveBeenCalled();
   });
 });
@@ -4645,14 +4657,14 @@ describe('accounts (concept 7.5, section 9 "Accounts")', () => {
     await seedEnvironment(h);
     h.token = undefined;
     expect((await rejection(h.service.openEnvironment(ENV_ID, options()))).code).toBe('signInRequired');
-    expect((await rejection(h.service.stop(ENV_ID))).code).toBe('signInRequired');
+    expect((await rejection(h.operations.stop(ENV_ID))).code).toBe('signInRequired');
   });
 
   // 2026-10-01: the Switch branch command was dropped (user decision).
   it('refuses stop, delete, the safety check, and the configuration questions for another account', async () => {
     await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: 'running' });
     const operations: Array<[string, () => Promise<unknown>]> = [
-      ['stop', () => h.service.stop(ENV_ID)],
+      ['stop', () => h.operations.stop(ENV_ID)],
       ['delete', () => h.service.delete(ENV_ID, options({ additionalVolumesToRemove: [] }))],
       ['safetyCheck', () => h.service.safetyCheck(ENV_ID, options())],
       ['listConfigurations', () => h.service.listConfigurations(ENV_ID, options())],

@@ -52,9 +52,13 @@ const shared = {
 const outfiles = [
   'dist/extension.js',
   'dist/groupsPreviewWorker.js',
-  'dist/configurationAnalysisWorker.js',
   'dist/helperChannel.js',
 ];
+
+// Plan step 11F1: the extension no longer runs the host access analysis (the worker does, from its own bundle: plan step
+// 11E2), so dist/configurationAnalysisWorker.js is no longer built; one of an earlier build is removed.
+fs.rmSync('dist/configurationAnalysisWorker.js', { force: true });
+fs.rmSync('dist/configurationAnalysisWorker.js.map', { force: true });
 
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
 // match the minified bundles stays in dist/.
@@ -75,13 +79,6 @@ const contexts = await Promise.all([
     entryPoints: ['src/vscode/groupsPreviewWorker.ts'],
     outfile: outfiles[1],
   }),
-  // Review round 8: the worker thread of the host access analysis (configurationAnalysisRunner.ts): analyses the
-  // Dockerfiles and the Compose model of a repository with limits of time and memory.
-  esbuild.context({
-    ...shared,
-    entryPoints: ['src/core/helper/configurationAnalysisWorker.ts'],
-    outfile: outfiles[2],
-  }),
   // User request 2026-09-28: the script of the helper channel on a remote Docker host. The extension sends it over SSH as
   // the first input line of the pipe loader of the channel container (plan step 3, src/core/loader/pipeLoader.ts), so it
   // is always minified (less data over SSH) and has no source map. Plan step 11D2: it holds the script of the Session
@@ -91,7 +88,7 @@ const contexts = await Promise.all([
   esbuild.context({
     ...shared,
     entryPoints: ['src/helperChannel/main.ts'],
-    outfile: outfiles[3],
+    outfile: outfiles[2],
     minify: true,
     sourcemap: false,
     plugins: [...shared.plugins, workerScriptsPlugin(fileURLToPath(new URL('.', import.meta.url)), shared.define)],

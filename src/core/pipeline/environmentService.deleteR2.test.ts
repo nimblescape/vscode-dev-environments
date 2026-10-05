@@ -19,7 +19,7 @@ describe('the clear after a flow without an answer (B-R2 C3)', () => {
       flow: async () => { throw new HelperOperationError(LOCK_BUSY_CODE, 'held', false); },
     });
     await seedEnvironment(h, { container: 'stopped' });
-    const error = await h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }).then(() => undefined, (e: unknown) => e);
+    const error = await h.operations.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }).then(() => undefined, (e: unknown) => e);
     expect(busyMarks.clear).toHaveBeenCalledWith(ENV_ID);
     expect(error).toMatchObject({ code: 'startFailed', message: PipelineTexts.environmentLockBusy(REPO) });
     expect(h.logger.warnings.join('\n')).toContain('registry locked');

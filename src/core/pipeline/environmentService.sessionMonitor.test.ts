@@ -430,7 +430,7 @@ describe('Close and Keep Running in the registry', () => {
   it('Stop clears keepRunningOnce, also when the container does not run', async () => {
     const { h } = setup(LOCAL);
     await seedEnvironment(h, { container: 'stopped', extra: { keepRunningOnce: true } });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
   });
 });

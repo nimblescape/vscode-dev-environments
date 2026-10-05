@@ -14,13 +14,11 @@ import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { monitorImageTag } from '../../src/core/helper/helperState';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
-import { EnvironmentService } from '../../src/core/pipeline/environmentService';
+import { EnvironmentOperations } from '../../src/core/pipeline/environmentOperations';
 import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -31,7 +29,15 @@ import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { extensionFlow, extensionHostSide } from '../../src/vscode/hostSide';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, readBaseline, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, offlineTransport, registryClient, runInVolume } from './harness';
+import {
+  FakeUi,
+  HELPER_DOCKERFILE,
+  RecordingProgress,
+  TEST_ACCOUNT,
+  dockerTestContext,
+  fakeAuth,
+  runInVolume,
+} from './harness';
 import { workerLocks } from './workerLocks';
 
 const REPOSITORY = 'devenv-test/worker-open';
@@ -99,23 +105,17 @@ describe('the open through a real worker (plan step 11E6)', () => {
     }),
     log,
   );
-  const service = new EnvironmentService({
-    analyzer: inProcessAnalyzer,
-    environmentLock: locks.take,
+  // Plan step 11F1: the operations of the window (the pipeline runs in the worker).
+  const service = new EnvironmentOperations({
     flow,
     workerRefresh: (environments) => locks.refresh(environments),
-    docker,
-    runner,
-    helper,
+    dockerRunning: () => docker.isRunning(),
     registry,
     sessionFiles,
-    imageChecker: new ImageChecker(registryClient(offlineTransport, runner, env, log), log),
     auth: fakeAuth,
     ui,
     logger: log,
     clock: systemClock,
-    platform: process.platform,
-    env,
     owner,
     settings: () => settings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),

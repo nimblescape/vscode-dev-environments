@@ -21,8 +21,8 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks,
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
-import { PipelineTexts, type EnvironmentService, type OpenResult } from '../core/pipeline/environmentService';
-import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
+import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
+import { PipelineTexts, type OpenResult } from '../core/pipeline/operationBase';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -123,7 +123,7 @@ export interface ControllerDeps {
    * exercise a flow.
    */
   flow?: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
-  service: EnvironmentService;
+  service: EnvironmentOperations;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
   connection: ConnectionAdapter;

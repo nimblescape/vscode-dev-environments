@@ -44,7 +44,6 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
-import { EnvironmentService } from '../../src/core/pipeline/environmentService';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { workerLocks, type WorkerLocks } from './workerLocks';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -66,8 +65,7 @@ import {
   fakeAuth,
   registryClient,
   registryTransport,
-  runInVolume,
-} from './harness';
+  runInVolume, pipelineWithOperations } from './harness';
 
 const ALIAS = 'devenv-test-remote';
 const REPOSITORY = 'devenv-test/remote';
@@ -284,7 +282,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint),
     );
     remoteLocks = locks;
-    const service = new EnvironmentService({
+    const service = pipelineWithOperations({
       analyzer: inProcessAnalyzer,
       // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
       // was always granted, whose plain Docker calls ran directly): the real lock of the worker on the remote engine.
@@ -374,12 +372,12 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
 
     // Back on the local Docker, the environment of the remote host is never acted on.
     await useContext(docker, 'default');
-    await expect(targets.withOperation(() => service.stop(environmentId))).rejects.toMatchObject({ code: 'otherDockerHost' });
+    await expect(targets.withOperation(() => service.operations.stop(environmentId))).rejects.toMatchObject({ code: 'otherDockerHost' });
     expect(localCli.container(containerName)?.State.Running).toBe(true);
 
     // On the remote host again, the stop goes through SSH.
     await useRemoteContext(docker, ALIAS);
-    await targets.withOperation(() => service.stop(environmentId));
+    await targets.withOperation(() => service.operations.stop(environmentId));
     expect(localCli.container(containerName)?.State.Running).toBe(false);
     // Plan step 6, PR C: the open ran its helper steps in one batch helper of the worker on the remote engine; no worker
     // and no batch helper is left over.

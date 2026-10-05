@@ -6,7 +6,7 @@
 // and whose mark (Environment.lifecycleIncomplete) could not be recorded (review round 4 of PR #68, B-R4-2). The memory is
 // the window's: the pipeline of the window uses it directly, the pipeline of the worker through the requests of its
 // operation (`local unrecordedLifecycle`, `record rememberLifecycle`, `record forgetLifecycle`). Pure; no `vscode`.
-import { sameContainer } from './pipelineRules';
+import { sameContainer } from './containerIds';
 
 /**
  * Plan step 11E6 (review round 1 of PR #107, A-L2): what the window remembers for an environment whose open in the worker

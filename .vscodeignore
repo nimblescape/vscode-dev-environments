@@ -1,7 +1,6 @@
 **
 !dist/extension.js
 !dist/groupsPreviewWorker.js
-!dist/configurationAnalysisWorker.js
 !dist/helperChannel.js
 !resources/**
 !package.json

@@ -3,7 +3,10 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // In-memory fakes for the tests of the environment service: Docker, workspace helper, image check, and user interface.
-// The registry and the session files are the real ones, in a temporary folder. Only test files import this module.
+// The registry and the session files are the real ones, in a temporary folder. Only test files
+// import this module.
+import { EnvironmentOperations, type EnvironmentOperationsDeps, type OperationFlow } from './environmentOperations';
+import { windowLifecycleMemory } from './lifecycleMemory';
 import type { DeleteConfirmation } from './deleteCheck';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -1364,6 +1367,8 @@ export interface Harness {
   rejectedTokens: string[];
   clock: Clock;
   service: EnvironmentService;
+  /** Plan step 11F1: the operations of the window (the flows that it sends to the worker). */
+  operations: EnvironmentOperations;
   cleanup(): void;
 }
 
@@ -1432,11 +1437,11 @@ export function fakeDockerEngine(docker: FakeDocker): DockerEngine {
 }
 
 /**
- * Plan step 11B2: EnvironmentServiceDeps.flow as the worker serves it, for the unit tests: the helper image of the
+ * Plan step 11B2: the flow of a window (plan step 11F1: EnvironmentOperationsDeps.flow) as the worker serves it, for the unit tests: the helper image of the
  * worker first (as HelperChannels opens it), the lock of the environment through `lock` (as the operation takes it
  * itself), then the flow over fakeDockerEngine. The refusals are those of the channel and the worker.
  */
-export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' | 'clock'>, lock: EnvironmentServiceDeps['environmentLock']): EnvironmentServiceDeps['flow'] {
+export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' | 'clock'>, lock: EnvironmentServiceDeps['environmentLock']): OperationFlow {
   return async (op, params, options) => {
     // Plan step 11C1: the reads of an attached window, over the same FakeDocker (no lock, no helper image).
     if (op === OP_WINDOW_STATE) {
@@ -1484,7 +1489,7 @@ export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' |
   };
 }
 
-export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): Harness {
+export function createHarness(overrides: Partial<EnvironmentServiceDeps & EnvironmentOperationsDeps> = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const paths = new StoragePaths(root);
   paths.ensureDirectoriesSync();
@@ -1527,7 +1532,7 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
       h.docker.running = true;
     }
   };
-  h.service = new EnvironmentService({
+  const common = {
     docker: h.docker,
     runner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }) },
     helper: h.helper,
@@ -1557,6 +1562,14 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps> = {}): 
     analyzer: inProcessAnalyzer,
     // Plan step 5, PR B (D1: no unlocked path): a lock that is always granted, for the tests that are not about it.
     environmentLock: h.lock.take,
+    // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
+    lifecycleMemory: windowLifecycleMemory(),
+  } satisfies EnvironmentServiceDeps;
+  h.service = new EnvironmentService({ ...common, ...overrides });
+  // Plan step 11F1: the operations of the window (the extension's side) on the same registry, files and FakeDocker.
+  h.operations = new EnvironmentOperations({
+    ...common,
+    dockerRunning: () => h.docker.isRunning(),
     // Plan step 11B2: the flows of the worker against the same FakeDocker, under the lock of the service.
     flow: fakeWorkerFlow(h, overrides.environmentLock ?? h.lock.take),
     // Plan step 11C1: the refresh of the worker, which reads the same FakeDocker.

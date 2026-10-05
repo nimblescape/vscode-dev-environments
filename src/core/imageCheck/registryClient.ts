@@ -10,6 +10,9 @@ import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
 import { abortError, isAbortError, silentLogger, type Credentials, type Logger } from '../ports';
 import { isDockerHub, registryDisplayName, type ImageReference } from './reference';
 
+/** Common time limit of all requests of one image check (NFR-08), and of the check of the base image of the helper. */
+export const IMAGE_CHECK_TIMEOUT_MS = 5000;
+
 /** Manifest types in the `Accept` header: OCI index, Docker manifest list, Docker manifest v2, OCI manifest. */
 export const MANIFEST_MEDIA_TYPES = [
   'application/vnd.oci.image.index.v1+json',

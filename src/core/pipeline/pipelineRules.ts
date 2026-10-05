@@ -828,20 +828,10 @@ export function composeMountVolumes(
   return { names: [...names], sources: [...sources], skipped: [...skipped] };
 }
 
-/** Plan step 11E4a: moved from ./environmentService. Docker and the Dev Container CLI name a container by its full ID or by a prefix of it. */
-export function sameContainerId(a: string, b: string): boolean {
-  return a !== '' && b !== '' && (a.startsWith(b) || b.startsWith(a));
-}
+/** Plan step 11F1: moved to ./containerIds (the window's operations use them without the rules of the pipeline). */
+import { sameContainer, sameContainerId } from './containerIds';
+export { sameContainer, sameContainerId };
 
-/**
- * Review round 2 of PR #68: the same container. Two full IDs (64 hexadecimal digits) are compared exactly; only a short
- * one is compared as a prefix (sameContainerId), so that no ID that merely starts with another one matches.
- */
-export function sameContainer(a: string, b: string): boolean {
-  if (a === b) return true;
-  const full = /^[0-9a-f]{64}$/;
-  return full.test(a) !== full.test(b) && sameContainerId(a, b);
-}
 
 /**
  * Review round 4 of PR #68 (A-R4-1): whether finish clears the mark Environment.lifecycleIncomplete (`mark`, as the

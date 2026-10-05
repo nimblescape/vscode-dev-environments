@@ -20,7 +20,6 @@ import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage, UserFacingError } from '../core/errors';
-import { WorkerConfigurationAnalyzer } from '../core/helper/configurationAnalysisRunner';
 import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
 import { HelperPrebuild, dockerEngineAnswers } from '../core/helper/helperPrebuild';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../core/helper/workspaceHelper';
@@ -29,14 +28,13 @@ import { HelperChannelError } from '../core/helperChannel/helperChannel';
 import { Messages } from '../core/messages';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
-import { ImageChecker } from '../core/imageCheck/imageCheck';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock, type Logger } from '../core/ports';
 import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
 import { PACKAGES_TIMEOUT_MS, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
 import { imageLists } from './imageLists';
 import { REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
-import { EnvironmentService } from '../core/pipeline/environmentService';
+import { EnvironmentOperations } from '../core/pipeline/environmentOperations';
 import { windowLifecycleMemory } from '../core/pipeline/lifecycleMemory';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
@@ -185,7 +183,6 @@ async function activateExtension(
   const registryClient = new RegistryClient(nodeHttpsTransport, withGitHubPackagesFallback(credentials.provider(), auth), logger, {
     onCredentialsRejected: ghcrRejectionReporter(auth),
   });
-  const imageChecker = new ImageChecker(registryClient, logger);
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
   const helper = new WorkspaceHelper({
     docker,
@@ -432,11 +429,6 @@ async function activateExtension(
   windowCoordinator = sessionCoordinator;
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
-  // Review round 9 (P9-2): without its bundle every analysis fails (as an internal error, which refuses new and changed
-  // configurations): the log says why at once.
-  if (!fs.existsSync(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')))) {
-    logger.error('The bundle of the configuration check (dist/configurationAnalysisWorker.js) is missing. Reinstall Dev Environments.');
-  }
   // Plan step 11B1, 11B2 (decision of 2026-10-03, the worker is the deputy): the flows that run in the worker of the
   // current engine, with the HostSide of this computer answering their requests; one for the service and the controller.
   // Plan step 11E4d (decision of 2026-09-29): the containers that this window remembers, for its pipeline and its worker.
@@ -463,17 +455,13 @@ async function activateExtension(
     }),
     logger,
   );
-  const service = new EnvironmentService({
+  // Plan step 11F1 (decision 1 of 2026-10-03): the operations of this window, each a flow in the worker of the Docker
+  // target; the pipeline runs there (EnvironmentService), never here.
+  const service = new EnvironmentOperations({
     flow: workerFlow,
-    docker,
-    runner,
-    helper,
     registry,
     sessionFiles,
-    imageChecker,
     auth,
-    // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
-    viewer: (token, signal) => discovery.viewer(token, signal),
     lifecycleMemory,
     // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker of the Docker target of the operation
     // (plan step 11C1: outside of an operation, of the current one; never read directly). Plan step 5, PR D (rule D1 of 2026-09-30): within
@@ -488,20 +476,16 @@ async function activateExtension(
         throw new UserFacingError('helperFailed', Messages.workerUnavailable(error.message), error.message);
       }
     },
-    // Plan step 5, PR B: the lock of an environment in the worker of the Docker target of the operation (Stop, Delete).
-    environmentLock: async (environmentId, waitSeconds, signal) => channels.lock(await targets.current(), environmentId, waitSeconds, signal),
+    // Whether the Docker engine of the current target answers (Stop and the refresh do nothing without it).
+    dockerRunning: () => docker.isRunning(),
     ui,
     logger,
     clock: systemClock,
-    platform,
-    env,
     owner: { windowId: sessionCoordinator.windowId, pid: process.pid },
     // Plan step 11C2a: the id of this computer in the Session Monitor, for the `forget` of Delete in the worker.
     monitorSource: computerId,
     settings: getSettings,
     windowStatuses: () => sessionFiles.readWindowStatuses(),
-    // Review round 8: the host access analysis of a configuration runs in a worker thread with limits of time and memory.
-    analyzer: new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger),
     // Unit 7: new environments record the Docker host; only its environments are used. Review D2: an endpoint that is
     // neither local nor SSH is refused by every operation and never read.
     dockerTarget: () => targets.current(),

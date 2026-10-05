@@ -7,15 +7,38 @@
 // `open`. Each step checks the current state first and does nothing when its result exists (principle 7.1.7), so the
 // pipeline can run again at any time.
 import * as path from 'path';
-import { registryBusyMarks, type BusyMarkView, type EnvironmentBusyMarks } from './busyMarks';
+import { type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
-import { ContainerAdapter, isDevContainer, type ContainerInfo, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
-import { dockerHostField, dockerHostOf, environmentsOfHost, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
-import { dockerEndpointUnsupported } from '../docker/remoteDocker';
+import {
+  ContainerAdapter,
+  isDevContainer,
+  type ContainerInfo,
+  type NetworkInfo,
+  type VolumeInfo,
+} from '../docker/containerAdapter';
+import {
+  dockerHostField,
+  dockerHostOf,
+  environmentsOfHost,
+  isOnDockerHost,
+  type DockerTarget,
+} from '../docker/dockerHost';
 import { ensureDockerRunning } from '../docker/dockerStart';
-import { EnvironmentLockError, holdsEnvironmentLock, runWithEnvironmentLock, type HeldEnvironmentLock } from '../docker/environmentLock';
-import { BatchHelperUnavailableError, UserFacingError, errorMessage, isBatchHelperUnavailable, isSessionMonitorFailed, isUserFacingError } from '../errors';
+import {
+  EnvironmentLockError,
+  holdsEnvironmentLock,
+  runWithEnvironmentLock,
+  type HeldEnvironmentLock,
+} from '../docker/environmentLock';
+import {
+  BatchHelperUnavailableError,
+  UserFacingError,
+  errorMessage,
+  isBatchHelperUnavailable,
+  isSessionMonitorFailed,
+  isUserFacingError,
+} from '../errors';
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
@@ -60,43 +83,23 @@ import {
   type AnalysisResult,
   type ConfigurationAnalyzer,
 } from '../helper/configurationAnalysis';
-import { containerGitSupport, gitIdentity, homeGitConfigCommand, isGitHubLogin, type GitHubViewer, type GitIdentity } from '../helper/containerGit';
+import {
+  containerGitSupport,
+  gitIdentity,
+  homeGitConfigCommand,
+  isGitHubLogin,
+  type GitHubViewer,
+  type GitIdentity,
+} from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
+import { channelStepLabel, newCleanupLabel } from '../helperChannel/protocol';
 import {
-  channelStepLabel,
-  LOCK_BUSY_CODE,
-  LOCK_UNAVAILABLE_CODE,
-  newCleanupLabel,
-  OP_DELETE,
-  OP_DELETE_CHECK,
-  OP_LIST_CONFIGURATIONS,
-  OP_OPEN,
-  OPEN_PROGRESS_DETAIL,
-  OP_RECONCILE,
-  OP_STOP,
-  OP_WINDOW_STATE,
-  parseDeleteCheckParams,
-  parseDeleteCheckValue,
-  parseDeleteParams,
-  parseDeleteValue,
-  parseListConfigurationsParams,
-  parseReconcileParams,
-  parseReconcileValue,
-  parseListConfigurationsValue,
-  parseOpenParams,
-  parseOpenValue,
-  parseStopParams,
-  parseStopValue,
-  parseWindowStateParams,
-  parseWindowStateValue,
-  type FlowRefusal,
-  type OpenParams,
-  type WindowStateValue,
-} from '../helperChannel/protocol';
-import type { ImageSettings } from '../remoteMonitor/protocol';
-import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { DevcontainerCommandError, buildComposeOverrideConfig, buildOverrideConfig, composeConfigOverride } from '../helper/devcontainerCli';
+  DevcontainerCommandError,
+  buildComposeOverrideConfig,
+  buildOverrideConfig,
+  composeConfigOverride,
+} from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
 import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
 import {
@@ -108,7 +111,7 @@ import {
 } from '../imageCheck/imageCheck';
 import { registryDisplayName } from '../imageCheck/reference';
 import { parseJsonc } from '../jsonc';
-import { Messages, Steps, listSome, type ProgressStep } from '../messages';
+import { Messages, listSome } from '../messages';
 import {
   CONFIG_FOLDER,
   CONTAINER_CONFIG_UNKNOWN_LABEL,
@@ -138,9 +141,15 @@ import {
 } from '../names';
 import { namePair } from '../namePairs';
 import { imageBuildRecord, imageRecordLabels } from './imageRecord';
-import { isAvailableTo, ownerOf } from '../ownership';
+import { ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
-import { BRANCH_EXEC_TIMEOUT_MS, readBranch, type EnvironmentRuntimeState, type EnvironmentStates, type StateEnvironment } from './refreshStates';
+import {
+  BRANCH_EXEC_TIMEOUT_MS,
+  readBranch,
+  type EnvironmentRuntimeState,
+  type EnvironmentStates,
+  type StateEnvironment,
+} from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -180,10 +189,8 @@ import {
   type NetworkState,
 } from '../policy';
 import {
-  abortError,
   isAbortError,
   isoTime,
-  sleep as defaultSleep,
   type Clock,
   type GitHubAuth,
   type Logger,
@@ -192,13 +199,10 @@ import {
   type ProgressReporter,
 } from '../ports';
 import { isStorageId } from '../storage/paths';
-import { isEnvironmentOf, type EnvironmentRegistry } from '../storage/registry';
-import type { SessionFiles } from '../storage/sessionFiles';
 import type {
   BuildRecord,
   BusyMark,
   BusyOperation,
-  ContainerState,
   DevcontainerConfig,
   DevcontainerResult,
   Environment,
@@ -263,69 +267,33 @@ import {
   stringList,
   type ImageCheckState,
 } from './pipelineRules';
-import { otherWindowMarkIsLive, readLiveness, registryOpenRecords, sameBusyMark, type MarkLiveness, type OpenRecords } from './openRecords';
-import { LIFECYCLE_UNKNOWN, rememberedFor, windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
+import { sameBusyMark, type OpenRecords } from './openRecords';
+import { rememberedFor, type LifecycleMemory } from './lifecycleMemory';
 import type { PullCredentials, PullCredentialsProvider } from './pullCredentials';
+import {
+  OperationBase,
+  PipelineTexts,
+  StepReporter,
+  waitUnlessAborted,
+  cancelledError,
+  environmentMissing,
+  environmentBusy,
+  repositoryKey,
+  BUSY_POLL_MS,
+  ENVIRONMENT_LOCK_WAIT_SECONDS,
+  type DockerStarter,
+  type GitHubSession,
+  type EnvironmentSessionFiles,
+  type EnvironmentStore,
+  type OpenOptions,
+  type OpenResult,
+  type OperationBaseDeps,
+  type OperationOptions,
+  type RepositoryTarget,
+} from './operationBase';
 
-// User-visible texts that messages.ts lacks (plain language, NFR-02); to be moved there.
-export const PipelineTexts = {
-  cancelled: 'The operation was cancelled.',
-  startFailed: 'The environment could not be started.',
-  environmentMissing: 'This environment does not exist anymore.',
-  environmentBusy: (repository: string) =>
-    `${repository} is being changed in another window. Try again when this is finished.`,
-  preparingHelper: 'The workspace helper is being prepared. This happens once and can take a few minutes.',
-  updatingHelper: 'The workspace helper is being updated. This can take a few minutes.',
-  lifecycleCommandFailed: (command: string | undefined) =>
-    `The ${command ?? 'lifecycle command'} of the environment failed. The environment is opened anyway.`,
-  /** Plan step 5, PR B, user decision D3: the lock of the environment stayed held elsewhere for ENVIRONMENT_LOCK_WAIT_SECONDS. */
-  environmentLockBusy: (repository: string) =>
-    `${repository} is busy with an operation from another window or computer; try again in a moment.`,
-  /**
-   * Plan step 5, PR B, user decision D1: the worker that holds the lock of the environment could not be made ready (the
-   * helper image could not be built, the worker could not be opened or reaches another Docker engine, or the lock failed
-   * in it). Nothing was changed.
-   */
-  environmentLockUnavailable: (repository: string, cause: string) =>
-    `${repository} was not changed: the Dev Environments worker on the Docker host could not be prepared (${cause}). Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
-  /** Plan step 11B2 (review round 1, A-R1-5): the record of the environment holds a name or user that Stop cannot use. */
-  stopRefused: (repository: string) =>
-    `${repository} cannot be stopped from here: its record holds a value (the container name, the remote user, or the repository folder) that Dev Environments cannot pass on. Stop it with Docker.`,
-} as const;
 
-/** Plan step 5, PR B, user decision D3: how long an operation waits for the lock of an environment that is held elsewhere. */
-export const ENVIRONMENT_LOCK_WAIT_SECONDS = 10;
-/**
- * Plan step 11B2: the longest Stop in the worker (the wait for the lock, the Git state, the stop of each container). A
- * Stop with more than about eight services that all hit their own time limit ends here (review round 1, A-R1-6).
- */
-export const STOP_FLOW_TIMEOUT_MS = 10 * 60_000;
-/** Plan step 11C1: the longest read of an attached window in the worker (the branch read has 15 s of its own). */
-export const WINDOW_STATE_FLOW_TIMEOUT_MS = 30_000;
-/**
- * Plan step 11B3b: the longest listing of Select configuration in the worker: the wait for the lock (D3), the start of the
- * batch helper, and its step.
- */
-export const LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS = 5 * 60_000;
-/**
- * Plan step 11C2a: the longest Delete in the worker: the wait for the operation of another window and for the lock, the
- * stop and removal of the containers, the images, the volumes with their retries. Delete is not cancellable.
- */
-export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
-/**
- * Plan step 11C2b: the longest check of Delete in the worker: the Git state (GIT_EXEC_TIMEOUT_MS) and the questions,
- * which wait for the user.
- */
-export const DELETE_CHECK_FLOW_TIMEOUT_MS = 60 * 60_000;
-/** Plan step 11C3: the longest rebuild of the registry in the worker (it lists and inspects the volumes and containers). */
-export const RECONCILE_FLOW_TIMEOUT_MS = 2 * 60_000;
-/**
- * Plan step 11E6: the longest open in the worker: the clone, the image check and pulls, the build of the image (a large
- * one may take an hour or more), `up` with the lifecycle commands, and the questions to the user, which wait for an answer.
- */
-export const OPEN_FLOW_TIMEOUT_MS = 4 * 60 * 60_000;
-/** Plan step 11E6: the longest detail of a step of the open that the worker reports (the progress notification). */
-const MAX_OPEN_DETAIL_LENGTH = 1000;
+
 
 /** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
 export type EnvironmentDocker = Pick<
@@ -392,17 +360,7 @@ export type EnvironmentHelper = Pick<
   | 'fixConfigOwnership'
 >;
 
-/** The part of EnvironmentRegistry that the service uses. */
-export type EnvironmentStore = Pick<
-  EnvironmentRegistry,
-  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'add' | 'restore' | 'updateEnvironment' | 'remove'
->;
 
-/** The part of SessionFiles that the service uses. */
-export type EnvironmentSessionFiles = Pick<
-  SessionFiles,
-  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'readReopen' | 'removeReopen' | 'removeReopenOf' | 'readPendings'
->;
 
 /**
  * Unit 7, PR 2: the Session Monitor container of the Docker engine of the operation (RemoteSessionMonitor, with the
@@ -437,10 +395,8 @@ export interface EnvironmentSessionMonitor {
   images?(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, signal?: AbortSignal): Promise<void>;
 }
 
-/** Starts Docker when it does not run and waits until it is ready (concept 7.6 "Docker start"). */
-export type DockerStarter = (options: { onStarting: () => void; signal?: AbortSignal }) => Promise<void>;
 
-export interface EnvironmentServiceDeps {
+export interface EnvironmentServiceDeps extends OperationBaseDeps {
   docker: EnvironmentDocker;
   /** For ensureDockerRunning. */
   runner: ProcessRunner;
@@ -517,11 +473,6 @@ export interface EnvironmentServiceDeps {
    */
   openRecords?: OpenRecords;
   /**
-   * Plan step 11C2a: the id of this computer in the Session Monitor (its heartbeat records), which Delete sends to the
-   * worker for its `forget`. Without it, deleteInWorker refuses.
-   */
-  monitorSource?: () => string;
-  /**
    * Plan step 11C2b (decision of 2026-10-04): records the Git state of an environment (Environment.gitSummary). Default:
    * through `registry`; the worker's pipeline sends it to the extension (`record recordGitSummary`).
    */
@@ -547,76 +498,30 @@ export interface EnvironmentServiceDeps {
    */
   analyzer: ConfigurationAnalyzer;
   /**
-   * Plan step 5, PR C: readEnvironmentStates in the worker of the Docker target (HelperChannels.refresh). Plan step 5,
-   * PR D (rule D1 of 2026-09-30): it makes the worker ready first, and rejects when it cannot (the refresh then fails).
-   * Plan step 11C1: always, also outside of an operation (the current Docker target); the states are never read directly.
-   */
-  workerRefresh: (environments: readonly StateEnvironment[]) => Promise<EnvironmentStates>;
-  /**
    * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
    * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
    * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
    */
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
-  /**
-   * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the Docker target of
-   * the operation (Stop first); the worker takes the lock of the environment itself. Rejects with a HelperChannelError
-   * when there is no worker, and with a HelperOperationError (`busy` for a lock held elsewhere) when the flow fails.
-   * Plan step 11C1, review round 1 (A-R1-1): `passive`, a read in the background: the worker is made ready as for the
-   * refresh (the helper image only checked, the wait after a failed open kept).
-   */
-  flow: (
-    op: string,
-    params: unknown,
-    options: {
-      signal?: AbortSignal;
-      timeoutMs?: number;
-      passive?: boolean;
-      // Review round 1 of 11C2b (A-R1-M1): each answer of the user to a question of the flow.
-      onAnswer?: (call: string, args: unknown[], value: unknown) => void;
-      // Review round 3 of 11C2b (A-R3-L1): a question of the flow is asked, and has its answer (or failed).
-      onQuestion?: (state: 'asked' | 'settled') => void;
-      // Plan step 11E6: a step of the flow began (the progress of the open).
-      onProgress?: (step: string, detail?: string) => void;
-    },
-  ) => Promise<unknown>;
-  /**
-   * Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance of this computer for the Session Monitor of the
-   * engine of an open (`dockerHost`), and the image list when there is one to give (read from GitHub at most once an hour
-   * per engine); `listSent` when the monitor took it. Without it, openInWorker refuses.
-   */
-  openMonitor?: (dockerHost: string) => { images: ImageSettings; repositories?: string[]; listSent: () => void };
 }
 
-export interface RepositoryTarget {
-  /** `owner/name`. */
-  repository: string;
-  defaultBranch?: string | null;
-  /** From the discovery, in the order of precedence. Empty for an unknown repository: the pipeline then uses the first configuration in the volume. */
-  configPaths: string[];
-  /** isTrustedOwner() (concept section 9). */
-  trusted: boolean;
-}
 
-export interface OperationOptions {
-  progress: ProgressReporter;
-  signal?: AbortSignal;
-}
 
-export interface OpenOptions extends OperationOptions {
-  /** Manual rebuild: build the environment image also when no digest changed (concept 7.14). */
-  forceRebuild?: boolean;
-  /** "Select configuration…": change the configuration first. Implies a rebuild when an environment exists. */
-  configPath?: string;
-}
 
-export interface OpenResult {
-  /** Registry entry after the pipeline. */
-  environment: Environment;
-  containerName: string;
-  /** From `devcontainer up`, fallback `/workspaces/<name>`. */
-  remoteWorkspaceFolder: string;
-}
+
+/** Plan step 11F1: moved to ./operationBase (shared with EnvironmentOperations, the extension's side). */
+export {
+  PipelineTexts,
+  ENVIRONMENT_LOCK_WAIT_SECONDS,
+  STOP_FLOW_TIMEOUT_MS,
+  WINDOW_STATE_FLOW_TIMEOUT_MS,
+  LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS,
+  DELETE_FLOW_TIMEOUT_MS,
+  DELETE_CHECK_FLOW_TIMEOUT_MS,
+  RECONCILE_FLOW_TIMEOUT_MS,
+  OPEN_FLOW_TIMEOUT_MS,
+} from './operationBase';
+export type { DockerStarter, EnvironmentSessionFiles, EnvironmentStore, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from './operationBase';
 
 /** Plan step 5, PR C: moved to ./refreshStates (shared with the worker). */
 export type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment };
@@ -624,7 +529,6 @@ export type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment };
 /** MAX_REFUSED_ITEMS_LENGTH of ./pipelineRules (hotfix review 3, C3-2; review 4, Q3). */
 export { MAX_REFUSED_ITEMS_LENGTH };
 
-const BUSY_POLL_MS = 500;
 /** Review round 4 of PR #68 (B-R4-2): the pause before the second write of Environment.lifecycleIncomplete. */
 const LIFECYCLE_MARK_RETRY_MS = 500;
 
@@ -634,7 +538,6 @@ const LIFECYCLE_MARK_RETRY_MS = 500;
  */
 const NOT_RUNNING_STATES: ReadonlySet<string> = new Set(['exited', 'created']);
 
-const DEFAULT_BUSY_WAIT_MS = 10_000;
 // A pending connection file counts for 2 minutes (concept 7.9 rule 1). A helper image build, `up` with long lifecycle
 // commands, or an open prompt can take longer; a refresh well within the waiting time keeps the container in use.
 const DEFAULT_PENDING_REFRESH_MS = 15_000;
@@ -881,12 +784,6 @@ interface PipelineContext {
   modelOfContainers?: boolean;
 }
 
-/** A token together with the account of its session. */
-interface GitHubSession {
-  token: string;
-  account: GitHubAccount;
-}
-
 /**
  * Review round 2 of PR #68: what withdrawAfterHelperFailed did with the container of an `up` whose lifecycle commands could
  * not run (run-user-commands failed with helperFailed). `id`: its container ID (review round 3, A-R3-1: a later cleanup of a
@@ -1032,38 +929,6 @@ interface UpdatePlan {
   current: boolean;
 }
 
-/** Reports each progress step once, and logs it. */
-class StepReporter {
-  private current: ProgressStep | undefined;
-  /** The detail shown with the current step (a new step removes it). */
-  private shownDetail: string | undefined;
-
-  constructor(
-    private readonly progress: ProgressReporter,
-    private readonly logger: Logger,
-  ) {}
-
-  step(step: ProgressStep): void {
-    if (step === this.current) return;
-    this.current = step;
-    this.shownDetail = undefined;
-    this.logger.info(`Step: ${Steps[step]}`);
-    this.progress.step(step);
-  }
-
-  /** Shows `message` with the current step, once while it is shown. */
-  detail(message: string): void {
-    if (message === this.shownDetail) return;
-    this.shownDetail = message;
-    this.progress.detail(message);
-  }
-
-  /** Removes the detail of the current step (an empty detail is not shown). */
-  clearDetail(): void {
-    this.shownDetail = undefined;
-    this.progress.detail('');
-  }
-}
 
 /**
  * Review round 4 of PR #68 (A-R4-5): a step without a busy mark (Step 9) would have to stop, remove, or rename a container,
@@ -1075,21 +940,8 @@ class OtherWindowUsesError extends UserFacingError {
   }
 }
 
-function cancelledError(): UserFacingError {
-  return new UserFacingError('cancelled', PipelineTexts.cancelled);
-}
 
-function environmentMissing(repository?: string): UserFacingError {
-  return new UserFacingError('startFailed', repository ? Messages.noEnvironment(repository) : PipelineTexts.environmentMissing);
-}
 
-function environmentBusy(repository: string, mark: BusyMark): UserFacingError {
-  return new UserFacingError(
-    'startFailed',
-    PipelineTexts.environmentBusy(repository),
-    `Busy mark: ${mark.operation} since ${mark.since}, process ${mark.pid}, window ${mark.windowId}.`,
-  );
-}
 
 /** Plan step 11E4a: moved to ./pipelineRules (the open's registry writes, ./openRecords, use it too). */
 export { lifecycleMarkClears };
@@ -1109,9 +961,6 @@ function configurationError(error: unknown): unknown {
   return new UserFacingError('buildFailed', Messages.buildFailed, errorDetail(error));
 }
 
-function repositoryKey(repository: string): string {
-  return repository.toLowerCase();
-}
 
 function volumeLabels(environment: Environment): Record<string, string> {
   const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environment.id, [LABEL_REPOSITORY]: environment.repository };
@@ -1204,9 +1053,6 @@ function isHostAccess(error: unknown): boolean {
   return isUserFacingError(error) && error.code === 'hostAccess';
 }
 
-function otherAccount(repository: string): UserFacingError {
-  return new UserFacingError('otherAccount', Messages.otherAccount(repository));
-}
 
 /**
  * The message of a refusal (concept section 9 "Host access"): the settings that need access to the computer
@@ -1286,21 +1132,9 @@ const EXISTING_PATHS_CHARACTERS = 16 * 1024;
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
 const VIEWER_TIMEOUT_MS = 5_000;
-/** Review round 1 of PR #107 (A-M1): the questions whether a process runs that the pipeline asks at the same time. */
-const PROCESS_QUESTIONS_AT_ONCE = 4;
 /** After a failed question for the profile, the fallback identity is used this long before GitHub is asked again. */
 const IDENTITY_RETRY_MS = 10 * 60_000;
 
-/** `process.kill(pid, 0)`: EPERM (a process of another user) counts as alive. */
-function processExists(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
 
 function defaultDockerStarter(deps: EnvironmentServiceDeps): DockerStarter {
   return async ({ onStarting, signal }) => {
@@ -1312,76 +1146,25 @@ function defaultDockerStarter(deps: EnvironmentServiceDeps): DockerStarter {
   };
 }
 
-/** Waits for `promise`; rejects with an AbortError when `signal` aborts first. */
-function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortError());
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(abortError());
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(error);
-      },
-    );
-  });
-}
 
 /**
  * The open pipeline and the environment operations (concept 7.5, 7.6, 7.7, 7.12, 7.14).
  * Operations on the same repository run one after the other in this window; busy marks in the registry keep other
  * windows and the Session Monitor away while an environment changes.
  */
-export class EnvironmentService {
-  private readonly queues = new Map<string, Promise<void>>();
-  /**
-   * Review round 4 of PR #68 (B-R4-2): environment ID → the ID of a container that runs without its lifecycle commands
-   * while the registry could not record it (Environment.lifecycleIncomplete). Consulted with the mark, so that no later
-   * open of this window opens it as it is; cleared where the mark is (clearLifecycleMark, and finish after the lifecycle
-   * commands of that container ran). Plan step 11E4d: the window's memory (LifecycleMemory), read into
-   * PipelineContext.unrecordedLifecycle.
-   */
-  private readonly lifecycleMemory: LifecycleMemory;
-  /** Plan step 11E4d: whether a process of this computer runs (EnvironmentServiceDeps.processAlive). */
-  private readonly processAlive: (pid: number) => Promise<boolean>;
-  /** Review D2: the endpoints (neither local nor SSH) whose refusal the reads showed already: once each. */
-  private readonly refusedEndpoints = new Set<string>();
+export class EnvironmentService extends OperationBase {
   /**
    * Git identity per account ID (identityOf): the question to GitHub, shared by the opens of this window. After a failed
    * question, `retryAfter` is the time from which GitHub is asked again.
    */
   private readonly identities = new Map<string, { identity: Promise<GitIdentity>; retryAfter?: number }>();
-  private readonly startDockerFn: DockerStarter;
-  private readonly isAlive: (pid: number) => boolean;
-  private readonly busyMarks: EnvironmentBusyMarks;
-  /** Plan step 11E4a: the owner, clock, and view of the windows with which this window decides busy marks. */
-  private readonly markView: BusyMarkView;
-  private readonly openRecords: OpenRecords;
-  private readonly busyWaitMs: number;
   private readonly pendingRefreshMs: number;
-  private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly output = (text: string): void => this.deps.logger.output(text);
 
-  constructor(private readonly deps: EnvironmentServiceDeps) {
-    this.startDockerFn = deps.startDocker ?? defaultDockerStarter(deps);
-    this.isAlive = deps.isProcessAlive ?? processExists;
-    this.processAlive = deps.processAlive ?? (async (pid) => this.isAlive(pid));
-    this.lifecycleMemory = deps.lifecycleMemory ?? windowLifecycleMemory();
-    this.markView = { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger };
-    this.busyMarks = deps.busyMarks ?? registryBusyMarks(deps.registry, this.markView);
-    this.openRecords = deps.openRecords ?? registryOpenRecords(deps.registry, this.markView);
-    this.busyWaitMs = Math.max(0, deps.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
+  // Plan step 11F1: the rules of an operation of a window are OperationBase's (shared with EnvironmentOperations).
+  constructor(protected override readonly deps: EnvironmentServiceDeps) {
+    super(deps, deps.startDocker ?? defaultDockerStarter(deps));
     this.pendingRefreshMs = Math.max(1, deps.pendingRefreshMs ?? DEFAULT_PENDING_REFRESH_MS);
-    this.sleepFn = deps.sleep ?? defaultSleep;
-  }
-
-  private get logger(): Logger {
-    return this.deps.logger;
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -1426,165 +1209,6 @@ export class EnvironmentService {
         throw this.toUserError(error, options.signal);
       }
     });
-  }
-
-  /**
-   * Plan step 11E6 (decisions of 2026-10-03 and 2026-10-04): the open of a repository (`open`) by the worker of the Docker
-   * target, as the operation `open` (openThroughWorker). The worker's pipeline finds the environment of the repository of
-   * the signed-in account, or creates it.
-   */
-  async openInWorker(target: RepositoryTarget, options: OpenOptions): Promise<OpenResult> {
-    splitRepository(target.repository);
-    return this.exclusive(repositoryKey(target.repository), options.signal, async () => {
-      try {
-        return await this.openThroughWorker(
-          target.repository,
-          { target: { ...(target.defaultBranch !== undefined ? { defaultBranch: target.defaultBranch } : {}), configPaths: [...target.configPaths], trusted: target.trusted } },
-          options,
-        );
-      } catch (error) {
-        throw this.toUserError(error, options.signal);
-      }
-    });
-  }
-
-  /** Plan step 11E6: the open of an existing environment (`openEnvironment`) by the worker of the Docker target (openThroughWorker). */
-  async openEnvironmentInWorker(environmentId: string, options: OpenOptions): Promise<OpenResult> {
-    const environment = await this.deps.registry.get(environmentId);
-    if (!environment) throw environmentMissing();
-    await this.requireCurrentHost(environment);
-    return this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
-      try {
-        const current = await this.deps.registry.get(environmentId);
-        if (!current) throw environmentMissing(environment.repository);
-        if (holdsEnvironmentLock(current.id)) throw new Error(`The open of ${current.repository} under a lock of the environment that this window holds.`);
-        return await this.openThroughWorker(current.repository, { environmentId: current.id }, options);
-      } catch (error) {
-        throw this.toUserError(error, options.signal);
-      }
-    });
-  }
-
-  /**
-   * Plan step 11E6 (decision A1 of 2026-10-05): sends the open to the worker and answers with what the window needs to
-   * connect, after the worker released the lock of the environment. Before it is sent: the sign-in of this window (with a
-   * dialog when needed: the worker asks for the token without one) and the start of the local Docker (concept 7.6). The
-   * steps of the worker are the progress of the open. Decision D1: the open carries the image maintenance of this
-   * computer and the image list. The answer names an environment of the signed-in account on the Docker host of the
-   * operation (and of the repository of the open), which the window takes from its own registry.
-   */
-  private async openThroughWorker(
-    repository: string,
-    what: Pick<OpenParams, 'environmentId'> | Pick<OpenParams, 'target'>,
-    options: OpenOptions,
-  ): Promise<OpenResult> {
-    const { signal } = options;
-    const session = await this.requireSession();
-    // Review round 1 of PR #111 (A-L1): an environment of another account is never sent (concept 7.5, as before the move).
-    if ('environmentId' in what && what.environmentId !== undefined) {
-      const entry = await this.deps.registry.get(what.environmentId);
-      if (!entry) throw environmentMissing(repository);
-      this.availableEntry(entry, session.account);
-    }
-    await this.startDocker(new StepReporter(options.progress, this.logger), signal);
-    this.throwIfCancelled(signal);
-    const dockerHost = await this.currentDockerHost();
-    const monitor = this.deps.openMonitor?.(dockerHost);
-    const settings = this.deps.settings();
-    const params = parseOpenParams({
-      dockerHost,
-      owner: this.deps.owner,
-      monitorSource: this.deps.monitorSource?.(),
-      settings: {
-        updateImagesOnConnect: settings.updateImagesOnConnect,
-        hostAccessChecks: hostAccessChecks(repository, settings),
-        waitingTimeSeconds: waitingTimeMs(settings) / 1000,
-        stopOnClose: settings.stopOnClose !== false,
-        respectShutdownActionNone: settings.respectShutdownActionNone === true,
-        ...(settings.stopAfterMinutes !== undefined ? { stopAfterMinutes: settings.stopAfterMinutes } : {}),
-      },
-      images: monitor?.images,
-      ...(monitor?.repositories !== undefined ? { repositories: monitor.repositories } : {}),
-      repository,
-      ...what,
-      ...(options.forceRebuild === true ? { forceRebuild: true } : {}),
-      ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
-    });
-    if (params === undefined) throw new Error(`The open of ${repository} cannot be sent to the worker.`);
-    // The steps of the worker's pipeline (it logs them itself); `starting`: its `up` may run from here on.
-    let started = false;
-    const onProgress = (step: string, detail?: string) => {
-      if (step === OPEN_PROGRESS_DETAIL) {
-        const text = detail ?? '';
-        options.progress.detail(text.length > MAX_OPEN_DETAIL_LENGTH ? `${text.slice(0, MAX_OPEN_DETAIL_LENGTH - 1)}…` : text);
-      } else if (Object.hasOwn(Steps, step)) {
-        if (step === 'starting') started = true;
-        options.progress.step(step as ProgressStep);
-      }
-    };
-    let answer: unknown;
-    try {
-      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress);
-    } catch (error) {
-      // Review round 1 of PR #111 (A-M1): the user cancelled a question of the open in the worker (the worker cleaned up
-      // through its requests, which were answered): a cancel, as before the move.
-      // Review round 2 of PR #111 (A2-M1): never a worker that ended the operation itself (its shutdown, a defect): its
-      // requests ended with it, so this window cleans up.
-      if (error instanceof HelperOperationError && error.code === 'cancelled' && !error.timedOut && !error.aborted && signal?.aborted !== true) throw cancelledError();
-      await this.afterLostWorkerOpen(repository, params, session.account, started);
-      throw error;
-    }
-    const value = parseOpenValue(answer);
-    if (value === undefined) {
-      await this.afterLostWorkerOpen(repository, params, session.account, started);
-      throw new Error(`The worker answered the open of ${repository} with an invalid value.`);
-    }
-    if (value.imageListSent === true) monitor?.listSent();
-    if ('refused' in value) throw refusalError(value.refused);
-    const { opened } = value;
-    const environment = await this.deps.registry.get(opened.environmentId);
-    const expected = params.environmentId ?? (await this.deps.registry.findForAccount(repository, session.account.id, dockerHost))?.id;
-    // Review round 1 of PR #111 (A-I1): and its folder is the one that the open recorded (`record openFinished`).
-    if (
-      !environment ||
-      environment.id !== expected ||
-      !isAvailableTo(environment, session.account) ||
-      (environment.dockerHost ?? '') !== dockerHost ||
-      environment.remoteWorkspaceFolder !== opened.remoteWorkspaceFolder
-    ) {
-      throw new Error(`The worker answered the open of ${repository} with an environment that is not the one of the open.`);
-    }
-    return { environment, containerName: opened.containerName, remoteWorkspaceFolder: opened.remoteWorkspaceFolder };
-  }
-
-  /**
-   * Plan step 11E6: a worker open that ended without its answer (a lost channel, its time limit, a cancel) could not
-   * clean up on this computer: its requests end with it. This window does it for the environment of the open (as the
-   * pipeline's own `finally` blocks did): the pending connection file goes; the busy mark of this window goes, and a
-   * create mark stays as ended (so the next open completes the clone, or Delete removes the environment: PR #78, A-R1-1);
-   * and when the worker had begun `up` (its step `starting`), this window remembers the lifecycle of the environment as
-   * unknown (review round 1 of PR #107, A-L2: the worker could record neither the lifecycle mark nor this window's
-   * memory), so its next open of the environment does not open a running container as it is (LIFECYCLE_UNKNOWN).
-   */
-  private async afterLostWorkerOpen(repository: string, params: OpenParams, account: GitHubAccount, started: boolean): Promise<void> {
-    const id =
-      params.environmentId ??
-      (await this.deps.registry.findForAccount(repository, account.id, params.dockerHost).catch((error: unknown) => {
-        this.logger.warn(`The environment of ${repository} could not be read after the open in the worker ended: ${errorMessage(error)}`);
-        return undefined;
-      }))?.id;
-    if (id === undefined) return;
-    await this.quietly('remove the pending connection file', () => this.deps.sessionFiles.removePending(id));
-    await this.quietly('end the busy mark of this window', async () => {
-      const busy = (await this.deps.registry.get(id))?.busy;
-      if (busy === undefined || busy.windowId !== this.deps.owner.windowId || busy.pid !== this.deps.owner.pid) return;
-      if (busy.operation === 'create') await this.openRecords.createMark(id, 'ended');
-      else await this.busyMarks.clear(id);
-    });
-    if (started) {
-      await this.lifecycleMemory.remember(id, LIFECYCLE_UNKNOWN).catch((error: unknown) => this.logger.warn(`The window could not remember ${repository}: ${errorMessage(error)}`));
-      this.logger.warn(`The open of ${repository} in the worker ended while it started the container: the next open of this window runs its lifecycle commands again.`);
-    }
   }
 
   /**
@@ -1807,23 +1431,6 @@ export class EnvironmentService {
     if (current.owner.login === account.login) return current;
     const updated = await this.openRecords.ownerLogin(current.id, account);
     return updated ?? current;
-  }
-
-  /**
-   * The signed-in account (`interactive`: a sign-in may be asked for); refuses an environment of another account (concept
-   * 7.5).
-   */
-  private async requireOwnAccount(environment: Environment, interactive: boolean): Promise<void> {
-    const account = await this.deps.auth.getAccount({ interactive });
-    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    this.availableEntry(environment, account);
-  }
-
-  /** The registry entry, when it belongs to `account` (concept 7.5). Throws otherAccount for an entry of another account. */
-  private availableEntry(environment: Environment, account: GitHubAccount): Environment {
-    if (isAvailableTo(environment, account)) return environment;
-    this.logger.info(`The environment ${environment.id} does not belong to the signed-in account. It is not used.`);
-    throw otherAccount(environment.repository);
   }
 
   /** Concept 7.12: the workspace volume is missing. Never creates an empty volume without asking (concept 7.5). */
@@ -5832,102 +5439,6 @@ export class EnvironmentService {
   // Other operations
 
   /**
-   * Stop: records the Git summary from the running container, then `docker stop`. Does not start Docker. The other
-   * services of a Docker Compose environment are stopped after the dev container (D-20).
-   */
-  async stop(environmentId: string): Promise<void> {
-    const environment = await this.deps.registry.get(environmentId);
-    if (!environment) {
-      this.logger.info(`Stop: the environment ${environmentId} does not exist.`);
-      return;
-    }
-    await this.requireCurrentHost(environment);
-    await this.requireOwnAccount(environment, false);
-    await this.exclusive(repositoryKey(environment.repository), undefined, async () => {
-      // Unit 7, PR 2: Stop ends Close and Keep Running (Keep Running When Closed stays).
-      if ((await this.deps.registry.get(environmentId))?.keepRunningOnce !== undefined) {
-        await this.quietly('clear Close and Keep Running', () =>
-          this.deps.registry.updateEnvironment(environmentId, (entry) => {
-            delete entry.keepRunningOnce;
-          }),
-        );
-      }
-      if (!(await this.deps.docker.isRunning())) {
-        this.logger.info('Docker is not running, so no container runs.');
-        return;
-      }
-      // An update, rebuild, or delete in another window replaces or removes the container: no stop in between (concept
-      // 7.9 rule 1 applies to the Session Monitor; a Stop from a sidebar that is not up to date must respect it too).
-      const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
-      // Plan step 11B2: the Stop runs in the worker, under the lock of the environment that the worker takes itself (user
-      // decisions D1 to D3); this window records the Git state that it answers.
-      // Review round 1 (A-R1-4): never under a lock that this window holds (the worker would wait for it and refuse).
-      if (holdsEnvironmentLock(env.id)) throw new Error(`Stop of ${env.repository} under a lock of the environment that this window holds.`);
-      // Review round 1 (A-R1-5): the parameters are checked here, so that one the worker would refuse is named.
-      const params = parseStopParams({
-        environmentId: env.id,
-        containerName: env.containerName,
-        folder: repositoryFolder(env.repository),
-        ...(env.remoteUser !== undefined && env.remoteUser !== '' ? { user: env.remoteUser } : {}),
-        waitSeconds: ENVIRONMENT_LOCK_WAIT_SECONDS,
-      });
-      if (params === undefined) {
-        throw new UserFacingError('recordInvalid', PipelineTexts.stopRefused(env.repository), `container ${env.containerName}, remote user ${JSON.stringify(env.remoteUser ?? '')}, repository ${env.repository}`);
-      }
-      const value = parseStopValue(await this.workerFlow(env, OP_STOP, params, STOP_FLOW_TIMEOUT_MS));
-      if (value === undefined) throw new Error(`The worker answered the Stop of ${env.repository} with an invalid value.`);
-      const summary = value.gitSummary;
-      if (summary !== undefined) {
-        // Review round 1 (A-R1-1): the time of this computer, as the other times of the entry (lastUsedAt), never the
-        // clock of the Docker host; recordedStateNote compares them.
-        const recorded = { ...summary, recordedAt: isoTime(this.deps.clock) };
-        await this.quietly('record the Git state', () =>
-          this.deps.registry.updateEnvironment(env.id, (entry) => {
-            entry.gitSummary = recorded;
-          }),
-        );
-      }
-      // Review round 1 (A-R1-2): the containers that could not be stopped, after the Git state is recorded.
-      if (value.failures.length > 0) throw new Error(value.failures.join(' '));
-    });
-  }
-
-  /**
-   * Plan step 11B2: a flow in the worker, with the refusals of the lock as before the move (user decisions D1 to D3): a
-   * lock held elsewhere is environmentLockBusy, no worker (or no helper image for it) is environmentLockUnavailable, and
-   * nothing runs another way. Any other failure of the flow is thrown as it is.
-   */
-  private async workerFlow(
-    env: Pick<Environment, 'repository'>,
-    op: string,
-    params: unknown,
-    timeoutMs: number,
-    signal?: AbortSignal,
-    onAnswer?: (call: string, args: unknown[], value: unknown) => void,
-    onQuestion?: (state: 'asked' | 'settled') => void,
-    // Plan step 11E6: the progress of the flow (the open).
-    onProgress?: (step: string, detail?: string) => void,
-  ): Promise<unknown> {
-    try {
-      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}), ...(onQuestion ? { onQuestion } : {}), ...(onProgress ? { onProgress } : {}) });
-    } catch (error) {
-      if (this.isCancellation(error, signal)) throw error;
-      if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
-        this.logger.info(`${env.repository} is locked on the Docker host by another window or computer: ${error.message}`);
-        throw new UserFacingError('startFailed', PipelineTexts.environmentLockBusy(env.repository), error.message);
-      }
-      // Review round 1 (A-R1-3): only a refusal before anything ran is "nothing is changed": the lock that could not be
-      // taken, or a worker that could not be reached or knows no such flow (review round 2, A-R2-1: `closed` is not sent). A channel lost while the flow ran is thrown as
-      // it is (the flow may have changed something).
-      if ((error instanceof HelperOperationError && error.code === LOCK_UNAVAILABLE_CODE) || (error instanceof HelperChannelError && (error.code === 'unavailable' || error.code === 'unsendable' || error.code === 'open' || error.code === 'closed'))) {
-        this.logger.warn(`${env.repository}: the worker on the Docker host could not be reached, so nothing is changed: ${errorMessage(error)}`);
-        throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, errorMessage(error)), errorMessage(error));
-      }
-      throw error;
-    }
-  }
-
-  /**
    * The containers of the other services of a Docker Compose environment (label nimblescape.devenv.compose-service) are
    * removed, before `up` creates a single container for a configuration that no longer uses Docker Compose. Their
    * volumes stay.
@@ -6172,113 +5683,6 @@ export class EnvironmentService {
   }
 
   /**
-   * Plan step 11C2b (decisions of 2026-10-03 and 2026-10-04): the check of Delete and its questions in the worker of the
-   * Docker host of the operation (`deleteCheck`), which asks them through its requests. A refusal of its pipeline is
-   * thrown as before the move; a worker that cannot be reached is refused as for Stop (workerFlow). An environment that
-   * is not in the registry is not deleted (cancel); nothing is sent then.
-   */
-  async deleteCheckInWorker(environmentId: string, options: OperationOptions & { repository: string; otherWindow: boolean }): Promise<DeleteDecision> {
-    const environment = await this.deps.registry.get(environmentId);
-    if (!environment) {
-      this.logger.info(`The environment ${environmentId} does not exist anymore. Nothing is deleted.`);
-      return { decision: 'cancel' };
-    }
-    await this.requireCurrentHost(environment);
-    try {
-      const params = parseDeleteCheckParams({
-        environmentId: environment.id,
-        dockerHost: await this.currentDockerHost(),
-        owner: this.deps.owner,
-        repository: options.repository,
-        otherWindow: options.otherWindow,
-      });
-      if (params === undefined) throw new Error(`The check of the Delete of ${environment.repository} cannot be sent to the worker.`);
-      // Review round 1 of 11C2b (A-R1-M1): the decision of the worker counts only as far as the user gave it here.
-      const given = { confirm: undefined as unknown, volumes: [] as string[], volumesAnswer: undefined as unknown, serviceData: [] as string[], picked: [] as string[], cancelled: false };
-      const onAnswer = (call: string, args: unknown[], value: unknown) => {
-        if (call === 'confirmDelete') given.confirm = value;
-        if (call === 'deleteAdditionalVolumes') {
-          given.volumes = Array.isArray(args[0]) ? (args[0] as string[]) : [];
-          given.volumesAnswer = value;
-          // Review round 2 of 11C2b (A-R2-M1): Escape at a later question cancels the Delete.
-          if (value !== 'remove' && value !== 'keep') given.cancelled = true;
-        }
-        if (call === 'deleteServiceData') {
-          given.serviceData = Array.isArray(args[0]) ? (args[0] as string[]) : [];
-          given.picked = Array.isArray(value) ? (value as string[]) : [];
-          if (!Array.isArray(value)) given.cancelled = true;
-        }
-      };
-      // Review round 3 of 11C2b (A-R3-L1): a decision while a question is still open is not the user's.
-      let open = 0;
-      const onQuestion = (state: 'asked' | 'settled') => {
-        open += state === 'asked' ? 1 : -1;
-      };
-      const value = parseDeleteCheckValue(await this.workerFlow(environment, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer, onQuestion));
-      if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with an invalid value.`);
-      if ('refused' in value) throw refusalError(value.refused);
-      if (value.decision === 'cancel') return value;
-      if (value.decision !== given.confirm || (value.decision === 'delete' && given.cancelled) || open > 0) {
-        throw new Error(`The worker answered the check of the Delete of ${environment.repository} with a decision that the user did not give.`);
-      }
-      if (value.decision === 'delete') {
-        const allowed = new Set([...(given.volumesAnswer === 'remove' ? given.volumes : []), ...given.picked.filter((name) => given.serviceData.includes(name))]);
-        const odd = value.additionalVolumesToRemove.filter((name) => !allowed.has(name));
-        if (odd.length > 0) throw new Error(`The worker answered the check of the Delete of ${environment.repository} with volumes that the user did not choose: ${odd.join(', ')}.`);
-      }
-      return value;
-    } catch (error) {
-      throw this.toUserError(error, options.signal);
-    }
-  }
-
-  /**
-   * Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): Delete (concept 7.14 steps 3 to 5) in the worker of the
-   * Docker host of the operation, where its own pipeline runs `delete` (the busy mark, the entry and the session files of
-   * the environment through its requests, the lock there, `forget` in the Session Monitor). The caller made the safety
-   * check and closed a connected window. An environment that is not in the registry has nothing on Docker: only its
-   * session files are removed here. A refusal of that pipeline is thrown as it was before the move; a worker that cannot
-   * be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
-   */
-  async deleteInWorker(environmentId: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }): Promise<void> {
-    const environment = await this.deps.registry.get(environmentId);
-    if (!environment) {
-      await this.removeEnvironmentFiles(environmentId);
-      return;
-    }
-    await this.requireCurrentHost(environment);
-    await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
-      try {
-        if (holdsEnvironmentLock(environment.id)) throw new Error(`The Delete of ${environment.repository} under a lock of the environment that this window holds.`);
-        const monitorSource = this.deps.monitorSource?.();
-        const params = parseDeleteParams({
-          environmentId: environment.id,
-          dockerHost: await this.currentDockerHost(),
-          owner: this.deps.owner,
-          additionalVolumesToRemove: [...options.additionalVolumesToRemove],
-          monitorSource,
-        });
-        if (params === undefined) throw new Error(`The Delete of ${environment.repository} cannot be sent to the worker.`);
-        let answer: unknown;
-        try {
-          answer = await this.workerFlow(environment, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, options.signal);
-        } catch (error) {
-          // Review round 1 of 11C2a (A-R1-M1): a worker that ended without an answer (its channel lost, its time limit, a
-          // cancel) may have marked the environment busy for this window and could not clear it; this window clears its
-          // own mark (never the mark of another window). A refusal (the value) was cleared by the worker.
-          await this.clearOwnMark(environment.id);
-          throw error;
-        }
-        const value = parseDeleteValue(answer);
-        if (value === undefined) throw new Error(`The worker answered the Delete of ${environment.repository} with an invalid value.`);
-        if ('refused' in value) throw refusalError(value.refused);
-      } catch (error) {
-        throw this.toUserError(error, options.signal);
-      }
-    });
-  }
-
-  /**
    * Delete (concept 7.14 steps 3 to 5). The caller made the safety check and closed a connected window. Plan step 11C2a:
    * runs in the worker (deleteInWorker sends it there).
    */
@@ -6379,28 +5783,6 @@ export class EnvironmentService {
   }
 
   /**
-   * Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration in the worker of the Docker host of
-   * the operation, where its own pipeline runs listConfigurations (the record and the account through its requests, the
-   * lock and the batch helper there). A refusal of that pipeline is thrown here as it was before the move; a worker that
-   * cannot be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
-   */
-  async listConfigurationsInWorker(environmentId: string, options: OperationOptions): Promise<string[]> {
-    const env = await this.deps.registry.get(environmentId);
-    if (!env) return [];
-    try {
-      if (holdsEnvironmentLock(env.id)) throw new Error(`The listing of the configurations of ${env.repository} under a lock of the environment that this window holds.`);
-      const params = parseListConfigurationsParams({ environmentId: env.id, dockerHost: await this.currentDockerHost(), owner: this.deps.owner });
-      if (params === undefined) throw new Error(`The listing of the configurations of ${env.repository} cannot be sent to the worker.`);
-      const value = parseListConfigurationsValue(await this.workerFlow(env, OP_LIST_CONFIGURATIONS, params, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, options.signal));
-      if (value === undefined) throw new Error(`The worker answered the listing of the configurations of ${env.repository} with an invalid value.`);
-      if ('refused' in value) throw refusalError(value.refused);
-      return value.configPaths;
-    } catch (error) {
-      throw this.toUserError(error, options.signal);
-    }
-  }
-
-  /**
    * Configuration paths in the volume (current branch), in the order of precedence. Plan step 11B3b: runs in the worker
    * (listConfigurationsInWorker sends it there).
    */
@@ -6428,92 +5810,6 @@ export class EnvironmentService {
       );
     } catch (error) {
       throw this.toUserError(error, options.signal);
-    }
-  }
-
-  /**
-   * Container and volume state of each environment. Does not start Docker: `undefined` when Docker does not run. Review
-   * D2: no Docker call at all on an endpoint that is neither local nor SSH; its (empty) map of states. Plan step 5, PR C:
-   * refreshStates without branches.
-   */
-  async inspectStates(): Promise<Map<string, EnvironmentRuntimeState> | undefined> {
-    return (await this.refreshStates(new Set())).runtime;
-  }
-
-  /**
-   * Plan step 5, PR C: the states of inspectStates and the branches of the running dev containers of `branchIds` (the
-   * sidebar: the environments of the account), in one worker operation (`refresh`; plan step 11C1: also outside of an
-   * operation, never directly). Plan step 5, PR D (rule D1 of 2026-09-30): a worker refresh that cannot be made or fails is
-   * never read directly: the refresh fails (logged, with the cause). `runtime` is `undefined` when Docker does not run or
-   * the states could not be read; then there are no branches.
-   */
-  async refreshStates(
-    branchIds: ReadonlySet<string>,
-  ): Promise<{ runtime: Map<string, EnvironmentRuntimeState> | undefined; branches: Map<string, string> }> {
-    const { docker } = this.deps;
-    try {
-      const readable = await this.readableDockerHost();
-      if (readable === undefined) return { runtime: new Map(), branches: new Map() };
-      if (!(await docker.isRunning())) return { runtime: undefined, branches: new Map() };
-      // Unit 7: only the environments of the current Docker host; the others are hidden.
-      const environments: StateEnvironment[] = environmentsOfHost(await this.deps.registry.list(), readable).map((env) => ({
-        id: env.id,
-        containerName: env.containerName,
-        volumeName: env.volumeName,
-        ...(env.remoteUser ? { user: env.remoteUser } : {}),
-        folder: repositoryFolder(env.repository),
-        branch: branchIds.has(env.id),
-      }));
-      // Plan step 5, PR D (rule D1 of 2026-09-30): a failure of the worker refresh fails the refresh (below). Plan step
-      // 11C1: only through the worker.
-      return await this.deps.workerRefresh(environments);
-    } catch (error) {
-      this.logger.warn(`The state of the environments could not be read: ${errorMessage(error)}`);
-      return { runtime: undefined, branches: new Map() };
-    }
-  }
-
-  /**
-   * Plan step 11C1 (decisions of 2026-10-03 and 2026-10-04): what an attached window reads of the dev container
-   * `containerName` of `environment`, by the worker of the Docker host of the operation (`windowState`): its state,
-   * whether it may be used as it is, and with `branch` the branch of its repository. `undefined` when it could not be read
-   * (the worker could not be reached, or it failed): the window keeps its state then (decision of 2026-10-04, "unknown").
-   * Never throws. Review rounds 1 and 2 of 11C1 (A-R1-1, A-R2-M1, A-R2-M2): the worker is made ready passively (as for
-   * the refresh: never a build of the helper image, the wait after a failed open kept), and within
-   * WINDOW_STATE_FLOW_TIMEOUT_MS. Review round 3 (A-R3-M1): with `signal` (a read within an operation of the user, with
-   * its progress and Cancel), it is made ready in full, as for the pipeline, until `signal` aborts.
-   */
-  async windowStateInWorker(
-    environment: Environment,
-    containerName: string,
-    options: { branch?: boolean; signal?: AbortSignal } = {},
-  ): Promise<WindowStateValue | undefined> {
-    try {
-      // Unit 7: an environment of another Docker host is not read through the worker of this one.
-      if (!(await this.isOnCurrentHost(environment))) return undefined;
-      const params = parseWindowStateParams({
-        environmentId: environment.id,
-        containerName,
-        checks: hostAccessChecks(environment.repository, this.deps.settings()),
-        ...(options.branch
-          ? { branch: { folder: repositoryFolder(environment.repository), ...(environment.remoteUser !== undefined && environment.remoteUser !== '' ? { user: environment.remoteUser } : {}) } }
-          : {}),
-      });
-      if (params === undefined) throw new Error('its parameters are beyond the checks of the worker');
-      const value = parseWindowStateValue(
-        await this.deps.flow(
-          OP_WINDOW_STATE,
-          params,
-          options.signal !== undefined
-            ? { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, signal: options.signal }
-            : { timeoutMs: WINDOW_STATE_FLOW_TIMEOUT_MS, passive: true, signal: AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS) },
-        ),
-      );
-      if (value === undefined) throw new Error('the worker answered with an invalid value');
-      return value;
-    } catch (error) {
-      this.logger.info(`The state of the container ${containerName} could not be read: ${errorMessage(error)}`);
-      return undefined;
     }
   }
 
@@ -6634,27 +5930,6 @@ export class EnvironmentService {
   }
 
   /**
-   * Plan step 11C3 (decisions of 2026-10-03 and 2026-10-04): concept 7.5 "registry lost" by the worker of the Docker host
-   * of the operation (`reconcile`, where reconcileFromVolumes runs; the entries come back as `record restore`, which this
-   * computer adds under its registry lock). Returns the number of added entries. Does not start Docker: 0 when it does not
-   * run, and on an endpoint that is neither local nor SSH (review D2). `passive`: a call in the background; the worker is
-   * made ready as for the refresh (the helper image only checked, the wait after a failed open kept). Throws when the
-   * worker could not be reached or failed (nothing is added then).
-   */
-  async reconcileInWorker(options: { passive: boolean; signal?: AbortSignal }): Promise<number> {
-    const readable = await this.readableDockerHost();
-    if (readable === undefined) return 0;
-    if (!(await this.deps.docker.isRunning())) return 0;
-    const params = parseReconcileParams({ dockerHost: readable, owner: this.deps.owner });
-    if (params === undefined) throw new Error('The rebuild of the registry cannot be sent to the worker.');
-    const value = parseReconcileValue(
-      await this.deps.flow(OP_RECONCILE, params, { timeoutMs: RECONCILE_FLOW_TIMEOUT_MS, ...(options.passive ? { passive: true } : {}), ...(options.signal ? { signal: options.signal } : {}) }),
-    );
-    if (value === undefined) throw new Error('The worker answered the rebuild of the registry with an invalid value.');
-    return value.added;
-  }
-
-  /**
    * Registry lost: the named volumes without labels of Dev Environments that the container of a restored environment
    * mounts (the container, which a lost registry does not remove, still mounts them), for example volumes that Docker
    * created at `up` without labels. Recorded again, they protect the data of the environment: without them, the
@@ -6679,67 +5954,6 @@ export class EnvironmentService {
   // Steps and helpers
 
   /**
-   * Unit 7, review D2: the one check of the Docker target of the service. The target of the operation (dockerTarget),
-   * else the host of `dockerHost` (local or SSH).
-   */
-  private async dockerTarget(): Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>> {
-    if (this.deps.dockerTarget) return this.deps.dockerTarget();
-    const host = (await this.deps.dockerHost?.()) ?? '';
-    return { kind: host === '' ? 'local' : 'remote', host, endpoint: '' };
-  }
-
-  /**
-   * Unit 7: the Docker host of the operation ('' = the local Docker). Review D2: an endpoint that is neither local nor
-   * SSH is refused (UserFacingError dockerEndpointUnsupported), so no operation reaches it or records it.
-   */
-  private async currentDockerHost(): Promise<string> {
-    const target = await this.dockerTarget();
-    if (target.kind === 'unsupported') {
-      this.logger.warn(`The Docker endpoint ${target.endpoint || target.host} is neither local nor SSH. Nothing is done.`);
-      throw dockerEndpointUnsupported(target.endpoint || target.host);
-    }
-    return target.host;
-  }
-
-  /**
-   * Review D2: the Docker host for the reads of the view and the restore (states, branch, volumes): undefined on an
-   * endpoint that is neither local nor SSH, and the reads do nothing then. The message is shown once per endpoint.
-   */
-  private async readableDockerHost(): Promise<string | undefined> {
-    const target = await this.dockerTarget();
-    if (target.kind !== 'unsupported') return target.host;
-    const endpoint = target.endpoint || target.host;
-    if (!this.refusedEndpoints.has(endpoint)) {
-      this.refusedEndpoints.add(endpoint);
-      this.logger.warn(`The Docker endpoint ${endpoint} is neither local nor SSH. Its containers and volumes are not read.`);
-      this.deps.ui.warn(Messages.dockerEndpointUnsupported(endpoint));
-    }
-    return undefined;
-  }
-
-  private async isOnCurrentHost(environment: Environment): Promise<boolean> {
-    const host = await this.readableDockerHost();
-    return host !== undefined && isOnDockerHost(environment, host);
-  }
-
-  /**
-   * Unit 7: an environment of another Docker host is never acted on (no clone, restore, recreation, deletion, stop, or
-   * token write there): UserFacingError('otherDockerHost').
-   */
-  private async requireCurrentHost(environment: Environment): Promise<void> {
-    const host = await this.currentDockerHost();
-    if (isOnDockerHost(environment, host)) return;
-    const environmentHost = dockerHostOf(environment);
-    this.logger.warn(`${environment.repository}: the environment is on the Docker host ${environmentHost || '(local)'}, and Docker is set to ${host || '(local)'}. Nothing is done.`);
-    throw new UserFacingError('otherDockerHost', Messages.otherDockerHost(environment.repository, environmentHost, host));
-  }
-
-  private async startDocker(steps: StepReporter, signal: AbortSignal | undefined): Promise<void> {
-    this.throwIfCancelled(signal);
-    await this.startDockerFn({ onStarting: () => steps.step('startingDocker'), signal });
-  }
-
-  /**
    * A new environment ID (implementation notes 5). User decisions 2026-10-03: the names of an environment end in the pair
    * of its ID (namePair), and the pair is unique on the Docker engine: an ID is not used when an entry of the registry or
    * a volume of an environment on the engine (nimblescape.devenv.environment-id) has its pair, or when its volume or its
@@ -6762,21 +5976,6 @@ export class EnvironmentService {
       if (!used.has(namePair(id)) && !recorded.has(name.toLowerCase()) && !(await this.deps.docker.volumeExists(name)) && (await this.deps.docker.containerState(name)) === 'missing') return id;
       if (attempt >= ENVIRONMENT_ID_ATTEMPTS) throw new Error(`No unused environment ID was found for ${repository}.`);
     }
-  }
-
-  /**
-   * The token and the account of the GitHub session; asks for a sign-in when needed. Both must come from one session: a
-   * sign-in with another account between the two questions would give an environment of this account the token of the
-   * other one.
-   */
-  private async requireSession(): Promise<GitHubSession> {
-    const token = await this.deps.auth.getToken({ interactive: true });
-    if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    const account = await this.deps.auth.getAccount({ interactive: false });
-    if (!account || (await this.deps.auth.getToken({ interactive: false })) !== token) {
-      throw new UserFacingError('signInRequired', Messages.signInRequired, 'The GitHub session changed during the open.');
-    }
-    return { token, account };
   }
 
   /**
@@ -7237,17 +6436,6 @@ export class EnvironmentService {
     }
   }
 
-  /** Removes the pending connection file, the pending operation, the disconnect request (R7), and a reopen record of the environment. */
-  private async removeEnvironmentFiles(environmentId: string): Promise<void> {
-    const files = this.deps.sessionFiles;
-    await this.quietly('remove the pending connection file', () => files.removePending(environmentId));
-    await this.quietly('remove the pending operation', () => files.removeOperation(environmentId));
-    // Monitor cleanup, user decision 2026-09-29 (R7): a disconnect request of the deleted environment.
-    await this.quietly('remove the disconnect request', () => files.removeDisconnectRequest(environmentId));
-    // Plan step 11C2a: one request from the worker (the reopen record is read where it is).
-    await this.quietly('remove the reopen record', () => files.removeReopenOf(environmentId));
-  }
-
   /**
    * Delete and a failed first open of a Docker Compose environment (implementation notes, section "Docker Compose"),
    * after the containers with the label nimblescape.devenv.environment-id: the containers of the project that have no
@@ -7355,76 +6543,6 @@ export class EnvironmentService {
 
   // --- Busy marks ----------------------------------------------------------------------------------------------------
 
-  private busyMark(operation: BusyOperation): BusyMark {
-    return { operation, since: isoTime(this.deps.clock), pid: this.deps.owner.pid, windowId: this.deps.owner.windowId };
-  }
-
-  /**
-   * The test "a live mark of another window" (concept 7.9 rule 1, `isBusyMarkLive`) for `mark`: a mark of an ended process,
-   * a mark older than 6 hours, and (with window status files) a mark whose window has no recent status file of that
-   * process are ignored. Reads the window status files once per call.
-   */
-  private async markBlocks(mark: BusyMark): Promise<boolean> {
-    const liveness = await this.markLiveness();
-    // Plan step 11E4d: whether its process runs is asked first (in the worker, the extension answers); review round 1 of
-    // PR #107 (A-L4): never for a mark of this window or its process, which never counts.
-    const isAlive = await this.processesAlive(mark.pid === this.markView.owner.pid ? [] : [mark.pid]);
-    return otherWindowMarkIsLive(mark, { owner: this.markView.owner, isAlive }, liveness);
-  }
-
-  /**
-   * Plan step 11E4d: whether the processes `pids` of this computer run, asked once each (EnvironmentServiceDeps.processAlive;
-   * in the worker, the extension answers). A process whose answer fails counts as running, and so does one not asked:
-   * when in doubt, another window uses the environment, and nothing is stopped or taken over.
-   */
-  private async processesAlive(pids: Iterable<number>): Promise<(pid: number) => boolean> {
-    const alive = new Map<number, boolean>();
-    const unique = [...new Set(pids)];
-    // Review round 1 of PR #107 (A-M1): a few at a time, far below the open requests that an operation may have
-    // (MAX_OPEN_ASKS), so that the other requests of the open (its pending file, its questions) still get through.
-    for (let start = 0; start < unique.length; start += PROCESS_QUESTIONS_AT_ONCE) {
-      await Promise.all(
-        unique.slice(start, start + PROCESS_QUESTIONS_AT_ONCE).map(async (pid) => {
-          try {
-            alive.set(pid, await this.processAlive(pid));
-          } catch (error) {
-            this.logger.warn(`Whether the process ${pid} runs could not be read: ${errorMessage(error)}`);
-            alive.set(pid, true);
-          }
-        }),
-      );
-    }
-    return (pid) => alive.get(pid) ?? true;
-  }
-
-  /** Plan step 11E4a: what markBlocks decides with (the window status files, read once, and the time), as plain data. */
-  private markLiveness(): Promise<MarkLiveness> {
-    return readLiveness(this.markView);
-  }
-
-  /**
-   * Waits while another live window holds a busy mark (for example the window that asked for a rebuild and is closing
-   * its remote connection), at most `busyWaitMs`. Returns the current registry entry.
-   * Assumption (V-3): after "Close Remote Connection", the extension host of the old window ends within this time, so
-   * the reloaded window can take over the operation that the old window marked.
-   */
-  private async waitForOtherOperation(environment: Environment, signal: AbortSignal | undefined): Promise<Environment> {
-    const attempts = Math.ceil(this.busyWaitMs / BUSY_POLL_MS);
-    let current = environment;
-    for (let attempt = 0; ; attempt++) {
-      const mark = current.busy;
-      if (!mark || !(await this.markBlocks(mark))) return current;
-      if (attempt >= attempts) throw environmentBusy(current.repository, mark);
-      if (attempt === 0) {
-        this.logger.info(`${current.repository} is busy (${mark.operation}) in another window (process ${mark.pid}). Waiting.`);
-      }
-      await this.sleepFn(BUSY_POLL_MS, signal);
-      const next = await this.deps.registry.get(current.id);
-      if (!next) throw environmentMissing(current.repository);
-      current = next;
-    }
-  }
-
   /**
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
    * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
@@ -7524,10 +6642,6 @@ export class EnvironmentService {
     await this.clearOwnMark(ctx.env.id);
   }
 
-  private async clearOwnMark(environmentId: string): Promise<void> {
-    await this.quietly('clear the busy mark', () => this.busyMarks.clear(environmentId));
-  }
-
   // --- General ---------------------------------------------------------------------------------------------------------
 
   /** Plan step 11E4a: the entry that an OpenRecords write returned becomes ctx.env; a missing one is environmentMissing. */
@@ -7536,58 +6650,8 @@ export class EnvironmentService {
     ctx.env = updated;
   }
 
-  /** Runs operations on the same key one after the other. Waiting ends with `cancelled` when the signal aborts. */
-  private async exclusive<T>(key: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const done = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(() => done);
-    this.queues.set(key, tail);
-    try {
-      try {
-        await waitUnlessAborted(previous, signal);
-      } catch {
-        throw cancelledError();
-      }
-      return await fn();
-    } finally {
-      release();
-      if (this.queues.get(key) === tail) this.queues.delete(key);
-    }
-  }
-
-  private throwIfCancelled(signal: AbortSignal | undefined): void {
-    if (signal?.aborted) throw cancelledError();
-  }
-
-  private isCancellation(error: unknown, signal: AbortSignal | undefined): boolean {
-    return signal?.aborted === true || isAbortError(error) || (isUserFacingError(error) && error.code === 'cancelled');
-  }
-
-  /** A cancelled operation ends with UserFacingError('cancelled'); other errors pass unchanged. */
-  private toUserError(error: unknown, signal: AbortSignal | undefined): unknown {
-    if (this.isCancellation(error, signal)) {
-      return isUserFacingError(error) && error.code === 'cancelled' ? error : cancelledError();
-    }
-    return error;
-  }
-
-  /** Runs a cleanup step; a failure is logged and ignored. */
-  private async quietly(what: string, fn: () => Promise<unknown>): Promise<void> {
-    try {
-      await fn();
-    } catch (error) {
-      this.logger.warn(`Could not ${what}: ${errorMessage(error)}`);
-    }
-  }
 }
 
-/** Plan step 11B3b: the UserFacingError of a refusal that the worker's own pipeline answered (FlowRefusal). */
-function refusalError(refused: FlowRefusal): UserFacingError {
-  return refused.batchHelperUnavailable === true ? new BatchHelperUnavailableError(refused.message, refused.detail) : new UserFacingError(refused.code, refused.message, refused.detail);
-}
 
 /**
  * Review round 5 of PR #82 (A-R5-4): a helperFailed of Step 8 with `detail`; the refusal of the batch scope keeps its

@@ -31,6 +31,9 @@ import {
 } from '../../src/core/ports';
 import type { Environment } from '../../src/core/types';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
+import { EnvironmentService, type EnvironmentServiceDeps } from '../../src/core/pipeline/environmentService';
+import { EnvironmentOperations, type EnvironmentOperationsDeps } from '../../src/core/pipeline/environmentOperations';
+import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
@@ -363,4 +366,23 @@ export async function registryDigest(checker: Pick<ImageChecker, 'check'>, refer
     throw new Error(`The digest of ${reference} could not be read: ${JSON.stringify(outcome)}`);
   }
   return outcome.images[reference];
+}
+
+/** Plan step 11F1: the deps of a pipeline of a Docker test, with the flows of the window to the worker. */
+export type PipelineTestDeps = EnvironmentServiceDeps & Pick<EnvironmentOperationsDeps, 'flow' | 'workerRefresh'>;
+
+/**
+ * Plan step 11F1: the pipeline of a Docker test (EnvironmentService, as the worker runs it) and, on the same records, the
+ * operations of the window (EnvironmentOperations: Stop, the refresh and the opens that it sends to the worker).
+ */
+export function pipelineWithOperations(deps: PipelineTestDeps): EnvironmentService & { operations: EnvironmentOperations } {
+  // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
+  const shared = { ...deps, lifecycleMemory: deps.lifecycleMemory ?? windowLifecycleMemory() };
+  const operations = new EnvironmentOperations({
+    ...shared,
+    // The engine of the tests runs; nothing to start.
+    startDocker: deps.startDocker ?? (async () => {}),
+    dockerRunning: () => deps.docker.isRunning(),
+  });
+  return Object.assign(new EnvironmentService(shared), { operations });
 }
