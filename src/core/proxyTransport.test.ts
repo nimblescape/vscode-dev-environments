@@ -166,12 +166,15 @@ describe('the TLS names through the tunnel (review round 1 of PR #109, A-M1, A-M
   it('a certificate is checked for the host of the URL, also an IP address; SNI only for a name', () => {
     const forName = (names: string) => ({ subject: { CN: '' }, subjectaltname: names }) as unknown as tls.PeerCertificate;
     const ip = tlsNameOf('10.9.9.9');
-    expect(ip.servername).toBeUndefined();
+    // Review round 2 of PR #109 (A2-L2): changed expectation, an empty name, so that Node sends no SNI (before: undefined).
+    expect(ip.servername).toBe('');
     // Node would pass the name of the proxy here; the certificate of the proxy is no certificate of the registry.
     expect(ip.checkServerIdentity!('proxy.local', forName('DNS:proxy.local'))).toBeInstanceOf(Error);
     expect(ip.checkServerIdentity!('proxy.local', forName('IP Address:10.9.9.9'))).toBeUndefined();
     const name = tlsNameOf('registry.example.com');
     expect(name.servername).toBe('registry.example.com');
+    // Review round 2 of PR #109 (A2-L3): no trailing dot in SNI.
+    expect(tlsNameOf('registry.example.com.').servername).toBe('registry.example.com');
     expect(name.checkServerIdentity!('other', forName('DNS:registry.example.com'))).toBeUndefined();
     expect(name.checkServerIdentity!('registry.example.com', forName('DNS:proxy.local'))).toBeInstanceOf(Error);
   });
@@ -217,6 +220,14 @@ describe('the TLS names through the tunnel (review round 1 of PR #109, A-M1, A-M
       const transport = proxiedHttpsTransport(async () => ({ httpsProxy: `https://localhost:${proxy.port}` }));
       await expect(transport.request({ method: 'GET', url: 'https://registry.example.com/v2/' })).rejects.toThrow();
       expect(proxy.names).toEqual(['localhost']);
+    });
+
+    it('an https:// proxy of an IP address gets no SNI, never the name of the target (review round 2 of PR #109, A2-L2)', async () => {
+      const proxy = await tlsServer();
+      const transport = proxiedHttpsTransport(async () => ({ httpsProxy: `https://127.0.0.1:${proxy.port}` }));
+      await expect(transport.request({ method: 'GET', url: 'https://registry.example.com/v2/' })).rejects.toThrow();
+      expect(proxy.connections()).toBe(1);
+      expect(proxy.names).toEqual([]);
     });
 
     it('a registry of an IP address gets no SNI through the tunnel, and its certificate is checked (A-M1)', async () => {

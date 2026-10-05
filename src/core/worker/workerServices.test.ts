@@ -558,6 +558,19 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       expect(events).toEqual(['ask a.example', 'forget', 'ask b.example', 'forget']);
     });
 
+    it('a login whose user gave up while it waited is not asked; its turn still ends with the forget (review round 2 of PR #109, A2-L1)', async () => {
+      const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
+      let forgotten = 0;
+      const provider = hostRegistryCredentials(registryLogins(side.host, () => void forgotten++, silentLogger));
+      const gaveUp = new AbortController();
+      gaveUp.abort();
+      expect(await provider('ghcr.io', gaveUp.signal)).toBeUndefined();
+      expect(side.asked).toEqual([]);
+      expect(forgotten).toBe(1);
+      expect(await provider('ghcr.io', new AbortController().signal)).toEqual({ username: 'octo', password: 'p1' });
+      expect(side.asked).toEqual(['ghcr.io']);
+    });
+
     it('a use that fails still forgets, and the next login is still asked', async () => {
       const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
       let forgotten = 0;

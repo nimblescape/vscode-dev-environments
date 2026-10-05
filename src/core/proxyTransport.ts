@@ -108,7 +108,9 @@ export function proxyFor(url: URL, settings: ProxySettings): URL | undefined {
  */
 export function tlsNameOf(host: string): Pick<tls.ConnectionOptions, 'servername' | 'checkServerIdentity'> {
   return {
-    ...(net.isIP(host) === 0 ? { servername: host } : {}),
+    // Review round 2 of PR #109 (A2-L2, A2-L3): no SNI for an IP address (an empty name, so that Node does not take the
+    // name of the target from the Host header), and none with the trailing dot of a fully qualified name (RFC 6066).
+    servername: net.isIP(host) === 0 ? host.replace(/\.$/, '') : '',
     checkServerIdentity: (_name, certificate) => tls.checkServerIdentity(host, certificate),
   };
 }

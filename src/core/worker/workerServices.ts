@@ -196,14 +196,20 @@ export type RegistryLogin = NonNullable<Awaited<ReturnType<HostSide['secrets']['
  * when the computer has none, or its request failed, which is logged), and the operation forgets the secret when `use`
  * ends, before the next login is asked.
  */
-export function registryLogins(host: HostSide, forget: () => void, log: Logger): <T>(registry: string, use: (login: RegistryLogin | undefined) => Promise<T>) => Promise<T> {
+export function registryLogins(
+  host: HostSide,
+  forget: () => void,
+  log: Logger,
+): <T>(registry: string, use: (login: RegistryLogin | undefined) => Promise<T>, signal?: AbortSignal) => Promise<T> {
   let queue: Promise<unknown> = Promise.resolve();
-  return (registry, use) => {
+  // `use` must not ask for a login itself (it would wait for its own turn).
+  return (registry, use, signal) => {
     const run = queue.then(async () => {
       try {
         let login: RegistryLogin | undefined;
         try {
-          login = await host.secrets.registry(registry);
+          // Review round 2 of PR #109 (A2-L1): a login whose user gave up while it waited is not asked.
+          if (!signal?.aborted) login = await host.secrets.registry(registry);
         } catch (error) {
           log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
         }
@@ -223,9 +229,11 @@ export function registryLogins(host: HostSide, forget: () => void, log: Logger):
  * password of IDENTITY_TOKEN_USER, as the Docker credentials give it. Never throws.
  */
 export function hostRegistryCredentials(logins: ReturnType<typeof registryLogins>): CredentialsProvider {
-  return (registry) =>
-    logins(registry, async (login) =>
-      login === undefined ? undefined : { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password },
+  return (registry, signal) =>
+    logins(
+      registry,
+      async (login) => (login === undefined ? undefined : { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password }),
+      signal,
     ).catch(() => undefined);
 }
 
