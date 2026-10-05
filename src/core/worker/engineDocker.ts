@@ -389,18 +389,27 @@ export class EngineDocker implements EnvironmentDocker {
    * round 1 of 11B3a, A-R1-4; plan step 11B3b hands them in as the registry secret).
    */
   async pullImage(reference: string, options: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials } = {}): Promise<void> {
-    // Plan step 11E3b (decision B1 of 2026-10-05): without credentials of the caller, the pull asks for the login of its
-    // registry and holds it only for its own turn (the operation forgets it when the pull ends); without a login, or for a
-    // reference that names no registry, anonymously.
-    const registry = options.credentials === undefined && this.logins !== undefined ? parseImageReference(reference)?.registry : undefined;
+    // Plan step 11E3b (decision B1 of 2026-10-05): without credentials of the caller, the pull asks for the login of the
+    // registry of the reference (Docker Hub for a reference without a registry) and holds it only for its own turn (the
+    // operation forgets it when the pull ends); a reference that the parser refuses, or whose registry the daemon would
+    // read otherwise (review round 1 of PR #110, A-L2), is pulled anonymously, as is one without a login.
+    const registry = options.credentials === undefined && this.logins !== undefined ? loginRegistryOf(reference) : undefined;
     if (registry === undefined || this.logins === undefined) return this.pullWith(reference, options);
     return this.logins(
       registry,
-      (login) =>
-        this.pullWith(reference, {
-          ...options,
-          ...(login !== undefined ? { credentials: { registry, username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password } } : {}),
-        }),
+      async (login) => {
+        if (login === undefined) return this.pullWith(reference, options);
+        const credentials = { registry, username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password };
+        try {
+          return await this.pullWith(reference, { ...options, credentials });
+        } catch (error) {
+          // Review round 1 of PR #110 (A-M1): a login that the registry refuses (an expired token of the credential store)
+          // never keeps a public image from downloading: once more without it, as the image check does.
+          if (options.signal?.aborted || !isLoginRefusal(error)) throw error;
+          this.logger.warn(`The registry ${registry} refused the login of this computer for ${reference}; it is downloaded without it: ${errorMessage(error)}`);
+          return this.pullWith(reference, options);
+        }
+      },
       options.signal,
     );
   }
@@ -429,3 +438,22 @@ export class EngineDocker implements EnvironmentDocker {
   }
 }
 
+/**
+ * Review round 1 of PR #110 (A-L2): the registry whose login a pull of `reference` sends, only when the daemon reads the
+ * same registry from it: no space around it, and a registry part (before the first `/`, when it names a host) in lower
+ * case, as Docker compares `docker.io` and `index.docker.io`. `undefined`: no login.
+ */
+function loginRegistryOf(reference: string): string | undefined {
+  if (reference !== reference.trim()) return undefined;
+  const slash = reference.indexOf('/');
+  const first = slash < 0 ? '' : reference.slice(0, slash);
+  const namesHost = first.includes('.') || first.includes(':') || first === 'localhost';
+  if (namesHost && first !== first.toLowerCase()) return undefined;
+  return parseImageReference(reference)?.registry;
+}
+
+/** Review round 1 of PR #110 (A-M1): a refusal of the login by the registry (HTTP 401 or 403, or Docker's words for it). */
+function isLoginRefusal(error: unknown): boolean {
+  if (error instanceof EngineError && (error.status === 401 || error.status === 403)) return true;
+  return /unauthorized|authentication required|incorrect username or password|denied: denied|invalid username\/password/i.test(errorMessage(error));
+}

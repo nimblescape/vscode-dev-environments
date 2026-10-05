@@ -27,7 +27,7 @@ import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessio
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import type { OpenRecords } from '../pipeline/openRecords';
 import type { LifecycleMemory } from '../pipeline/lifecycleMemory';
-import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
+import { abortError, systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
 import { forgetRecord, sendHeartbeat } from './monitorFlow';
@@ -204,23 +204,42 @@ export function registryLogins(
   let queue: Promise<unknown> = Promise.resolve();
   // `use` must not ask for a login itself (it would wait for its own turn).
   return (registry, use, signal) => {
-    const run = queue.then(async () => {
+    const previous = queue;
+    const run = (async () => {
+      // Review round 1 of PR #110 (A-L1): the wait for the turn ends with a cancel (an AbortError; review round 2 of PR
+      // #109, A2-L2: a login whose user gave up is not asked); nothing was asked then, so nothing is forgotten.
+      await turnOf(previous, signal);
       try {
         let login: RegistryLogin | undefined;
         try {
-          // Review round 2 of PR #109 (A2-L1): a login whose user gave up while it waited is not asked.
-          if (!signal?.aborted) login = await host.secrets.registry(registry);
+          login = await host.secrets.registry(registry);
         } catch (error) {
           log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
         }
+        if (signal?.aborted) throw abortError();
         return await use(login);
       } finally {
         forget();
       }
-    });
-    queue = run.catch(() => undefined);
+    })();
+    // The next turn waits for this one and for the one before it (a cancelled wait ends before the turn before it).
+    queue = Promise.allSettled([previous, run]);
     return run;
   };
+}
+
+/** Review round 1 of PR #110 (A-L1): resolves when `previous` settled; rejects with an AbortError when `signal` aborts first. */
+function turnOf(previous: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  if (signal === undefined) return previous.then(() => undefined, () => undefined);
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(abortError());
+    signal.addEventListener('abort', aborted, { once: true });
+    previous.then(
+      () => (signal.removeEventListener('abort', aborted), resolve()),
+      () => (signal.removeEventListener('abort', aborted), resolve()),
+    );
+  });
 }
 
 /**
