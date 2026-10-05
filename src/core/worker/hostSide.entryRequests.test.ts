@@ -110,6 +110,7 @@ function setup(
     ownerLogin: (id: string, scope?: OpenRequestScope) => open(scope).ownerLogin(id),
     createEnvironment: (id: string, repository: string, configPath: string, scope?: OpenRequestScope) => open(scope).createEnvironment({ id, repository, configPath }),
     dropCreated: (id: string, scope?: OpenRequestScope) => open(scope).dropCreated(id),
+    createMark: (id: string, kind: 'ended' | 'previous', previous: BusyMark | undefined, scope?: OpenRequestScope) => open(scope).createMark(id, kind, previous),
     configuration: (id: string, change: ConfigurationChange, scope?: OpenRequestScope) => open(scope).configuration(id, change),
     build: (id: string, change: BuildChange, scope?: OpenRequestScope) => open(scope).build(id, change),
   };
@@ -237,6 +238,14 @@ describe('the entry of a first open, the configuration and the build records as 
       expect(file().environments).toEqual([]);
     });
 
+    it('refuses the ID of an entry of another account or on another Docker host, in any case (review round 2 of PR #106)', async () => {
+      for (const existing of [entryOf(NEW.toUpperCase(), { owner: { id: '7', login: 'other' } }), entryOf(NEW.toUpperCase(), { dockerHost: 'ssh://other' })]) {
+        const { ask, file } = firstOpen([existing]);
+        await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('already') });
+        expect(file().environments).toEqual([existing]);
+      }
+    });
+
     it('an entry of the repository of another account or on another Docker host is no clash', async () => {
       for (const existing of [entryOf(OTHER, { owner: { id: '7', login: 'other' } }), entryOf(OTHER, { dockerHost: 'ssh://other' }), entryOf(OTHER, { dockerHost: undefined })]) {
         const { ask, file } = firstOpen([existing]);
@@ -328,6 +337,15 @@ describe('the entry of a first open, the configuration and the build records as 
         await expect(ask('dropCreated', NEW)).rejects.toMatchObject({ code: 'invalid' });
         expect(file()).toEqual(before);
       }
+    });
+
+    it('after `record createMark ended` of the failed first open, still removes it (review round 2 of PR #106)', async () => {
+      const { ask, file } = setup([], { scope: { repository: REPOSITORY, dockerHost: HOST }, allowed: [...ALLOWED, 'record createMark'] });
+      await ask('createEnvironment', CREATE);
+      await ask('createMark', NEW, 'ended');
+      expect(file().environments[0]?.busy).toMatchObject({ operation: 'create', windowId: OWNER.windowId });
+      expect(await ask('dropCreated', NEW)).toBeNull();
+      expect(file().environments).toEqual([]);
     });
 
     it('a missing entry is no error, as EnvironmentRegistry.remove', async () => {
@@ -465,6 +483,20 @@ describe('the entry of a first open, the configuration and the build records as 
         'The worker recorded the volume devenv-theirs of a service for acme/api, which is left out: it is no additional volume of the environment.',
         'The worker recorded the volume devenv-other of a service for acme/api, which is left out: it is no additional volume of the environment.',
       ]);
+    });
+
+    it('at most 1000 additional volumes in all, over repeated requests; a name recorded already adds nothing (review round 2 of PR #106, A2-M1)', async () => {
+      const { ask, entry, warnings } = setup();
+      const batch = (from: number) => Array.from({ length: 1000 }, (_, i) => `v${from + i}`);
+      await ask('configuration', ID, { addVolumes: batch(0).slice(0, 600), addServiceVolumes: batch(0).slice(0, 600) });
+      const updated = (await ask('configuration', ID, { addVolumes: [...batch(0).slice(0, 10), ...batch(600).slice(0, 990)], addServiceVolumes: batch(600) })) as Environment;
+      expect(updated.additionalVolumes).toEqual(batch(0));
+      expect(updated.serviceVolumes).toEqual(batch(0));
+      expect(warnings.filter((text) => text.includes('the most additional volumes'))).toHaveLength(590);
+      // Again: nothing more is recorded.
+      await ask('configuration', ID, { addVolumes: batch(5000), addServiceVolumes: batch(5000) });
+      expect(entry()?.additionalVolumes).toHaveLength(1000);
+      expect(entry()?.serviceVolumes).toHaveLength(1000);
     });
 
     it('a volume of a service that the entry recorded before stays a volume of a service', async () => {

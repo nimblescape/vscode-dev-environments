@@ -397,7 +397,7 @@ export interface OpenRequests {
 function admittedVolumes(names: readonly string[], entry: Environment, file: RegistryFile, logger: BusyMarkView['logger']): string[] {
   const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
   const others = file.environments.filter((other) => other.id !== entry.id);
-  return names.filter((name) => {
+  const admitted = names.filter((name) => {
     let why: string | undefined;
     if (same(name, entry.volumeName)) why = 'it is the workspace volume of the environment';
     else if (others.some((other) => same(other.volumeName, name))) why = 'it is the workspace volume of another environment';
@@ -406,6 +406,20 @@ function admittedVolumes(names: readonly string[], entry: Environment, file: Reg
     // The name is a volume name (checkedConfigurationChange), never other text of the worker.
     if (why !== undefined) logger.warn(`The worker recorded the volume ${name} for ${entry.repository}, which is left out: ${why}.`);
     return why === undefined;
+  });
+  // Review round 2 of PR #106 (A2-M1): at most MAX_DELETE_VOLUMES additional volumes in all, over every request, so that
+  // a worker cannot grow the registry without bound; a name recorded already adds nothing.
+  const recorded = new Set(entry.additionalVolumes ?? []);
+  let count = recorded.size;
+  return admitted.filter((name) => {
+    if (recorded.has(name)) return true;
+    if (count >= MAX_DELETE_VOLUMES) {
+      logger.warn(`The worker recorded the volume ${name} for ${entry.repository}, which is left out: the environment has the most additional volumes.`);
+      return false;
+    }
+    recorded.add(name);
+    count += 1;
+    return true;
   });
 }
 
