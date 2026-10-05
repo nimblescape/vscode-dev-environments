@@ -55,6 +55,7 @@ import { WorkerConfigurationAnalyzer, analysisSlots } from '../core/helper/confi
 import { analysisFailure, type ConfigurationAnalyzer } from '../core/helper/configurationAnalysis';
 import { monitorImageTag } from '../core/helper/helperState';
 import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
+import type { ImageSettings } from '../core/remoteMonitor/protocol';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -507,6 +508,25 @@ export async function monitorImage(engine: DockerEngine, own: { tag: string; id?
 }
 
 /**
+ * Plan step 11E4e: the Session Monitor of the worker's engine made sure, as `monitorEnsure` does it, for that operation
+ * and for the open in the worker (WorkerServicesDeps.monitorEnsure): from the worker's own helper image (its monitor tag,
+ * monitorImage), with the socket that the worker mounts, the monitor script of the worker's bundle and the image
+ * maintenance of the operation. Rejects with the cause when it cannot.
+ */
+export async function ensureWorkerMonitor(
+  engine: DockerEngine,
+  own: OwnHelper,
+  logger: Logger,
+  script: () => string,
+  images: ImageSettings,
+  signal: AbortSignal,
+): Promise<MonitorEnsureValue['outcome']> {
+  const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engine), logger, script: async () => script(), imageMaintenance: () => images });
+  const image = await monitorImage(engine, own.image, logger, signal);
+  return monitor.ensureOrThrow(own.image.tag, own.socket, signal, image.reference, image.id);
+}
+
+/**
  * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the Session Monitor container of the worker's engine made
  * sure (RemoteSessionMonitor.ensureOrThrow over the Engine API, engineMonitor): with the worker's own helper image (the
  * image the worker runs from: its tag in the label, its ID as the image of the container; plan step 11D3: its monitor
@@ -520,11 +540,7 @@ export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf:
     if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorEnsure operation takes no secret.');
     try {
       const own = await ownHelperOf(context);
-      const engine = engineOf(context);
-      const logger = contextLogger(context);
-      const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engine), logger, script: async () => script(), imageMaintenance: () => checked.images });
-      const image = await monitorImage(engine, own.image, logger, context.signal);
-      const outcome = await monitor.ensureOrThrow(own.image.tag, own.socket, context.signal, image.reference, image.id);
+      const outcome = await ensureWorkerMonitor(engineOf(context), own, contextLogger(context), script, checked.images, context.signal);
       return { outcome } satisfies MonitorEnsureValue;
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorEnsure operation was cancelled.');
