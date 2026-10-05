@@ -4430,6 +4430,9 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     // Review round 1 (F2): the pending connection file of the pipeline is removed.
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(h.docker.containerState.mock.calls.filter(([name]) => name === 'devenv-acme-api-a1b2c3d4').length).toBeGreaterThanOrEqual(5);
+    // Review round 1 of PR #113 (A-M1): each check of the attach is a read of the worker (windowStateInWorker), never a
+    // Docker call of the window (this harness's worker reads the same fake).
+    expect(h.service.windowStateInWorker.mock.calls.filter(([, name]) => name === 'devenv-acme-api-a1b2c3d4').length).toBeGreaterThanOrEqual(5);
     expect(fakeVscode.window.showErrorMessage.mock.calls[0]?.[0]).toBe(Messages.containerNotReady('acme/api', 'devenv-acme-api-a1b2c3d4'));
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();

@@ -37,11 +37,12 @@ function members(prototype: object): string[] {
 describe('BootstrapDocker (plan step 11F2)', () => {
   it('has only the calls of the bootstrap: no route through the worker and no Docker call of the flows', () => {
     const own = members(BootstrapDocker.prototype);
-    for (const name of ['setRouter', 'setWorkerEngine', 'pullImage', 'startContainer', 'exec', 'removeContainer', 'stopContainer', 'createVolume', 'removeVolume', 'labelImage']) {
+    // Review round 1 of PR #113 (A-M1): also no read of a container's state (the worker reads it, windowStateInWorker).
+    for (const name of ['setRouter', 'setWorkerEngine', 'pullImage', 'startContainer', 'exec', 'removeContainer', 'stopContainer', 'createVolume', 'removeVolume', 'labelImage', 'containerState']) {
       expect(own, name).not.toContain(name);
     }
     expect(own).toEqual(
-      expect.arrayContaining(['isInstalled', 'run', 'runDirect', 'start', 'daemonStatus', 'isRunning', 'containerState', 'imageExists', 'imageId', 'buildImage', 'listImagesByLabel', 'removeImage']),
+      expect.arrayContaining(['isInstalled', 'run', 'runDirect', 'start', 'daemonStatus', 'isRunning', 'imageExists', 'imageId', 'buildImage', 'listImagesByLabel', 'removeImage']),
     );
   });
 

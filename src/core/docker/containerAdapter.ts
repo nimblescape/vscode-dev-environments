@@ -22,6 +22,7 @@ import {
   type RunOptions,
   type RunResult,
 } from '../ports';
+import type { ContainerState } from '../types';
 import { envValue } from './dockerCli';
 import {
   BootstrapDocker,
@@ -551,6 +552,20 @@ export class ContainerAdapter extends BootstrapDocker {
       });
     }
     return sorted.filter((image) => !foreign.has(image));
+  }
+
+  /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */
+  // Review round 1 of PR #113 (A-M1): not a call of the bootstrap, so not in BootstrapDocker.
+  async containerState(nameOrId: string): Promise<ContainerState> {
+    const args = ['container', 'inspect', '--format', '{{json .State.Status}}', nameOrId];
+    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+    if (result.exitCode !== 0) {
+      if (this.isMissing(result, 'container')) return 'missing';
+      throw this.commandError(args, result);
+    }
+    const status = parseJsonOutput(result.stdout);
+    if (typeof status !== 'string') throw this.commandError(args, result, 'Unexpected output of docker container inspect.');
+    return mapContainerState(status);
   }
 
   /** `docker stop` (the container gets 10 s to end, then SIGKILL). A missing container is not an error. */

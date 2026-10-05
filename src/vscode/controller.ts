@@ -2099,17 +2099,14 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The state of the container as the Docker port of the window reports it, or why it could not be read: the check of the
-   * attach (readyForWindow). Plan step 11C1 (review round 1, A-R1-5): it is not a window read of 11C1; within an operation
-   * the Docker port sends it through the worker (its generic `docker` operation).
+   * The state of the container, or why it could not be read: the check of the attach (readyForWindow). Review round 1 of
+   * PR #113 (A-M1): read by the worker of the engine (windowStateInWorker), like every read of a container; before plan
+   * step 11F2 the Docker port of the window sent it through the worker's generic `docker` operation.
    */
-  private async containerStateText(containerName: string): Promise<string> {
+  private async containerStateText(environment: Environment, containerName: string): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
-    try {
-      return String(await this.deps.docker.containerState(containerName));
-    } catch (error) {
-      return `not readable: ${errorMessage(error)}`;
-    }
+    const value = await this.deps.service.windowStateInWorker(environment, containerName);
+    return value === undefined ? 'not readable' : String(value.state);
   }
 
   /**
@@ -2551,7 +2548,7 @@ export class Controller implements vscode.Disposable {
     let state = 'not read';
     for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
       if (signal.aborted) return undefined;
-      state = await this.containerStateText(containerName);
+      state = await this.containerStateText(environment, containerName);
       if (state === 'running') return undefined;
       if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS, signal);
     }

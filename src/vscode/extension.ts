@@ -327,8 +327,8 @@ async function activateExtension(
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
   // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
-  // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
-  // worker is made ready first, D1); a missing monitor is started again as the open starts it.
+  // the engine of each environment it uses, through this window's worker of that engine (its operation `heartbeat`; the
+  // worker is made ready first, D1; review round 1 of PR #113, A-L1); a missing monitor is started again as the open starts it.
   // Review round 1 of PR #85 (A-R1-2): `signal` aborts at the deadline of the heartbeat's attempt. Review round 2 of PR
   // #85 (A-R2-2): it ends only the wait for the helper image, whose build runs with the long signal of the preparation.
   // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it, the

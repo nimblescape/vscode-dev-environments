@@ -13,10 +13,9 @@ import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_BUILD_ID } from '../names';
 import { isAbortError, sleep, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
-import type { ContainerState } from '../types';
 import { dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './dockerCli';
 import { isSshClosedBeforeLogin } from './dockerHost';
-import { mapContainerState, type ImageInfo } from './dockerObjects';
+import type { ImageInfo } from './dockerObjects';
 import { operationDockerTarget } from './dockerTargets';
 import { runPreparingWorker } from './workerPreparation';
 
@@ -397,19 +396,6 @@ export class BootstrapDocker {
   /** `docker info` exit code 0 (time limit 20 s). False without a CLI. Rejects only with an AbortError. */
   async isRunning(signal?: AbortSignal): Promise<boolean> {
     return (await this.daemonStatus(signal)).running;
-  }
-
-  /** 'missing' if not found; running|restarting|paused → 'running'; created|exited|dead|removing → 'stopped'. */
-  async containerState(nameOrId: string): Promise<ContainerState> {
-    const args = ['container', 'inspect', '--format', '{{json .State.Status}}', nameOrId];
-    const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
-    if (result.exitCode !== 0) {
-      if (this.isMissing(result, 'container')) return 'missing';
-      throw this.commandError(args, result);
-    }
-    const status = parseJsonOutput(result.stdout);
-    if (typeof status !== 'string') throw this.commandError(args, result, 'Unexpected output of docker container inspect.');
-    return mapContainerState(status);
   }
 
   /** True if the image exists locally. Throws CommandError for other errors (for example an invalid reference). */

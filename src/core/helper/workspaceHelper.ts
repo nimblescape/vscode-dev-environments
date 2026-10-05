@@ -813,7 +813,7 @@ export class WorkspaceHelper {
    */
   private runImage(options: EnsureImageOptions): Promise<HelperImageUse> {
     if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.image(options, false);
+    return this.images.runImage(options);
   }
 
   /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
