@@ -74,7 +74,7 @@ describe('an environment of another Docker host is never acted on', () => {
 
   it.each([
     ['openEnvironment', () => h.service.openEnvironment(ENV_ID, { progress: h.progress })],
-    ['stop', () => h.service.stop(ENV_ID)],
+    ['stop', () => h.operations.stop(ENV_ID)],
     ['delete', () => h.service.delete(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] })],
     ['safetyCheck', () => h.service.safetyCheck(ENV_ID, { progress: h.progress })],
     // 2026-10-01: the Switch branch command was dropped (user decision). Its rows switchBranch and configurationChanged are gone.
@@ -95,15 +95,15 @@ describe('an environment of another Docker host is never acted on', () => {
 
   it('reads nothing of it from Docker', async () => {
     // Plan step 11C1: changed expectation, the reads of the window go through windowStateInWorker (was: currentBranch).
-    expect(await h.service.windowStateInWorker((await h.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
+    expect(await h.operations.windowStateInWorker((await h.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
     expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual([]);
-    expect((await h.service.inspectStates())?.has(ENV_ID)).toBe(false);
+    expect((await h.operations.inspectStates())?.has(ENV_ID)).toBe(false);
   });
 
   it('the environment of the local Docker is refused on a remote host too', async () => {
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web' });
-    const error = await rejection(h.service.stop(OTHER_ID));
+    const error = await rejection(h.operations.stop(OTHER_ID));
     expect(error.message).toBe(Messages.otherDockerHost('acme/web', '', 'other-box'));
     expect(error.message).toContain('the local Docker');
   });
@@ -113,10 +113,10 @@ describe('inspectStates shows the environments of the current host only', () => 
   it('leaves out the other hosts (which would otherwise show "files missing")', async () => {
     await seedEnvironment(h, { container: 'running' });
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: null, volume: false, extra: { dockerHost: 'build-box' } });
-    const states = await h.service.inspectStates();
+    const states = await h.operations.inspectStates();
     expect([...(states?.keys() ?? [])]).toEqual([ENV_ID]);
     currentHost = 'build-box';
-    expect([...((await h.service.inspectStates())?.keys() ?? [])]).toEqual([OTHER_ID]);
+    expect([...((await h.operations.inspectStates())?.keys() ?? [])]).toEqual([OTHER_ID]);
   });
 });
 
@@ -178,8 +178,8 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
   it.each([
     ['open', () => u.service.open(TARGET, { progress: u.progress })],
     ['openEnvironment', () => u.service.openEnvironment(ENV_ID, { progress: u.progress })],
-    ['stop', () => u.service.stop(ENV_ID)],
-    ['stop (local environment)', () => u.service.stop(OTHER_ID)],
+    ['stop', () => u.operations.stop(ENV_ID)],
+    ['stop (local environment)', () => u.operations.stop(OTHER_ID)],
     ['delete', () => u.service.delete(ENV_ID, { progress: u.progress, additionalVolumesToRemove: [] })],
     ['safetyCheck', () => u.service.safetyCheck(ENV_ID, { progress: u.progress })],
     // 2026-10-01: the Switch branch command was dropped (user decision). Its rows switchBranch and configurationChanged are gone.
@@ -195,17 +195,21 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
   it('the reads of the view and the restore do nothing, and the message is shown once', async () => {
     const name = resourceName('acme/lost', OTHER_ID.replace(/^./, 'f'));
     u.docker.volumes.set(name, { [LABEL_ENVIRONMENT_ID]: OTHER_ID.replace(/^./, 'f'), [LABEL_REPOSITORY]: 'acme/lost', [LABEL_OWNER_ID]: ACCOUNT.id });
-    expect(await u.service.reconcileFromVolumes()).toBe(0);
-    expect(await u.service.inspectStates()).toEqual(new Map());
+    // Plan step 11F1: changed, the reads of the window (EnvironmentOperations) and those of the pipeline (EnvironmentService,
+    // which runs in the worker) each show the message once.
+    const shown = () => u.ui.warnings.filter((warning) => warning === Messages.dockerEndpointUnsupported(ENDPOINT));
+    expect(await u.operations.inspectStates()).toEqual(new Map());
     // Plan step 11C1: changed expectation, windowStateInWorker (was: currentBranch).
-    expect(await u.service.windowStateInWorker((await u.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
+    expect(await u.operations.windowStateInWorker((await u.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
+    expect(await u.operations.inspectStates()).toEqual(new Map());
+    expect(shown()).toHaveLength(1);
+    expect(await u.service.reconcileFromVolumes()).toBe(0);
     expect(await u.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
     expect(await u.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
     expect(await u.service.repositoryServiceData(ENV_ID)).toEqual([]);
-    expect(await u.service.inspectStates()).toEqual(new Map());
     noDockerCall();
     // Never recorded as the host of a restored entry.
     expect((await u.registry.list()).filter((env) => env.repository === 'acme/lost')).toEqual([]);
-    expect(u.ui.warnings.filter((warning) => warning === Messages.dockerEndpointUnsupported(ENDPOINT))).toHaveLength(1);
+    expect(shown()).toHaveLength(2);
   });
 });

@@ -3,11 +3,12 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Review round 2 of plan step 11C2b (mutation tests, B-R2): the open questions in the gate of deleteCheckInWorker.
+import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
 import { ENV_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import type { EnvironmentServiceDeps } from './environmentService';
 
-type FlowOptions = Parameters<EnvironmentServiceDeps['flow']>[2];
+type FlowOptions = Parameters<OperationFlow>[2];
 const rejection = (p: Promise<unknown>) => p.then((value) => ({ resolved: value }), (error: unknown) => error);
 
 describe('review round 2 of 11C2b (mutation tests): the open questions of the check of Delete', () => {
@@ -15,7 +16,7 @@ describe('review round 2 of 11C2b (mutation tests): the open questions of the ch
     let answer: (options: FlowOptions) => unknown = () => ({ decision: 'cancel' });
     const h = createHarness({ flow: async (_op, _params, options) => answer(options) });
     await seedEnvironment(h, { container: 'stopped' });
-    const check = () => rejection(h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: 'acme/api', otherWindow: false }));
+    const check = () => rejection(h.operations.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: 'acme/api', otherWindow: false }));
     answer = (options) => {
       options.onQuestion?.('asked');
       options.onAnswer?.('confirmDelete', ['acme/api', {}], 'delete');

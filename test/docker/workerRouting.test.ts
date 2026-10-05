@@ -21,7 +21,6 @@ import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/
 import { ENGINE_IDENTITY_ARGS, LABEL_HELPER_CHANNEL, OP_STOP } from '../../src/core/helperChannel/protocol';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
-import { EnvironmentService } from '../../src/core/pipeline/environmentService';
 import { isoTime, systemClock, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -29,7 +28,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume } from './harness';
+import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume, pipelineWithOperations } from './harness';
 
 const REPOSITORY = 'devenv-test/worker-routing';
 
@@ -108,7 +107,7 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
   const paths = new StoragePaths(path.join(run.runDir, 'worker-routing-storage'));
   const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
   const sessionFiles = new SessionFiles(paths);
-  const service = new EnvironmentService({
+  const service = pipelineWithOperations({
     analyzer: inProcessAnalyzer,
     docker,
     runner,
@@ -250,7 +249,7 @@ describe('Stop and Delete through the worker (plan step 5, PR A)', () => {
     expect(cli.container(name)?.State.Running).toBe(true);
     spy.calls.length = 0;
 
-    await targets.withOperation(() => service.stop(environmentId));
+    await targets.withOperation(() => service.operations.stop(environmentId));
     expect(cli.container(name)?.State.Running).toBe(false);
     // Plan step 11B2: changed expectation (before: the `docker stop` of this window, routed through the worker that held
     // the lock): Stop is the worker's operation `stop`, under the lock that it takes itself; no Docker call of this window.

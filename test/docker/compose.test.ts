@@ -40,7 +40,6 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
-import { EnvironmentService } from '../../src/core/pipeline/environmentService';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -59,8 +58,7 @@ import {
   fakeAuth,
   registryClient,
   registryTransport,
-  runInVolume,
-} from './harness';
+  runInVolume, pipelineWithOperations } from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { workerLocks } from './workerLocks';
 
@@ -113,7 +111,7 @@ describe('open pipeline for a Docker Compose configuration', () => {
   // that holds the lock; there is no other path, D1).
   const targets = new DockerTargets(docker, env, log);
   const locks = workerLocks({ run, cli, log }, docker, targets, 'compose', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
-  const service = new EnvironmentService({
+  const service = pipelineWithOperations({
     analyzer: inProcessAnalyzer,
     // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
     // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs the
@@ -442,7 +440,7 @@ ${extra}volumes:
   it('Stop stops both containers; the next open starts them again without a build', async () => {
     if (!supportsVolumeSubpath(apiVersion)) return;
     const before = containers(app).sort();
-    await service.stop(app.id);
+    await service.operations.stop(app.id);
     expect(cli.container(app.name)?.State.Running).toBe(false);
     expect(cli.container(dbContainer())?.State.Running).toBe(false);
 

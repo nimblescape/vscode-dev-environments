@@ -200,7 +200,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   // held the lock): the Stop runs in the worker under the lock that it took itself, so no lock is held in this window.
   it('stops under the lock and releases it', async () => {
     await seedEnvironment(h, { container: 'running' });
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop', 'release']);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('stopped');
   });
@@ -208,7 +208,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   it('user decision D3: a lock held elsewhere refuses with its message and stops nothing', async () => {
     await seedEnvironment(h, { container: 'running' });
     lockOutcome = new EnvironmentLockError('busy', 'held');
-    const error = await rejection(h.service.stop(ENV_ID));
+    const error = await rejection(h.operations.stop(ENV_ID));
     expect(error.message).toBe(PipelineTexts.environmentLockBusy(REPO));
     expect(h.docker.log).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
@@ -217,10 +217,10 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   it('user decision D1: without a worker or a helper image it refuses and stops nothing; never the direct way', async () => {
     await seedEnvironment(h, { container: 'running' });
     lockOutcome = new EnvironmentLockError('unavailable', 'no image');
-    expect((await rejection(h.service.stop(ENV_ID))).message).toBe(PipelineTexts.environmentLockUnavailable(REPO, 'no image'));
+    expect((await rejection(h.operations.stop(ENV_ID))).message).toBe(PipelineTexts.environmentLockUnavailable(REPO, 'no image'));
     lockOutcome = undefined;
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'no space left on device');
-    expect((await rejection(h.service.stop(ENV_ID))).message).toContain('no space left on device');
+    expect((await rejection(h.operations.stop(ENV_ID))).message).toContain('no space left on device');
     expect(h.docker.log).toEqual([]);
     expect(h.docker.execs).toEqual([]);
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
@@ -234,7 +234,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
       events.push('ensureImageUse (maintaining)');
       return new Promise(() => {});
     };
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     // Plan step 11B2: changed expectation (`docker stop`, not `(locked)`), as above.
     expect(events).toEqual(['ensureImage', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker stop', 'release']);
     expect(h.helper.calls).toContain('ensureImagePresent');
@@ -245,7 +245,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   it('A-R1-1: a failed build of the missing tag refuses Stop with the D1 message, before the lock, with no fallback', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.helper.ensureImageError = new UserFacingError('helperFailed', Messages.helperFailed, 'failed to solve: node:22');
-    const error = await rejection(h.service.stop(ENV_ID));
+    const error = await rejection(h.operations.stop(ENV_ID));
     expect(error.message).toBe(PipelineTexts.environmentLockUnavailable(REPO, `${Messages.helperFailed} failed to solve: node:22`));
     expect(events).toEqual(['ensureImage']);
     expect(h.docker.log).toEqual([]);
@@ -255,7 +255,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   it('Docker not running stays the refusal of before: no image, no lock', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.docker.running = false;
-    await h.service.stop(ENV_ID);
+    await h.operations.stop(ENV_ID);
     expect(events).toEqual([]);
   });
 });
@@ -268,7 +268,7 @@ describe('no unlocked path (plan step 5, PR B, D1: no unlocked path)', () => {
     const plain = createHarness();
     try {
       await seedEnvironment(plain, { container: 'running' });
-      await plain.service.stop(ENV_ID);
+      await plain.operations.stop(ENV_ID);
       await plain.service.delete(ENV_ID, { progress: plain.progress, additionalVolumesToRemove: [] });
       expect(plain.lock.acquired).toEqual([ENV_ID, ENV_ID]);
       expect(plain.lock.released).toEqual([ENV_ID, ENV_ID]);

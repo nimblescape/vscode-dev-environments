@@ -7,6 +7,8 @@
 // settings, the image maintenance and the image list, shows the steps of the worker, and answers with the entry of the
 // environment that the worker opened (A1: the window connects after the lock is released). A worker that ended without
 // its answer could not clean up here: this window does (review round 1 of PR #107, A-L2: the lifecycle as unknown).
+import type { EnvironmentOperationsDeps } from './environmentOperations';
+import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperChannelError } from '../helperChannel/helperChannel';
@@ -17,13 +19,13 @@ import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, PID, REPO, WINDOW_ID, createHarness, s
 import { LIFECYCLE_UNKNOWN, windowLifecycleMemory } from './lifecycleMemory';
 import type { BusyMark } from '../types';
 
-type FlowOptions = Parameters<EnvironmentServiceDeps['flow']>[2];
+type FlowOptions = Parameters<OperationFlow>[2];
 
 const SOURCE = '0123456789abcdef0123456789abcdef';
 const IMAGES = { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'UTC' };
 const OPENED = { environmentId: ENV_ID, containerName: 'devenv-acme-api-c', remoteWorkspaceFolder: '/workspaces/api' };
 
-function harness(answer: (op: string, params: unknown, options: FlowOptions) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps> = {}) {
+function harness(answer: (op: string, params: unknown, options: FlowOptions) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps & EnvironmentOperationsDeps> = {}) {
   const sent: { op: string; params: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }[] = [];
   const listSent = vi.fn();
   const memory = windowLifecycleMemory();
@@ -54,7 +56,7 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const { h, sent, listSent } = harness(async () => ({ opened: OPENED, imageListSent: true }));
     const seeded = await seedEnvironment(h, { container: 'stopped' });
     const controller = new AbortController();
-    const result = await h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, forceRebuild: true, configPath: 'b/devcontainer.json' });
+    const result = await h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, forceRebuild: true, configPath: 'b/devcontainer.json' });
     expect(result).toEqual({ environment: await h.registry.get(ENV_ID), containerName: OPENED.containerName, remoteWorkspaceFolder: OPENED.remoteWorkspaceFolder });
     expect(result.environment.id).toBe(seeded.id);
     expect(sent).toEqual([
@@ -87,24 +89,24 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const { h, sent, listSent } = harness(async () => answer);
     await seedEnvironment(h, { container: 'stopped' });
     const target = { repository: REPO, defaultBranch: null, configPaths: ['.devcontainer/devcontainer.json'], trusted: true };
-    expect((await h.service.openInWorker(target, { progress: h.progress })).environment.id).toBe(ENV_ID);
+    expect((await h.operations.openInWorker(target, { progress: h.progress })).environment.id).toBe(ENV_ID);
     expect(sent[0].params).toMatchObject({ repository: REPO, target: { defaultBranch: null, configPaths: ['.devcontainer/devcontainer.json'], trusted: true } });
     expect(sent[0].params).not.toHaveProperty('environmentId');
     expect(listSent).not.toHaveBeenCalled();
     // An answer that names an environment that is not the one of the repository of the account is refused.
     await seedEnvironment(h, { id: OTHER_ID, repository: 'acme/web', container: 'stopped' });
     answer = { opened: { ...OPENED, environmentId: OTHER_ID } };
-    expect(((await rejection(h.service.openInWorker(target, { progress: h.progress }))) as Error).message).toContain('not the one of the open');
+    expect(((await rejection(h.operations.openInWorker(target, { progress: h.progress }))) as Error).message).toContain('not the one of the open');
   });
 
   it('never answers with an environment of another account or Docker host', async () => {
     const { h } = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(h, { container: 'stopped', owner: OTHER_ACCOUNT });
-    expect(await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toBeInstanceOf(Error);
+    expect(await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toBeInstanceOf(Error);
     const elsewhere = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(elsewhere.h, { container: 'stopped', extra: { dockerHost: 'ssh://box' } });
     // The entry of another Docker host is refused before anything is sent.
-    expect(await rejection(elsewhere.h.service.openEnvironmentInWorker(ENV_ID, { progress: elsewhere.h.progress }))).toBeInstanceOf(UserFacingError);
+    expect(await rejection(elsewhere.h.operations.openEnvironmentInWorker(ENV_ID, { progress: elsewhere.h.progress }))).toBeInstanceOf(UserFacingError);
     expect(elsewhere.sent).toEqual([]);
   });
 
@@ -112,7 +114,7 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const { h, sent } = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(h, { container: 'stopped' });
     h.settings = { ...h.settings, hostAccessChecksOff: ['acme/other', REPO.toUpperCase()], stopAfterMinutes: 30, stopOnClose: false, respectShutdownActionNone: true, waitingTimeSeconds: 12 };
-    await h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
+    await h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
     expect(sent[0].params.settings).toEqual({ updateImagesOnConnect: true, hostAccessChecks: 'off', waitingTimeSeconds: 12, stopOnClose: false, respectShutdownActionNone: true, stopAfterMinutes: 30 });
   });
 
@@ -127,7 +129,7 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
       return { opened: OPENED };
     });
     await seedEnvironment(h, { container: 'stopped' });
-    await h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
+    await h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
     expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
     expect(h.progress.details[0]).toBe('A newer image is available.');
     expect(h.progress.details[1]).toHaveLength(1000);
@@ -137,19 +139,19 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const { h, sent } = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(h, { container: 'stopped' });
     h.dockerStopped = true;
-    await h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
+    await h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress });
     expect(h.dockerStarts).toBe(1);
     expect(h.progress.steps[0]).toBe('startingDocker');
     h.token = undefined;
-    expect(await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'signInRequired' });
+    expect(await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'signInRequired' });
     expect(sent).toHaveLength(1);
   });
 
   it('without the computer or the image maintenance nothing is sent (review round 1 of PR #108, A-L2)', async () => {
-    for (const overrides of [{ monitorSource: undefined }, { openMonitor: undefined }] as Partial<EnvironmentServiceDeps>[]) {
+    for (const overrides of [{ monitorSource: undefined }, { openMonitor: undefined }] as Partial<EnvironmentServiceDeps & EnvironmentOperationsDeps>[]) {
       const { h, sent } = harness(async () => ({ opened: OPENED }), overrides);
       await seedEnvironment(h, { container: 'stopped' });
-      expect(((await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('cannot be sent to the worker');
+      expect(((await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('cannot be sent to the worker');
       expect(sent).toEqual([]);
     }
   });
@@ -158,7 +160,7 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const { h, sent } = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(h, { container: 'stopped' });
     const held = await h.lock.take(ENV_ID);
-    const error = await rejection(runWithEnvironmentLock(held, () => h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress })));
+    const error = await rejection(runWithEnvironmentLock(held, () => h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress })));
     expect((error as Error).message).toContain('under a lock of the environment that this window holds');
     expect(sent).toEqual([]);
     await held.release();
@@ -169,7 +171,7 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
     const mark = own('update');
     await seedEnvironment(h, { container: 'stopped', extra: { busy: mark } });
     await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
-    const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    const error = await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
     expect(error).toBeInstanceOf(UserFacingError);
     expect(error).toMatchObject({ code: 'buildFailed', detail: 'log' });
     expect(listSent).toHaveBeenCalledTimes(1);
@@ -187,7 +189,7 @@ describe('a worker open that ended without its answer (plan step 11E6)', () => {
       });
       await seedEnvironment(h, { container: 'stopped', extra: { busy: own(operation) } });
       await h.sessionFiles.writePending(ENV_ID, WINDOW_ID);
-      const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+      const error = await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
       expect(error, operation).toBeInstanceOf(UserFacingError);
       expect(await h.sessionFiles.readPendings(), operation).toEqual([]);
       const busy = (await h.registry.get(ENV_ID))?.busy;
@@ -202,7 +204,7 @@ describe('a worker open that ended without its answer (plan step 11E6)', () => {
     });
     const other: BusyMark = { operation: 'update', since: new Date().toISOString(), pid: PID + 1, windowId: 'window-2' };
     await seedEnvironment(h, { container: 'stopped', extra: { busy: other } });
-    await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(other);
   });
 
@@ -212,14 +214,14 @@ describe('a worker open that ended without its answer (plan step 11E6)', () => {
       throw new HelperChannelError('closed', 'The worker ended.');
     });
     await seedEnvironment(before.h, { container: 'stopped' });
-    await rejection(before.h.service.openEnvironmentInWorker(ENV_ID, { progress: before.h.progress }));
+    await rejection(before.h.operations.openEnvironmentInWorker(ENV_ID, { progress: before.h.progress }));
     expect(await before.memory.get(ENV_ID)).toBeUndefined();
     const after = harness(async (_op, _params, options) => {
       options.onProgress?.('starting');
       throw new HelperChannelError('closed', 'The worker ended.');
     });
     await seedEnvironment(after.h, { container: 'stopped' });
-    await rejection(after.h.service.openEnvironmentInWorker(ENV_ID, { progress: after.h.progress }));
+    await rejection(after.h.operations.openEnvironmentInWorker(ENV_ID, { progress: after.h.progress }));
     expect(await after.memory.get(ENV_ID)).toBe(LIFECYCLE_UNKNOWN);
     expect(after.h.logger.warnings.join('\n')).toContain('the next open of this window runs its lifecycle commands again');
   });
@@ -232,12 +234,12 @@ describe('a worker open that ended without its answer (plan step 11E6)', () => {
       throw Object.assign(new Error('aborted'), { name: 'AbortError' });
     });
     await seedEnvironment(cancelled.h, { container: 'stopped', extra: { busy: own('update') } });
-    await rejection(cancelled.h.service.openInWorker({ repository: REPO, configPaths: [], trusted: true }, { progress: cancelled.h.progress, signal: controller.signal }));
+    await rejection(cancelled.h.operations.openInWorker({ repository: REPO, configPaths: [], trusted: true }, { progress: cancelled.h.progress, signal: controller.signal }));
     expect((await cancelled.h.registry.get(ENV_ID))?.busy).toBeUndefined();
     expect(await cancelled.memory.get(ENV_ID)).toBe(LIFECYCLE_UNKNOWN);
     const odd = harness(async () => ({ opened: { ...OPENED, containerName: '-' } }));
     await seedEnvironment(odd.h, { container: 'stopped', extra: { busy: own('update') } });
-    expect(((await rejection(odd.h.service.openEnvironmentInWorker(ENV_ID, { progress: odd.h.progress }))) as Error).message).toContain('with an invalid value');
+    expect(((await rejection(odd.h.operations.openEnvironmentInWorker(ENV_ID, { progress: odd.h.progress }))) as Error).message).toContain('with an invalid value');
     expect((await odd.h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
@@ -245,7 +247,7 @@ describe('a worker open that ended without its answer (plan step 11E6)', () => {
     const { h } = harness(async () => {
       throw new HelperChannelError('closed', 'The worker ended.');
     });
-    expect(await rejection(h.service.openInWorker({ repository: REPO, configPaths: [], trusted: true }, { progress: h.progress }))).toBeInstanceOf(UserFacingError);
+    expect(await rejection(h.operations.openInWorker({ repository: REPO, configPaths: [], trusted: true }, { progress: h.progress }))).toBeInstanceOf(UserFacingError);
     expect(await h.registry.list()).toEqual([]);
   });
 });

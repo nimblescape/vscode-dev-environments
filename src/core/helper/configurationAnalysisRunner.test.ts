@@ -363,13 +363,12 @@ describe('WorkerConfigurationAnalyzer', () => {
     expect(broken.report).toEqual({ hostAccess: [], unsupported: [analysisInternalItem(broken.failure!.reason)] });
   });
 
-  it('is built by esbuild.mjs and included in the package', () => {
-    expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("entryPoints: ['src/core/helper/configurationAnalysisWorker.ts']");
-    expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).toContain("'dist/configurationAnalysisWorker.js'");
-    expect(fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split('\n')).toContain('!dist/configurationAnalysisWorker.js');
-    expect(fs.readFileSync(path.join(ROOT, 'src', 'vscode', 'extension.ts'), 'utf8')).toContain(
-      "new WorkerConfigurationAnalyzer(context.asAbsolutePath(path.join('dist', 'configurationAnalysisWorker.js')), logger)",
-    );
+  // Plan step 11F1: changed, the extension no longer runs the analysis (the worker does, from the script in its bundle:
+  // plan step 11E2), so its own bundle is neither built nor packaged.
+  it('is no bundle of the extension any more: neither built by esbuild.mjs nor packaged', () => {
+    expect(fs.readFileSync(path.join(ROOT, 'esbuild.mjs'), 'utf8')).not.toContain("entryPoints: ['src/core/helper/configurationAnalysisWorker.ts']");
+    expect(fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split('\n')).not.toContain('!dist/configurationAnalysisWorker.js');
+    expect(fs.readFileSync(path.join(ROOT, 'src', 'vscode', 'extension.ts'), 'utf8')).not.toContain('WorkerConfigurationAnalyzer');
   });
 });
 

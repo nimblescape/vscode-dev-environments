@@ -7,7 +7,7 @@
 import { filterRepositories, isTrustedOwner } from '../core/discovery/discoveryService';
 import { isRepositoryInScope } from '../core/discovery/scope';
 import { configurationName } from '../core/names';
-import type { RepositoryTarget } from '../core/pipeline/environmentService';
+import type { RepositoryTarget } from '../core/pipeline/operationBase';
 import type { DiscoveryData, Environment, ExtensionSettings, RepositoryInfo } from '../core/types';
 import { ControllerTexts } from './controllerTexts';
 

@@ -18,7 +18,7 @@ import { Actions } from '../core/messages';
 import { environmentsOfHost } from '../core/docker/dockerHost';
 import { availableEnvironments } from '../core/ownership';
 import { systemClock, type Clock, type Logger } from '../core/ports';
-import type { EnvironmentService } from '../core/pipeline/environmentService';
+import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { DiscoveryData, Environment, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
@@ -48,7 +48,7 @@ export interface SidebarDeps {
   registry: EnvironmentRegistry;
   sessionFiles: SessionFiles;
   coordinator: SessionCoordinator;
-  service: EnvironmentService;
+  service: EnvironmentOperations;
   docker: ContainerAdapter;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;

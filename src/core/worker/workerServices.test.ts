@@ -258,7 +258,8 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     // Plan step 11E3a: changed, the image check runs in the worker (before: it threw "before plan step 11E").
     expect(all.imageChecker).toBeInstanceOf(ImageChecker);
     await expect(all.runner.run('docker', [])).rejects.toThrow('runs no process');
-    await expect(all.flow('stop', {}, {})).rejects.toThrow('sends no flow');
+    // Plan step 11F1: changed, the pipeline has no flow at all (the flows are the window's: EnvironmentOperations).
+    expect(all).not.toHaveProperty('flow');
     expect(() => all.settings()).toThrow('before plan step 11E');
     const settings = { stopAfterMinutes: 5 } as never;
     expect(deps({ settings }).all.settings()).toBe(settings);

@@ -4,6 +4,7 @@
 
 // Review round 1 of PR #111 (A): a question that the user cancels in the worker is a cancel (A-M1); an environment of
 // another account is never sent (A-L1); the answer names the folder that the open recorded (A-I1).
+import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperOperationError } from '../helperChannel/helperChannel';
@@ -18,7 +19,7 @@ function harness(answer: () => Promise<unknown>) {
   const h = createHarness({
     monitorSource: () => '0123456789abcdef0123456789abcdef',
     openMonitor: () => ({ images: { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, listSent: () => {} }),
-    flow: (async (op: string) => (sent.push(op), answer())) as EnvironmentServiceDeps['flow'],
+    flow: (async (op: string) => (sent.push(op), answer())) as OperationFlow,
   });
   return { h, sent };
 }
@@ -32,7 +33,7 @@ describe('the open in the worker (review round 1 of PR #111)', () => {
     });
     const mark: BusyMark = { operation: 'update', since: new Date().toISOString(), pid: PID, windowId: WINDOW_ID };
     await seedEnvironment(h, { container: 'stopped', extra: { busy: mark } });
-    const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    const error = await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
     expect(error).toBeInstanceOf(UserFacingError);
     expect(error).toMatchObject({ code: 'cancelled' });
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(mark);
@@ -43,7 +44,7 @@ describe('the open in the worker (review round 1 of PR #111)', () => {
       throw new HelperOperationError('cancelled', 'The operation ended at its time limit.', true);
     });
     await seedEnvironment(h, { container: 'stopped', extra: { busy: { operation: 'update', since: new Date().toISOString(), pid: PID, windowId: WINDOW_ID } } });
-    const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    const error = await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
     expect(error).toBeInstanceOf(HelperOperationError);
     expect(error).not.toBeInstanceOf(UserFacingError);
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
@@ -52,14 +53,14 @@ describe('the open in the worker (review round 1 of PR #111)', () => {
   it('A-L1: an environment of another account is refused before anything is sent', async () => {
     const { h, sent } = harness(async () => ({ opened: OPENED }));
     await seedEnvironment(h, { container: 'stopped', owner: OTHER_ACCOUNT });
-    expect(await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'otherAccount' });
+    expect(await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'otherAccount' });
     expect(sent).toEqual([]);
   });
 
   it('A-I1: an answer whose folder is not the one that the open recorded is refused', async () => {
     const { h } = harness(async () => ({ opened: { ...OPENED, remoteWorkspaceFolder: '/workspaces/other' } }));
     await seedEnvironment(h, { container: 'stopped' });
-    expect(((await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('not the one of the open');
+    expect(((await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('not the one of the open');
   });
 
   // Review round 2 of PR #111 (A2-M1): a worker that ended the operation itself (its shutdown) is no cancel of the user.
@@ -68,7 +69,7 @@ describe('the open in the worker (review round 1 of PR #111)', () => {
       throw new HelperOperationError('cancelled', 'The worker ends.', false, true);
     });
     await seedEnvironment(h, { container: 'stopped', extra: { busy: { operation: 'update', since: new Date().toISOString(), pid: PID, windowId: WINDOW_ID } } });
-    const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    const error = await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
     expect(error).not.toBeInstanceOf(UserFacingError);
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });

@@ -47,7 +47,6 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
-import { EnvironmentService } from '../../src/core/pipeline/environmentService';
 import { isoTime, systemClock, type GitHubAuth } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { StoragePaths } from '../../src/core/storage/paths';
@@ -76,8 +75,7 @@ import {
   registryTransport,
   runInVolume,
   timedChecker,
-  type CheckRecord,
-} from './harness';
+  type CheckRecord, pipelineWithOperations } from './harness';
 import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 
 const REPOSITORY = 'devenv-test/tiny';
@@ -191,9 +189,9 @@ describe('open pipeline on a seeded environment', () => {
   const offlineHelper = helperWithDueCheck(offlineTransport, 'offline');
   const hangingHelper = helperWithDueCheck(hangingTransport, 'hanging');
 
-  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): EnvironmentService {
+  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): ReturnType<typeof pipelineWithOperations> {
     const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
-    return new EnvironmentService({
+    return pipelineWithOperations({
       analyzer: inProcessAnalyzer,
       // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
       // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs
@@ -600,7 +598,7 @@ describe('open pipeline on a seeded environment', () => {
   it('stop: records the Git summary, then stops the container', async () => {
     expect(execIn(REMOTE_USER, `cd ${FOLDER} && printf kept > ${UNTRACKED} && echo ok`)).toBe('ok');
     const started = Date.now();
-    await timings.measure('stop', () => online.stop(environmentId));
+    await timings.measure('stop', () => online.operations.stop(environmentId));
 
     const summary = (await registry.get(environmentId))?.gitSummary;
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
@@ -759,7 +757,7 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('offline: an information message, and the container starts within the time limit of the check', async () => {
-    await online.stop(environmentId);
+    await online.operations.stop(environmentId);
     expect(cli.container(containerName)?.State.Status).toBe('exited');
     const containerId = cli.container(containerName)?.Id;
     const record = (await registry.get(environmentId))?.buildRecord;
@@ -780,7 +778,7 @@ describe('open pipeline on a seeded environment', () => {
     // A registry that never answers: the check ends after 5 seconds (NFR-08), then the container starts. The helper of
     // this new window checks its base image at the same time, in the background: its 5 seconds overlap with those of
     // the image check, instead of coming first.
-    await online.stop(environmentId);
+    await online.operations.stop(environmentId);
     progress = new RecordingProgress();
     events = ui.events.length;
     checked = checks.length;

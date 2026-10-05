@@ -40,14 +40,14 @@ describe('review round 1 of 11C2b (mutation tests): EnvironmentService.deleteChe
     await h.registry.updateEnvironment(ENV_ID, (entry) => {
       entry.dockerHost = 'build-box';
     });
-    await h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: 'acme/api', otherWindow: false });
+    await h.operations.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: 'acme/api', otherWindow: false });
     expect((sent[0].params as { dockerHost: string }).dockerHost).toBe('build-box');
   });
 
   it('ES20: parameters that do not fit (an empty name) are not sent', async () => {
     const { h, sent } = harness(async () => ({ decision: 'cancel' }));
     await seedEnvironment(h, { container: 'stopped' });
-    expect(((await rejection(h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: '', otherWindow: false }))) as Error).message).toContain('cannot be sent');
+    expect(((await rejection(h.operations.deleteCheckInWorker(ENV_ID, { progress: h.progress, repository: '', otherWindow: false }))) as Error).message).toContain('cannot be sent');
     expect(sent).toEqual([]);
   });
 
@@ -58,6 +58,6 @@ describe('review round 1 of 11C2b (mutation tests): EnvironmentService.deleteChe
       throw new Error('the channel went away');
     });
     await seedEnvironment(h, { container: 'stopped' });
-    expect(await rejection(h.service.deleteCheckInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, repository: 'acme/api', otherWindow: false }))).toMatchObject({ code: 'cancelled' });
+    expect(await rejection(h.operations.deleteCheckInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, repository: 'acme/api', otherWindow: false }))).toMatchObject({ code: 'cancelled' });
   });
 });

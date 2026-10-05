@@ -141,7 +141,7 @@ describe('deleteInWorker (review round 1 of 11C2a, B-R1)', () => {
     const id = '6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b';
     await h.sessionFiles.writePending(id, 'window-1');
     h.sessionFiles.writeReopenSync({ environmentId: id, closedAt: new Date(0).toISOString() });
-    await h.service.deleteInWorker(id, { progress: h.progress, additionalVolumesToRemove: [] });
+    await h.operations.deleteInWorker(id, { progress: h.progress, additionalVolumesToRemove: [] });
     expect(sent).toEqual([]);
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(await h.sessionFiles.readReopen()).toBeUndefined();
@@ -152,7 +152,7 @@ describe('deleteInWorker (review round 1 of 11C2a, B-R1)', () => {
     const { h, sent } = harness(async () => ({ deleted: true }), { dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
     await seedEnvironment(h, { container: 'stopped', extra: { dockerHost: 'build-box' } as Partial<Environment> });
     const controller = new AbortController();
-    await h.service.deleteInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, additionalVolumesToRemove: [] });
+    await h.operations.deleteInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, additionalVolumesToRemove: [] });
     expect(sent.map((s) => [s.op, (s.params as { dockerHost: string }).dockerHost, s.signal])).toEqual([[OP_DELETE, 'build-box', controller.signal]]);
     h.cleanup();
   });
@@ -162,8 +162,8 @@ describe('deleteInWorker (review round 1 of 11C2a, B-R1)', () => {
     const gate = new Promise<void>((resolve) => (release = resolve));
     const { h, sent } = harness(async () => (await gate, { deleted: true }));
     await seedEnvironment(h, { container: 'stopped' });
-    const first = h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
-    const second = h.service.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    const first = h.operations.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
+    const second = h.operations.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] });
     await new Promise((r) => setTimeout(r, 50));
     expect(sent.length).toBe(1);
     release();
@@ -178,7 +178,7 @@ describe('deleteInWorker (review round 1 of 11C2a, B-R1)', () => {
       throw new HelperOperationError('cancelled', 'The operation ended.', false);
     });
     await seedEnvironment(h, { container: 'stopped' });
-    const error = await caught(h.service.deleteInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, additionalVolumesToRemove: [] }));
+    const error = await caught(h.operations.deleteInWorker(ENV_ID, { progress: h.progress, signal: controller.signal, additionalVolumesToRemove: [] }));
     expect(error).toBeInstanceOf(UserFacingError);
     expect(error).toMatchObject({ code: 'cancelled' });
     h.cleanup();

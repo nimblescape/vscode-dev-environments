@@ -29,7 +29,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume } from './harness';
+import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext, fakeAuth, registryClient, registryTransport, testStateVolume, pipelineWithOperations } from './harness';
 
 const REPOSITORY = 'devenv-test/worker-lock';
 /** Short waits for the test (the service asks for ENVIRONMENT_LOCK_WAIT_SECONDS, 10 s). */
@@ -139,7 +139,7 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
     paths.ensureDirectoriesSync();
     const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
     const sessionFiles = new SessionFiles(paths);
-    const service = new EnvironmentService({
+    const service = pipelineWithOperations({
       analyzer: inProcessAnalyzer,
       docker,
       runner,

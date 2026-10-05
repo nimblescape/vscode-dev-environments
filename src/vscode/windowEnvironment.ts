@@ -6,7 +6,7 @@
 // 7.5). Review round 1 of 11C3 (A-R1-M2): moved out of extension.ts (no `vscode` import here), so it is unit-tested.
 import type { ContainerAdapter } from '../core/docker/containerAdapter';
 import type { HelperPrebuildOutcome } from '../core/helper/helperPrebuild';
-import type { EnvironmentService } from '../core/pipeline/environmentService';
+import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
 import type { Logger } from '../core/ports';
 import { errorMessage } from '../core/errors';
 import type { EnvironmentRegistry } from '../core/storage/registry';
@@ -27,7 +27,7 @@ export async function findWindowEnvironment(
     registry: Pick<EnvironmentRegistry, 'findByContainerName'>;
     needsRestore: () => Promise<boolean>;
     docker: Pick<ContainerAdapter, 'isInstalled'>;
-    service: Pick<EnvironmentService, 'reconcileInWorker'>;
+    service: Pick<EnvironmentOperations, 'reconcileInWorker'>;
     logger: Logger;
   },
 ): Promise<Environment | undefined> {

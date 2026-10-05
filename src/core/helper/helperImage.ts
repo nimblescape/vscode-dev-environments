@@ -13,7 +13,7 @@ import * as path from 'path';
 import type { ContainerAdapter, ImageInfo } from '../docker/containerAdapter';
 import { errorMessage } from '../errors';
 import { extractBaseImages } from '../imageCheck/dockerfile';
-import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/imageCheck';
+import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/registryClient';
 import { parseImageReference } from '../imageCheck/reference';
 import type { RegistryClient } from '../imageCheck/registryClient';
 import { LABEL_HELPER } from '../names';

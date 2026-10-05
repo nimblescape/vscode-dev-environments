@@ -34,7 +34,6 @@ import { forgetRecord, sendHeartbeat } from './monitorFlow';
 import { isSourceId } from '../remoteMonitor/protocol';
 import { stopAfterSeconds } from '../session/sessionRules';
 import { EngineDocker } from './engineDocker';
-import { readEnvironmentStates } from '../pipeline/refreshStates';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
 
@@ -451,10 +450,6 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     analyzer: deps.analyzer ?? ANALYZER_NOT_IN_WORKER,
     dockerTarget: async () => ({ kind: deps.dockerHost === '' ? 'local' : 'remote', host: deps.dockerHost, endpoint: '' }),
     environmentLock: deps.environmentLock,
-    // Plan step 11C1: the pipeline of the worker reads the states itself, over its engine.
-    workerRefresh: (environments) => readEnvironmentStates(docker, environments),
-    flow: async (op) => {
-      throw new Error(`The pipeline of the worker sends no flow (${op}): it is the flow.`);
-    },
+    // Plan step 11F1: the flows and the refresh through a worker are the window's (EnvironmentOperations), not the pipeline's.
   };
 }

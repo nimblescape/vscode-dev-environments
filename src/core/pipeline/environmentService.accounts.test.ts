@@ -123,7 +123,7 @@ describe('two GitHub accounts open the same repository (concept D-3)', () => {
     expect(h.docker.containersOf(first.id).map((container) => container.id)).toContain(h.docker.tokenWrites().at(-1)?.container);
     // Only an explicit reference to the environment of the other account is refused.
     expect((await rejection(h.service.openEnvironment(second.id, options()))).code).toBe('otherAccount');
-    expect((await rejection(h.service.stop(second.id))).code).toBe('otherAccount');
+    expect((await rejection(h.operations.stop(second.id))).code).toBe('otherAccount');
   });
 
   it('creates an environment of the account when another window created one of another account in the meantime', async () => {
