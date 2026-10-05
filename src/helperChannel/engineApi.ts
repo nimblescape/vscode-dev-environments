@@ -26,6 +26,12 @@ export interface EngineRequest {
   signal?: AbortSignal;
   /** The answer as it comes, instead of in `body`. */
   onChunk?: (text: string) => void;
+  /**
+   * Plan step 11G1: the answer decoded as Latin-1 instead of UTF-8, so that each character of `body` is one byte of the
+   * answer (`Buffer.from(body, 'latin1')` gives the bytes back): for a binary answer such as the tar archive of
+   * `GET /containers/<id>/archive`, whose offsets are byte offsets. MAX_ENGINE_ANSWER_CHARACTERS then counts bytes.
+   */
+  latin1?: boolean;
 }
 
 export interface EngineAnswer {
@@ -87,7 +93,7 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
         else resolve(answer!);
       };
       const req = http.request({ socketPath, method: request.method, path: request.path, headers }, (res) => {
-        res.setEncoding('utf8');
+        res.setEncoding(request.latin1 === true ? 'latin1' : 'utf8');
         let text = '';
         let truncated = false;
         res.on('data', (chunk: string) => {
@@ -98,6 +104,12 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
           if (text.length + chunk.length > MAX_ENGINE_ANSWER_CHARACTERS) {
             text += chunk.slice(0, Math.max(0, MAX_ENGINE_ANSWER_CHARACTERS - text.length));
             truncated = true;
+            // Review round 1 of PR #114 (A-L3): the read of a file of an image (latin1) ends at the bound at once, instead of
+            // reading the rest of a large file until its time limit; its caller counts a truncated answer as unknown.
+            if (request.latin1 === true) {
+              finish(undefined, { status: res.statusCode ?? 0, body: text, truncated });
+              req.destroy();
+            }
           } else {
             text += chunk;
           }

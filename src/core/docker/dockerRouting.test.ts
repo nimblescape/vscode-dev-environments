@@ -190,7 +190,8 @@ const CLASSIFICATION: Record<string, { routed: boolean; readOnly: boolean }> = {
   // is the worker operation `startContainers` (containerAdapter.engine.test.ts).
   start: { routed: false, readOnly: false },
   // Plan step 11B3: the `docker run` of the ownership fix before the create (runOnVolume; under the lock it goes through
-  // the worker that holds it, as before; plan step 11G replaces it).
+  // the worker that holds it, as before; plan step 11G replaces it). Plan step 11G1: also the read of /etc/passwd of
+  // imageUserIds; the pipeline in the worker uses neither (EngineDocker), ContainerAdapter keeps them until plan step 11I.
   run: { routed: false, readOnly: false },
 };
 
@@ -305,6 +306,8 @@ describe('the classification of every Docker call of ContainerAdapter (plan step
       imageConfig: (d) => d.imageConfig('i'),
       runOnVolume: (d) => d.runOnVolume({ image: 'i', volume: 'v', target: '/w', entrypoint: 'sh', args: ['-c', 'true'], user: 'root', labels: { a: 'b' } }),
       containerIdsWithLabel: (d) => d.containerIdsWithLabel('a=b'),
+      // Plan step 11G1: the read of /etc/passwd of an image (a `docker run` of `cat`, only for the Docker tests).
+      imageUserIds: (d) => d.imageUserIds('i', 'u'),
     };
     const members = Object.getOwnPropertyNames(ContainerAdapter.prototype);
     const unknown = members.filter((name) => !NO_OWN_CALL.has(name) && !(name in exercised));

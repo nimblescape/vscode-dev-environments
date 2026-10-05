@@ -18,6 +18,8 @@ export const BATCH_STEP_KINDS = [
   'runUserCommands',
   'gitFiles',
   'ownershipFix',
+  // Plan step 11G1: the ownership fix of the repository folder before the dev container is created.
+  'repositoryOwnershipFix',
 ] as const;
 export type BatchStepKind = (typeof BATCH_STEP_KINDS)[number];
 

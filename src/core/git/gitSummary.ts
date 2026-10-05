@@ -179,6 +179,39 @@ ${SERVICE_REAL_PATHS}  if [ -n "$whole" ]; then
 `;
 
 /**
+ * Review round 1 of PR #114 (A-M1): SERVICE_OWNER_FIX for the batch helper (its image has GNU findutils): `-execdir`
+ * runs `chown -h -- ./<name>` in the folder that `find` has open, so a folder of the path that a running container of a
+ * service replaces by a link after `find` listed the file is not followed (with `-exec`, chown resolves the whole path
+ * again, and the batch helper also mounts the Docker socket of the engine and the shared cache). The fix in the dev
+ * container (OWNERSHIP_FIX_SCRIPT) keeps `-exec`: the image may have BusyBox, and it mounts neither.
+ */
+export const HELPER_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, () => true);
+
+/**
+ * Review round 2 of PR #114 (A2-M1): HELPER_SERVICE_OWNER_FIX for the repository before the create. `-execdir … +` runs
+ * one chown per folder, which costs seconds to minutes on a large repository after a new clone; then no container of the
+ * environment has run on the files, so nothing can replace a folder by a link, and the branch without paths keeps
+ * `-exec`. The branches with paths of services keep `-execdir`. Review round 3 of PR #114 (A3-M1): a resumed clone uses
+ * HELPER_SERVICE_OWNER_FIX (RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT), also with an empty list of paths.
+ */
+export const REPOSITORY_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, (line) => line.includes('"$@"') || line.includes('-user 0'));
+
+/**
+ * `script` with `-execdir chown -h --` in place of `-exec chown -h` in the lines of its finds that `inLine` picks. Review
+ * round 2 of PR #114 (A2-L2): throws when no line changed, so a change of SERVICE_OWNER_FIX cannot drop it unseen.
+ */
+function withExecdir(script: string, inLine: (line: string) => boolean): string {
+  const exec = '-exec chown -h "$fix_owner" {} +';
+  const execdir = '-execdir chown -h -- "$fix_owner" {} +';
+  const result = script
+    .split('\n')
+    .map((line) => (inLine(line) ? line.split(exec).join(execdir) : line))
+    .join('\n');
+  if (result === script) throw new Error('The ownership fix has no find with -exec chown to change.');
+  return result;
+}
+
+/**
  * Review round 11 (G5): the most paths of the repository that the ownership fixes leave to the services (a list of
  * serviceFolderPaths). Over it, the whole repository counts as a path of the services (servicePathArguments): only the
  * files of root get their owner, so no data of a service loses its owner.
@@ -420,8 +453,41 @@ if [ -L "$1" ] || [ ! -d "$1" ]; then
   echo "$1 is not a folder." >&2
   exit 1
 fi
-${SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
+${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
 `;
+
+/**
+ * Plan step 11G1 ("No extra containers"): OWNERSHIP_FIX_SCRIPT with the numeric user ID `$2` and group ID `$3` in place
+ * of a user name that `id` resolves: gives every file in the repository folder `$1` that does not have that user and
+ * group that owner (service_owner_fix), except in the paths of the services `$4`… (servicePathArguments), where only the
+ * files of root change. It runs as a step of the batch helper (repositoryOwnershipFix, WorkspaceHelper
+ * .fixRepositoryOwnership), which mounts only the workspace volume, before the dev container is created; the IDs come
+ * from the `/etc/passwd` of the environment image (EngineDocker.imageUserIds), so no container of that image runs for
+ * it. As CONFIG_OWNERSHIP_FIX_SCRIPT, a link or a missing folder in place of `$1` is not walked (exit code 1).
+ */
+export const NUMERIC_OWNERSHIP_FIX_SCRIPT = numericOwnershipFixScript(REPOSITORY_SERVICE_OWNER_FIX);
+
+/**
+ * Review round 3 of PR #114 (A3-M1): NUMERIC_OWNERSHIP_FIX_SCRIPT for a resumed clone, `-execdir` in every branch: the
+ * dev container and the services of an interrupted open may still run (the fix comes before they are stopped), also when
+ * no service mounts a path of the repository (an empty list), so a folder of a path may be replaced by a link.
+ */
+export const RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT = numericOwnershipFixScript(HELPER_SERVICE_OWNER_FIX);
+
+/** NUMERIC_OWNERSHIP_FIX_SCRIPT with the fix function `ownerFix` (REPOSITORY_SERVICE_OWNER_FIX, HELPER_SERVICE_OWNER_FIX). */
+function numericOwnershipFixScript(ownerFix: string): string {
+  return `set -eu
+if [ -L "$1" ] || [ ! -d "$1" ]; then
+  echo "$1 is not a folder." >&2
+  exit 1
+fi
+dir="$1"
+uid="$2"
+gid="$3"
+shift 3
+${ownerFix}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+`;
+}
 
 /** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */
 export function isNumericId(text: string): boolean {
@@ -489,4 +555,17 @@ export function gitSummaryCommand(repoFolder: string): string[] {
  */
 export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
   return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders, gitPaths)];
+}
+
+/**
+ * Plan step 11G1: the command of NUMERIC_OWNERSHIP_FIX_SCRIPT for the repository folder `repoFolder`, the numeric IDs
+ * `uid` and `gid` (isNumericId; throws for anything else), and the paths of the services `serviceFolders` (the same
+ * arguments as ownershipFixCommand, servicePathArguments).
+ */
+export function repositoryOwnershipFixCommand(repoFolder: string, uid: string, gid: string, serviceFolders?: ServiceFolders): string[] {
+  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+  // Review round 3 of PR #114 (A3-M1): `serviceFolders` (also an empty list) is the mark of a resumed clone, whose containers
+  // may run; only a new clone (none) keeps `-exec` in the branch without paths.
+  const script = serviceFolders === undefined ? NUMERIC_OWNERSHIP_FIX_SCRIPT : RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT;
+  return ['sh', '-c', script, 'sh', repoFolder, uid, gid, ...servicePathArguments(repoFolder, serviceFolders)];
 }

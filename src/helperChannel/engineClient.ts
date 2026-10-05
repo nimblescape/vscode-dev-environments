@@ -16,7 +16,7 @@ import {
   type EngineImage,
   type EngineObjectKind,
   type EnginePullLogin,
-  type EngineRun,
+  MAX_IMAGE_FILE_BYTES,
 } from '../core/worker/dockerEngine';
 import { abortError, isAbortError } from '../core/ports';
 import { errorMessage } from '../core/errors';
@@ -25,6 +25,7 @@ import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monit
 import * as crypto from 'crypto';
 import { hasTagOrDigest, StreamRedactor } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
+import { firstTarFile } from '../core/docker/tarFile';
 import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
 
 /**
@@ -296,7 +297,48 @@ export function dockerEngine(
         await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
       }
     },
-    runContainer: (spec, options = {}) => runContainer(api, spec, options),
+    imageFile: async (image, filePath, signal) => {
+      // Plan step 11G1: the read of the label container of labelImage, without a commit: created from the image (never
+      // started; its command is never run), the file read through the archive endpoint, and removed in every case.
+      const base = filePath.slice(filePath.lastIndexOf('/') + 1);
+      if (!filePath.startsWith('/') || base === '' || base === '.' || base === '..') throw new Error(`The path ${JSON.stringify(filePath)} is no absolute path of a file.`);
+      if (signal?.aborted) throw abortError();
+      // As labelImage: a name of its own, by which it is removed also when its create did not answer within its time
+      // limit, and the create without the signal of the operation, so that a cancel never leaves it created but unknown.
+      const name = `devenv-read-${crypto.randomBytes(6).toString('hex')}`;
+      const removeByName = () =>
+        api({ method: 'DELETE', path: `/containers/${name}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      let created: EngineAnswer;
+      try {
+        created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
+      } catch (error) {
+        await removeByName();
+        if (!limit.aborted) throw error;
+        throw new EngineError(`The engine did not answer the create of a container for the read of ${filePath} of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+      }
+      if (created.status !== 201) fail(created);
+      const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+      if (typeof container !== 'string' || container === '') {
+        await removeByName();
+        throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      }
+      try {
+        if (signal?.aborted) throw abortError();
+        // Latin-1: one character per byte, so that the offsets of the tar archive stay byte offsets.
+        const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/archive?path=${encodeURIComponent(filePath)}`, signal, latin1: true });
+        // The path does not exist in the image.
+        if (answer.status === 404) return undefined;
+        if (answer.status !== 200) fail(answer);
+        // More than the answer holds: more than the bound of the file anyway.
+        if (answer.truncated) return undefined;
+        const content = firstTarFile(Buffer.from(answer.body, 'latin1'), { name: base, maxBytes: MAX_IMAGE_FILE_BYTES });
+        return content === undefined ? undefined : content.toString('utf8');
+      } finally {
+        // With its anonymous volumes (`VOLUME` of the image), within a time limit of its own, never the cancel signal.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      }
+    },
     systemTime: async (signal) => {
       const value = (await list('/info', signal)) as { SystemTime?: unknown };
       if (typeof value?.SystemTime !== 'string') throw new EngineError('The engine answered /info without its time.', 200);
@@ -316,90 +358,10 @@ export function dockerEngine(
 }
 
 /**
- * Review round 2 of 11B3a (A-R2-2, A-R2-4): the time limit of the removal of a container of labelImage or runContainer,
- * and of the read of the log of a failed run; review round 3 (A-R3-3): also of the create of labelImage.
+ * Review round 2 of 11B3a (A-R2-2): the time limit of the removal of a container of labelImage; review round 3 (A-R3-3):
+ * also of the create of labelImage. Plan step 11G1: also of the create and the removal of the container of imageFile.
  */
 export const RUN_CLEANUP_TIMEOUT_MS = 60_000;
-
-/** The most of the output of runContainer that is kept. */
-const MAX_RUN_OUTPUT_CHARACTERS = 64 * 1024;
-
-/**
- * Plan step 11B3: `docker run --rm --init --pull never --network none` over the API: create, start, wait (within the
- * time limit), the output for its result, and the removal in every case.
- */
-async function runContainer(
-  api: EngineApi,
-  spec: EngineRun,
-  options: { timeoutMs?: number; signal?: AbortSignal },
-): Promise<{ exitCode: number | null; output: string; timedOut: boolean }> {
-  if (options.signal?.aborted) throw abortError();
-  const ended = new AbortController();
-  const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
-  let timedOut = false;
-  // Review round 2 of 11B3a (A-R2-2): the time limit covers the create too. A container whose create it cut may still
-  // come to exist; the caller removes it by its labels (EnvironmentService.removeOwnershipContainers).
-  let timer = options.timeoutMs === undefined ? undefined : setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
-  let id: string | undefined;
-  try {
-    const created = await api({
-      method: 'POST',
-      path: '/containers/create',
-      signal,
-      json: {
-        Image: spec.image,
-        Entrypoint: [spec.entrypoint],
-        Cmd: [...spec.args],
-        User: spec.user,
-        Labels: spec.labels,
-        HostConfig: {
-          Init: true,
-          NetworkMode: 'none',
-          Mounts: spec.volumes.map((volume) => ({ Type: 'volume', Source: volume.name, Target: volume.target })),
-        },
-      },
-    });
-    if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
-    const createdId = (json(created.body) as { Id?: unknown } | undefined)?.Id;
-    if (typeof createdId !== 'string' || createdId === '') throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
-    id = createdId;
-    const started = await api({ method: 'POST', path: `/containers/${id}/start`, signal });
-    if (started.status !== 204 && started.status !== 304) throw new EngineError(engineErrorMessage({ ...started, truncated: false }), started.status);
-    const waited = await api({ method: 'POST', path: `/containers/${id}/wait`, signal });
-    if (waited.status !== 200) throw new EngineError(engineErrorMessage({ ...waited, truncated: false }), waited.status);
-    // Review round 2 of 11B3a (A-R2-4): the time limit ends with the run; the log has a limit of its own, and without it
-    // the exit code is still the answer.
-    if (timer !== undefined) clearTimeout(timer);
-    timer = undefined;
-    const code = (json(waited.body) as { StatusCode?: unknown } | undefined)?.StatusCode;
-    const exitCode = typeof code === 'number' ? code : null;
-    let output = '';
-    if (exitCode !== 0) {
-      // Review round 1 of 11B3a (A-R1-8): the end of the log, where the reason is.
-      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
-      const logs = await api({
-        method: 'GET',
-        path: `/containers/${id}/logs?stdout=true&stderr=true&tail=200`,
-        signal: options.signal ? AbortSignal.any([options.signal, limit]) : limit,
-      }).catch((error: unknown) => {
-        if (options.signal?.aborted) throw error;
-        return undefined;
-      });
-      // The frames of the log of a container without a terminal: their headers are left out.
-      output = logs?.status === 200 ? logs.body.replace(/[\u0000-\u0002]\u0000\u0000\u0000[\s\S]{4}/g, '').slice(-MAX_RUN_OUTPUT_CHARACTERS) : '';
-    }
-    return { exitCode, output, timedOut: false };
-  } catch (error) {
-    if (timedOut) return { exitCode: null, output: '', timedOut: true };
-    throw error;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    // Removed in every case, also after a cancel (without its signal; review round 2 of 11B3a, A-R2-2: within a time
-    // limit of its own).
-    // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; a named volume (the workspace) is kept.
-    if (id !== undefined) await api({ method: 'DELETE', path: `/containers/${id}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
-  }
-}
 
 /** `repository:tag` of a reference with a tag (`registry:5000/name:1` → `registry:5000/name`, `1`); `latest` without one. */
 function splitTag(reference: string): [string, string] {

@@ -19,8 +19,12 @@ import {
   boundServiceFolders,
   configOwnershipFixCommand,
   gitSummaryCommand,
+  NUMERIC_OWNERSHIP_FIX_SCRIPT,
+  RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT,
+  type ServiceFolders,
   isNumericId,
   ownershipFixCommand,
+  repositoryOwnershipFixCommand,
   parseGitSummaryOutput,
   serviceFolderPaths,
   servicePathArguments,
@@ -117,10 +121,18 @@ describe('commands', () => {
   it('never follows a link and never leaves the file system of the folder, on every branch of the fix (review round 3 of PR #81, B-R3-1, B-R3-2)', () => {
     // Review round 3 of PR #81: the tests with real tools and mounts need root and are skipped elsewhere (CI); this one
     // runs everywhere. Each of the three find commands of the fix keeps -xdev and chown -h.
-    for (const script of [OWNERSHIP_FIX_SCRIPT, CONFIG_OWNERSHIP_FIX_SCRIPT]) {
+    // Review round 1 of PR #114 (A-M1): changed expectation for CONFIG_OWNERSHIP_FIX_SCRIPT (before: `-exec`), which runs
+    // in the batch helper: `-execdir chown -h --`, so a folder of the path that is replaced by a link is not followed.
+    for (const [script, exec] of [
+      [OWNERSHIP_FIX_SCRIPT, '-exec chown -h "$fix_owner" {} +'],
+      [CONFIG_OWNERSHIP_FIX_SCRIPT, '-execdir chown -h -- "$fix_owner" {} +'],
+    ] as const) {
       const finds = script.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
       expect(finds).toHaveLength(3);
-      for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
+      for (const line of finds) {
+        expect(line).toMatch(/^\s*find "\$folder" -xdev /);
+        expect(line.endsWith(exec)).toBe(true);
+      }
     }
   });
 
@@ -917,6 +929,104 @@ describe('review round 15 (K3): the ownership fix of the internal folder with nu
   });
 });
 
+describe('plan step 11G1: the ownership fix of the repository with numeric IDs, for a step of the batch helper', () => {
+  const REPO = '/workspaces/api';
+
+  it('takes only decimal user and group IDs, and the paths of the services as servicePathArguments builds them', () => {
+    expect(repositoryOwnershipFixCommand(REPO, '1000', '1001')).toEqual(['sh', '-c', NUMERIC_OWNERSHIP_FIX_SCRIPT, 'sh', REPO, '1000', '1001']);
+    // Review round 3 of PR #114 (A3-M1): changed expectation, with paths of services (a resumed clone) the script of a
+    // resumed clone (`-execdir` in every branch).
+    expect(repositoryOwnershipFixCommand(REPO, '1000', '1001', [`${REPO}/pgdata`])).toEqual([
+      'sh',
+      '-c',
+      RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT,
+      'sh',
+      REPO,
+      '1000',
+      '1001',
+      ...servicePathArguments(REPO, [`${REPO}/pgdata`]),
+    ]);
+    expect(repositoryOwnershipFixCommand(REPO, '1000', '1001', 'repository').slice(-5)).toEqual(['-path', REPO, '-o', '-path', `${REPO}/*`]);
+    for (const [uid, gid] of [
+      ['vscode', '1000'],
+      ['1000', '$(reboot)'],
+      ['', '1000'],
+      ['1000', '-1'],
+      ['1000:1000', '1000'],
+    ]) {
+      expect(() => repositoryOwnershipFixCommand(REPO, uid, gid), `${uid}:${gid}`).toThrow('Invalid user or group ID');
+    }
+  });
+
+  it('uses the same service_owner_fix as the other fixes, with numbers in place of `id`', () => {
+    expect(NUMERIC_OWNERSHIP_FIX_SCRIPT).not.toMatch(/\bid -[ug]\b/);
+    expect(NUMERIC_OWNERSHIP_FIX_SCRIPT).toContain('service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"');
+    const finds = NUMERIC_OWNERSHIP_FIX_SCRIPT.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
+    expect(finds).toHaveLength(3);
+    // Review round 1 of PR #114 (A-M1): changed expectation (before: `-exec chown -h`): the batch helper's fix runs chown in
+    // the folder that find has open (`-execdir`), so a folder of the path replaced by a link meanwhile is not followed.
+    // Review round 2 of PR #114 (A2-M1): changed expectation, the branch without paths of services (a new clone, on which no
+    // service has run) keeps `-exec` (one chown for many files; `-execdir` runs one per folder).
+    const [whole, withPaths, withoutPaths] = finds;
+    for (const line of [whole, withPaths]) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -execdir chown -h -- "\$fix_owner" \{\} \+$/);
+    expect(withPaths).toContain('"$@"');
+    expect(withoutPaths).not.toContain('"$@"');
+    expect(withoutPaths).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      const result = spawnSync(shell, ['-n', '-c', NUMERIC_OWNERSHIP_FIX_SCRIPT], { encoding: 'utf8' });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    }
+  });
+
+  it('refuses a link or a missing folder in place of the repository folder', () => {
+    const root = tempDir();
+    fs.mkdirSync(path.join(root, 'real'));
+    fs.symlinkSync(path.join(root, 'real'), path.join(root, 'link'));
+    fs.writeFileSync(path.join(root, 'file'), 'x');
+    for (const folder of [path.join(root, 'link'), path.join(root, 'missing'), path.join(root, 'file')]) {
+      const [file, ...args] = repositoryOwnershipFixCommand(folder, String(os.userInfo().uid), String(os.userInfo().gid));
+      const result = spawnSync(file, args, { encoding: 'utf8' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('is not a folder');
+    }
+  });
+
+  it('runs and changes nothing when every file has the user and the group', () => {
+    const dir = tempDir();
+    fs.mkdirSync(path.join(dir, 'sub'));
+    fs.writeFileSync(path.join(dir, 'sub', 'file.txt'), 'x');
+    const [file, ...args] = repositoryOwnershipFixCommand(dir, String(os.userInfo().uid), String(os.userInfo().gid), [`${dir}/sub`]);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.statSync(path.join(dir, 'sub', 'file.txt')).uid).toBe(os.userInfo().uid);
+  });
+
+  it.skipIf(process.getuid?.() !== 0)('as root: gives the files the IDs; in a path of a service only the files of root', () => {
+    const repo = path.join(tempDir(), 'api');
+    fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'pgdata'));
+    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), 'x');
+    fs.writeFileSync(path.join(repo, 'pgdata', 'PG_VERSION'), '16');
+    fs.writeFileSync(path.join(repo, 'pgdata', 'root-file'), 'x');
+    fs.chownSync(path.join(repo, 'pgdata', 'PG_VERSION'), 999, 999);
+    const [file, ...args] = repositoryOwnershipFixCommand(repo, '1234', '2345', [`${repo}/pgdata`]);
+    const result = spawnSync(file, args, { encoding: 'utf8' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const owner = (name: string) => {
+      const stat = fs.lstatSync(path.join(repo, name));
+      return `${stat.uid}:${stat.gid}`;
+    };
+    expect(['.', 'src', 'src/a.ts', 'pgdata/root-file'].map(owner)).toEqual(['1234:2345', '1234:2345', '1234:2345', '1234:2345']);
+    expect(owner('pgdata/PG_VERSION')).toBe('999:999');
+  });
+});
+
 const canBindMount =
   process.getuid?.() === 0 && spawnSync('unshare', ['-m', 'sh', '-c', 'mount --bind "$1" "$1"', 'sh', os.tmpdir()], { stdio: 'ignore' }).status === 0;
 
@@ -1257,4 +1367,45 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
   });
 
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 2 of PR #114 (A2-M1): the fix before the create after a new clone, with real tools as root', () => {
+  // Review round 3 of PR #114 (A3-L1): its own time limit (the setup of 3000 folders is synchronous).
+  it('gives every file of a repository with many folders its owner quickly (one chown for many files, not one per folder)', { timeout: 60_000 }, () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-many-'));
+    try {
+      const repository = path.join(folder, 'repo');
+      for (let i = 0; i < 3000; i++) {
+        const dir = path.join(repository, `d${Math.floor(i / 100)}`, `e${i}`);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'f'), 'x');
+      }
+      const started = Date.now();
+      const [file, ...args] = repositoryOwnershipFixCommand(repository, '4242', '4343');
+      const result = spawnSync(file, args, { encoding: 'utf8', timeout: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      const sample = fs.statSync(path.join(repository, 'd29', 'e2999', 'f'));
+      expect([sample.uid, sample.gid]).toEqual([4242, 4343]);
+      // `-execdir … +` took about 11 s for 3000 folders here; `-exec … +` a fraction of a second.
+      expect(seconds).toBeLessThan(5);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('review round 3 of PR #114 (A3-M1): the fix of a resumed clone', () => {
+  it('uses -execdir in every branch for a resumed clone, also with an empty list of paths of services; a new clone keeps -exec without paths', () => {
+    const script = (folders?: ServiceFolders) => repositoryOwnershipFixCommand('/workspaces/repo', '1000', '1001', folders)[2];
+    for (const folders of [[], ['/workspaces/repo/data'], 'repository'] as ServiceFolders[]) {
+      expect(script(folders)).toBe(RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT);
+      expect(script(folders)).not.toContain(' -exec chown');
+    }
+    expect(script(undefined)).toBe(NUMERIC_OWNERSHIP_FIX_SCRIPT);
+    const finds = RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
+    expect(finds).toHaveLength(3);
+    for (const line of finds) expect(line).toMatch(/ -execdir chown -h -- "\$fix_owner" \{\} \+$/);
+  });
 });

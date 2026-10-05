@@ -4,7 +4,8 @@
 
 // Plan step 11B3: the Docker of the pipeline over the Engine API (EngineDocker on the port of engineClient.ts) answers
 // as ContainerAdapter answers over the Docker CLI, against the real engine of the runner: the same objects, asked both
-// ways. Also what only the API way does: the labels of an image by a commit, and a container run to its end.
+// ways. Also what only the API way does: the labels of an image by a commit, and (plan step 11G1) the read of a file of
+// an image without running anything.
 import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
@@ -78,14 +79,26 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     expect(cli.lines(['ps', '-a', '--filter', `ancestor=${image}`, '--format', '{{.ID}}'])).toEqual([]);
   });
 
-  it('runs a container on the volume to its end and removes it; a failure names its output', async () => {
-    const labels = { [TEST_RUN_LABEL]: run.runId, 'nimblescape.devenv.test-run': tag };
-    await apiDocker.runOnVolume({ image: TEST_BASE_IMAGE, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo done > /w/run-marker'], user: 'root', labels });
-    expect(cli.ok(['exec', name, 'cat', '/workspaces/run-marker'])).toBe('done');
-    await expect(
-      apiDocker.runOnVolume({ image: TEST_BASE_IMAGE, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo broken >&2; exit 3'], user: 'root', labels }),
-    ).rejects.toThrow(/exit code 3: .*broken/);
-    expect(await apiDocker.containerIdsWithLabel(`nimblescape.devenv.test-run=${tag}`)).toEqual([]);
+  // Plan step 11G1: replaces the test of runOnVolume (a container run to its end on the volume), which the read of
+  // /etc/passwd through the archive endpoint replaced.
+  it('plan step 11G1: reads the IDs of a user from /etc/passwd of an image without running anything, and leaves no container', async () => {
+    // The IDs that `id -u` and `id -g` print in a container of the image.
+    const uid = cli.ok(['run', '--rm', '--network', 'none', TEST_BASE_IMAGE, 'id', '-u', 'nobody']);
+    const gid = cli.ok(['run', '--rm', '--network', 'none', TEST_BASE_IMAGE, 'id', '-g', 'nobody']);
+    const containersBefore = new Set(cli.lines(['ps', '-aq', '--no-trunc']));
+    expect(await apiDocker.imageUserIds(TEST_BASE_IMAGE, 'root')).toEqual({ uid: '0', gid: '0' });
+    expect(await apiDocker.imageUserIds(TEST_BASE_IMAGE, '0')).toEqual({ uid: '0', gid: '0' });
+    expect(await apiDocker.imageUserIds(TEST_BASE_IMAGE, 'nobody')).toEqual({ uid, gid });
+    expect(await apiDocker.imageUserIds(TEST_BASE_IMAGE, 'devenv-no-such-user')).toBeUndefined();
+    // A path that does not exist is unknown, not a failure; a missing image is a failure.
+    const engine = dockerEngine(engineApi(socket), engineHijack(socket));
+    expect(await engine.imageFile(TEST_BASE_IMAGE, '/etc/devenv-missing')).toBeUndefined();
+    // A folder is no regular file (any base image has /etc).
+    expect(await engine.imageFile(TEST_BASE_IMAGE, '/etc')).toBeUndefined();
+    await expect(apiDocker.imageUserIds('devenv-test-missing:1', 'root')).rejects.toThrow();
+    // No container of the reads is left.
+    expect(cli.lines(['ps', '-aq', '--no-trunc']).filter((id) => !containersBefore.has(id))).toEqual([]);
+    expect(cli.lines(['ps', '-aq', '--filter', 'name=devenv-read-'])).toEqual([]);
   });
 
   it('leaves no anonymous volume of an image with `VOLUME` behind (review round 1 of 11B3a, A-R1-1)', async () => {
@@ -94,13 +107,11 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     cli.ok(['rm', `${name}-base`]);
     const anonymous = (): Set<string> => new Set(cli.lines(['volume', 'ls', '-q', '--filter', 'dangling=true']).filter((volume) => /^[0-9a-f]{64}$/.test(volume)));
     const before = anonymous();
-    const labels = { [TEST_RUN_LABEL]: run.runId };
-    await apiDocker.runOnVolume({ image: withVolume, volume: name, target: '/w', entrypoint: 'sh', args: ['-c', 'echo x > /data/x; echo kept > /w/kept'], user: 'root', labels });
+    // Plan step 11G1: changed expectation, the read of /etc/passwd (its container is created from the image) in place of
+    // runOnVolume; the checks of the named volume of the workspace went with runOnVolume, which mounted it.
+    expect(await apiDocker.imageUserIds(withVolume, 'root')).toEqual({ uid: '0', gid: '0' });
     await apiDocker.labelImage(withVolume, { 'nimblescape.devenv.test': 'yes' });
     expect([...anonymous()].filter((volume) => !before.has(volume))).toEqual([]);
-    // Review round 2 of 11B3a (missing test 2 of reviewer A): the named volume of the workspace is kept, with its files.
-    expect(cli.ok(['exec', name, 'cat', '/workspaces/run-marker'])).toBe('done');
-    expect(cli.ok(['exec', name, 'cat', '/workspaces/kept'])).toBe('kept');
   });
 
   it('exec: a refusal of the engine is a result, over the API as over the Docker CLI (review round 1 of 11B3a, A-R1-3)', async () => {

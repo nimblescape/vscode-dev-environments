@@ -447,9 +447,10 @@ describe('open pipeline on a seeded environment', () => {
     expect(execIn(REMOTE_USER, `touch ${FOLDER}/.git/write-test && rm ${FOLDER}/.git/write-test && echo ok`)).toBe('ok');
     expect(helperContainers()).toEqual([]);
     // Plan step 6, PR C: the whole open (the reads, the build, `up`, the lifecycle commands, the Git files, the ownership
-    // fix after `up`) ran in exactly one batch helper container, which is gone now. Review round 1 of PR #82 (A-R1-1):
-    // the ownership fix before the container is created is not counted here; it needs the environment image and runs as
-    // a `docker run` of its own under the lock (implementation notes 17).
+    // fix after `up`) ran in exactly one batch helper container, which is gone now. Plan step 11G1: the ownership fix
+    // before the container is created is a step of that batch helper too (repositoryOwnershipFix); only the read of
+    // /etc/passwd of the environment image is a `docker run` of its own here (ContainerAdapter.imageUserIds; the worker
+    // reads it through the Engine API without running anything).
     expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
     expect(ui.since(events)).toEqual([]);
     // Lifecycle token (user decision 2026-09-27): postCreateCommand and postStartCommand ran once each, with the token.
