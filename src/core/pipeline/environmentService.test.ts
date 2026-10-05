@@ -3396,6 +3396,16 @@ describe('open: existing environment', () => {
       expect(before.serviceFolders).toEqual([pg]);
     });
 
+    it('passes an empty list of paths of services for a resumed clone without any, so the fix runs as for a resumed clone (review round 4 of PR #114, A4-L1)', async () => {
+      // Review round 3 of PR #114 (A3-M1): a defined list (also an empty one) selects the fix of a resumed clone, whose
+      // containers may still run (repositoryOwnershipFixCommand); only a new clone passes none.
+      await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
+      await h.service.open(TARGET, options());
+      const before = h.helper.repositoryOwnershipFixes[0];
+      expect(before).toBeDefined();
+      expect(before.serviceFolders).toEqual([]);
+    });
+
     it('fixes only the files of root before up of a resumed clone of a single container when the recorded paths overflowed (review round 1 of PR #81, B-R1-1)', async () => {
       // Review round 1 of PR #81 (B-R1-1): the overflow branch had no test of its own; the deleted Switch branch test only
       // covered its copy in switchServiceFolders.
