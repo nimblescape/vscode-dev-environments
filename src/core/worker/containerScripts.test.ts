@@ -30,8 +30,9 @@ function fakeEngine() {
 
 describe('the registry of the scripts that run in a container (plan step 11B1)', () => {
   it('names the scripts that the flows run, each with the text that is written and reviewed where it belongs', () => {
+    // Review round 2 of PR #114 (A2-L1): changed expectation, no `configOwnershipFix` (it runs only in the batch helper,
+    // whose image has GNU find for its `-execdir`; review round 15, K3: never in the dev container).
     expect(Object.keys(CONTAINER_SCRIPTS).sort()).toEqual([
-      'configOwnershipFix',
       'existingPaths',
       'gitSummary',
       'homeGitConfig',

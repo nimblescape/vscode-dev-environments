@@ -7,7 +7,7 @@
 // arguments and never builds a command of its own, and every entry runs through the one primitive `DockerEngine.exec`
 // (runScript). The scripts themselves stay where they are written and reviewed (containerToken.ts, gitSummary.ts,
 // containerGit.ts); this module only names them. No I/O, no `vscode`.
-import { CONFIG_OWNERSHIP_FIX_SCRIPT, EXISTING_PATHS_SCRIPT, GIT_SUMMARY_SCRIPT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { EXISTING_PATHS_SCRIPT, GIT_SUMMARY_SCRIPT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
 import { HOME_GIT_CONFIG_SCRIPT } from '../helper/containerGit';
 import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
@@ -37,8 +37,6 @@ export const CONTAINER_SCRIPTS = {
   homeGitConfig: { program: 'sh', script: HOME_GIT_CONFIG_SCRIPT },
   /** Gives the files of the repository folder to the remote user. */
   ownershipFix: { program: 'sh', script: OWNERSHIP_FIX_SCRIPT },
-  /** Gives the files of the configuration folder to the remote user. */
-  configOwnershipFix: { program: 'sh', script: CONFIG_OWNERSHIP_FIX_SCRIPT },
   /** Of the paths that it gets, the ones that exist. */
   existingPaths: { program: 'sh', script: EXISTING_PATHS_SCRIPT },
 } as const satisfies Record<string, ScriptEntry>;

@@ -961,8 +961,13 @@ describe('plan step 11G1: the ownership fix of the repository with numeric IDs, 
     expect(finds).toHaveLength(3);
     // Review round 1 of PR #114 (A-M1): changed expectation (before: `-exec chown -h`): the batch helper's fix runs chown in
     // the folder that find has open (`-execdir`), so a folder of the path replaced by a link meanwhile is not followed.
-    for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -execdir chown -h -- "\$fix_owner" \{\} \+$/);
-    expect(NUMERIC_OWNERSHIP_FIX_SCRIPT).not.toMatch(/ -exec chown/);
+    // Review round 2 of PR #114 (A2-M1): changed expectation, the branch without paths of services (a new clone, on which no
+    // service has run) keeps `-exec` (one chown for many files; `-execdir` runs one per folder).
+    const [whole, withPaths, withoutPaths] = finds;
+    for (const line of [whole, withPaths]) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -execdir chown -h -- "\$fix_owner" \{\} \+$/);
+    expect(withPaths).toContain('"$@"');
+    expect(withoutPaths).not.toContain('"$@"');
+    expect(withoutPaths).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
   });
 
   it('has valid sh syntax, and dash syntax where dash exists', () => {
@@ -1358,4 +1363,30 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
     expect(parseGitSummaryOutput(result.stdout, RECORDED_AT)).toMatchObject({ branch: null, uncommittedFiles: 0, unpushedCommits: 1, stashes: 0 });
   });
 
+});
+
+describe.skipIf(process.getuid?.() !== 0)('review round 2 of PR #114 (A2-M1): the fix before the create after a new clone, with real tools as root', () => {
+  it('gives every file of a repository with many folders its owner quickly (one chown for many files, not one per folder)', () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-many-'));
+    try {
+      const repository = path.join(folder, 'repo');
+      for (let i = 0; i < 3000; i++) {
+        const dir = path.join(repository, `d${Math.floor(i / 100)}`, `e${i}`);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'f'), 'x');
+      }
+      const started = Date.now();
+      const [file, ...args] = repositoryOwnershipFixCommand(repository, '4242', '4343');
+      const result = spawnSync(file, args, { encoding: 'utf8', timeout: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      const sample = fs.statSync(path.join(repository, 'd29', 'e2999', 'f'));
+      expect([sample.uid, sample.gid]).toEqual([4242, 4343]);
+      // `-execdir … +` took about 11 s for 3000 folders here; `-exec … +` a fraction of a second.
+      expect(seconds).toBeLessThan(5);
+    } finally {
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
 });

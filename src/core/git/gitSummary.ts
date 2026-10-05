@@ -185,7 +185,30 @@ ${SERVICE_REAL_PATHS}  if [ -n "$whole" ]; then
  * again, and the batch helper also mounts the Docker socket of the engine and the shared cache). The fix in the dev
  * container (OWNERSHIP_FIX_SCRIPT) keeps `-exec`: the image may have BusyBox, and it mounts neither.
  */
-export const HELPER_SERVICE_OWNER_FIX = SERVICE_OWNER_FIX.split('-exec chown -h "$fix_owner" {} +').join('-execdir chown -h -- "$fix_owner" {} +');
+export const HELPER_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, () => true);
+
+/**
+ * Review round 2 of PR #114 (A2-M1): HELPER_SERVICE_OWNER_FIX for the repository before the create. `-execdir … +` runs
+ * one chown per folder, which costs seconds to minutes on a large repository after a new clone; then no service has run
+ * on the files (no paths of services), so nothing can replace a folder by a link, and the branch without paths keeps
+ * `-exec`. The branches with paths of services (a resumed clone, whose services may run) keep `-execdir`.
+ */
+export const REPOSITORY_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, (line) => line.includes('"$@"') || line.includes('-user 0'));
+
+/**
+ * `script` with `-execdir chown -h --` in place of `-exec chown -h` in the lines of its finds that `inLine` picks. Review
+ * round 2 of PR #114 (A2-L2): throws when no line changed, so a change of SERVICE_OWNER_FIX cannot drop it unseen.
+ */
+function withExecdir(script: string, inLine: (line: string) => boolean): string {
+  const exec = '-exec chown -h "$fix_owner" {} +';
+  const execdir = '-execdir chown -h -- "$fix_owner" {} +';
+  const result = script
+    .split('\n')
+    .map((line) => (inLine(line) ? line.split(exec).join(execdir) : line))
+    .join('\n');
+  if (result === script) throw new Error('The ownership fix has no find with -exec chown to change.');
+  return result;
+}
 
 /**
  * Review round 11 (G5): the most paths of the repository that the ownership fixes leave to the services (a list of
@@ -450,7 +473,7 @@ dir="$1"
 uid="$2"
 gid="$3"
 shift 3
-${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+${REPOSITORY_SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
 
 /** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */
