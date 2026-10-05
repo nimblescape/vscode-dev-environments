@@ -399,6 +399,18 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw new HelperOperationError('invalid', 'The process id is invalid.', false);
       return host.state.processAlive(pid);
     }
+    // Plan step 11E4d: the profile of the signed-in account, read by the extension with its own token.
+    case 'viewer': {
+      argumentCount(args, 0);
+      const viewer = await host.state.viewer();
+      return viewer === undefined ? null : { databaseId: viewer.databaseId, login: viewer.login, name: viewer.name ?? null };
+    }
+    // Plan step 11E4d: the container that the window remembers for the environment of the operation (SCOPED_REQUESTS).
+    case 'unrecordedLifecycle': {
+      strings(args, 1);
+      argumentCount(args, 1);
+      return (await host.state.unrecordedLifecycle(args[0] as string)) ?? null;
+    }
     case 'account': {
       const interactive = args[0];
       if (typeof interactive !== 'boolean') throw new HelperOperationError('invalid', 'The account request is invalid.', false);
@@ -410,6 +422,12 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
       throw new HelperOperationError('invalid', `The state ${call} is unknown.`, false);
   }
 }
+
+/**
+ * Plan step 11E4d: a container ID as Docker gives it: 64 hexadecimal digits, or a short one of at least 12 (a shorter
+ * prefix would name other containers too: sameContainer).
+ */
+const CONTAINER_ID = /^[0-9a-f]{12,64}$/;
 
 /** Plan step 11E4b: the arguments of a request of the open, exactly `count` of them (no field beyond its closed list). */
 function argumentCount(args: unknown[], count: number): void {
@@ -570,6 +588,17 @@ async function record(host: HostSide, call: string, args: unknown[], context: Re
     case 'build': {
       const [environmentId, kind] = strings(args, 2);
       return (await records.build(environmentId, checkedBuildChange(kind, args.slice(2)), openScope(dockerHost))) ?? null;
+    }
+    // Plan step 11E4d (decision of 2026-09-29): the window's memory of a container of the environment of the operation
+    // whose lifecycle mark could not be recorded; only a container ID.
+    case 'rememberLifecycle':
+    case 'forgetLifecycle': {
+      const [environmentId, containerId] = strings(args, 2);
+      argumentCount(args, 2);
+      if (!CONTAINER_ID.test(containerId)) throw new HelperOperationError('invalid', 'The container ID of the request is invalid.', false);
+      if (call === 'rememberLifecycle') await records.rememberLifecycle(environmentId, containerId);
+      else await records.forgetLifecycle(environmentId, containerId);
+      return null;
     }
     default:
       throw new HelperOperationError('invalid', `The record ${call} is unknown.`, false);

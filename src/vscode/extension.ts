@@ -37,6 +37,7 @@ import { PACKAGES_TIMEOUT_MS, ghcrOwnerOf, ghcrRepositories } from '../core/remo
 import { MAX_IMAGE_REPOSITORIES, REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentService } from '../core/pipeline/environmentService';
 import { githubPackagesPullCredentials } from '../core/pipeline/pullCredentials';
+import { windowLifecycleMemory } from '../core/pipeline/lifecycleMemory';
 import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { ClosingWork } from '../core/session/closingWork';
@@ -502,6 +503,8 @@ async function activateExtension(
   }
   // Plan step 11B1, 11B2 (decision of 2026-10-03, the worker is the deputy): the flows that run in the worker of the
   // current engine, with the HostSide of this computer answering their requests; one for the service and the controller.
+  // Plan step 11E4d (decision of 2026-09-29): the containers that this window remembers, for its pipeline and its worker.
+  const lifecycleMemory = windowLifecycleMemory();
   const workerFlow = extensionFlow(
     channels,
     () => targets.current(),
@@ -517,6 +520,9 @@ async function activateExtension(
       pid: process.pid,
       clock: systemClock,
       isProcessAlive: (pid: number) => isProcessAlive(pid),
+      // Plan step 11E4d: the profile of the account and the window's memory, for the open in the worker.
+      viewer: (token, signal) => discovery.viewer(token, signal),
+      lifecycleMemory,
       logger,
     }),
     logger,
@@ -532,6 +538,7 @@ async function activateExtension(
     auth,
     // Concept section 9: the profile name of the owner account for the Git identity of a new environment.
     viewer: (token, signal) => discovery.viewer(token, signal),
+    lifecycleMemory,
     // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker of the Docker target of the operation
     // (plan step 11C1: outside of an operation, of the current one; never read directly). Plan step 5, PR D (rule D1 of 2026-09-30): within
     // an operation, the worker is made ready first; when it cannot be, the refresh fails (never read directly).
