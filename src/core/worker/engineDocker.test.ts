@@ -201,16 +201,20 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     const signals: (AbortSignal | undefined)[] = [];
     const engine: DockerEngine = {
       ...unusedEngine(),
-      containerIds: (_filters, signal) => (signals.push(signal), hanging(signal)),
+      // Plan step 11G1: imageFile (imageUserIds) in place of containerIds (containerIdsWithLabel, removed with the
+      // ownership container of prepareOwnership).
+      imageFile: (_image, _path, signal) => (signals.push(signal), hanging(signal)),
       inspect: (_kind, _reference, signal) => (signals.push(signal), hanging(signal)),
       start: (_id, signal) => (signals.push(signal), hanging(signal)),
     };
     const docker = new EngineDocker(engine);
-    await expect(docker.containerIdsWithLabel('a=b', { timeoutMs: 20 })).rejects.toThrow(new EngineError('The engine did not answer the list of the containers within 0.02 s.', 0));
+    // Plan step 11G1: changed expectation, the time limit of imageUserIds (was: of containerIdsWithLabel).
+    await expect(docker.imageUserIds('img', 'vscode', { timeoutMs: 20 })).rejects.toThrow(new EngineError('The engine did not answer the read of /etc/passwd of img within 0.02 s.', 0));
     await expect(docker.imageConfig('img', { timeoutMs: 20 })).rejects.toThrow('did not answer the inspect of img within 0.02 s');
     await expect(docker.startContainer('c', { timeoutMs: 20 })).rejects.toThrow('did not answer the start of c within 0.02 s');
     const controller = new AbortController();
-    const cancelled = docker.containerIdsWithLabel('a=b', { signal: controller.signal, timeoutMs: 60_000 });
+    // Plan step 11G1: changed expectation, the cancel of imageUserIds (was: of containerIdsWithLabel).
+    const cancelled = docker.imageUserIds('img', 'vscode', { signal: controller.signal, timeoutMs: 60_000 });
     controller.abort();
     await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
     // The signal of the caller reaches the port.
@@ -234,8 +238,6 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     // A signal that aborts later: the port gets one that follows it.
     const late = { aborted: false };
     controller.signal.addEventListener('abort', () => (late.aborted = true));
-    expect(await docker.containerIdsWithLabel('nimblescape.devenv.step=x', { signal: controller.signal })).toEqual(['id1']);
-    expect(seen.at(-1)).toEqual(['ids', { label: ['nimblescape.devenv.step=x'] }, false]);
     // The image has no configuration: as `docker image inspect --format {{json .Config}}`, null.
     expect(await docker.imageConfig('img')).toBeNull();
     expect(await docker.listEnvironmentContainers()).toEqual([expect.not.objectContaining({ created: expect.anything() })]);
@@ -248,13 +250,15 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
       ...engine,
       version: async (signal) => (signals.push(signal!), { apiVersion: '1.48', version: '29.0.0' }),
       inspect: async (_kind, _reference, signal) => (signals.push(signal!), { Id: 'sha256:1' }),
-      containerIds: async (_filters, signal) => (signals.push(signal!), []),
+      // Plan step 11G1: imageFile (imageUserIds) in place of containerIds (containerIdsWithLabel, removed).
+      imageFile: async (_image, _path, signal) => (signals.push(signal!), undefined),
     };
     const watched = new EngineDocker(watching);
     await watched.isRunning(controller.signal);
     await watched.engineApiVersion(controller.signal);
     await watched.imageConfig('img', { signal: controller.signal });
-    await watched.containerIdsWithLabel('a=b', { signal: controller.signal });
+    // Plan step 11G1: changed expectation, the signal of imageUserIds reaches the port (was: of containerIdsWithLabel).
+    await watched.imageUserIds('img', 'vscode', { signal: controller.signal });
     expect(signals).toHaveLength(4);
     controller.abort();
     expect(signals.map((signal) => signal.aborted)).toEqual([true, true, true, true]);
@@ -514,27 +518,20 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     await expect(docker.isRunning(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
   });
 
-  it('runOnVolume: the volume run, its failure with the output, and its time limit', async () => {
-    let result = { exitCode: 0 as number | null, output: '', timedOut: false };
-    const specs: unknown[] = [];
-    const engine: DockerEngine = { ...unusedEngine(), runContainer: async (spec) => (specs.push(spec), result) };
+  it('plan step 11G1: imageUserIds reads /etc/passwd of the image through the port and resolves the user as `id` does', async () => {
+    const reads: { image: string; path: string }[] = [];
+    let passwd: string | undefined = 'root:x:0:0:root:/root:/bin/sh\nvscode:x:1000:1001::/home/vscode:/bin/bash\n';
+    const engine: DockerEngine = { ...unusedEngine(), imageFile: async (image, path) => (reads.push({ image, path }), passwd) };
     const docker = new EngineDocker(engine);
-    const run = { image: 'img:1', volume: 'v', target: '/workspaces', entrypoint: 'sh', args: ['-c', 'x'], user: 'root', labels: { a: 'b' } };
-    await docker.runOnVolume(run);
-    expect(specs[0]).toEqual({ image: 'img:1', entrypoint: 'sh', args: ['-c', 'x'], user: 'root', labels: { a: 'b' }, volumes: [{ name: 'v', target: '/workspaces' }] });
-    result = { exitCode: 2, output: 'chown: denied\n', timedOut: false };
-    await expect(docker.runOnVolume(run)).rejects.toThrow('failed with exit code 2: chown: denied');
-    result = { exitCode: null, output: '', timedOut: true };
-    await expect(docker.runOnVolume(run)).rejects.toThrow('did not end in time');
-    // Review round 1 of 11B3a (mutation testing): no exit code without a time limit is a failure too; the user and the
-    // options reach the port.
-    result = { exitCode: null, output: 'killed', timedOut: false };
-    await expect(docker.runOnVolume(run)).rejects.toThrow('failed with exit code none: killed');
-    result = { exitCode: 0, output: '', timedOut: false };
-    const options: unknown[] = [];
-    const watching: DockerEngine = { ...unusedEngine(), runContainer: async (spec, given) => (specs.push(spec), options.push(given), result) };
-    await new EngineDocker(watching).runOnVolume({ ...run, user: '1000:1000' }, { timeoutMs: 7 });
-    expect(specs.at(-1)).toMatchObject({ user: '1000:1000' });
-    expect(options).toEqual([{ timeoutMs: 7 }]);
+    expect(await docker.imageUserIds('img:1', 'vscode')).toEqual({ uid: '1000', gid: '1001' });
+    expect(reads).toEqual([{ image: 'img:1', path: '/etc/passwd' }]);
+    expect(await docker.imageUserIds('img:1', '1000')).toEqual({ uid: '1000', gid: '1001' });
+    expect(await docker.imageUserIds('img:1', 'node')).toBeUndefined();
+    // No regular file at the path (missing, a link, too large): unknown.
+    passwd = undefined;
+    expect(await docker.imageUserIds('img:1', 'vscode')).toBeUndefined();
+    // A failure of the engine stays a failure.
+    const failing: DockerEngine = { ...unusedEngine(), imageFile: async () => Promise.reject(new EngineError('No such image: img:1', 404)) };
+    await expect(new EngineDocker(failing).imageUserIds('img:1', 'vscode')).rejects.toMatchObject({ status: 404 });
   });
 });

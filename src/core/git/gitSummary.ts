@@ -423,6 +423,27 @@ fi
 ${SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
 `;
 
+/**
+ * Plan step 11G1 ("No extra containers"): OWNERSHIP_FIX_SCRIPT with the numeric user ID `$2` and group ID `$3` in place
+ * of a user name that `id` resolves: gives every file in the repository folder `$1` that does not have that user and
+ * group that owner (service_owner_fix), except in the paths of the services `$4`… (servicePathArguments), where only the
+ * files of root change. It runs as a step of the batch helper (repositoryOwnershipFix, WorkspaceHelper
+ * .fixRepositoryOwnership), which mounts only the workspace volume, before the dev container is created; the IDs come
+ * from the `/etc/passwd` of the environment image (EngineDocker.imageUserIds), so no container of that image runs for
+ * it. As CONFIG_OWNERSHIP_FIX_SCRIPT, a link or a missing folder in place of `$1` is not walked (exit code 1).
+ */
+export const NUMERIC_OWNERSHIP_FIX_SCRIPT = `set -eu
+if [ -L "$1" ] || [ ! -d "$1" ]; then
+  echo "$1 is not a folder." >&2
+  exit 1
+fi
+dir="$1"
+uid="$2"
+gid="$3"
+shift 3
+${SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+`;
+
 /** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */
 export function isNumericId(text: string): boolean {
   return /^(0|[1-9][0-9]{0,9})$/.test(text) && Number(text) < 4294967295;
@@ -489,4 +510,14 @@ export function gitSummaryCommand(repoFolder: string): string[] {
  */
 export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
   return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders, gitPaths)];
+}
+
+/**
+ * Plan step 11G1: the command of NUMERIC_OWNERSHIP_FIX_SCRIPT for the repository folder `repoFolder`, the numeric IDs
+ * `uid` and `gid` (isNumericId; throws for anything else), and the paths of the services `serviceFolders` (the same
+ * arguments as ownershipFixCommand, servicePathArguments).
+ */
+export function repositoryOwnershipFixCommand(repoFolder: string, uid: string, gid: string, serviceFolders?: ServiceFolders): string[] {
+  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+  return ['sh', '-c', NUMERIC_OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, uid, gid, ...servicePathArguments(repoFolder, serviceFolders)];
 }

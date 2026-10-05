@@ -44,6 +44,8 @@ const VOLUME_STEPS = [
   'runUserCommands',
   'prepareGit',
   'fixConfigOwnership',
+  // Plan step 11G1: the ownership fix of the repository before the dev container is created.
+  'fixRepositoryOwnership',
 ] as const;
 
 /** A HelperDocker for the real WorkspaceHelper (plan step 7): in the scope it runs nothing. */
@@ -383,7 +385,8 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
 }`;
 
   const opens: Array<[string, () => Promise<unknown>, BatchStepKind[]]> = [
-    ['single container (first open)', () => h.service.open(TARGET, { progress: h.progress }), ['clone', 'readConfiguration', 'build', 'up', 'gitFiles', 'runUserCommands']],
+    // Plan step 11G1: changed expectation, the first open runs the step repositoryOwnershipFix in the same session too.
+    ['single container (first open)', () => h.service.open(TARGET, { progress: h.progress }), ['clone', 'readConfiguration', 'build', 'repositoryOwnershipFix', 'up', 'gitFiles', 'runUserCommands']],
     [
       'Docker Compose (first open)',
       () => {
@@ -508,6 +511,34 @@ describe('a batch helper that cannot be opened refuses the open (user decision o
     );
     expect(scopes.map((scope) => scope.split(' ')[0])).toContain('fixConfigOwnership');
     expect(isBatchHelperUnavailable(error)).toBe(true);
+  });
+
+  // Plan step 11G1: as at fixConfigOwnership, the refusal of the scope at the fix before the container is created refuses
+  // the open; it is no warning, and nothing is created.
+  it('plan step 11G1: a step that fails in its session at fixRepositoryOwnership refuses the first open', async () => {
+    onStep = () => {
+      if (scopes.at(-1)?.startsWith('fixRepositoryOwnership ')) throw new Error('the lock was lost');
+    };
+    const error = await h.service.open(TARGET, { progress: h.progress }).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(scopes.map((scope) => scope.split(' ')[0])).toContain('fixRepositoryOwnership');
+    expect(isBatchHelperUnavailable(error)).toBe(true);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.filter((line) => line.includes('could not be changed before the container was created'))).toEqual([]);
+  });
+
+  it('plan step 11G1: the fix before the container is created runs in the session of the open, before `up`, with parameters the batch helper accepts', async () => {
+    realHelper = new WorkspaceHelper({ docker: noDockerInScope, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux' });
+    await h.service.open(TARGET, { progress: h.progress });
+    const kinds = recorded.map((step) => step.kind);
+    expect(kinds.indexOf('repositoryOwnershipFix')).toBeGreaterThan(kinds.indexOf('build'));
+    expect(kinds.indexOf('repositoryOwnershipFix')).toBeLessThan(kinds.indexOf('up'));
+    const fix = recorded.find((step) => step.kind === 'repositoryOwnershipFix')!;
+    expect(fix.params).toEqual({ repository: REPO, uid: '1000', gid: '1000' });
+    expect(() => batchStepCommand(fix.kind, fix.params)).not.toThrow();
+    expect(frame().filter((event) => event.startsWith('open '))).toHaveLength(1);
   });
 
   // Review round 6 of PR #82 (B-R6-2): only the refusal of the scope is rethrown at fixConfigOwnership. Any other failure

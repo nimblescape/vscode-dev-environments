@@ -8,7 +8,7 @@
 // WorkspaceHelper (scripts.ts, devcontainerCli.ts, stepInputs.ts, gitSummary.ts). It never runs a command line that it was
 // sent. Plan step 7 (user decision of 2026-10-01): the per-step runs of WorkspaceHelper are removed; every volume step is
 // a kind of this table and runs only in the batch helper of an operation. Pure functions. No `vscode`.
-import { configOwnershipFixCommand } from '../git/gitSummary';
+import { MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_LENGTH, boundServiceFolders, configOwnershipFixCommand, repositoryOwnershipFixCommand, type ServiceFolders } from '../git/gitSummary';
 import { CONFIG_FOLDER, WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { isStorageId } from '../storage/paths';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -58,6 +58,7 @@ export interface BatchStepCommand {
    * (closeConfigFolder). By the
    * agreed extension of the same day, readFiles, listConfigs and createFolders too. The steps that need the Docker
    * socket (readConfiguration, build, up, runUserCommands) and gitFiles and ownershipFix stay root; the clone stays Git's.
+   * Plan step 11G1: repositoryOwnershipFix stays root too (it gives the files of root to the remote user).
    */
   owner?: string;
   /**
@@ -170,6 +171,22 @@ function pathsBelow(kind: string, value: unknown, folder: string): string[] {
   const list = texts(kind, value);
   if (list.some((entry) => !entry.startsWith(`${folder}/`) || entry.slice(folder.length + 1).split('/').some((part) => part === '..' || part === '.' || part === ''))) fail(kind);
   return list;
+}
+
+/**
+ * Plan step 11G1: the paths of the services of repositoryOwnershipFix, checked as the worker checks those of an open
+ * (openRequests.ts): `'repository'`, or a list of at most MAX_SERVICE_FOLDERS texts of at most MAX_SERVICE_PATH_LENGTH
+ * characters without control characters, each an absolute path below `folder` without `.`, `..` and empty parts
+ * (pathsBelow). The list is then bounded as the pipeline bounds it (boundServiceFolders: its overflow is
+ * `'repository'`). The paths only leave files out of the fix (only their files of root change), so none of them can
+ * widen it beyond the repository folder.
+ */
+function serviceFoldersOf(kind: string, value: unknown, folder: string): ServiceFolders | undefined {
+  if (value === undefined || value === 'repository') return value;
+  if (!Array.isArray(value) || value.length > MAX_SERVICE_FOLDERS) fail(kind);
+  if (!value.every((entry) => typeof entry === 'string' && entry.length <= MAX_SERVICE_PATH_LENGTH && !/[\u0000-\u001f\u007f]/.test(entry))) fail(kind);
+  const bounded = boundServiceFolders(folder, [pathsBelow(kind, value, folder)]);
+  return bounded.overflow ? 'repository' : bounded.folders;
 }
 
 /**
@@ -310,6 +327,17 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const p = fields(kind, params, ['folder', 'uid', 'gid']);
       if (p.folder !== CONFIG_FOLDER) fail(kind);
       return { command: checked(kind, () => configOwnershipFixCommand(CONFIG_FOLDER, text(kind, p.uid, 16), text(kind, p.gid, 16))), env: {}, git: false };
+    }
+    case 'repositoryOwnershipFix': {
+      // Plan step 11G1: the ownership fix of the repository folder before the dev container is created, with the numeric
+      // IDs of the remote user (read from the /etc/passwd of the environment image), as root and without a secret. The
+      // folder comes from the repository (folderOf), never from a path of the request; NUMERIC_OWNERSHIP_FIX_SCRIPT
+      // refuses a link or a non-folder in its place.
+      const p = fields(kind, params, ['repository', 'uid', 'gid'], ['serviceFolders']);
+      const { folder } = folderOf(kind, p.repository);
+      const serviceFolders = serviceFoldersOf(kind, p.serviceFolders, folder);
+      const command = checked(kind, () => repositoryOwnershipFixCommand(folder, text(kind, p.uid, 16), text(kind, p.gid, 16), serviceFolders));
+      return { command, env: {}, git: false };
     }
     default:
       throw new BatchStepError(`The batch helper does not know the step ${String(kind).slice(0, 64)}.`);

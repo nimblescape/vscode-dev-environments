@@ -34,7 +34,7 @@ export function unusedEngine(): DockerEngine {
     removeNetwork: unused('removeNetwork'),
     pull: unused('pull'),
     labelImage: unused('labelImage'),
-    runContainer: unused('runContainer'),
+    imageFile: unused('imageFile'),
     systemTime: unused('systemTime'),
     proxy: unused('proxy'),
     createAttached: unused('createAttached'),

@@ -2798,9 +2798,13 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     // Review round 11, G5: the ready arguments of find (before: [FOLDER, 'vscode', SOURCE]).
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SOURCE])]]);
     // The fix before `up` of the new clone: no service has run on the files yet, so every file gets its owner.
-    const before = h.docker.runs.filter((run) => run.all.includes('--entrypoint'));
+    // Plan step 11G1: changed expectation, the fix before `up` is the step repositoryOwnershipFix of the batch helper with
+    // the IDs of vscode from the /etc/passwd of the image (was: a `docker run` of the image with [FOLDER, 'vscode']),
+    // without paths of services.
+    const before = h.helper.repositoryOwnershipFixes;
     expect(before).toHaveLength(1);
-    expect(before[0].args.slice(-2)).toEqual([FOLDER, 'vscode']);
+    expect(before[0]).toMatchObject({ repository: REPO, uid: '1000', gid: '1000' });
+    expect(before[0].serviceFolders).toBeUndefined();
     // Review round 10, D10-1 and D10-3: in the entry, not in the build record, and without the read-only INIT_SQL
     // (before: buildRecord.compose.serviceFolders [SOURCE, INIT_SQL]).
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([SOURCE]);
@@ -2811,7 +2815,8 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     await h.service.openEnvironment(ENV_ID, { ...options(), forceRebuild: true });
     expect(h.helper.ups.length).toBeGreaterThan(0);
     // The fix before `up` is for a new clone only (R12-1): the services have run on these files.
-    expect(h.docker.runs.filter((run) => run.all.includes('--entrypoint'))).toEqual([]);
+    // Plan step 11G1: changed expectation, no step repositoryOwnershipFix (was: no `docker run` of the image).
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
   });
 
   // 2026-10-01: the Switch branch command was dropped (user decision).

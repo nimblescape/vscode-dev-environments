@@ -10,7 +10,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EngineError, isMissing, type DockerEngine } from '../core/worker/dockerEngine';
+import { EngineError, isMissing, MAX_IMAGE_FILE_BYTES, type DockerEngine } from '../core/worker/dockerEngine';
 import { MIN_SECRET_LENGTH, SECRET_TOKEN } from '../core/helperChannel/protocol';
 import { scriptCommand } from '../core/worker/containerScripts';
 import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
@@ -29,6 +29,28 @@ function frame(stream: 1 | 2, text: string): Buffer {
   header[0] = stream;
   header.writeUInt32BE(data.length, 4);
   return Buffer.concat([header, data]);
+}
+
+/**
+ * Plan step 11G1: a tar archive of one entry, as the archive endpoint of the engine answers it: a ustar header (with its
+ * checksum), the data padded to blocks, and the two empty blocks of the end.
+ */
+function tarOf(name: string, data: Buffer, typeflag = '0'): Buffer {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 'utf8');
+  header.write('0000644\0', 100, 'latin1');
+  header.write('0000000\0', 108, 'latin1');
+  header.write('0000000\0', 116, 'latin1');
+  header.write(`${data.length.toString(8).padStart(11, '0')}\0`, 124, 'latin1');
+  header.write('00000000000\0', 136, 'latin1');
+  header.write(typeflag, 156, 'latin1');
+  header.write('ustar\x0000', 257, 'latin1');
+  header.write('        ', 148, 'latin1');
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'latin1');
+  const padding = Buffer.alloc((512 - (data.length % 512)) % 512);
+  return Buffer.concat([header, data, padding, Buffer.alloc(1024)]);
 }
 
 const INSPECT = {
@@ -64,7 +86,7 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
 
   /** An engine whose requests `answer` serves; an exec is served over a hijacked connection by `exec`. */
   async function serve(
-    answer: (call: Call) => { status: number; json?: unknown; body?: string } | undefined,
+    answer: (call: Call) => { status: number; json?: unknown; body?: string; raw?: Buffer } | undefined,
     exec?: (socket: net.Socket, input: Buffer) => void,
     more: {
       /** Written in the same write as the answer 101 (review round 1 of 11B1, A-R1-1, B-R1-3). */
@@ -92,7 +114,8 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         // No answer: the engine hangs.
         if (given === undefined) return;
         res.writeHead(given.status, { 'Content-Type': 'application/json' });
-        res.end(given.json !== undefined ? JSON.stringify(given.json) : (given.body ?? ''));
+        // Plan step 11G1: `raw`, a binary answer (the tar archive of the archive endpoint).
+        res.end(given.raw ?? (given.json !== undefined ? JSON.stringify(given.json) : (given.body ?? '')));
       });
     });
     // The hijacked start of an exec: the engine answers 101 and the connection carries the streams.
@@ -729,43 +752,6 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         await expect(missing.engine.labelImage('img:1', {})).rejects.toMatchObject({ status: 404 });
       });
 
-      it('B-R2-7, B-R2-8, B-R2-9: runContainer follows the cancel, reads the wait strictly, and cleans the log', async () => {
-        const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: {}, volumes: [] };
-        let wait: () => EngineAnswer | Promise<EngineAnswer> = () => ok({ StatusCode: 0 });
-        let log = '';
-        const { engine, requests } = fake((request) => {
-          if (request.path.startsWith('/containers/create')) return ok({ Id: 'r' }, 201);
-          if (request.path.endsWith('/wait')) return wait();
-          if (request.path.includes('/logs')) return ok(log);
-          return ok('', 204);
-        });
-        // B-R2-7: a cancel of the caller ends a hanging wait with an AbortError, not as timed out; the container goes.
-        wait = () =>
-          new Promise((_resolve, reject) => {
-            const signal = requests.at(-1)!.signal!;
-            signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
-          });
-        const controller = new AbortController();
-        setTimeout(() => controller.abort(), 20);
-        await expect(engine.runContainer(spec, { signal: controller.signal, timeoutMs: 60_000 })).rejects.toMatchObject({ name: 'AbortError' });
-        expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
-        // B-R2-8: a wait without a status code is no success; a wait that fails is a failure, and the container goes.
-        wait = () => ok({});
-        expect(await engine.runContainer(spec)).toMatchObject({ exitCode: null, timedOut: false });
-        wait = () => ok({ message: 'boom' }, 500);
-        await expect(engine.runContainer(spec)).rejects.toMatchObject({ status: 500 });
-        expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
-        // B-R2-9: the headers of the frames of the log are left out, and its end is kept.
-        wait = () => ok({ StatusCode: 1 });
-        const frame = (stream: number, text: string) => String.fromCharCode(stream, 0, 0, 0, 0, 0, 0, text.length) + text;
-        log = frame(1, 'out\n') + frame(2, 'err\n');
-        expect((await engine.runContainer(spec)).output).toBe('out\nerr\n');
-        log = 'a'.repeat(70 * 1024) + 'THE END';
-        const long = (await engine.runContainer(spec)).output;
-        expect(long.endsWith('THE END')).toBe(true);
-        expect(long.length).toBe(64 * 1024);
-      });
-
       // Review round 4 of 11B3a (mutation testing, G1 to G6): the time limits of their own, driven by a spy of
       // AbortSignal.timeout that hands out a controllable signal per call.
       function controlledTimeouts(): { limits: { ms: number; controller: AbortController }[]; restore: () => void } {
@@ -820,69 +806,132 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
         await expect(failingRemoval.engine.labelImage('img:1', {})).rejects.toThrow('invalid value');
       });
 
-      it('G2, G3, G4: the log of a run and its start have time limits; the removal has its own and never fails the run', async () => {
-        const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: {}, volumes: [] };
-        const { limits, restore } = controlledTimeouts();
-        try {
-          // G2: a log that does not end is cut by its own limit; the exit code stays, the container goes.
-          const { engine, requests } = fake((request) => {
-            if (request.path.startsWith('/containers/create')) return ok({ Id: 'r' }, 201);
-            if (request.path.endsWith('/wait')) return ok({ StatusCode: 4 });
-            if (request.path.includes('/logs')) return abortWith(request.signal);
-            return ok('', 204);
+      // Plan step 11G1 ("No extra containers"): the read of a file of an image, in place of runContainer.
+      describe('imageFile (plan step 11G1)', () => {
+        const PASSWD = Buffer.from('root:x:0:0:root:/root:/bin/sh\nvscode:x:1000:1000:Zoë Ünicode:/home/vscode:/bin/bash\n', 'utf8');
+        /** The archive answer as engineApi gives it with `latin1`: one character per byte. */
+        const archive = (bytes: Buffer, status = 200, truncated = false): EngineAnswer => ({ status, body: bytes.toString('latin1'), truncated });
+        function reading(answer: (request: EngineRequest) => EngineAnswer | Promise<EngineAnswer> | undefined) {
+          return fake((request) => {
+            if (request.path.startsWith('/containers/create')) return ok({ Id: 'read1' }, 201);
+            if (request.path.includes('/archive')) return answer(request);
+            if (request.method === 'DELETE') return ok('', 204);
+            return undefined;
           });
-          const running = engine.runContainer(spec);
-          await settle();
-          const log = requests.find((request) => request.path.includes('/logs'))!;
-          expect(limitOf(limits, log.signal)?.ms).toBe(60_000);
-          limitOf(limits, log.signal)!.controller.abort();
-          expect(await running).toEqual({ exitCode: 4, output: '', timedOut: false });
-          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/r?force=true&v=true' });
-          // G4: the removal has a time limit of its own, not aborted.
-          expect(limitOf(limits, requests.at(-1)?.signal)?.ms).toBe(60_000);
-          expect(requests.at(-1)?.signal?.aborted).toBe(false);
-        } finally {
-          restore();
         }
-        // G3: a start that does not answer is cut by the time limit of the run.
-        const hangingStart = fake((request) => {
-          if (request.path.startsWith('/containers/create')) return ok({ Id: 's' }, 201);
-          if (request.path.endsWith('/start')) return abortWith(request.signal);
-          return ok('', 204);
+
+        it('creates a container that never starts, reads the file through the archive endpoint as Latin-1, decodes it as UTF-8, and removes the container', async () => {
+          const { engine, requests } = reading(() => archive(tarOf('passwd', PASSWD)));
+          expect(await engine.imageFile('img:1', '/etc/passwd')).toBe(PASSWD.toString('utf8'));
+          expect(requests.map((request) => `${request.method} ${request.path.split('?')[0]}`)).toEqual([
+            'POST /containers/create',
+            'GET /containers/read1/archive',
+            'DELETE /containers/read1',
+          ]);
+          const [create, read, removal] = requests;
+          expect(create.path).toMatch(/^\/containers\/create\?name=devenv-read-[0-9a-f]{12}$/);
+          expect(create.json).toEqual({ Image: 'img:1', Cmd: ['true'], Entrypoint: [], Labels: {} });
+          expect(read.path).toBe('/containers/read1/archive?path=%2Fetc%2Fpasswd');
+          expect(read.latin1).toBe(true);
+          // No start: the container never runs.
+          expect(requests.some((request) => request.path.endsWith('/start'))).toBe(false);
+          expect(removal.path).toBe('/containers/read1?force=true&v=true');
+          expect(removal.signal?.aborted).toBe(false);
         });
-        expect(await hangingStart.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
-        expect(hangingStart.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/s?force=true&v=true' });
-        // G4: a cancel does not reach the removal; a removal that fails does not fail a run that succeeded.
-        const controller = new AbortController();
-        const cancelled = fake((request) => {
-          if (request.path.startsWith('/containers/create')) return ok({ Id: 'c' }, 201);
-          if (request.path.endsWith('/wait')) return abortWith(request.signal);
-          return ok('', 204);
+
+        it('answers undefined for a missing path (404), a link, a folder, a file over the bound, a truncated answer, and a malformed archive; the container goes each time', async () => {
+          const cases: EngineAnswer[] = [
+            ok({ message: 'Could not find the file /etc/passwd in container read1' }, 404),
+            archive(tarOf('passwd', Buffer.from('/usr/lib/passwd'), '2')),
+            archive(tarOf('passwd', Buffer.alloc(0), '1')),
+            archive(tarOf('passwd/', Buffer.alloc(0), '5')),
+            archive(tarOf('passwd', Buffer.alloc(MAX_IMAGE_FILE_BYTES + 1, 0x61))),
+            archive(tarOf('passwd', PASSWD), 200, true),
+            archive(tarOf('passwd', PASSWD).subarray(0, 520)),
+            archive(Buffer.from('not a tar archive')),
+            archive(tarOf('group', PASSWD)),
+          ];
+          for (const [index, answer] of cases.entries()) {
+            const { engine, requests } = reading(() => answer);
+            expect(await engine.imageFile('img:1', '/etc/passwd'), `case ${index}`).toBeUndefined();
+            expect(requests.at(-1), `case ${index}`).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          }
         });
-        const run = cancelled.engine.runContainer(spec, { signal: controller.signal });
-        await settle();
-        controller.abort();
-        await expect(run).rejects.toMatchObject({ name: 'AbortError' });
-        const removal = cancelled.requests.at(-1)!;
-        expect(removal).toMatchObject({ method: 'DELETE', path: '/containers/c?force=true&v=true' });
-        expect(removal.signal).toBeDefined();
-        expect(removal.signal).not.toBe(controller.signal);
-        expect(removal.signal?.aborted).toBe(false);
-        const failingRemoval = fake((request) => {
-          if (request.path.startsWith('/containers/create')) return ok({ Id: 'f' }, 201);
-          if (request.path.endsWith('/wait')) return ok({ StatusCode: 0 });
-          if (request.method === 'DELETE') throw new Error('engine gone');
-          return ok('', 204);
+
+        it('fails for a missing image and for other answers of the archive endpoint; the container goes after a failure', async () => {
+          const missing = fake((request) => (request.path.startsWith('/containers/create') ? ok({ message: 'No such image: img:1' }, 404) : undefined));
+          await expect(missing.engine.imageFile('img:1', '/etc/passwd')).rejects.toMatchObject({ status: 404, message: 'No such image: img:1' });
+          const failing = reading(() => ok({ message: 'the engine is busy' }, 500));
+          await expect(failing.engine.imageFile('img:1', '/etc/passwd')).rejects.toMatchObject({ status: 500 });
+          expect(failing.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          const broken = reading(() => {
+            throw new Error('socket hang up');
+          });
+          await expect(broken.engine.imageFile('img:1', '/etc/passwd')).rejects.toThrow('socket hang up');
+          expect(broken.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          // A removal that fails changes nothing of the answer.
+          const failingRemoval = fake((request) => {
+            if (request.path.startsWith('/containers/create')) return ok({ Id: 'read1' }, 201);
+            if (request.path.includes('/archive')) return archive(tarOf('passwd', PASSWD));
+            throw new Error('engine gone');
+          });
+          expect(await failingRemoval.engine.imageFile('img:1', '/etc/passwd')).toBe(PASSWD.toString('utf8'));
+          // A path that is no absolute path of a file is refused before any request.
+          const none = fake(() => undefined);
+          await expect(none.engine.imageFile('img:1', 'etc/passwd')).rejects.toThrow('no absolute path');
+          await expect(none.engine.imageFile('img:1', '/etc/')).rejects.toThrow('no absolute path');
+          expect(none.requests).toEqual([]);
         });
-        expect(await failingRemoval.engine.runContainer(spec)).toEqual({ exitCode: 0, output: '', timedOut: false });
-        // G6 (#21): a wait without a status code reads the log, for the reason.
-        const noCode = fake((request) => {
-          if (request.path.startsWith('/containers/create')) return ok({ Id: 'n' }, 201);
-          if (request.path.endsWith('/wait')) return ok({});
-          if (request.path.includes('/logs')) return ok('the reason');
-          return ok('', 204);
+
+        it('a cancel: never cancels the create, removes the container, and rejects with an AbortError', async () => {
+          const controller = new AbortController();
+          controller.abort();
+          const before = fake(() => undefined);
+          await expect(before.engine.imageFile('img:1', '/etc/passwd', controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+          expect(before.requests).toEqual([]);
+          const later = new AbortController();
+          const { engine, requests } = fake((request) => {
+            if (request.path.startsWith('/containers/create')) {
+              later.abort();
+              return ok({ Id: 'read2' }, 201);
+            }
+            if (request.method === 'DELETE') return ok('', 204);
+            return undefined;
+          });
+          await expect(engine.imageFile('img:1', '/etc/passwd', later.signal)).rejects.toMatchObject({ name: 'AbortError' });
+          const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+          expect(create.signal).not.toBe(later.signal);
+          expect(requests.some((request) => request.path.includes('/archive'))).toBe(false);
+          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read2?force=true&v=true' });
+          expect(requests.at(-1)?.signal?.aborted).toBe(false);
         });
-        expect(await noCode.engine.runContainer(spec)).toEqual({ exitCode: null, output: 'the reason', timedOut: false });
+
+        it('a create that does not answer in time is an EngineError, and its container is removed by its name', async () => {
+          const { limits, restore } = controlledTimeouts();
+          try {
+            const { engine, requests } = fake((request) => {
+              if (request.path.startsWith('/containers/create')) return abortWith(request.signal);
+              return ok('', 204);
+            });
+            const reading = engine.imageFile('img:1', '/etc/passwd');
+            await settle();
+            const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+            expect(limitOf(limits, create.signal)?.ms).toBe(60_000);
+            limitOf(limits, create.signal)!.controller.abort();
+            const error = await reading.catch((caught: unknown) => caught);
+            expect(error).toBeInstanceOf(EngineError);
+            expect(error).toMatchObject({ status: 0, message: expect.stringContaining('did not answer the create of a container for the read of /etc/passwd') });
+            const name = create.path.split('name=')[1];
+            expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+          } finally {
+            restore();
+          }
+          // A create whose answer has no ID: removed by its name.
+          const invalid = fake((request) => (request.path.startsWith('/containers/create') ? ok({ Id: '' }, 201) : ok('', 204)));
+          await expect(invalid.engine.imageFile('img:1', '/etc/passwd')).rejects.toThrow('invalid value');
+          const name = invalid.requests[0].path.split('name=')[1];
+          expect(invalid.requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+        });
       });
 
       it('B-R2-15: a pull prints a line that is no JSON, fails with the first error, and needs the secret of its login', async () => {
@@ -941,78 +990,15 @@ describe('the port of the engine over the Engine API (plan step 11B1)', () => {
       expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
     });
 
-    it('runs a container to its end: create, start, wait, the log only on a failure, the removal always', async () => {
-      let code = 0;
+    it('plan step 11G1: imageFile over the socket: the bytes of the archive keep their offsets (latin1), and the file is UTF-8', async () => {
+      const content = Buffer.from('root:x:0:0:root:/root:/bin/sh\nmüller:x:1000:1000:Jürgen Müller ✓:/home/müller:/bin/sh\n', 'utf8');
       const { engine, calls } = await serve((call) => {
-        if (call.url === '/containers/create') return { status: 201, json: { Id: 'run1' } };
-        if (call.url.endsWith('/wait')) return { status: 200, json: { StatusCode: code } };
-        if (call.url.includes('/logs')) return { status: 200, body: 'chown: denied' };
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'read3' } };
+        if (call.url.includes('/archive')) return { status: 200, raw: tarOf('passwd', content) };
         return { status: 204 };
       });
-      const spec = { image: 'img:1', entrypoint: 'sh', args: ['-c', 'x'], user: 'root', labels: { a: 'b' }, volumes: [{ name: 'v', target: '/workspaces' }] };
-      expect(await engine.runContainer(spec)).toEqual({ exitCode: 0, output: '', timedOut: false });
-      expect(JSON.parse(calls[0].body)).toEqual({
-        Image: 'img:1',
-        Entrypoint: ['sh'],
-        Cmd: ['-c', 'x'],
-        User: 'root',
-        Labels: { a: 'b' },
-        HostConfig: { Init: true, NetworkMode: 'none', Mounts: [{ Type: 'volume', Source: 'v', Target: '/workspaces' }] },
-      });
-      expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create', 'POST /containers/run1/start', 'POST /containers/run1/wait', 'DELETE /containers/run1?force=true&v=true']);
-      code = 2;
-      expect(await engine.runContainer(spec)).toEqual({ exitCode: 2, output: 'chown: denied', timedOut: false });
-      // Review round 1 of 11B3a (A-R1-8): only the end of the log is read.
-      expect(calls.find((call) => call.url.includes('/logs'))?.url).toBe('/containers/run1/logs?stdout=true&stderr=true&tail=200');
-      const hanging = await serve((call) => (call.url === '/containers/create' ? { status: 201, json: { Id: 'run2' } } : call.url.endsWith('/wait') ? undefined : { status: 204 }));
-      expect(await hanging.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
-      // Review round 1 of 11B3a (A-R1-1): with its anonymous volumes; the named volume of the workspace is kept by the engine.
-      expect(hanging.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/run2?force=true&v=true' });
-    });
-
-    it('the time limit of a run covers its create, ends with its wait, and a slow log keeps the exit code (review round 2 of 11B3a, A-R2-2, A-R2-4)', async () => {
-      // The create does not answer: the run ends at its limit; there is no container ID to remove (the caller removes it by label).
-      const slowCreate = await serve(() => undefined);
-      const spec = { image: 'img:1', entrypoint: 'sh', args: [], user: 'root', labels: { a: 'b' }, volumes: [] };
-      expect(await slowCreate.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: null, output: '', timedOut: true });
-      expect(slowCreate.calls.map((call) => `${call.method} ${call.url}`)).toEqual(['POST /containers/create']);
-      // The run fails and its log comes after the limit of the run: the exit code and the log are the answer.
-      const answerAfter = (ms: number, answer: EngineAnswer, signal?: AbortSignal): Promise<EngineAnswer> =>
-        new Promise((resolve, reject) => {
-          const timer = setTimeout(() => resolve(answer), ms);
-          signal?.addEventListener('abort', () => (clearTimeout(timer), reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
-        });
-      const requests: string[] = [];
-      const fakeApi: EngineApi = async (request) => {
-        requests.push(`${request.method} ${request.path}`);
-        if (request.path === '/containers/create') return { status: 201, body: JSON.stringify({ Id: 'run3' }), truncated: false };
-        if (request.path.endsWith('/wait')) return { status: 200, body: JSON.stringify({ StatusCode: 4 }), truncated: false };
-        if (request.path.includes('/logs')) return answerAfter(120, { status: 200, body: 'late reason', truncated: false }, request.signal);
-        return { status: 204, body: '', truncated: false };
-      };
-      const fake = dockerEngine(fakeApi, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
-      expect(await fake.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: 4, output: 'late reason', timedOut: false });
-      expect(requests.at(-1)).toBe('DELETE /containers/run3?force=true&v=true');
-      // A cancel of the operation ends the read of the log; the container is still removed.
-      const controller = new AbortController();
-      const cancelled = fake.runContainer(spec, { signal: controller.signal });
-      setTimeout(() => controller.abort(), 30);
-      await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
-      expect(requests.at(-1)).toBe('DELETE /containers/run3?force=true&v=true');
-      // A log read that throws (the connection broke) is no output either; the exit code stays.
-      const brokenLog = dockerEngine(async (request) => {
-        if (request.path.includes('/logs')) throw new Error('socket hang up');
-        return fakeApi(request);
-      }, engineHijack(path.join(os.tmpdir(), 'devenv-no-socket')));
-      expect(await brokenLog.runContainer(spec)).toEqual({ exitCode: 4, output: '', timedOut: false });
-      // A log that fails is no output; the exit code stays.
-      const failedLog = await serve((call) => {
-        if (call.url === '/containers/create') return { status: 201, json: { Id: 'run4' } };
-        if (call.url.endsWith('/wait')) return { status: 200, json: { StatusCode: 5 } };
-        if (call.url.includes('/logs')) return { status: 500, json: { message: 'busy' } };
-        return { status: 204 };
-      });
-      expect(await failedLog.engine.runContainer(spec, { timeoutMs: 50 })).toEqual({ exitCode: 5, output: '', timedOut: false });
+      expect(await engine.imageFile('img:1', '/etc/passwd')).toBe(content.toString('utf8'));
+      expect(calls.map((call) => `${call.method} ${call.url.split('?')[0]}`)).toEqual(['POST /containers/create', 'GET /containers/read3/archive', 'DELETE /containers/read3']);
     });
 
     it('never pulls a reference without a tag or a digest (review round 2 of 11B3a, A-R2-1)', async () => {

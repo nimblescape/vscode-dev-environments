@@ -53,6 +53,7 @@ import {
   type ServiceFolders,
 } from '../git/gitSummary';
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
+import type { UserIds } from '../docker/passwdUsers';
 import {
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
@@ -93,7 +94,6 @@ import {
 } from '../helper/containerGit';
 import { writeContainerToken } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
-import { channelStepLabel, newCleanupLabel } from '../helperChannel/protocol';
 import {
   DevcontainerCommandError,
   buildComposeOverrideConfig,
@@ -118,8 +118,6 @@ import {
   LABEL_COMPOSE_SERVICE,
   LABEL_CONFIG_PATH,
   LABEL_ENVIRONMENT_ID,
-  LABEL_CHANNEL_STEP,
-  LABEL_HELPER_RUN,
   LABEL_OWNER_ID,
   LABEL_REPOSITORY,
   LABEL_SERVICE_DATA,
@@ -127,7 +125,6 @@ import {
   SERVICE_DATA,
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
-  WORKSPACES_ROOT,
   composeProjectName,
   configurationFolder,
   configurationName,
@@ -300,8 +297,6 @@ export type EnvironmentDocker = Pick<
   ContainerAdapter,
   | 'isRunning'
   | 'imageConfig'
-  | 'runOnVolume'
-  | 'containerIdsWithLabel'
   | 'findContainer'
   | 'containerState'
   | 'imageLabels'
@@ -339,6 +334,12 @@ export type EnvironmentDocker = Pick<
     reference: string,
     options?: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials },
   ): Promise<void>;
+  /**
+   * Plan step 11G1 ("No extra containers"): the numeric user and group IDs of `user` in the image `image`, as `id -u` and
+   * `id -g` would print them in a container of it, read from its `/etc/passwd` without running anything
+   * (EngineDocker.imageUserIds). Undefined when they cannot be known that way.
+   */
+  imageUserIds(image: string, user: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<UserIds | undefined>;
 };
 
 /** The part of WorkspaceHelper that the service uses. */
@@ -358,6 +359,7 @@ export type EnvironmentHelper = Pick<
   | 'prepareGit'
   | 'createRepositoryFolders'
   | 'fixConfigOwnership'
+  | 'fixRepositoryOwnership'
 >;
 
 
@@ -5221,18 +5223,20 @@ export class EnvironmentService extends OperationBase {
   /**
    * Implementation notes 7 "Ownership", before the container exists: the helper clones as root, and the lifecycle
    * commands (run-user-commands after `up`) run onCreateCommand and postCreateCommand as the remote user in a new
-   * container. A command that writes to the repository (for example `npm install`) would fail, and with it the open. So the files get their owner first,
-   * in a short-lived container of the environment image, which knows the user. The fix after `up` (fixOwnership) stays
-   * for files that `up` itself creates as root. A failure is logged, it does not fail the pipeline.
-   * Assumption (V-10): the environment image has sh, id, find, and chown, and its label devcontainer.metadata names the
-   * remote user as the Dev Container CLI resolves it.
+   * container. A command that writes to the repository (for example `npm install`) would fail, and with it the open. So the files get their owner first.
+   * The fix after `up` (fixOwnership) stays for files that `up` itself creates as root. A failure is logged, it does not
+   * fail the pipeline. Plan step 11G1 ("No extra containers"): no container of the environment image runs for it any
+   * more. The numeric IDs of the remote user come from the `/etc/passwd` of the image (EnvironmentDocker.imageUserIds,
+   * read through the Engine API), and the fix runs as the step repositoryOwnershipFix of the batch helper of the open
+   * (WorkspaceHelper.fixRepositoryOwnership). IDs that cannot be read that way (no such entry, a link in place of the
+   * file, a user that only a name service knows) skip the fix: the fix after `up` gives the files their owner then.
+   * Assumption (V-10): the label devcontainer.metadata of the environment image names the remote user as the Dev
+   * Container CLI resolves it.
    */
   private async prepareOwnership(ctx: PipelineContext, image: string, runArgs: readonly string[]): Promise<void> {
     ctx.ownershipPrepared = true;
-    const { docker } = this.deps;
     const env = ctx.env;
     const folder = repositoryFolder(env.repository);
-    let cleanup: string | undefined;
     try {
       const user = await this.imageUser(ctx, image, runArgs);
       if (user === undefined) {
@@ -5241,7 +5245,15 @@ export class EnvironmentService extends OperationBase {
         return;
       }
       if (isRootUser(user)) return;
-      this.logger.info(`Giving the files in ${folder} to ${user} before the container is created.`);
+      // Plan step 11G1: the IDs from the /etc/passwd of the image, in place of `id -u` and `id -g` in a container of it.
+      const ids = await this.deps.docker.imageUserIds(image, user, { signal: ctx.signal, timeoutMs: IMAGE_INSPECT_TIMEOUT_MS });
+      if (ids === undefined) {
+        this.logger.info(`The user ${user} is not in /etc/passwd of ${image}: the files in ${folder} get their owner after the start.`);
+        return;
+      }
+      // Plan step 11G1: a user with the user ID of root needs no fix, as root itself.
+      if (ids.uid === '0') return;
+      this.logger.info(`Giving the files in ${folder} to ${user} (${ids.uid}:${ids.gid}) before the container is created.`);
       // Review round 9 (D9-1): after a new clone, no service has run on the files yet: every file gets its owner (also the
       // source folders that a service mounts). After a resumed clone, the paths of the services are left out. Review
       // round 12 (D12-1): on the path of a single container, runComposeUp has not computed them: from the facts
@@ -5250,42 +5262,26 @@ export class EnvironmentService extends OperationBase {
         const facts = await this.serviceFolderFacts(env, []);
         ctx.serviceFolders = facts.overflow ? 'repository' : facts.folders;
       }
-      const [shell, ...args] = ownershipFixCommand(folder, user, ctx.resumedClone === true ? ctx.serviceFolders : undefined);
-      // Review round 1 of PR #82 (A-R1-1): a cleanup label of its own (channelStepLabel with a new value), by which a
-      // cancel or a failure removes the container before anything removes the volume, and `--init`, so that a SIGTERM
-      // ends `sh` (as PID 1 it would ignore it) and the container does not keep the volume.
-      cleanup = newCleanupLabel();
-      await docker.runOnVolume(
-        {
-          image,
-          volume: env.volumeName,
-          target: WORKSPACES_ROOT,
-          entrypoint: shell,
-          args,
-          user: 'root',
-          labels: { [LABEL_HELPER_RUN]: 'true', [LABEL_CHANNEL_STEP]: cleanup },
-        },
-        { timeoutMs: OWNERSHIP_TIMEOUT_MS, signal: ctx.signal },
-      );
+      const serviceFolders = ctx.resumedClone === true ? ctx.serviceFolders : undefined;
+      const result = await this.deps.helper.fixRepositoryOwnership({
+        volumeName: env.volumeName,
+        repository: env.repository,
+        uid: ids.uid,
+        gid: ids.gid,
+        ...(serviceFolders !== undefined ? { serviceFolders } : {}),
+        timeoutMs: OWNERSHIP_TIMEOUT_MS,
+        image: ctx.helperImage,
+        signal: ctx.signal,
+      });
+      if (result.exitCode !== 0) {
+        this.logger.warn(`The owner of the files in ${folder} could not be changed before the container was created: ${(result.stderr || result.stdout).trim()}`);
+      }
     } catch (error) {
-      // Review round 1 of PR #82 (A-R1-1): the container of the run goes first (also after a cancel, before the error
-      // reaches removeFailedFirstOpen and its volume removal).
-      if (cleanup !== undefined) await this.removeOwnershipContainers(cleanup);
       if (this.isCancellation(error, ctx.signal)) throw error;
+      // Plan step 11G1: as in fixConfigOwnership, the refusal of the batch scope (D1) refuses the operation.
+      if (isBatchHelperUnavailable(error)) throw error;
       this.logger.warn(`The owner of the files in ${folder} could not be changed before the container was created: ${errorDetail(error)}`);
     }
-  }
-
-  /**
-   * Review round 1 of PR #82 (A-R1-1): `docker rm -f` of the containers of a prepareOwnership run, by its cleanup label
-   * (`docker ps -aq --no-trunc --filter label=…`). Without the signal of the operation, which may be aborted: under the
-   * lock, both calls go through the worker that holds it. Best effort: a failure is logged.
-   */
-  private async removeOwnershipContainers(cleanup: string): Promise<void> {
-    await this.quietly('remove the container of the ownership fix', async () => {
-      const listed = await this.deps.docker.containerIdsWithLabel(channelStepLabel(cleanup), { timeoutMs: IMAGE_INSPECT_TIMEOUT_MS });
-      for (const id of listed) await this.deps.docker.removeContainer(id);
-    });
   }
 
   /**

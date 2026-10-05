@@ -9,7 +9,8 @@
 // `vscode`.
 import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/bootstrapDocker';
-import type { ImageInspection, ImageNames, VolumeRun } from '../docker/containerAdapter';
+import type { ImageInspection, ImageNames } from '../docker/containerAdapter';
+import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../names';
@@ -105,17 +106,15 @@ export class EngineDocker implements EnvironmentDocker {
     return value.Config ?? null;
   }
 
-  async runOnVolume(p: VolumeRun, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<void> {
-    const result = await this.engine.runContainer(
-      { image: p.image, entrypoint: p.entrypoint, args: p.args, user: p.user, labels: p.labels, volumes: [{ name: p.volume, target: p.target }] },
-      options,
-    );
-    if (result.timedOut) throw new EngineError(`The container of ${p.image} on ${p.volume} did not end in time.`, 0);
-    if (result.exitCode !== 0) throw new EngineError(`The container of ${p.image} on ${p.volume} failed with exit code ${result.exitCode ?? 'none'}: ${result.output.trim().slice(-2000)}`, 0);
-  }
-
-  containerIdsWithLabel(label: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string[]> {
-    return this.call('the list of the containers', options.signal, (limited) => this.engine.containerIds({ label: [label] }, limited), options.timeoutMs);
+  /**
+   * Plan step 11G1 ("No extra containers"): the numeric user and group IDs of `user` in the image `image`, as `id -u` and
+   * `id -g` print them in a container of it, read from its `/etc/passwd` (DockerEngine.imageFile, which runs nothing)
+   * and resolved by passwdUserIds. Undefined when the file is missing, is no regular file, is too large, or names no
+   * such user. Within `timeoutMs` (DOCKER_QUERY_TIMEOUT_MS by default); a cancel of `signal` stays its AbortError.
+   */
+  async imageUserIds(image: string, user: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<UserIds | undefined> {
+    const passwd = await this.call(`the read of /etc/passwd of ${image}`, options.signal, (limited) => this.engine.imageFile(image, '/etc/passwd', limited), options.timeoutMs);
+    return passwd === undefined ? undefined : passwdUserIds(passwd, user);
   }
 
   private containersWithLabel(label: string, signal?: AbortSignal): Promise<EngineContainer[]> {

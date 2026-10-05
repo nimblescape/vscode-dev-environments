@@ -6,7 +6,7 @@
 // runs from checked inputs; an unknown kind, a key too many, a path out of the repository, and a refused variable are
 // refused; a command line is never taken from the request.
 import { describe, expect, it } from 'vitest';
-import { configOwnershipFixCommand } from '../git/gitSummary';
+import { MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_DEPTH, MAX_SERVICE_PATH_LENGTH, configOwnershipFixCommand, repositoryOwnershipFixCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, environmentIdLabel } from '../names';
 import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, isBatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
@@ -31,11 +31,13 @@ const FOLDER = '/workspaces/hello';
 const ID = 'env-1';
 
 describe('batchStepCommand (plan step 6, PR B)', () => {
-  it('knows exactly the twelve kinds of the plan', () => {
+  it('knows exactly the thirteen kinds of the plan', () => {
     // user decision 2026-10-02: Delete runs no Git: changed expectation, gitSummary is no kind any more (was in plan step
-    // 7: thirteen kinds with gitSummary, Delete's check), and the batch helper refuses it as unknown.
+    // 7: thirteen kinds with gitSummary, Delete's check), and the batch helper refuses it as unknown. Plan step 11G1:
+    // changed expectation, the kind repositoryOwnershipFix (the fix of the repository before the dev container is
+    // created) is new (was: twelve kinds).
     expect([...BATCH_STEP_KINDS].sort()).toEqual(
-      ['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up'],
+      ['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'repositoryOwnershipFix', 'runUserCommands', 'up'],
     );
     expect(isBatchStepKind('gitSummary')).toBe(false);
     expect(() => batchStepCommand('gitSummary', { repository: REPO })).toThrow(BatchStepError);
@@ -107,6 +109,8 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
         runUserCommands: { repository: REPO, override: {}, environmentId: ID, containerId: 'a'.repeat(64) },
         gitFiles: { repository: REPO, identity: { name: 'n', email: 'e' } },
         ownershipFix: { folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' },
+        // Plan step 11G1: the new kind, as root (no `owner`).
+        repositoryOwnershipFix: { repository: REPO, uid: '1000', gid: '1000' },
       };
       return batchStepCommand(kind, samples[kind]).owner !== undefined;
     });
@@ -171,6 +175,85 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
     });
     expect(batchStepCommand('ownershipFix', { folder: CONFIG_FOLDER, uid: '1000', gid: '1000' })).toEqual({ command: configOwnershipFixCommand(CONFIG_FOLDER, '1000', '1000'), env: {}, git: false });
+  });
+
+  describe('repositoryOwnershipFix (plan step 11G1)', () => {
+    const fix = (params: unknown) => batchStepCommand('repositoryOwnershipFix', params);
+
+    it('builds the fix of the repository folder with numeric IDs, as root, without a secret', () => {
+      expect(fix({ repository: REPO, uid: '1000', gid: '1001' })).toEqual({ command: repositoryOwnershipFixCommand(FOLDER, '1000', '1001'), env: {}, git: false });
+      expect(fix({ repository: REPO, uid: '0', gid: '4294967294' }).command).toEqual(repositoryOwnershipFixCommand(FOLDER, '0', '4294967294'));
+      const step = fix({ repository: REPO, uid: '1000', gid: '1000' });
+      expect(step.owner).toBeUndefined();
+      expect(step.secret).toBeUndefined();
+      expect(step.input).toBeUndefined();
+    });
+
+    it('takes the paths of the services as a list below the repository or `repository`, bounded as the pipeline bounds them', () => {
+      const pg = `${FOLDER}/pgdata`;
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: [pg, `${FOLDER}/cache dir`] }).command).toEqual(
+        repositoryOwnershipFixCommand(FOLDER, '1000', '1000', [pg, `${FOLDER}/cache dir`]),
+      );
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: [] }).command).toEqual(repositoryOwnershipFixCommand(FOLDER, '1000', '1000', []));
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: 'repository' }).command).toEqual(repositoryOwnershipFixCommand(FOLDER, '1000', '1000', 'repository'));
+      // boundServiceFolders: a duplicate and a path below another one go, `.git` is never left out, an overlong path is the
+      // overflow (`repository`).
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: [pg, pg, `${pg}/base`, `${FOLDER}/.git/x`] }).command).toEqual(
+        repositoryOwnershipFixCommand(FOLDER, '1000', '1000', [pg]),
+      );
+      const deep = `${FOLDER}/${Array.from({ length: MAX_SERVICE_PATH_DEPTH + 1 }, () => 'd').join('/')}`;
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: [deep] }).command).toEqual(repositoryOwnershipFixCommand(FOLDER, '1000', '1000', 'repository'));
+      const many = Array.from({ length: MAX_SERVICE_FOLDERS }, (_, i) => `${FOLDER}/data-${i}`);
+      expect(fix({ repository: REPO, uid: '1000', gid: '1000', serviceFolders: many }).command).toEqual(repositoryOwnershipFixCommand(FOLDER, '1000', '1000', many));
+    });
+
+    it('refuses a bad repository, bad IDs, bad paths of the services, and keys too many or missing', () => {
+      const ok = { repository: REPO, uid: '1000', gid: '1000' };
+      const bad: unknown[] = [
+        // The repository.
+        { ...ok, repository: '../x' },
+        { ...ok, repository: 'a/b/c' },
+        { ...ok, repository: '-a/b' },
+        { ...ok, repository: 'octo/..' },
+        { ...ok, repository: 7 },
+        { ...ok, repository: `octo/${'x'.repeat(300)}` },
+        // The IDs.
+        { ...ok, uid: 'vscode' },
+        { ...ok, uid: 1000 },
+        { ...ok, gid: '$(reboot)' },
+        { ...ok, uid: '-1' },
+        { ...ok, uid: '01000' },
+        { ...ok, gid: '4294967295' },
+        { ...ok, uid: '1000:1000' },
+        { ...ok, uid: '1'.repeat(17) },
+        // The paths of the services.
+        { ...ok, serviceFolders: 'all' },
+        { ...ok, serviceFolders: null },
+        { ...ok, serviceFolders: { folders: [] } },
+        { ...ok, serviceFolders: [7] },
+        { ...ok, serviceFolders: ['/workspaces/other/data'] },
+        { ...ok, serviceFolders: [FOLDER] },
+        { ...ok, serviceFolders: [`${FOLDER}/`] },
+        { ...ok, serviceFolders: [`${FOLDER}/../other`] },
+        { ...ok, serviceFolders: [`${FOLDER}/./x`] },
+        { ...ok, serviceFolders: [`${FOLDER}//x`] },
+        { ...ok, serviceFolders: ['data'] },
+        { ...ok, serviceFolders: [`${FOLDER}/a\nb`] },
+        { ...ok, serviceFolders: [`${FOLDER}/a\u0000b`] },
+        { ...ok, serviceFolders: [`${FOLDER}/a\u007fb`] },
+        { ...ok, serviceFolders: [`${FOLDER}/${'x'.repeat(MAX_SERVICE_PATH_LENGTH)}`] },
+        { ...ok, serviceFolders: Array.from({ length: MAX_SERVICE_FOLDERS + 1 }, (_, i) => `${FOLDER}/data-${i}`) },
+        // The keys.
+        { ...ok, folder: FOLDER },
+        { ...ok, command: ['sh', '-c', 'id'] },
+        { ...ok, user: 'vscode' },
+        { repository: REPO, uid: '1000' },
+        { uid: '1000', gid: '1000' },
+        null,
+        [REPO, '1000', '1000'],
+      ];
+      for (const params of bad) expect(() => fix(params), JSON.stringify(params)?.slice(0, 200)).toThrow(BatchStepError);
+    });
   });
 
   it('refuses an unknown kind and never takes a command line from the request', () => {

@@ -145,11 +145,13 @@ export interface DockerEngine {
    */
   labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<string>;
   /**
-   * Plan step 11B3: runs a container to its end and removes it (`docker run --rm`): no pull, no network, `--init`. Only
-   * the ownership fix before the create uses it (runOnVolume), until plan step 11G makes it a step of the batch helper.
-   * Answers its exit code and its output (both streams, bounded); `timeoutMs` ends and removes it.
+   * Plan step 11G1 (decision of 2026-10-03, no extra containers where the API suffices): the content of the regular file
+   * at the absolute path `path` of the image `image`, as UTF-8 text, read without running anything: a container is
+   * created from the image (never started), the file is read through `GET /containers/<id>/archive`, and the container is
+   * removed. Undefined when the path is missing, is no regular file (a link, a folder), or is larger than
+   * MAX_IMAGE_FILE_BYTES; rejects with an EngineError for a missing image and the other failures.
    */
-  runContainer(spec: EngineRun, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
+  imageFile(image: string, path: string, signal?: AbortSignal): Promise<string | undefined>;
   /** Plan step 11D2: the clock of the daemon (`GET /info`, its SystemTime as Docker writes it). */
   systemTime(signal?: AbortSignal): Promise<string>;
   /**
@@ -168,16 +170,8 @@ export interface DockerEngine {
   createAttached(spec: MonitorRunSpec, options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal }): Promise<MonitorCreated>;
 }
 
-/** Plan step 11B3: a container of runContainer. */
-export interface EngineRun {
-  image: string;
-  entrypoint: string;
-  args: readonly string[];
-  user: string;
-  labels: Record<string, string>;
-  /** Named volumes, each at its target. */
-  volumes: ReadonlyArray<{ name: string; target: string }>;
-}
+/** Plan step 11G1: the largest file that DockerEngine.imageFile reads (in bytes). */
+export const MAX_IMAGE_FILE_BYTES = 512 * 1024;
 
 /** A failure of the engine: its message, and the HTTP status that it answered with. */
 export class EngineError extends Error {

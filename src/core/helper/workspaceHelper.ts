@@ -12,7 +12,7 @@
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { DOCKER_QUERY_TIMEOUT_MS, type BootstrapDocker } from '../docker/bootstrapDocker';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
-import { configOwnershipFixCommand } from '../git/gitSummary';
+import { boundServiceFolders, configOwnershipFixCommand, repositoryOwnershipFixCommand, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
 import { WORKSPACES_ROOT, environmentIdLabel } from '../names';
 import { abortError, isAbortError, type RunResult } from '../ports';
@@ -799,6 +799,45 @@ export class WorkspaceHelper {
   }): Promise<RunResult> {
     return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
       batch: { kind: 'ownershipFix', params: { folder: p.folder, uid: p.uid, gid: p.gid } },
+      image: p.image,
+      timeoutMs: p.timeoutMs,
+      signal: p.signal,
+    });
+  }
+
+  /**
+   * Plan step 11G1 ("No extra containers"): gives the files of the repository folder of `repository` in the volume the
+   * owner `uid`:`gid` (numbers, read from the /etc/passwd of the environment image), except in the paths of the services
+   * `serviceFolders`, where only the files of root change: the step repositoryOwnershipFix of the batch helper, with
+   * NUMERIC_OWNERSHIP_FIX_SCRIPT, before the dev container is created (it replaced the short-lived container of the
+   * environment image). The paths are bounded as the pipeline bounds them (boundServiceFolders; an overflow is
+   * `'repository'`), so that the step's checks accept them. Throws for IDs that are not numbers
+   * (repositoryOwnershipFixCommand); returns the result also for a non-zero exit code.
+   */
+  async fixRepositoryOwnership(p: {
+    volumeName: string;
+    repository: string;
+    uid: string;
+    gid: string;
+    serviceFolders?: ServiceFolders;
+    timeoutMs?: number;
+    /** The helper image of the open (HelperImageUse). */
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<RunResult> {
+    const { name } = checkRepository(p.repository);
+    const folder = `${WORKSPACES_ROOT}/${name}`;
+    let serviceFolders: ServiceFolders | undefined = p.serviceFolders;
+    if (serviceFolders !== undefined && serviceFolders !== 'repository') {
+      const bounded = boundServiceFolders(folder, [serviceFolders]);
+      serviceFolders = bounded.overflow ? 'repository' : bounded.folders;
+    }
+    const command = repositoryOwnershipFixCommand(folder, p.uid, p.gid, serviceFolders);
+    return this.runStreams(p.volumeName, command, {
+      batch: {
+        kind: 'repositoryOwnershipFix',
+        params: { repository: p.repository, uid: p.uid, gid: p.gid, ...(serviceFolders === undefined ? {} : { serviceFolders: serviceFolders === 'repository' ? serviceFolders : [...serviceFolders] }) },
+      },
       image: p.image,
       timeoutMs: p.timeoutMs,
       signal: p.signal,

@@ -26,6 +26,12 @@ export interface EngineRequest {
   signal?: AbortSignal;
   /** The answer as it comes, instead of in `body`. */
   onChunk?: (text: string) => void;
+  /**
+   * Plan step 11G1: the answer decoded as Latin-1 instead of UTF-8, so that each character of `body` is one byte of the
+   * answer (`Buffer.from(body, 'latin1')` gives the bytes back): for a binary answer such as the tar archive of
+   * `GET /containers/<id>/archive`, whose offsets are byte offsets. MAX_ENGINE_ANSWER_CHARACTERS then counts bytes.
+   */
+  latin1?: boolean;
 }
 
 export interface EngineAnswer {
@@ -87,7 +93,7 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
         else resolve(answer!);
       };
       const req = http.request({ socketPath, method: request.method, path: request.path, headers }, (res) => {
-        res.setEncoding('utf8');
+        res.setEncoding(request.latin1 === true ? 'latin1' : 'utf8');
         let text = '';
         let truncated = false;
         res.on('data', (chunk: string) => {

@@ -32,8 +32,6 @@ import {
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
   LABEL_BUILD_RECORD,
-  LABEL_CHANNEL_STEP,
-  LABEL_HELPER_RUN,
   LABEL_COMPOSE_SERVICE,
   LABEL_CONTAINER_VERSION,
   LABEL_ENVIRONMENT_ID,
@@ -392,35 +390,33 @@ describe('open: first open', () => {
     h.helper.remoteUser = 'root';
     await h.service.open(TARGET, options());
     expect(h.docker.execs.some((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT)).toBe(false);
-    expect(h.docker.runs).toEqual([]);
+    // Plan step 11G1: changed expectation, no step repositoryOwnershipFix and no read of /etc/passwd (was: no `docker run`).
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.docker.userIdReads).toEqual([]);
     // Root gets the ~/.gitconfig too.
     expect(h.docker.execs.some((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT && e.command[4] === 'root')).toBe(true);
     expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.remoteUser).toBe('root');
   });
 
   it('gives the cloned files to the remote user before up runs the lifecycle commands', async () => {
-    let runsAtUp = -1;
-    const original = h.helper.up.bind(h.helper);
-    h.helper.up = async (p) => {
-      runsAtUp = h.docker.runs.length;
-      return original(p);
-    };
     await h.service.open(TARGET, options());
     const env = (await h.registry.findForAccount(REPO, ACCOUNT.id))!;
-    expect(h.docker.runs).toHaveLength(1);
-    expect(runsAtUp).toBe(1);
-    const run = h.docker.runs[0];
-    expect(run.image).toBe(environmentImageName(REPO, env.id, 1));
-    expect(run.all).toEqual(
-      expect.arrayContaining(['--rm', '--user', 'root', '--network', 'none', '--entrypoint', 'sh', `type=volume,source=${env.volumeName},target=/workspaces`]),
-    );
-    // Review round 1 of PR #82 (A-R1-1): `--init` and a cleanup label of its own (channelStepLabel, a new value per run).
-    expect(run.all).toContain('--init');
-    expect(run.all.filter((arg) => new RegExp(`^${LABEL_CHANNEL_STEP}=[0-9a-f]{24}$`).test(arg))).toHaveLength(1);
-    // Review round 2 of 11B3a (B-R2-13): the label of the helper runs.
-    expect(run.all).toContain(`${LABEL_HELPER_RUN}=true`);
-    expect(run.args[0]).toBe('-c');
-    expect(run.args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+    // Plan step 11G1: changed expectation, the IDs of the remote user come from the /etc/passwd of the environment image
+    // (EnvironmentDocker.imageUserIds), and the fix is the step repositoryOwnershipFix of the batch helper of the open,
+    // with the helper image of the open (was: a `docker run` of the environment image with `--init`, a cleanup label of
+    // its own, the label of the helper runs, and the user name for `id`).
+    expect(h.docker.userIdReads).toEqual([{ image: environmentImageName(REPO, env.id, 1), user: 'vscode' }]);
+    expect(h.helper.repositoryOwnershipFixes).toHaveLength(1);
+    const fix = h.helper.repositoryOwnershipFixes[0];
+    expect(fix).toMatchObject({ volumeName: env.volumeName, repository: REPO, uid: '1000', gid: '1000', upsBefore: 0 });
+    // A new clone: no service has run on the files yet, so no path of a service is left out.
+    expect(fix.serviceFolders).toBeUndefined();
+    expect(h.helper.helperImages.filter((entry) => entry.call === 'fixRepositoryOwnership')).toEqual([
+      { call: 'fixRepositoryOwnership', image: { tag: 'devenv-helper:test', id: h.helper.currentHelperImageId } },
+    ]);
+    // No container of the environment image runs for it.
+    expect(h.docker.log.filter((line) => line.startsWith('run '))).toEqual([]);
+    expect(h.logger.infos).toContain('Giving the files in /workspaces/api to vscode (1000:1000) before the container is created.');
     // The fix after up stays, for files that up itself creates as root.
     // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
     expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
@@ -430,10 +426,13 @@ describe('open: first open', () => {
   it('reads the image and runs the fix before up with their time limits and the signal of the open', async () => {
     const controller = new AbortController();
     await h.service.open(TARGET, options({ signal: controller.signal }));
-    const calls = h.docker.typedCalls.filter((call) => call.method !== 'containerIdsWithLabel');
+    const calls = h.docker.typedCalls;
     const signal = calls[0].options.signal;
     expect(signal).toBeInstanceOf(AbortSignal);
-    expect(calls.filter((call) => call.method === 'runOnVolume')).toEqual([{ method: 'runOnVolume', options: { timeoutMs: 10 * 60_000, signal } }]);
+    // Plan step 11G1: changed expectation, the read of /etc/passwd with the time limit of an image read, and the step of
+    // the batch helper with the time limit of the fix (was: the runOnVolume with the time limit of the fix).
+    expect(calls.filter((call) => call.method === 'imageUserIds')).toEqual([{ method: 'imageUserIds', options: { timeoutMs: 60_000, signal } }]);
+    expect(h.helper.repositoryOwnershipFixes.map((fix) => [fix.timeoutMs, fix.signal])).toEqual([[10 * 60_000, signal]]);
     const reads = calls.filter((call) => call.method === 'imageConfig');
     expect(reads.length).toBeGreaterThan(0);
     for (const read of reads) expect(read.options).toEqual({ timeoutMs: 60_000, signal });
@@ -453,8 +452,10 @@ describe('open: first open', () => {
     };
     await h.service.open(TARGET, options());
     expect(h.helper.ups[0].override.runArgs).toEqual(expect.arrayContaining(['--user', 'node:staff']));
-    expect(h.docker.runs).toHaveLength(1);
-    expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'node']);
+    // Plan step 11G1: changed expectation, the IDs of node from the /etc/passwd of the image (was: a `docker run` with
+    // the user name node).
+    expect(h.docker.userIdReads.map((read) => read.user)).toEqual(['node']);
+    expect(h.helper.repositoryOwnershipFixes.map((fix) => [fix.uid, fix.gid])).toEqual([['1001', '1001']]);
   });
 
   // hotfix review 2, P3: the CLI substitutes the label at `up` before it reads the remote user.
@@ -473,14 +474,17 @@ describe('open: first open', () => {
     it('gives the cloned files to the user that the CLI resolves before up', async () => {
       labelUser('${localEnv:DEVUSER:vscode}');
       await h.service.open(TARGET, options());
-      expect(h.docker.runs).toHaveLength(1);
-      expect(h.docker.runs[0].args.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+      // Plan step 11G1: changed expectation, the IDs of vscode in the step of the batch helper (was: a `docker run`).
+      expect(h.docker.userIdReads.map((read) => read.user)).toEqual(['vscode']);
+      expect(h.helper.repositoryOwnershipFixes.map((fix) => [fix.uid, fix.gid])).toEqual([['1000', '1000']]);
     });
 
     it('skips the fix before up when the user is not known, and gives the files to the user that up reports', async () => {
       labelUser('${localEnv:TERM:vscode}');
       await h.service.open(TARGET, options());
-      expect(h.docker.runs).toEqual([]);
+      // Plan step 11G1: changed expectation, no read of /etc/passwd and no step (was: no `docker run`).
+      expect(h.docker.userIdReads).toEqual([]);
+      expect(h.helper.repositoryOwnershipFixes).toEqual([]);
       expect(h.logger.infos.some((line) => line.includes('is not known before the container is created'))).toBe(true);
       // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
       expect(h.docker.execs.find(isOwnershipFix)?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
@@ -496,180 +500,101 @@ describe('open: first open', () => {
     });
   });
 
-  // Review round 1 of PR #82 (A-R1-1): a cancel during the fix before up removes its container by its cleanup label
-  // before the failed first open removes the volume, so the volume is not kept in use and nothing is left behind.
-  it('removes the container of the fix before up by its cleanup label when the open is cancelled during it', async () => {
+  // Plan step 11G1: replaces the tests of the removal of the container of the fix before up by its cleanup label (review
+  // round 1 of PR #82, A-R1-1, and review rounds 2 and 4 of PR #82): the fix is a step of the batch helper of the open,
+  // so no container of the environment image is left to remove. A cancel during the step cancels the open, and the
+  // failed first open removes its volume.
+  it('plan step 11G1: a cancel during the fix before up cancels the open, and the failed first open removes its volume', async () => {
     const controller = new AbortController();
-    const runChecked = h.docker.runChecked.bind(h.docker);
-    const removeContainer = h.docker.removeContainer.bind(h.docker);
-    let label: string | undefined;
-    h.docker.runChecked = async (args: readonly string[]): Promise<string> => {
-      if (args[0] === 'run') {
-        await runChecked(args);
-        label = args.find((arg) => arg.startsWith(`${LABEL_CHANNEL_STEP}=`));
-        // The CLI was killed, but the container (PID 1 sh) still holds the volume.
-        h.docker.volumesInUse.add(args.find((arg) => arg.startsWith('type=volume,source='))!.split(',')[1].slice('source='.length));
-        controller.abort();
-        throw abortError();
-      }
-      if (args[0] === 'ps' && label !== undefined && args.includes(`label=${label}`)) {
-        h.docker.log.push(args.join(' '));
-        return 'ownership-container\n';
-      }
-      return runChecked(args);
-    };
-    h.docker.removeContainer = async (nameOrId: string): Promise<void> => {
-      if (nameOrId === 'ownership-container') h.docker.volumesInUse.clear();
-      return removeContainer(nameOrId);
-    };
+    h.helper.onRepositoryOwnershipFix = () => controller.abort();
     const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
     expect(error.code).toBe('cancelled');
-    expect(label).toBeDefined();
-    const listed = h.docker.log.indexOf(`ps -aq --no-trunc --filter label=${label}`);
-    const removed = h.docker.log.indexOf('rm ownership-container');
-    const volumeRemoved = h.docker.log.findIndex((line) => line.startsWith('volume rm '));
-    expect(listed).toBeGreaterThanOrEqual(0);
-    expect(removed).toBeGreaterThan(listed);
-    expect(volumeRemoved).toBeGreaterThan(removed);
-    // Review round 2 of 11B3a (B-R2-12): the list of the cleanup has a time limit and never the aborted signal of the open.
-    expect(h.docker.typedCalls.filter((call) => call.method === 'containerIdsWithLabel')).toEqual([{ method: 'containerIdsWithLabel', options: { timeoutMs: 60_000 } }]);
+    expect(h.helper.repositoryOwnershipFixes).toHaveLength(1);
+    expect(h.helper.ups).toEqual([]);
+    expect(h.logger.warnings.filter((w) => w.includes('could not be changed before the container was created'))).toEqual([]);
     expect(await h.registry.list()).toEqual([]);
     expect(h.docker.volumes.size).toBe(0);
   });
 
-  it('continues when the files cannot be given to the remote user before up', async () => {
-    h.docker.runError = new CommandError('docker run', 1, '', 'sh: find: not found');
-    await h.service.open(TARGET, options());
-    expect(h.docker.runs).toHaveLength(1);
-    expect(h.helper.ups).toHaveLength(1);
-    expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created'))).toBe(true);
+  it('plan step 11G1: a cancel during the read of /etc/passwd cancels the open before the fix', async () => {
+    const controller = new AbortController();
+    const imageUserIds = h.docker.imageUserIds.bind(h.docker);
+    h.docker.imageUserIds = async (image, user, readOptions) => {
+      controller.abort();
+      return imageUserIds(image, user, readOptions);
+    };
+    const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
+    expect(error.code).toBe('cancelled');
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.docker.volumes.size).toBe(0);
   });
 
-  // Review round 2 of PR #82 (B-R2-1, B-R2-3): the removal of the container of the fix before up, with a `ps` and an
-  // `rm` that take time and refuse an aborted signal, as the real round trips to the worker under the lock do.
-  describe('the removal of the container of the fix before up (review round 2 of PR #82)', () => {
-    function deferred(): { promise: Promise<void>; resolve: () => void } {
-      let resolve!: () => void;
-      const promise = new Promise<void>((r) => (resolve = r));
-      return { promise, resolve };
-    }
+  it('continues when the files cannot be given to the remote user before up', async () => {
+    // Plan step 11G1: changed expectation, the step of the batch helper fails (was: the `docker run` failed).
+    h.helper.repositoryOwnershipResult = { exitCode: 1, stderr: 'sh: find: not found' };
+    await h.service.open(TARGET, options());
+    expect(h.helper.repositoryOwnershipFixes).toHaveLength(1);
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created: sh: find: not found'))).toBe(true);
+  });
 
-    /** One turn of the event loop (no timer). */
-    const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+  it('plan step 11G1: continues when the step of the fix before up throws, or the read of /etc/passwd fails', async () => {
+    h.helper.repositoryOwnershipResult = new Error('The step repositoryOwnershipFix of the batch helper did not end within 600 seconds.');
+    await h.service.open(TARGET, options());
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created') && w.includes('did not end within 600 seconds'))).toBe(true);
+    // The fix after up still gives the files their owner.
+    expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
+  });
 
-    /**
-     * The `run` of the fix fails (a cancel when `controller` is given, else `runError`) and leaves its container, which
-     * holds the volume; the `ps` of its cleanup label waits on `listGate` and fails with `listError` when given; `ps`
-     * and `rm` reject with an AbortError when their signal is aborted. Review round 4 of PR #82 (B-R4-1): the `rm` of the
-     * container calls `removing` and settles only after `removeGate`.
-     */
-    function fakeFix(p: {
-      controller?: AbortController;
-      listGate?: Promise<void>;
-      listed?: () => void;
-      listError?: Error;
-      removing?: () => void;
-      removeGate?: Promise<void>;
-    }): { label: () => string | undefined } {
-      const runChecked = h.docker.runChecked.bind(h.docker);
-      const removeContainer = h.docker.removeContainer.bind(h.docker);
-      let label: string | undefined;
-      h.docker.runChecked = async (args: readonly string[], options?: { signal?: AbortSignal }): Promise<string> => {
-        if (args[0] === 'run') {
-          await runChecked(args);
-          label = args.find((arg) => arg.startsWith(`${LABEL_CHANNEL_STEP}=`));
-          h.docker.volumesInUse.add(args.find((arg) => arg.startsWith('type=volume,source='))!.split(',')[1].slice('source='.length));
-          if (p.controller === undefined) throw new CommandError('docker run', 1, '', 'sh: find: not found');
-          p.controller.abort();
-          throw abortError();
-        }
-        if (args[0] === 'ps' && label !== undefined && args.includes(`label=${label}`)) {
-          p.listed?.();
-          if (options?.signal?.aborted) throw abortError();
-          await p.listGate;
-          if (options?.signal?.aborted) throw abortError();
-          h.docker.log.push(args.join(' '));
-          if (p.listError !== undefined) throw p.listError;
-          return 'ownership-container\n';
-        }
-        return runChecked(args);
-      };
-      h.docker.removeContainer = async (nameOrId: string, options?: { signal?: AbortSignal }): Promise<void> => {
-        if (options?.signal?.aborted) throw abortError();
-        if (nameOrId === 'ownership-container') {
-          p.removing?.();
-          await p.removeGate;
-          h.docker.volumesInUse.clear();
-        }
-        return removeContainer(nameOrId);
-      };
-      return { label: () => label };
-    }
+  it('plan step 11G1: a failed read of /etc/passwd is logged, and the open continues without the fix before up', async () => {
+    h.docker.imageUserIdsError = new Error('The engine did not answer the read of /etc/passwd of the image within 60 s.');
+    await h.service.open(TARGET, options());
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
+    expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created') && w.includes('did not answer the read of /etc/passwd'))).toBe(true);
+    expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
+  });
 
-    // Review round 4 of PR #82, B-R4-1: the removal of the ownership container is awaited before the volume goes (the
-    // `await` of removeContainer in removeOwnershipContainers); without it, the volume removal would start while the
-    // container that holds the volume is still being removed.
-    it('review round 4 of PR #82, B-R4-1: a cancel removes the volume only after the removal of the ownership container resolved', async () => {
-      const controller = new AbortController();
-      const removing = deferred();
-      const removal = deferred();
-      fakeFix({ controller, removing: removing.resolve, removeGate: removal.promise });
-      let containerRemoved = false;
-      const volumeRemovals: string[] = [];
-      const removeVolume = h.docker.removeVolume.bind(h.docker);
-      h.docker.removeVolume = async (name: string): Promise<void> => {
-        volumeRemovals.push(containerRemoved ? 'after the container' : 'while the container is removed');
-        return removeVolume(name);
-      };
-      const run = rejection(h.service.open(TARGET, options({ signal: controller.signal })));
-      await removing.promise;
-      for (let i = 0; i < 5; i += 1) await turn();
-      expect(volumeRemovals).toEqual([]);
-      containerRemoved = true;
-      removal.resolve();
-      const error = await run;
-      expect(error.code).toBe('cancelled');
-      expect(volumeRemovals.length).toBeGreaterThan(0);
-      expect(volumeRemovals.every((when) => when === 'after the container')).toBe(true);
-      expect(h.docker.volumes.size).toBe(0);
-    });
+  it('plan step 11G1: a user that /etc/passwd of the image does not name skips the fix before up; the fix after up gives the files their owner', async () => {
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      // No entry of vscode (for example a user that only a name service knows).
+      h.docker.passwd.set(p.imageName, 'root:x:0:0:root:/root:/bin/sh\n');
+      return result;
+    };
+    await h.service.open(TARGET, options());
+    expect(h.docker.userIdReads.map((read) => read.user)).toEqual(['vscode']);
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.logger.infos.some((line) => line.includes('The user vscode is not in /etc/passwd of') && line.includes('get their owner after the start'))).toBe(true);
+    expect(h.logger.warnings.filter((w) => w.includes('could not be changed'))).toEqual([]);
+    expect(h.docker.execs.find(isOwnershipFix)?.command.slice(-2)).toEqual(['/workspaces/api', 'vscode']);
+  });
 
-    it('review round 2 of PR #82, B-R2-1: a cancel removes the volume only after the removal of the container settled, and the removal runs without the aborted signal', async () => {
-      const controller = new AbortController();
-      const listing = deferred();
-      const gate = deferred();
-      const fix = fakeFix({ controller, listGate: gate.promise, listed: listing.resolve });
-      const run = rejection(h.service.open(TARGET, options({ signal: controller.signal })));
-      await listing.promise;
-      await turn();
-      expect(h.docker.log.some((line) => line.startsWith('volume rm '))).toBe(false);
-      gate.resolve();
-      const error = await run;
-      expect(error.code).toBe('cancelled');
-      const removed = h.docker.log.indexOf('rm ownership-container');
-      const volumeRemoved = h.docker.log.findIndex((line) => line.startsWith('volume rm '));
-      expect(h.docker.log.indexOf(`ps -aq --no-trunc --filter label=${fix.label()}`)).toBeGreaterThanOrEqual(0);
-      expect(removed).toBeGreaterThanOrEqual(0);
-      expect(volumeRemoved).toBeGreaterThan(removed);
-      expect(await h.registry.list()).toEqual([]);
-      expect(h.docker.volumes.size).toBe(0);
-    });
+  it('plan step 11G1: an image without a /etc/passwd that counts skips the fix before up', async () => {
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      h.docker.passwd.set(p.imageName, null);
+      return result;
+    };
+    await h.service.open(TARGET, options());
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
+  });
 
-    it('review round 2 of PR #82, B-R2-3: a failed removal after a cancel is logged; the open is still cancelled', async () => {
-      const controller = new AbortController();
-      fakeFix({ controller, listError: new CommandError('docker ps', 1, '', 'the worker was lost') });
-      const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
-      expect(error.code).toBe('cancelled');
-      expect(h.logger.warnings.some((w) => w.includes('Could not remove the container of the ownership fix'))).toBe(true);
-    });
-
-    it('review round 2 of PR #82, B-R2-3: a failed removal after a failed fix is logged; the open continues', async () => {
-      fakeFix({ listError: new CommandError('docker ps', 1, '', 'the worker was lost') });
-      await h.service.open(TARGET, options());
-      expect(h.helper.ups).toHaveLength(1);
-      expect(h.logger.warnings.some((w) => w.includes('could not be changed before the container was created'))).toBe(true);
-      expect(h.logger.warnings.some((w) => w.includes('Could not remove the container of the ownership fix'))).toBe(true);
-    });
+  it('plan step 11G1: a remote user with the user ID of root needs no fix before up', async () => {
+    const build = h.helper.build.bind(h.helper);
+    h.helper.build = async (p) => {
+      const result = await build(p);
+      h.docker.passwd.set(p.imageName, 'root:x:0:0:root:/root:/bin/sh\nvscode:x:0:0::/home/vscode:/bin/bash\n');
+      return result;
+    };
+    await h.service.open(TARGET, options());
+    expect(h.docker.userIdReads.map((read) => read.user)).toEqual(['vscode']);
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
+    expect(h.helper.ups).toHaveLength(1);
   });
 
   it('uses the environment that another window of the account created in the meantime (one per repository and account)', async () => {
@@ -836,8 +761,9 @@ describe('open: existing environment', () => {
     expect(await pendingIds()).toEqual([ENV_ID]);
     expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
     expect(h.helper.silentlyCreatedVolumes).toEqual([]);
-    // Nothing was cloned: no ownership fix before up.
-    expect(h.docker.runs).toEqual([]);
+    // Nothing was cloned: no ownership fix before up. Plan step 11G1: changed expectation, no step repositoryOwnershipFix
+    // (was: no `docker run`).
+    expect(h.helper.repositoryOwnershipFixes).toEqual([]);
   });
 
   it('keeps the pending connection file fresh while a long step runs', async () => {
@@ -1143,7 +1069,10 @@ describe('open: existing environment', () => {
       expect(h.docker.volumes.get(NAME)).toEqual({ [LABEL_ENVIRONMENT_ID]: ENV_ID, [LABEL_REPOSITORY]: REPO, [LABEL_OWNER_ID]: ACCOUNT.id });
       expect(h.helper.clones).toEqual([{ volumeName: NAME, repository: REPO, branch: 'main', token: TOKEN }]);
       expect(h.helper.calls).toContain(`up ${IMAGE_1}`);
-      expect(h.docker.runs.map((run) => run.image)).toEqual([IMAGE_1]);
+      // Plan step 11G1: changed expectation, the IDs come from the /etc/passwd of IMAGE_1 and the fix is a step of the
+      // batch helper (was: a `docker run` of IMAGE_1).
+      expect(h.docker.userIdReads.map((read) => read.image)).toEqual([IMAGE_1]);
+      expect(h.helper.repositoryOwnershipFixes).toHaveLength(1);
       // Lifecycle token (user decision 2026-09-27): the token write (also as root) now comes before the ownership fix after up.
       expect(h.docker.execs.some(isOwnershipFix)).toBe(true);
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 0, stashes: 0 });
@@ -3460,10 +3389,11 @@ describe('open: existing environment', () => {
       const pg = `/workspaces/${REPO.split('/')[1]}/pgdata`;
       await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate, serviceFolders: [pg] } });
       await h.service.open(TARGET, options());
-      const before = h.docker.runs.find((run) => run.args[0] === '-c');
+      // Plan step 11G1: changed expectation, the paths of the services are a parameter of the step repositoryOwnershipFix
+      // (was: the arguments of a `docker run`; the step builds the same arguments, servicePathArguments).
+      const before = h.helper.repositoryOwnershipFixes[0];
       expect(before).toBeDefined();
-      expect(before!.args).toContain(pg);
-      expect(before!.args).toContain(`${pg}/*`);
+      expect(before.serviceFolders).toEqual([pg]);
     });
 
     it('fixes only the files of root before up of a resumed clone of a single container when the recorded paths overflowed (review round 1 of PR #81, B-R1-1)', async () => {
@@ -3473,10 +3403,11 @@ describe('open: existing environment', () => {
       const pg = `${repo}/pgdata`;
       await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate, serviceFolders: [pg], serviceFoldersOverflow: true } });
       await h.service.open(TARGET, options());
-      const before = h.docker.runs.find((run) => run.args[0] === '-c');
+      // Plan step 11G1: changed expectation, the overflow is the parameter `'repository'` of the step (was: the arguments
+      // `-path <repo> -o -path <repo>/*` of a `docker run`; the step builds them, servicePathArguments).
+      const before = h.helper.repositoryOwnershipFixes[0];
       expect(before).toBeDefined();
-      expect(before!.args.slice(-5)).toEqual(['-path', repo, '-o', '-path', `${repo}/*`]);
-      expect(before!.args).not.toContain(pg);
+      expect(before.serviceFolders).toBe('repository');
     });
 
     it('restores the mark of the ended window when the resumed clone is cancelled', async () => {
@@ -5679,7 +5610,8 @@ describe('host access policy in the pipeline (concept section 9 "Host access")',
       await h.service.openEnvironment(ENV_ID, options());
       expect(h.helper.ups.map((u) => [u.image, u.removeExistingContainer])).toEqual([[IMAGE_1, false]]);
       expect(h.docker.containersOf(ENV_ID).map((c) => c.image)).toEqual([IMAGE_1]);
-      expect(h.docker.runs).toEqual([]);
+      // Plan step 11G1: changed expectation, no step repositoryOwnershipFix (was: no `docker run`).
+      expect(h.helper.repositoryOwnershipFixes).toEqual([]);
       expect(h.ui.warnings).toEqual([REFUSED]);
       expect(h.docker.images.has(IMAGE_2)).toBe(false);
 

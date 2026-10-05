@@ -13,6 +13,7 @@ import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { IMAGE_INSPECT_BATCH, MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID } from '../names';
+import { passwdUserIds, type UserIds } from './passwdUsers';
 import {
   abortError,
   isAbortError,
@@ -661,6 +662,17 @@ export class ContainerAdapter extends BootstrapDocker {
    */
   async runOnVolume(p: VolumeRun, options: Pick<RunOptions, 'timeoutMs' | 'signal'> = {}): Promise<void> {
     await this.runChecked(volumeRunArgs(p), options);
+  }
+
+  /**
+   * Plan step 11G1: the numeric user and group IDs of `user` in the image `image`, from its `/etc/passwd`
+   * (passwdUserIds), or undefined when they cannot be read. This adapter serves only the Docker tests of the pipeline
+   * until plan step 11I removes it; it reads the file with a short-lived `docker run` (`cat`, which follows a link),
+   * where the worker's EngineDocker reads it through the Engine API without running anything.
+   */
+  async imageUserIds(image: string, user: string, options: Pick<RunOptions, 'timeoutMs' | 'signal'> = {}): Promise<UserIds | undefined> {
+    const result = await this.run(['run', '--rm', '--pull', 'never', '--network', 'none', '--user', 'root', '--entrypoint', 'cat', image, '/etc/passwd'], options);
+    return result.exitCode === 0 ? passwdUserIds(result.stdout, user) : undefined;
   }
 
   /** Plan step 11B3: the full IDs of the containers with the label `label` (`key=value`), stopped ones included. */

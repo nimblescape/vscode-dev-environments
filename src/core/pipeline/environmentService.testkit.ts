@@ -12,9 +12,10 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { EXISTING_PATHS_SCRIPT } from '../git/gitSummary';
+import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
+import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
-import { isDevContainer, volumeRunArgs, type VolumeRun, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
 import { CommandError, UserFacingError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -120,6 +121,14 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
 // ---------------------------------------------------------------------------------------------------------------------
 // Docker
 
+/** Plan step 11G1: the `/etc/passwd` of the images of the tests (FakeDocker.imageUserIds): root, vscode and node. */
+export const DEFAULT_PASSWD = [
+  'root:x:0:0:root:/root:/bin/sh',
+  'vscode:x:1000:1000::/home/vscode:/bin/bash',
+  'node:x:1001:1001::/home/node:/bin/sh',
+  '',
+].join('\n');
+
 export class FakeDocker implements EnvironmentDocker {
   running = true;
   readonly containers = new Map<string, ContainerInfo>();
@@ -148,9 +157,15 @@ export class FakeDocker implements EnvironmentDocker {
   readonly volumeInspections: string[][] = [];
   /** `Config` of `docker image inspect` per image. Default: no labels, no user. */
   readonly imageConfigs = new Map<string, { User?: string; Env?: string[]; Labels?: Record<string, string> }>();
-  /** `docker run` calls: the image and the arguments after it. */
-  readonly runs: Array<{ image: string; args: readonly string[]; all: readonly string[] }> = [];
-  runError: Maybe<Error>;
+  /**
+   * Plan step 11G1: the `/etc/passwd` of each image that imageUserIds reads (default DEFAULT_PASSWD); `null`: the image has
+   * none that counts (missing, a link, too large).
+   */
+  readonly passwd = new Map<string, string | null>();
+  /** Plan step 11G1: each imageUserIds, with the image and the user. */
+  readonly userIdReads: Array<{ image: string; user: string }> = [];
+  /** Plan step 11G1: imageUserIds rejects with it (a failure of the engine, or an AbortError). */
+  imageUserIdsError: Maybe<Error>;
   /** The API version of the Docker Engine (engineApiVersion). `undefined`: the engine does not tell it. */
   apiVersion: string | undefined = '1.48';
   /** Networks by name, with their labels (Docker Compose creates them for a project). */
@@ -227,15 +242,6 @@ export class FakeDocker implements EnvironmentDocker {
       if (name === undefined) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
       return `${JSON.stringify(this.imageConfigs.get(name) ?? { User: '', Labels: {} })}\n`;
     }
-    if (args[0] === 'run') {
-      const index = args.indexOf('--mount') + 2;
-      const image = args[index];
-      this.log.push(`run ${image}`);
-      this.runs.push({ image, args: args.slice(index + 1), all: args });
-      if (!this.images.has(image)) throw new CommandError('docker run', 125, '', `Unable to find image '${image}' locally`);
-      if (this.runError) throw this.runError;
-      return '';
-    }
     this.log.push(args.join(' '));
     if (args[0] === 'start') {
       const container = this.containerByRef(args[1]);
@@ -247,10 +253,11 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   /**
-   * Review round 2 of 11B3a (B-R2-12): the options of the typed calls of the ownership fix (imageConfig, runOnVolume,
-   * containerIdsWithLabel), in order; they also reach runChecked, as they reach the Docker CLI in ContainerAdapter.
+   * Review round 2 of 11B3a (B-R2-12): the options of the typed calls of the ownership fix before up (imageConfig; plan
+   * step 11G1: imageUserIds in place of runOnVolume and containerIdsWithLabel), in order; imageConfig also reaches
+   * runChecked, as it reaches the Docker CLI in ContainerAdapter.
    */
-  readonly typedCalls: { method: 'imageConfig' | 'runOnVolume' | 'containerIdsWithLabel'; options: { signal?: AbortSignal; timeoutMs?: number } }[] = [];
+  readonly typedCalls: { method: 'imageConfig' | 'imageUserIds'; options: { signal?: AbortSignal; timeoutMs?: number } }[] = [];
 
   /** Plan step 11B3: like ContainerAdapter.imageConfig (the `image inspect` of runChecked). */
   async imageConfig(reference: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<unknown> {
@@ -258,18 +265,18 @@ export class FakeDocker implements EnvironmentDocker {
     return JSON.parse((await this.runChecked(['image', 'inspect', '--format', '{{json .Config}}', reference], options)).trim()) as unknown;
   }
 
-  /** Plan step 11B3: like ContainerAdapter.runOnVolume (the `run` of runChecked, with the same arguments). */
-  async runOnVolume(p: VolumeRun, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
-    this.typedCalls.push({ method: 'runOnVolume', options });
-    await this.runChecked(volumeRunArgs(p), options);
-  }
-
-  /** Plan step 11B3: like ContainerAdapter.containerIdsWithLabel. */
-  async containerIdsWithLabel(label: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string[]> {
-    this.typedCalls.push({ method: 'containerIdsWithLabel', options });
-    // As ContainerAdapter: the `ps` of runChecked, so that the tests that answer it keep doing so.
-    const listed = await this.runChecked(['ps', '-aq', '--no-trunc', '--filter', `label=${label}`], options);
-    return listed.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  /**
+   * Plan step 11G1: like EngineDocker.imageUserIds: the IDs of `user` in the `/etc/passwd` of the image (`passwd`, else
+   * DEFAULT_PASSWD), resolved by passwdUserIds. A missing image fails as the engine fails the create of its container.
+   */
+  async imageUserIds(image: string, user: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<UserIds | undefined> {
+    this.typedCalls.push({ method: 'imageUserIds', options });
+    this.userIdReads.push({ image, user });
+    if (options.signal?.aborted) throw abortError();
+    if (this.imageUserIdsError) throw this.imageUserIdsError;
+    if (this.imageNamed(image) === undefined) throw new Error(`No such image: ${image}`);
+    const passwd = this.passwd.has(image) ? this.passwd.get(image) : DEFAULT_PASSWD;
+    return passwd === null || passwd === undefined ? undefined : passwdUserIds(passwd, user);
   }
 
   /** Plan step 10A: like ContainerAdapter.startContainer (recorded as the `start` of runChecked). */
@@ -1196,6 +1203,53 @@ export class FakeHelper implements EnvironmentHelper {
   readonly configOwnershipFixes: Array<{ volumeName: string; folder: string; uid: string; gid: string }> = [];
   /** Result of fixConfigOwnership (an Error is thrown). */
   configOwnershipResult: Partial<RunResult> | Error = {};
+
+  /**
+   * Plan step 11G1: each fixRepositoryOwnership (the fix of the repository folder before up, a step of the batch helper),
+   * with the number of `up` calls before it.
+   */
+  readonly repositoryOwnershipFixes: Array<{
+    volumeName: string;
+    repository: string;
+    uid: string;
+    gid: string;
+    serviceFolders?: ServiceFolders;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    upsBefore: number;
+  }> = [];
+  /** Plan step 11G1: result of fixRepositoryOwnership (an Error is thrown). */
+  repositoryOwnershipResult: Partial<RunResult> | Error = {};
+  /** Plan step 11G1: runs when fixRepositoryOwnership starts (for a cancel during the step). */
+  onRepositoryOwnershipFix: (() => void) | undefined;
+
+  async fixRepositoryOwnership(p: {
+    volumeName: string;
+    repository: string;
+    uid: string;
+    gid: string;
+    serviceFolders?: ServiceFolders;
+    timeoutMs?: number;
+    image?: HelperImageUse;
+    signal?: AbortSignal;
+  }): Promise<RunResult> {
+    this.usedImage('fixRepositoryOwnership', p.image);
+    this.mount(p.volumeName);
+    this.repositoryOwnershipFixes.push({
+      volumeName: p.volumeName,
+      repository: p.repository,
+      uid: p.uid,
+      gid: p.gid,
+      ...(p.serviceFolders !== undefined ? { serviceFolders: p.serviceFolders } : {}),
+      timeoutMs: p.timeoutMs,
+      signal: p.signal,
+      upsBefore: this.ups.length,
+    });
+    this.onRepositoryOwnershipFix?.();
+    if (p.signal?.aborted) throw abortError();
+    if (this.repositoryOwnershipResult instanceof Error) throw this.repositoryOwnershipResult;
+    return { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...this.repositoryOwnershipResult };
+  }
 
   async fixConfigOwnership(p: { volumeName: string; folder: string; uid: string; gid: string; image?: HelperImageUse }): Promise<RunResult> {
     this.usedImage('fixConfigOwnership', p.image);

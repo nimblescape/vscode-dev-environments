@@ -113,8 +113,48 @@ describe('prepareBatchHelper (plan step 6, PR B)', () => {
     await expect(operations.listConfigs({ repository: 'octo/hello' }, context())).rejects.toMatchObject({ code: 'unsafe' });
     await expect(operations.listConfigs({ repository: '../x' }, context())).rejects.toMatchObject({ code: 'invalid' });
     // user decision 2026-10-02: Delete runs no Git: changed expectation, no operation gitSummary (was in plan step 7).
-    expect(Object.keys(operations).sort()).toEqual(['build', 'clone', 'composeHash', 'composeModel', 'createFolders', 'gitFiles', 'listConfigs', 'ownershipFix', 'readConfiguration', 'readFiles', 'runUserCommands', 'up']);
+    // Plan step 11G1: changed expectation, the operation repositoryOwnershipFix is new.
+    expect(Object.keys(operations).sort()).toEqual([
+      'build',
+      'clone',
+      'composeHash',
+      'composeModel',
+      'createFolders',
+      'gitFiles',
+      'listConfigs',
+      'ownershipFix',
+      'readConfiguration',
+      'readFiles',
+      'repositoryOwnershipFix',
+      'runUserCommands',
+      'up',
+    ]);
     expect(new OperationError('x', 'y').code).toBe('x');
+  });
+});
+
+describe('the step repositoryOwnershipFix (plan step 11G1)', () => {
+  it('runs the command that the helper builds itself, as root (no setpriv), without input; refuses a secret and invalid parameters', async () => {
+    const spawned: { command: readonly string[]; input: string | undefined }[] = [];
+    const operations = batchHelperOperations({
+      spawnStep: (command, _env, input) => {
+        spawned.push({ command, input });
+        return { exited: Promise.resolve({ exitCode: 0 }), killGroup: () => {} };
+      },
+      runQuiet: async () => {},
+      // A step as root reads no owner and touches no file of the helper.
+      fs: {} as never,
+      env: {},
+    });
+    const params = { repository: 'octo/hello', uid: '1000', gid: '1000', serviceFolders: ['/workspaces/hello/pgdata'] };
+    expect(await operations.repositoryOwnershipFix(params, context())).toEqual({ exitCode: 0 });
+    expect(spawned).toEqual([{ command: batchStepCommand('repositoryOwnershipFix', params).command, input: undefined }]);
+    expect(spawned[0].command[0]).toBe('sh');
+    await expect(operations.repositoryOwnershipFix(params, context('tok-1234'))).rejects.toMatchObject({ code: 'invalid' });
+    await expect(operations.repositoryOwnershipFix({ ...params, uid: 'vscode' }, context())).rejects.toMatchObject({ code: 'invalid' });
+    await expect(operations.repositoryOwnershipFix({ ...params, serviceFolders: ['/etc'] }, context())).rejects.toMatchObject({ code: 'invalid' });
+    await expect(operations.repositoryOwnershipFix({ ...params, repository: '../x' }, context())).rejects.toMatchObject({ code: 'invalid' });
+    expect(spawned).toHaveLength(1);
   });
 });
 
