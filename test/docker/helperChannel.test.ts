@@ -125,7 +125,7 @@ describe('the helper channel with the real Docker engine', () => {
     return ['run', '--rm', '--name', name, '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', channelStepLabel(label), '--entrypoint', 'sleep', helperTag, '300'];
   }
 
-  it('opens: the container has no network, no capability, --rm, and the labels; Docker calls and their output come back', async () => {
+  it('opens: the container has outbound network only, no capability, --rm, and the labels; Docker calls and their output come back', async () => {
     const { channel, name } = await timings.measure('open a channel', () => open());
     const details = cli.container(name)!;
     expect(details.State.Running).toBe(true);
@@ -133,7 +133,11 @@ describe('the helper channel with the real Docker engine', () => {
     expect(details.HostConfig.CapDrop).toEqual(['ALL']);
     expect(details.HostConfig.RestartPolicy?.Name ?? 'no').toMatch(/^(no|)$/);
     expect(details.Config.Labels?.[LABEL_HELPER_CHANNEL]).toBe(channelLabelValue(script));
-    expect((details as unknown as { HostConfig: { NetworkMode: string } }).HostConfig.NetworkMode).toBe('none');
+    // Plan step 11E3a (decision of 2026-10-03): changed expectation, outbound network on the default bridge and no published
+    // port (before: 'none').
+    const host = (details as unknown as { HostConfig: { NetworkMode: string; PortBindings?: Record<string, unknown> | null } }).HostConfig;
+    expect(host.NetworkMode).toBe('bridge');
+    expect(host.PortBindings ?? {}).toEqual({});
     // Plan step 3 (pipe loading, user decision 2026-09-29): the command is the pipe loader with the path, the hash and the
     // entry; the script came over stdin and is nowhere in the configuration of the container.
     expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', bundleHash(script), 'startChannel']);
