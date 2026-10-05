@@ -29,7 +29,9 @@ import { batchHelperOperations } from './batchHelper';
 import { contextSecrets } from './operationContext.testkit';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
-import { tokenRemoveOperation } from './flowOperations';
+import { flowHost, tokenRemoveOperation } from './flowOperations';
+import { hostRegistryCredentials, registryLogins } from '../core/worker/workerServices';
+import { silentLogger } from '../core/ports';
 import { dockerOperation } from './operations';
 import { ChannelServer, OperationError, type OperationContext, type OperationHandler, type ServerChild } from './server';
 
@@ -332,6 +334,32 @@ describe('requests of an operation to the extension, in the script (plan step 11
     const text = JSON.stringify(of(1));
     expect(text).not.toContain('reg-5678');
     expect(text).not.toContain('reg-9999');
+  });
+
+  it('the registry logins of an operation: one asked at a time, each password its own, also when answers would come together (review round 1 of PR #109, A-H1)', async () => {
+    const { send, asksOf, resultOf } = setup({
+      asking: async (_params, context) => {
+        const logins = registryLogins(flowHost(context), () => context.forgetSecret('registry'), silentLogger);
+        const provider = hostRegistryCredentials(logins);
+        const got = await Promise.all([provider('a.example'), provider('b.example')]);
+        // The result is masked: what each provider got is compared here.
+        return { own: [got[0]?.password === 'PASS-A1', got[1]?.password === 'PASS-B2'], users: got.map((login) => login?.username), held: Object.keys(context.secrets) };
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    // Only one request is open: the second login waits.
+    expect(asksOf(1)).toHaveLength(1);
+    expect(asksOf(1)[0]).toMatchObject({ kind: 'secret', payload: { call: 'registry', args: ['a.example'] } });
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: { given: true, username: 'ua', serveraddress: 'a.example' }, secrets: { registry: 'PASS-A1' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asksOf(1)).toHaveLength(2);
+    send({ t: 'answer', id: 1, ask: 2, ok: true, value: { given: true, username: 'ub', serveraddress: 'b.example' }, secrets: { registry: 'PASS-B2' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resultOf(1)).toMatchObject({
+      ok: true,
+      value: { own: [true, true], users: ['ua', 'ub'], held: [] },
+    });
   });
 
   // Review round 1 of plan step 11A (pre-existing gap): the value of a result is masked too.

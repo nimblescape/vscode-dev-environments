@@ -24,38 +24,56 @@ export interface ProxySettings {
 export const PROXY_CONNECT_TIMEOUT_MS = 30_000;
 
 /**
- * True when `host` (a name or an IP address, without brackets) on `port` is reached without the proxy: an entry of
- * `noProxy` (comma or space separated) is `*`, an IP address, a CIDR block, or a domain (`example.com` and `.example.com`
- * both match the domain and its subdomains), each optionally with `:port`; case does not matter.
+ * True when `host` (a name or an IP address, without brackets) on `port` is reached without the proxy, as Go's httpproxy
+ * decides (review round 1 of PR #109, A-L1, A-L2): `localhost` and a loopback address always; else an entry of `noProxy`
+ * (comma or space separated, case does not matter) that is `*`, an IP address, a CIDR block, `example.com` (the domain
+ * and its subdomains) or `.example.com` / `*.example.com` (its subdomains only), a name or an address optionally with
+ * `:port` (an IPv6 address with a port in brackets, `[::1]:443`).
  */
 export function bypassesProxy(host: string, port: number, noProxy: string | undefined): boolean {
-  if (noProxy === undefined) return false;
   const name = host.toLowerCase().replace(/\.$/, '');
+  if (name === 'localhost' || name.endsWith('.localhost') || isLoopback(name)) return true;
+  if (noProxy === undefined) return false;
   for (const raw of noProxy.split(/[\s,]+/)) {
-    const entry = raw.trim().toLowerCase();
+    let entry = raw.trim().toLowerCase();
     if (entry === '') continue;
     if (entry === '*') return true;
     if (entry.includes('/')) {
       if (net.isIP(name) !== 0 && inCidr(name, entry)) return true;
       continue;
     }
-    let pattern = entry;
     let entryPort: number | undefined;
-    const portMatch = /^(.*):(\d{1,5})$/.exec(entry);
-    if (portMatch && !entry.startsWith('[') && net.isIP(entry) === 0) {
-      pattern = portMatch[1];
-      entryPort = Number(portMatch[2]);
+    const bracketed = /^\[([^\]]+)\](?::(\d{1,5}))?$/.exec(entry);
+    if (bracketed) {
+      entry = bracketed[1];
+      if (bracketed[2] !== undefined) entryPort = Number(bracketed[2]);
+    } else if (net.isIP(entry) === 0) {
+      const withPort = /^(.*):(\d{1,5})$/.exec(entry);
+      if (withPort) {
+        entry = withPort[1];
+        entryPort = Number(withPort[2]);
+      }
     }
-    pattern = pattern.replace(/^\[|\]$/g, '');
     if (entryPort !== undefined && entryPort !== port) continue;
-    if (net.isIP(pattern) !== 0) {
-      if (pattern === name) return true;
+    if (net.isIP(entry) !== 0) {
+      if (entry === name) return true;
       continue;
     }
-    const domain = pattern.replace(/^\*?\./, '');
-    if (domain !== '' && (name === domain || name.endsWith(`.${domain}`))) return true;
+    if (entry.startsWith('*.') || entry.startsWith('.')) {
+      // Subdomains only.
+      const domain = entry.replace(/^\*?\./, '');
+      if (domain !== '' && name.endsWith(`.${domain}`)) return true;
+      continue;
+    }
+    if (name === entry || name.endsWith(`.${entry}`)) return true;
   }
   return false;
+}
+
+/** True for an address of the loopback (127.0.0.0/8, ::1). */
+function isLoopback(address: string): boolean {
+  if (net.isIPv4(address)) return address.startsWith('127.');
+  return net.isIPv6(address) && inCidr(address, '::1/128');
 }
 
 function inCidr(address: string, cidr: string): boolean {
@@ -84,20 +102,35 @@ export function proxyFor(url: URL, settings: ProxySettings): URL | undefined {
   return proxy;
 }
 
+/**
+ * Review round 1 of PR #109 (A-M1, A-M2): the TLS options that check a certificate for `host`: its name as SNI (none for
+ * an IP address, which SNI does not carry) and the check of the name or the address against the certificate.
+ */
+export function tlsNameOf(host: string): Pick<tls.ConnectionOptions, 'servername' | 'checkServerIdentity'> {
+  return {
+    ...(net.isIP(host) === 0 ? { servername: host } : {}),
+    checkServerIdentity: (_name, certificate) => tls.checkServerIdentity(host, certificate),
+  };
+}
+
 /** A tunnel to `host:port` through `proxy` (CONNECT); rejects when the proxy refuses or does not answer in time. */
 function tunnel(proxy: URL, host: string, port: number, signal: AbortSignal | undefined): Promise<Duplex> {
   const limit = AbortSignal.timeout(PROXY_CONNECT_TIMEOUT_MS);
   const both = signal ? AbortSignal.any([signal, limit]) : limit;
   const target = `${host.includes(':') ? `[${host}]` : host}:${port}`;
   return new Promise((resolve, reject) => {
-    const options: http.RequestOptions = {
-      host: proxy.hostname.replace(/^\[|\]$/g, ''),
+    const proxyHost = proxy.hostname.replace(/^\[|\]$/g, '');
+    const options: https.RequestOptions = {
+      host: proxyHost,
       port: proxy.port === '' ? (proxy.protocol === 'https:' ? 443 : 80) : Number(proxy.port),
       method: 'CONNECT',
       path: target,
       headers: { host: target },
       signal: both,
       agent: false,
+      // Review round 1 of PR #109 (A-M2): the TLS of an `https://` proxy is checked for the name of the proxy (Node would
+      // take the name of the target from the Host header).
+      ...(proxy.protocol === 'https:' ? tlsNameOf(proxyHost) : {}),
     };
     const req = proxy.protocol === 'https:' ? https.request(options) : http.request(options);
     req.on('connect', (res, socket) => {
@@ -133,7 +166,9 @@ export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): H
       // No agent: Node then uses createConnection (with `agent: false` it would make an agent of its own, which connects
       // directly).
       return httpsRequest(request, signal, {
-        createConnection: () => tls.connect({ socket, servername: net.isIP(host) === 0 ? host : undefined }),
+        // Review round 1 of PR #109 (A-M1): checked for the host of the URL, also an IP address (Node would take the name
+        // of the proxy from the socket).
+        createConnection: () => tls.connect({ socket, ...tlsNameOf(host) }),
       });
     },
   };

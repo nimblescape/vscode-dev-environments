@@ -5,10 +5,15 @@
 // Plan step 11E3a (decision C1 of 2026-10-05): the worker's HTTPS through the proxy of the Docker daemon. The tunnel is
 // tested against a local proxy (CONNECT) and a local TCP server that records what the client sends through it: the TLS
 // handshake for the name of the host (SNI), never the request in clear text.
+import { execFileSync } from 'child_process';
+import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
-import { afterEach, describe, expect, it } from 'vitest';
-import { bypassesProxy, proxiedHttpsTransport, proxyFor } from './proxyTransport';
+import * as os from 'os';
+import * as path from 'path';
+import * as tls from 'tls';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { bypassesProxy, proxiedHttpsTransport, proxyFor, tlsNameOf } from './proxyTransport';
 
 describe('bypassesProxy (NO_PROXY as Go reads it)', () => {
   it('matches `*`, domains with their subdomains, IP addresses, CIDR blocks and ports; nothing without NoProxy', () => {
@@ -18,7 +23,10 @@ describe('bypassesProxy (NO_PROXY as Go reads it)', () => {
       ['registry.example.com', 443, '*', true],
       ['registry.example.com', 443, 'example.com', true],
       ['registry.example.com', 443, '.example.com', true],
-      ['example.com', 443, '.example.com', true],
+      // Review round 1 of PR #109 (A-L1): changed expectation, `.example.com` is its subdomains only, as in Go (before: true).
+      ['example.com', 443, '.example.com', false],
+      ['registry.example.com', 443, '*.example.com', true],
+      ['example.com', 443, '*.example.com', false],
       ['REGISTRY.Example.COM.', 443, 'example.com', true],
       ['badexample.com', 443, 'example.com', false],
       ['registry.example.com', 443, 'other.com, example.com', true],
@@ -29,8 +37,18 @@ describe('bypassesProxy (NO_PROXY as Go reads it)', () => {
       ['11.1.2.3', 443, '10.0.0.0/8', false],
       ['10.1.2.3', 443, '10.1.2.3', true],
       ['10.1.2.4', 443, '10.1.2.3', false],
-      ['::1', 443, '::1', true],
-      ['::1', 443, '[::1]', true],
+      ['fd00::1', 443, 'fd00::1', true],
+      ['fd00::1', 443, '[fd00::1]', true],
+      // Review round 1 of PR #109 (A-L2): an IPv6 address with a port in brackets; localhost and the loopback always.
+      ['fd00::1', 443, '[fd00::1]:443', true],
+      ['fd00::1', 8443, '[fd00::1]:443', false],
+      ['localhost', 443, undefined, true],
+      ['LOCALHOST.', 443, '', true],
+      ['api.localhost', 443, undefined, true],
+      ['127.0.0.1', 443, undefined, true],
+      ['127.8.9.10', 443, undefined, true],
+      ['::1', 443, undefined, true],
+      ['notlocalhost', 443, undefined, false],
       ['fd00::5', 443, 'fd00::/8', true],
       ['registry.example.com', 443, '10.0.0.0/8', false],
       ['10.1.2.3', 443, 'bad/cidr', false],
@@ -141,5 +159,88 @@ describe('proxiedHttpsTransport', () => {
     await expect(transport.request({ method: 'GET', url: 'http://registry.example.com/v2/' })).rejects.toThrow('without TLS');
     await expect(transport.request({ method: 'GET', url: `https://127.0.0.1:${target.port}/v2/` })).rejects.toThrow();
     expect(reads).toBe(1);
+  });
+});
+
+describe('the TLS names through the tunnel (review round 1 of PR #109, A-M1, A-M2)', () => {
+  it('a certificate is checked for the host of the URL, also an IP address; SNI only for a name', () => {
+    const forName = (names: string) => ({ subject: { CN: '' }, subjectaltname: names }) as unknown as tls.PeerCertificate;
+    const ip = tlsNameOf('10.9.9.9');
+    expect(ip.servername).toBeUndefined();
+    // Node would pass the name of the proxy here; the certificate of the proxy is no certificate of the registry.
+    expect(ip.checkServerIdentity!('proxy.local', forName('DNS:proxy.local'))).toBeInstanceOf(Error);
+    expect(ip.checkServerIdentity!('proxy.local', forName('IP Address:10.9.9.9'))).toBeUndefined();
+    const name = tlsNameOf('registry.example.com');
+    expect(name.servername).toBe('registry.example.com');
+    expect(name.checkServerIdentity!('other', forName('DNS:registry.example.com'))).toBeUndefined();
+    expect(name.checkServerIdentity!('registry.example.com', forName('DNS:proxy.local'))).toBeInstanceOf(Error);
+  });
+
+  describe('against TLS servers', () => {
+    let dir: string;
+    let key: Buffer;
+    let cert: Buffer;
+    const closers: (() => Promise<void>)[] = [];
+    beforeAll(() => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-proxy-tls-'));
+      execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost', '-keyout', path.join(dir, 'key.pem'), '-out', path.join(dir, 'cert.pem')], { stdio: 'ignore' });
+      key = fs.readFileSync(path.join(dir, 'key.pem'));
+      cert = fs.readFileSync(path.join(dir, 'cert.pem'));
+    });
+    afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+    afterEach(async () => {
+      for (const close of closers.splice(0)) await close();
+    });
+
+    /** A TLS server that records the SNI of each handshake as it starts (`connections`: every TCP connection to it). */
+    async function tlsServer(): Promise<{ port: number; names: string[]; connections: () => number }> {
+      const names: string[] = [];
+      let connections = 0;
+      const context = tls.createSecureContext({ key, cert });
+      const server = tls.createServer({
+        key,
+        cert,
+        SNICallback: (name, done) => {
+          names.push(name);
+          done(null, context);
+        },
+      });
+      server.on('connection', () => void connections++);
+      server.on('tlsClientError', () => undefined);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      closers.push(() => new Promise((resolve) => server.close(() => resolve())));
+      return { port: (server.address() as net.AddressInfo).port, names, connections: () => connections };
+    }
+
+    it('an https:// proxy is spoken to with its own name, never the name of the target (A-M2)', async () => {
+      const proxy = await tlsServer();
+      const transport = proxiedHttpsTransport(async () => ({ httpsProxy: `https://localhost:${proxy.port}` }));
+      await expect(transport.request({ method: 'GET', url: 'https://registry.example.com/v2/' })).rejects.toThrow();
+      expect(proxy.names).toEqual(['localhost']);
+    });
+
+    it('a registry of an IP address gets no SNI through the tunnel, and its certificate is checked (A-M1)', async () => {
+      const target = await tlsServer();
+      const connects: string[] = [];
+      const server = http.createServer();
+      server.on('connect', (req: http.IncomingMessage, client: net.Socket) => {
+        connects.push(req.url ?? '');
+        const upstream = net.connect(target.port, '127.0.0.1', () => {
+          client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          upstream.pipe(client);
+          client.pipe(upstream);
+        });
+        upstream.on('error', () => client.destroy());
+        client.on('error', () => upstream.destroy());
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      closers.push(() => new Promise((resolve) => server.close(() => resolve())));
+      const transport = proxiedHttpsTransport(async () => ({ httpsProxy: `http://localhost:${(server.address() as net.AddressInfo).port}` }));
+      await expect(transport.request({ method: 'GET', url: 'https://10.9.9.9/v2/' })).rejects.toThrow();
+      expect(connects).toEqual(['10.9.9.9:443']);
+      // No SNI for the IP address (before, Node took the name of the proxy, `localhost`, which this certificate has).
+      expect(target.connections()).toBe(1);
+      expect(target.names).toEqual([]);
+    });
   });
 });

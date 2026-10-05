@@ -11,7 +11,7 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostRegistryCredentials, workerImageChecker, hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { hostRegistryCredentials, registryLogins, workerImageChecker, hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
@@ -510,7 +510,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
         const { host: side, asked } = host(answer as () => Promise<unknown>);
         let forgotten = 0;
         const warnings: string[] = [];
-        const provider = hostRegistryCredentials(side, () => void forgotten++, { ...silentLogger, warn: (text) => warnings.push(text) });
+        // Review round 1 of PR #109 (A-H1): changed call, the logins of the operation are one after the other (registryLogins).
+        const provider = hostRegistryCredentials(registryLogins(side, () => void forgotten++, { ...silentLogger, warn: (text: string) => warnings.push(text) }));
         expect(await provider('ghcr.io')).toEqual(expected);
         expect(asked).toEqual(['ghcr.io']);
         expect(forgotten).toBe(1);
@@ -519,6 +520,51 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
         expect(asked).toEqual(['ghcr.io', 'ghcr.io']);
         if (answer === undefined) expect(warnings).toEqual([]);
       }
+    });
+
+    it('two logins asked at once are asked one after the other, each read and forgotten before the next (review round 1 of PR #109, A-H1)', async () => {
+      // One secret slot, as the operation has it: an answer sets it; the reader reads it after the answer.
+      let slot: string | undefined;
+      const events: string[] = [];
+      const pending: (() => void)[] = [];
+      const side = {
+        secrets: {
+          registry: (registry: string) =>
+            new Promise((resolve) => {
+              events.push(`ask ${registry}`);
+              pending.push(() => {
+                slot = `PASS-${registry}`;
+                resolve({ username: `u-${registry}`, serveraddress: registry, password: slot });
+              });
+            }),
+        },
+      } as unknown as HostSide;
+      const logins = registryLogins(side, () => {
+        events.push('forget');
+        slot = undefined;
+      }, silentLogger);
+      const provider = hostRegistryCredentials(logins);
+      const both = Promise.all([provider('a.example'), provider('b.example')]);
+      await Promise.resolve();
+      // Only the first is asked while it is open.
+      expect(events).toEqual(['ask a.example']);
+      pending.shift()!();
+      for (let i = 0; i < 10 && pending.length === 0; i++) await Promise.resolve();
+      pending.shift()!();
+      expect(await both).toEqual([
+        { username: 'u-a.example', password: 'PASS-a.example' },
+        { username: 'u-b.example', password: 'PASS-b.example' },
+      ]);
+      expect(events).toEqual(['ask a.example', 'forget', 'ask b.example', 'forget']);
+    });
+
+    it('a use that fails still forgets, and the next login is still asked', async () => {
+      const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
+      let forgotten = 0;
+      const logins = registryLogins(side.host, () => void forgotten++, silentLogger);
+      await expect(logins('ghcr.io', async () => Promise.reject(new Error('pull failed')))).rejects.toThrow('pull failed');
+      expect(await logins('ghcr.io', async (login) => login?.password)).toBe('p1');
+      expect(forgotten).toBe(2);
     });
 
     it("the worker's image check reads neither the proxy nor a login before a check needs them", async () => {

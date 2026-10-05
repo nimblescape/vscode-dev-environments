@@ -186,25 +186,47 @@ export function hostLifecycleMemory(host: HostSide): LifecycleMemory {
   };
 }
 
+/** Plan step 11E3a: a registry login as the operation holds it while it is used. */
+export type RegistryLogin = NonNullable<Awaited<ReturnType<HostSide['secrets']['registry']>>>;
+
 /**
- * Plan step 11E3a (decision B1 of 2026-10-05): the login of a registry for one use (CredentialsProvider): asked as `secret
- * registry <host>` when the registry client needs it, and forgotten by the operation as soon as it is read (`forget`);
- * the next use asks again. An identity token is the password of IDENTITY_TOKEN_USER, as the Docker credentials give it.
- * Never throws (a failed request is no login).
+ * Plan step 11E3a (decision B1 of 2026-10-05): the logins of the registries of one operation. Every login comes as the one
+ * registry secret of the operation (SECRET_REGISTRY), so they are used one after the other (review round 1 of PR #109,
+ * A-H1: two logins asked at once could each read the other's): `use` runs with the login of `registry` (`undefined`
+ * when the computer has none, or its request failed, which is logged), and the operation forgets the secret when `use`
+ * ends, before the next login is asked.
  */
-export function hostRegistryCredentials(host: HostSide, forget: () => void, log: Logger): CredentialsProvider {
-  return async (registry) => {
-    try {
-      const login = await host.secrets.registry(registry);
-      if (login === undefined) return undefined;
-      return { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password };
-    } catch (error) {
-      log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
-      return undefined;
-    } finally {
-      forget();
-    }
+export function registryLogins(host: HostSide, forget: () => void, log: Logger): <T>(registry: string, use: (login: RegistryLogin | undefined) => Promise<T>) => Promise<T> {
+  let queue: Promise<unknown> = Promise.resolve();
+  return (registry, use) => {
+    const run = queue.then(async () => {
+      try {
+        let login: RegistryLogin | undefined;
+        try {
+          login = await host.secrets.registry(registry);
+        } catch (error) {
+          log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
+        }
+        return await use(login);
+      } finally {
+        forget();
+      }
+    });
+    queue = run.catch(() => undefined);
+    return run;
   };
+}
+
+/**
+ * Plan step 11E3a (decision B1 of 2026-10-05): the login of a registry for one use of the registry client
+ * (CredentialsProvider), through `logins` (asked when it is needed, forgotten right after). An identity token is the
+ * password of IDENTITY_TOKEN_USER, as the Docker credentials give it. Never throws.
+ */
+export function hostRegistryCredentials(logins: ReturnType<typeof registryLogins>): CredentialsProvider {
+  return (registry) =>
+    logins(registry, async (login) =>
+      login === undefined ? undefined : { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password },
+    ).catch(() => undefined);
 }
 
 /**
@@ -212,10 +234,9 @@ export function hostRegistryCredentials(host: HostSide, forget: () => void, log:
  * the daemon of its engine (proxiedHttpsTransport, decision C1), the logins by hostRegistryCredentials (decision B1). A
  * login that a registry rejects is logged; the check goes on without it (RegistryClient).
  */
-export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engine' | 'forgetSecret' | 'logger'>): ImageChecker {
+export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engine' | 'forgetSecret' | 'logger'>, logins = registryLogins(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger)): ImageChecker {
   const transport = proxiedHttpsTransport(() => deps.engine.proxy());
-  const credentials = hostRegistryCredentials(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger);
-  const client = new RegistryClient(transport, credentials, deps.logger, {
+  const client = new RegistryClient(transport, hostRegistryCredentials(logins), deps.logger, {
     onCredentialsRejected: (registry) => deps.logger.warn(`The registry ${registry} rejected the login of this computer.`),
   });
   return new ImageChecker(client, deps.logger);
