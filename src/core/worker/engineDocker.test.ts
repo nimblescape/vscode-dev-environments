@@ -356,7 +356,12 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
         [new EngineError('Head "https://ghcr.io/v2/o/i/manifests/1": unauthorized', 500), true],
         [new EngineError('forbidden', 403), true],
         [new EngineError('pull access denied', 401), true],
+        // Review round 2 of PR #110 (A2-L-3): the containerd image store, ghcr.io and ECR.
+        [new EngineError('failed to resolve reference "ghcr.io/o/i:1": failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://ghcr.io/token: 403 Forbidden', 500), true],
+        [new EngineError('Head "https://ghcr.io/v2/o/i/manifests/1": denied', 500), true],
+        [new EngineError('denied: Your authorization token has expired. Reauthenticate and try again.', 500), true],
         [new EngineError('manifest unknown', 404), false],
+        [new EngineError('pull access for o/i is not possible: repository does not exist or may require login (denied later)', 500), false],
         [new Error('no space left on device'), false],
       ] as const) {
         const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
@@ -380,6 +385,24 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
           expect(state.events).toEqual(['ask ghcr.io', 'pull ghcr.io/o/i:1 with gho_old', 'forget']);
         }
       }
+    });
+
+    it('a pull cancelled during its authenticated try is not tried again (review round 2 of PR #110)', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
+      const cancel = new AbortController();
+      let pulls = 0;
+      const engine: DockerEngine = {
+        ...unusedEngine(),
+        pull: async () => {
+          pulls++;
+          cancel.abort();
+          throw new EngineError('unauthorized', 401);
+        },
+      };
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await expect(docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {}, signal: cancel.signal })).rejects.toThrow('unauthorized');
+      expect(pulls).toBe(1);
+      expect(state.events.at(-1)).toBe('forget');
     });
 
     it('the pull without the refused login keeps the output and the signal of the pull (review round 1 of PR #110, B)', async () => {
@@ -408,7 +431,8 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
       const { run, state } = logins({ 'registry-1.docker.io': { username: 'hub', password: 'hub_x' }, 'localhost:5000': { username: 'local', password: 'local_x' } });
       const { engine, pulls } = engineWith(state);
       const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
-      for (const reference of ['Docker.io/library/node:22', 'INDEX.DOCKER.IO/library/node:22', ' node:22', 'node:22 ']) {
+      // Review round 2 of PR #110 (A2-L-2): also an upper-case first part without a dot or a colon (a host to Docker).
+      for (const reference of ['Docker.io/library/node:22', 'INDEX.DOCKER.IO/library/node:22', ' node:22', 'node:22 ', 'MyHost/img:1', 'LOCALHOST/img:1']) {
         await docker.pullImage(reference, { onOutput: () => {} }).catch(() => undefined);
       }
       expect(state.events.filter((event) => event.startsWith('ask'))).toEqual([]);

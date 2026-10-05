@@ -447,13 +447,16 @@ function loginRegistryOf(reference: string): string | undefined {
   if (reference !== reference.trim()) return undefined;
   const slash = reference.indexOf('/');
   const first = slash < 0 ? '' : reference.slice(0, slash);
-  const namesHost = first.includes('.') || first.includes(':') || first === 'localhost';
-  if (namesHost && first !== first.toLowerCase()) return undefined;
+  // Review round 2 of PR #110 (A2-L-2): Docker reads a first part with an upper-case letter as a host too (`MyHost/img`).
+  if (first !== first.toLowerCase()) return undefined;
   return parseImageReference(reference)?.registry;
 }
 
 /** Review round 1 of PR #110 (A-M1): a refusal of the login by the registry (HTTP 401 or 403, or Docker's words for it). */
 function isLoginRefusal(error: unknown): boolean {
   if (error instanceof EngineError && (error.status === 401 || error.status === 403)) return true;
-  return /unauthorized|authentication required|incorrect username or password|denied: denied|invalid username\/password/i.test(errorMessage(error));
+  // Review round 2 of PR #110 (A2-L-3): also the words of the containerd image store and of ghcr.io and ECR.
+  return /unauthori[sz]ed|forbidden|failed to authorize|authentication required|incorrect username or password|(^|: )denied(:|$)|authorization token has expired|invalid username\/password/i.test(
+    errorMessage(error),
+  );
 }

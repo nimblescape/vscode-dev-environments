@@ -639,6 +639,25 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       expect(events).toEqual(['ask a.example', 'forget', 'ask c.example', 'forget']);
     });
 
+    it('an abort during the request of a login: AbortError, no use, and the login is forgotten (review round 2 of PR #110)', async () => {
+      const cancel = new AbortController();
+      let forgotten = 0;
+      let used = 0;
+      const side = {
+        secrets: {
+          registry: async (registry: string) => {
+            cancel.abort();
+            return { username: 'u', serveraddress: registry, password: 'p' };
+          },
+        },
+      } as unknown as HostSide;
+      const logins = registryLogins(side, () => void forgotten++, silentLogger);
+      await expect(logins('a.example', async () => void used++, cancel.signal)).rejects.toMatchObject({ name: 'AbortError' });
+      expect({ forgotten, used }).toEqual({ forgotten: 1, used: 0 });
+      // The next turn still runs.
+      expect(await logins('b.example', async (login) => login?.password)).toBe('p');
+    });
+
     it("the worker never passes credentials of its own to a pull (they would bypass the turns; review round 1 of PR #110, A-L3)", () => {
       const all = workerServiceDeps({
         host: {} as HostSide,

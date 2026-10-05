@@ -223,7 +223,8 @@ export function registryLogins(
       }
     })();
     // The next turn waits for this one and for the one before it (a cancelled wait ends before the turn before it).
-    queue = Promise.allSettled([previous, run]);
+    // Review round 2 of PR #110 (A2-L-1): the queue keeps no value of a turn (a login that `use` gave back).
+    queue = Promise.allSettled([previous, run]).then(() => undefined);
     return run;
   };
 }
