@@ -234,6 +234,24 @@ describe('the entry of a first open, the configuration and the build records as 
       }
     });
 
+    it('refuses a volume that an entry of another account or its Delete recorded; one of the account is no clash (review round 4 of PR #106, A4-L2)', async () => {
+      const theirs = { id: '7', login: 'other' };
+      const cases: [Environment[], KeptVolume[], boolean][] = [
+        [[entryOf(OTHER, { repository: 'acme/web', owner: theirs, additionalVolumes: [name(NEW).toUpperCase()] })], [], true],
+        [[], [{ name: name(NEW), owner: theirs, keptAt: '2026-10-01T00:00:00.000Z' }], true],
+        [[entryOf(OTHER, { repository: 'acme/web', additionalVolumes: [name(NEW)] })], [{ name: name(NEW), owner: ACCOUNT, keptAt: '2026-10-01T00:00:00.000Z' }], false],
+      ];
+      for (const [entries, kept, refused] of cases) {
+        const { ask, file } = firstOpen(entries, { kept });
+        if (refused) {
+          await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('another account') });
+          expect(file().environments).toEqual(entries);
+        } else {
+          expect(await ask('createEnvironment', CREATE)).toMatchObject({ id: NEW });
+        }
+      }
+    });
+
     it('never for an operation without a repository (review round 1 of PR #106, A-L1)', async () => {
       const { ask, file } = setup([], { scope: { dockerHost: HOST } });
       await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('another repository') });
@@ -494,7 +512,12 @@ describe('the entry of a first open, the configuration and the build records as 
       const updated = (await ask('configuration', ID, { addVolumes: [...batch(0).slice(0, 10), ...batch(600).slice(0, 990)], addServiceVolumes: batch(600) })) as Environment;
       expect(updated.additionalVolumes).toEqual(batch(0));
       expect(updated.serviceVolumes).toEqual(batch(0));
-      expect(warnings.filter((text) => text.includes('the most additional volumes'))).toHaveLength(590);
+      // Review round 4 of PR #106 (A4-L1): the first ten names that are left out, then one line with the count of the rest
+      // (round 3 logged a line for each of the 590).
+      expect(warnings.filter((text) => text.includes('the most additional volumes'))).toHaveLength(10);
+      // 590 additional volumes and 600 volumes of services (no additional volumes) left out by the second request.
+      expect(warnings.slice(0, 11)).toHaveLength(11);
+      expect(warnings[10]).toBe('The worker recorded 1180 more volumes for acme/api, which are left out.');
       // Again: nothing more is recorded.
       await ask('configuration', ID, { addVolumes: batch(5000), addServiceVolumes: batch(5000) });
       expect(entry()?.additionalVolumes).toHaveLength(1000);

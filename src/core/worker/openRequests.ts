@@ -395,7 +395,7 @@ export interface OpenRequests {
  * another entry of the same account stays: the environments of one account share it (recordedVolumes,
  * isSameOwnerAdditionalVolume), and its record keeps the Delete of the other entry from removing it.
  */
-function admittedVolumes(names: readonly string[], entry: Environment, file: RegistryFile, logger: BusyMarkView['logger']): string[] {
+function admittedVolumes(names: readonly string[], entry: Environment, file: RegistryFile, logger: Pick<BusyMarkView['logger'], 'warn'>): string[] {
   const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
   const others = file.environments.filter((other) => other.id !== entry.id);
   const admitted = names.filter((name) => {
@@ -422,6 +422,23 @@ function admittedVolumes(names: readonly string[], entry: Environment, file: Reg
     count += 1;
     return true;
   });
+}
+
+/** Review round 4 of PR #106 (A4-L1): the most lines that one request logs for the volumes that it leaves out. */
+export const MAX_LEFT_OUT_LINES = 10;
+
+/** A log of the volumes that one request leaves out: the first MAX_LEFT_OUT_LINES lines, then one line with the count of the rest. */
+function leftOutLog(logger: BusyMarkView['logger']): Pick<BusyMarkView['logger'], 'warn'> & { end(repository: string): void } {
+  let lines = 0;
+  return {
+    warn: (text: string) => {
+      lines += 1;
+      if (lines <= MAX_LEFT_OUT_LINES) logger.warn(text);
+    },
+    end: (repository: string) => {
+      if (lines > MAX_LEFT_OUT_LINES) logger.warn(`The worker recorded ${lines - MAX_LEFT_OUT_LINES} more volumes for ${repository}, which are left out.`);
+    },
+  };
 }
 
 /**
@@ -543,6 +560,14 @@ export function requestOpenRecords(
         if (file.environments.some((entry) => same(entry.id, id) || same(entry.volumeName, name) || same(entry.containerName, name))) {
           throw new HelperOperationError('invalid', 'The registry has an environment of the ID or the volume of the request already.', false);
         }
+        // Review round 4 of PR #106 (A4-L2): nor a volume that an entry of another account or its Delete recorded.
+        const foreign = (owner: { id: string }) => owner.id !== scope.account.id;
+        if (
+          file.environments.some((entry) => foreign(entry.owner) && (entry.additionalVolumes ?? []).some((volume) => same(volume, name))) ||
+          (file.keptVolumes ?? []).some((record) => foreign(record.owner) && same(record.name, name))
+        ) {
+          throw new HelperOperationError('invalid', 'The volume of the request is one that another account recorded already.', false);
+        }
         file.environments.push(environment);
         return environment;
       });
@@ -563,15 +588,17 @@ export function requestOpenRecords(
       const admitted: ConfigurationChange = { ...change };
       return registry.update((file) =>
         recordsIn(file, (entry) => {
-          if (change.addVolumes !== undefined) admitted.addVolumes = admittedVolumes(change.addVolumes, entry, file, view.logger);
+          const logger = leftOutLog(view.logger);
+          if (change.addVolumes !== undefined) admitted.addVolumes = admittedVolumes(change.addVolumes, entry, file, logger);
           if (change.addServiceVolumes !== undefined) {
             // The volumes of the services are additional volumes of the entry (after this change), and no other.
             const additional = new Set([...(entry.additionalVolumes ?? []), ...(admitted.addVolumes ?? [])]);
             admitted.addServiceVolumes = change.addServiceVolumes.filter((name) => {
-              if (!additional.has(name)) view.logger.warn(`The worker recorded the volume ${name} of a service for ${entry.repository}, which is left out: it is no additional volume of the environment.`);
+              if (!additional.has(name)) logger.warn(`The worker recorded the volume ${name} of a service for ${entry.repository}, which is left out: it is no additional volume of the environment.`);
               return additional.has(name);
             });
           }
+          logger.end(entry.repository);
           // As the pipeline records them (and the restore): only paths of the repository, within the bounds.
           if (change.serviceFolders !== undefined) {
             admitted.serviceFolders = boundServiceFolders(repositoryFolder(entry.repository), [change.serviceFolders.folders], change.serviceFolders.overflow);
