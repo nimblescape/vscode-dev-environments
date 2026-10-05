@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { ContainerAdapter, DOCKER_QUERY_TIMEOUT_MS } from '../core/docker/containerAdapter';
+import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { dockerHostOf, isOnDockerHost, sshEndpoint, type DockerTarget } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
@@ -22,7 +22,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage, UserFacingError } from '../core/errors';
 import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
 import { HelperPrebuild, dockerEngineAnswers } from '../core/helper/helperPrebuild';
-import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../core/helper/workspaceHelper';
+import { DOCKER_SOCKET, HelperImages, helperDockerSocket } from '../core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperChannels';
 import { HelperChannelError } from '../core/helperChannel/helperChannel';
 import { Messages } from '../core/messages';
@@ -146,15 +146,14 @@ async function activateExtension(
   let daemonRunning = false;
   const adapterOptions = dockerAdapterOptions(() => dockerSetup);
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload.
-  const docker = new ContainerAdapter(runner, dockerPath, env, logger, platform, {
+  // Plan step 11F2 (decision 1 of 2026-10-03): the Docker CLI of the extension is only the bootstrap's (BootstrapDocker).
+  const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();
       daemonRunning = running;
       adapterOptions.onDaemonStatus?.(running);
     },
-    // Plan step 10A: a pull through the worker sends the credentials that Docker stored here (the store comes below).
-    storedCredentials: (registry, signal) => credentials.getForPull(registry, signal),
   });
   // Unit 7: the Docker host is the current Docker context, read at the start of each operation.
   const targets = new DockerTargets(docker, env, logger, platform);
@@ -184,7 +183,8 @@ async function activateExtension(
     onCredentialsRejected: ghcrRejectionReporter(auth),
   });
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
-  const helper = new WorkspaceHelper({
+  // Plan step 11F2: the helper image of the bootstrap, apart from the steps of the workspace helper (the worker's).
+  const helper = new HelperImages({
     docker,
     logger,
     dockerfilePath: helperDockerfile,
@@ -230,10 +230,9 @@ async function activateExtension(
   });
   const heartbeatPreparation = heartbeats.preparation;
   // Plan step 5, PR A: the worker per window and Docker engine (the helper channel, dist/helperChannel.js), local and
-  // remote. The plain Docker calls of an operation go through it (ContainerAdapter.run, dockerRouting.ts); everything
-  // else runs directly. Plan step 5, PR D (rule D1 of 2026-09-30): a call that needs it makes it ready first (the helper
-  // image, then the open), and is refused when that fails, never run directly. Its socket mount is the one of the
-  // workspace helper on that engine.
+  // remote. Plan step 11F2: every operation runs in it; the extension sends no Docker call of its own through it. Plan
+  // step 5, PR D (rule D1 of 2026-09-30): an operation makes it ready first (the helper image, then the open), and is
+  // refused when that fails. Its socket mount is the one of the workspace helper on that engine.
   const channelScriptPath = context.asAbsolutePath(path.join('dist', 'helperChannel.js'));
   // The source of the socket mount on the host of an engine, for the worker and the Session Monitor container: the
   // recorded socket of a rootless remote engine, else /var/run/docker.sock there; on the local Docker the socket of its
@@ -275,18 +274,11 @@ async function activateExtension(
       ),
   });
   helperChannels = channels;
-  docker.setRouter((target, args, options) => channels.docker(target, args, options));
-  // Plan step 10A (decision of 2026-10-03): the operations of the worker over the Engine API.
-  docker.setWorkerEngine({
-    pull: (target, reference, options) => channels.pull(target, reference, options),
-    startContainers: (target, ids, options) => channels.startContainers(target, ids, options),
-  });
+  // Plan step 11F2: the extension relays no Docker call through the worker any more (its pipeline runs there).
   // Plan step 8, PR C: after the release of deactivate() (bounded; it never rejects), which needs the worker.
   context.subscriptions.push(
     closingWork.deferred({
       dispose: () => {
-        docker.setRouter(undefined);
-        docker.setWorkerEngine(undefined);
         channels.dispose();
       },
     }),
@@ -335,8 +327,8 @@ async function activateExtension(
   // The source of the heartbeats (computer.id); created by the first reader.
   const computerId = (): string => readOrCreateComputerId(paths.computerId);
   // Plan step 8, PR A (user decision Q4 of 2026-10-02): the heartbeats of this window to the Session Monitor container of
-  // the engine of each environment it uses, through this window's worker of that engine (a routed `docker exec`: the
-  // worker is made ready first, D1); a missing monitor is started again as the open starts it.
+  // the engine of each environment it uses, through this window's worker of that engine (its operation `heartbeat`; the
+  // worker is made ready first, D1; review round 1 of PR #113, A-L1); a missing monitor is started again as the open starts it.
   // Review round 1 of PR #85 (A-R1-2): `signal` aborts at the deadline of the heartbeat's attempt. Review round 2 of PR
   // #85 (A-R2-2): it ends only the wait for the helper image, whose build runs with the long signal of the preparation.
   // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it, the

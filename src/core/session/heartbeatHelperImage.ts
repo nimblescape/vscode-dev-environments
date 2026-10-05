@@ -11,7 +11,7 @@
 // No `vscode`.
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperImageUse } from '../helper/helperImage';
-import type { PresentImageOptions } from '../helper/workspaceHelper';
+import type { PresentImageOptions } from '../helper/helperImages';
 import type { HeartbeatPreparation } from './heartbeatPreparation';
 
 export interface HeartbeatHelperImageDeps {

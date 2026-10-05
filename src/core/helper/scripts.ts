@@ -18,8 +18,9 @@ import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
 
-/** tmpfs mount of the helper for the token (only for runs with `secrets: true`). */
-export const SECRETS_FOLDER = '/run/devenv-secrets';
+// Plan step 11F2: SECRETS_FOLDER moved to ../names (the window's helper channel uses it without the scripts).
+import { SECRETS_FOLDER } from '../names';
+export { SECRETS_FOLDER };
 /** File of the token in SECRETS_FOLDER. */
 export const TOKEN_FILE = `${SECRETS_FOLDER}/github-token`;
 /**

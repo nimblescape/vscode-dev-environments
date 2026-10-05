@@ -567,7 +567,11 @@ export class EnvironmentOperations extends OperationBase {
   ): Promise<WindowStateValue | undefined> {
     try {
       // Unit 7: an environment of another Docker host is not read through the worker of this one.
-      if (!(await this.isOnCurrentHost(environment))) return undefined;
+      if (!(await this.isOnCurrentHost(environment))) {
+        // Review round 2 of PR #113 (A2-L2): the reason of an unread state is in the log.
+        this.logger.info(`The state of the container ${containerName} was not read: Docker is set to another host now.`);
+        return undefined;
+      }
       const params = parseWindowStateParams({
         environmentId: environment.id,
         containerName,

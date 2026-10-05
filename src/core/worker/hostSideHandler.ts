@@ -25,7 +25,7 @@ import {
 } from './openRequests';
 import { MAX_RESTORE_ENTRIES } from '../helperChannel/protocol';
 import { isConfigPathLabelValue, repositoryFolder, resourceName } from '../names';
-import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/pipelineRules';
+import { DEFAULT_CONFIG_PATH, isRepositoryName } from '../pipeline/recordRules';
 import { boundServiceFolders, MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_LENGTH } from '../git/gitSummary';
 import { dockerHostField } from '../docker/dockerHost';
 import { isStorageId } from '../storage/paths';

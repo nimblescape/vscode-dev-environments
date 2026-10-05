@@ -16,7 +16,7 @@ import { errorMessage } from '../errors';
 import { isAbortError, type Logger } from '../ports';
 import { helperImageTag } from './helperImage';
 import { readHelperState } from './helperState';
-import { helperStatePathFor, type WorkspaceHelper } from './workspaceHelper';
+import { helperStatePathFor, type HelperImages } from './helperImages';
 
 /**
  * What a prebuild did. `notDue`: the state file of the engine knows the current tag; `unsupported`: the Docker endpoint
@@ -35,7 +35,7 @@ export type HelperPrebuildOutcome = 'notDue' | 'unsupported' | 'dockerNotRunning
 export const HELPER_PREBUILD_TIMEOUT_MS = 15 * 60_000;
 
 export interface HelperPrebuildDeps {
-  helper: Pick<WorkspaceHelper, 'engineKey' | 'prebuildImage'>;
+  helper: Pick<HelperImages, 'engineKey' | 'prebuildImage'>;
   /**
    * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker. Called within the
    * operation on `target`. Never throws, except an AbortError.
@@ -55,7 +55,7 @@ export interface HelperPrebuildDeps {
 
 /** What dockerEngineAnswers needs. */
 export interface DockerEngineAnswersDeps {
-  /** ContainerAdapter.daemonStatus: `docker info` in the context of the operation, directly (not through the worker). */
+  /** BootstrapDocker.daemonStatus: `docker info` in the context of the operation, directly (not through the worker). */
   daemonStatus: (signal: AbortSignal, timeoutMs?: number) => Promise<{ running: boolean }>;
   /** For the SSH check before a remote host (checkSshLogin). */
   ssh: SshCheckDeps;

@@ -584,6 +584,8 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
   it('awaits the new cache when it was replaced during the check', async () => {
     const { a } = windows();
     await a.ensureImageUse();
+    // Plan step 11F2: the cache of the helper image is in HelperImages (the `images` of the helper).
+    const cache = (a as unknown as { images: { resetImage(): void; imagePromise: Promise<HelperImageUse> } }).images;
     const I3 = `sha256:${'3'.repeat(64)}`;
     const calls = docker.imageIdCalls;
     const imageId = docker.imageId.bind(docker);
@@ -592,10 +594,10 @@ describe('WorkspaceHelper reuses its cached helper image only while the tag stil
       if (!replaced) {
         replaced = true;
         // Meanwhile, a run outside an open found its image missing and reset the cache (resetImage).
-        (a as unknown as { resetImage(): void }).resetImage();
+        cache.resetImage();
         docker.ids.set(TAG, I2);
         // The new (pending) result of another caller; this caller awaits it and does not reset it.
-        (a as unknown as { imagePromise: Promise<HelperImageUse> }).imagePromise = Promise.resolve({ tag: TAG, id: I3 });
+        cache.imagePromise = Promise.resolve({ tag: TAG, id: I3 });
       }
       return imageId(reference);
     };

@@ -8,7 +8,8 @@
 // 11B3 and 11E); the inspect JSON is read by the same functions (dockerObjects.ts). Pure over the port; no I/O, no
 // `vscode`.
 import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
-import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS, type ImageInspection, type ImageNames, type VolumeRun } from '../docker/containerAdapter';
+import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/bootstrapDocker';
+import type { ImageInspection, ImageNames, VolumeRun } from '../docker/containerAdapter';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../names';

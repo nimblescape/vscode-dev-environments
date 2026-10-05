@@ -4,7 +4,7 @@
 
 // The environment of the window at its activation (concept 7.8), and the restore of a lost registry around it (concept
 // 7.5). Review round 1 of 11C3 (A-R1-M2): moved out of extension.ts (no `vscode` import here), so it is unit-tested.
-import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { HelperPrebuildOutcome } from '../core/helper/helperPrebuild';
 import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
 import type { Logger } from '../core/ports';
@@ -26,7 +26,7 @@ export async function findWindowEnvironment(
   deps: {
     registry: Pick<EnvironmentRegistry, 'findByContainerName'>;
     needsRestore: () => Promise<boolean>;
-    docker: Pick<ContainerAdapter, 'isInstalled'>;
+    docker: Pick<BootstrapDocker, 'isInstalled'>;
     service: Pick<EnvironmentOperations, 'reconcileInWorker'>;
     logger: Logger;
   },

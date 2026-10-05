@@ -8,7 +8,7 @@
 // Accounts (concept 7.5): the view shows the list and the environments of the signed-in GitHub account only; without a
 // sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
-import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DockerTargets } from '../core/docker/dockerTargets';
 import { DISCOVERY_CONCURRENCY, type DiscoveryService, type PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
@@ -49,7 +49,7 @@ export interface SidebarDeps {
   sessionFiles: SessionFiles;
   coordinator: SessionCoordinator;
   service: EnvironmentOperations;
-  docker: ContainerAdapter;
+  docker: BootstrapDocker;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
   tree: RepositoriesTreeProvider;

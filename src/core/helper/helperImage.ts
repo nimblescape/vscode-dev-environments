@@ -10,7 +10,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ContainerAdapter, ImageInfo } from '../docker/containerAdapter';
+import type { BootstrapDocker } from '../docker/bootstrapDocker';
+import type { ImageInfo } from '../docker/dockerObjects';
 import { errorMessage } from '../errors';
 import { extractBaseImages } from '../imageCheck/dockerfile';
 import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/registryClient';
@@ -58,9 +59,9 @@ export const HELPER_RETRY_INTERVAL_MS = DAY_MS;
  */
 export const HELPER_TOMBSTONE_MS = 90 * DAY_MS;
 
-/** The part of ContainerAdapter that the helper image needs. */
+/** The part of BootstrapDocker that the helper image needs. */
 export type HelperImageDocker = Pick<
-  ContainerAdapter,
+  BootstrapDocker,
   'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage'
 >;
 

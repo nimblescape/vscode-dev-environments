@@ -50,7 +50,7 @@ export const CONTEXT_INSPECT_TIMEOUT_MS = 15_000;
 /** A name of a Docker context as the Docker CLI accepts it (never an option). */
 const CONTEXT_NAME = /^[A-Za-z0-9][A-Za-z0-9_.+-]*$/;
 
-/** The part of ContainerAdapter that the resolver uses. */
+/** The part of BootstrapDocker that the resolver uses. */
 export interface ContextReader {
   isInstalled(): boolean;
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;

@@ -12,7 +12,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
 import { ensureRemoteContext } from '../core/docker/remoteDocker';
 import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
-import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
@@ -22,7 +22,7 @@ import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
-import { PipelineTexts, type OpenResult } from '../core/pipeline/operationBase';
+import { PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS, type OpenResult } from '../core/pipeline/operationBase';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -116,7 +116,7 @@ export interface ControllerDeps {
   sessionFiles: SessionFiles;
   /** Requests of other windows to close this window's connection first (concept 6.2 Stop, 7.14). */
   disconnectRequests: DisconnectRequests;
-  docker: ContainerAdapter;
+  docker: BootstrapDocker;
   /**
    * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the current engine
    * (`tokenRemove` first), with the HostSide of this computer answering its requests. Undefined only in tests that do not
@@ -2099,17 +2099,18 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The state of the container as the Docker port of the window reports it, or why it could not be read: the check of the
-   * attach (readyForWindow). Plan step 11C1 (review round 1, A-R1-5): it is not a window read of 11C1; within an operation
-   * the Docker port sends it through the worker (its generic `docker` operation).
+   * The state of the container, or why it could not be read: the check of the attach (readyForWindow). Review round 1 of
+   * PR #113 (A-M1): read by the worker of the engine (windowStateInWorker), like every read of a container; before plan
+   * step 11F2 the Docker port of the window sent it through the worker's generic `docker` operation.
    */
-  private async containerStateText(containerName: string): Promise<string> {
+  private async containerStateText(environment: Environment, containerName: string, signal: AbortSignal): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
-    try {
-      return String(await this.deps.docker.containerState(containerName));
-    } catch (error) {
-      return `not readable: ${errorMessage(error)}`;
-    }
+    // Review round 2 of PR #113 (A2-L1): not passive, as the relay was before (a worker lost after the open is opened
+    // again at once), bounded, and ended by the cancel of the open.
+    const value = await this.deps.service.windowStateInWorker(environment, containerName, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS)]),
+    });
+    return value === undefined ? 'not readable' : String(value.state);
   }
 
   /**
@@ -2551,7 +2552,7 @@ export class Controller implements vscode.Disposable {
     let state = 'not read';
     for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
       if (signal.aborted) return undefined;
-      state = await this.containerStateText(containerName);
+      state = await this.containerStateText(environment, containerName, signal);
       if (state === 'running') return undefined;
       if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS, signal);
     }

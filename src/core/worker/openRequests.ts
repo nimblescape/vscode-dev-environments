@@ -22,7 +22,7 @@ import { isBuildRecord, isEnvironmentOf, type EnvironmentRegistry } from '../sto
 import { isStorageId } from '../storage/paths';
 import { BUSY_OPERATIONS, type BusyMarkView } from '../pipeline/busyMarks';
 import { buildRecordFits } from '../pipeline/imageRecord';
-import { DEFAULT_CONFIG_PATH, isRepositoryName, MAX_REFUSED_ITEMS_LENGTH } from '../pipeline/pipelineRules';
+import { DEFAULT_CONFIG_PATH, isRepositoryName, MAX_REFUSED_ITEMS_LENGTH } from '../pipeline/recordRules';
 import {
   readLiveness,
   registryOpenRecords,
