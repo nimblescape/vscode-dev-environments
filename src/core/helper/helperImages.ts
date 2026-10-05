@@ -281,6 +281,14 @@ export class HelperImages {
   }
 
   /**
+   * Review round 1 of PR #113 (A-L2; round 2, A2-L3: its own place): the helper image of a step of the workspace helper without the image of an open
+   * (the cache, without its maintenance: only a missing tag is built), for WorkspaceHelper.
+   */
+  runImage(options: EnsureImageOptions): Promise<HelperImageUse> {
+    return this.image(options, false);
+  }
+
+  /**
    * The background prebuild (user decision 2026-09-29: no previous helper image; HelperPrebuild): makes sure that the
    * helper tag exists on the engine of the operation, and builds it when it is missing, without the maintenance of
    * ensureImage (like the helper runs). It shares the cached promise of this instance with ensureImage and the helper
@@ -288,14 +296,6 @@ export class HelperImages {
    * the build is cancelled, and an open that waited for it builds again for itself. Plan step 6, PR D: on every engine,
    * local or remote (it no longer returns `undefined` for a remote one). Throws like ensureImage.
    */
-  /**
-   * Review round 1 of PR #113 (A-L2): the helper image of a step of the workspace helper without the image of an open
-   * (the cache, without its maintenance: only a missing tag is built), for WorkspaceHelper.
-   */
-  runImage(options: EnsureImageOptions): Promise<HelperImageUse> {
-    return this.image(options, false);
-  }
-
   async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse> {
     return this.image({ signal: options.signal, onBuild: options.onBuild }, false);
   }

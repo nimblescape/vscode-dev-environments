@@ -22,7 +22,7 @@ import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import type { EnvironmentOperations } from '../core/pipeline/environmentOperations';
-import { PipelineTexts, type OpenResult } from '../core/pipeline/operationBase';
+import { PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS, type OpenResult } from '../core/pipeline/operationBase';
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
@@ -2103,9 +2103,13 @@ export class Controller implements vscode.Disposable {
    * PR #113 (A-M1): read by the worker of the engine (windowStateInWorker), like every read of a container; before plan
    * step 11F2 the Docker port of the window sent it through the worker's generic `docker` operation.
    */
-  private async containerStateText(environment: Environment, containerName: string): Promise<string> {
+  private async containerStateText(environment: Environment, containerName: string, signal: AbortSignal): Promise<string> {
     if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
-    const value = await this.deps.service.windowStateInWorker(environment, containerName);
+    // Review round 2 of PR #113 (A2-L1): not passive, as the relay was before (a worker lost after the open is opened
+    // again at once), bounded, and ended by the cancel of the open.
+    const value = await this.deps.service.windowStateInWorker(environment, containerName, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS)]),
+    });
     return value === undefined ? 'not readable' : String(value.state);
   }
 
@@ -2548,7 +2552,7 @@ export class Controller implements vscode.Disposable {
     let state = 'not read';
     for (let attempt = 1; attempt <= READY_CHECKS; attempt++) {
       if (signal.aborted) return undefined;
-      state = await this.containerStateText(environment, containerName);
+      state = await this.containerStateText(environment, containerName, signal);
       if (state === 'running') return undefined;
       if (attempt < READY_CHECKS) await this.delay(this.deps.timing?.readyPollMs ?? READY_POLL_MS, signal);
     }
