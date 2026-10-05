@@ -162,6 +162,19 @@ describe('only the processes that a rule can count are asked, a few at a time (r
     expect(most).toBe(4);
   });
 
+  it('a failed answer counts only that process as running; the others of its batch and the later batches are asked (review round 2 of PR #107)', async () => {
+    const fresh = new Date(T0).toISOString();
+    const statuses: WindowStatus[] = Array.from({ length: 10 }, (_, i) => ({ windowId: `w${i}`, pid: 3000 + i, environmentId: ENV_ID, state: 'active' as const, updatedAt: fresh }));
+    h = harness((pid) => pid === PID, { windowStatuses: async () => statuses }, async (pid) => (pid === 3001 ? Promise.reject(new Error('channel busy')) : false));
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.userCommandsError = gone();
+    await rejection(h.service.open(TARGET, options()));
+    expect(new Set(asked)).toEqual(new Set(statuses.map((status) => status.pid)));
+    // The window of that process counts as connected: the container is left running.
+    expect(h.docker.containersOf(ENV_ID).some((container) => container.state === 'running')).toBe(true);
+    expect(h.logger.warnings.filter((line) => line.includes('could not be read: channel busy'))).toEqual(['Whether the process 3001 runs could not be read: channel busy']);
+  });
+
   it('the mark of this window\'s process is never asked about', async () => {
     await seedEnvironment(h, { extra: { busy: { ...BUSY, pid: PID, windowId: 'window-old' } } });
     await h.service.open(TARGET, options());
