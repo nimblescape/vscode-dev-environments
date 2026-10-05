@@ -382,6 +382,28 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
       }
     });
 
+    it('the pull without the refused login keeps the output and the signal of the pull (review round 1 of PR #110, B)', async () => {
+      const { run, state } = logins({ 'ghcr.io': { username: 'octo', password: 'gho_old' } });
+      const seen: { login: boolean; signal: AbortSignal | undefined }[] = [];
+      const engine: DockerEngine = {
+        ...unusedEngine(),
+        pull: async (_reference, options) => {
+          seen.push({ login: options?.login !== undefined, signal: options?.signal });
+          if (options?.login) throw new EngineError('unauthorized', 401);
+          options?.onLine?.('done');
+        },
+      };
+      const output: string[] = [];
+      const signal = new AbortController().signal;
+      const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_REGISTRY ? state.slot : undefined), run);
+      await docker.pullImage('ghcr.io/o/i:1', { onOutput: (text) => void output.push(text), signal });
+      expect(seen).toEqual([
+        { login: true, signal },
+        { login: false, signal },
+      ]);
+      expect(output).toEqual(['done\n']);
+    });
+
     it('a login only for a registry that the daemon reads the same way; the Docker Hub aliases and a port (review round 1 of PR #110, A-L2)', async () => {
       const { run, state } = logins({ 'registry-1.docker.io': { username: 'hub', password: 'hub_x' }, 'localhost:5000': { username: 'local', password: 'local_x' } });
       const { engine, pulls } = engineWith(state);
