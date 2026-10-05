@@ -244,8 +244,12 @@ export function checkedConfigurationChange(value: unknown): ConfigurationChange 
 }
 
 /** Plan step 11E4c: a build number of a request: a whole number above zero. */
+/** Plan step 11E4c: the highest build number that a request records. */
+export const MAX_BUILD_NUMBER = 1_000_000_000;
+
 function checkedBuildNumber(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw invalid('build number');
+  // Review round 1 of PR #106 (A-L3): bounded, far above any count of builds.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0 || value > MAX_BUILD_NUMBER) throw invalid('build number');
   return value;
 }
 
@@ -515,10 +519,13 @@ export function requestOpenRecords(
       return registry.update((file) => {
         // One environment per repository and account on a Docker host (concept D-3): the one that another window created
         // meanwhile is the answer, and the open uses it (as openFirst does).
-        const existing = file.environments.find((entry) => isEnvironmentOf(entry, repository, scope.account.id, scope.dockerHost));
-        if (existing) return existing;
         const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-        if (file.environments.some((entry) => entry.id === id || same(entry.volumeName, name) || same(entry.containerName, name))) {
+        const existing = file.environments.find((entry) => isEnvironmentOf(entry, repository, scope.account.id, scope.dockerHost));
+        // Review round 1 of PR #106 (A-M1): an answer of an existing entry never has the ID of the request, so the operation
+        // never counts it as its created one (which dropCreated would remove).
+        if (existing && !same(existing.id, id)) return existing;
+        // Review round 1 of PR #106 (A-L2): the IDs compared as the volume and container names are.
+        if (file.environments.some((entry) => same(entry.id, id) || same(entry.volumeName, name) || same(entry.containerName, name))) {
           throw new HelperOperationError('invalid', 'The registry has an environment of the ID or the volume of the request already.', false);
         }
         file.environments.push(environment);

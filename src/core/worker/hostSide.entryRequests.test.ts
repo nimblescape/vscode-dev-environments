@@ -18,7 +18,7 @@ import type { EnvironmentRegistry } from '../storage/registry';
 import type { BuildRecord, BusyMark, Environment, GitHubAccount, KeptVolume, RefusedUpdate, RegistryFile } from '../types';
 import { DETAILED_REQUESTS, FLOW_REQUESTS, SCOPED_REQUESTS, type HostCall, type HostSide } from './hostSide';
 import { hostSideHandler } from './hostSideHandler';
-import { requestOpenRecords, type OpenRequestScope } from './openRequests';
+import { MAX_BUILD_NUMBER, requestOpenRecords, type OpenRequestScope } from './openRequests';
 import { workerHostSide } from './workerHostSide';
 import { hostOpenRecords } from './workerServices';
 
@@ -198,7 +198,9 @@ describe('the entry of a first open, the configuration and the build records as 
 
     it('refuses an ID or a volume that the registry has; nothing is written', async () => {
       // An entry of another repository with the ID, and one whose volume has the name of the new entry.
-      for (const existing of [entryOf(NEW, { repository: 'acme/web' }), entryOf(OTHER, { repository: 'acme/web', volumeName: name(NEW).toUpperCase() })]) {
+      // Review round 1 of PR #106 (A-L2): and the ID in other case.
+      const otherCase = entryOf(NEW.toUpperCase(), { repository: 'acme/web', volumeName: name(OTHER), containerName: name(OTHER) });
+      for (const existing of [entryOf(NEW, { repository: 'acme/web' }), entryOf(OTHER, { repository: 'acme/web', volumeName: name(NEW).toUpperCase() }), otherCase]) {
         const { ask, file } = firstOpen([existing]);
         await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('already') });
         expect(file().environments).toEqual([existing]);
@@ -216,6 +218,23 @@ describe('the entry of a first open, the configuration and the build records as 
       // This operation did not create it: it never removes it.
       await expect(ask('dropCreated', OTHER)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('not the one that the operation created') });
       expect(file().environments).toEqual([{ ...theirs, owner: ACCOUNT }]);
+    });
+
+    it('refuses the ID of the entry of the repository: it is never answered as the created one, which dropCreated would remove (review round 1 of PR #106, A-M1)', async () => {
+      for (const existing of [entryOf(NEW), entryOf(NEW, { busy: ownCreate() }), entryOf(NEW.toUpperCase(), { repository: 'Acme/API' })]) {
+        const { ask, file } = firstOpen([existing]);
+        await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('already') });
+        // The operation is bound to no environment: no mark, no removal.
+        await expect(ask('markBusy', existing.id, 'create')).rejects.toMatchObject({ code: 'invalid' });
+        await expect(ask('dropCreated', existing.id)).rejects.toMatchObject({ code: 'invalid' });
+        expect(file().environments).toEqual([existing]);
+      }
+    });
+
+    it('never for an operation without a repository (review round 1 of PR #106, A-L1)', async () => {
+      const { ask, file } = setup([], { scope: { dockerHost: HOST } });
+      await expect(ask('createEnvironment', CREATE)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('another repository') });
+      expect(file().environments).toEqual([]);
     });
 
     it('an entry of the repository of another account or on another Docker host is no clash', async () => {
@@ -500,6 +519,8 @@ describe('the entry of a first open, the configuration and the build records as 
         ['the image of another repository', buildRecord(ID, 7, { environmentImage: environmentImageName('acme/web', ID, 7) })],
         ['a build number 0', buildRecord(ID, 0)],
         ['a build number that is no whole number', { ...buildRecord(ID, 7), buildNumber: 7.5 }],
+        // Review round 1 of PR #106 (A-L3).
+        ['a build number above the bound', buildRecord(ID, MAX_BUILD_NUMBER + 1)],
         ['an image ID that is no sha256', buildRecord(ID, 7, { imageId: 'abc' })],
         ['an image ID of another algorithm', buildRecord(ID, 7, { imageId: `sha512:${'e'.repeat(64)}` })],
         ['a digest that is no sha256', buildRecord(ID, 7, { images: { 'node:22': 'latest' } })],
@@ -601,8 +622,11 @@ describe('the entry of a first open, the configuration and the build records as 
       }, () => undefined),
     );
     // As openFirst builds it in the worker: its clock, owner and mark are not sent.
-    await records.createEnvironment({ ...entryOf(NEW), createdAt: '1999-01-01T00:00:00.000Z', busy: ownCreate({ windowId: 'worker' }) });
+    const built = { ...entryOf(NEW), createdAt: '1999-01-01T00:00:00.000Z', busy: ownCreate({ windowId: 'worker' }) };
+    await records.createEnvironment(built);
     expect(file().environments[0]).toMatchObject({ id: NEW, createdAt: new Date(NOW).toISOString(), owner: ACCOUNT, busy: ownCreate() });
+    // Review round 1 of PR #106 (A-L6): the open goes on with the entry as the extension recorded it.
+    expect(built).toEqual(file().environments[0]);
     await records.configuration(NEW, { select: DEFAULT, shutdownActionNone: false, addVolumes: ['devenv-cache'], addServiceVolumes: ['devenv-cache'], keepRefusedFor: { configPath: DEFAULT, configHash: DIGEST }, serviceFolders: { folders: [], overflow: false }, cloned: true });
     await records.build(NEW, { kind: 'number', buildNumber: 1 });
     const record = buildRecord(NEW, 1, { compose: { service: 'app', images: [`${composeProjectName(REPOSITORY, NEW)}-app`], serviceImages: [], version: '2.39.0', inputsHash: DIGEST } });

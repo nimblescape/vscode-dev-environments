@@ -104,6 +104,8 @@ export function hostOpenRecords(host: HostSide): OpenRecords {
       // The extension answered the environment of the repository that another window of the account created meanwhile:
       // the open finds it and uses it (openFirst), as when the registry refuses a second one.
       if (entry.id !== environment.id) throw new Error(`An environment of ${environment.repository} of the GitHub account exists already.`);
+      // Review round 1 of PR #106 (A-L6): the open goes on with the entry as the extension recorded it (its clock, mark, owner).
+      Object.assign(environment, entry);
     },
     dropCreated: (environmentId) => records.dropCreated(environmentId),
     createMark: (environmentId, kind, previous) => records.createMark(environmentId, kind, previous),

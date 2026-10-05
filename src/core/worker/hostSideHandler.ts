@@ -543,7 +543,8 @@ async function record(host: HostSide, call: string, args: unknown[], context: Re
       argumentCount(args, 1);
       if (context.environment.id !== undefined) throw new HelperOperationError('invalid', 'The operation has an environment already: it creates none.', false);
       const request = checkedCreateRequest(args[0]);
-      if (context.repository !== undefined && request.repository !== context.repository) {
+      // Review round 1 of PR #106 (A-L1): only an operation of a repository creates its entry.
+      if (context.repository === undefined || request.repository !== context.repository) {
         throw new HelperOperationError('invalid', 'The environment of the request is of another repository than the one of the operation.', false);
       }
       const entry = await records.createEnvironment(request.id, request.repository, request.configPath, openScope(dockerHost));
