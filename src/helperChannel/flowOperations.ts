@@ -16,12 +16,14 @@ import {
   parseListConfigurationsParams,
   parseReconcileParams,
   parseHeartbeatParams,
-  parseMonitorSettingsParams,
   parseMonitorEnsureParams,
+  parseOpenParams,
+  OPEN_PROGRESS_DETAIL,
+  type OpenParams,
+  type OpenValue,
   type MonitorEnsureValue,
   parseRecordGitStateParams,
   type HeartbeatValue,
-  type MonitorSettingsValue,
   type RecordGitStateValue,
   parseStopParams,
   parseTokenRemoveParams,
@@ -36,7 +38,7 @@ import {
   type ReconcileValue,
 } from '../core/helperChannel/protocol';
 import { isBatchHelperUnavailable, isUserFacingError } from '../core/errors';
-import { isAbortError, silentProgress, type Logger } from '../core/ports';
+import { isAbortError, silentProgress, type Logger, type ProgressReporter } from '../core/ports';
 import { errorMessage } from '../core/errors';
 import { readOwnHelper, type OwnHelper } from '../core/worker/ownHelper';
 import { workerServices } from '../core/worker/workerServices';
@@ -49,6 +51,7 @@ import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
 import type { DockerEngine } from '../core/worker/dockerEngine';
 import { removeTokenFlow } from '../core/worker/tokenRemoveFlow';
 import { sendHeartbeat, sendMonitorSettings } from '../core/worker/monitorFlow';
+import type { ExtensionSettings } from '../core/types';
 import { engineMonitor, limited } from '../core/worker/engineMonitor';
 import analysisScript from 'devenv:analysis-script';
 import { WorkerConfigurationAnalyzer, analysisSlots } from '../core/helper/configurationAnalysisRunner';
@@ -438,25 +441,6 @@ export function heartbeatOperation(engineOf: EngineOfOperation): OperationHandle
 }
 
 /**
- * Plan step 11D1: `monitorSettings`, the image settings or the image list for the Session Monitor of the worker's engine
- * (monitorFlow.sendMonitorSettings). Best effort: a failure is logged and answered as not sent.
- */
-export function monitorSettingsOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    const checked = parseMonitorSettingsParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the monitorSettings operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorSettings operation takes no secret.');
-    const what = 'settings' in checked ? 'The image settings' : 'The image list';
-    const result = await sendMonitorSettings(engineOf(context), checked, context.signal).catch((error: unknown) => {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorSettings operation was cancelled.');
-      throw error;
-    });
-    if (!result.ok) context.log(`${what} could not be given to the Session Monitor: ${result.detail}`, 'warn');
-    return { sent: result.ok } satisfies MonitorSettingsValue;
-  };
-}
-
-/**
  * Plan step 11D1 (user decision Q2 of 2026-10-02): `recordGitState`, the Git state of the running dev container of an
  * environment that a window releases, by the worker's own pipeline (EnvironmentService.recordGitState): the record
  * through `record get`, the state recorded through `record recordGitSummary`. No lock: it only reads on the engine.
@@ -550,6 +534,143 @@ export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf:
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorEnsure operation was cancelled.');
       throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+    }
+  };
+}
+
+/**
+ * Plan step 11E6: the settings of the pipeline of an open from its OpenSettings: the host access checks of its repository
+ * (`hostAccessChecksOff` names it only when they are off), and nothing that the pipeline does not read.
+ */
+export function openSettingsOf(repository: string, settings: OpenParams['settings']): ExtensionSettings {
+  return {
+    reopenLastOnStartup: false,
+    stopOnClose: settings.stopOnClose,
+    waitingTimeSeconds: settings.waitingTimeSeconds,
+    updateImagesOnConnect: settings.updateImagesOnConnect,
+    respectShutdownActionNone: settings.respectShutdownActionNone,
+    owners: [],
+    includeArchived: false,
+    includeForks: false,
+    refreshIntervalMinutes: 0,
+    hostAccessChecksOff: settings.hostAccessChecks === 'off' ? [repository] : [],
+    ...(settings.stopAfterMinutes !== undefined ? { stopAfterMinutes: settings.stopAfterMinutes } : {}),
+  };
+}
+
+/** Plan step 11E6: the progress of the pipeline as the progress of the operation (OPEN_PROGRESS_DETAIL for a detail). */
+export function operationProgress(context: OperationContext): ProgressReporter {
+  return {
+    step: (step) => context.progress(step),
+    detail: (message) => context.progress(OPEN_PROGRESS_DETAIL, message),
+  };
+}
+
+/**
+ * Plan step 11E6 (decision D1 of 2026-10-05): the image settings and the image list of an open for the Session Monitor of
+ * the worker's engine, after its ensure: the settings when they name prefixes, the list when the open carries one.
+ * Best effort: a failure is logged. Returns whether the monitor took the list.
+ */
+export async function giveMonitorImages(
+  engine: DockerEngine,
+  params: Pick<OpenParams, 'images' | 'repositories'>,
+  logger: Logger,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (params.images.prefixes.length > 0) {
+    const settings = await sendMonitorSettings(engine, { settings: params.images }, signal);
+    if (!settings.ok) logger.warn(`The image settings could not be given to the Session Monitor: ${settings.detail}`);
+  }
+  if (params.repositories === undefined) return false;
+  const list = await sendMonitorSettings(engine, { repositories: params.repositories }, signal);
+  if (!list.ok) logger.warn(`The image list could not be given to the Session Monitor: ${list.detail}`);
+  return list.ok;
+}
+
+/**
+ * Plan step 11E6 (decision D1 of 2026-10-05): the Session Monitor of an open: its ensure with the image maintenance of
+ * the parameters, then its image settings and list (giveMonitorImages); each with the signal of the operation when the
+ * pipeline gives none (review round 1 of PR #108, A-I1). `imageListSent`: the monitor took the list.
+ */
+export function openMonitor(
+  engine: DockerEngine,
+  own: OwnHelper,
+  logger: Logger,
+  script: () => string,
+  params: Pick<OpenParams, 'images' | 'repositories'>,
+  operationSignal: AbortSignal,
+  ensure: typeof ensureWorkerMonitor = ensureWorkerMonitor,
+): { monitorEnsure: (signal: AbortSignal | undefined) => Promise<unknown>; monitorImages: (signal: AbortSignal | undefined) => Promise<void>; imageListSent: () => boolean } {
+  let sent = false;
+  return {
+    monitorEnsure: (signal) => ensure(engine, own, logger, script, params.images, signal ?? operationSignal),
+    monitorImages: async (signal) => {
+      if (await giveMonitorImages(engine, params, logger, signal ?? operationSignal)) sent = true;
+    },
+    imageListSent: () => sent,
+  };
+}
+
+/**
+ * Plan step 11E6 (decisions of 2026-10-03 and 2026-10-04; A1 and D1 of 2026-10-05): `open`, the open of an environment by
+ * the worker's own pipeline (workerServices, EnvironmentService.open or openEnvironment): the records, the questions,
+ * the token and the registry logins through the requests of the operation, the lock and the batch helper (on the
+ * worker's own image) taken here, the Session Monitor of the engine made sure with the image maintenance of the
+ * parameters (ensureWorkerMonitor, with the signal of the operation when the pipeline gives none: review round 1 of PR
+ * #108, A-I1), its image settings and list given after it (giveMonitorImages), and its first heartbeat with the time
+ * limit of the settings. It answers with what the window needs to connect (A1); a refusal of the pipeline is its value.
+ */
+export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, script: () => string, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
+  return async (params, context) => {
+    const checked = parseOpenParams(params);
+    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the open operation are invalid.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The open operation takes no secret: it asks for the ones it needs.');
+    context.progress('open', checked.environmentId ?? checked.repository);
+    let ownHelper: OwnHelper;
+    try {
+      ownHelper = await ownHelperOf(context);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
+      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const engine = engineOf(context);
+    const logger = contextLogger(context);
+    const monitor = openMonitor(engine, ownHelper, logger, script, checked, context.signal);
+    const { service } = workerServices({
+      host: flowHost(context),
+      engine,
+      secretOf: (name) => context.secrets[name],
+      forgetSecret: (name) => context.forgetSecret(name),
+      logger,
+      ownHelper,
+      dockerHost: checked.dockerHost,
+      owner: checked.owner,
+      environmentLock: workerEnvironmentLock(lockDeps, (p) => openBatch(context, p), context),
+      analyzer: workerAnalyzer(context),
+      settings: openSettingsOf(checked.repository, checked.settings),
+      monitorSource: checked.monitorSource,
+      monitorEnsure: monitor.monitorEnsure,
+      monitorImages: monitor.monitorImages,
+    });
+    const sent = (): { imageListSent?: true } => (monitor.imageListSent() ? { imageListSent: true } : {});
+    const options = {
+      progress: operationProgress(context),
+      signal: context.signal,
+      ...(checked.forceRebuild === true ? { forceRebuild: true } : {}),
+      ...(checked.configPath !== undefined ? { configPath: checked.configPath } : {}),
+    };
+    try {
+      const result =
+        checked.environmentId !== undefined
+          ? await service.openEnvironment(checked.environmentId, options)
+          : await service.open({ repository: checked.repository, ...checked.target!, defaultBranch: checked.target!.defaultBranch ?? null }, options);
+      return {
+        opened: { environmentId: result.environment.id, containerName: result.containerName, remoteWorkspaceFolder: result.remoteWorkspaceFolder },
+        ...sent(),
+      } satisfies OpenValue;
+    } catch (error) {
+      return { ...flowRefusal(error, context), ...sent() } satisfies OpenValue;
     }
   };
 }

@@ -3,10 +3,11 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11B (decision of 2026-10-03, the worker is the deputy): what a flow in the worker needs from the user's
-// computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`, `connect`).
+// computer, as one interface per kind of request of plan step 11A (`question`, `local`, `record`, `secret`; plan step 11E6,
+// decision A1 of 2026-10-05: no `connect`, the open answers with what the window needs).
 // The worker's side of them (workerHostSide) sends the requests; the extension's side (hostSideHandler, src/vscode)
 // answers them. Pure types, the check of a request, and the requests of each flow; no I/O, no `vscode`.
-import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MONITOR_ENSURE, OP_MONITOR_SETTINGS, OP_RECONCILE, OP_RECORD_GIT_STATE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
+import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MONITOR_ENSURE, OP_OPEN, OP_RECONCILE, OP_RECORD_GIT_STATE, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, SECRET_REGISTRY, SECRET_TOKEN, type AskKind } from '../helperChannel/protocol';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import type { BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
@@ -141,18 +142,12 @@ export interface HostSecrets {
   registry(registry: string): Promise<{ username?: string; identityToken?: boolean; serveraddress: string; password: string } | undefined>;
 }
 
-/** What the window needs to connect at the end of an open (the extension connects it through the Dev Containers extension). */
-export interface HostConnect {
-  connect(data: { environmentId: string; container: string; user?: string; folder: string }): Promise<void>;
-}
-
 /** Everything that a flow in the worker needs from the user's computer. */
 export interface HostSide {
   questions: HostQuestions;
   state: HostState;
   records: HostRecords;
   secrets: HostSecrets;
-  connect: HostConnect;
 }
 
 /**
@@ -236,11 +231,63 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   [OP_RECONCILE]: ['record restore'],
   // Plan step 11D1: the commands of the Session Monitor need nothing from this computer (their parameters carry them).
   [OP_HEARTBEAT]: [],
-  [OP_MONITOR_SETTINGS]: [],
   // Plan step 11D2: the ensure of the monitor needs nothing from this computer either.
   [OP_MONITOR_ENSURE]: [],
   // Plan step 11D1: the Git state of a release reads the record and records the state of its environment (SCOPED_REQUESTS).
   [OP_RECORD_GIT_STATE]: ['record get', 'record recordGitSummary'],
+  // Plan step 11E6: the open reads the registry (the entry, the environment of the repository and the account, the volumes
+  // that other environments record), the windows and pending files of this computer, the account, the profile and the
+  // window's lifecycle memory; it rebuilds the registry from the volumes before a first open (`record restore`); it writes
+  // the records of the open (each for its environment: SCOPED_REQUESTS), the pending file of the window, and the busy
+  // marks of the open (and of its Delete, when the files are missing and the user deletes the environment); it asks the
+  // questions of the open, the token and the registry logins. `local settings` is not sent: the settings come with the
+  // parameters.
+  [OP_OPEN]: [
+    'record get',
+    'record list',
+    'record read',
+    'record findForAccount',
+    'record restore',
+    'local account',
+    'local viewer',
+    'local windowStatuses',
+    'local pendings',
+    'local processAlive',
+    'local unrecordedLifecycle',
+    'record rememberLifecycle',
+    'record forgetLifecycle',
+    'record sessionFile.writePending',
+    'record sessionFile.removePending',
+    'record markBusy.create',
+    'record markBusy.update',
+    'record markBusy.rebuild',
+    'record markBusy.delete',
+    'record clearBusy',
+    'record createMark',
+    'record stepMark',
+    'record ownerLogin',
+    'record lifecycleMark',
+    'record openFinished',
+    'record createEnvironment',
+    'record dropCreated',
+    'record configuration',
+    'record build',
+    // The records of kept volumes that are gone from the engine (hostAccessInput).
+    'record forgetKeptVolumes',
+    // Delete of the environment after "files missing" (concept 7.12), as the operation `delete` sends them.
+    'record remove',
+    'record sessionFile.removeOperation',
+    'record sessionFile.removeDisconnectRequest',
+    'record sessionFile.removeReopenOf',
+    'question confirmUntrustedRepository',
+    'question configurationChanged',
+    'question configurationKindChanged',
+    'question filesMissing',
+    'question recreateContainer',
+    'question message',
+    'secret token',
+    'secret registry',
+  ],
 };
 
 /**
@@ -269,7 +316,7 @@ export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record remove': 0,
   'record sessionFile': 1,
   'record recordGitSummary': 0,
-  // Plan step 11E4b: the registry writes of the open (OpenRecords); no operation sends them before plan step 11E6.
+  // Plan step 11E4b: the registry writes of the open (OpenRecords); plan step 11E6: the operation `open` sends them.
   'record createMark': 0,
   'record stepMark': 0,
   'record ownerLogin': 0,

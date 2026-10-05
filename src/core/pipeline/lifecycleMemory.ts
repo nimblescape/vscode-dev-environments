@@ -8,12 +8,24 @@
 // operation (`local unrecordedLifecycle`, `record rememberLifecycle`, `record forgetLifecycle`). Pure; no `vscode`.
 import { sameContainer } from './pipelineRules';
 
+/**
+ * Plan step 11E6 (review round 1 of PR #107, A-L2): what the window remembers for an environment whose open in the worker
+ * ended without its answer after it began `up`: which container runs without its lifecycle commands is not known, so
+ * every running container of the environment counts as one (when in doubt, its lifecycle commands run again).
+ */
+export const LIFECYCLE_UNKNOWN = 'unknown';
+
+/** Whether the remembered `mark` names `containerId`: the container itself, or any one when it is LIFECYCLE_UNKNOWN. */
+export function rememberedFor(mark: string, containerId: string): boolean {
+  return mark === LIFECYCLE_UNKNOWN || sameContainer(mark, containerId);
+}
+
 export interface LifecycleMemory {
-  /** The container of the environment that the window remembers, if any. */
+  /** The container of the environment that the window remembers (or LIFECYCLE_UNKNOWN), if any. */
   get(environmentId: string): Promise<string | undefined>;
-  /** Remembers `containerId` for the environment (it replaces the one remembered before). */
+  /** Remembers `containerId` (or LIFECYCLE_UNKNOWN) for the environment (it replaces the one remembered before). */
   remember(environmentId: string, containerId: string): Promise<void>;
-  /** Forgets the container of the environment when it is `containerId` (sameContainer). */
+  /** Forgets the container of the environment when it is `containerId` (rememberedFor). */
   forget(environmentId: string, containerId: string): Promise<void>;
 }
 
@@ -25,7 +37,7 @@ export function windowLifecycleMemory(): LifecycleMemory {
     remember: async (environmentId, containerId) => void remembered.set(environmentId, containerId),
     forget: async (environmentId, containerId) => {
       const known = remembered.get(environmentId);
-      if (known !== undefined && sameContainer(known, containerId)) remembered.delete(environmentId);
+      if (known !== undefined && rememberedFor(known, containerId)) remembered.delete(environmentId);
     },
   };
 }

@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DockerTarget } from '../core/docker/dockerHost';
 import type { OperationOptions } from '../core/helperChannel/helperChannel';
-import { OP_HEARTBEAT, OP_MONITOR_ENSURE, OP_MONITOR_SETTINGS, OP_RECORD_GIT_STATE, OP_WINDOW_STATE } from '../core/helperChannel/protocol';
+import { OP_HEARTBEAT, OP_MONITOR_ENSURE, OP_RECORD_GIT_STATE, OP_WINDOW_STATE } from '../core/helperChannel/protocol';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
@@ -40,18 +40,6 @@ describe('the calls of a window to the Session Monitor, as operations of the wor
     // An answer that does not fit, and a worker that cannot be reached, are failures (never `missing`, so no repair).
     expect(await monitorWith(() => ({ ok: 'yes' })).monitor.heartbeat(TARGET, HEARTBEAT)).toEqual({ ok: false, missing: false, detail: 'the worker answered the heartbeat with an invalid value' });
     expect(await monitorWith(() => new Error('the worker could not be reached')).monitor.heartbeat(TARGET, HEARTBEAT)).toEqual({ ok: false, missing: false, detail: 'the worker could not be reached' });
-  });
-
-  it('the image settings and list: true when the monitor took them; else logged and false', async () => {
-    const settings = { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'UTC' };
-    const { monitor, calls } = monitorWith(() => ({ sent: true }));
-    expect(await monitor.monitorSettings(TARGET, { settings })).toBe(true);
-    expect(calls[0]).toEqual([OP_MONITOR_SETTINGS, { settings }, { target: TARGET, timeoutMs: MONITOR_FLOW_TIMEOUT_MS }]);
-    const refused = monitorWith(() => ({ sent: false }));
-    expect(await refused.monitor.monitorSettings(TARGET, { repositories: [] })).toBe(false);
-    const failing = monitorWith(() => new Error('no worker'));
-    expect(await failing.monitor.monitorSettings(TARGET, { repositories: [] })).toBe(false);
-    expect(failing.lines).toEqual(['warn The image list could not be given to the Session Monitor: no worker']);
   });
 
   it('the container of an environment exists unless the worker reads it as missing; a failure counts as not there', async () => {

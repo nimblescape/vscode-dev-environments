@@ -3,22 +3,21 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11D1 (decision of 2026-10-03, "every remote action is a worker operation"): the calls of this window to the
-// Session Monitor of an engine, as operations of the worker of that engine: the heartbeats (`heartbeat`), the image
-// settings and list (`monitorSettings`), the check that the container of an environment exists there (`windowState`),
-// the Git state of a release (`recordGitState`), and (plan step 11D2) the ensure of the monitor (`monitorEnsure`). Before, a `docker exec` through the relay, a direct `docker exec -i`,
-// and a `docker container inspect`. No `vscode` here; never throws, except the Git state (its caller bounds and logs it).
+// Session Monitor of an engine, as operations of the worker of that engine: the heartbeats (`heartbeat`), the check that
+// the container of an environment exists there (`windowState`), the Git state of a release (`recordGitState`), and (plan
+// step 11D2) the ensure of the monitor (`monitorEnsure`). Plan step 11E6 (decision D1 of 2026-10-05): the image settings
+// and list come with the operation `open`. Before, a `docker exec` through the relay, a direct `docker exec -i`, and a
+// `docker container inspect`. No `vscode` here; never throws, except the Git state (its caller bounds and logs it).
 import type { DockerTarget } from '../core/docker/dockerHost';
 import { errorMessage } from '../core/errors';
 import {
   OP_HEARTBEAT,
   OP_MONITOR_ENSURE,
-  OP_MONITOR_SETTINGS,
   OP_RECORD_GIT_STATE,
   OP_WINDOW_STATE,
   parseHeartbeatValue,
   parseMonitorEnsureParams,
   parseMonitorEnsureValue,
-  parseMonitorSettingsValue,
   parseRecordGitStateParams,
   parseRecordGitStateValue,
   parseWindowStateParams,
@@ -60,19 +59,6 @@ export function workerMonitor(deps: WorkerMonitorDeps) {
         return value;
       } catch (error) {
         return { ok: false, missing: false, detail: errorMessage(error) };
-      }
-    },
-
-    /** The image settings (`settings`) or the image list (`repositories`) for the monitor of `target`; true when it took them. */
-    async monitorSettings(target: DockerTarget, params: { settings: ImageSettings } | { repositories: string[] }): Promise<boolean> {
-      const what = 'settings' in params ? 'The image settings' : 'The image list';
-      try {
-        const value = parseMonitorSettingsValue(await flow(OP_MONITOR_SETTINGS, params, { target, timeoutMs: MONITOR_FLOW_TIMEOUT_MS }));
-        if (value === undefined) throw new Error('the worker answered with an invalid value');
-        return value.sent;
-      } catch (error) {
-        logger.warn(`${what} could not be given to the Session Monitor: ${errorMessage(error)}`);
-        return false;
       }
     },
 

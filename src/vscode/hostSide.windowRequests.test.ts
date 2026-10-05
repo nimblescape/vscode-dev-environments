@@ -9,6 +9,7 @@
 // operation). No operation sends them before plan step 11E6.
 import { describe, expect, it, vi } from 'vitest';
 import { silentLogger } from '../core/ports';
+import { OP_OPEN } from '../core/helperChannel/protocol';
 import type { GitHubViewer } from '../core/helper/containerGit';
 import { windowLifecycleMemory } from '../core/pipeline/lifecycleMemory';
 import { extensionHostSide, type HostSideDeps } from './hostSide';
@@ -70,9 +71,11 @@ function handlerOf(host: HostSide, environmentId: string | null = ID) {
 }
 
 describe('the facts of the window as requests (plan step 11E4d)', () => {
-  it('no operation may send them before plan step 11E6; the memory only for the environment of the operation', () => {
-    for (const allowed of Object.values(FLOW_REQUESTS)) {
-      expect(allowed.filter((call) => /^(local viewer|local unrecordedLifecycle|record rememberLifecycle|record forgetLifecycle)$/.test(call))).toEqual([]);
+  // Plan step 11E6: changed, the operation `open` sends them (and no other operation).
+  it('only the operation open may send them; the memory only for the environment of the operation', () => {
+    for (const [op, allowed] of Object.entries(FLOW_REQUESTS)) {
+      const open = allowed.filter((call) => /^(local viewer|local unrecordedLifecycle|record rememberLifecycle|record forgetLifecycle)$/.test(call));
+      expect(open, op).toEqual(op === OP_OPEN ? ['local viewer', 'local unrecordedLifecycle', 'record rememberLifecycle', 'record forgetLifecycle'] : []);
     }
     expect(SCOPED_REQUESTS).toMatchObject({ 'local unrecordedLifecycle': 0, 'record rememberLifecycle': 0, 'record forgetLifecycle': 0 });
     expect(SCOPED_REQUESTS).not.toHaveProperty(['local viewer']);

@@ -106,7 +106,9 @@ export function hostSideHandler(
     if (signal.aborted) throw new HelperOperationError('cancelled', 'The operation ended.', false);
     try {
       // Review round 1 of 11C2b (A-R1-M2): a question names the repository of the operation, never a text of the worker.
-      if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && request.args[0] !== scope.repository) {
+      // Plan step 11E6: as the registry compares repositories (isEnvironmentOf), without case: the entry of the open may spell
+      // its repository otherwise than the target of the operation.
+      if (request.kind === 'question' && QUESTIONS_WITH_REPOSITORY.has(request.call) && scope.repository !== undefined && !sameRepository(request.args[0], scope.repository)) {
         throw new HelperOperationError('invalid', `The question ${request.call} names another repository than the one of the operation.`, false);
       }
       if (request.kind !== 'question') return await answer(host, request.kind, request.call, request.args, { dockerHost: scope.dockerHost, repository: scope.repository, logger, replaced, environment });
@@ -158,8 +160,17 @@ interface RequestContext {
 /** Plan step 11E4b: the most marks that the handler of an operation remembers as replaced by its `record markBusy`. */
 const MAX_REPLACED_MARKS = 8;
 
-/** Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. */
-const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete']);
+/** Plan step 11E6: the same repository, as the registry compares them (isEnvironmentOf: without case). */
+function sameRepository(value: unknown, repository: string): boolean {
+  return typeof value === 'string' && value.toLowerCase() === repository.toLowerCase();
+}
+
+/**
+ * Review round 1 of 11C2b (A-R1-M2): the questions whose first argument is the name of the repository. Plan step 11E6: the
+ * questions of the open too (a worker never asks the trust, or a rebuild, for another repository than the one of its
+ * operation).
+ */
+const QUESTIONS_WITH_REPOSITORY = new Set(['confirmDelete', 'confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer']);
 
 /** The most names of a question of Delete. */
 const MAX_QUESTION_NAMES = 1000;
@@ -330,13 +341,6 @@ async function answer(host: HostSide, kind: AskKind, call: string, args: unknown
       return { value: await record(host, call, args, context) };
     case 'secret':
       return secret(host, call, args);
-    case 'connect': {
-      if (call !== 'connect' || typeof args[0] !== 'object' || args[0] === null) {
-        throw new HelperOperationError('invalid', `The request connect ${call} is unknown.`, false);
-      }
-      await host.connect.connect(args[0] as Parameters<HostSide['connect']['connect']>[0]);
-      return { value: null };
-    }
   }
 }
 
@@ -453,8 +457,22 @@ async function record(host: HostSide, call: string, args: unknown[], context: Re
     case 'get':
       return (await records.get(strings(args, 1)[0])) ?? null;
     case 'findForAccount': {
-      const [repository, accountId, dockerHost] = strings(args, 3);
-      return (await records.findForAccount(repository, accountId, dockerHost)) ?? null;
+      const [repository, accountId, onHost] = strings(args, 3);
+      // Plan step 11E6 (review round 2 of PR #106): an operation of a repository without its environment yet (the open
+      // of a repository) is bound to the environment that it finds for the repository of the operation, the account
+      // signed in here and the Docker host of the operation: the existing one, or the one that its `record restore` added.
+      // Only then may it change that entry (SCOPED_REQUESTS); an operation that is bound already finds no other one.
+      const bindable = context.repository !== undefined && sameRepository(repository, context.repository) && dockerHost !== undefined && onHost === dockerHost;
+      if (bindable && context.environment.id === undefined) {
+        const account = await host.state.account(false);
+        if (account === undefined || account.id !== accountId) throw new HelperOperationError('invalid', 'The account of the request is not the one signed in.', false);
+      }
+      const found = await records.findForAccount(repository, accountId, onHost);
+      if (found !== undefined && bindable) {
+        if (context.environment.id === undefined) context.environment.id = found.id;
+        else if (context.environment.id !== found.id) throw new HelperOperationError('invalid', 'The operation found another environment than its own.', false);
+      }
+      return found ?? null;
     }
     case 'remove': {
       const [id] = strings(args, 1);
@@ -467,7 +485,11 @@ async function record(host: HostSide, call: string, args: unknown[], context: Re
     }
     case 'forgetKeptVolumes': {
       const names = args[0];
-      if (!stringList(names)) throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
+      // Review round 1 of PR #111 (A-L2): volume names, at most as many as a question names (the worker reads which kept
+      // volumes are gone from its engine; it holds that engine anyway, so the records are no more than its word).
+      if (!stringList(names) || names.length > MAX_QUESTION_NAMES || !names.every((name) => VOLUME_NAME.test(name))) {
+        throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
+      }
       await records.forgetKeptVolumes(names as string[]);
       return null;
     }

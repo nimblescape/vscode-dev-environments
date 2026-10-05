@@ -46,8 +46,6 @@ export interface HostSideDeps {
   viewer?: (token: string, signal?: AbortSignal) => Promise<GitHubViewer>;
   /** Plan step 11E4d (decision of 2026-09-29): the memory of this window, which its own pipeline uses too. */
   lifecycleMemory: LifecycleMemory;
-  /** Connects the window at the end of an open (plan step 11E; until then it is not called). */
-  connect?: (data: { environmentId: string; container: string; user?: string; folder: string }) => Promise<void>;
   logger: Logger;
 }
 
@@ -182,12 +180,6 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         return login === undefined ? undefined : { username: login.username, serveraddress: GITHUB_PACKAGES_REGISTRY, password: login.password };
       },
     },
-    connect: {
-      connect: async (data) => {
-        if (deps.connect === undefined) throw new Error('This window connects no environment from the worker.');
-        await deps.connect(data);
-      },
-    },
   };
 }
 
@@ -230,6 +222,8 @@ export function extensionFlow(
     passive?: boolean;
     onAnswer?: (call: string, args: unknown[], value: unknown) => void;
     onQuestion?: (state: 'asked' | 'settled') => void;
+    // Plan step 11E6: the progress of the flow (the steps of the open).
+    onProgress?: (step: string, detail?: string) => void;
     // Plan step 11D1: the engine of the flow when it is not the current one (the heartbeats and the release of a window
     // go to the engine that the window uses the environment on).
     target?: DockerTarget;
@@ -241,6 +235,7 @@ export function extensionFlow(
       timeoutMs: options.timeoutMs,
       // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.
       ...(options.passive === true ? { passive: true } : {}),
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
       // Review round 1 of 11C2b (A-R1-M1, A-R1-M2): the repository that the questions name, and the observer of the answers.
       onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
         environmentId: environmentOf(params),

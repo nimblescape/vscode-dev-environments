@@ -106,6 +106,11 @@ export class HelperOperationError extends Error {
     readonly code: string,
     message: string,
     readonly timedOut: boolean,
+    /**
+     * Review round 2 of PR #111 (A2-M1): the helper ended the operation itself (its cancel: a shutdown of the worker, a
+     * signal, a defect), as its result says (`cancelled`); a refusal of the operation is none.
+     */
+    readonly aborted = false,
   ) {
     super(message);
     this.name = 'HelperOperationError';
@@ -543,7 +548,7 @@ export class HelperChannel {
         }
         this.logResult(message.id, pending, message.ok ? undefined : message.error.message);
         if (message.ok) pending.resolve(message.value);
-        else pending.reject(new HelperOperationError(message.error.code, message.error.message, message.timedOut));
+        else pending.reject(new HelperOperationError(message.error.code, message.error.message, message.timedOut, message.cancelled));
         return;
       }
     }

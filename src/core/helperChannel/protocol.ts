@@ -216,7 +216,9 @@ export interface CancelledAnswer {
  * Plan step 11A (decision of 2026-10-03, the worker is the deputy): a request of the operation `id` to the extension,
  * which answers it with `answer` (number `ask`, counted per operation). ASK_KINDS: `question` (a question to the user),
  * `local` (state on the user's computer), `record` (a change of the local records), `secret` (a secret that only the
- * user's computer has), `connect` (the data that the window needs to connect). `payload`: checked by the extension.
+ * user's computer has). `payload`: checked by the extension. Plan step 11E6 (decision A1 of 2026-10-05): no `connect`
+ * request; the operation `open` answers with what the window needs to connect, and the extension connects it after the
+ * lock of the environment is released.
  */
 export interface AskAnswer {
   t: 'ask';
@@ -226,7 +228,7 @@ export interface AskAnswer {
   payload: unknown;
 }
 
-export const ASK_KINDS = ['question', 'local', 'record', 'secret', 'connect'] as const;
+export const ASK_KINDS = ['question', 'local', 'record', 'secret'] as const;
 export type AskKind = (typeof ASK_KINDS)[number];
 /** Plan step 11A: the most open requests of one operation. */
 export const MAX_OPEN_ASKS = 16;
@@ -1386,40 +1388,6 @@ export function parseHeartbeatValue(value: unknown): HeartbeatValue | undefined 
 }
 
 /**
- * Plan step 11D1: `monitorSettings`, what the Session Monitor of the worker's engine needs for its image maintenance: the
- * settings of this computer (`monitor.js settings -`) or the image repositories that the extension read from GitHub
- * (`monitor.js images -`), on the input of the command. Best effort; no request, no secret. Parameters
- * MonitorSettingsParams; value MonitorSettingsValue.
- */
-export const OP_MONITOR_SETTINGS = 'monitorSettings';
-
-export type MonitorSettingsParams = { settings: ImageSettings } | { repositories: string[] };
-
-/** `sent`: the monitor took them (else the extension sends them again at the next open). */
-export interface MonitorSettingsValue {
-  sent: boolean;
-}
-
-/** The strict check of MonitorSettingsParams (both sides): as the monitor reads its input. */
-export function parseMonitorSettingsParams(value: unknown): MonitorSettingsParams | undefined {
-  if (!isRecord(value)) return undefined;
-  if (hasOnlyKeys(value, ['settings'])) {
-    const settings = parseImageSettingsInput(JSON.stringify(value.settings) ?? '');
-    return settings === undefined ? undefined : { settings };
-  }
-  if (hasOnlyKeys(value, ['repositories'])) {
-    const repositories = parseImageListInput(JSON.stringify({ repositories: value.repositories }));
-    return repositories === undefined ? undefined : { repositories };
-  }
-  return undefined;
-}
-
-/** The check of MonitorSettingsValue (the extension). */
-export function parseMonitorSettingsValue(value: unknown): MonitorSettingsValue | undefined {
-  return isRecord(value) && hasOnlyKeys(value, ['sent']) && typeof value.sent === 'boolean' ? { sent: value.sent } : undefined;
-}
-
-/**
  * Plan step 11D1 (user decisions Q2 of 2026-10-02 and of 2026-10-04): `recordGitState`, the Git state of the running dev
  * container of an environment that a window releases (EnvironmentService.recordGitState), read by the worker and
  * recorded through `record recordGitSummary`. Parameters RecordGitStateParams; value RecordGitStateValue.
@@ -1478,4 +1446,160 @@ export function parseMonitorEnsureValue(value: unknown): MonitorEnsureValue | un
   if (!isRecord(value) || !hasOnlyKeys(value, ['outcome'])) return undefined;
   const { outcome } = value;
   return outcome === 'running' || outcome === 'started' || outcome === 'created' ? { outcome } : undefined;
+}
+
+/**
+ * Plan step 11E6 (decisions of 2026-10-03 and 2026-10-04; A1 and D1 of 2026-10-05): `open`, the open of an environment by
+ * the worker's own pipeline (EnvironmentService.open of a repository, `target`, or EnvironmentService.openEnvironment of
+ * an existing environment, `environmentId`), under the lock that the worker takes itself. Its records go to the
+ * extension as the specific requests of the open; its questions are `question` requests; the token is asked (`secret
+ * token`), the registry logins too (`secret registry`). It makes sure that the Session Monitor of its engine runs, with
+ * the image maintenance of this computer (`images`, and the image list `repositories` when the extension has one to give)
+ * (D1). It answers with what the window needs to connect (A1): the extension connects it after the lock is released.
+ * Parameters OpenParams; value OpenValue.
+ */
+export const OP_OPEN = 'open';
+
+/** Plan step 11E6: the settings of this computer that the open reads (the settings of the pipeline, for its repository). */
+export interface OpenSettings {
+  updateImagesOnConnect: boolean;
+  /** The host access checks of the repository of the open (hostAccessChecks): never the whole list of the setting. */
+  hostAccessChecks: 'on' | 'off';
+  waitingTimeSeconds: number;
+  stopOnClose: boolean;
+  respectShutdownActionNone: boolean;
+  /** The time limit of the heartbeats (stopAfterSeconds reads it); missing: the default. */
+  stopAfterMinutes?: number;
+}
+
+export interface OpenParams {
+  /** The Docker host of the operation as the extension resolved it ('' for the local Docker; DockerTargets.host). */
+  dockerHost: string;
+  /** The window that sends the operation (EnvironmentServiceDeps.owner). */
+  owner: { windowId: string; pid: number };
+  /** The id of this computer in the Session Monitor, for the first heartbeat of the open (isSourceId). */
+  monitorSource: string;
+  settings: OpenSettings;
+  /** Decision D1 of 2026-10-05: the image maintenance of this computer, for the ensure of the Session Monitor. */
+  images: ImageSettings;
+  /** Decision D1: the image repositories that the extension read from GitHub, when it has a list to give. */
+  repositories?: string[];
+  /** The repository of the open (the questions name it; a first open creates its environment). */
+  repository: string;
+  /** An existing environment (reconnect, reopen, switch, rebuild); not with `target`. */
+  environmentId?: string;
+  /** The open of the repository for the signed-in account (RepositoryTarget without its name); not with `environmentId`. */
+  target?: { defaultBranch?: string | null; configPaths: string[]; trusted: boolean };
+  /** A manual rebuild (OpenOptions.forceRebuild). */
+  forceRebuild?: true;
+  /** Select configuration (OpenOptions.configPath). */
+  configPath?: string;
+}
+
+/** What the window needs to connect (decision A1), or the refusal of the pipeline; `imageListSent`: the list was given. */
+export type OpenValue = ({ opened: OpenedEnvironment } | { refused: FlowRefusal }) & { imageListSent?: true };
+
+export interface OpenedEnvironment {
+  environmentId: string;
+  containerName: string;
+  remoteWorkspaceFolder: string;
+}
+
+/** Plan step 11E6: the progress of an open whose `step` is this carries the detail of the current step (ProgressReporter.detail). */
+export const OPEN_PROGRESS_DETAIL = 'detail';
+
+/** The longest branch of the parameters of the open, and the longest remote workspace folder of its value. */
+const MAX_OPEN_BRANCH_LENGTH = 255;
+const MAX_REMOTE_FOLDER_LENGTH = 4096;
+
+function plainOpenText(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value !== '' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/** The strict check of OpenSettings. */
+function parseOpenSettings(value: unknown): OpenSettings | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['updateImagesOnConnect', 'hostAccessChecks', 'waitingTimeSeconds', 'stopOnClose', 'respectShutdownActionNone'], ['stopAfterMinutes'])) return undefined;
+  const { updateImagesOnConnect, hostAccessChecks, waitingTimeSeconds, stopOnClose, respectShutdownActionNone, stopAfterMinutes } = value;
+  if (typeof updateImagesOnConnect !== 'boolean' || typeof stopOnClose !== 'boolean' || typeof respectShutdownActionNone !== 'boolean') return undefined;
+  if (hostAccessChecks !== 'on' && hostAccessChecks !== 'off') return undefined;
+  if (typeof waitingTimeSeconds !== 'number' || !Number.isFinite(waitingTimeSeconds)) return undefined;
+  if (stopAfterMinutes !== undefined && (typeof stopAfterMinutes !== 'number' || !Number.isFinite(stopAfterMinutes))) return undefined;
+  return {
+    updateImagesOnConnect,
+    hostAccessChecks,
+    waitingTimeSeconds,
+    stopOnClose,
+    respectShutdownActionNone,
+    ...(stopAfterMinutes !== undefined ? { stopAfterMinutes } : {}),
+  };
+}
+
+/**
+ * The strict check of OpenParams (both sides). Review round 1 of PR #108 (A-L2): the computer (`monitorSource`) and the
+ * settings are required, so that a wiring without them fails here instead of sending no first heartbeat.
+ */
+export function parseOpenParams(value: unknown): OpenParams | undefined {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['dockerHost', 'owner', 'monitorSource', 'settings', 'images', 'repository'], ['repositories', 'environmentId', 'target', 'forceRebuild', 'configPath'])
+  ) {
+    return undefined;
+  }
+  const operationTarget = parseOperationTarget(value.dockerHost, value.owner);
+  if (operationTarget === undefined) return undefined;
+  const { monitorSource, repository, environmentId, target, forceRebuild, configPath } = value;
+  if (!isSourceId(monitorSource)) return undefined;
+  if (!plainOpenText(repository, 256) || !/^[^/\s]+\/[^/\s]+$/.test(repository)) return undefined;
+  const settings = parseOpenSettings(value.settings);
+  if (settings === undefined) return undefined;
+  const images = parseImageSettingsInput(JSON.stringify(value.images) ?? '');
+  if (images === undefined) return undefined;
+  let repositories: string[] | undefined;
+  if (value.repositories !== undefined) {
+    repositories = parseImageListInput(JSON.stringify({ repositories: value.repositories }) ?? '');
+    if (repositories === undefined) return undefined;
+  }
+  // Exactly one of the two: an existing environment, or the repository for the signed-in account.
+  if ((environmentId === undefined) === (target === undefined)) return undefined;
+  if (environmentId !== undefined && !isStorageId(environmentId)) return undefined;
+  let checkedTarget: OpenParams['target'];
+  if (target !== undefined) {
+    if (!isRecord(target) || !hasOnlyKeys(target, ['configPaths', 'trusted'], ['defaultBranch'])) return undefined;
+    const { defaultBranch, configPaths, trusted } = target;
+    if (typeof trusted !== 'boolean') return undefined;
+    if (defaultBranch !== undefined && defaultBranch !== null && !plainOpenText(defaultBranch, MAX_OPEN_BRANCH_LENGTH)) return undefined;
+    if (!Array.isArray(configPaths) || configPaths.length > MAX_LISTED_CONFIGURATIONS || !configPaths.every((path) => plainOpenText(path, MAX_CONFIGURATION_PATH_LENGTH))) return undefined;
+    checkedTarget = { ...(defaultBranch !== undefined ? { defaultBranch } : {}), configPaths: [...(configPaths as string[])], trusted };
+  }
+  if (forceRebuild !== undefined && forceRebuild !== true) return undefined;
+  if (configPath !== undefined && !plainOpenText(configPath, MAX_CONFIGURATION_PATH_LENGTH)) return undefined;
+  return {
+    ...operationTarget,
+    monitorSource,
+    settings,
+    images,
+    ...(repositories !== undefined ? { repositories } : {}),
+    repository,
+    ...(environmentId !== undefined ? { environmentId } : {}),
+    ...(checkedTarget !== undefined ? { target: checkedTarget } : {}),
+    ...(forceRebuild === true ? { forceRebuild } : {}),
+    ...(configPath !== undefined ? { configPath } : {}),
+  };
+}
+
+/** The check of OpenValue (the extension): a container name of Docker, an absolute folder. */
+export function parseOpenValue(value: unknown): OpenValue | undefined {
+  if (!isRecord(value)) return undefined;
+  const { imageListSent } = value;
+  if (imageListSent !== undefined && imageListSent !== true) return undefined;
+  const sent = imageListSent === true ? { imageListSent: true as const } : {};
+  if (hasOnlyKeys(value, ['refused'], ['imageListSent'])) {
+    const refused = parseFlowRefusal(value.refused);
+    return refused === undefined ? undefined : { refused, ...sent };
+  }
+  if (!hasOnlyKeys(value, ['opened'], ['imageListSent']) || !isRecord(value.opened) || !hasOnlyKeys(value.opened, ['environmentId', 'containerName', 'remoteWorkspaceFolder'])) return undefined;
+  const { environmentId, containerName, remoteWorkspaceFolder } = value.opened;
+  if (!isStorageId(environmentId) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
+  if (!plainOpenText(remoteWorkspaceFolder, MAX_REMOTE_FOLDER_LENGTH) || !remoteWorkspaceFolder.startsWith('/')) return undefined;
+  return { opened: { environmentId, containerName, remoteWorkspaceFolder }, ...sent };
 }

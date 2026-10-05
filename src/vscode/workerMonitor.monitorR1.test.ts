@@ -33,12 +33,6 @@ describe('workerMonitor (review B-R1 probes, plan step 11D1)', () => {
     expect(MONITOR_FLOW_TIMEOUT_MS).toBeGreaterThan(MONITOR_EXEC_TIMEOUT_MS);
   });
 
-  it('the image settings: an answer that does not fit is false and logged with what was sent (WM5, WM6)', async () => {
-    const { monitor, lines } = monitorWith(() => ({ sent: 'yes' }));
-    expect(await monitor.monitorSettings(TARGET, { settings: { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'UTC' } })).toBe(false);
-    expect(lines).toEqual(['warn The image settings could not be given to the Session Monitor: the worker answered with an invalid value']);
-  });
-
   it('containerExists: the time limit and the signal; parameters beyond the checks send nothing; the local Docker is named (WM10, WM11, WM12, WM17)', async () => {
     const signal = new AbortController().signal;
     const { monitor, calls } = monitorWith(() => ({ state: 'running' }));

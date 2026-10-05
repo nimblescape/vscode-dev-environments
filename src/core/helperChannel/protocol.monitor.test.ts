@@ -2,14 +2,13 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 11D1: the strict checks of the operations `heartbeat`, `monitorSettings` and `recordGitState`.
+// Plan step 11D1: the strict checks of the operations `heartbeat` and `recordGitState` (plan step 11E6: `monitorSettings` is
+// removed, decision D1 of 2026-10-05; its checks of the settings and the list are those of `open`, protocol.open.test.ts).
 import { describe, expect, it } from 'vitest';
 import {
   MAX_MONITOR_DETAIL_LENGTH,
   parseHeartbeatParams,
   parseHeartbeatValue,
-  parseMonitorSettingsParams,
-  parseMonitorSettingsValue,
   parseRecordGitStateParams,
   parseRecordGitStateValue,
 } from './protocol';
@@ -17,7 +16,6 @@ import {
 const SOURCE = '0123456789abcdef0123456789abcdef';
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const HEARTBEAT = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: false, seq: 1 }] };
-const SETTINGS = { prefixes: ['ghcr.io/acme/base'], schedule: '7 6 * * *', timeZone: 'Europe/Vienna' };
 
 describe('the operations of the Session Monitor in the worker (plan step 11D1)', () => {
   it('heartbeat: the heartbeat as the monitor takes it, and nothing else', () => {
@@ -45,25 +43,6 @@ describe('the operations of the Session Monitor in the worker (plan step 11D1)',
     for (const odd of [null, { ok: true, missing: false }, { ok: false, detail: 'x' }, { ok: false, missing: 'no', detail: 'x' }, { ok: false, missing: false, detail: 'x'.repeat(MAX_MONITOR_DETAIL_LENGTH + 1) }, { ok: 'yes' }]) {
       expect(parseHeartbeatValue(odd), JSON.stringify(odd)).toBeUndefined();
     }
-  });
-
-  it('monitorSettings: the settings or the list as the monitor reads them, never both', () => {
-    expect(parseMonitorSettingsParams({ settings: SETTINGS })).toEqual({ settings: SETTINGS });
-    expect(parseMonitorSettingsParams({ repositories: ['ghcr.io/acme/app', 'ghcr.io/acme/app'] })).toEqual({ repositories: ['ghcr.io/acme/app'] });
-    for (const odd of [
-      {},
-      { settings: SETTINGS, repositories: [] },
-      { settings: { ...SETTINGS, schedule: 'daily' } },
-      { settings: { ...SETTINGS, timeZone: 'Mars/Base' } },
-      { settings: { ...SETTINGS, prefixes: ['docker.io/library'] } },
-      { repositories: ['not a repository'] },
-      { repositories: Array.from({ length: 501 }, (_, i) => `ghcr.io/acme/app${i}`) },
-    ]) {
-      expect(parseMonitorSettingsParams(odd), JSON.stringify(odd).slice(0, 80)).toBeUndefined();
-    }
-    expect(parseMonitorSettingsValue({ sent: true })).toEqual({ sent: true });
-    expect(parseMonitorSettingsValue({ sent: 'yes' })).toBeUndefined();
-    expect(parseMonitorSettingsValue({ sent: true, more: 1 })).toBeUndefined();
   });
 
   it('recordGitState: the environment, the Docker host and the window; the answer whether it was recorded', () => {

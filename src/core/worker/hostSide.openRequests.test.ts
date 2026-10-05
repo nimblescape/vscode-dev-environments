@@ -8,7 +8,7 @@
 // (requestOpenRecords), with its owner, clock, account and view of the windows. No operation sends them before plan step
 // 11E6, so the handler runs here with an explicit allowance.
 import { describe, expect, it } from 'vitest';
-import { OP_DELETE } from '../helperChannel/protocol';
+import { OP_DELETE, OP_OPEN } from '../helperChannel/protocol';
 import { registryBusyMarks, type BusyMarkView } from '../pipeline/busyMarks';
 import { endedMark } from '../pipeline/openRecords';
 import { silentLogger } from '../ports';
@@ -90,9 +90,11 @@ const REQUESTS: readonly [string, ...unknown[]][] = [
 ];
 
 describe('the registry writes of the open as requests (plan step 11E4b)', () => {
-  it('no operation may send them before plan step 11E6', async () => {
-    for (const allowed of Object.values(FLOW_REQUESTS)) {
-      expect(allowed.filter((call) => /^record (createMark|stepMark|ownerLogin|lifecycleMark|openFinished)/.test(call))).toEqual([]);
+  // Plan step 11E6: changed, the operation `open` sends them (and no other operation).
+  it('only the operation open may send them', async () => {
+    for (const [op, allowed] of Object.entries(FLOW_REQUESTS)) {
+      const open = allowed.filter((call) => /^record (createMark|stepMark|ownerLogin|lifecycleMark|openFinished)/.test(call));
+      expect(open, op).toEqual(op === OP_OPEN ? ['record createMark', 'record stepMark', 'record ownerLogin', 'record lifecycleMark', 'record openFinished'] : []);
     }
     const handler = hostSideHandler({ records: {} } as unknown as HostSide, silentLogger, FLOW_REQUESTS[OP_DELETE], { environmentId: ID, dockerHost: HOST });
     await expect(handler('record', { call: 'ownerLogin', args: [ID] }, new AbortController().signal)).rejects.toMatchObject({ code: 'invalid' });

@@ -177,8 +177,8 @@ interface Harness {
     processEnv: ReturnType<typeof vi.fn>;
   };
   service: {
-    open: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
-    openEnvironment: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
+    openInWorker: ReturnType<typeof vi.fn<(target: RepositoryTarget, options: OpenOptions) => Promise<OpenResult>>>;
+    openEnvironmentInWorker: ReturnType<typeof vi.fn<(id: string, options: OpenOptions) => Promise<OpenResult>>>;
     stop: ReturnType<typeof vi.fn<(id: string) => Promise<void>>>;
     safetyCheck: ReturnType<typeof vi.fn<(id: string, options: OperationOptions) => Promise<GitSummary | undefined>>>;
     /** Review round 11 (G3, G4). */
@@ -279,8 +279,8 @@ function createHarness(
     processEnv: vi.fn(() => ({})),
   };
   const service: Harness['service'] = {
-    open: vi.fn(async () => openResult(environment())),
-    openEnvironment: vi.fn(async (id: string) => openResult((await registry.get(id)) ?? environment())),
+    openInWorker: vi.fn(async () => openResult(environment())),
+    openEnvironmentInWorker: vi.fn(async (id: string) => openResult((await registry.get(id)) ?? environment())),
     stop: vi.fn(async () => {}),
     safetyCheck: vi.fn(async () => undefined),
     repositoryServiceData: vi.fn(async () => []),
@@ -500,7 +500,7 @@ async function connectHere(env: Environment): Promise<void> {
   await h.controller.openAttachedWindow(env, env.containerName, { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) });
   // The window reads its connection state and branch in the background; wait for it, so tests start from a quiet state.
   await settle(() => h.service.currentBranch.mock.calls.length > reads, 'the branch of the window');
-  h.service.openEnvironment.mockClear();
+  h.service.openEnvironmentInWorker.mockClear();
 }
 
 /** A live window 2 that holds a busy mark on `env`. */
@@ -519,12 +519,12 @@ async function otherWindowBusy(env: Environment): Promise<void> {
 }
 
 /**
- * The pipeline starts the container: after openEnvironment, Docker reports it as running (user decision 2026-09-28:
+ * The pipeline starts the container: after openEnvironmentInWorker, Docker reports it as running (user decision 2026-09-28:
  * the window connects only to a container that runs).
  */
 function pipelineStartsContainer(): void {
-  const start = h.service.openEnvironment.getMockImplementation();
-  h.service.openEnvironment.mockImplementation(async (id: string, options: OpenOptions) => {
+  const start = h.service.openEnvironmentInWorker.getMockImplementation();
+  h.service.openEnvironmentInWorker.mockImplementation(async (id: string, options: OpenOptions) => {
     const result = await start!(id, options);
     h.docker.containerState.mockResolvedValue('running');
     return result;
@@ -772,7 +772,7 @@ describe('Start', () => {
   it('creates the environment of a repository, then connects this window after the pending connection file', async () => {
     const info = repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] });
     h.sidebar.infos.set('acme/api', info);
-    h.service.open.mockImplementation(async () => {
+    h.service.openInWorker.mockImplementation(async () => {
       const env = environment();
       await h.registry.add(env);
       return openResult(env);
@@ -780,8 +780,8 @@ describe('Start', () => {
 
     await run('start', row('acme/api', undefined, info));
 
-    expect(h.service.open).toHaveBeenCalledTimes(1);
-    expect(h.service.open.mock.calls[0][0]).toEqual({
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+    expect(h.service.openInWorker.mock.calls[0][0]).toEqual({
       repository: 'acme/api',
       defaultBranch: 'main',
       configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'],
@@ -798,8 +798,8 @@ describe('Start', () => {
   it('opens an existing environment with the pipeline and connects this window (switch)', async () => {
     await h.registry.add(environment());
     await run('start', row('acme/api', environment()));
-    expect(h.service.open).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ configPath: undefined }));
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ configPath: undefined }));
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -808,7 +808,7 @@ describe('Start', () => {
     await h.registry.add(env);
     await connectHere(env);
     await run('start', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
   });
@@ -820,7 +820,7 @@ describe('Start', () => {
     h.docker.containerState.mockResolvedValue('stopped');
     pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -831,7 +831,7 @@ describe('Start', () => {
       { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: ENV_ID, state: 'active', updatedAt: iso(NOW) },
     ]);
     await run('start', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
@@ -853,8 +853,8 @@ describe('Start', () => {
     h.docker.containerState.mockResolvedValue('stopped');
     pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', row('acme/api', env));
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.coordinator.writePending).toHaveBeenCalledWith(ENV_ID);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
@@ -866,7 +866,7 @@ describe('Start', () => {
     h.docker.containerState.mockRejectedValue(new Error('Cannot connect to the Docker daemon'));
     pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('start', row('acme/api', env));
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -874,7 +874,7 @@ describe('Start', () => {
     const env = environment();
     await h.registry.add(env);
     const progress = cancellableProgress();
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       // The pipeline wrote the pending connection file in its last step; then the user pressed Cancel.
       await h.sessionFiles.writePending(id, WINDOW_ID);
       progress.cancel();
@@ -893,7 +893,7 @@ describe('Start', () => {
     const env = environment();
     await h.registry.add(env);
     const progress = cancellableProgress();
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       return openResult(env);
     });
@@ -947,13 +947,13 @@ describe('Start', () => {
     await h.registry.add(environment());
     await h.registry.add(web);
     const webPipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementation(async (id: string) => (id === ENV_ID ? openResult(environment()) : webPipeline.promise));
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => (id === ENV_ID ? openResult(environment()) : webPipeline.promise));
     const apiState = deferred<string>();
     h.docker.containerState.mockImplementation(async (name: string) => (name === CONTAINER ? apiState.promise : 'running'));
     const first = run('start', row('acme/api', environment()));
     await settle(() => h.docker.containerState.mock.calls.some(([name]) => name === CONTAINER), 'the check of the first container');
     const second = run('start', row('acme/web', web));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 2, 'the second pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 2, 'the second pipeline');
     apiState.resolve('running');
     await first;
     expect(h.connection.open).not.toHaveBeenCalled();
@@ -982,11 +982,11 @@ describe('Start', () => {
   it('runs one operation per environment at a time; a second Start is ignored', async () => {
     await h.registry.add(environment());
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockReturnValueOnce(pipeline.promise);
+    h.service.openEnvironmentInWorker.mockReturnValueOnce(pipeline.promise);
     const first = run('start', row('acme/api', environment()));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the first pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the first pipeline');
     await run('start', row('acme/api', environment()));
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     pipeline.resolve(openResult(environment()));
     await first;
     expect(h.connection.open).toHaveBeenCalledTimes(1);
@@ -1006,12 +1006,12 @@ describe('Start', () => {
       [ENV_ID, deferred<OpenResult>()],
       [web.id, deferred<OpenResult>()],
     ]);
-    h.service.openEnvironment.mockImplementation((id: string) => pipelines.get(id)!.promise);
+    h.service.openEnvironmentInWorker.mockImplementation((id: string) => pipelines.get(id)!.promise);
     // For example the automatic reopen of acme/api, then the user's Start of acme/web.
     const first = run('start', row('acme/api', environment()));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the first pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the first pipeline');
     const second = run('start', row('acme/web', web));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 2, 'the second pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 2, 'the second pipeline');
 
     pipelines.get(ENV_ID)!.resolve(openResult(environment()));
     await first;
@@ -1027,12 +1027,12 @@ describe('Start', () => {
     await h.registry.add(environment());
     await h.registry.add(web);
     const api = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       if (id === ENV_ID) return api.promise;
       throw new UserFacingError('cancelled', PipelineTexts.cancelled);
     });
     const first = run('start', row('acme/api', environment()));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the first pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the first pipeline');
     await run('start', row('acme/web', web));
     api.resolve(openResult(environment()));
     await first;
@@ -1041,7 +1041,7 @@ describe('Start', () => {
 
   it('shows a failed pipeline with Show details and Try again, and does not connect', async () => {
     await h.registry.add(environment());
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
     await run('start', row('acme/api', environment()));
     expect(h.connection.open).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.buildFailed, Actions.showDetails, Actions.tryAgain);
@@ -1049,7 +1049,7 @@ describe('Start', () => {
 
   it('shows nothing when the user cancels', async () => {
     await h.registry.add(environment());
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('cancelled', PipelineTexts.cancelled));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('cancelled', PipelineTexts.cancelled));
     await run('start', row('acme/api', environment()));
     expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
     expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
@@ -1059,7 +1059,7 @@ describe('Start', () => {
     h.sidebar.infos.set('acme/web', repositoryInfo('acme/web'));
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
     await run('start');
-    expect(h.service.open.mock.calls[0][0].repository).toBe('acme/web');
+    expect(h.service.openInWorker.mock.calls[0][0].repository).toBe('acme/web');
   });
 });
 
@@ -1105,10 +1105,10 @@ describe('Stop', () => {
     expect(h.service.stop).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.otherWindowsUnknown, Actions.showDetails);
     await run('rebuild', row('acme/api', environment()));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     // PR #76 review round 1 (B-R1-2): an Open never replaces a container under a window that cannot be read.
     await run('start', row('acme/api', environment()));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.delete);
     await run('delete', row('acme/api', environment()));
     expect(h.service.deleteInWorker).not.toHaveBeenCalled();
@@ -1494,7 +1494,7 @@ describe('Delete', () => {
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.openEnvironment);
     await run('delete', row('acme/api', environment()));
     expect(h.service.deleteInWorker).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.connection.open).toHaveBeenCalled();
   });
 
@@ -1508,7 +1508,7 @@ describe('Delete', () => {
     expect(warningMessages()).toHaveLength(1);
     expect(warningMessages()[0]).toBe(Messages.deleteUnsaved('acme/api', '1 uncommitted'));
     expect(h.service.deleteInWorker).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -1521,7 +1521,7 @@ describe('Delete', () => {
     }
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
     expect(h.service.deleteInWorker).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('asks for the plain confirmation when there are no changes or the volume is missing, and stops on Cancel', async () => {
@@ -1614,7 +1614,7 @@ describe('Rebuild', () => {
     await h.registry.add(env);
     await connectHere(env);
     await run('rebuild', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readOperations()).toEqual([
       expect.objectContaining({ environmentId: ENV_ID, operation: 'rebuild', reason: 'manual' }),
     ]);
@@ -1628,7 +1628,7 @@ describe('Rebuild', () => {
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.rebuildNow);
     await run('rebuild', row('acme/api', environment()));
     expect(warningMessages()).toEqual([ControllerTexts.otherWindowClosesConnection('acme/api')]);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(await h.disconnectRequests.read(ENV_ID)).toEqual(
       expect.objectContaining({ operation: 'rebuild', reason: 'manual', requestedBy: WINDOW_ID }),
     );
@@ -1641,7 +1641,7 @@ describe('Rebuild', () => {
     fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: unknown[]) => items[1]);
     fakeVscode.window.showWarningMessage.mockResolvedValueOnce(Actions.rebuildNow);
     await run('selectConfiguration', row('acme/api', environment()));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(await h.disconnectRequests.read(ENV_ID)).toEqual(
       expect.objectContaining({
         operation: 'rebuild',
@@ -1654,7 +1654,7 @@ describe('Rebuild', () => {
   it('rebuilds an environment of no window without connecting this window', async () => {
     await h.registry.add(environment());
     await run('rebuild', row('acme/api', environment()));
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ forceRebuild: true }));
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ forceRebuild: true }));
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -1760,7 +1760,7 @@ describe('Select configuration…', () => {
       return items[1];
     });
     await run('selectConfiguration', row('acme/api', environment()));
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(
       ENV_ID,
       expect.objectContaining({ configPath: '.devcontainer/python/devcontainer.json', forceRebuild: true }),
     );
@@ -1790,7 +1790,7 @@ describe('Select configuration…', () => {
     await run('selectConfiguration', row('acme/api', undefined, info));
     // Plan step 11B3b: changed expectation, the listing goes through the worker.
     expect(h.service.listConfigurationsInWorker).not.toHaveBeenCalled();
-    expect(h.service.open).toHaveBeenCalledWith(
+    expect(h.service.openInWorker).toHaveBeenCalledWith(
       expect.objectContaining({ repository: 'acme/api' }),
       expect.objectContaining({ configPath: '.devcontainer/go/devcontainer.json' }),
     );
@@ -1861,7 +1861,7 @@ describe('Window roles', () => {
     const env = environment();
     await h.registry.add(env);
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.not.objectContaining({ forceRebuild: true }));
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.not.objectContaining({ forceRebuild: true }));
     expect(h.connection.open).not.toHaveBeenCalled();
     expect(h.statusBar.showConnected).toHaveBeenCalledWith('acme/api', 'main');
   });
@@ -1870,17 +1870,17 @@ describe('Window roles', () => {
     const env = environment();
     await h.registry.add(env);
     await h.controller.openAttachedWindow(env, CONTAINER, { environmentId: ENV_ID, windowId: 'old', createdAt: iso(NOW - 30_000) });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('role A: does not show Reconnect for a container that the running pipeline has not started yet', async () => {
     const env = environment();
     await h.registry.add(env);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.service.openEnvironmentInWorker.mockImplementationOnce(() => pipeline.promise);
     h.docker.containerState.mockResolvedValue('stopped');
     const opening = h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     // Heartbeats while the pipeline starts Docker and the container.
     h.controller.onHeartbeat();
     h.controller.onHeartbeat();
@@ -1898,7 +1898,7 @@ describe('Window roles', () => {
   it('role A: shows Reconnect when the pipeline fails', async () => {
     const env = environment();
     await h.registry.add(env);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('dockerStartFailed', Messages.dockerStartFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerStartFailed, Actions.showDetails, Actions.tryAgain);
@@ -1907,7 +1907,7 @@ describe('Window roles', () => {
   it('role A: leaves the environment and closes the connection when "Delete environment" removed it', async () => {
     const env = environment();
     await h.registry.add(env);
-    h.service.openEnvironment.mockImplementationOnce(async () => {
+    h.service.openEnvironmentInWorker.mockImplementationOnce(async () => {
       // Concept 7.12: the files are missing, and the user selected "Delete environment".
       await h.registry.remove(ENV_ID);
       throw new UserFacingError('cancelled', PipelineTexts.cancelled);
@@ -1923,7 +1923,7 @@ describe('Window roles', () => {
   it('role A: still shows Reconnect after a plain cancel', async () => {
     const env = environment();
     await h.registry.add(env);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('cancelled', PipelineTexts.cancelled));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('cancelled', PipelineTexts.cancelled));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     expect(h.coordinator.setEnvironment).not.toHaveBeenCalled();
@@ -1934,7 +1934,7 @@ describe('Window roles', () => {
     // The container passed the policy when it was made; the user can change the configuration in it.
     const env = environment();
     await h.registry.add(env);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
@@ -1951,7 +1951,7 @@ describe('Window roles', () => {
       const env = environment();
       await h.registry.add(env);
       h.docker.findContainer.mockResolvedValue(containerInfo(code === 'cancelled' ? undefined : '0'));
-      h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError(code, message));
+      h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError(code, message));
       await h.controller.openAttachedWindow(env, CONTAINER, undefined);
       await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
       // Review round 1 (D2): the lookup gets the name of the environment too.
@@ -1974,7 +1974,7 @@ describe('Window roles', () => {
     await h.registry.add(env);
     h.docker.findContainer.mockResolvedValue(containerInfo('0'));
     h.service.windowStateInWorker.mockResolvedValue(undefined);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     await pause(20);
@@ -1991,7 +1991,7 @@ describe('Window roles', () => {
     await run('start', row('acme/api', env));
     expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
     // The pipeline does not replace the container under this window; a Start from the empty window makes a new one.
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(h.coordinator.setEnvironment).toHaveBeenLastCalledWith(null);
     expect(warningMessages()).toEqual([ControllerTexts.outdatedContainerClosed('acme/api')]);
@@ -2002,7 +2002,7 @@ describe('Window roles', () => {
     await h.registry.add(env);
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
-    h.service.openEnvironment.mockImplementationOnce(async () => {
+    h.service.openEnvironmentInWorker.mockImplementationOnce(async () => {
       await h.registry.remove(ENV_ID);
       throw new UserFacingError('cancelled', PipelineTexts.cancelled);
     });
@@ -2034,7 +2034,7 @@ describe('Window roles', () => {
     expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(false);
     expect(fs.existsSync(denied)).toBe(true);
     expect(warningMessages()).toContainEqual(expect.stringContaining(`${OTHER_ENV_ID}.json: EACCES`));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('role B (PR #76 review round 5, A-R5-1): an unreadable operation file alone is reported, not dropped, and the window is not reopened', async () => {
@@ -2056,7 +2056,7 @@ describe('Window roles', () => {
     expect(h.service.stop).not.toHaveBeenCalled();
     expect(fs.existsSync(denied)).toBe(true);
     expect(warningMessages()).toContainEqual(expect.stringContaining(`${ENV_ID}.json: EACCES`));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -2078,7 +2078,7 @@ describe('Window roles', () => {
     expect(h.service.stop).not.toHaveBeenCalled();
     expect(fs.existsSync(h.paths.operationFile(ENV_ID))).toBe(true);
     expect(warningMessages()).toContainEqual(expect.stringContaining('EIO'));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -2096,13 +2096,13 @@ describe('Window roles', () => {
     });
     await h.controller.runEmptyWindowTasks();
     expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readReopen()).toEqual({ environmentId: ENV_ID, closedAt: iso(NOW - 5000) });
 
     // The next start of VS Code, later: the record is older than 5 seconds (REOPEN_MIN_AGE_MS).
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -2122,7 +2122,7 @@ describe('Window roles', () => {
       operationsAtConnect = fs.readdirSync(h.paths.operationsDir).length;
     });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(
       ENV_ID,
       expect.objectContaining({ forceRebuild: true, configPath: '.devcontainer/python/devcontainer.json' }),
     );
@@ -2166,7 +2166,7 @@ describe('Window roles', () => {
     });
     h.connection.isEmptyWindow.mockReturnValue(true);
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(await h.sessionFiles.readOperations()).toEqual([]);
   });
 
@@ -2175,7 +2175,7 @@ describe('Window roles', () => {
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
     h.connection.isEmptyWindow.mockReturnValue(true);
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.progressTitles[0]).toContain(Messages.opening('acme/api'));
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
@@ -2187,10 +2187,10 @@ describe('Window roles', () => {
     h.connection.isEmptyWindow.mockReturnValue(true);
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 4_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 6_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
   // Review finding F1: the age of the reopen record is measured at activation, not after the awaits (ready, the stale
@@ -2219,13 +2219,13 @@ describe('Window roles', () => {
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 3_000) });
     await h.controller.runEmptyWindowTasks();
     expect(now - Date.parse((await h.sessionFiles.readReopen())!.closedAt)).toBe(6_000);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
 
     // 6 seconds old at activation: a reopen.
     advancing();
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(now - 6_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
   });
 
   it('role B: does not reopen after Close Remote Connection, with another window, or when the setting is off', async () => {
@@ -2244,7 +2244,7 @@ describe('Window roles', () => {
 
     h.settings.reopenLastOnStartup = false;
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 });
 
@@ -2288,7 +2288,7 @@ describe('Connection of this window', () => {
     // ran the pipeline): it reads again with the worker made ready in full; still unknown, it fails, and the window is
     // disconnected (decision of 2026-10-04), without a pipeline that could replace the container under it.
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.signal instanceof AbortSignal)).toBe(true);
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(ControllerTexts.containerStateUnreadable('acme/api'), expect.anything(), expect.anything());
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
@@ -2302,7 +2302,7 @@ describe('Connection of this window', () => {
     h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
     h.docker.findContainer.mockResolvedValue(containerInfo('0'));
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(warningMessages()).toEqual([ControllerTexts.outdatedContainerClosed('acme/api')]);
   });
@@ -2313,7 +2313,7 @@ describe('Connection of this window', () => {
     await connectHere(env);
     h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
   });
@@ -2325,9 +2325,9 @@ describe('Connection of this window', () => {
     await connectHere(env);
     h.docker.containerState.mockResolvedValue('stopped');
     h.docker.findContainer.mockResolvedValue(containerInfo('0'));
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(warningMessages()).toContain(ControllerTexts.outdatedContainerClosed('acme/api'));
   });
@@ -2337,7 +2337,7 @@ describe('Connection of this window', () => {
     const env = environment();
     await h.registry.add(env);
     h.service.windowStateInWorker.mockResolvedValue(undefined);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     // The reads of the window after its open (the connection and the branch) end before the heartbeat.
@@ -2359,7 +2359,7 @@ describe('Connection of this window', () => {
     h.docker.findContainer.mockResolvedValue({ ...containerInfo(String(CONTAINER_VERSION)), labels: { [LABEL_CONTAINER_VERSION]: String(CONTAINER_VERSION), [LABEL_HOST_ACCESS]: HOST_ACCESS_UNRESTRICTED } });
     const read = h.service.windowStateInWorker.getMockImplementation()!;
     h.service.windowStateInWorker.mockResolvedValue(undefined);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -2378,11 +2378,11 @@ describe('Connection of this window', () => {
     const env = environment();
     await h.registry.add(env);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.service.openEnvironmentInWorker.mockImplementationOnce(() => pipeline.promise);
     h.docker.containerState.mockResolvedValue('stopped');
     h.docker.findContainer.mockResolvedValue(containerInfo('0'));
     const opening = h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     await run('start', { environmentId: ENV_ID });
     await new Promise((resolve) => setTimeout(resolve, 50));
     const closes = h.connection.closeRemoteConnection.mock.calls.length;
@@ -2399,10 +2399,10 @@ describe('Connection of this window', () => {
     const env = environment();
     await h.registry.add(env);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    h.service.openEnvironmentInWorker.mockImplementationOnce(() => pipeline.promise);
     h.docker.findContainer.mockResolvedValue(containerInfo('0'));
     const opening = h.controller.openAttachedWindow(env, CONTAINER, undefined);
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     const reads = h.service.windowStateInWorker.mock.calls.length;
     await run('start', { environmentId: ENV_ID });
     expect(h.service.windowStateInWorker.mock.calls.length).toBe(reads);
@@ -2425,7 +2425,7 @@ describe('Connection of this window', () => {
     h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
     h.service.windowStateInWorker.mockResolvedValue(undefined);
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.statusBar.showConnectionLost.mock.calls.length).toBe(lostCalls);
     expect(h.statusBar.showConnected.mock.calls.length).toBeGreaterThan(connectedCalls);
     expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', expect.anything());
@@ -2444,7 +2444,7 @@ describe('Connection of this window', () => {
     h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
     h.service.windowStateInWorker.mockResolvedValue(undefined);
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.statusBar.showConnectionLost.mock.calls.length).toBe(lostCalls);
     expect(h.statusBar.showConnected.mock.calls.length).toBeGreaterThan(connectedCalls);
   });
@@ -2459,7 +2459,7 @@ describe('Connection of this window', () => {
     h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
     h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'running' });
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(false);
   });
 
@@ -2485,7 +2485,7 @@ describe('Connection of this window', () => {
       return undefined;
     });
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
   });
 
@@ -2502,7 +2502,7 @@ describe('Connection of this window', () => {
     const env = environment();
     await h.registry.add(env);
     h.service.windowStateInWorker.mockResolvedValue(undefined);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -2525,9 +2525,9 @@ describe('Connection of this window', () => {
     await connectHere(env);
     h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
     h.service.windowStateInWorker.mockResolvedValueOnce({ state: 'stopped' });
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     await new Promise((resolve) => setTimeout(resolve, 20));
     h.service.windowStateInWorker.mockResolvedValue({ state: 'running', outdated: 'hostAccess' });
     const reads = h.service.windowStateInWorker.mock.calls.length;
@@ -2540,7 +2540,7 @@ describe('Connection of this window', () => {
   // Review round 5 of 11C1 (A-R5 missing tests): the pending outdated check and the reads of Start.
   async function attachUnknown(env: Environment): Promise<void> {
     h.service.windowStateInWorker.mockResolvedValue(undefined);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('helperFailed', Messages.helperFailed));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.service.windowStateInWorker.mock.calls.some((call) => call[2]?.branch === true), 'the branch read');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -2655,7 +2655,7 @@ describe('Connection of this window', () => {
     h.service.windowStateInWorker.mockResolvedValueOnce(undefined);
     h.docker.containerState.mockResolvedValueOnce('stopped');
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     h.docker.containerState.mockResolvedValue('running');
     expect(h.service.windowStateInWorker.mock.calls.length).toBeGreaterThan(reads);
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -2714,7 +2714,7 @@ describe('Connection of this window', () => {
     const lostCalls = h.statusBar.showConnectionLost.mock.calls.length;
     h.docker.containerState.mockResolvedValue('running');
     await run('start', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.statusBar.showConnectionLost.mock.calls.length).toBe(lostCalls);
     expect(h.statusBar.showConnected).toHaveBeenLastCalledWith('acme/api', expect.anything());
     // Review round 3 of 11C1 (B-R3 R7): the read of Start asks for no branch.
@@ -2726,7 +2726,7 @@ describe('Connection of this window', () => {
     const env = environment();
     await h.registry.add(env);
     h.docker.containerState.mockResolvedValue('stopped');
-    h.service.openEnvironment.mockResolvedValueOnce(openResult(env));
+    h.service.openEnvironmentInWorker.mockResolvedValueOnce(openResult(env));
     await h.controller.openAttachedWindow(env, CONTAINER, { environmentId: env.id, windowId: WINDOW_ID, createdAt: iso(NOW - 5000) });
     await settle(() => h.statusBar.showConnectionLost.mock.calls.length > 0, 'Reconnect');
   });
@@ -2760,7 +2760,7 @@ describe('Connection of this window', () => {
     h.docker.containerState.mockResolvedValue('running');
     await run('start', { environmentId: ENV_ID });
     expect(h.statusBar.showStateUnknown).toHaveBeenLastCalledWith(false);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   // Review round 1 of 11C1 (A-R1-4): a read that ends after an operation of the environment started changes nothing.
@@ -2774,11 +2774,11 @@ describe('Connection of this window', () => {
     h.controller.onHeartbeat();
     await settle(() => h.service.windowStateInWorker.mock.calls.length > reads, 'the read in the background');
     // A Start of the user meanwhile: the container does not run, the pipeline reconnects and is still running.
-    const pipeline = deferred<Awaited<ReturnType<typeof h.service.openEnvironment>>>();
-    h.service.openEnvironment.mockImplementationOnce(() => pipeline.promise);
+    const pipeline = deferred<Awaited<ReturnType<typeof h.service.openEnvironmentInWorker>>>();
+    h.service.openEnvironmentInWorker.mockImplementationOnce(() => pipeline.promise);
     h.docker.containerState.mockResolvedValue('stopped');
     const starting = run('start', { environmentId: ENV_ID });
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     read.resolve({ state: 'stopped' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(h.statusBar.showConnectionLost).not.toHaveBeenCalled();
@@ -2930,14 +2930,14 @@ describe('Accounts (concept 7.5)', () => {
   it('starts the own environment of the account for a repository that has an environment of another account (D-3)', async () => {
     await h.registry.add(environment({ owner: OTHER_ACCOUNT }));
     const own = environment({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devenv-octo-api-c1d2e3f4' });
-    h.service.open.mockImplementation(async () => {
+    h.service.openInWorker.mockImplementation(async () => {
       await h.registry.add(own);
       return openResult(own);
     });
     // A stale row without the environment, and a repository row: the environment of the other account is not named.
     await run('start', row('acme/api'));
-    expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([]);
     expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
   });
@@ -2947,36 +2947,36 @@ describe('Accounts (concept 7.5)', () => {
     ['a row that names the environment', true],
   ])('Try again after an account change: %s', async (_name, named) => {
     await h.registry.add(environment());
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
     // The user signs in with another account while the error shows, then presses Try again.
     fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
       h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
       return Actions.tryAgain;
     });
     const own = environment({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devenv-acme-api-c1d2e3f4', owner: OTHER_ACCOUNT });
-    h.service.open.mockImplementation(async () => {
+    h.service.openInWorker.mockImplementation(async () => {
       await h.registry.add(own);
       return openResult(own);
     });
     await run('start', named ? row('acme/api', environment()) : row('acme/api'));
     if (named) {
       // An environment that the command named stays that environment (the service refuses it: another account).
-      await settle(() => h.service.openEnvironment.mock.calls.length === 2, 'the second open');
-      expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID]);
-      expect(h.service.open).not.toHaveBeenCalled();
+      await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 2, 'the second open');
+      expect(h.service.openEnvironmentInWorker.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID]);
+      expect(h.service.openInWorker).not.toHaveBeenCalled();
     } else {
       // A repository gets the environment of the account that is signed in now: its first open (D-3).
       await settle(() => h.connection.open.mock.calls.length === 1, 'the connection of the other account');
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
       expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
       expect(warningMessages()).toEqual([]);
-      expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+      expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     }
   });
 
   it('Try again of a named environment (the status bar item) keeps that environment, also twice and after an account change', async () => {
     await h.registry.add(environment());
-    h.service.openEnvironment.mockRejectedValue(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    h.service.openEnvironmentInWorker.mockRejectedValue(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
     let answers = 0;
     fakeVscode.window.showErrorMessage.mockImplementation(async () => {
       answers++;
@@ -2984,9 +2984,9 @@ describe('Accounts (concept 7.5)', () => {
       return answers <= 2 ? Actions.tryAgain : undefined;
     });
     await run('start', { environmentId: ENV_ID });
-    await settle(() => h.service.openEnvironment.mock.calls.length === 3, 'the second Try again');
-    expect(h.service.openEnvironment.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID, ENV_ID]);
-    expect(h.service.open).not.toHaveBeenCalled();
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 3, 'the second Try again');
+    expect(h.service.openEnvironmentInWorker.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID, ENV_ID]);
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
   });
 
   it('asks for a sign-in for an environment when nobody is signed in', async () => {
@@ -2994,7 +2994,7 @@ describe('Accounts (concept 7.5)', () => {
     h.auth.getAccount.mockResolvedValue(undefined);
     await run('start', row('acme/api', environment()));
     expect(warningMessages()).toEqual([Messages.signInRequired]);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('lists only the environments of the account in the pickers', async () => {
@@ -3011,7 +3011,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.registry.add(env);
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.coordinator.setEnvironment).toHaveBeenCalledWith(null);
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
     expect(h.statusBar.showNotConnected).toHaveBeenCalled();
@@ -3021,7 +3021,7 @@ describe('Accounts (concept 7.5)', () => {
     const env = environment();
     await h.registry.add(env);
     // The account changes while the pipeline runs; the session event is not handled yet when the pipeline fails.
-    h.service.openEnvironment.mockImplementationOnce(async () => {
+    h.service.openEnvironmentInWorker.mockImplementationOnce(async () => {
       h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
       throw new UserFacingError('otherAccount', Messages.otherAccount('acme/api'));
     });
@@ -3131,7 +3131,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([ControllerTexts.signedOutConnection('acme/api')]);
   });
 
@@ -3170,7 +3170,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.sessionFiles.removeOperation(ENV_ID);
     h.sessionFiles.writeReopenSync({ environmentId: ENV_ID, closedAt: iso(NOW - 60_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('closes the connection with a sign-in message when nobody is signed in anymore', async () => {
@@ -3290,7 +3290,7 @@ describe('Accounts (concept 7.5)', () => {
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length >= 2, 'the second close');
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.stillConnected('acme/api'), { modal: true });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('does not close the connection again when the window has left the container, or after dispose', async () => {
@@ -3356,12 +3356,12 @@ describe('Accounts (concept 7.5)', () => {
     const env = environment();
     await h.registry.add(env);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementationOnce(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementationOnce(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       return pipeline.promise;
     });
     const start = run('start', row('acme/api', env));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     pipeline.resolve(openResult(env));
     await start;
@@ -3376,12 +3376,12 @@ describe('Accounts (concept 7.5)', () => {
     const info = repositoryInfo('acme/api');
     h.sidebar.infos.set('acme/api', info);
     const pipeline = deferred<OpenResult>();
-    h.service.open.mockImplementationOnce(async () => {
+    h.service.openInWorker.mockImplementationOnce(async () => {
       await h.registry.add(environment());
       return pipeline.promise;
     });
     const start = run('start', row('acme/api', undefined, info));
-    await settle(() => h.service.open.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openInWorker.mock.calls.length === 1, 'the pipeline');
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     pipeline.resolve(openResult(environment()));
     await start;
@@ -3393,9 +3393,9 @@ describe('Accounts (concept 7.5)', () => {
     const env = environment();
     await h.registry.add(env);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockReturnValueOnce(pipeline.promise);
+    h.service.openEnvironmentInWorker.mockReturnValueOnce(pipeline.promise);
     const start = run('start', row('acme/api', env));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     h.auth.getAccount.mockResolvedValue(undefined);
     pipeline.resolve(openResult(env));
     await start;
@@ -3414,9 +3414,9 @@ describe('Accounts (concept 7.5)', () => {
     });
     h.connection.isEmptyWindow.mockReturnValue(true);
     const pipeline = deferred<OpenResult>();
-    h.service.openEnvironment.mockReturnValueOnce(pipeline.promise);
+    h.service.openEnvironmentInWorker.mockReturnValueOnce(pipeline.promise);
     const tasks = h.controller.runEmptyWindowTasks();
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the pipeline');
     h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
     pipeline.resolve(openResult(environment()));
     await tasks;
@@ -3436,14 +3436,14 @@ describe('Accounts (concept 7.5)', () => {
         return { token: 'gho_other', account: OTHER_ACCOUNT };
       });
       // The pipeline creates the environment of the account of its session.
-      h.service.open.mockResolvedValue(openResult(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT })));
+      h.service.openInWorker.mockResolvedValue(openResult(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT })));
     });
 
     it('Start of the repository uses the environment of the new account, not the one of the account before', async () => {
       await run('start', row('acme/api'));
       expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
-      expect(h.service.openEnvironment).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
       expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
     });
 
@@ -3451,8 +3451,8 @@ describe('Accounts (concept 7.5)', () => {
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
       fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
       await run('search');
-      expect(h.service.openEnvironment).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
     });
 
     it('the repository choice of the switcher does the same', async () => {
@@ -3463,8 +3463,8 @@ describe('Accounts (concept 7.5)', () => {
       );
       await run('switchEnvironment');
       expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
-      expect(h.service.openEnvironment).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
       expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
     });
 
@@ -3476,8 +3476,8 @@ describe('Accounts (concept 7.5)', () => {
       await run('selectConfiguration', row('acme/api'));
       // Plan step 11B3b: changed expectation, the listing goes through the worker.
       expect(h.service.listConfigurationsInWorker).not.toHaveBeenCalled();
-      expect(h.service.openEnvironment).not.toHaveBeenCalled();
-      expect(h.service.open).toHaveBeenCalledWith(
+      expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
+      expect(h.service.openInWorker).toHaveBeenCalledWith(
         expect.objectContaining({ repository: 'acme/api' }),
         expect.objectContaining({ configPath: '.devcontainer/python/devcontainer.json' }),
       );
@@ -3488,7 +3488,7 @@ describe('Accounts (concept 7.5)', () => {
       // The first try: the token works, the session belongs to ACCOUNT, and the pipeline fails.
       h.auth.getSession.mockImplementation(async () => ({ token: 'gho_token', account: ACCOUNT }));
       h.auth.getAccount.mockResolvedValue(ACCOUNT);
-      h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+      h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
       // While the message shows, GitHub starts to reject the token; at the new sign-in, OTHER_ACCOUNT signs in.
       fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
         h.auth.getSession.mockImplementation(async (options?: { interactive: boolean }) => {
@@ -3501,9 +3501,9 @@ describe('Accounts (concept 7.5)', () => {
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
       fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
       await run('search');
-      await settle(() => h.service.open.mock.calls.length === 1, 'Try again');
-      expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
-      expect(h.service.open).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      await settle(() => h.service.openInWorker.mock.calls.length === 1, 'Try again');
+      expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
       expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
     });
 
@@ -3522,7 +3522,7 @@ describe('Accounts (concept 7.5)', () => {
       // ACCOUNT has no environment of acme/api; OTHER_ACCOUNT has one.
       await h.registry.add(OTHER_ENV());
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
-      h.service.open.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+      h.service.openInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
       // While the message shows, OTHER_ACCOUNT signs in; then the user selects Try again.
       fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
         h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
@@ -3536,8 +3536,8 @@ describe('Accounts (concept 7.5)', () => {
         items.find((item) => item.configPath === '.devcontainer/python/devcontainer.json'),
       );
       await run('selectConfiguration', row('acme/api'));
-      await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'Try again');
-      expect(h.service.openEnvironment).toHaveBeenCalledWith(
+      await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'Try again');
+      expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(
         OTHER_ENV_ID,
         expect.objectContaining({ configPath: '.devcontainer/python/devcontainer.json', forceRebuild: true }),
       );
@@ -3547,7 +3547,7 @@ describe('Accounts (concept 7.5)', () => {
   it('Try again of a first open of Select configuration… with the configuration of the environment of the new account already does nothing more', async () => {
     await h.registry.add(environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' }));
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
-    h.service.open.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    h.service.openInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
     let retried = false;
     fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
       h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
@@ -3560,8 +3560,8 @@ describe('Accounts (concept 7.5)', () => {
     );
     await run('selectConfiguration', row('acme/api'));
     await settle(() => retried && h.logger.info.mock.calls.some((call: unknown[]) => String(call[0]).includes('uses the configuration')), 'Try again');
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
-    expect(h.service.open).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
   });
 
   it('offers no Try again of the command itself for an error', async () => {
@@ -3714,7 +3714,7 @@ describe('the switch of the host access checks (concept section 9 "Host access",
     const env = environment();
     await h.registry.add(env);
     h.docker.findContainer.mockResolvedValue(unrestricted);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('privileged mode')));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length === 1, 'the close');
     expect(warningMessages()).toContain(ControllerTexts.unrestrictedContainerClosed('acme/api'));
@@ -3726,7 +3726,7 @@ describe('the switch of the host access checks (concept section 9 "Host access",
     const env = environment();
     await h.registry.add(env);
     h.docker.findContainer.mockResolvedValue(unrestricted);
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('variable GH_TOKEN in containerEnv')));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('hostAccess', Messages.hostAccess('variable GH_TOKEN in containerEnv')));
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     expect(h.statusBar.showConnectionLost).toHaveBeenCalledWith('acme/api', ENV_ID);
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
@@ -3747,7 +3747,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     const env = environment();
     await h.registry.add(env);
     await run('startInNewWindow', row('acme/api', env));
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.coordinator.writePending).toHaveBeenCalledWith(ENV_ID);
     // The window that ran the pipeline wrote the pending connection file: the container is in use until the new window
     // has written its status file.
@@ -3777,13 +3777,13 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
   it('opens a new repository (first open) in a new window', async () => {
     const info = repositoryInfo('acme/api');
     h.sidebar.infos.set('acme/api', info);
-    h.service.open.mockImplementation(async () => {
+    h.service.openInWorker.mockImplementation(async () => {
       const env = environment();
       await h.registry.add(env);
       return openResult(env);
     });
     await run('startInNewWindow', row('acme/api', undefined, info));
-    expect(h.service.open).toHaveBeenCalledTimes(1);
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
     expect(h.connection.openInNewWindow).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
     expect(h.connection.open).not.toHaveBeenCalled();
   });
@@ -3829,7 +3829,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     otherWindowConnected();
     await run('startInNewWindow', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
     // Review of unit 14: a request for a new window never uses the current window, also here. VS Code shows the window
     // that has this folder open (concept 7.11); if it did not find it, a new window opens and this one stays.
@@ -3842,7 +3842,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     otherWindowConnected();
     await run('start', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
@@ -3852,7 +3852,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     await connectHere(env);
     await run('startInNewWindow', row('acme/api', env));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.alreadyConnected('acme/api'));
   });
@@ -3865,7 +3865,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     h.docker.containerState.mockResolvedValue('stopped');
     pipelineStartsContainer(); // User decision 2026-09-28: the window connects only to a running container.
     await run('startInNewWindow', { environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
   });
@@ -3874,9 +3874,9 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(environment());
     await h.registry.add(web());
     const api = deferred<OpenResult>();
-    h.service.openEnvironment.mockImplementation(async (id: string) => (id === ENV_ID ? api.promise : openResult(web())));
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => (id === ENV_ID ? api.promise : openResult(web())));
     const first = run('start', row('acme/api', environment()));
-    await settle(() => h.service.openEnvironment.mock.calls.length === 1, 'the first pipeline');
+    await settle(() => h.service.openEnvironmentInWorker.mock.calls.length === 1, 'the first pipeline');
     await run('startInNewWindow', row('acme/web', web()));
     expect(h.connection.openInNewWindow).toHaveBeenCalledWith('web', '/workspaces/web');
     api.resolve(openResult(environment()));
@@ -3888,7 +3888,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     const env = environment();
     await h.registry.add(env);
     const progress = cancellableProgress();
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       progress.cancel();
       return openResult(env);
@@ -3900,7 +3900,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
 
   it('Try again after a failure opens a new window again', async () => {
     await h.registry.add(environment());
-    h.service.openEnvironment.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    h.service.openEnvironmentInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
     fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
     await run('startInNewWindow', row('acme/api', environment()));
     await settle(() => h.connection.openInNewWindow.mock.calls.length === 1, 'the new window of Try again');
@@ -3937,7 +3937,7 @@ describe('Start in a new window (unit 14, concept 6.2, 7.9, 8)', () => {
     await h.registry.add(env);
     // The file names the window that ran the pipeline, not this (new) window.
     await h.controller.openAttachedWindow(env, CONTAINER, { environmentId: ENV_ID, windowId: OTHER_WINDOW_ID, createdAt: iso(NOW - 5000) });
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.statusBar.showConnected).toHaveBeenCalled();
   });
 
@@ -4084,8 +4084,8 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
     await run('start', row('acme/api', undefined, repositoryInfo('acme/api')));
     // The local Docker is current: the service opens the repository (a new environment), not the one on build-box.
-    expect(h.service.open).toHaveBeenCalledTimes(1);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('a restored window of the current host opens as before, without a question', async () => {
@@ -4094,7 +4094,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     await h.registry.add(env);
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
     expect(remote.offerSwitchBack).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
     expect(operations.map((target) => target.host)).toEqual(['build-box']);
   });
 
@@ -4106,7 +4106,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     h.connection.currentContainerName.mockReturnValue(env.containerName);
     h.connection.currentDockerContext.mockReturnValue('my-build-box');
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     // Greenfield, drop migration logic, user decision 2026-09-28: no check of reopenWithDockerContext (removed).
     expect(h.connection.open).not.toHaveBeenCalled();
   });
@@ -4132,7 +4132,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     ]);
     h.coordinator.otherActiveWindows.mockResolvedValue([]);
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open.mock.calls).toEqual([['devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box']]);
   });
 
@@ -4148,7 +4148,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       { windowId: OTHER_WINDOW_ID, pid: OTHER_PID, environmentId: REMOTE_ENV_ID, state: 'active', updatedAt: iso(NOW) },
     ]);
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open.mock.calls).toEqual([
       ['devenv-acme-api-a1b2c3d4', '/workspaces/api', 'my-build-box'],
       ['devenv-acme-api-a1b2c3d4', '/workspaces/api'],
@@ -4168,7 +4168,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
   it('names the context of the operation, not the current one, when both are on the host', async () => {
     current = dockerTargetOf('ssh://build-box', 'my-build-box');
     await h.registry.add(remoteEnvironment());
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
       return openResult((await h.registry.get(id))!);
     });
@@ -4299,7 +4299,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     fakeVscode.window.showWarningMessage.mockResolvedValue(undefined);
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
     expect(remote.offerSwitchBack).toHaveBeenCalledWith('build-box', current);
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.docker.exec).not.toHaveBeenCalled();
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.otherDockerHost('acme/api', 'build-box', ''));
@@ -4314,7 +4314,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
       return true;
     });
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(REMOTE_ENV_ID, expect.anything());
     expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
     // The pipeline runs on the host that the switch selected.
     expect(operations.map((target) => target.host)).toEqual(['build-box']);
@@ -4337,7 +4337,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     await h.sessionFiles.removeOperation(REMOTE_ENV_ID).catch(() => {});
     h.sessionFiles.writeReopenSync({ environmentId: REMOTE_ENV_ID, closedAt: iso(NOW - 60_000) });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
@@ -4354,7 +4354,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
   it('does not connect the window when the Docker context changed to another host during the start', async () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
     await h.registry.add(remoteEnvironment());
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
       return openResult((await h.registry.get(id))!);
@@ -4405,13 +4405,13 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     };
     recreateHarness({ dockerTargets: new DockerTargets(cli, {}, silentLogger, 'linux'), remoteDocker: remote });
     await h.registry.add(remoteEnvironment());
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       currentContext = 'default';
       return openResult((await h.registry.get(id))!);
     });
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     expect(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0]).toBe(Messages.otherDockerHostAfterStart('acme/api', 'build-box', ''));
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(h.connection.open).not.toHaveBeenCalled();
@@ -4421,12 +4421,12 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     current = dockerTargetOf('ssh://build-box', 'devenv-remote-11111111');
     await h.registry.add(remoteEnvironment());
     h.docker.containerState.mockResolvedValue('stopped');
-    h.service.openEnvironment.mockImplementation(async (id: string) => {
+    h.service.openEnvironmentInWorker.mockImplementation(async (id: string) => {
       await h.sessionFiles.writePending(id, WINDOW_ID);
       return openResult((await h.registry.get(id))!);
     });
     await run('start', row('acme/api', remoteEnvironment()));
-    expect(h.service.openEnvironment).toHaveBeenCalledTimes(1);
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledTimes(1);
     // Review round 1 (F2): the pending connection file of the pipeline is removed.
     expect(await h.sessionFiles.readPendings()).toEqual([]);
     expect(h.docker.containerState.mock.calls.filter(([name]) => name === 'devenv-acme-api-a1b2c3d4').length).toBeGreaterThanOrEqual(5);
@@ -4672,7 +4672,7 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     await h.registry.add(environment());
     await click(viewRow('acme/api', environment(), 'stopped'), 0);
     expect(start).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
     // 2026-10-01: the Switch branch command was dropped (user decision). No FakeQuickPick any more.
     expect(fakeVscode.window.createQuickPick).not.toHaveBeenCalled();
   });
@@ -4686,7 +4686,7 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     expect(start).toHaveBeenCalledTimes(1);
     // The same argument as the Start button of the row.
     expect(start).toHaveBeenCalledWith({ kind: 'row', repository: 'acme/api', info: undefined, environmentId: ENV_ID });
-    expect(h.service.openEnvironment).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openEnvironmentInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
     expect(h.connection.open).toHaveBeenCalledWith(CONTAINER, '/workspaces/api');
   });
 
@@ -4696,7 +4696,7 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     await click(viewRow('acme/web', undefined), 100);
     await click(viewRow('acme/api', undefined), 200);
     expect(start).not.toHaveBeenCalled();
-    expect(h.service.open).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
   });
 
   it('starts nothing on clicks slower than the interval', async () => {
@@ -4740,7 +4740,7 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     await click(viewRow('acme/api', env, 'stopped'), 1100);
     expect(start).not.toHaveBeenCalled();
     expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalled();
-    expect(h.service.openEnvironment).not.toHaveBeenCalled();
+    expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
   });
 
   it('starts nothing where the row shows no Start (updating)', async () => {

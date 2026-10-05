@@ -126,8 +126,9 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     // Plan step 11B1, 11B2: changed expectation, the flows that run in the worker (`tokenRemove`, `stop`).
     // Plan step 11B3b: changed expectation, `listConfigurations`; plan step 11C1: changed expectation, `windowState`.
     // Plan step 11C2a: changed expectation, `delete`; plan step 11C2b: `deleteCheck`; plan step 11C3: `reconcile`; plan step 11D1: `heartbeat`,
-    // `monitorSettings`, `recordGitState`; plan step 11D2: `monitorEnsure`.
-    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'delete', 'deleteCheck', 'docker', 'heartbeat', 'listConfigurations', 'lock', 'monitorEnsure', 'monitorSettings', 'probe', 'pull', 'reconcile', 'recordGitState', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove', 'windowState']);
+    // `monitorSettings`, `recordGitState`; plan step 11D2: `monitorEnsure`; plan step 11E6: `open`, and `monitorSettings`
+    // removed (decision D1 of 2026-10-05).
+    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'delete', 'deleteCheck', 'docker', 'heartbeat', 'listConfigurations', 'lock', 'monitorEnsure', 'open', 'probe', 'pull', 'reconcile', 'recordGitState', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove', 'windowState']);
     expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
     const result = await channel.docker(['cat'], { input: 'hello channel' });
     expect(result).toEqual({ exitCode: 0, stdout: 'hello channel', stderr: '', timedOut: false });
