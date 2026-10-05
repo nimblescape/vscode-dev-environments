@@ -28,26 +28,9 @@ import {
 } from './scripts';
 import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
 
-/** The step kinds of the batch helper (each one is an operation of its ChannelServer). */
-export const BATCH_STEP_KINDS = [
-  'clone',
-  'readFiles',
-  'listConfigs',
-  'readConfiguration',
-  'build',
-  'composeModel',
-  'composeHash',
-  'createFolders',
-  'up',
-  'runUserCommands',
-  'gitFiles',
-  'ownershipFix',
-] as const;
-export type BatchStepKind = (typeof BATCH_STEP_KINDS)[number];
-
-export function isBatchStepKind(value: unknown): value is BatchStepKind {
-  return typeof value === 'string' && (BATCH_STEP_KINDS as readonly string[]).includes(value);
-}
+// Plan step 11F2: the step kinds moved to ./batchStepKinds (the window's helper channel checks them without the steps).
+import { BATCH_STEP_KINDS, isBatchStepKind, type BatchStepKind } from './batchStepKinds';
+export { BATCH_STEP_KINDS, isBatchStepKind, type BatchStepKind };
 
 /**
  * Decision 2026-10-01, Q2: Docker Compose fetches no remote `include` (Git or OCI) in the helper: these variables are set

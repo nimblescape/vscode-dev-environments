@@ -12,7 +12,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { describeDockerHost, dockerHostOf, environmentsOfHost, isOnDockerHost } from '../core/docker/dockerHost';
 import { ensureRemoteContext } from '../core/docker/remoteDocker';
 import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
-import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
@@ -116,7 +116,7 @@ export interface ControllerDeps {
   sessionFiles: SessionFiles;
   /** Requests of other windows to close this window's connection first (concept 6.2 Stop, 7.14). */
   disconnectRequests: DisconnectRequests;
-  docker: ContainerAdapter;
+  docker: BootstrapDocker;
   /**
    * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the current engine
    * (`tokenRemove` first), with the HostSide of this computer answering its requests. Undefined only in tests that do not

@@ -15,7 +15,7 @@ import { outsideOperation } from './dockerTargets';
 /** Time limit of each call (context reads are local files; an inspect may go over SSH). */
 export const ATTACH_DIAGNOSTICS_TIMEOUT_MS = 15_000;
 
-/** The part of ContainerAdapter that the diagnostics use. */
+/** The part of BootstrapDocker that the diagnostics use. */
 export interface DiagnosticsDocker {
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
 }

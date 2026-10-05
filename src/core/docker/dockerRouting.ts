@@ -12,19 +12,10 @@
 // build, pull, push, cp, context, login, compose, buildx, logs, events, prune, …) stays direct.
 import type { RunOptions } from '../ports';
 
-/** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */
-const GLOBAL_OPTIONS_WITH_VALUE = new Set(['-H', '--host', '-c', '--context', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']);
+// Plan step 11F2: the command words and the read-only calls moved to dockerCli.ts (the bootstrap's Docker CLI uses them).
+import { dockerCommandWords, isReadOnlyDockerCall } from './dockerCli';
 
-/** Docker commands that only read: `docker <command>`, or `docker <object> <command>`. */
-const READ_ONLY_COMMANDS = new Set(['info', 'version', 'ps', 'images', 'inspect']);
-const READ_ONLY_OBJECT_COMMANDS: Record<string, readonly string[]> = {
-  container: ['inspect', 'ls', 'list', 'ps'],
-  image: ['inspect', 'ls', 'list', 'history'],
-  volume: ['inspect', 'ls', 'list'],
-  network: ['inspect', 'ls', 'list'],
-  context: ['inspect', 'ls', 'list', 'show'],
-  system: ['info', 'df'],
-};
+export { dockerCommandWords, isReadOnlyDockerCall };
 
 /** The commands that may go through the worker: `docker <command>`, or `docker <object> <command>`. */
 const ROUTABLE_COMMANDS = new Set(['ps', 'inspect', 'info', 'version', 'images', 'stop', 'rm', 'rmi', 'rename', 'exec']);
@@ -34,24 +25,6 @@ const ROUTABLE_OBJECT_COMMANDS: Record<string, readonly string[]> = {
   volume: ['inspect', 'ls', 'rm', 'create'],
   network: ['inspect', 'ls', 'rm'],
 };
-
-/** The first two words after the global options of the Docker CLI (`docker -H ssh://box image inspect x` → image inspect). */
-export function dockerCommandWords(args: readonly string[]): string[] {
-  let i = 0;
-  while (i < args.length && args[i].startsWith('-')) i += GLOBAL_OPTIONS_WITH_VALUE.has(args[i]) ? 2 : 1;
-  return args.slice(i, i + 2);
-}
-
-/**
- * True for a Docker call that only reads (inspect, ls, ps, info, version…), which may run again without any effect.
- * Everything else (create, run, exec, start, stop, rm, build, pull, …) is never repeated.
- */
-export function isReadOnlyDockerCall(args: readonly string[]): boolean {
-  const [command, subcommand] = dockerCommandWords(args);
-  if (command === undefined) return false;
-  if (READ_ONLY_COMMANDS.has(command)) return true;
-  return READ_ONLY_OBJECT_COMMANDS[command]?.includes(subcommand ?? '') ?? false;
-}
 
 /** A group of short options (`-e`, `-it`, `-eKEY=value`, `-e=KEY`) whose letters before any `=` contain `letter`. */
 function shortOptionsContain(arg: string, letter: string): boolean {

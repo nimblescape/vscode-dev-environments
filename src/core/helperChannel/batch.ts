@@ -11,9 +11,8 @@
 // helper until it is cancelled (at most BATCH_HOLD_LIMIT_MS). `batchStep` relays one step to it; `batchChunk` carries an
 // input that is longer than one request of the channel, in pieces before the step. Pure functions and constants. No `vscode`.
 import { loaderCommand } from '../loader/pipeLoader';
-import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../names';
-import { SECRETS_FOLDER } from '../helper/scripts';
-import { isBatchStepKind, type BatchStepKind } from '../helper/batchSteps';
+import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
+import { isBatchStepKind, type BatchStepKind } from '../helper/batchStepKinds';
 import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, channelStepLabel, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
 
 /** Starts a batch helper and holds it (BatchParams; the value is `{}`). Long-lived, like `lock`. */

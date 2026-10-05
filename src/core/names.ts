@@ -312,3 +312,6 @@ export function containerHostname(repositoryName: string): string {
     .replace(/-+$/, '');
   return label === '' ? 'devenv' : label;
 }
+
+/** tmpfs mount of the helper for the token (only for runs with `secrets: true`). Plan step 11F2: from helper/scripts.ts. */
+export const SECRETS_FOLDER = '/run/devenv-secrets';

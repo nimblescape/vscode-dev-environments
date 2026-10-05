@@ -10,7 +10,7 @@
 // its parameters are never logged. No `vscode`.
 import { OutputTooLargeError } from '../process';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
-import type { BatchStepKind } from '../helper/batchSteps';
+import type { BatchStepKind } from '../helper/batchStepKinds';
 import {
   BATCH_CHUNK_CHARACTERS,
   BATCH_HOLD_LIMIT_MS,

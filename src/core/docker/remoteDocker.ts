@@ -52,7 +52,7 @@ export const CONTEXT_COMMAND_TIMEOUT_MS = 15_000;
 /** `docker info` in one line of JSON: the server version and the security options (`name=rootless`). */
 export const ENGINE_INFO_FORMAT = '{"version":{{json .ServerVersion}},"securityOptions":{{json .SecurityOptions}}}';
 
-/** The part of ContainerAdapter used here. */
+/** The part of BootstrapDocker used here. */
 export interface RemoteDockerCli {
   isInstalled(): boolean;
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;

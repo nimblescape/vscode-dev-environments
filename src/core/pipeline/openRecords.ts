@@ -15,7 +15,7 @@ import { isoTime } from '../ports';
 import type { BusyMark, BusyOperation, BuildRecord, Environment, GitHubAccount, GitSummary, RefusedUpdate, WindowStatus } from '../types';
 import type { EnvironmentRegistry } from '../storage/registry';
 import type { BusyMarkView } from './busyMarks';
-import { composeRecordOf, lifecycleMarkClears, refusedUpdateOf } from './pipelineRules';
+import { composeRecordOf, lifecycleMarkClears, refusedUpdateOf } from './recordRules';
 
 /**
  * PR #78 review round 2 (A-R2-1): a mark that isBusyMarkLive counts as ended (older than BUSY_MARK_MAX_AGE_MS; the epoch,

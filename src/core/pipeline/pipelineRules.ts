@@ -10,7 +10,7 @@ import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';
 import { composeMountVolumeName } from '../helper/compose';
-import { isAnonymousVolumeName, runArgsUser, truncated, type HostAccessChecks } from '../policy';
+import { isAnonymousVolumeName, runArgsUser, type HostAccessChecks } from '../policy';
 import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
@@ -25,12 +25,14 @@ import {
   WORKSPACES_ROOT,
   repositoryFolder,
 } from '../names';
-import type { BuildRecord, ComposeBuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
+import type { BuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
 
 export type { RefusedUpdate };
 
-/** Configuration path of an environment whose configuration is not known yet (the pipeline falls back to the first one found). */
-export const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
+// Plan step 11F2: the rules of the records that the window's side of the worker's requests also checks (openRecords.ts,
+// the host side) moved to ./recordRules, without the rules of the pipeline.
+import { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, composeRecordOf, isRepositoryName, lifecycleMarkClears, refusedUpdateOf } from './recordRules';
+export { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, composeRecordOf, isRepositoryName, lifecycleMarkClears, refusedUpdateOf };
 
 /**
  * True for a container of the current setup: its label nimblescape.devenv.container-version is CONTAINER_VERSION or
@@ -65,42 +67,6 @@ export function isUnrestrictedContainer(labels: Readonly<Record<string, string>>
 }
 
 /**
- * The most characters of the text `items` of a refused update (hotfix review 3, C3-2): it is kept in the registry, and
- * an error message that is no HostAccessError has no bound of its own. The middle is `…` (truncated).
- */
-export const MAX_REFUSED_ITEMS_LENGTH = 4096;
-
-/**
- * The field `refusedUpdate` of a registry entry, when it is valid. Its items at most MAX_REFUSED_ITEMS_LENGTH
- * characters (hotfix review 4, Q3): a registry changed by hand may hold more, and they are logged and shown.
- */
-export function refusedUpdateOf(entry: object): RefusedUpdate | undefined {
-  const value: unknown = (entry as { refusedUpdate?: unknown }).refusedUpdate;
-  if (
-    !isRecord(value) ||
-    typeof value.configPath !== 'string' ||
-    typeof value.configHash !== 'string' ||
-    !isStringRecord(value.images) ||
-    !isStringRecord(value.features) ||
-    typeof value.items !== 'string' ||
-    (value.hostAccessChecks !== undefined && value.hostAccessChecks !== 'off')
-  ) {
-    return undefined;
-  }
-  const refused: RefusedUpdate = {
-    configPath: value.configPath,
-    configHash: value.configHash,
-    images: value.images,
-    features: value.features,
-    items: truncated(value.items, MAX_REFUSED_ITEMS_LENGTH),
-  };
-  if (value.hostAccessChecks === 'off') refused.hostAccessChecks = 'off';
-  // Review round 10 (P10-3).
-  if (value.reason === 'size') refused.reason = 'size';
-  return refused;
-}
-
-/**
  * True if `update` is the refused update `refused`: same configuration, same digests (ignoring the case), and the same
  * state of the host access checks (absent: on). A refusal while the checks were on does not block the update once they
  * are off for the repository, and a refusal while they were off does not block it once they are on again.
@@ -120,10 +86,6 @@ function sameDigests(a: Record<string, string>, b: Record<string, string>): bool
   const keys = Object.keys(a);
   if (keys.length !== Object.keys(b).length) return false;
   return keys.every((key) => ownValue(b, key)?.toLowerCase() === a[key].toLowerCase());
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return isRecord(value) && Object.values(value).every((item) => typeof item === 'string');
 }
 
 /** Result of the image check of one open pipeline. */
@@ -508,11 +470,6 @@ export function configRemoteUser(config: { remoteUser?: unknown; containerUser?:
   return user === undefined ? undefined : containerUserName(user);
 }
 
-/** `owner/name`, as the registry accepts it. */
-export function isRepositoryName(value: unknown): value is string {
-  return typeof value === 'string' && /^[^/\s]+\/[^/\s]+$/.test(value);
-}
-
 /** Only the strings of a list (for values of a configuration that may have any JSON type). */
 export function stringList(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -564,22 +521,6 @@ export function recordedComposeService(record: BuildRecord | undefined): string 
   const value: unknown = record?.compose;
   if (!isRecord(value)) return undefined;
   return typeof value.service === 'string' && value.service !== '' ? value.service : undefined;
-}
-
-/** BuildRecord.compose, when it is valid: the build record of a Docker Compose configuration. */
-export function composeRecordOf(record: BuildRecord | undefined): ComposeBuildRecord | undefined {
-  const value: unknown = record?.compose;
-  if (!isRecord(value) || typeof value.service !== 'string' || value.service === '') return undefined;
-  if (!Array.isArray(value.images) || !value.images.every((image) => typeof image === 'string')) return undefined;
-  if (!Array.isArray(value.serviceImages) || !value.serviceImages.every((image) => typeof image === 'string')) return undefined;
-  if (typeof value.version !== 'string' || typeof value.inputsHash !== 'string') return undefined;
-  return {
-    service: value.service,
-    images: [...value.images],
-    serviceImages: [...value.serviceImages],
-    version: value.version,
-    inputsHash: value.inputsHash,
-  };
 }
 
 /**
@@ -832,15 +773,3 @@ export function composeMountVolumes(
 import { sameContainer, sameContainerId } from './containerIds';
 export { sameContainer, sameContainerId };
 
-
-/**
- * Review round 4 of PR #68 (A-R4-1): whether finish clears the mark Environment.lifecycleIncomplete (`mark`, as the
- * registry holds it under the lock): only when it is the value this run decided with (`read`), or when it names the
- * container whose `up` and run-user-commands this run completed (`ranFor`). A mark that another window set after this run
- * read the entry (for example for the container that this run opened as it is) stays.
- */
-export function lifecycleMarkClears(mark: string | undefined, read: string | undefined, ranFor: string | undefined): boolean {
-  if (mark === undefined) return false;
-  if (read !== undefined && sameContainer(mark, read)) return true;
-  return ranFor !== undefined && sameContainer(mark, ranFor);
-}

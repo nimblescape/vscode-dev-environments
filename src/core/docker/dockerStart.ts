@@ -9,7 +9,7 @@ import * as path from 'path';
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { abortError, isAbortError, sleep as defaultSleep, systemClock, type Clock, type Logger, type ProcessRunner, type RunResult } from '../ports';
-import { DOCKER_INFO_TIMEOUT_MS, type ContainerAdapter } from './containerAdapter';
+import { DOCKER_INFO_TIMEOUT_MS, type BootstrapDocker } from './bootstrapDocker';
 import { windowsDockerDesktopFolders } from './dockerCli';
 
 /** The start command gets this head start before the polling of `docker info` begins; it keeps running in parallel. */
@@ -80,7 +80,7 @@ export function launchDetachedProcess(file: string, args: readonly string[]): Pr
 }
 
 async function startDocker(
-  docker: ContainerAdapter,
+  docker: BootstrapDocker,
   runner: ProcessRunner,
   logger: Logger,
   options: DockerStarterOptions,
@@ -174,7 +174,7 @@ function startFailed(detail: string): UserFacingError {
  * at most 10 s, and it is ended when this function returns.
  */
 export async function ensureDockerRunning(
-  docker: ContainerAdapter,
+  docker: BootstrapDocker,
   runner: ProcessRunner,
   logger: Logger,
   options: DockerStarterOptions,

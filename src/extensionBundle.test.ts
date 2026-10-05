@@ -6,6 +6,7 @@
 // pipeline. Its operations send their flows to the worker (EnvironmentOperations); the pipeline (EnvironmentService), the
 // image update check and the host access analysis run only there. Checked on the modules that esbuild bundles into
 // dist/extension.js (its metafile), as esbuild.mjs builds it.
+import * as fs from 'fs';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { beforeAll, describe, expect, it } from 'vitest';
@@ -21,6 +22,57 @@ const PIPELINE_MODULES = [
   'src/core/helper/configurationAnalysisWorker.ts',
   'src/core/worker/workerServices.ts',
   'src/core/worker/engineDocker.ts',
+];
+
+/**
+ * Plan step 11F2: the only modules of these folders that the extension may bundle: the bootstrap (the Docker CLI of
+ * this computer, the helper image, the start of the worker, the Docker contexts, the attach diagnostics), the operations
+ * of the window that send their flows to the worker, and the window's side of the worker's requests. Every other module
+ * of these folders is the pipeline or the Docker of the flows, which only the worker runs. A new module in a bundle
+ * must be named here on purpose.
+ */
+const ALLOWED_MODULES: Record<string, readonly string[]> = {
+  'src/core/docker': [
+    'attachDiagnostics.ts',
+    'bootstrapDocker.ts',
+    'dockerCli.ts',
+    'dockerDownload.ts',
+    'dockerHost.ts',
+    'dockerObjects.ts',
+    'dockerSetup.ts',
+    'dockerStart.ts',
+    'dockerTargets.ts',
+    'environmentLock.ts',
+    'remoteDocker.ts',
+    'workerPreparation.ts',
+  ],
+  'src/core/helper': ['analysisLimits.ts', 'batchStepKinds.ts', 'helperImage.ts', 'helperImages.ts', 'helperPrebuild.ts', 'helperState.ts'],
+  'src/core/imageCheck': ['credentials.ts', 'dockerfile.ts', 'reference.ts', 'registryClient.ts'],
+  'src/core/pipeline': [
+    'busyMarks.ts',
+    'containerIds.ts',
+    'environmentOperations.ts',
+    'imageRecord.ts',
+    'lifecycleMemory.ts',
+    'openRecords.ts',
+    'operationBase.ts',
+    'recordRules.ts',
+  ],
+  'src/core/policy': ['hostAccessChecks.ts', 'report.ts'],
+  'src/core/worker': ['hostSide.ts', 'hostSideHandler.ts', 'openRequests.ts'],
+};
+
+/** Plan step 11F2: the modules that left the extension's bundle in this step (the Docker CLI adapter and the steps). */
+const BOOTSTRAP_ONLY_REMOVED = [
+  'src/core/docker/containerAdapter.ts',
+  'src/core/docker/dockerRouting.ts',
+  'src/core/helper/workspaceHelper.ts',
+  'src/core/helper/batchSteps.ts',
+  'src/core/helper/scripts.ts',
+  'src/core/helper/compose.ts',
+  'src/core/helper/devcontainerCli.ts',
+  'src/core/pipeline/pipelineRules.ts',
+  'src/core/policy/index.ts',
 ];
 
 let inputs: string[] = [];
@@ -51,5 +103,35 @@ describe("the extension's bundle (plan step 11F1)", () => {
 
   it('holds no module of the pipeline', () => {
     expect(inputs.filter((input) => PIPELINE_MODULES.includes(input))).toEqual([]);
+  });
+});
+
+describe("the extension's bundle (plan step 11F2: only the bootstrap of Docker)", () => {
+  it('holds the Docker CLI of the bootstrap and the helper image', () => {
+    expect(inputs).toContain('src/core/docker/bootstrapDocker.ts');
+    expect(inputs).toContain('src/core/helper/helperImages.ts');
+  });
+
+  it('holds no module of the pipeline folders beyond the bootstrap and the operations of the window', () => {
+    const outside = inputs.filter((input) => {
+      const folder = path.posix.dirname(input);
+      const allowed = ALLOWED_MODULES[folder];
+      return allowed !== undefined && !allowed.includes(path.posix.basename(input));
+    });
+    expect(outside).toEqual([]);
+  });
+
+  it('holds no Docker CLI adapter of the flows, no step of the workspace helper and no policy', () => {
+    expect(inputs.filter((input) => BOOTSTRAP_ONLY_REMOVED.includes(input))).toEqual([]);
+  });
+
+  it('names only modules that exist (a renamed module would pass unseen)', () => {
+    const named = [...Object.entries(ALLOWED_MODULES).flatMap(([folder, files]) => files.map((file) => `${folder}/${file}`)), ...BOOTSTRAP_ONLY_REMOVED, ...PIPELINE_MODULES];
+    expect(named.filter((file) => !fs.existsSync(path.join(ROOT, file)))).toEqual([]);
+    // Each folder of the allowlist has modules that the extension must not bundle, so the check of the folder does something.
+    for (const [folder, files] of Object.entries(ALLOWED_MODULES)) {
+      const others = fs.readdirSync(path.join(ROOT, folder)).filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts') && !files.includes(file));
+      expect(others.length, folder).toBeGreaterThan(0);
+    }
   });
 });

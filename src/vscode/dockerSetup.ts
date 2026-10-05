@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { ContainerAdapter } from '../core/docker/containerAdapter';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { findExecutable } from '../core/docker/dockerCli';
 import { downloadFile, type DownloadOptions } from '../core/docker/dockerDownload';
 import {
@@ -87,7 +87,7 @@ export const DockerSetupUiTexts = {
 } as const;
 
 export interface DockerSetupDeps {
-  docker: ContainerAdapter;
+  docker: BootstrapDocker;
   runner: ProcessRunner;
   logger: Logger;
   /** Opens the log (action Show details). */
@@ -271,7 +271,7 @@ export class DockerSetup implements vscode.Disposable {
     await vscode.commands.executeCommand(SHOW_SIDEBAR_COMMAND);
   }
 
-  /** The result of a `docker info` that ran anyway (ContainerAdapter option `onDaemonStatus`). */
+  /** The result of a `docker info` that ran anyway (BootstrapDocker option `onDaemonStatus`). */
   reportDaemonStatus(running: boolean): void {
     this.apply({ kind: 'engine', running });
   }

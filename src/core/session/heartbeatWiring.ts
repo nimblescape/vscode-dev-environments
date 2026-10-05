@@ -31,7 +31,7 @@ export type EnsureMonitor = (target: DockerTarget, signal: AbortSignal) => Promi
 export interface HeartbeatWiring {
   /** The preparation of the heartbeats (its scope for their send, repair and check). */
   readonly preparation: HeartbeatPreparation;
-  /** WorkspaceHelper's onImageBuilt: a build succeeded, so the wait of its engine ends (every wait when not known). */
+  /** HelperImages' onImageBuilt: a build succeeded, so the wait of its engine ends (every wait when not known). */
   imageBuilt(): void;
   /** HelperChannels' `prepare`: the helper image for the worker of `target`, through the preparation (its wait). */
   prepareWorker(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;

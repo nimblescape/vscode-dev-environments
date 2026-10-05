@@ -179,3 +179,38 @@ export function dockerProcessEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Platfo
   }
   return result;
 }
+
+// Plan step 11F2: the words of a Docker command and the calls that only read (from dockerRouting.ts), for the Docker
+// CLI of the bootstrap.
+
+/** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */
+const GLOBAL_OPTIONS_WITH_VALUE = new Set(['-H', '--host', '-c', '--context', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']);
+
+/** Docker commands that only read: `docker <command>`, or `docker <object> <command>`. */
+const READ_ONLY_COMMANDS = new Set(['info', 'version', 'ps', 'images', 'inspect']);
+const READ_ONLY_OBJECT_COMMANDS: Record<string, readonly string[]> = {
+  container: ['inspect', 'ls', 'list', 'ps'],
+  image: ['inspect', 'ls', 'list', 'history'],
+  volume: ['inspect', 'ls', 'list'],
+  network: ['inspect', 'ls', 'list'],
+  context: ['inspect', 'ls', 'list', 'show'],
+  system: ['info', 'df'],
+};
+
+/** The first two words after the global options of the Docker CLI (`docker -H ssh://box image inspect x` → image inspect). */
+export function dockerCommandWords(args: readonly string[]): string[] {
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-')) i += GLOBAL_OPTIONS_WITH_VALUE.has(args[i]) ? 2 : 1;
+  return args.slice(i, i + 2);
+}
+
+/**
+ * True for a Docker call that only reads (inspect, ls, ps, info, version…), which may run again without any effect.
+ * Everything else (create, run, exec, start, stop, rm, build, pull, …) is never repeated.
+ */
+export function isReadOnlyDockerCall(args: readonly string[]): boolean {
+  const [command, subcommand] = dockerCommandWords(args);
+  if (command === undefined) return false;
+  if (READ_ONLY_COMMANDS.has(command)) return true;
+  return READ_ONLY_OBJECT_COMMANDS[command]?.includes(subcommand ?? '') ?? false;
+}
