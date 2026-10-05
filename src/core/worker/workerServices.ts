@@ -7,10 +7,12 @@
 // run unchanged; what they need from the user's computer goes through the requests of the operation (HostSide), the
 // engine is the worker's own (EngineDocker), the helper image is the worker's own image, and the lock and the batch
 // helper are taken in the worker (`environmentLock`, given by the operation). What only the open runs (the host access
-// analysis, the image update check, the GitHub viewer, the variables of the computer) comes with plan step 11E; until
+// analysis, the image update check, the variables of the computer) comes with plan step 11E; until
 // then it fails closed here, as do the record writes by a function (plan steps 11D, 11E) and the Session Monitor beyond Delete's
 // `forget` (plan step 11D). Plan step 11C2a: the busy marks are specific requests to the extension (decision of
-// 2026-10-04); plan step 11E4b: so are the registry writes of the open (hostOpenRecords). Pure over its deps; no `vscode`.
+// 2026-10-04); plan step 11E4b: so are the registry writes of the open (hostOpenRecords); plan step 11E4d: the liveness of
+// the processes of the computer, the GitHub profile and the window's lifecycle memory are asked of the extension. Pure
+// over its deps; no `vscode`.
 import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
@@ -19,6 +21,7 @@ import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import type { OpenRecords } from '../pipeline/openRecords';
+import type { LifecycleMemory } from '../pipeline/lifecycleMemory';
 import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../ports';
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
@@ -149,6 +152,18 @@ export function workerSessionMonitor(engine: DockerEngine, source: string | unde
   };
 }
 
+/**
+ * Plan step 11E4d (decision of 2026-09-29): the memory of the window that sent the operation, over `local
+ * unrecordedLifecycle`, `record rememberLifecycle` and `record forgetLifecycle`.
+ */
+export function hostLifecycleMemory(host: HostSide): LifecycleMemory {
+  return {
+    get: (environmentId) => host.state.unrecordedLifecycle(environmentId),
+    remember: (environmentId, containerId) => host.records.rememberLifecycle(environmentId, containerId),
+    forget: (environmentId, containerId) => host.records.forgetLifecycle(environmentId, containerId),
+  };
+}
+
 /** The GitHub sign-in of the user's computer: the account through `local account`, the token through `secret token`. */
 export function hostAuth(host: HostSide, log: Logger): Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'> {
   return {
@@ -270,9 +285,20 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     sessionMonitor: workerSessionMonitor(deps.engine, deps.monitorSource, deps.logger),
     sessionFiles: hostSessionFiles(deps.host),
     windowStatuses: () => deps.host.state.windowStatuses(),
-    // The pipeline asks synchronously, so every other process counts as alive here. Plan step 11C2a: the busy marks that
-    // Delete sets and waits for are decided by the extension (busyMarks); the opens follow with plan step 11E.
-    isProcessAlive: () => true,
+    // Plan step 11E4d: the processes of the user's computer are not the worker's; the pipeline asks the extension before
+    // each decision about the other windows (processAlive). Nothing asks synchronously any more: fail closed.
+    isProcessAlive: () => {
+      throw new Error('The worker does not know synchronously whether a process of the computer runs.');
+    },
+    processAlive: (pid) => deps.host.state.processAlive(pid),
+    // Plan step 11E4d (decision of 2026-09-29): the window's memory of the containers whose lifecycle mark was not recorded.
+    lifecycleMemory: hostLifecycleMemory(deps.host),
+    // Plan step 11E4d: the GitHub profile of the account, read by the extension with its token (never the worker's).
+    viewer: async () => {
+      const profile = await deps.host.state.viewer();
+      if (profile === undefined) throw new Error('The extension could not read the GitHub profile.');
+      return profile;
+    },
     imageChecker: {
       check: async () => {
         throw notInWorker('The image update check', '11E');

@@ -9,6 +9,7 @@ import { HelperOperationError } from '../helperChannel/helperChannel';
 import { OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger, type Logger } from '../ports';
 import type { Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
+import type { GitHubViewer } from '../helper/containerGit';
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import { FLOW_REQUESTS, parseHostRequest, type HostCall, type HostSide } from './hostSide';
 import { hostSideHandler } from './hostSideHandler';
@@ -55,6 +56,9 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       settings: async () => (record('settings'), of('settings', { stopAfterMinutes: 10 })),
       processAlive: async (pid) => (record('processAlive', pid), of('processAlive', true)),
       account: async (interactive) => (record('account', interactive), of('account', undefined as GitHubAccount | undefined)),
+      // Plan step 11E4d.
+      viewer: async () => (record('viewer'), of('viewer', undefined as GitHubViewer | undefined)),
+      unrecordedLifecycle: async (environmentId) => (record('unrecordedLifecycle', environmentId), of('unrecordedLifecycle', undefined as string | undefined)),
     },
     records: {
       read: async () => (record('read'), of('read', { version: 1, environments: [] } as RegistryFile)),
@@ -63,6 +67,9 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       findForAccount: async (repository, accountId, dockerHost) => (record('findForAccount', repository, accountId, dockerHost), of('findForAccount', undefined)),
       remove: async (id, volumes) => void record('remove', id, volumes),
       forgetKeptVolumes: async (names) => void record('forgetKeptVolumes', names),
+      // Plan step 11E4d.
+      rememberLifecycle: async (environmentId, containerId) => void record('rememberLifecycle', environmentId, containerId),
+      forgetLifecycle: async (environmentId, containerId) => void record('forgetLifecycle', environmentId, containerId),
       sessionFile: async (kind, environmentId) => void record('sessionFile', kind, environmentId),
       // Plan step 11C2a.
       markBusy: async (environmentId, operation) => (record('markBusy', environmentId, operation), of('markBusy', undefined as BusyMarkResult)),
@@ -402,8 +409,12 @@ describe('the handler of the requests on the side of the extension (plan step 11
     expect(await worker.records.get('nope')).toBeUndefined();
     expect(await worker.records.list()).toEqual([]);
     expect(await worker.state.windowStatuses()).toEqual([]);
-    expect(await worker.state.processAlive(1)).toBe(false);
+    // Plan step 11E4d: a missing or odd answer counts as a running process (fail closed: another window keeps its
+    // environment); only `false` is an ended one (before, anything but `true` counted as ended).
+    expect(await worker.state.processAlive(1)).toBe(true);
     answers.set('local processAlive', 'true');
+    expect(await worker.state.processAlive(1)).toBe(true);
+    answers.set('local processAlive', false);
     expect(await worker.state.processAlive(1)).toBe(false);
     // A login whose password the operation does not hold is no login; without its server the asked one.
     answers.set('secret registry', { given: true, username: 'octo' });

@@ -59,6 +59,9 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       settings: () => answer('settings'),
       processAlive: (pid) => answer('processAlive', pid),
       account: (interactive) => answer('account', interactive),
+      // Plan step 11E4d.
+      viewer: () => answer('viewer'),
+      unrecordedLifecycle: (environmentId) => answer('unrecordedLifecycle', environmentId),
     },
     records: {
       read: () => answer<RegistryFile>('read'),
@@ -67,6 +70,9 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       findForAccount: (repository, accountId, dockerHost) => answer('findForAccount', repository, accountId, dockerHost),
       remove: (id, volumes) => answer('remove', id, volumes),
       forgetKeptVolumes: (names) => answer('forgetKeptVolumes', names),
+      // Plan step 11E4d.
+      rememberLifecycle: (environmentId, containerId) => answer('rememberLifecycle', environmentId, containerId),
+      forgetLifecycle: (environmentId, containerId) => answer('forgetLifecycle', environmentId, containerId),
       sessionFile: (kind, environmentId) => answer('sessionFile', kind, environmentId),
       // Plan step 11C2a.
       markBusy: (environmentId, operation) => answer('markBusy', environmentId, operation),
@@ -316,8 +322,9 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     await all.startDocker!({ onStarting: () => {} });
     const down = deps({ engine: { ...unusedEngine(), version: async () => Promise.reject(new Error('connect ENOENT')) } }).all;
     await expect(down.startDocker!({ onStarting: () => {} })).rejects.toMatchObject({ code: 'dockerEngineNotRunning' });
-    // Every other process counts as alive: a busy mark of another window is never taken over here.
-    expect(all.isProcessAlive!(1)).toBe(true);
+    // Plan step 11E4d: the worker never answers synchronously whether a process of the computer runs (before, every
+    // process counted as alive); the pipeline asks the extension (processAlive).
+    expect(() => all.isProcessAlive!(1)).toThrow('synchronously');
     expect(await all.windowStatuses!()).toEqual([{ windowId: 'w' }]);
     expect(await all.ui.confirmUntrustedRepository('acme/api')).toBe(false);
     expect(await all.ui.recreateContainer('acme/api', { message: 'm', detail: 'd' })).toBe(true);

@@ -258,6 +258,7 @@ import {
   type ImageCheckState,
 } from './pipelineRules';
 import { otherWindowMarkIsLive, readLiveness, registryOpenRecords, sameBusyMark, type MarkLiveness, type OpenRecords } from './openRecords';
+import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
 import type { PullCredentials, PullCredentialsProvider } from './pullCredentials';
 
 // User-visible texts that messages.ts lacks (plain language, NFR-02); to be moved there.
@@ -480,6 +481,16 @@ export interface EnvironmentServiceDeps {
   sessionMonitor?: EnvironmentSessionMonitor;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
+  /**
+   * Plan step 11E4d: whether the process `pid` of this computer runs, asked before a decision about the other windows
+   * (processesAlive). Default: `isProcessAlive`; the worker's pipeline asks the extension (`local processAlive`).
+   */
+  processAlive?: (pid: number) => Promise<boolean>;
+  /**
+   * Plan step 11E4d (decision of 2026-09-29): the containers that the window remembers because their lifecycle mark could
+   * not be recorded. Default: the memory of this service; the worker's pipeline uses the window's through requests.
+   */
+  lifecycleMemory?: LifecycleMemory;
   /**
    * Plan step 11C2a (decision of 2026-10-04): the busy marks of the window that runs the operation. Default: over
    * `registry` with this service's owner, clock, and view of the windows (registryBusyMarks); the worker's pipeline sends
@@ -825,6 +836,11 @@ interface PipelineContext {
    * meanwhile (for a container that this run opened as it is) stays.
    */
   lifecycleMarkRead?: string;
+  /**
+   * Plan step 11E4d: the container that the window remembers for the environment (LifecycleMemory), read under the lock
+   * at the start of the open; kept here as this run changes it.
+   */
+  unrecordedLifecycle?: string;
   /**
    * Review round 4 of PR #68 (A-R4-1): the container whose `up` and run-user-commands this run completed (its lifecycle
    * commands ran, also when one of them failed on its own: keptAfterLifecycleFailure).
@@ -1249,6 +1265,8 @@ const EXISTING_PATHS_CHARACTERS = 16 * 1024;
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
 const VIEWER_TIMEOUT_MS = 5_000;
+/** Review round 1 of PR #107 (A-M1): the questions whether a process runs that the pipeline asks at the same time. */
+const PROCESS_QUESTIONS_AT_ONCE = 4;
 /** After a failed question for the profile, the fallback identity is used this long before GitHub is asked again. */
 const IDENTITY_RETRY_MS = 10 * 60_000;
 
@@ -1304,9 +1322,12 @@ export class EnvironmentService {
    * Review round 4 of PR #68 (B-R4-2): environment ID → the ID of a container that runs without its lifecycle commands
    * while the registry could not record it (Environment.lifecycleIncomplete). Consulted with the mark, so that no later
    * open of this window opens it as it is; cleared where the mark is (clearLifecycleMark, and finish after the lifecycle
-   * commands of that container ran).
+   * commands of that container ran). Plan step 11E4d: the window's memory (LifecycleMemory), read into
+   * PipelineContext.unrecordedLifecycle.
    */
-  private readonly unrecordedLifecycle = new Map<string, string>();
+  private readonly lifecycleMemory: LifecycleMemory;
+  /** Plan step 11E4d: whether a process of this computer runs (EnvironmentServiceDeps.processAlive). */
+  private readonly processAlive: (pid: number) => Promise<boolean>;
   /** Review D2: the endpoints (neither local nor SSH) whose refusal the reads showed already: once each. */
   private readonly refusedEndpoints = new Set<string>();
   /**
@@ -1328,6 +1349,8 @@ export class EnvironmentService {
   constructor(private readonly deps: EnvironmentServiceDeps) {
     this.startDockerFn = deps.startDocker ?? defaultDockerStarter(deps);
     this.isAlive = deps.isProcessAlive ?? processExists;
+    this.processAlive = deps.processAlive ?? (async (pid) => this.isAlive(pid));
+    this.lifecycleMemory = deps.lifecycleMemory ?? windowLifecycleMemory();
     this.markView = { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger };
     this.busyMarks = deps.busyMarks ?? registryBusyMarks(deps.registry, this.markView);
     this.openRecords = deps.openRecords ?? registryOpenRecords(deps.registry, this.markView);
@@ -1563,6 +1586,8 @@ export class EnvironmentService {
           gitPrepared: false,
           identity,
           hostAccessChecks: this.hostAccessChecksFor(env.repository),
+          // Plan step 11E4d: what the window remembers, read under the lock (no other open of the environment runs now).
+          unrecordedLifecycle: await this.lifecycleMemory.get(env.id),
         };
         ctx = opened;
         // Review round 3 of PR #88 (A-R3-1): a volume of its name that is another environment's is never opened.
@@ -4243,7 +4268,7 @@ export class EnvironmentService {
       // Review round 4 (B-R4-2): nothing is stopped here, also when the mark cannot be written (another window may use it).
       const marked = ranBefore ? markedBefore : await this.markLifecycleIncomplete(ctx, id, name);
       const markFailed = !ranBefore && !marked;
-      if (markFailed) this.lifecycleNotRecorded(ctx, id, name);
+      if (markFailed) await this.lifecycleNotRecorded(ctx, id, name);
       ctx.upWithdrawn = {
         outcome: user.known ? 'inUse' : 'useUnknown',
         id,
@@ -4309,7 +4334,7 @@ export class EnvironmentService {
           outcome = created === true ? 'stoppedAfterRemovalFailed' : 'stopped';
         } else {
           markFailed = true;
-          this.lifecycleNotRecorded(ctx, id, name);
+          await this.lifecycleNotRecorded(ctx, id, name);
         }
       }
     } else if (outcome === 'removed') {
@@ -4451,8 +4476,10 @@ export class EnvironmentService {
    * Review round 4 of PR #68 (B-R4-2): the container `id` runs without its lifecycle commands, and the registry could not
    * record it: this window remembers it (unrecordedLifecycle), and the log and a warning say so.
    */
-  private lifecycleNotRecorded(ctx: PipelineContext, id: string, name: string): void {
-    this.unrecordedLifecycle.set(ctx.env.id, id);
+  private async lifecycleNotRecorded(ctx: PipelineContext, id: string, name: string): Promise<void> {
+    ctx.unrecordedLifecycle = id;
+    // Plan step 11E4d: in the memory of the window (in the worker, a request): a failure is logged, the warning still says it.
+    await this.lifecycleMemory.remember(ctx.env.id, id).catch((error: unknown) => this.logger.warn(`The window could not remember the container ${name}: ${errorMessage(error)}`));
     this.logger.error(
       `The container ${name} of ${ctx.env.repository} runs without its lifecycle commands, and this could not be recorded. Stop or rebuild the environment before working in it.`,
     );
@@ -4488,7 +4515,12 @@ export class EnvironmentService {
     // false), the status files of other windows do not count (their files are still read: one that cannot be read keeps
     // the answer "not known").
     const windows = check?.runs === false ? [] : windowStatuses;
-    const other = otherWindowUsesEnvironment(env.id, this.deps.owner.windowId, { now, isAlive: this.isAlive, windowStatuses: windows, pendings });
+    // Plan step 11E4d: whether the processes of the windows run is asked first (in the worker, the extension answers).
+    // Review round 1 of PR #107 (A-M1): only for the windows that the rules can count (another window, active, of this
+    // environment), and none when no status file counts: a pid not asked counts as running, but is never looked at.
+    const candidates = (windowStatuses ?? []).filter((status) => status.windowId !== this.deps.owner.windowId && status.environmentId === env.id && status.state === 'active');
+    const isAlive = await this.processesAlive((check?.runs === false ? [] : candidates).map((status) => status.pid));
+    const other = otherWindowUsesEnvironment(env.id, this.deps.owner.windowId, { now, isAlive, windowStatuses: windows, pendings });
     if (other !== undefined) {
       // Review round 4 (A-R4-3): a pending connection file: that window opens the environment (it may still wait or build).
       return 'window' in other
@@ -4501,7 +4533,7 @@ export class EnvironmentService {
     if (check?.runs === true && !unreadable) {
       const late = otherWindowMayUseEnvironment(env.id, this.deps.owner.windowId, {
         now,
-        isAlive: this.isAlive,
+        isAlive,
         windowStatuses,
         waitingMs: waitingTimeMs(this.deps.settings()),
         grace: sleepGraceOfWindow(windowStatuses, this.deps.owner, now),
@@ -4520,7 +4552,7 @@ export class EnvironmentService {
   private lifecycleIncomplete(ctx: PipelineContext, container: ContainerInfo | undefined): boolean {
     if (container === undefined) return false;
     // Review round 4 of PR #68 (B-R4-2): also a container that this window remembers because the mark could not be written.
-    return [ctx.env.lifecycleIncomplete, this.unrecordedLifecycle.get(ctx.env.id)].some((mark) => mark !== undefined && sameContainer(mark, container.id));
+    return [ctx.env.lifecycleIncomplete, ctx.unrecordedLifecycle].some((mark) => mark !== undefined && sameContainer(mark, container.id));
   }
 
   /**
@@ -4536,11 +4568,21 @@ export class EnvironmentService {
     return this.lifecycleIncomplete(ctx, container);
   }
 
+  /**
+   * Plan step 11E4d: forgets the container that the window remembers for the environment when it is `containerId` (in the
+   * worker, a request); a failure is logged (the next open runs the lifecycle commands once more, when in doubt).
+   */
+  private async forgetUnrecordedLifecycle(ctx: PipelineContext, containerId: string): Promise<void> {
+    const unrecorded = ctx.unrecordedLifecycle;
+    if (unrecorded === undefined || !sameContainer(unrecorded, containerId)) return;
+    ctx.unrecordedLifecycle = undefined;
+    await this.lifecycleMemory.forget(ctx.env.id, containerId).catch((error: unknown) => this.logger.warn(`The window could not forget the container ${containerId}: ${errorMessage(error)}`));
+  }
+
   /** Review round 3 of PR #68 (A-R3-5): clears Environment.lifecycleIncomplete when it names `containerId` (the container is gone). */
   private async clearLifecycleMark(ctx: PipelineContext, containerId: string): Promise<void> {
     // Review round 4 of PR #68 (B-R4-2): also the mark that this window remembers.
-    const unrecorded = this.unrecordedLifecycle.get(ctx.env.id);
-    if (unrecorded !== undefined && sameContainer(unrecorded, containerId)) this.unrecordedLifecycle.delete(ctx.env.id);
+    await this.forgetUnrecordedLifecycle(ctx, containerId);
     const mark = ctx.env.lifecycleIncomplete;
     if (mark === undefined || !sameContainer(mark, containerId)) return;
     await this.quietly('clear the mark of the container whose lifecycle commands did not run', async () =>
@@ -5378,8 +5420,7 @@ export class EnvironmentService {
     ctx.busy = false;
     // Review round 4 of PR #68 (B-R4-2): the mark that this window remembers goes once the lifecycle commands of its
     // container ran.
-    const unrecorded = this.unrecordedLifecycle.get(env.id);
-    if (unrecorded !== undefined && ctx.lifecycleRanFor !== undefined && sameContainer(unrecorded, ctx.lifecycleRanFor)) this.unrecordedLifecycle.delete(env.id);
+    if (ctx.lifecycleRanFor !== undefined) await this.forgetUnrecordedLifecycle(ctx, ctx.lifecycleRanFor);
     this.logger.info(`${env.repository} is ready in the container ${containerName}.`);
     return { environment: ctx.env, containerName, remoteWorkspaceFolder };
   }
@@ -7127,16 +7168,44 @@ export class EnvironmentService {
   }
 
   /**
-   * Returns the test "a live mark of another window" (concept 7.9 rule 1, `isBusyMarkLive`): a mark of an ended process,
+   * The test "a live mark of another window" (concept 7.9 rule 1, `isBusyMarkLive`) for `mark`: a mark of an ended process,
    * a mark older than 6 hours, and (with window status files) a mark whose window has no recent status file of that
    * process are ignored. Reads the window status files once per call.
    */
-  private async markBlocker(): Promise<(mark: BusyMark) => boolean> {
+  private async markBlocks(mark: BusyMark): Promise<boolean> {
     const liveness = await this.markLiveness();
-    return (mark) => otherWindowMarkIsLive(mark, this.markView, liveness);
+    // Plan step 11E4d: whether its process runs is asked first (in the worker, the extension answers); review round 1 of
+    // PR #107 (A-L4): never for a mark of this window or its process, which never counts.
+    const isAlive = await this.processesAlive(mark.pid === this.markView.owner.pid ? [] : [mark.pid]);
+    return otherWindowMarkIsLive(mark, { owner: this.markView.owner, isAlive }, liveness);
   }
 
-  /** Plan step 11E4a: what markBlocker decides with (the window status files, read once, and the time), as plain data. */
+  /**
+   * Plan step 11E4d: whether the processes `pids` of this computer run, asked once each (EnvironmentServiceDeps.processAlive;
+   * in the worker, the extension answers). A process whose answer fails counts as running, and so does one not asked:
+   * when in doubt, another window uses the environment, and nothing is stopped or taken over.
+   */
+  private async processesAlive(pids: Iterable<number>): Promise<(pid: number) => boolean> {
+    const alive = new Map<number, boolean>();
+    const unique = [...new Set(pids)];
+    // Review round 1 of PR #107 (A-M1): a few at a time, far below the open requests that an operation may have
+    // (MAX_OPEN_ASKS), so that the other requests of the open (its pending file, its questions) still get through.
+    for (let start = 0; start < unique.length; start += PROCESS_QUESTIONS_AT_ONCE) {
+      await Promise.all(
+        unique.slice(start, start + PROCESS_QUESTIONS_AT_ONCE).map(async (pid) => {
+          try {
+            alive.set(pid, await this.processAlive(pid));
+          } catch (error) {
+            this.logger.warn(`Whether the process ${pid} runs could not be read: ${errorMessage(error)}`);
+            alive.set(pid, true);
+          }
+        }),
+      );
+    }
+    return (pid) => alive.get(pid) ?? true;
+  }
+
+  /** Plan step 11E4a: what markBlocks decides with (the window status files, read once, and the time), as plain data. */
   private markLiveness(): Promise<MarkLiveness> {
     return readLiveness(this.markView);
   }
@@ -7152,7 +7221,7 @@ export class EnvironmentService {
     let current = environment;
     for (let attempt = 0; ; attempt++) {
       const mark = current.busy;
-      if (!mark || !(await this.markBlocker())(mark)) return current;
+      if (!mark || !(await this.markBlocks(mark))) return current;
       if (attempt >= attempts) throw environmentBusy(current.repository, mark);
       if (attempt === 0) {
         this.logger.info(`${current.repository} is busy (${mark.operation}) in another window (process ${mark.pid}). Waiting.`);

@@ -19,6 +19,9 @@ import { isoTime, type Clock } from '../core/ports';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
 import type { HelperChannels } from '../core/helperChannel/helperChannels';
 import type { DockerTarget } from '../core/docker/dockerHost';
+import { errorMessage } from '../core/errors';
+import type { GitHubViewer } from '../core/helper/containerGit';
+import type { LifecycleMemory } from '../core/pipeline/lifecycleMemory';
 
 export interface HostSideDeps {
   // Plan step 11E4c: changed (`add` is gone with `record add`; `update` for the writes of the open that read the whole registry).
@@ -39,10 +42,17 @@ export interface HostSideDeps {
   /** Plan step 11C2a: the clock of the busy marks. */
   clock: Clock;
   isProcessAlive: (pid: number) => boolean;
+  /** Plan step 11E4d: the GitHub profile of a token (DiscoveryService.viewer); without it, `local viewer` answers none. */
+  viewer?: (token: string, signal?: AbortSignal) => Promise<GitHubViewer>;
+  /** Plan step 11E4d (decision of 2026-09-29): the memory of this window, which its own pipeline uses too. */
+  lifecycleMemory: LifecycleMemory;
   /** Connects the window at the end of an open (plan step 11E; until then it is not called). */
   connect?: (data: { environmentId: string; container: string; user?: string; folder: string }) => Promise<void>;
   logger: Logger;
 }
+
+/** Plan step 11E4d: the time limit of the question to GitHub for the profile (as EnvironmentService.identityOf). */
+const VIEWER_TIMEOUT_MS = 5_000;
 
 /** The only registry for which the GitHub sign-in is a login (concept 7.7); everything else comes from Docker's store. */
 const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
@@ -90,6 +100,21 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       settings: async () => ({ ...deps.settings() }) as unknown as Record<string, unknown>,
       processAlive: async (pid) => deps.isProcessAlive(pid),
       account: (interactive) => deps.auth.getAccount({ interactive }),
+      // Plan step 11E4d: with the token of this window, never one of the worker; only the profile of the signed-in account.
+      viewer: async () => {
+        if (!deps.viewer) return undefined;
+        try {
+          const account = await deps.auth.getAccount({ interactive: false });
+          const token = await deps.auth.getToken({ interactive: false });
+          if (account === undefined || token === undefined) return undefined;
+          const profile = await deps.viewer(token, AbortSignal.timeout(VIEWER_TIMEOUT_MS));
+          return String(profile.databaseId) === account.id ? profile : undefined;
+        } catch (error) {
+          deps.logger.info(`The GitHub profile could not be read for the worker: ${errorMessage(error)}`);
+          return undefined;
+        }
+      },
+      unrecordedLifecycle: (environmentId) => deps.lifecycleMemory.get(environmentId),
     },
     records: {
       read: () => deps.registry.read(),
@@ -105,6 +130,9 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         await deps.registry.remove(id, volumes);
       },
       forgetKeptVolumes: (names) => deps.registry.forgetKeptVolumes(names),
+      // Plan step 11E4d: the memory of this window (the handler checks the environment and the container ID).
+      rememberLifecycle: (environmentId, containerId) => deps.lifecycleMemory.remember(environmentId, containerId),
+      forgetLifecycle: (environmentId, containerId) => deps.lifecycleMemory.forget(environmentId, containerId),
       sessionFile: async (kind, environmentId) => {
         if (kind === 'writePending') await deps.sessionFiles.writePending(environmentId, deps.windowId);
         else if (kind === 'removePending') await deps.sessionFiles.removePending(environmentId);

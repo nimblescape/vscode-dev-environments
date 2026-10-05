@@ -9,6 +9,7 @@ import { BUSY_OPERATIONS, type BusyMarkResult } from '../pipeline/busyMarks';
 import type { BuildChange, StepMarkResult } from '../pipeline/openRecords';
 import type { BusyMark, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
+import { isGitHubLogin, type GitHubViewer } from '../helper/containerGit';
 
 /**
  * Plan step 11C2a: the answer of `record markBusy` as the pipeline uses it: the entry of `environmentId`, or a busy mark
@@ -67,6 +68,22 @@ export function parseStepMarkAnswer(value: unknown, environmentId: string): Step
     }
   }
   throw new Error('The extension answered the step mark with an invalid value.');
+}
+
+/**
+ * Plan step 11E4d: the answer of `local viewer`: a GitHub profile (its database ID, a login, a name of at most 255
+ * characters or none), or `undefined` when the extension could not read it. Anything else is an error (identityOf then
+ * uses the account of the session).
+ */
+export function parseViewerAnswer(value: unknown): GitHubViewer | undefined {
+  if (value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('The extension answered the GitHub profile with an invalid value.');
+  const { databaseId, login, name } = value as Record<string, unknown>;
+  const id = typeof databaseId === 'number' ? Number.isSafeInteger(databaseId) && databaseId > 0 : typeof databaseId === 'string' && /^[1-9][0-9]{0,19}$/.test(databaseId);
+  if (!id || typeof login !== 'string' || !isGitHubLogin(login) || (name !== null && name !== undefined && (typeof name !== 'string' || name.length > 255))) {
+    throw new Error('The extension answered the GitHub profile with an invalid value.');
+  }
+  return { databaseId: databaseId as number | string, login, name: (name as string | null | undefined) ?? null };
 }
 
 /**
@@ -149,7 +166,15 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       windowStatuses: async () => ((await call('local', 'windowStatuses')) ?? []) as readonly WindowStatus[],
       pendings: async () => ((await call('local', 'pendings')) ?? []) as readonly { environmentId: string; windowId: string; createdAt: string }[],
       settings: async () => ((await call('local', 'settings')) ?? {}) as Record<string, unknown>,
-      processAlive: async (pid) => (await call('local', 'processAlive', pid)) === true,
+      // Plan step 11E4d: only `false` is an ended process; anything else counts as running (when in doubt, in use).
+      processAlive: async (pid) => (await call('local', 'processAlive', pid)) !== false,
+      viewer: async () => parseViewerAnswer(await call('local', 'viewer')),
+      unrecordedLifecycle: async (environmentId) => {
+        const answer = await call('local', 'unrecordedLifecycle', environmentId);
+        if (answer === null) return undefined;
+        if (typeof answer !== 'string' || !/^[0-9a-f]{12,64}$/.test(answer)) throw new Error('The extension answered the remembered container with an invalid value.');
+        return answer;
+      },
       account: async (interactive) => {
         const answer = (await call('local', 'account', interactive)) as { id?: unknown; login?: unknown } | null;
         // Plan step 11B3b: only an account with its id; anything else counts as no one signed in.
@@ -165,6 +190,9 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
         ((await call('record', 'findForAccount', repository, accountId, dockerHost)) ?? undefined) as Environment | undefined,
       remove: async (id, volumes) => void (await call('record', 'remove', id, volumes)),
       forgetKeptVolumes: async (names) => void (await call('record', 'forgetKeptVolumes', [...names])),
+      // Plan step 11E4d: the window's memory of the container whose lifecycle mark could not be recorded.
+      rememberLifecycle: async (environmentId, containerId) => void (await call('record', 'rememberLifecycle', environmentId, containerId)),
+      forgetLifecycle: async (environmentId, containerId) => void (await call('record', 'forgetLifecycle', environmentId, containerId)),
       sessionFile: async (kind, environmentId) => void (await call('record', 'sessionFile', kind, environmentId)),
       markBusy: async (environmentId, operation) => parseBusyMarkAnswer(await call('record', 'markBusy', environmentId, operation), environmentId),
       clearBusy: async (environmentId) => void (await call('record', 'clearBusy', environmentId)),

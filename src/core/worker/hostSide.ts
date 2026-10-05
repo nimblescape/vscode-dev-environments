@@ -10,6 +10,7 @@ import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MO
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import type { BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
+import type { GitHubViewer } from '../helper/containerGit';
 import type { BuildChange, ConfigurationChange, LifecycleMarkChange, StepMarkResult } from '../pipeline/openRecords';
 import type { HostOpenFinish, OpenRequestScope } from './openRequests';
 
@@ -43,6 +44,13 @@ export interface HostState {
    * lets the extension ask the user to sign in. `undefined`: no one is signed in.
    */
   account(interactive: boolean): Promise<GitHubAccount | undefined>;
+  /**
+   * Plan step 11E4d: the GitHub profile of the signed-in account (DiscoveryService.viewer), asked by the extension with
+   * its own token, for the Git identity of a new environment. `undefined`: it could not be read.
+   */
+  viewer(): Promise<GitHubViewer | undefined>;
+  /** Plan step 11E4d (decision of 2026-09-29): the container that the window remembers for the environment (LifecycleMemory). */
+  unrecordedLifecycle(environmentId: string): Promise<string | undefined>;
 }
 
 /** The records of the user's computer that a flow changes (the registry and the session files). */
@@ -55,6 +63,10 @@ export interface HostRecords {
   // createEnvironment`, and changed only by the specific requests below.
   remove(id: string, volumes: { kept?: readonly string[]; removed?: readonly string[] }): Promise<void>;
   forgetKeptVolumes(names: readonly string[]): Promise<void>;
+  /** Plan step 11E4d: the window remembers the container of the environment whose lifecycle mark could not be recorded. */
+  rememberLifecycle(environmentId: string, containerId: string): Promise<void>;
+  /** Plan step 11E4d: the window forgets it, when it is that container. */
+  forgetLifecycle(environmentId: string, containerId: string): Promise<void>;
   /**
    * The session files of the environment (pending, operation, reopen, disconnect request). Plan step 11C2a:
    * `removeReopenOf`, the reopen record only when it names the environment.
@@ -268,4 +280,8 @@ export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record dropCreated': 0,
   'record configuration': 0,
   'record build': 0,
+  // Plan step 11E4d: the window's memory of the environment's container whose lifecycle mark could not be recorded.
+  'local unrecordedLifecycle': 0,
+  'record rememberLifecycle': 0,
+  'record forgetLifecycle': 0,
 };
