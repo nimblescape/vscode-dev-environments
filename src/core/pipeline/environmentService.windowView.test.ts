@@ -116,6 +116,59 @@ describe('whether a process of the computer runs, asked before a decision (plan 
   });
 });
 
+describe('only the processes that a rule can count are asked, a few at a time (review round 1 of PR #107, A-M1, A-L4)', () => {
+  it('of 40 status files, only the active one of another window of the environment is asked, never more than 4 at once', async () => {
+    const fresh = new Date(T0).toISOString();
+    const statuses: WindowStatus[] = [
+      ...Array.from({ length: 40 }, (_, i) => ({ windowId: `w${i}`, pid: 1000 + i, environmentId: i % 2 === 0 ? 'other-environment' : null, state: 'active' as const, updatedAt: fresh })),
+      { windowId: 'w-closing', pid: 2000, environmentId: ENV_ID, state: 'closing', updatedAt: fresh },
+      { windowId: WINDOW_ID, pid: PID, environmentId: ENV_ID, state: 'active', updatedAt: fresh },
+      { windowId: 'w-connected', pid: OTHER_PID, environmentId: ENV_ID, state: 'active', updatedAt: fresh },
+    ];
+    let open = 0;
+    let most = 0;
+    h = harness(
+      (pid) => pid === PID,
+      { windowStatuses: async () => statuses },
+      async () => {
+        most = Math.max(most, ++open);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        open--;
+        return false;
+      },
+    );
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.userCommandsError = gone();
+    await rejection(h.service.open(TARGET, options()));
+    expect(new Set(asked)).toEqual(new Set([OTHER_PID]));
+    expect(most).toBeLessThanOrEqual(4);
+  });
+
+  it('ten windows of the environment: all asked, at most 4 at once', async () => {
+    const fresh = new Date(T0).toISOString();
+    const statuses: WindowStatus[] = Array.from({ length: 10 }, (_, i) => ({ windowId: `w${i}`, pid: 3000 + i, environmentId: ENV_ID, state: 'active' as const, updatedAt: fresh }));
+    let open = 0;
+    let most = 0;
+    h = harness((pid) => pid === PID, { windowStatuses: async () => statuses }, async () => {
+      most = Math.max(most, ++open);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      open--;
+      return false;
+    });
+    await seedEnvironment(h, { container: 'stopped' });
+    h.helper.userCommandsError = gone();
+    await rejection(h.service.open(TARGET, options()));
+    expect(new Set(asked)).toEqual(new Set(statuses.map((status) => status.pid)));
+    expect(most).toBe(4);
+  });
+
+  it('the mark of this window\'s process is never asked about', async () => {
+    await seedEnvironment(h, { extra: { busy: { ...BUSY, pid: PID, windowId: 'window-old' } } });
+    await h.service.open(TARGET, options());
+    expect(asked).not.toContain(PID);
+  });
+});
+
 describe("the window's memory of a container whose lifecycle mark could not be recorded (plan step 11E4d)", () => {
   function memory(): LifecycleMemory & { calls: string[] } {
     const inner = windowLifecycleMemory();

@@ -136,6 +136,8 @@ const ONCE_REQUESTS: ReadonlySet<string> = new Set([
   'record openFinished',
   // Plan step 11E4c: an operation creates at most one environment.
   'record createEnvironment',
+  // Review round 1 of PR #107 (A-L3): one question to GitHub with the user's token per operation (identityOf asks once).
+  'local viewer',
 ]);
 
 /** Plan step 11E4c: the environment of an operation (SCOPED_REQUESTS), and the one that it created. */

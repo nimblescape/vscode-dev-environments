@@ -1265,6 +1265,8 @@ const EXISTING_PATHS_CHARACTERS = 16 * 1024;
 
 /** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
 const VIEWER_TIMEOUT_MS = 5_000;
+/** Review round 1 of PR #107 (A-M1): the questions whether a process runs that the pipeline asks at the same time. */
+const PROCESS_QUESTIONS_AT_ONCE = 4;
 /** After a failed question for the profile, the fallback identity is used this long before GitHub is asked again. */
 const IDENTITY_RETRY_MS = 10 * 60_000;
 
@@ -4514,7 +4516,10 @@ export class EnvironmentService {
     // the answer "not known").
     const windows = check?.runs === false ? [] : windowStatuses;
     // Plan step 11E4d: whether the processes of the windows run is asked first (in the worker, the extension answers).
-    const isAlive = await this.processesAlive((windowStatuses ?? []).map((status) => status.pid));
+    // Review round 1 of PR #107 (A-M1): only for the windows that the rules can count (another window, active, of this
+    // environment), and none when no status file counts: a pid not asked counts as running, but is never looked at.
+    const candidates = (windowStatuses ?? []).filter((status) => status.windowId !== this.deps.owner.windowId && status.environmentId === env.id && status.state === 'active');
+    const isAlive = await this.processesAlive((check?.runs === false ? [] : candidates).map((status) => status.pid));
     const other = otherWindowUsesEnvironment(env.id, this.deps.owner.windowId, { now, isAlive, windowStatuses: windows, pendings });
     if (other !== undefined) {
       // Review round 4 (A-R4-3): a pending connection file: that window opens the environment (it may still wait or build).
@@ -7169,8 +7174,9 @@ export class EnvironmentService {
    */
   private async markBlocks(mark: BusyMark): Promise<boolean> {
     const liveness = await this.markLiveness();
-    // Plan step 11E4d: whether its process runs is asked first (in the worker, the extension answers).
-    const isAlive = await this.processesAlive([mark.pid]);
+    // Plan step 11E4d: whether its process runs is asked first (in the worker, the extension answers); review round 1 of
+    // PR #107 (A-L4): never for a mark of this window or its process, which never counts.
+    const isAlive = await this.processesAlive(mark.pid === this.markView.owner.pid ? [] : [mark.pid]);
     return otherWindowMarkIsLive(mark, { owner: this.markView.owner, isAlive }, liveness);
   }
 
@@ -7181,16 +7187,21 @@ export class EnvironmentService {
    */
   private async processesAlive(pids: Iterable<number>): Promise<(pid: number) => boolean> {
     const alive = new Map<number, boolean>();
-    await Promise.all(
-      [...new Set(pids)].map(async (pid) => {
-        try {
-          alive.set(pid, await this.processAlive(pid));
-        } catch (error) {
-          this.logger.warn(`Whether the process ${pid} runs could not be read: ${errorMessage(error)}`);
-          alive.set(pid, true);
-        }
-      }),
-    );
+    const unique = [...new Set(pids)];
+    // Review round 1 of PR #107 (A-M1): a few at a time, far below the open requests that an operation may have
+    // (MAX_OPEN_ASKS), so that the other requests of the open (its pending file, its questions) still get through.
+    for (let start = 0; start < unique.length; start += PROCESS_QUESTIONS_AT_ONCE) {
+      await Promise.all(
+        unique.slice(start, start + PROCESS_QUESTIONS_AT_ONCE).map(async (pid) => {
+          try {
+            alive.set(pid, await this.processAlive(pid));
+          } catch (error) {
+            this.logger.warn(`Whether the process ${pid} runs could not be read: ${errorMessage(error)}`);
+            alive.set(pid, true);
+          }
+        }),
+      );
+    }
     return (pid) => alive.get(pid) ?? true;
   }
 

@@ -85,6 +85,14 @@ describe('the facts of the window as requests (plan step 11E4d)', () => {
       await expect(handlerOf(host)('local', 'viewer', 'gho_worker')).rejects.toMatchObject({ code: 'invalid' });
     });
 
+    it('once per operation: each question uses the rate limit of the user\'s token (review round 1 of PR #107, A-L3)', async () => {
+      const { host, viewer } = extension();
+      const ask = handlerOf(host);
+      await ask('local', 'viewer');
+      await expect(ask('local', 'viewer')).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('only once') });
+      expect(viewer).toHaveBeenCalledTimes(1);
+    });
+
     it('none: without the viewer, without a sign-in, for a profile of another account, or when GitHub fails (logged)', async () => {
       expect(await handlerOf(extension({ viewer: undefined }).host)('local', 'viewer')).toBeNull();
       expect(await handlerOf(extension({}, null).host)('local', 'viewer')).toBeNull();
