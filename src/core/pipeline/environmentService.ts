@@ -1480,6 +1480,12 @@ export class EnvironmentService {
   ): Promise<OpenResult> {
     const { signal } = options;
     const session = await this.requireSession();
+    // Review round 1 of PR #111 (A-L1): an environment of another account is never sent (concept 7.5, as before the move).
+    if ('environmentId' in what && what.environmentId !== undefined) {
+      const entry = await this.deps.registry.get(what.environmentId);
+      if (!entry) throw environmentMissing(repository);
+      this.availableEntry(entry, session.account);
+    }
     await this.startDocker(new StepReporter(options.progress, this.logger), signal);
     this.throwIfCancelled(signal);
     const dockerHost = await this.currentDockerHost();
@@ -1520,6 +1526,9 @@ export class EnvironmentService {
     try {
       answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress);
     } catch (error) {
+      // Review round 1 of PR #111 (A-M1): the user cancelled a question of the open in the worker (the worker cleaned up
+      // through its requests, which were answered): a cancel, as before the move.
+      if (error instanceof HelperOperationError && error.code === 'cancelled' && !error.timedOut && signal?.aborted !== true) throw cancelledError();
       await this.afterLostWorkerOpen(repository, params, session.account, started);
       throw error;
     }
@@ -1533,7 +1542,14 @@ export class EnvironmentService {
     const { opened } = value;
     const environment = await this.deps.registry.get(opened.environmentId);
     const expected = params.environmentId ?? (await this.deps.registry.findForAccount(repository, session.account.id, dockerHost))?.id;
-    if (!environment || environment.id !== expected || !isAvailableTo(environment, session.account) || (environment.dockerHost ?? '') !== dockerHost) {
+    // Review round 1 of PR #111 (A-I1): and its folder is the one that the open recorded (`record openFinished`).
+    if (
+      !environment ||
+      environment.id !== expected ||
+      !isAvailableTo(environment, session.account) ||
+      (environment.dockerHost ?? '') !== dockerHost ||
+      environment.remoteWorkspaceFolder !== opened.remoteWorkspaceFolder
+    ) {
       throw new Error(`The worker answered the open of ${repository} with an environment that is not the one of the open.`);
     }
     return { environment, containerName: opened.containerName, remoteWorkspaceFolder: opened.remoteWorkspaceFolder };

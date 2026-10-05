@@ -485,7 +485,11 @@ async function record(host: HostSide, call: string, args: unknown[], context: Re
     }
     case 'forgetKeptVolumes': {
       const names = args[0];
-      if (!stringList(names)) throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
+      // Review round 1 of PR #111 (A-L2): volume names, at most as many as a question names (the worker reads which kept
+      // volumes are gone from its engine; it holds that engine anyway, so the records are no more than its word).
+      if (!stringList(names) || names.length > MAX_QUESTION_NAMES || !names.every((name) => VOLUME_NAME.test(name))) {
+        throw new HelperOperationError('invalid', 'The volume names are invalid.', false);
+      }
       await records.forgetKeptVolumes(names as string[]);
       return null;
     }

@@ -104,3 +104,18 @@ describe('the environment of the open of a repository (plan step 11E6)', () => {
     expect(await ask('record', 'clearBusy', 'e1')).toBeNull();
   });
 });
+
+// Review round 1 of PR #111 (A-L2): the kept volumes that the open forgets are names of volumes, bounded.
+describe('the kept volumes that an open forgets (review round 1 of PR #111, A-L2)', () => {
+  it('volume names only, at most 1000', async () => {
+    const forgotten: string[][] = [];
+    const host = { questions: {}, state: {}, records: { forgetKeptVolumes: async (names: string[]) => void forgotten.push(names) }, secrets: {} } as unknown as HostSide;
+    const handler = hostSideHandler(host, silentLogger, FLOW_REQUESTS[OP_OPEN], { environmentId: 'e1', repository: 'acme/app', dockerHost: HOST });
+    const ask = (names: unknown) => handler('record', { call: 'forgetKeptVolumes', args: [names] }, new AbortController().signal);
+    await ask(['acme-cache']);
+    for (const odd of [['../x'], ['a b'], [42], Array.from({ length: 1001 }, (_, i) => `v${i}`)]) {
+      await expect(ask(odd)).rejects.toMatchObject({ code: 'invalid' });
+    }
+    expect(forgotten).toEqual([['acme-cache']]);
+  });
+});

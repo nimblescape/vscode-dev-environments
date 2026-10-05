@@ -111,6 +111,11 @@ export interface HelperDeps {
    * nothing is checked, built, maintained or recorded, and the Dockerfile is never read.
    */
   ownImage?: HelperImageUse;
+  /**
+   * Plan step 11E6 (review round 1 of PR #111, A-M2): whether a container runs, for the open in the worker, which
+   * runs no Docker CLI of its own (its engine answers). Default: `docker container inspect` through `docker.run`.
+   */
+  containerRuns?: (containerId: string, signal?: AbortSignal) => Promise<boolean>;
 }
 
 /** The options of WorkspaceHelper.ensureImagePresent. */
@@ -1216,6 +1221,7 @@ export class WorkspaceHelper {
   /** Whether the container has the state `running`. A failed query counts as `false`; an abort passes through. */
   private async containerRuns(containerId: string, signal?: AbortSignal): Promise<boolean> {
     try {
+      if (this.deps.containerRuns !== undefined) return await this.deps.containerRuns(containerId, signal);
       const result = await this.deps.docker.run(['container', 'inspect', '--format', '{{json .State.Status}}', containerId], {
         timeoutMs: DOCKER_QUERY_TIMEOUT_MS,
         signal,

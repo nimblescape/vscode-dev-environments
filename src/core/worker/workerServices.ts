@@ -389,6 +389,9 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     platform: 'linux',
     engine: async () => ({ key: deps.dockerHost, socket: deps.ownHelper.socket }),
     ownImage: deps.ownHelper.image,
+    // Review round 1 of PR #111 (A-M2): a container that runs after its lifecycle commands failed is kept (the helper's own
+    // inspect would fail closed in the worker, so every such open failed).
+    containerRuns: async (containerId) => (await docker.containerState(containerId)) === 'running',
   });
   return {
     docker,
