@@ -1528,7 +1528,9 @@ export class EnvironmentService {
     } catch (error) {
       // Review round 1 of PR #111 (A-M1): the user cancelled a question of the open in the worker (the worker cleaned up
       // through its requests, which were answered): a cancel, as before the move.
-      if (error instanceof HelperOperationError && error.code === 'cancelled' && !error.timedOut && signal?.aborted !== true) throw cancelledError();
+      // Review round 2 of PR #111 (A2-M1): never a worker that ended the operation itself (its shutdown, a defect): its
+      // requests ended with it, so this window cleans up.
+      if (error instanceof HelperOperationError && error.code === 'cancelled' && !error.timedOut && !error.aborted && signal?.aborted !== true) throw cancelledError();
       await this.afterLostWorkerOpen(repository, params, session.account, started);
       throw error;
     }

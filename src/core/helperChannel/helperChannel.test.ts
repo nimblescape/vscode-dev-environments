@@ -227,6 +227,17 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
     expect(lines[lines.length - 1]).toEqual({ level: 'warn', text: `[build-box] start#${id}: failed: git clone failed after 0.0 s.` });
   });
 
+  // Review round 2 of PR #111 (A2-M1): a cancel of the helper itself (its shutdown) is told apart from a refusal.
+  it('a result that the helper cancelled itself carries `aborted`; a refusal with the code cancelled does not', async () => {
+    const { channel, fake } = await openChannel();
+    const shutdown = channel.operation('open', {});
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: false, error: { code: 'cancelled', message: 'The worker ends.' }, cancelled: true, timedOut: false });
+    await expect(shutdown).rejects.toMatchObject({ code: 'cancelled', aborted: true, timedOut: false });
+    const refused = channel.operation('open', {});
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: false, error: { code: 'cancelled', message: 'The operation was cancelled.' }, cancelled: false, timedOut: false });
+    await expect(refused).rejects.toMatchObject({ code: 'cancelled', aborted: false });
+  });
+
   // Review round 4 (M2): the AbortError comes when the script confirmed the cancel (it came at once before).
   it('cancels an operation in the helper when its signal aborts: AbortError once the script confirms it, its late messages ignored', async () => {
     const { channel, fake } = await openChannel();

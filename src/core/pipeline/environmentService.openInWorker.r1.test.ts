@@ -61,4 +61,15 @@ describe('the open in the worker (review round 1 of PR #111)', () => {
     await seedEnvironment(h, { container: 'stopped' });
     expect(((await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('not the one of the open');
   });
+
+  // Review round 2 of PR #111 (A2-M1): a worker that ended the operation itself (its shutdown) is no cancel of the user.
+  it('A2-M1: a cancel of the worker itself is no cancel of the user; this window cleans up', async () => {
+    const { h } = harness(async () => {
+      throw new HelperOperationError('cancelled', 'The worker ends.', false, true);
+    });
+    await seedEnvironment(h, { container: 'stopped', extra: { busy: { operation: 'update', since: new Date().toISOString(), pid: PID, windowId: WINDOW_ID } } });
+    const error = await rejection(h.service.openEnvironmentInWorker(ENV_ID, { progress: h.progress }));
+    expect(error).not.toBeInstanceOf(UserFacingError);
+    expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
+  });
 });
