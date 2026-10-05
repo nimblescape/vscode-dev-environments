@@ -572,6 +572,40 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       expect(side.asked).toEqual(['ghcr.io']);
     });
 
+    it("the pipeline's pulls ask the login of their registry through the operation and forget the registry secret (plan step 11E3b)", async () => {
+      const asked: string[] = [];
+      const forgotten: string[] = [];
+      let slot: string | undefined;
+      const side = {
+        secrets: {
+          registry: async (registry: string) => {
+            asked.push(registry);
+            slot = 'gho_x';
+            return { username: 'octo', serveraddress: registry, password: 'gho_x' };
+          },
+        },
+      } as unknown as HostSide;
+      const logins: string[] = [];
+      const all = workerServiceDeps({
+        host: side,
+        engine: { ...unusedEngine(), pull: async (_reference, options) => void logins.push(`${options?.login?.secretName} ${slot}`) },
+        secretOf: (name) => (name === 'registry' ? slot : undefined),
+        forgetSecret: (name) => {
+          forgotten.push(name);
+          slot = undefined;
+        },
+        logger: silentLogger,
+        ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
+        dockerHost: '',
+        owner: { windowId: 'w', pid: 1 },
+        environmentLock: async () => Promise.reject(new Error('no lock in this test')),
+      });
+      await all.docker.pullImage('ghcr.io/o/i:1', { onOutput: () => {} });
+      expect(asked).toEqual(['ghcr.io']);
+      expect(logins).toEqual(['registry gho_x']);
+      expect(forgotten).toEqual(['registry']);
+    });
+
     it('a use that fails still forgets, and the next login is still asked', async () => {
       const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
       let forgotten = 0;

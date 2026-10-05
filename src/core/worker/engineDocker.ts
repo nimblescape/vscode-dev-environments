@@ -16,7 +16,7 @@ import type { EnvironmentDocker } from '../pipeline/environmentService';
 import type { PullCredentials } from '../pipeline/pullCredentials';
 import { abortError, isAbortError, silentLogger, type Logger, type RunResult } from '../ports';
 import type { ContainerState } from '../types';
-import { credentialServerName } from '../imageCheck/reference';
+import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { EngineError, isDevContainer, isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
 
@@ -36,14 +36,26 @@ function inspected(container: EngineContainer): InspectedContainer {
 }
 
 /**
+ * Plan step 11E3b (decision B1 of 2026-10-05): the logins of the registries of the operation, one at a time
+ * (workerServices.registryLogins): `use` runs while the operation holds the login of `registry` as its registry secret,
+ * which it forgets when `use` ends.
+ */
+export type PullLogins = <T>(
+  registry: string,
+  use: (login: { username?: string; identityToken?: boolean; password: string } | undefined) => Promise<T>,
+  signal?: AbortSignal,
+) => Promise<T>;
+
+/**
  * Plan step 11B3: EnvironmentDocker over the port. `secretOf` gives the secrets of the operation (the registry login of a
- * pull is one of them, SECRET_REGISTRY).
+ * pull is one of them, SECRET_REGISTRY). Plan step 11E3b: `logins`, the login of the registry of each pull.
  */
 export class EngineDocker implements EnvironmentDocker {
   constructor(
     private readonly engine: DockerEngine,
     private readonly logger: Logger = silentLogger,
     private readonly secretOf: (name: string) => string | undefined = () => undefined,
+    private readonly logins?: PullLogins,
   ) {}
 
   /**
@@ -377,6 +389,23 @@ export class EngineDocker implements EnvironmentDocker {
    * round 1 of 11B3a, A-R1-4; plan step 11B3b hands them in as the registry secret).
    */
   async pullImage(reference: string, options: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials } = {}): Promise<void> {
+    // Plan step 11E3b (decision B1 of 2026-10-05): without credentials of the caller, the pull asks for the login of its
+    // registry and holds it only for its own turn (the operation forgets it when the pull ends); without a login, or for a
+    // reference that names no registry, anonymously.
+    const registry = options.credentials === undefined && this.logins !== undefined ? parseImageReference(reference)?.registry : undefined;
+    if (registry === undefined || this.logins === undefined) return this.pullWith(reference, options);
+    return this.logins(
+      registry,
+      (login) =>
+        this.pullWith(reference, {
+          ...options,
+          ...(login !== undefined ? { credentials: { registry, username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password } } : {}),
+        }),
+      options.signal,
+    );
+  }
+
+  private async pullWith(reference: string, options: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials }): Promise<void> {
     const onOutput = options.onOutput ?? ((text: string) => this.logger.output(text));
     const login = options.credentials;
     if (login !== undefined && this.secretOf(SECRET_REGISTRY) !== login.password) {

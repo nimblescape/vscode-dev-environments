@@ -331,7 +331,10 @@ export function workerServices(deps: WorkerServicesDeps): { service: Environment
 
 /** The deps of EnvironmentService in the worker (workerServices; review round 1 of 11B3b: apart, for their tests). */
 export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceDeps & { helper: WorkspaceHelper; docker: EngineDocker } {
-  const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf);
+  // Plan step 11E3b: one queue of registry logins for the operation, shared by its pulls and its image check (they share the
+  // one registry secret; review round 1 of PR #109, A-H1).
+  const logins = registryLogins(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger);
+  const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf, logins);
   const helper = new WorkspaceHelper({
     docker: {
       run: async () => {
@@ -398,7 +401,7 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     },
     // Plan step 11E3a: the image update check in the worker, over its own HTTPS (through the proxy of the daemon, decision
     // C1) with the login of each registry asked when it is needed and forgotten after its use (decision B1).
-    imageChecker: workerImageChecker(deps),
+    imageChecker: workerImageChecker(deps, logins),
     auth: hostAuth(deps.host, deps.logger),
     ui: hostUi(deps.host.questions, deps.logger),
     logger: deps.logger,
