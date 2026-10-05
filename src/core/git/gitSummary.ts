@@ -189,9 +189,10 @@ export const HELPER_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, () => tru
 
 /**
  * Review round 2 of PR #114 (A2-M1): HELPER_SERVICE_OWNER_FIX for the repository before the create. `-execdir … +` runs
- * one chown per folder, which costs seconds to minutes on a large repository after a new clone; then no service has run
- * on the files (no paths of services), so nothing can replace a folder by a link, and the branch without paths keeps
- * `-exec`. The branches with paths of services (a resumed clone, whose services may run) keep `-execdir`.
+ * one chown per folder, which costs seconds to minutes on a large repository after a new clone; then no container of the
+ * environment has run on the files, so nothing can replace a folder by a link, and the branch without paths keeps
+ * `-exec`. The branches with paths of services keep `-execdir`. Review round 3 of PR #114 (A3-M1): a resumed clone uses
+ * HELPER_SERVICE_OWNER_FIX (RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT), also with an empty list of paths.
  */
 export const REPOSITORY_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, (line) => line.includes('"$@"') || line.includes('-user 0'));
 
@@ -464,7 +465,18 @@ ${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
  * from the `/etc/passwd` of the environment image (EngineDocker.imageUserIds), so no container of that image runs for
  * it. As CONFIG_OWNERSHIP_FIX_SCRIPT, a link or a missing folder in place of `$1` is not walked (exit code 1).
  */
-export const NUMERIC_OWNERSHIP_FIX_SCRIPT = `set -eu
+export const NUMERIC_OWNERSHIP_FIX_SCRIPT = numericOwnershipFixScript(REPOSITORY_SERVICE_OWNER_FIX);
+
+/**
+ * Review round 3 of PR #114 (A3-M1): NUMERIC_OWNERSHIP_FIX_SCRIPT for a resumed clone, `-execdir` in every branch: the
+ * dev container and the services of an interrupted open may still run (the fix comes before they are stopped), also when
+ * no service mounts a path of the repository (an empty list), so a folder of a path may be replaced by a link.
+ */
+export const RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT = numericOwnershipFixScript(HELPER_SERVICE_OWNER_FIX);
+
+/** NUMERIC_OWNERSHIP_FIX_SCRIPT with the fix function `ownerFix` (REPOSITORY_SERVICE_OWNER_FIX, HELPER_SERVICE_OWNER_FIX). */
+function numericOwnershipFixScript(ownerFix: string): string {
+  return `set -eu
 if [ -L "$1" ] || [ ! -d "$1" ]; then
   echo "$1 is not a folder." >&2
   exit 1
@@ -473,8 +485,9 @@ dir="$1"
 uid="$2"
 gid="$3"
 shift 3
-${REPOSITORY_SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+${ownerFix}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
+}
 
 /** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */
 export function isNumericId(text: string): boolean {
@@ -551,5 +564,8 @@ export function ownershipFixCommand(repoFolder: string, user: string, serviceFol
  */
 export function repositoryOwnershipFixCommand(repoFolder: string, uid: string, gid: string, serviceFolders?: ServiceFolders): string[] {
   if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
-  return ['sh', '-c', NUMERIC_OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, uid, gid, ...servicePathArguments(repoFolder, serviceFolders)];
+  // Review round 3 of PR #114 (A3-M1): `serviceFolders` (also an empty list) is the mark of a resumed clone, whose containers
+  // may run; only a new clone (none) keeps `-exec` in the branch without paths.
+  const script = serviceFolders === undefined ? NUMERIC_OWNERSHIP_FIX_SCRIPT : RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT;
+  return ['sh', '-c', script, 'sh', repoFolder, uid, gid, ...servicePathArguments(repoFolder, serviceFolders)];
 }

@@ -20,6 +20,8 @@ import {
   configOwnershipFixCommand,
   gitSummaryCommand,
   NUMERIC_OWNERSHIP_FIX_SCRIPT,
+  RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT,
+  type ServiceFolders,
   isNumericId,
   ownershipFixCommand,
   repositoryOwnershipFixCommand,
@@ -932,10 +934,12 @@ describe('plan step 11G1: the ownership fix of the repository with numeric IDs, 
 
   it('takes only decimal user and group IDs, and the paths of the services as servicePathArguments builds them', () => {
     expect(repositoryOwnershipFixCommand(REPO, '1000', '1001')).toEqual(['sh', '-c', NUMERIC_OWNERSHIP_FIX_SCRIPT, 'sh', REPO, '1000', '1001']);
+    // Review round 3 of PR #114 (A3-M1): changed expectation, with paths of services (a resumed clone) the script of a
+    // resumed clone (`-execdir` in every branch).
     expect(repositoryOwnershipFixCommand(REPO, '1000', '1001', [`${REPO}/pgdata`])).toEqual([
       'sh',
       '-c',
-      NUMERIC_OWNERSHIP_FIX_SCRIPT,
+      RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT,
       'sh',
       REPO,
       '1000',
@@ -1366,7 +1370,8 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
 });
 
 describe.skipIf(process.getuid?.() !== 0)('review round 2 of PR #114 (A2-M1): the fix before the create after a new clone, with real tools as root', () => {
-  it('gives every file of a repository with many folders its owner quickly (one chown for many files, not one per folder)', () => {
+  // Review round 3 of PR #114 (A3-L1): its own time limit (the setup of 3000 folders is synchronous).
+  it('gives every file of a repository with many folders its owner quickly (one chown for many files, not one per folder)', { timeout: 60_000 }, () => {
     const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-many-'));
     try {
       const repository = path.join(folder, 'repo');
@@ -1388,5 +1393,19 @@ describe.skipIf(process.getuid?.() !== 0)('review round 2 of PR #114 (A2-M1): th
     } finally {
       fs.rmSync(folder, { recursive: true, force: true });
     }
+  });
+});
+
+describe('review round 3 of PR #114 (A3-M1): the fix of a resumed clone', () => {
+  it('uses -execdir in every branch for a resumed clone, also with an empty list of paths of services; a new clone keeps -exec without paths', () => {
+    const script = (folders?: ServiceFolders) => repositoryOwnershipFixCommand('/workspaces/repo', '1000', '1001', folders)[2];
+    for (const folders of [[], ['/workspaces/repo/data'], 'repository'] as ServiceFolders[]) {
+      expect(script(folders)).toBe(RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT);
+      expect(script(folders)).not.toContain(' -exec chown');
+    }
+    expect(script(undefined)).toBe(NUMERIC_OWNERSHIP_FIX_SCRIPT);
+    const finds = RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
+    expect(finds).toHaveLength(3);
+    for (const line of finds) expect(line).toMatch(/ -execdir chown -h -- "\$fix_owner" \{\} \+$/);
   });
 });
