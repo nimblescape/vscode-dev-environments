@@ -106,4 +106,28 @@ describe('WorkspaceHelper.fixRepositoryOwnership (plan step 11G1)', () => {
     expect(lock.steps).toEqual([]);
     await expect(helper().fixRepositoryOwnership({ volumeName: 'vol', repository: REPO, uid: '1000', gid: '1000' })).rejects.toThrow('ran outside the batch helper of an operation');
   });
+
+  it('review round 1 of PR #114 (A-M2): sends the whole repository for paths of services that the step would refuse', async () => {
+    const cases: string[][] = [
+      [`${FOLDER}/data\tdir`],
+      [`${FOLDER}/data\u007f`],
+      // Within MAX_SERVICE_FOLDERS, but over the bound of the request.
+      Array.from({ length: 300 }, (_, i) => `${FOLDER}/${'d'.repeat(4000)}${i}`),
+    ];
+    for (const serviceFolders of cases) {
+      const lock = new StepLock();
+      await runWithBatchScope(lock, 'vol', silentLogger, () =>
+        helper().fixRepositoryOwnership({ volumeName: 'vol', repository: REPO, uid: '1000', gid: '1001', serviceFolders, image: OWN }),
+      );
+      expect(lock.steps).toHaveLength(1);
+      expect(lock.steps[0].params).toEqual({ repository: REPO, uid: '1000', gid: '1001', serviceFolders: 'repository' });
+      expect(() => batchStepCommand('repositoryOwnershipFix', lock.steps[0].params)).not.toThrow();
+    }
+    // A valid path stays as it is.
+    const lock = new StepLock();
+    await runWithBatchScope(lock, 'vol', silentLogger, () =>
+      helper().fixRepositoryOwnership({ volumeName: 'vol', repository: REPO, uid: '1000', gid: '1001', serviceFolders: [`${FOLDER}/data`], image: OWN }),
+    );
+    expect(lock.steps[0].params).toEqual({ repository: REPO, uid: '1000', gid: '1001', serviceFolders: [`${FOLDER}/data`] });
+  });
 });

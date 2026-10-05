@@ -104,6 +104,12 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
           if (text.length + chunk.length > MAX_ENGINE_ANSWER_CHARACTERS) {
             text += chunk.slice(0, Math.max(0, MAX_ENGINE_ANSWER_CHARACTERS - text.length));
             truncated = true;
+            // Review round 1 of PR #114 (A-L3): the read of a file of an image (latin1) ends at the bound at once, instead of
+            // reading the rest of a large file until its time limit; its caller counts a truncated answer as unknown.
+            if (request.latin1 === true) {
+              finish(undefined, { status: res.statusCode ?? 0, body: text, truncated });
+              req.destroy();
+            }
           } else {
             text += chunk;
           }

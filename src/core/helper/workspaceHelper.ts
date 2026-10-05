@@ -73,7 +73,7 @@ import {
 import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
 // Plan step 6, PR C, plan step 7: the volume steps run only in the batch helper of an operation.
 import { currentBatchScope, type BatchScope } from './batchScope';
-import type { BatchStepKind } from './batchSteps';
+import { batchStepCommand, type BatchStepKind } from './batchSteps';
 
 export { isPassableEnvName };
 
@@ -223,6 +223,13 @@ export type { HelperFiles };
 
 /** Plan step 6, PR C: the step kinds of the batch helper that take the variables of the request (`env`). */
 const BATCH_ENV_KINDS: ReadonlySet<BatchStepKind> = new Set<BatchStepKind>(['readConfiguration', 'build', 'up', 'runUserCommands']);
+
+/**
+ * Review round 1 of PR #114 (A-M2): the most characters of the paths of the services in the request of the ownership fix
+ * before the create, well below the bound of a request of the batch helper (MAX_BATCH_INPUT_CHARACTERS, 3 MiB); over it,
+ * the whole repository counts as a path of the services.
+ */
+const MAX_SERVICE_FOLDERS_REQUEST_CHARACTERS = 1024 * 1024;
 
 /** Time limit of the model run of a Docker Compose configuration (composeModel). */
 export const COMPOSE_MODEL_TIMEOUT_MS = 60_000;
@@ -832,11 +839,28 @@ export class WorkspaceHelper {
       const bounded = boundServiceFolders(folder, [serviceFolders]);
       serviceFolders = bounded.overflow ? 'repository' : bounded.folders;
     }
+    const params = (folders: ServiceFolders | undefined) => ({
+      repository: p.repository,
+      uid: p.uid,
+      gid: p.gid,
+      ...(folders === undefined ? {} : { serviceFolders: folders === 'repository' ? folders : [...folders] }),
+    });
+    // Review round 1 of PR #114 (A-M2): paths of the services that the step would refuse (a control character, a path
+    // too long, a list too large for the request) count as the whole repository (only the files of root change), as the
+    // fix did before, instead of a refusal of the step that refuses the open.
+    if (serviceFolders !== undefined && serviceFolders !== 'repository') {
+      try {
+        batchStepCommand('repositoryOwnershipFix', params(serviceFolders));
+        if (JSON.stringify(serviceFolders).length > MAX_SERVICE_FOLDERS_REQUEST_CHARACTERS) serviceFolders = 'repository';
+      } catch {
+        serviceFolders = 'repository';
+      }
+    }
     const command = repositoryOwnershipFixCommand(folder, p.uid, p.gid, serviceFolders);
     return this.runStreams(p.volumeName, command, {
       batch: {
         kind: 'repositoryOwnershipFix',
-        params: { repository: p.repository, uid: p.uid, gid: p.gid, ...(serviceFolders === undefined ? {} : { serviceFolders: serviceFolders === 'repository' ? serviceFolders : [...serviceFolders] }) },
+        params: params(serviceFolders),
       },
       image: p.image,
       timeoutMs: p.timeoutMs,

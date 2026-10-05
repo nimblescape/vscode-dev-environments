@@ -179,6 +179,15 @@ ${SERVICE_REAL_PATHS}  if [ -n "$whole" ]; then
 `;
 
 /**
+ * Review round 1 of PR #114 (A-M1): SERVICE_OWNER_FIX for the batch helper (its image has GNU findutils): `-execdir`
+ * runs `chown -h -- ./<name>` in the folder that `find` has open, so a folder of the path that a running container of a
+ * service replaces by a link after `find` listed the file is not followed (with `-exec`, chown resolves the whole path
+ * again, and the batch helper also mounts the Docker socket of the engine and the shared cache). The fix in the dev
+ * container (OWNERSHIP_FIX_SCRIPT) keeps `-exec`: the image may have BusyBox, and it mounts neither.
+ */
+export const HELPER_SERVICE_OWNER_FIX = SERVICE_OWNER_FIX.split('-exec chown -h "$fix_owner" {} +').join('-execdir chown -h -- "$fix_owner" {} +');
+
+/**
  * Review round 11 (G5): the most paths of the repository that the ownership fixes leave to the services (a list of
  * serviceFolderPaths). Over it, the whole repository counts as a path of the services (servicePathArguments): only the
  * files of root get their owner, so no data of a service loses its owner.
@@ -420,7 +429,7 @@ if [ -L "$1" ] || [ ! -d "$1" ]; then
   echo "$1 is not a folder." >&2
   exit 1
 fi
-${SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
+${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
 `;
 
 /**
@@ -441,7 +450,7 @@ dir="$1"
 uid="$2"
 gid="$3"
 shift 3
-${SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
+${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 `;
 
 /** Review round 15 (K3): a user or group ID as `id -u` and `id -g` print it: a decimal number below 2^32 - 1. */

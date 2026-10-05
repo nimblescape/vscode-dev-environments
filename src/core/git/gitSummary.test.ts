@@ -119,10 +119,18 @@ describe('commands', () => {
   it('never follows a link and never leaves the file system of the folder, on every branch of the fix (review round 3 of PR #81, B-R3-1, B-R3-2)', () => {
     // Review round 3 of PR #81: the tests with real tools and mounts need root and are skipped elsewhere (CI); this one
     // runs everywhere. Each of the three find commands of the fix keeps -xdev and chown -h.
-    for (const script of [OWNERSHIP_FIX_SCRIPT, CONFIG_OWNERSHIP_FIX_SCRIPT]) {
+    // Review round 1 of PR #114 (A-M1): changed expectation for CONFIG_OWNERSHIP_FIX_SCRIPT (before: `-exec`), which runs
+    // in the batch helper: `-execdir chown -h --`, so a folder of the path that is replaced by a link is not followed.
+    for (const [script, exec] of [
+      [OWNERSHIP_FIX_SCRIPT, '-exec chown -h "$fix_owner" {} +'],
+      [CONFIG_OWNERSHIP_FIX_SCRIPT, '-execdir chown -h -- "$fix_owner" {} +'],
+    ] as const) {
       const finds = script.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
       expect(finds).toHaveLength(3);
-      for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
+      for (const line of finds) {
+        expect(line).toMatch(/^\s*find "\$folder" -xdev /);
+        expect(line.endsWith(exec)).toBe(true);
+      }
     }
   });
 
@@ -951,7 +959,10 @@ describe('plan step 11G1: the ownership fix of the repository with numeric IDs, 
     expect(NUMERIC_OWNERSHIP_FIX_SCRIPT).toContain('service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"');
     const finds = NUMERIC_OWNERSHIP_FIX_SCRIPT.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
     expect(finds).toHaveLength(3);
-    for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -exec chown -h "\$fix_owner" \{\} \+$/);
+    // Review round 1 of PR #114 (A-M1): changed expectation (before: `-exec chown -h`): the batch helper's fix runs chown in
+    // the folder that find has open (`-execdir`), so a folder of the path replaced by a link meanwhile is not followed.
+    for (const line of finds) expect(line).toMatch(/^\s*find "\$folder" -xdev .* -execdir chown -h -- "\$fix_owner" \{\} \+$/);
+    expect(NUMERIC_OWNERSHIP_FIX_SCRIPT).not.toMatch(/ -exec chown/);
   });
 
   it('has valid sh syntax, and dash syntax where dash exists', () => {
