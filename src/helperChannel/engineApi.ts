@@ -57,6 +57,12 @@ export interface EngineStream {
   readonly ended: Promise<void>;
   /** Ends the connection at once (a cancel, or the end of the exec). */
   destroy(): void;
+  /**
+   * Plan step 11G3: stops and resumes the reading of the output (the engine's buffer fills, so the process waits), for
+   * the long-lived stream of DockerEngine.runAttached while the connection of the extension is congested.
+   */
+  pause?(): void;
+  resume?(): void;
 }
 
 /** A request of engineHijack; `onFrame` is given before the connection exists, so no output can come before it. */
@@ -255,6 +261,8 @@ function engineStream(socket: Duplex, head: Buffer, onFrame: EngineHijackRequest
       settle(abortError());
       socket.destroy();
     },
+    pause: () => void socket.pause(),
+    resume: () => void socket.resume(),
   };
 }
 

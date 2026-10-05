@@ -2,7 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 6, PR B: the messages of the batch helper and the `docker run` of the helper.
+// Plan step 6, PR B: the messages of the batch helper and the `docker run` of the helper (plan step 11G3: the spec of its
+// run over the Engine API).
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
@@ -14,8 +15,8 @@ import {
   BATCH_GIT_UID,
   BATCH_SCRIPT_PATH,
   BATCH_SOCKET_FOLDER,
-  batchRunArgs,
-  batchVolumeArgs,
+  batchContainerName,
+  batchRunSpec,
   parseBatchChunkParams,
   parseBatchParams,
   parseBatchStepParams,
@@ -75,35 +76,25 @@ describe('the batch messages (plan step 6, PR B)', () => {
     expect(parseBatchStepValue({ exitCode: 0, stdout: 'x' })).toBeUndefined();
   });
 
-  it('checks the volume by its name, and starts the helper without a variable, with the session label and the pipe loader', () => {
-    expect(batchVolumeArgs('devenv-v')).toEqual(['volume', 'inspect', '--format', '{{.Name}}', 'devenv-v']);
-    expect(batchRunArgs({ session: SESSION, volume: 'devenv-v', image: IMAGE, socket: '/var/run/docker.sock', scriptHash: 'f'.repeat(64) })).toEqual([
-      'run',
-      '--rm',
-      '-i',
-      '--pull',
-      'never',
-      '--name',
-      `devenv-batch-${SESSION}`,
-      '--label',
-      'nimblescape.devenv.helper-run=true',
-      '--label',
-      `nimblescape.devenv.channel-step=${SESSION}`,
-      '--log-driver',
-      'none',
-      '--security-opt',
-      'no-new-privileges',
-      '--mount',
-      'type=volume,source=devenv-v,target=/workspaces',
-      '--mount',
-      'type=volume,source=devenv-helper-cache,target=/devenv-cache',
-      '--mount',
-      `type=bind,source=/var/run/docker.sock,target=${BATCH_DOCKER_SOCKET}`,
-      '--tmpfs',
-      '/run/devenv-secrets:rw,noexec,nosuid,nodev,size=1m,mode=0700',
-      IMAGE,
-      ...loaderCommand({ path: BATCH_SCRIPT_PATH, hash: 'f'.repeat(64), entry: BATCH_ENTRY }),
-    ]);
+  it('starts the helper without a variable, with the session label and the pipe loader', () => {
+    // Plan step 11G3: changed expectation: the helper runs over the Engine API (DockerEngine.runAttached) instead of the
+    // worker's own `docker run`, so the spec of its create replaces the arguments of that `docker run --rm -i --pull
+    // never` (each option maps to one field; `--rm -i`, `--pull never` and `--log-driver none` are runAttached's own), and
+    // the volume check is the inspect of the port instead of `docker volume inspect` (batchVolumeArgs is removed).
+    expect(batchContainerName(SESSION)).toBe(`devenv-batch-${SESSION}`);
+    expect(batchRunSpec({ session: SESSION, volume: 'devenv-v', image: IMAGE, socket: '/var/run/docker.sock', scriptHash: 'f'.repeat(64) })).toEqual({
+      name: `devenv-batch-${SESSION}`,
+      image: IMAGE,
+      command: loaderCommand({ path: BATCH_SCRIPT_PATH, hash: 'f'.repeat(64), entry: BATCH_ENTRY }),
+      labels: { 'nimblescape.devenv.helper-run': 'true', 'nimblescape.devenv.channel-step': SESSION },
+      mounts: [
+        { type: 'volume', source: 'devenv-v', target: '/workspaces' },
+        { type: 'volume', source: 'devenv-helper-cache', target: '/devenv-cache' },
+        { type: 'bind', source: '/var/run/docker.sock', target: BATCH_DOCKER_SOCKET },
+      ],
+      tmpfs: { '/run/devenv-secrets': 'rw,noexec,nosuid,nodev,size=1m,mode=0700' },
+      securityOpt: ['no-new-privileges'],
+    });
   });
 
   it('matches the user and the socket folder of the helper image', () => {

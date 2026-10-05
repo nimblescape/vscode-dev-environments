@@ -26,7 +26,7 @@ import {
   withDevcontainerIdPlaceholder,
   type CliVariables,
 } from './cliVariables';
-import { batchRunArgs } from '../helperChannel/batch';
+import { batchRunSpec } from '../helperChannel/batch';
 import { batchStepCommand } from './batchSteps';
 import { composeMountVolumes } from '../pipeline/pipelineRules';
 
@@ -335,8 +335,11 @@ describe('the known variables of the helper process (hotfix review 1, N4)', () =
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the batch helper
     // container (batchRunArgs) gets no user and no HOME (was: helperRunArgs), and its steps of the Dev Container CLI run
     // as root with the variables of the helper (no owner, not the Git user).
-    const args = batchRunArgs({ session: 'a'.repeat(24), volume: 'v', image: `sha256:${'1'.repeat(64)}`, socket: '/var/run/docker.sock', scriptHash: 'f'.repeat(64) });
-    expect(args.filter((arg) => arg === '--user' || arg === '-u' || arg.startsWith('--user=') || arg.startsWith('HOME='))).toEqual([]);
+    // Plan step 11G3: changed expectation: the spec of its create over the Engine API (batchRunSpec, was batchRunArgs)
+    // has no user and no variable, and its command no `--user` or HOME either.
+    const spec = batchRunSpec({ session: 'a'.repeat(24), volume: 'v', image: `sha256:${'1'.repeat(64)}`, socket: '/var/run/docker.sock', scriptHash: 'f'.repeat(64) });
+    expect(Object.keys(spec).sort()).toEqual(['command', 'image', 'labels', 'mounts', 'name', 'securityOpt', 'tmpfs']);
+    expect(spec.command.filter((arg) => arg === '--user' || arg === '-u' || arg.startsWith('--user=') || arg.startsWith('HOME='))).toEqual([]);
     for (const step of [
       batchStepCommand('readConfiguration', { repository: 'o/r', configPath: 'a.json', environmentId: 'e', merged: true }),
       batchStepCommand('build', { repository: 'o/r', configPath: 'a.json', imageName: 'devenv-x:1' }),
