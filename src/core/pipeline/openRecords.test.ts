@@ -185,6 +185,8 @@ describe('the registry writes of the open (plan step 11E4a)', () => {
       expect(result?.additionalVolumes).toEqual(['a', 'b', 'c']);
       expect(result?.serviceVolumes).toEqual(['s', 't']);
       const fresh = await setup().records.configuration(ID, { addVolumes: ['x'], addServiceVolumes: ['y'] });
+      // Review round 3 of PR #106 (A3-M1): a name that the change repeats is recorded once.
+      expect(await setup().records.configuration(ID, { addVolumes: ['x', 'x'], addServiceVolumes: ['y', 'y'] })).toMatchObject({ additionalVolumes: ['x'], serviceVolumes: ['y'] });
       expect(fresh).toMatchObject({ additionalVolumes: ['x'], serviceVolumes: ['y'] });
     });
 

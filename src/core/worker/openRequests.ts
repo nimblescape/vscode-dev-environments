@@ -191,7 +191,8 @@ function hasOnlyFields(value: Record<string, unknown>, fields: ReadonlySet<strin
 /** Plan step 11E4c: names of volumes as Docker takes them, at most MAX_DELETE_VOLUMES (the most additional volumes). */
 function volumeNames(value: unknown, what: string): string[] {
   if (!Array.isArray(value) || value.length > MAX_DELETE_VOLUMES || !value.every((name) => typeof name === 'string' && VOLUME_NAME.test(name))) throw invalid(what);
-  return [...(value as string[])];
+  // Review round 3 of PR #106 (A3-M1): a name once; a repeat adds nothing (each would be recorded again).
+  return [...new Set(value as string[])];
 }
 
 /**

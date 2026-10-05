@@ -215,6 +215,8 @@ describe('the entry of a first open, the configuration and the build records as 
       expect(file().environments).toEqual([theirs]);
       // The open uses it: its requests are for that environment, never for the ID of the request.
       expect(await ask('ownerLogin', OTHER)).toMatchObject({ id: OTHER, owner: ACCOUNT });
+      // Review round 3 of PR #106: the configuration of the open is for it too.
+      expect(await ask('configuration', OTHER, { cloned: true })).toMatchObject({ id: OTHER });
       await expect(ask('configuration', NEW, { cloned: true })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('another environment') });
       // This operation did not create it: it never removes it.
       await expect(ask('dropCreated', OTHER)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('not the one that the operation created') });
@@ -497,6 +499,20 @@ describe('the entry of a first open, the configuration and the build records as 
       await ask('configuration', ID, { addVolumes: batch(5000), addServiceVolumes: batch(5000) });
       expect(entry()?.additionalVolumes).toHaveLength(1000);
       expect(entry()?.serviceVolumes).toHaveLength(1000);
+    });
+
+    it('a name repeated within a request or across requests is recorded once (review round 3 of PR #106, A3-M1)', async () => {
+      const { ask, entry } = setup();
+      for (let i = 0; i < 3; i += 1) {
+        const repeated = [...Array.from({ length: 999 }, () => `v${i}`), 'v0'];
+        await ask('configuration', ID, { addVolumes: repeated, addServiceVolumes: repeated });
+      }
+      expect(entry()?.additionalVolumes).toEqual(['v0', 'v1', 'v2']);
+      expect(entry()?.serviceVolumes).toEqual(['v0', 'v1', 'v2']);
+      // Names that differ in case are distinct volumes for Docker; a volume of a service is one of the same case.
+      const updated = (await ask('configuration', ID, { addVolumes: ['Ab', 'aB'], addServiceVolumes: ['AB'] })) as Environment;
+      expect(updated.additionalVolumes).toEqual(['v0', 'v1', 'v2', 'Ab', 'aB']);
+      expect(updated.serviceVolumes).toEqual(['v0', 'v1', 'v2']);
     });
 
     it('a volume of a service that the entry recorded before stays a volume of a service', async () => {
