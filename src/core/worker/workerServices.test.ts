@@ -11,13 +11,15 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { hostRegistryCredentials, registryLogins, workerImageChecker, hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
 import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand, heartbeatCommand } from '../remoteMonitor/protocol';
 import { stopAfterSeconds } from '../session/sessionRules';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
+import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
+import { ImageChecker } from '../imageCheck/imageCheck';
 
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
 
@@ -210,6 +212,7 @@ describe('the core services in the worker (plan step 11B3b)', () => {
       host,
       engine: unusedEngine(),
       secretOf: () => undefined,
+      forgetSecret: () => undefined,
       logger: silentLogger,
       ownHelper: { image: { tag: 'devenv-helper:abc', id: IMAGE_ID }, socket: '/s.sock' },
       dockerHost: 'build-box',
@@ -235,6 +238,7 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
       host,
       engine: { ...unusedEngine(), version: async () => ({ apiVersion: '1.48', version: '29.0.0' }) },
       secretOf: (name) => (name === SECRET_TOKEN ? 'ghp_x' : undefined),
+      forgetSecret: () => undefined,
       logger: silentLogger,
       ownHelper: { image: { tag: 'devenv-helper:abc', id: IMAGE_ID }, socket: '/s.sock' },
       dockerHost: 'build-box',
@@ -247,10 +251,11 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     return { all, calls };
   }
 
-  it('fails closed where the worker has nothing yet: the analysis, the image check, a process, a flow, a helper container or build', async () => {
+  it('fails closed where the worker has nothing yet: the analysis, a process, a flow, a helper container or build', async () => {
     const { all } = deps();
     await expect(all.analyzer.analyze({} as never)).rejects.toThrow('before plan step 11E');
-    await expect(all.imageChecker.check({} as never)).rejects.toThrow('before plan step 11E');
+    // Plan step 11E3a: changed, the image check runs in the worker (before: it threw "before plan step 11E").
+    expect(all.imageChecker).toBeInstanceOf(ImageChecker);
     await expect(all.runner.run('docker', [])).rejects.toThrow('runs no process');
     await expect(all.flow('stop', {}, {})).rejects.toThrow('sends no flow');
     expect(() => all.settings()).toThrow('before plan step 11E');
@@ -458,6 +463,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
           host: {} as HostSide,
           engine,
           secretOf: () => undefined,
+          forgetSecret: () => undefined,
           logger: silentLogger,
           ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
           dockerHost: '',
@@ -478,6 +484,115 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
       expect(await bare.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toMatchObject({ ok: false });
       expect(execs).toHaveLength(1);
+    });
+  });
+
+  describe('the login of a registry for one use (plan step 11E3a, decision B1)', () => {
+    function host(answer: () => Promise<unknown>) {
+      const asked: string[] = [];
+      return {
+        asked,
+        host: {
+          secrets: {
+            registry: async (registry: string) => (asked.push(registry), answer()),
+          },
+        } as unknown as HostSide,
+      };
+    }
+
+    it('asked for the registry when it is needed, and forgotten by the operation right after, whatever the answer', async () => {
+      for (const [answer, expected] of [
+        [async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }), { username: 'octo', password: 'p1' }],
+        [async () => ({ identityToken: true, serveraddress: 'registry.example.com', password: 't1' }), { username: IDENTITY_TOKEN_USER, password: 't1' }],
+        [async () => undefined, undefined],
+        [async () => Promise.reject(new Error('channel closed')), undefined],
+      ] as const) {
+        const { host: side, asked } = host(answer as () => Promise<unknown>);
+        let forgotten = 0;
+        const warnings: string[] = [];
+        // Review round 1 of PR #109 (A-H1): changed call, the logins of the operation are one after the other (registryLogins).
+        const provider = hostRegistryCredentials(registryLogins(side, () => void forgotten++, { ...silentLogger, warn: (text: string) => warnings.push(text) }));
+        expect(await provider('ghcr.io')).toEqual(expected);
+        expect(asked).toEqual(['ghcr.io']);
+        expect(forgotten).toBe(1);
+        // The next use asks again.
+        await provider('ghcr.io');
+        expect(asked).toEqual(['ghcr.io', 'ghcr.io']);
+        // Review round 1 of PR #109 (B): the assertion that never ran (`answer` is always a function); only a failed request is logged.
+        expect(warnings.length > 0).toBe(expected === undefined && warnings.some((text) => text.includes('channel closed')));
+      }
+    });
+
+    it('two logins asked at once are asked one after the other, each read and forgotten before the next (review round 1 of PR #109, A-H1)', async () => {
+      // One secret slot, as the operation has it: an answer sets it; the reader reads it after the answer.
+      let slot: string | undefined;
+      const events: string[] = [];
+      const pending: (() => void)[] = [];
+      const side = {
+        secrets: {
+          registry: (registry: string) =>
+            new Promise((resolve) => {
+              events.push(`ask ${registry}`);
+              pending.push(() => {
+                slot = `PASS-${registry}`;
+                resolve({ username: `u-${registry}`, serveraddress: registry, password: slot });
+              });
+            }),
+        },
+      } as unknown as HostSide;
+      const logins = registryLogins(side, () => {
+        events.push('forget');
+        slot = undefined;
+      }, silentLogger);
+      const provider = hostRegistryCredentials(logins);
+      const both = Promise.all([provider('a.example'), provider('b.example')]);
+      await Promise.resolve();
+      // Only the first is asked while it is open.
+      expect(events).toEqual(['ask a.example']);
+      pending.shift()!();
+      for (let i = 0; i < 10 && pending.length === 0; i++) await Promise.resolve();
+      pending.shift()!();
+      expect(await both).toEqual([
+        { username: 'u-a.example', password: 'PASS-a.example' },
+        { username: 'u-b.example', password: 'PASS-b.example' },
+      ]);
+      expect(events).toEqual(['ask a.example', 'forget', 'ask b.example', 'forget']);
+    });
+
+    it('a login whose user gave up while it waited is not asked; its turn still ends with the forget (review round 2 of PR #109, A2-L1)', async () => {
+      const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
+      let forgotten = 0;
+      const provider = hostRegistryCredentials(registryLogins(side.host, () => void forgotten++, silentLogger));
+      const gaveUp = new AbortController();
+      gaveUp.abort();
+      expect(await provider('ghcr.io', gaveUp.signal)).toBeUndefined();
+      expect(side.asked).toEqual([]);
+      expect(forgotten).toBe(1);
+      expect(await provider('ghcr.io', new AbortController().signal)).toEqual({ username: 'octo', password: 'p1' });
+      expect(side.asked).toEqual(['ghcr.io']);
+    });
+
+    it('a use that fails still forgets, and the next login is still asked', async () => {
+      const side = host(async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }));
+      let forgotten = 0;
+      const logins = registryLogins(side.host, () => void forgotten++, silentLogger);
+      await expect(logins('ghcr.io', async () => Promise.reject(new Error('pull failed')))).rejects.toThrow('pull failed');
+      expect(await logins('ghcr.io', async (login) => login?.password)).toBe('p1');
+      expect(forgotten).toBe(2);
+    });
+
+    it("the worker's image check reads neither the proxy nor a login before a check needs them", async () => {
+      let proxies = 0;
+      const side = host(async () => undefined);
+      const checker = workerImageChecker({
+        host: side.host,
+        engine: { ...unusedEngine(), proxy: async () => (proxies++, {}) },
+        forgetSecret: () => undefined,
+        logger: silentLogger,
+      });
+      expect(checker).toBeInstanceOf(ImageChecker);
+      expect(proxies).toBe(0);
+      expect(side.asked).toEqual([]);
     });
   });
 

@@ -61,12 +61,12 @@ export const CHANNEL_PASSIVE_OPEN_WAIT_MS = 30_000;
 
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
- * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, no network, no
+ * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, outbound network only (plan step 11E3a), no
  * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
  * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
  * the first line of the input (HelperChannel.open), never on the command line.
  */
-export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume: string; containerName: string; label: string; scriptHash: string }): string[] {
+export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume: string; containerName: string; label: string; scriptHash: string; network?: 'bridge' | 'none' }): string[] {
   // --mount is CSV: a path with a comma or a quote would change the mount.
   if (/[",]/.test(p.socketPath)) throw new HelperChannelError('open', `The Docker socket path ${p.socketPath} cannot be mounted.`);
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(p.stateVolume)) throw new HelperChannelError('open', `The volume ${p.stateVolume} cannot be mounted.`);
@@ -82,8 +82,10 @@ export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume
     `${LABEL_HELPER_RUN}=true`,
     '--label',
     `${LABEL_HELPER_CHANNEL}=${p.label}`,
+    // Plan step 11E3a (decision of 2026-10-03: the worker gets outbound network): the default bridge, never a published
+    // port; its HTTPS goes through the proxy of the daemon (decision C1 of 2026-10-05, proxyTransport.ts).
     '--network',
-    'none',
+    p.network ?? 'bridge',
     // Review round 2 (B3): the engine keeps no log of the channel (its commands and output), whatever its log driver.
     '--log-driver',
     'none',
@@ -123,6 +125,9 @@ export interface ChannelOpenDeps {
   stateVolume: string;
 }
 
+/** Review round 1 of PR #109 (A-L3): Docker's refusal of `--network bridge` on a daemon without it. */
+const NO_BRIDGE = /network "?bridge"? not found/i;
+
 /** The name of the engine of `target` in the log. */
 function engineName(target: DockerTarget): string {
   return target.kind === 'local' ? 'the local Docker' : target.host;
@@ -137,12 +142,24 @@ function engineName(target: DockerTarget): string {
  */
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const [script, tag, socketPath] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target)]);
-  const containerName = `devenv-channel-${crypto.randomBytes(6).toString('hex')}`;
-  const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script) });
-  const process = await runWithDockerTarget(target, async () => deps.start(args));
-  if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
   const name = engineName(target);
-  const channel = await HelperChannel.open(process, script, { logger: deps.logger, name });
+  const start = async (network: 'bridge' | 'none'): Promise<HelperChannel> => {
+    const containerName = `devenv-channel-${crypto.randomBytes(6).toString('hex')}`;
+    const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script), network });
+    const process = await runWithDockerTarget(target, async () => deps.start(args));
+    if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
+    return HelperChannel.open(process, script, { logger: deps.logger, name });
+  };
+  let channel: HelperChannel;
+  try {
+    channel = await start('bridge');
+  } catch (error) {
+    // Review round 1 of PR #109 (A-L3): a daemon without its default bridge (`"bridge": "none"`) starts the worker without
+    // network; only what needs it (the image check, the downloads) fails then, and the log says why.
+    if (!(error instanceof HelperChannelError) || !NO_BRIDGE.test(error.message)) throw error;
+    deps.logger.warn(`The Docker engine ${name} has no default bridge network, so the worker runs without outbound network there: image checks and downloads in the worker cannot reach the network.`);
+    channel = await start('none');
+  }
   let engine: string | undefined;
   try {
     const probe = parseProbeValue(await channel.operation(OP_PROBE, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));

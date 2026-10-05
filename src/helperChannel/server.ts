@@ -118,6 +118,11 @@ export interface OperationContext {
   /** Plan step 11A: true when the operation has no secret at all. */
   hasNoSecret(): boolean;
   /**
+   * Plan step 11E3a (decision B1 of 2026-10-05): the operation no longer holds the secret `name` (it asks again when it
+   * needs it); its value stays masked in all that the operation sends back (maskedValues).
+   */
+  forgetSecret(name: string): void;
+  /**
    * Plan step 11E1 (review round 1 of PR #102, A-M1): every secret value that the operation ever held (also one that a
    * later answer replaced), as the server masks them, for the output that an operation keeps of its own processes.
    */
@@ -502,6 +507,7 @@ export class ChannelServer {
         return { ...run.secrets };
       },
       hasNoSecret: () => Object.keys(run.secrets).length === 0,
+      forgetSecret: (name) => void delete run.secrets[name],
       maskedValues: () => [...run.masked],
       ask: (kind, payload) => this.ask(run, kind, payload),
       progress: (step, detail) =>

@@ -17,6 +17,11 @@ import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
 import { WorkspaceHelper } from '../helper/workspaceHelper';
+import { ImageChecker } from '../imageCheck/imageCheck';
+import { RegistryClient, type CredentialsProvider } from '../imageCheck/registryClient';
+import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
+import { proxiedHttpsTransport } from '../proxyTransport';
+import { SECRET_REGISTRY } from '../helperChannel/protocol';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
@@ -181,6 +186,70 @@ export function hostLifecycleMemory(host: HostSide): LifecycleMemory {
   };
 }
 
+/** Plan step 11E3a: a registry login as the operation holds it while it is used. */
+export type RegistryLogin = NonNullable<Awaited<ReturnType<HostSide['secrets']['registry']>>>;
+
+/**
+ * Plan step 11E3a (decision B1 of 2026-10-05): the logins of the registries of one operation. Every login comes as the one
+ * registry secret of the operation (SECRET_REGISTRY), so they are used one after the other (review round 1 of PR #109,
+ * A-H1: two logins asked at once could each read the other's): `use` runs with the login of `registry` (`undefined`
+ * when the computer has none, or its request failed, which is logged), and the operation forgets the secret when `use`
+ * ends, before the next login is asked.
+ */
+export function registryLogins(
+  host: HostSide,
+  forget: () => void,
+  log: Logger,
+): <T>(registry: string, use: (login: RegistryLogin | undefined) => Promise<T>, signal?: AbortSignal) => Promise<T> {
+  let queue: Promise<unknown> = Promise.resolve();
+  // `use` must not ask for a login itself (it would wait for its own turn).
+  return (registry, use, signal) => {
+    const run = queue.then(async () => {
+      try {
+        let login: RegistryLogin | undefined;
+        try {
+          // Review round 2 of PR #109 (A2-L1): a login whose user gave up while it waited is not asked.
+          if (!signal?.aborted) login = await host.secrets.registry(registry);
+        } catch (error) {
+          log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
+        }
+        return await use(login);
+      } finally {
+        forget();
+      }
+    });
+    queue = run.catch(() => undefined);
+    return run;
+  };
+}
+
+/**
+ * Plan step 11E3a (decision B1 of 2026-10-05): the login of a registry for one use of the registry client
+ * (CredentialsProvider), through `logins` (asked when it is needed, forgotten right after). An identity token is the
+ * password of IDENTITY_TOKEN_USER, as the Docker credentials give it. Never throws.
+ */
+export function hostRegistryCredentials(logins: ReturnType<typeof registryLogins>): CredentialsProvider {
+  return (registry, signal) =>
+    logins(
+      registry,
+      async (login) => (login === undefined ? undefined : { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password }),
+      signal,
+    ).catch(() => undefined);
+}
+
+/**
+ * Plan step 11E3a: the image update check of the worker (ImageChecker over a RegistryClient): HTTPS through the proxy of
+ * the daemon of its engine (proxiedHttpsTransport, decision C1), the logins by hostRegistryCredentials (decision B1). A
+ * login that a registry rejects is logged; the check goes on without it (RegistryClient).
+ */
+export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engine' | 'forgetSecret' | 'logger'>, logins = registryLogins(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger)): ImageChecker {
+  const transport = proxiedHttpsTransport(() => deps.engine.proxy());
+  const client = new RegistryClient(transport, hostRegistryCredentials(logins), deps.logger, {
+    onCredentialsRejected: (registry) => deps.logger.warn(`The registry ${registry} rejected the login of this computer.`),
+  });
+  return new ImageChecker(client, deps.logger);
+}
+
 /** The GitHub sign-in of the user's computer: the account through `local account`, the token through `secret token`. */
 export function hostAuth(host: HostSide, log: Logger): Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'> {
   return {
@@ -227,6 +296,8 @@ export interface WorkerServicesDeps {
   engine: DockerEngine;
   /** The secrets of the operation (OperationContext.secrets). */
   secretOf: (name: string) => string | undefined;
+  /** Plan step 11E3a (decision B1 of 2026-10-05): the operation no longer holds the secret (OperationContext.forgetSecret). */
+  forgetSecret: (name: string) => void;
   logger: Logger;
   /** The worker's own helper image and socket (readOwnHelper). */
   ownHelper: OwnHelper;
@@ -325,11 +396,9 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
       if (profile === undefined) throw new Error('The extension could not read the GitHub profile.');
       return profile;
     },
-    imageChecker: {
-      check: async () => {
-        throw notInWorker('The image update check', '11E');
-      },
-    },
+    // Plan step 11E3a: the image update check in the worker, over its own HTTPS (through the proxy of the daemon, decision
+    // C1) with the login of each registry asked when it is needed and forgotten after its use (decision B1).
+    imageChecker: workerImageChecker(deps),
     auth: hostAuth(deps.host, deps.logger),
     ui: hostUi(deps.host.questions, deps.logger),
     logger: deps.logger,

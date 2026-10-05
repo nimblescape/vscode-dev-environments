@@ -249,4 +249,14 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     const bad = await serve(() => ({ status: 200, json: { Containers: 3 } }));
     await expect(bad.engine.systemTime()).rejects.toThrow('without its time');
   });
+
+  it('reads the proxy of the daemon (plan step 11E3a, decision C1): each field trimmed, an empty or odd one left out', async () => {
+    const good = await serve(() => ({ status: 200, json: { HttpProxy: ' http://proxy.corp:3128 ', HttpsProxy: 'http://xxxxx:xxxxx@proxy.corp:3128', NoProxy: 'localhost,.corp' } }));
+    expect(await good.engine.proxy()).toEqual({ httpProxy: 'http://proxy.corp:3128', httpsProxy: 'http://xxxxx:xxxxx@proxy.corp:3128', noProxy: 'localhost,.corp' });
+    expect(good.calls[0]).toMatchObject({ method: 'GET', url: '/info' });
+    const none = await serve(() => ({ status: 200, json: { HttpProxy: '', HttpsProxy: 7, NoProxy: '  ' } }));
+    expect(await none.engine.proxy()).toEqual({});
+    const failing = await serve(() => ({ status: 500, json: { message: 'daemon busy' } }));
+    await expect(failing.engine.proxy()).rejects.toThrow('daemon busy');
+  });
 });

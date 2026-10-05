@@ -359,7 +359,7 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
 });
 
 describe('channelRunArgs and openHelperChannel', () => {
-  it('runs the helper image with --rm -i, never a pull, no network, no capability, only the socket, and the loader', () => {
+  it('runs the helper image with --rm -i, never a pull, outbound network only, no capability, only the socket, and the loader', () => {
     const hash = bundleHash('SCRIPT');
     // Plan step 5, PR B: changed call: the state volume with the lock files is mounted too.
     const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', stateVolume: 'devenv-session-monitor', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
@@ -367,8 +367,9 @@ describe('channelRunArgs and openHelperChannel', () => {
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
       '--label', `${LABEL_HELPER_CHANNEL}=1-x`,
-      // Review round 2 (B3): no log of the channel on the host.
-      '--network', 'none', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      // Review round 2 (B3): no log of the channel on the host. Plan step 11E3a (decision of 2026-10-03): changed
+      // expectation, outbound network on the default bridge (before: '--network', 'none').
+      '--network', 'bridge', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
       // Plan step 5, PR B: changed expectation: the volume of the Session Monitor at /state, for the lock files.
       '--mount', 'type=volume,source=devenv-session-monitor,target=/state',
@@ -436,6 +437,73 @@ describe('channelRunArgs and openHelperChannel', () => {
     // Review round 4 (M1): then the sweep of never-started channel containers, in the background.
     expect(written.some((line) => line.includes('"op":"sweep"'))).toBe(true);
     channel.close();
+  });
+
+  it('a daemon without its default bridge: the worker starts again without network, and the log says why (review round 1 of PR #109, A-L3)', async () => {
+    const good = (): StartedProcess => {
+      let stdout: ((text: string) => void) | undefined;
+      return {
+        write: (text) => {
+          for (const line of text.split('\n').filter((part) => part !== '')) {
+            const message = parseClientMessage(line);
+            if (message?.t === 'hello') queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
+            if (message?.t === 'op' && message.op === 'probe') {
+              queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
+            }
+          }
+          return true;
+        },
+        end: () => {},
+        kill: () => {},
+        onStdout: (listener) => (stdout = listener),
+        onStderr: () => {},
+        exited: new Promise(() => {}),
+      };
+    };
+    const refused = (stderr: string): StartedProcess => {
+      let errors: ((text: string) => void) | undefined;
+      let exit: (value: { exitCode: number | null }) => void = () => {};
+      const exited = new Promise<{ exitCode: number | null }>((resolve) => (exit = resolve));
+      return {
+        write: () => true,
+        end: () => {},
+        kill: () => {},
+        onStdout: () => {},
+        onStderr: (listener) => {
+          errors = listener;
+          queueMicrotask(() => {
+            errors?.(stderr);
+            exit({ exitCode: 125 });
+          });
+        },
+        exited,
+      };
+    };
+    const open = async (first: StartedProcess) => {
+      const networks: string[] = [];
+      const warnings: string[] = [];
+      const processes = [first, good()];
+      const channel = await openHelperChannel(
+        {
+          start: (args) => (networks.push(args[args.indexOf('--network') + 1]), processes.shift()),
+          runDirect: async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false }),
+          logger: { ...silentLogger, warn: (text) => warnings.push(text) },
+          script: async () => 'SCRIPT',
+          helperTag: async () => 'devenv-helper:abc',
+          socketPath: async () => '/var/run/docker.sock',
+          stateVolume: 'devenv-session-monitor',
+        },
+        REMOTE,
+      );
+      return { channel, networks, warnings };
+    };
+    const fallback = await open(refused('docker: Error response from daemon: network bridge not found.\n'));
+    expect(fallback.networks).toEqual(['bridge', 'none']);
+    expect(fallback.channel.isOpen).toBe(true);
+    expect(fallback.warnings.join('\n')).toContain('no default bridge network');
+    fallback.channel.close();
+    // Any other failure is not retried.
+    await expect(open(refused('docker: Error response from daemon: no space left on device.\n'))).rejects.toThrow('no space left');
   });
 
   // Plan step 3 (pipe loading, user decision 2026-09-29): the script size limit of the command line is gone.
