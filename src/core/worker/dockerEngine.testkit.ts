@@ -36,6 +36,7 @@ export function unusedEngine(): DockerEngine {
     labelImage: unused('labelImage'),
     runContainer: unused('runContainer'),
     systemTime: unused('systemTime'),
+    proxy: unused('proxy'),
     createAttached: unused('createAttached'),
   };
 }

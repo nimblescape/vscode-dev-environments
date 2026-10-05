@@ -31,40 +31,46 @@ export interface HttpTransport {
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 /**
+ * One request with the Node.js `https` module; `options` adds to the request (plan step 11E3a: the connection through a
+ * proxy). The body is read up to MAX_BODY_BYTES.
+ */
+export function httpsRequest(request: HttpRequest, signal: AbortSignal | undefined, options: https.RequestOptions = {}): Promise<HttpResponse> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      request.url,
+      { ...options, method: request.method, headers: request.headers, signal },
+      (res) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > MAX_BODY_BYTES) {
+            req.destroy(new Error(`Response of ${request.url} is too large.`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const headers: Record<string, string> = {};
+          for (const [name, value] of Object.entries(res.headers)) {
+            if (value === undefined) continue;
+            headers[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
+          }
+          resolve({ status: res.statusCode ?? 0, headers, body: Buffer.concat(chunks).toString('utf8') });
+        });
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    if (request.body !== undefined) req.end(request.body);
+    else req.end();
+  });
+}
+
+/**
  * Transport with the Node.js `https` module. In the extension host, VS Code applies its proxy settings to this module
  * (implementation notes 9).
  */
 export const nodeHttpsTransport: HttpTransport = {
-  request(request, signal) {
-    return new Promise((resolve, reject) => {
-      const req = https.request(
-        request.url,
-        { method: request.method, headers: request.headers, signal },
-        (res) => {
-          const chunks: Buffer[] = [];
-          let size = 0;
-          res.on('data', (chunk: Buffer) => {
-            size += chunk.length;
-            if (size > MAX_BODY_BYTES) {
-              req.destroy(new Error(`Response of ${request.url} is too large.`));
-              return;
-            }
-            chunks.push(chunk);
-          });
-          res.on('end', () => {
-            const headers: Record<string, string> = {};
-            for (const [name, value] of Object.entries(res.headers)) {
-              if (value === undefined) continue;
-              headers[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
-            }
-            resolve({ status: res.statusCode ?? 0, headers, body: Buffer.concat(chunks).toString('utf8') });
-          });
-          res.on('error', reject);
-        },
-      );
-      req.on('error', reject);
-      if (request.body !== undefined) req.end(request.body);
-      else req.end();
-    });
-  },
+  request: (request, signal) => httpsRequest(request, signal),
 };

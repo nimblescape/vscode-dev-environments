@@ -11,13 +11,15 @@ import type { Environment, RegistryFile, WindowStatus } from '../types';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { ownHelperOf, readOwnHelper } from './ownHelper';
-import { hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
+import { hostRegistryCredentials, workerImageChecker, hostAuth, hostBusyMarks, hostOpenRecords, hostSessionFiles, hostStore, hostUi, workerServiceDeps, workerServices, workerSessionMonitor, type WorkerServicesDeps } from './workerServices';
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
 import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand, heartbeatCommand } from '../remoteMonitor/protocol';
 import { stopAfterSeconds } from '../session/sessionRules';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
+import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
+import { ImageChecker } from '../imageCheck/imageCheck';
 
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
 
@@ -210,6 +212,7 @@ describe('the core services in the worker (plan step 11B3b)', () => {
       host,
       engine: unusedEngine(),
       secretOf: () => undefined,
+      forgetSecret: () => undefined,
       logger: silentLogger,
       ownHelper: { image: { tag: 'devenv-helper:abc', id: IMAGE_ID }, socket: '/s.sock' },
       dockerHost: 'build-box',
@@ -235,6 +238,7 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
       host,
       engine: { ...unusedEngine(), version: async () => ({ apiVersion: '1.48', version: '29.0.0' }) },
       secretOf: (name) => (name === SECRET_TOKEN ? 'ghp_x' : undefined),
+      forgetSecret: () => undefined,
       logger: silentLogger,
       ownHelper: { image: { tag: 'devenv-helper:abc', id: IMAGE_ID }, socket: '/s.sock' },
       dockerHost: 'build-box',
@@ -247,10 +251,11 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     return { all, calls };
   }
 
-  it('fails closed where the worker has nothing yet: the analysis, the image check, a process, a flow, a helper container or build', async () => {
+  it('fails closed where the worker has nothing yet: the analysis, a process, a flow, a helper container or build', async () => {
     const { all } = deps();
     await expect(all.analyzer.analyze({} as never)).rejects.toThrow('before plan step 11E');
-    await expect(all.imageChecker.check({} as never)).rejects.toThrow('before plan step 11E');
+    // Plan step 11E3a: changed, the image check runs in the worker (before: it threw "before plan step 11E").
+    expect(all.imageChecker).toBeInstanceOf(ImageChecker);
     await expect(all.runner.run('docker', [])).rejects.toThrow('runs no process');
     await expect(all.flow('stop', {}, {})).rejects.toThrow('sends no flow');
     expect(() => all.settings()).toThrow('before plan step 11E');
@@ -458,6 +463,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
           host: {} as HostSide,
           engine,
           secretOf: () => undefined,
+          forgetSecret: () => undefined,
           logger: silentLogger,
           ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
           dockerHost: '',
@@ -478,6 +484,55 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
       expect(await bare.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toMatchObject({ ok: false });
       expect(execs).toHaveLength(1);
+    });
+  });
+
+  describe('the login of a registry for one use (plan step 11E3a, decision B1)', () => {
+    function host(answer: () => Promise<unknown>) {
+      const asked: string[] = [];
+      return {
+        asked,
+        host: {
+          secrets: {
+            registry: async (registry: string) => (asked.push(registry), answer()),
+          },
+        } as unknown as HostSide,
+      };
+    }
+
+    it('asked for the registry when it is needed, and forgotten by the operation right after, whatever the answer', async () => {
+      for (const [answer, expected] of [
+        [async () => ({ username: 'octo', serveraddress: 'ghcr.io', password: 'p1' }), { username: 'octo', password: 'p1' }],
+        [async () => ({ identityToken: true, serveraddress: 'registry.example.com', password: 't1' }), { username: IDENTITY_TOKEN_USER, password: 't1' }],
+        [async () => undefined, undefined],
+        [async () => Promise.reject(new Error('channel closed')), undefined],
+      ] as const) {
+        const { host: side, asked } = host(answer as () => Promise<unknown>);
+        let forgotten = 0;
+        const warnings: string[] = [];
+        const provider = hostRegistryCredentials(side, () => void forgotten++, { ...silentLogger, warn: (text) => warnings.push(text) });
+        expect(await provider('ghcr.io')).toEqual(expected);
+        expect(asked).toEqual(['ghcr.io']);
+        expect(forgotten).toBe(1);
+        // The next use asks again.
+        await provider('ghcr.io');
+        expect(asked).toEqual(['ghcr.io', 'ghcr.io']);
+        if (answer === undefined) expect(warnings).toEqual([]);
+      }
+    });
+
+    it("the worker's image check reads neither the proxy nor a login before a check needs them", async () => {
+      let proxies = 0;
+      const side = host(async () => undefined);
+      const checker = workerImageChecker({
+        host: side.host,
+        engine: { ...unusedEngine(), proxy: async () => (proxies++, {}) },
+        forgetSecret: () => undefined,
+        logger: silentLogger,
+      });
+      expect(checker).toBeInstanceOf(ImageChecker);
+      expect(proxies).toBe(0);
+      expect(side.asked).toEqual([]);
     });
   });
 

@@ -81,6 +81,13 @@ export interface EngineExecOptions {
   signal?: AbortSignal;
 }
 
+/** Plan step 11E3a: the proxy of the daemon, as `docker info` shows it (Docker masks a password in it as `xxxxx`). */
+export interface EngineProxy {
+  httpProxy?: string;
+  httpsProxy?: string;
+  noProxy?: string;
+}
+
 /**
  * Plan step 11B1: the port of the engine. It grows with the flows that move into the worker (plan steps 11B2 to 11E);
  * every method here is one request to the Engine API, and every script that runs in a container goes through `exec`
@@ -145,6 +152,11 @@ export interface DockerEngine {
   runContainer(spec: EngineRun, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ exitCode: number | null; output: string; timedOut: boolean }>;
   /** Plan step 11D2: the clock of the daemon (`GET /info`, its SystemTime as Docker writes it). */
   systemTime(signal?: AbortSignal): Promise<string>;
+  /**
+   * Plan step 11E3a (decision C1 of 2026-10-05): the proxy of the daemon (`GET /info`: HttpProxy, HttpsProxy, NoProxy), an
+   * empty one left out; the worker's outbound requests use it.
+   */
+  proxy(signal?: AbortSignal): Promise<EngineProxy>;
   /**
    * Plan step 11D2 (the Session Monitor container, plan step 3 pipe loading): creates the container of `spec` with an open
    * input, attaches to it, starts it, writes `input`, and waits for `readyText` on its output, its end, `timeoutMs`, or

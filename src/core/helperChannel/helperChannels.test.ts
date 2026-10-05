@@ -359,7 +359,7 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
 });
 
 describe('channelRunArgs and openHelperChannel', () => {
-  it('runs the helper image with --rm -i, never a pull, no network, no capability, only the socket, and the loader', () => {
+  it('runs the helper image with --rm -i, never a pull, outbound network only, no capability, only the socket, and the loader', () => {
     const hash = bundleHash('SCRIPT');
     // Plan step 5, PR B: changed call: the state volume with the lock files is mounted too.
     const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', stateVolume: 'devenv-session-monitor', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
@@ -367,8 +367,9 @@ describe('channelRunArgs and openHelperChannel', () => {
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
       '--label', `${LABEL_HELPER_CHANNEL}=1-x`,
-      // Review round 2 (B3): no log of the channel on the host.
-      '--network', 'none', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      // Review round 2 (B3): no log of the channel on the host. Plan step 11E3a (decision of 2026-10-03): changed
+      // expectation, outbound network on the default bridge (before: '--network', 'none').
+      '--network', 'bridge', '--log-driver', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
       // Plan step 5, PR B: changed expectation: the volume of the Session Monitor at /state, for the lock files.
       '--mount', 'type=volume,source=devenv-session-monitor,target=/state',

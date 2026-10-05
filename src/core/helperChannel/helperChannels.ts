@@ -61,7 +61,7 @@ export const CHANNEL_PASSIVE_OPEN_WAIT_MS = 30_000;
 
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
- * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, no network, no
+ * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, outbound network only (plan step 11E3a), no
  * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
  * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
  * the first line of the input (HelperChannel.open), never on the command line.
@@ -82,8 +82,10 @@ export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume
     `${LABEL_HELPER_RUN}=true`,
     '--label',
     `${LABEL_HELPER_CHANNEL}=${p.label}`,
+    // Plan step 11E3a (decision of 2026-10-03: the worker gets outbound network): the default bridge, never a published
+    // port; its HTTPS goes through the proxy of the daemon (decision C1 of 2026-10-05, proxyTransport.ts).
     '--network',
-    'none',
+    'bridge',
     // Review round 2 (B3): the engine keeps no log of the channel (its commands and output), whatever its log driver.
     '--log-driver',
     'none',

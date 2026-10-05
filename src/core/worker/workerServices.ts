@@ -17,6 +17,11 @@ import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
 import { WorkspaceHelper } from '../helper/workspaceHelper';
+import { ImageChecker } from '../imageCheck/imageCheck';
+import { RegistryClient, type CredentialsProvider } from '../imageCheck/registryClient';
+import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
+import { proxiedHttpsTransport } from '../proxyTransport';
+import { SECRET_REGISTRY } from '../helperChannel/protocol';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
@@ -181,6 +186,41 @@ export function hostLifecycleMemory(host: HostSide): LifecycleMemory {
   };
 }
 
+/**
+ * Plan step 11E3a (decision B1 of 2026-10-05): the login of a registry for one use (CredentialsProvider): asked as `secret
+ * registry <host>` when the registry client needs it, and forgotten by the operation as soon as it is read (`forget`);
+ * the next use asks again. An identity token is the password of IDENTITY_TOKEN_USER, as the Docker credentials give it.
+ * Never throws (a failed request is no login).
+ */
+export function hostRegistryCredentials(host: HostSide, forget: () => void, log: Logger): CredentialsProvider {
+  return async (registry) => {
+    try {
+      const login = await host.secrets.registry(registry);
+      if (login === undefined) return undefined;
+      return { username: login.identityToken === true ? IDENTITY_TOKEN_USER : (login.username ?? ''), password: login.password };
+    } catch (error) {
+      log.warn(`The login of ${registry} could not be asked: ${errorMessage(error)}`);
+      return undefined;
+    } finally {
+      forget();
+    }
+  };
+}
+
+/**
+ * Plan step 11E3a: the image update check of the worker (ImageChecker over a RegistryClient): HTTPS through the proxy of
+ * the daemon of its engine (proxiedHttpsTransport, decision C1), the logins by hostRegistryCredentials (decision B1). A
+ * login that a registry rejects is logged; the check goes on without it (RegistryClient).
+ */
+export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engine' | 'forgetSecret' | 'logger'>): ImageChecker {
+  const transport = proxiedHttpsTransport(() => deps.engine.proxy());
+  const credentials = hostRegistryCredentials(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger);
+  const client = new RegistryClient(transport, credentials, deps.logger, {
+    onCredentialsRejected: (registry) => deps.logger.warn(`The registry ${registry} rejected the login of this computer.`),
+  });
+  return new ImageChecker(client, deps.logger);
+}
+
 /** The GitHub sign-in of the user's computer: the account through `local account`, the token through `secret token`. */
 export function hostAuth(host: HostSide, log: Logger): Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'> {
   return {
@@ -227,6 +267,8 @@ export interface WorkerServicesDeps {
   engine: DockerEngine;
   /** The secrets of the operation (OperationContext.secrets). */
   secretOf: (name: string) => string | undefined;
+  /** Plan step 11E3a (decision B1 of 2026-10-05): the operation no longer holds the secret (OperationContext.forgetSecret). */
+  forgetSecret: (name: string) => void;
   logger: Logger;
   /** The worker's own helper image and socket (readOwnHelper). */
   ownHelper: OwnHelper;
@@ -325,11 +367,9 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
       if (profile === undefined) throw new Error('The extension could not read the GitHub profile.');
       return profile;
     },
-    imageChecker: {
-      check: async () => {
-        throw notInWorker('The image update check', '11E');
-      },
-    },
+    // Plan step 11E3a: the image update check in the worker, over its own HTTPS (through the proxy of the daemon, decision
+    // C1) with the login of each registry asked when it is needed and forgotten after its use (decision B1).
+    imageChecker: workerImageChecker(deps),
     auth: hostAuth(deps.host, deps.logger),
     ui: hostUi(deps.host.questions, deps.logger),
     logger: deps.logger,

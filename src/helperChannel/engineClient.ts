@@ -302,6 +302,15 @@ export function dockerEngine(
       if (typeof value?.SystemTime !== 'string') throw new EngineError('The engine answered /info without its time.', 200);
       return value.SystemTime;
     },
+    // Plan step 11E3a (decision C1 of 2026-10-05): the proxy of the daemon; a field that is no string or empty is none.
+    proxy: async (signal) => {
+      const value = (await list('/info', signal)) as { HttpProxy?: unknown; HttpsProxy?: unknown; NoProxy?: unknown } | null;
+      const field = (text: unknown) => (typeof text === 'string' && text.trim() !== '' ? text.trim() : undefined);
+      const httpProxy = field(value?.HttpProxy);
+      const httpsProxy = field(value?.HttpsProxy);
+      const noProxy = field(value?.NoProxy);
+      return { ...(httpProxy ? { httpProxy } : {}), ...(httpsProxy ? { httpsProxy } : {}), ...(noProxy ? { noProxy } : {}) };
+    },
     createAttached: (spec, options) => createAttached(api, hijack, spec, options),
   };
 }

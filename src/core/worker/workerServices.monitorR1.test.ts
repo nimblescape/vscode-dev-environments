@@ -26,6 +26,7 @@ function setup() {
       host: {} as HostSide,
       engine,
       secretOf: () => undefined,
+      forgetSecret: () => undefined,
       logger: silentLogger,
       ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
       dockerHost: '',

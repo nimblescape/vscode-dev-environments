@@ -28,6 +28,7 @@ function pipelineDeps(host: HostSide) {
     host,
     engine: {} as never,
     secretOf: () => undefined,
+    forgetSecret: () => undefined,
     logger: silentLogger,
     ownHelper: { image: { tag: 'devenv-helper:abc', id: `sha256:${'e'.repeat(64)}` }, socket: '/s.sock' },
     dockerHost: '',

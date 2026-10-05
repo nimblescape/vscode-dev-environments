@@ -305,6 +305,35 @@ describe('requests of an operation to the extension, in the script (plan step 11
     expect(seen?.after).toEqual(['oldtoken1', 'newtoken1', 'reg-5678']);
   });
 
+  it('forgetSecret: the operation no longer holds the secret, it stays masked, and a new answer brings it again (plan step 11E3a, decision B1)', async () => {
+    const seen: { held: string[]; empty: boolean; again?: string }[] = [];
+    const { send, of } = setup({
+      asking: async (_params, context) => {
+        await context.ask('secret', { name: 'registry' });
+        context.forgetSecret('registry');
+        context.forgetSecret('unknown');
+        seen.push({ held: Object.keys(context.secrets), empty: context.hasNoSecret() });
+        context.log('was reg-5678');
+        await context.ask('secret', { name: 'registry' });
+        seen.push({ held: Object.keys(context.secrets), empty: context.hasNoSecret(), again: context.secrets.registry });
+        return context.maskedValues();
+      },
+    });
+    send({ t: 'op', id: 1, op: 'asking', params: null });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 1, ok: true, value: null, secrets: { registry: 'reg-5678' } });
+    await vi.advanceTimersByTimeAsync(0);
+    send({ t: 'answer', id: 1, ask: 2, ok: true, value: null, secrets: { registry: 'reg-9999' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([
+      { held: [], empty: true },
+      { held: ['registry'], empty: false, again: 'reg-9999' },
+    ]);
+    const text = JSON.stringify(of(1));
+    expect(text).not.toContain('reg-5678');
+    expect(text).not.toContain('reg-9999');
+  });
+
   // Review round 1 of plan step 11A (pre-existing gap): the value of a result is masked too.
   it('masks the secrets in the value of a result, and fails a result that cannot be sent', async () => {
     const { send, resultOf } = setup({
