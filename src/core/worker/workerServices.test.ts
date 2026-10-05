@@ -518,7 +518,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
         // The next use asks again.
         await provider('ghcr.io');
         expect(asked).toEqual(['ghcr.io', 'ghcr.io']);
-        if (answer === undefined) expect(warnings).toEqual([]);
+        // Review round 1 of PR #109 (B): the assertion that never ran (`answer` is always a function); only a failed request is logged.
+        expect(warnings.length > 0).toBe(expected === undefined && warnings.some((text) => text.includes('channel closed')));
       }
     });
 
