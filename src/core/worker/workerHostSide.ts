@@ -6,7 +6,7 @@
 // call becomes a request of its kind to the extension (plan step 11A, `OperationContext.ask`), which answers it. Pure
 // over `ask`; no I/O of its own, no `vscode`.
 import { BUSY_OPERATIONS, type BusyMarkResult } from '../pipeline/busyMarks';
-import type { StepMarkResult } from '../pipeline/openRecords';
+import type { BuildChange, StepMarkResult } from '../pipeline/openRecords';
 import type { BusyMark, Environment, GitHubAccount, RegistryFile, WindowStatus } from '../types';
 import { HOST_SECRET_NAMES, type HostRequest, type HostSide } from './hostSide';
 
@@ -42,7 +42,8 @@ export function parseBusyMarkAnswer(value: unknown, environmentId: string): Busy
 
 /**
  * Plan step 11E4b: the answer of a registry write of the open (`record createMark`, `record stepMark` `release`, `record
- * ownerLogin`, `record lifecycleMark`, `record openFinished`): the entry of `environmentId`, or undefined (no entry).
+ * ownerLogin`, `record lifecycleMark`, `record openFinished`; plan step 11E4c: `record configuration`, `record build`):
+ * the entry of `environmentId`, or undefined (no entry).
  * Anything else is a failure of the request.
  */
 export function parseEntryAnswer(value: unknown, environmentId: string): Environment | undefined {
@@ -66,6 +67,32 @@ export function parseStepMarkAnswer(value: unknown, environmentId: string): Step
     }
   }
   throw new Error('The extension answered the step mark with an invalid value.');
+}
+
+/**
+ * Plan step 11E4c: the answer of `record createEnvironment`: the entry of the repository `repository` (the new one, or
+ * the one that another window of the account created meanwhile). Anything else is a failure of the request.
+ */
+export function parseCreatedAnswer(value: unknown, repository: string): Environment {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    const { id, repository: named } = value as { id?: unknown; repository?: unknown };
+    if (typeof id === 'string' && id !== '' && typeof named === 'string' && named.toLowerCase() === repository.toLowerCase()) return value as Environment;
+  }
+  throw new Error('The extension answered the entry of the first open with an invalid value.');
+}
+
+/** Plan step 11E4c: the arguments of `record build` after the environment: the kind of the change and its values. */
+export function buildArguments(change: BuildChange): unknown[] {
+  switch (change.kind) {
+    case 'number':
+      return ['number', change.buildNumber];
+    case 'record':
+      return ['record', change.record, change.dropRefused];
+    case 'rebaseline':
+      return ['rebaseline', change.environmentImage, change.configHash, change.version];
+    case 'refused':
+      return ['refused', change.refusedUpdate];
+  }
 }
 
 function isBusyMark(value: unknown): value is BusyMark {
@@ -136,8 +163,6 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       list: async () => ((await call('record', 'list')) ?? []) as Environment[],
       findForAccount: async (repository, accountId, dockerHost) =>
         ((await call('record', 'findForAccount', repository, accountId, dockerHost)) ?? undefined) as Environment | undefined,
-      add: async (environment) => void (await call('record', 'add', environment)),
-      update: async (id, changes) => void (await call('record', 'update', id, changes)),
       remove: async (id, volumes) => void (await call('record', 'remove', id, volumes)),
       forgetKeptVolumes: async (names) => void (await call('record', 'forgetKeptVolumes', [...names])),
       sessionFile: async (kind, environmentId) => void (await call('record', 'sessionFile', kind, environmentId)),
@@ -156,6 +181,12 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
       ownerLogin: async (environmentId) => parseEntryAnswer(await call('record', 'ownerLogin', environmentId), environmentId),
       lifecycleMark: async (environmentId, change) => parseEntryAnswer(await call('record', 'lifecycleMark', environmentId, change), environmentId),
       openFinished: async (environmentId, finish) => parseEntryAnswer(await call('record', 'openFinished', environmentId, finish), environmentId),
+      // Plan step 11E4c: the entry of a first open (its ID, repository and configuration only), its removal, the
+      // configuration and the build records.
+      createEnvironment: async (id, repository, configPath) => parseCreatedAnswer(await call('record', 'createEnvironment', { id, repository, configPath }), repository),
+      dropCreated: async (environmentId) => void (await call('record', 'dropCreated', environmentId)),
+      configuration: async (environmentId, change) => parseEntryAnswer(await call('record', 'configuration', environmentId, change), environmentId),
+      build: async (environmentId, change) => parseEntryAnswer(await call('record', 'build', environmentId, ...buildArguments(change)), environmentId),
     },
     secrets: {
       token: async () => {

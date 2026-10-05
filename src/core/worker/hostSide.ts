@@ -10,7 +10,7 @@ import { OP_DELETE, OP_DELETE_CHECK, OP_HEARTBEAT, OP_LIST_CONFIGURATIONS, OP_MO
 import type { BusyMarkResult } from '../pipeline/busyMarks';
 import type { BusyMark, BusyOperation, Environment, GitHubAccount, GitSummary, RegistryFile, WindowStatus } from '../types';
 import type { DeleteConfirmation } from '../pipeline/deleteCheck';
-import type { LifecycleMarkChange, StepMarkResult } from '../pipeline/openRecords';
+import type { BuildChange, ConfigurationChange, LifecycleMarkChange, StepMarkResult } from '../pipeline/openRecords';
 import type { HostOpenFinish, OpenRequestScope } from './openRequests';
 
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
@@ -51,8 +51,8 @@ export interface HostRecords {
   get(id: string): Promise<Environment | undefined>;
   list(): Promise<Environment[]>;
   findForAccount(repository: string, accountId: string, dockerHost: string): Promise<Environment | undefined>;
-  add(environment: Environment): Promise<void>;
-  update(id: string, changes: Partial<Environment>): Promise<void>;
+  // Plan step 11E4c: changed (the generic `add` and `update` are removed): an entry is added only as `record
+  // createEnvironment`, and changed only by the specific requests below.
   remove(id: string, volumes: { kept?: readonly string[]; removed?: readonly string[] }): Promise<void>;
   forgetKeptVolumes(names: readonly string[]): Promise<void>;
   /**
@@ -99,6 +99,19 @@ export interface HostRecords {
   lifecycleMark(environmentId: string, change: LifecycleMarkChange, scope?: OpenRequestScope): Promise<Environment | undefined>;
   /** Plan step 11E4b: `record openFinished`; the time and the liveness are the extension's. */
   openFinished(environmentId: string, finish: HostOpenFinish, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /**
+   * Plan step 11E4c: `record createEnvironment`, the entry of a first open: the worker picks its ID and names the
+   * repository and the configuration; the extension builds the rest (its account, clock and create mark, the Docker host
+   * of the operation) and binds the operation to the environment. The answer is the new entry, or the one of the
+   * repository that another window of the account created meanwhile.
+   */
+  createEnvironment(id: string, repository: string, configPath: string, scope?: OpenRequestScope): Promise<Environment>;
+  /** Plan step 11E4c: `record dropCreated`, only the entry that the operation created, with the create mark of the window. */
+  dropCreated(environmentId: string, scope?: OpenRequestScope): Promise<void>;
+  /** Plan step 11E4c: `record configuration`; a volume that the entry may not record is left out (and logged). */
+  configuration(environmentId: string, change: ConfigurationChange, scope?: OpenRequestScope): Promise<Environment | undefined>;
+  /** Plan step 11E4c: `record build` (`number`, `record`, `rebaseline`, `refused`). */
+  build(environmentId: string, change: BuildChange, scope?: OpenRequestScope): Promise<Environment | undefined>;
 }
 
 /** The session files that a flow writes or removes (HostRecords.sessionFile). */
@@ -229,18 +242,19 @@ export const DETAILED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   // Plan step 11E4b: the kind of the create mark (`ended`, `previous`) and of the step mark (`take`, `release`).
   'record createMark': 1,
   'record stepMark': 1,
+  // Plan step 11E4c: the kind of the build change (`number`, `record`, `rebaseline`, `refused`).
+  'record build': 1,
 };
 
 /**
  * Plan step 11C2a (review round 2 of 11B1, A-R2-2): the requests that change the record or the session files of one
  * environment, and the index of its id in their arguments. The extension answers them only for the environment of the
- * operation (`environmentId` of its parameters).
+ * operation (`environmentId` of its parameters; plan step 11E4c: or the one that its `record createEnvironment` created).
  */
 export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record markBusy': 0,
   'record clearBusy': 0,
   'record remove': 0,
-  'record update': 0,
   'record sessionFile': 1,
   'record recordGitSummary': 0,
   // Plan step 11E4b: the registry writes of the open (OpenRecords); no operation sends them before plan step 11E6.
@@ -249,4 +263,9 @@ export const SCOPED_REQUESTS: Readonly<Partial<Record<HostCall, number>>> = {
   'record ownerLogin': 0,
   'record lifecycleMark': 0,
   'record openFinished': 0,
+  // Plan step 11E4c: `record createEnvironment` names no environment of the operation yet: it binds the operation to the
+  // one that it creates (hostSideHandler), and these are answered only for it.
+  'record dropCreated': 0,
+  'record configuration': 0,
+  'record build': 0,
 };

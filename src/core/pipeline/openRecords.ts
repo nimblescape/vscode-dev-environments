@@ -203,14 +203,15 @@ export function registryOpenRecords(registry: Pick<EnvironmentRegistry, 'add' | 
       return registry.updateEnvironment(environmentId, (entry) => {
         if (change.select !== undefined) entry.configPath = change.select;
         if (change.shutdownActionNone !== undefined) entry.shutdownActionNone = change.shutdownActionNone;
+        // Review round 3 of PR #106 (A3-M1): a name once, also when the change repeats it.
         if (change.addVolumes !== undefined) {
           const recorded = entry.additionalVolumes ?? [];
-          const added = change.addVolumes.filter((name) => !recorded.includes(name));
+          const added = [...new Set(change.addVolumes)].filter((name) => !recorded.includes(name));
           if (added.length > 0) entry.additionalVolumes = [...recorded, ...added];
         }
         if (change.addServiceVolumes !== undefined) {
           const services = entry.serviceVolumes ?? [];
-          const used = change.addServiceVolumes.filter((name) => !services.includes(name));
+          const used = [...new Set(change.addServiceVolumes)].filter((name) => !services.includes(name));
           if (used.length > 0) entry.serviceVolumes = [...services, ...used];
         }
         if (change.keepRefusedFor !== undefined) {

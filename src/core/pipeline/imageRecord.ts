@@ -61,15 +61,24 @@ export function imageBuildRecord(
   } catch {
     return undefined;
   }
-  if (!isBuildRecord(value)) return undefined;
-  if (value.environmentImage !== tag || value.buildNumber !== buildNumber || !isConfigPathLabelValue(value.configPath)) return undefined;
-  if (value.compose !== undefined) {
-    const prefix = `${composeProjectName(env.repository, env.id)}-`;
-    const compose = value.compose as unknown;
-    if (typeof compose !== 'object' || compose === null) return undefined;
-    const images = (compose as { images?: unknown }).images;
-    if (!Array.isArray(images) || !images.every((image) => typeof image === 'string' && image.startsWith(prefix))) return undefined;
-  }
+  if (!isBuildRecord(value) || !buildRecordFits(value, env, tag, buildNumber)) return undefined;
   const { imageId: _ignored, ...record } = value;
   return record;
+}
+
+/**
+ * The checks of imageBuildRecord on a valid build record (isBuildRecord): it names exactly `tag` and `buildNumber`, has a
+ * configuration path of a repository, and names only images of the Compose project of `env`. Plan step 11E4c: also for
+ * the build record of a `record build` request of the worker (src/core/worker/openRequests.ts).
+ */
+export function buildRecordFits(record: BuildRecord, env: Pick<Environment, 'id' | 'repository'>, tag: string, buildNumber: number): boolean {
+  if (record.environmentImage !== tag || record.buildNumber !== buildNumber || !isConfigPathLabelValue(record.configPath)) return false;
+  if (record.compose !== undefined) {
+    const prefix = `${composeProjectName(env.repository, env.id)}-`;
+    const compose = record.compose as unknown;
+    if (typeof compose !== 'object' || compose === null) return false;
+    const images = (compose as { images?: unknown }).images;
+    if (!Array.isArray(images) || !images.every((image) => typeof image === 'string' && image.startsWith(prefix))) return false;
+  }
+  return true;
 }

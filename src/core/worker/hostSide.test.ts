@@ -22,7 +22,8 @@ const ALL: readonly HostCall[] = [
     (call) => `question ${call}` as const,
   ),
   ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
-  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy', 'recordGitSummary'].map((call) => `record ${call}` as const),
+  // Plan step 11E4c: `add` and `update` are removed (they stay allowed here, so their refusal is the handler's); `configuration` is new.
+  ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy', 'recordGitSummary', 'configuration'].map((call) => `record ${call}` as const),
   'secret token',
   'secret registry',
   'secret unknown',
@@ -60,8 +61,6 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       get: async (id) => (record('get', id), of('get', undefined)),
       list: async () => (record('list'), of('list', [] as Environment[])),
       findForAccount: async (repository, accountId, dockerHost) => (record('findForAccount', repository, accountId, dockerHost), of('findForAccount', undefined)),
-      add: async (environment) => void record('add', environment),
-      update: async (id, changes) => void record('update', id, changes),
       remove: async (id, volumes) => void record('remove', id, volumes),
       forgetKeptVolumes: async (names) => void record('forgetKeptVolumes', names),
       sessionFile: async (kind, environmentId) => void record('sessionFile', kind, environmentId),
@@ -78,6 +77,11 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
       ownerLogin: async (environmentId, scope) => (record('ownerLogin', environmentId, scope), of('ownerLogin', undefined)),
       lifecycleMark: async (environmentId, change, scope) => (record('lifecycleMark', environmentId, change, scope), of('lifecycleMark', undefined)),
       openFinished: async (environmentId, finish, scope) => (record('openFinished', environmentId, finish, scope), of('openFinished', undefined)),
+      // Plan step 11E4c (their tests: hostSide.entryRequests.test.ts).
+      createEnvironment: async (id, repository, configPath, scope) => (record('createEnvironment', id, repository, configPath, scope), of('createEnvironment', ENVIRONMENT)),
+      dropCreated: async (environmentId, scope) => void record('dropCreated', environmentId, scope),
+      configuration: async (environmentId, change, scope) => (record('configuration', environmentId, change, scope), of('configuration', undefined)),
+      build: async (environmentId, change, scope) => (record('build', environmentId, change, scope), of('build', undefined)),
     },
     secrets: {
       token: async () => (record('token'), of('token', undefined)),
@@ -152,12 +156,11 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
     expect(await worker.records.get('e1')).toEqual(ENVIRONMENT);
     expect(await worker.records.list()).toEqual([ENVIRONMENT]);
     expect(await worker.records.findForAccount('acme/app', 'a1', '')).toEqual(ENVIRONMENT);
-    await worker.records.add(ENVIRONMENT);
-    await worker.records.update('e1', { repository: 'acme/app' });
     await worker.records.remove('e1', { kept: ['v1'] });
     await worker.records.forgetKeptVolumes(['v1']);
     await worker.records.sessionFile('removePending', 'e1');
-    expect(requests.map((request) => request.kind)).toEqual(['local', 'local', 'local', 'record', 'record', 'record', 'record', 'record', 'record', 'record', 'record']);
+    // Plan step 11E4c: changed expectation (before: also `record add` and `record update`, which are removed).
+    expect(requests.map((request) => request.kind)).toEqual(['local', 'local', 'local', 'record', 'record', 'record', 'record', 'record', 'record']);
     expect(calls.filter((call) => call.call === 'processAlive')).toEqual([{ call: 'processAlive', args: [42] }]);
     expect(calls.at(-1)).toEqual({ call: 'sessionFile', args: ['removePending', 'e1'] });
   });
@@ -367,20 +370,23 @@ describe('the handler of the requests on the side of the extension (plan step 11
     ]);
   });
 
-  it('passes only the volumes of a removal, and the changes of an update that keep the identity', async () => {
+  // Plan step 11E4c: changed (before: also the changes of an update and an added entry, which are removed with `record
+  // update` and `record add`).
+  it('passes only the volumes of a removal', async () => {
     const { handler, signal, calls } = wired();
     await handler('record', { call: 'remove', args: ['e1', { kept: ['v1'], removed: ['v2'], other: 1 }] }, signal);
     // Plan step 11C2a: changed expectation (before: the removal of `e2` passed): it is not the environment of the operation.
     await expect(handler('record', { call: 'remove', args: ['e2'] }, signal)).rejects.toMatchObject({ code: 'invalid' });
     await handler('record', { call: 'remove', args: ['e1'] }, signal);
-    await handler('record', { call: 'update', args: ['e1', { lastUsedAt: 't' }] }, signal);
-    await handler('record', { call: 'add', args: [ENVIRONMENT] }, signal);
     expect(calls).toEqual([
       { call: 'remove', args: ['e1', { kept: ['v1'], removed: ['v2'] }] },
       { call: 'remove', args: ['e1', {}] },
-      { call: 'update', args: ['e1', { lastUsedAt: 't' }] },
-      { call: 'add', args: [ENVIRONMENT] },
     ]);
+    // Plan step 11E4c: the removed requests are unknown to the handler; nothing reaches this computer.
+    for (const payload of [{ call: 'update', args: ['e1', { lastUsedAt: 't' }] }, { call: 'add', args: [ENVIRONMENT] }]) {
+      await expect(handler('record', payload, signal)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('unknown') });
+    }
+    expect(calls).toHaveLength(2);
   });
 
   it('every request of a flow is one round trip', async () => {
@@ -440,7 +446,8 @@ describe('the requests of Delete (plan step 11C2a)', () => {
       ['markBusy', ['e2', 'delete']],
       ['clearBusy', ['e2']],
       ['sessionFile', ['removeReopenOf', 'e2']],
-      ['update', ['e2', { lastUsedAt: 't' }]],
+      // Plan step 11E4c: changed (before: `record update`, which is removed): `record configuration` is scoped.
+      ['configuration', ['e2', { cloned: true }]],
     ] as const) {
       await expect(handler('record', { call, args: [...args] }, signal), `${call} ${JSON.stringify(args)}`).rejects.toMatchObject({ code: 'invalid' });
     }

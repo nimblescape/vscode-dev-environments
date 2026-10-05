@@ -65,8 +65,6 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       get: (id) => answer<Environment | undefined>('get', id),
       list: () => answer<Environment[]>('list'),
       findForAccount: (repository, accountId, dockerHost) => answer('findForAccount', repository, accountId, dockerHost),
-      add: (environment) => answer('add', environment.id),
-      update: (id, changes) => answer('update', id, changes),
       remove: (id, volumes) => answer('remove', id, volumes),
       forgetKeptVolumes: (names) => answer('forgetKeptVolumes', names),
       sessionFile: (kind, environmentId) => answer('sessionFile', kind, environmentId),
@@ -83,6 +81,11 @@ function fakeHost(answers: Record<string, unknown> = {}) {
       ownerLogin: (environmentId) => answer('ownerLogin', environmentId),
       lifecycleMark: (environmentId, change) => answer('lifecycleMark', environmentId, change),
       openFinished: (environmentId, finish) => answer('openFinished', environmentId, finish),
+      // Plan step 11E4c.
+      createEnvironment: (id, repository, configPath) => answer('createEnvironment', id, repository, configPath),
+      dropCreated: (environmentId) => answer('dropCreated', environmentId),
+      configuration: (environmentId, change) => answer('configuration', environmentId, change),
+      build: (environmentId, change) => answer('build', environmentId, change),
     },
     secrets: {
       token: () => answer('token'),
@@ -153,6 +156,8 @@ describe('the core services in the worker (plan step 11B3b)', () => {
     // Plan step 11C3: changed, the changes of an entry by a function come with the flows of plan steps 11D and 11E
     // (EnvironmentStore.update, the change of the whole registry by a function, is removed with its test).
     await expect(store.updateEnvironment('e1', () => {})).rejects.toThrow('before plan step 11D or 11E');
+    // Plan step 11E4c: changed (before: `record add`, which is removed): the entry of a first open is `record createEnvironment`.
+    await expect(store.add({ id: 'e3' } as Environment)).rejects.toThrow('record createEnvironment');
     expect(calls).toHaveLength(4);
   });
 
@@ -246,7 +251,8 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     expect(deps({ settings }).all.settings()).toBe(settings);
   });
 
-  it("plan step 11E4b: the registry writes of the open go to the extension as their requests; the 11E4c ones fail closed", async () => {
+  // Plan step 11E4c: changed (before: createEnvironment, dropCreated, configuration and build failed closed until 11E4c).
+  it('plan steps 11E4b and 11E4c: the registry writes of the open go to the extension as their requests', async () => {
     const { all, calls } = deps();
     const records = all.openRecords!;
     const mark = { operation: 'update' as const, since: '2026-10-04T12:00:00.000Z', pid: 1, windowId: 'w' };
@@ -265,15 +271,37 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
       'lifecycleMark "e1" "clear"',
       'openFinished "e1" {"remoteUser":"node","remoteWorkspaceFolder":"/workspaces/api"}',
     ]);
-    await expect(records.createEnvironment({} as Environment)).rejects.toThrow('before plan step 11E4c');
-    await expect(records.dropCreated('e1')).rejects.toThrow('before plan step 11E4c');
-    await expect(records.configuration('e1', { cloned: true })).rejects.toThrow('before plan step 11E4c');
-    await expect(records.build('e1', { kind: 'number', buildNumber: 2 })).rejects.toThrow('before plan step 11E4c');
+    // Plan step 11E4c: the four writes that failed closed until now are requests too, and none names plan step 11E4c.
     expect(calls).toHaveLength(6);
     // hostOpenRecords over the HostSide alone.
     const alone = fakeHost();
     await hostOpenRecords(alone.host).lifecycleMark('e2', { set: 'a'.repeat(12) });
     expect(alone.calls).toEqual([`lifecycleMark "e2" {"set":"${'a'.repeat(12)}"}`]);
+  });
+
+  it('plan step 11E4c: hostOpenRecords sends the entry of a first open, its removal, the configuration and the build records', async () => {
+    const entry = { id: 'e1', repository: 'acme/api', configPath: '.devcontainer/devcontainer.json', owner: { id: 'w', login: 'w' }, createdAt: 'worker clock' } as Environment;
+    const { host, calls } = fakeHost({ createEnvironment: entry });
+    const records = hostOpenRecords(host);
+    await records.createEnvironment(entry);
+    await records.dropCreated('e1');
+    await records.configuration('e1', { addVolumes: ['v1'], cloned: true });
+    await records.build('e1', { kind: 'number', buildNumber: 3 });
+    // The worker sends the ID, the repository and the configuration of the entry; the owner and the times are the extension's.
+    expect(calls).toEqual([
+      'createEnvironment "e1" "acme/api" ".devcontainer/devcontainer.json"',
+      'dropCreated "e1"',
+      'configuration "e1" {"addVolumes":["v1"],"cloned":true}',
+      'build "e1" {"kind":"number","buildNumber":3}',
+    ]);
+    // The entry of the repository that another window created meanwhile: the open finds and uses it (openFirst).
+    const other = fakeHost({ createEnvironment: { ...entry, id: 'e9' } });
+    await expect(hostOpenRecords(other.host).createEnvironment(entry)).rejects.toThrow('exists already');
+    // Nothing of the open fails closed for plan step 11E4c any more.
+    for (const write of [() => records.createEnvironment(entry), () => records.dropCreated('e1'), () => records.configuration('e1', {}), () => records.build('e1', { kind: 'number', buildNumber: 1 })]) {
+      await expect(write()).resolves.toBeUndefined();
+    }
+    expect(calls).toHaveLength(8);
   });
 
   it('plan step 11E2: the analysis of the operation, when it brings one (the analysis thread of the worker)', () => {
