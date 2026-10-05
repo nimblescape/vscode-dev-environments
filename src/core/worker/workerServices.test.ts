@@ -402,20 +402,38 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
   });
 
   describe("the open's Session Monitor in the worker (plan step 11E4e)", () => {
+    /** The ID of the computer of the operation, as computer.id makes it. */
+    const COMPUTER = 'c'.repeat(32);
     it("the first heartbeat of the open: this computer's record with the time limit, by the command of the monitor script", async () => {
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
-      const monitor = workerSessionMonitor(engine, 'computer-1', silentLogger, { limitSeconds: () => 900 });
+      const monitor = workerSessionMonitor(engine, COMPUTER, silentLogger, { limitSeconds: () => 900 });
       expect(await monitor.heartbeat(TARGET, ID, true, 7)).toEqual({ ok: true });
       expect(execs).toEqual([
-        { container: REMOTE_MONITOR_CONTAINER, command: heartbeatCommand({ source: 'computer-1', limitSeconds: 900, environments: [{ id: ID, keepRunning: true, seq: 7 }] }), timeoutMs: MONITOR_EXEC_TIMEOUT_MS },
+        { container: REMOTE_MONITOR_CONTAINER, command: heartbeatCommand({ source: COMPUTER, limitSeconds: 900, environments: [{ id: ID, keepRunning: true, seq: 7 }] }), timeoutMs: MONITOR_EXEC_TIMEOUT_MS },
       ]);
+    });
+
+    it('a computer ID that the monitor would refuse is not sent (review round 1 of PR #108, A-L1); the limit is clamped', async () => {
+      const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+      for (const source of ['', 'a b', '../x', 'x'.repeat(200)]) {
+        expect(await workerSessionMonitor(engine, source, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1), source).toEqual({
+          ok: false,
+          detail: 'The computer of the operation has no valid ID for the Session Monitor.',
+        });
+      }
+      expect(execs).toEqual([]);
+      // The time limit of odd settings is the clamped one that the window's heartbeats send too.
+      for (const minutes of [Number.NaN, -5, 1e9]) {
+        const limit = stopAfterSeconds(minutes);
+        expect(Number.isInteger(limit) && limit > 0, String(minutes)).toBe(true);
+      }
     });
 
     it('a failed heartbeat is answered as not sent, with its cause; without the time limit it is not sent', async () => {
       const failing = engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'records locked', timedOut: false }));
-      expect(await workerSessionMonitor(failing.engine, 'computer-1', silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'records locked' });
+      expect(await workerSessionMonitor(failing.engine, COMPUTER, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'records locked' });
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
-      expect(await workerSessionMonitor(engine, 'computer-1', silentLogger).heartbeat(TARGET, ID, false, 1)).toEqual({
+      expect(await workerSessionMonitor(engine, COMPUTER, silentLogger).heartbeat(TARGET, ID, false, 1)).toEqual({
         ok: false,
         detail: 'The operation has no settings for the time limit of the heartbeat.',
       });
@@ -426,9 +444,9 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       const { engine } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
       const signals: (AbortSignal | undefined)[] = [];
       const signal = new AbortController().signal;
-      await workerSessionMonitor(engine, 'computer-1', silentLogger, { ensure: async (s) => void signals.push(s) }).ensure(TARGET, 'ignored-tag', signal, 'sha256:ignored');
+      await workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async (s) => void signals.push(s) }).ensure(TARGET, 'ignored-tag', signal, 'sha256:ignored');
       expect(signals).toEqual([signal]);
-      const failing = workerSessionMonitor(engine, 'computer-1', silentLogger, { ensure: async () => Promise.reject(new Error('no space left')) });
+      const failing = workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async () => Promise.reject(new Error('no space left')) });
       await expect(failing.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('no space left');
     });
 
@@ -447,11 +465,14 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
           environmentLock: async () => Promise.reject(new Error('no lock in this test')),
           ...overrides,
         });
-      const all = deps({ monitorSource: 'computer-1', settings: { stopAfterMinutes: 30 } as never, monitorEnsure: async (s) => void ensured.push(s) });
+      const all = deps({ monitorSource: COMPUTER, settings: { stopAfterMinutes: 30 } as never, monitorEnsure: async (s) => void ensured.push(s) });
       await all.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined);
-      expect(ensured).toEqual([undefined]);
+      // Review round 1 of PR #108: the signal of the run goes to the ensure of the operation.
+      const run = new AbortController().signal;
+      await all.sessionMonitor!.ensure(TARGET, 'tag', run, undefined);
+      expect(ensured).toEqual([undefined, run]);
       expect(await all.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toEqual({ ok: true });
-      expect(execs.map((exec) => exec.command)).toEqual([heartbeatCommand({ source: 'computer-1', limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]);
+      expect(execs.map((exec) => exec.command)).toEqual([heartbeatCommand({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]);
       // Without them, the ensure fails closed and no heartbeat is sent.
       const bare = deps({});
       await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');

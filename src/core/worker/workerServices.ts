@@ -26,6 +26,7 @@ import { systemClock, type GitHubAuth, type Logger, type PipelineUi } from '../p
 import type { ExtensionSettings } from '../types';
 import type { DockerEngine } from './dockerEngine';
 import { forgetRecord, sendHeartbeat } from './monitorFlow';
+import { isSourceId } from '../remoteMonitor/protocol';
 import { stopAfterSeconds } from '../session/sessionRules';
 import { EngineDocker } from './engineDocker';
 import { readEnvironmentStates } from '../pipeline/refreshStates';
@@ -154,6 +155,8 @@ export function workerSessionMonitor(
     },
     heartbeat: async (_target, environmentId, keepRunning, seq) => {
       if (source === undefined) return { ok: false, detail: 'The operation names no computer for the Session Monitor.' };
+      // Review round 1 of PR #108 (A-L1): a computer ID that the monitor script would refuse is named as such.
+      if (!isSourceId(source)) return { ok: false, detail: 'The computer of the operation has no valid ID for the Session Monitor.' };
       if (open.limitSeconds === undefined) return { ok: false, detail: 'The operation has no settings for the time limit of the heartbeat.' };
       const result = await sendHeartbeat(engine, { source, limitSeconds: open.limitSeconds(), environments: [{ id: environmentId, keepRunning, seq }] });
       return result.ok ? { ok: true } : { ok: false, detail: result.detail };
