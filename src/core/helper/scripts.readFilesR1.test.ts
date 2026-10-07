@@ -114,6 +114,18 @@ describe('READ_FILES_SCRIPT, review round 1 of PR #121 (reviewer B)', () => {
     }
   });
 
+  // Review round 2 of PR #121 (A-2): a configuration path that is a link to the repository folder itself is a folder, as a
+  // link to any other folder of the repository: no configuration (it was refused as a file out of the repository).
+  it('takes a configuration path that links to the repository folder itself for a configuration that does not exist', () => {
+    const repo = tempDir();
+    fs.mkdirSync(path.join(repo, 'x'), { recursive: true });
+    fs.symlinkSync('..', path.join(repo, 'x', 'root.json'));
+    const result = runNode(readFilesCommand(repo, 'x/root.json'));
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBeNull();
+  });
+
   // Mutant: ELOOP -> undefined (a configuration that does not exist). The PR refuses it (null).
   it('refuses a configuration file that is a link in a circle', () => {
     const repo = tempDir();

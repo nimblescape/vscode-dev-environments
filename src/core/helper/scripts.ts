@@ -421,21 +421,23 @@ ${READ_LIMITED}const realPath = (file) => {
 // the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
 // takes), read from the file that was opened, and only when that file is a plain file of the repository after links:
 // its real path is below the real folder of the repository and names the same file as the opened descriptor, so a link
-// that leads out of the repository, or one that is changed between the check and the read, is never read. A file that
-// is out of the repository after links before the open is not opened at all (review round 1 of PR #121: no device or
-// file of the system is opened). The open never waits (O_NONBLOCK: a FIFO of the repository cannot hold the step) and
-// never takes a terminal (O_NOCTTY). undefined: no such file (or a folder; also when the repository folder does not
-// exist, review round 1 of PR #121, B-R14, as the batch helper reports it, batchHelper.ts A-R5-1); null: a file that is
-// not a plain file of the repository (a link out of it or in a circle, a FIFO, a socket, a file that cannot be opened,
-// review round 1 of PR #121, A-1). A hard link is the file itself: the repository cannot hold one of a file out of it
-// (Git creates none, and the volume holds only the repository and CONFIG_FOLDER of its owner).
+// that leads out of the repository, or one that is changed between the check and the read, is never read. A file whose
+// real path before the open is out of the repository is not opened at all (review round 1 of PR #121; review round 2,
+// A-3: a magic link of /proc whose text names nothing is opened, and refused before any read). The open never waits
+// (O_NONBLOCK: a FIFO of the repository cannot hold the step) and never takes a terminal (O_NOCTTY). undefined: no
+// such file (or a folder; also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the
+// batch helper reports it, batchHelper.ts A-R5-1); null: a file that is not a plain file of the repository (a link out
+// of it or in a circle, a FIFO, a socket, a file that cannot be opened, review round 1 of PR #121, A-1). A hard link is
+// the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only the
+// repository and CONFIG_FOLDER of its owner).
 const realInRepository = (real) => {
   const rootReal = realPath(root);
   return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
 };
 const readInRepository = (file, limit) => {
   const before = realPath(file);
-  if (before !== null && !realInRepository(before)) return null;
+  // Review round 2 of PR #121 (A-2): a link to the repository folder itself is a folder, as a link to any other one.
+  if (before !== null && before !== realPath(root) && !realInRepository(before)) return null;
   let fd;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
@@ -450,7 +452,13 @@ const readInRepository = (file, limit) => {
     if (!opened.isFile()) return null;
     const real = realPath(file);
     if (!realInRepository(real)) return null;
-    const named = fs.statSync(real);
+    // Review round 2 of PR #121 (A-1): a file that is gone or changed since is refused, never a failure of the script.
+    let named;
+    try {
+      named = fs.statSync(real);
+    } catch {
+      return null;
+    }
     if (named.dev !== opened.dev || named.ino !== opened.ino) return null;
     return readLimitedFd(fd, limit);
   } finally {
