@@ -89,8 +89,10 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     expect(cli.run(['image', 'inspect', 'devenv-test-missing:1']).err).toMatch(/no such image/i);
     const refused = cli.run(['image', 'inspect', 'Not A Reference']);
     expect(refused.code).not.toBe(0);
-    const unchecked = /no such image/i.test(refused.err) ? [] : [{ reference: 'Not A Reference', reason: 'invalid' }];
-    expect(unchecked.length === 0 || /invalid reference|reference format/i.test(refused.err), refused.err).toBe(true);
+    // Review round 1 of PR #120 (A-L1): the engine refuses it as a reference (400, both image stores), so it is always
+    // `invalid` (was: whatever the removed adapter answered; a missing image is the case above).
+    expect(refused.err).toMatch(/invalid reference|reference format/i);
+    const unchecked = [{ reference: 'Not A Reference', reason: 'invalid' }];
     expect(await apiDocker.inspectImageNames(references)).toEqual({
       images: [{ id: details.Id, repoTags: details.RepoTags ?? [], repoDigests: details.RepoDigests ?? [] }],
       unchecked,
