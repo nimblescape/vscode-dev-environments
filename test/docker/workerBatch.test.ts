@@ -62,7 +62,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   let waitingGitImage = '';
   const allChannels: HelperChannels[] = [];
   /** Plan step 11I1, PR A1: the batch helpers started from the test process. */
-  let batches: InProcessBatches;
+  let batches: InProcessBatches | undefined;
   const sessions: string[] = [];
 
   const helpersOf = (session: string) => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_CHANNEL_STEP}=${session}`]);
@@ -106,7 +106,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   /** Plan step 11I1, PR A1: a batch session as the worker's own flow opens it, from the test process (no lock needed). */
   async function openBatch(image: string) {
     const target = await targets.current();
-    const session = await batches.open({ volume, image, socket: helperDockerSocket(env, process.platform, target.endpoint) });
+    const session = await batches!.open({ volume, image, socket: helperDockerSocket(env, process.platform, target.endpoint) });
     sessions.push(session.session);
     return session;
   }
@@ -114,7 +114,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   beforeAll(async () => {
     // Plan step 11I1, PR A1: the bundle of workerLocks.ts, which the in-process batch helpers load too.
     script = await workerScript();
-    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform));
+    // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await targets.current()).endpoint));
     const use = await helper.ensureImageUse();
     helperTag = use.tag;
     // A `git` first on PATH that only waits: the clone runs as the Git user until its time limit.
@@ -140,7 +141,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
 
   afterAll(async () => {
     // Plan step 11I1, PR A1: no in-process batch helper is left over.
-    const batchLeftovers = await batches.dispose();
+    // Review round 1 (A-L2): also when the setup failed before the batch helpers.
+    const batchLeftovers = batches === undefined ? [] : await batches.dispose();
     for (const channels of allChannels) channels.dispose();
     for (const session of sessions) for (const id of helpersOf(session)) cli.run(['rm', '-f', id]);
     let leftovers: string[] = [];
@@ -159,7 +161,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
     const target = await targets.current();
     const missing = `devenv-test-batch-missing-${run.runId}`;
-    await expect(batches.open({ volume: missing, image: waitingGitImage, socket: helperDockerSocket(env, process.platform, target.endpoint) })).rejects.toMatchObject({
+    await expect(batches!.open({ volume: missing, image: waitingGitImage, socket: helperDockerSocket(env, process.platform, target.endpoint) })).rejects.toMatchObject({
       code: 'missingVolume',
     });
     expect(cli.volume(missing)).toBeUndefined();

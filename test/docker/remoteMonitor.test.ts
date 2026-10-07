@@ -616,7 +616,7 @@ describe('the Session Monitor container: the environment lock of its stops and i
       expect(logs()).toContain(`Stopping the container ${name} of ${id}`);
       // The monitor released the lock after its stop: a worker takes it at once (plan step 11I1, PR A1: taken with
       // `flock` as a worker takes it, in a container of the helper image, instead of through the `lock` operation).
-      expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
+      expect(await lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
     } finally {
       if (!released) lock.release();
     }
@@ -632,11 +632,11 @@ describe('the Session Monitor container: the environment lock of its stops and i
     await waitUntil(() => logs().includes(`Stopping the container ${name} of ${id}`), 'the start of the slow stop', 60_000);
     // During the stop, the lock is held by the monitor: a worker is refused after its wait (plan step 11I1, PR A1: `flock`
     // as a worker takes it, instead of the `lock` operation; busy is its LOCK_BUSY_EXIT).
-    expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(false);
+    expect(await lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(false);
     cli.ok(['kill', containerName]);
     await waitUntil(() => !running(containerName), 'the end of the killed monitor', 30_000);
     // The kernel freed the lock with the process: a worker takes it at once (plan step 11I1, PR A1: as above).
-    expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
+    expect(await lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
     cli.run(['rm', '-f', name]);
   });
 

@@ -10,6 +10,7 @@
 // relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { parseJsonc } from '../../src/core/jsonc';
 import { newEnvironmentId, splitRepository } from '../../src/core/names';
@@ -30,9 +31,9 @@ describe(`clone of ${REPOSITORY}`, () => {
   const timings = new Timings();
   // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the batch helper of the worker runs the steps.
   // Plan step 11I1, PR A1: started from the test process (inProcessBatches) instead of through the lock of a worker.
-  let batches: InProcessBatches;
+  let batches: InProcessBatches | undefined;
   const lockId = newEnvironmentId();
-  const inBatch = <T>(fn: () => Promise<T>): Promise<T> => batches.inScope(lockId, volumeName, fn);
+  const inBatch = <T>(fn: () => Promise<T>): Promise<T> => batches!.inScope(lockId, volumeName, fn);
 
   /** A command in the helper on the volume, without the Docker socket and without network. */
   async function inVolume(command: string[]): Promise<{ exitCode: number | null; stdout: string }> {
@@ -43,7 +44,8 @@ describe(`clone of ${REPOSITORY}`, () => {
 
   beforeAll(async () => {
     await timings.measure('workspace helper image ready', () => helper.ensureImage());
-    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform));
+    // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await new DockerTargets(docker, env, log).current()).endpoint));
     cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, volumeName]);
   });
 
@@ -51,7 +53,8 @@ describe(`clone of ${REPOSITORY}`, () => {
     timings.print(`Timings of the clone scenario (${REPOSITORY}):`);
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no batch helper is left over (plan step
     // 11I1, PR A1: no worker is started any more).
-    const leftovers = await batches.dispose();
+    // Review round 1 (A-L2): also when the setup failed before the batch helpers.
+    const leftovers = batches === undefined ? [] : await batches.dispose();
     removeRunObjects(cli, run.runId);
     expect(leftovers).toEqual([]);
     expect(cli.volume(volumeName)).toBeUndefined();
@@ -100,7 +103,7 @@ describe(`clone of ${REPOSITORY}`, () => {
     expect(cli.lines(['ps', '-a', '-q', '--filter', `volume=${volumeName}`])).toEqual([]);
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: one batch helper per operation (two clones, the listing, two reads).
     // Plan step 11I1, PR A1: counted by the in-process batch helpers instead of the locks of the worker.
-    expect(batches.sessions).toHaveLength(5);
+    expect(batches!.sessions).toHaveLength(5);
     expect(cli.lines(['image', 'ls', '-q', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`])).toEqual([]);
   });
 });

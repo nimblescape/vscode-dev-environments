@@ -14,6 +14,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
+import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { composeProjectName, environmentImageName, resourceName } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -73,11 +74,12 @@ describe('model run of a Docker Compose configuration', () => {
   let apiVersion: string;
   // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the batch helper of the worker runs the model.
   // Plan step 11I1, PR A1: started from the test process (inProcessBatches) instead of through the lock of a worker.
-  let batches: InProcessBatches;
+  let batches: InProcessBatches | undefined;
 
   beforeAll(async () => {
     await helper.ensureImage();
-    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform));
+    // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await new DockerTargets(docker, env, log).current()).endpoint));
     cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, volumeName]);
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     const files = {
@@ -97,7 +99,8 @@ describe('model run of a Docker Compose configuration', () => {
   afterAll(async () => {
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no batch helper is left over (plan step
     // 11I1, PR A1: no worker is started any more).
-    const leftovers = await batches.dispose();
+    // Review round 1 (A-L2): also when the setup failed before the batch helpers.
+    const leftovers = batches === undefined ? [] : await batches.dispose();
     removeRunObjects(cli, run.runId);
     expect(leftovers).toEqual([]);
     expect(cli.volume(volumeName)).toBeUndefined();
@@ -107,7 +110,7 @@ describe('model run of a Docker Compose configuration', () => {
     const resolved = resolveComposeFiles('.devcontainer/devcontainer.json', 'app', names);
     if (!('files' in resolved)) throw new Error(resolved.problem);
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the step in the batch helper of an operation.
-    return batches.inScope(ENVIRONMENT_ID, volumeName, () => helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT }));
+    return batches!.inScope(ENVIRONMENT_ID, volumeName, () => helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT }));
   }
 
   it('prints the merged model of all profiles, and the policy allows it', async () => {

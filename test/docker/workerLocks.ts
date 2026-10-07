@@ -24,7 +24,7 @@ import { runWithBatchScope } from '../../src/core/helper/batchScope';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import type { HelperBatchSession } from '../../src/core/helperChannel/helperChannel';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LOCK_BUSY_EXIT, LOCK_STATE_DIR, lockFilePath, lockFolder } from '../../src/core/helperChannel/protocol';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LOCK_BUSY_EXIT, LOCK_STATE_DIR } from '../../src/core/helperChannel/protocol';
 import type { Logger } from '../../src/core/ports';
 import { workerBatchSession } from '../../src/helperChannel/batch';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
@@ -156,11 +156,31 @@ export async function inBatchScope<T>(locks: WorkerLocks, lockId: string, volume
   }
 }
 
+let lockHolderBundle: Promise<string> | undefined;
+
+/** Plan step 11I1, PR A1 (review round 1, A-M1): lockHolder.ts bundled, once per test process. */
+function lockHolderScript(): Promise<string> {
+  lockHolderBundle ??= esbuild
+    .build({ entryPoints: [path.resolve(__dirname, 'lockHolder.ts')], bundle: true, platform: 'node', format: 'cjs', target: 'node20', minify: true, write: false, logLevel: 'silent' })
+    .then((result) => result.outputFiles[0].text);
+  return lockHolderBundle;
+}
+
+/** The arguments of `docker run` of a lockHolder.ts container on the state volume (root, no network, no capabilities, as the worker). */
+async function lockHolderArgs(context: Pick<DockerTestContext, 'run'>, stateVolume: string, helperTag: string, args: string[]): Promise<string[]> {
+  return [
+    '--label', `${TEST_RUN_LABEL}=${context.run.runId}`, '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+    '--mount', `type=volume,source=${stateVolume},target=${LOCK_STATE_DIR}`,
+    helperTag, 'node', '-e', await lockHolderScript(), ...args,
+  ];
+}
+
 /**
  * Plan step 11I1, PR A1: the lock of an environment held by a plain container of the helper image on the state volume of
- * the workers (`flock` on the lock file, as a worker and the Session Monitor take it), for a test that needs a holder
- * elsewhere without the `lock` operation of the worker (removed by 11I1). Resolves once the lock is held; `release`
- * removes the container (the kernel lets go of the lock with its process).
+ * the workers, for a test that needs a holder elsewhere without the `lock` operation of the worker (removed by 11I1).
+ * Review round 1 (A-M1): taken with the code of the worker and the Session Monitor (lockHolder.ts: openLockFile, then
+ * `flock` on its file descriptor), so the lock file is the one that they make and check. Resolves once the lock is held;
+ * `release` removes the container (the kernel lets go of the lock with its process).
  */
 export async function holdLockInContainer(
   context: Pick<DockerTestContext, 'run' | 'cli'>,
@@ -168,14 +188,14 @@ export async function holdLockInContainer(
   helperTag: string,
   environmentId: string,
 ): Promise<{ container: string; release(): void }> {
-  const { run, cli } = context;
-  const script = `mkdir -p -m 0700 ${lockFolder()} && exec flock -x ${lockFilePath(environmentId)} sh -c 'echo held; exec sleep 3600'`;
-  const container = cli.ok(['run', '-d', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--network', 'none', '--cap-drop', 'ALL', '--mount', `type=volume,source=${stateVolume},target=${LOCK_STATE_DIR}`, helperTag, 'sh', '-c', script]);
-  const deadline = Date.now() + 30_000;
+  const { cli } = context;
+  const container = cli.ok(['run', '-d', ...(await lockHolderArgs(context, stateVolume, helperTag, ['hold', environmentId, '30']))]);
+  const deadline = Date.now() + 45_000;
   while (!cli.run(['logs', container]).out.includes('held')) {
-    if (Date.now() > deadline) {
+    if (Date.now() > deadline || cli.container(container)?.State.Running !== true) {
+      const logs = cli.run(['logs', container]);
       cli.run(['rm', '-f', container]);
-      throw new Error(`The lock of ${environmentId} was not taken by the holder container.`);
+      throw new Error(`The lock of ${environmentId} was not taken by the holder container: ${logs.out} ${logs.err}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -184,20 +204,18 @@ export async function holdLockInContainer(
 
 /**
  * Plan step 11I1, PR A1: whether the lock of an environment can be taken on the state volume within `waitSeconds` (a
- * plain container of the helper image takes it with `flock`, as a worker does, and lets go at once): true when taken,
+ * plain container of the helper image takes it as a worker does, lockHolder.ts, and lets go at once): true when taken,
  * false when another holder kept it for the whole wait (LOCK_BUSY_EXIT).
  */
-export function lockIsFree(context: Pick<DockerTestContext, 'run' | 'cli'>, stateVolume: string, helperTag: string, environmentId: string, waitSeconds: number): boolean {
-  const { run, cli } = context;
-  const script = `mkdir -p -m 0700 ${lockFolder()} && exec flock -x -w ${waitSeconds} -E ${LOCK_BUSY_EXIT} ${lockFilePath(environmentId)} true`;
-  const result = cli.run(['run', '--rm', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--network', 'none', '--cap-drop', 'ALL', '--mount', `type=volume,source=${stateVolume},target=${LOCK_STATE_DIR}`, helperTag, 'sh', '-c', script]);
+export async function lockIsFree(context: Pick<DockerTestContext, 'run' | 'cli'>, stateVolume: string, helperTag: string, environmentId: string, waitSeconds: number): Promise<boolean> {
+  const result = context.cli.run(['run', '--rm', ...(await lockHolderArgs(context, stateVolume, helperTag, ['try', environmentId, String(waitSeconds)]))]);
   if (result.code !== 0 && result.code !== LOCK_BUSY_EXIT) throw new Error(`The lock of ${environmentId} could not be tried: ${result.err}`);
   return result.code === 0;
 }
 
 export interface InProcessBatches {
   /** Opens a batch session as the worker's own flow opens it (workerBatchSession), from the test process. */
-  open(p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession>;
+  open(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
   /** The sessions opened, in order. */
   readonly sessions: string[];
   /**
@@ -234,8 +252,10 @@ export async function inProcessBatches(context: Pick<DockerTestContext, 'cli' | 
   const engine = dockerEngine(engineApi(socket), engineHijack(socket));
   const deps = { sessions: new Map(), engineOf: () => engine, readScript: () => script };
   const sessions: string[] = [];
-  const open = async (p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> => {
-    const session = await workerBatchSession(deps, operationContext, p);
+  // Review round 1 (A-L3): the cancel of an open (its `signal`) ends that open, as the worker's operation would.
+  const open = async (p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession> => {
+    const context = signal === undefined ? operationContext : { ...operationContext, signal: AbortSignal.any([operation.signal, signal]) };
+    const session = await workerBatchSession(deps, context, p);
     sessions.push(session.session);
     return session;
   };
@@ -251,7 +271,7 @@ export async function inProcessBatches(context: Pick<DockerTestContext, 'cli' | 
         docker: async () => {
           throw new Error('Plan step 11I1: no Docker call through the lock.');
         },
-        batch: (p) => open(p),
+        batch: (p, signal) => open(p, signal),
         release: async () => {},
       };
       return runWithBatchScope(lock, volume, log, fn);
