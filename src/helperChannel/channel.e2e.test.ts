@@ -108,6 +108,13 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // Review round 1 of PR #118 (A-L2): the worker as esbuild.mjs bundles it carries no operation of a test (the
+  // `holdBatch` of batchE2eWorker.testkit.ts, whose parameters are not checked).
+  it('bundles no operation of a test', () => {
+    expect(script).not.toContain('holdBatch');
+    expect(script).not.toContain('testkit');
+  });
+
   // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
   // Plan step 11I1, PR B1: changed test (before: also a Docker call with input through the operation `docker`, removed):
   // the log line of the Docker call of the probe instead.
