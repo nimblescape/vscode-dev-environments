@@ -23,6 +23,7 @@ import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';
 import { hostSideHandler } from '../../src/core/worker/hostSideHandler';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
+import { holdLockInContainer } from './workerLocks';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -241,14 +242,15 @@ describe('the flows through a real worker (plan step 11B1)', () => {
     // The batch helper is gone: no container uses the volume any more. (That it runs from the worker's own image ID is
     // checked by the unit test of the operation; review round 1 of 11B3b.)
     expect(cli.lines(['ps', '-a', '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).toEqual([]);
-    // A lock held elsewhere: refused as busy (startFailed) after the wait, and nothing ran.
-    const held = await channels.lock(target, id, 5);
+    // A lock held elsewhere: refused as busy (startFailed) after the wait, and nothing ran. Plan step 11I1, PR A1: held by
+    // a container of the helper image on the state volume of the workers (was: the `lock` operation of a second worker).
+    const held = await holdLockInContainer({ run, cli }, testStateVolume({ run, cli }, 'workerFlows'), helperTag, id);
     try {
       expect(parseListConfigurationsValue(await list())).toMatchObject({ refused: { code: 'startFailed' } });
       // Review round 1 of 11B3b (missing test): no batch helper was started for the refused listing.
       expect(cli.lines(['ps', '-a', '--filter', `volume=${volume}`, '--format', '{{.ID}}'])).toEqual([]);
     } finally {
-      await held.release();
+      held.release();
     }
   }, 240_000);
 

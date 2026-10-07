@@ -5,7 +5,9 @@
 // Clone of a public repository into a workspace volume with the real workspace helper (implementation notes 7), then
 // the configuration files from the volume. Nothing of the repository is built. Plan step 7 (user decision of 2026-10-01):
 // the per-step path is removed, so the steps run in the batch helper of the real worker under a lock, as an operation
-// runs them (inBatchScope); the checks of the volume run in a plain container of the helper image (runInVolume).
+// runs them; the checks of the volume run in a plain container of the helper image (runInVolume). Plan step 11I1, PR A1:
+// the batch helper is started from the test process as the worker's own flow starts it (inProcessBatches), without the
+// relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
@@ -15,7 +17,7 @@ import { newEnvironmentId, splitRepository } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, Timings, dockerTestContext, runInVolume } from './harness';
-import { inBatchScope, workerLocks } from './workerLocks';
+import { inProcessBatches, type InProcessBatches } from './workerLocks';
 
 /** A small public repository with a Dev Container configuration. */
 const REPOSITORY = process.env.DEVENV_TEST_REPOSITORY ?? 'microsoft/vscode-remote-try-node';
@@ -27,11 +29,11 @@ describe(`clone of ${REPOSITORY}`, () => {
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volumeName = `devenv-test-clone-${run.runId}`;
   const timings = new Timings();
-  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the real workers, whose batch helper runs the steps.
-  const targets = new DockerTargets(docker, env, log);
-  const locks = workerLocks({ run, cli, log }, docker, targets, 'clone', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
+  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the batch helper of the worker runs the steps.
+  // Plan step 11I1, PR A1: started from the test process (inProcessBatches) instead of through the lock of a worker.
+  let batches: InProcessBatches | undefined;
   const lockId = newEnvironmentId();
-  const inBatch = <T>(fn: () => Promise<T>): Promise<T> => inBatchScope(locks, lockId, volumeName, log, fn);
+  const inBatch = <T>(fn: () => Promise<T>): Promise<T> => batches!.inScope(lockId, volumeName, fn);
 
   /** A command in the helper on the volume, without the Docker socket and without network. */
   async function inVolume(command: string[]): Promise<{ exitCode: number | null; stdout: string }> {
@@ -42,13 +44,17 @@ describe(`clone of ${REPOSITORY}`, () => {
 
   beforeAll(async () => {
     await timings.measure('workspace helper image ready', () => helper.ensureImage());
+    // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await new DockerTargets(docker, env, log).current()).endpoint));
     cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, volumeName]);
   });
 
   afterAll(async () => {
     timings.print(`Timings of the clone scenario (${REPOSITORY}):`);
-    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no worker and no batch helper is left over.
-    const leftovers = await locks.dispose();
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no batch helper is left over (plan step
+    // 11I1, PR A1: no worker is started any more).
+    // Review round 1 (A-L2): also when the setup failed before the batch helpers.
+    const leftovers = batches === undefined ? [] : await batches.dispose();
     removeRunObjects(cli, run.runId);
     expect(leftovers).toEqual([]);
     expect(cli.volume(volumeName)).toBeUndefined();
@@ -96,7 +102,8 @@ describe(`clone of ${REPOSITORY}`, () => {
   it('leaves no helper container and builds no image', () => {
     expect(cli.lines(['ps', '-a', '-q', '--filter', `volume=${volumeName}`])).toEqual([]);
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: one batch helper per operation (two clones, the listing, two reads).
-    expect(locks.batches.get(lockId) ?? []).toHaveLength(5);
+    // Plan step 11I1, PR A1: counted by the in-process batch helpers instead of the locks of the worker.
+    expect(batches!.sessions).toHaveLength(5);
     expect(cli.lines(['image', 'ls', '-q', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`])).toEqual([]);
   });
 });

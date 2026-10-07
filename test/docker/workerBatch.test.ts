@@ -15,9 +15,10 @@
 // replaces option A): a Compose model step runs as the owner of the repository (1000 here): it cannot read a file in
 // CONFIG_FOLDER (root's and 0700 during the step, the owner's again after it), and it can read a 0600 file of the owner
 // in the repository (an `.env`); createFolders (agreed extension) creates folders of the owner.
+// Plan step 11I1, PR A1: the batch helper of the checks of one session is started from the test process as the worker's
+// own flow starts it (inProcessBatches: workerBatchSession over the Engine API), without the `lock` and `batch` relay of
+// the worker; only the end of the helper with its worker (kill, silence) still goes through a worker (PR A2 moves it).
 import * as path from 'path';
-import * as esbuild from 'esbuild';
-import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
@@ -31,30 +32,13 @@ import { bundleHash } from '../../src/core/loader/pipeLoader';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
+import { inProcessBatches, workerScript, type InProcessBatches } from './workerLocks';
 
 const REPOSITORY = 'devenv-test/worker-batch';
 /** As the folder of REPOSITORY in the volume. */
 const FOLDER = '/workspaces/worker-batch';
 /** The clone goes to a folder of its own (the folder of REPOSITORY exists and is no repository). */
 const CLONED = 'devenv-test/worker-batch-clone';
-
-async function bundleScript(): Promise<string> {
-  const result = await esbuild.build({
-    // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
-    define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
-    // Plan step 11D2: the script of the Session Monitor in the worker, as esbuild.mjs bundles it.
-    plugins: [workerScriptsPlugin(path.resolve(__dirname, '../..'), { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) })],
-    entryPoints: [path.resolve(__dirname, '../../src/helperChannel/main.ts')],
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node20',
-    minify: true,
-    write: false,
-    logLevel: 'silent',
-  });
-  return result.outputFiles[0].text;
-}
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -77,6 +61,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   /** The helper image with a `git` that only waits (deterministic Git steps). */
   let waitingGitImage = '';
   const allChannels: HelperChannels[] = [];
+  /** Plan step 11I1, PR A1: the batch helpers started from the test process. */
+  let batches: InProcessBatches | undefined;
   const sessions: string[] = [];
 
   const helpersOf = (session: string) => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_CHANNEL_STEP}=${session}`]);
@@ -117,8 +103,19 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     return { lock, session };
   }
 
+  /** Plan step 11I1, PR A1: a batch session as the worker's own flow opens it, from the test process (no lock needed). */
+  async function openBatch(image: string) {
+    const target = await targets.current();
+    const session = await batches!.open({ volume, image, socket: helperDockerSocket(env, process.platform, target.endpoint) });
+    sessions.push(session.session);
+    return session;
+  }
+
   beforeAll(async () => {
-    script = await bundleScript();
+    // Plan step 11I1, PR A1: the bundle of workerLocks.ts, which the in-process batch helpers load too.
+    script = await workerScript();
+    // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await targets.current()).endpoint));
     const use = await helper.ensureImageUse();
     helperTag = use.tag;
     // A `git` first on PATH that only waits: the clone runs as the Git user until its time limit.
@@ -143,6 +140,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   });
 
   afterAll(async () => {
+    // Plan step 11I1, PR A1: no in-process batch helper is left over.
+    // Review round 1 (A-L2): also when the setup failed before the batch helpers.
+    const batchLeftovers = batches === undefined ? [] : await batches.dispose();
     for (const channels of allChannels) channels.dispose();
     for (const session of sessions) for (const id of helpersOf(session)) cli.run(['rm', '-f', id]);
     let leftovers: string[] = [];
@@ -154,23 +154,22 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     cli.run(['rmi', '-f', `devenv-test-batch-git:${run.runId}`]);
     removeRunObjects(cli, run.runId);
     expect(leftovers).toEqual([]);
+    expect(batchLeftovers).toEqual([]);
   });
 
   it('refuses a missing volume and does not create it', async () => {
-    const channels = windowChannels();
+    // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
     const target = await targets.current();
-    const lock = await channels.lock(target, newEnvironmentId(), 5);
     const missing = `devenv-test-batch-missing-${run.runId}`;
-    await expect(lock.batch!({ volume: missing, image: waitingGitImage, socket: helperDockerSocket(env, process.platform, target.endpoint) })).rejects.toMatchObject({
+    await expect(batches!.open({ volume: missing, image: waitingGitImage, socket: helperDockerSocket(env, process.platform, target.endpoint) })).rejects.toMatchObject({
       code: 'missingVolume',
     });
     expect(cli.volume(missing)).toBeUndefined();
-    await lock.release();
   });
 
   it('isolates the Git user, keeps the token out of the container and the log, and keeps the session after a step time limit', async () => {
-    const channels = windowChannels();
-    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
+    const session = await openBatch(waitingGitImage);
     const helpers = helpersOf(session.session);
     expect(helpers).toHaveLength(1);
     const container = helpers[0];
@@ -265,12 +264,11 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // Close (the cancel of the operation): the container is gone.
     await session.close();
     await waitUntil(() => helpersOf(session.session).length === 0, 'the removal of the helper after the close');
-    await lock.release();
   });
 
   it('Docker Compose refuses remote includes in the helper (Q2)', async () => {
-    const channels = windowChannels();
-    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
+    const session = await openBatch(waitingGitImage);
     for (const [file, disabled] of [
       ['git.yml', 'git remote resource is disabled by "COMPOSE_EXPERIMENTAL_GIT_REMOTE"'],
       ['oci.yml', 'OCI remote resource is disabled by "COMPOSE_EXPERIMENTAL_OCI_REMOTE"'],
@@ -280,7 +278,6 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       expect(JSON.parse(result.stdout.trim().split('\n').pop()!)).toMatchObject({ error: expect.stringContaining(disabled) });
     }
     await session.close();
-    await lock.release();
   });
 
   // User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."): the
@@ -288,8 +285,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   // file in CONFIG_FOLDER, which belongs to that owner but is root's and 0700 during the step; the folder gets its owner
   // and mode back. (Under option A, which this replaces, the step ran as the unprivileged Git user.)
   it('a Compose model step as the repository owner cannot read a file in CONFIG_FOLDER (user decision of 2026-10-01)', async () => {
-    const channels = windowChannels();
-    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
+    const session = await openBatch(waitingGitImage);
     const container = helpersOf(session.session)[0];
     const result = await session.step('composeModel', { repository: REPOSITORY, files: [`${FOLDER}/token.yml`], project: 'devenv-batch-test' });
     const output = `${result.stdout}\n${result.stderr}`;
@@ -299,14 +296,13 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(execIn(container, '0:0', 'stat -c %a:%u:%g /workspaces/.devenv+').out).toBe('755:1000:1000');
     expect(execIn(container, '0:0', 'cat /workspaces/.devenv+/gitconfig').out).toBe('[user]');
     await session.close();
-    await lock.release();
   });
 
   // User decision of 2026-10-01: the Compose read runs as the owner of the repository, as a real user would, so it reads
   // a 0600 file of that owner in the repository (an `.env` that `env_file` names).
   it('a Compose model step reads a 0600 file of the repository owner (user decision of 2026-10-01)', async () => {
-    const channels = windowChannels();
-    const { lock, session } = await lockAndBatch(channels, waitingGitImage);
+    // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
+    const session = await openBatch(waitingGitImage);
     const container = helpersOf(session.session)[0];
     const result = await session.step('composeModel', { repository: REPOSITORY, files: [`${FOLDER}/owner.yml`], project: 'devenv-batch-test' });
     expect(result.exitCode).toBe(0);
@@ -319,7 +315,6 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(created.exitCode).toBe(0);
     expect(execIn(container, '0:0', `stat -c %u:%g ${FOLDER}/data ${FOLDER}/data/pg`).out.split('\n')).toEqual(['1000:1000', '1000:1000']);
     await session.close();
-    await lock.release();
   });
 
   it('the helper is gone after a kill of the worker', async () => {
