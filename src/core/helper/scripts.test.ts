@@ -1370,6 +1370,40 @@ describe('READ_FILES_SCRIPT', () => {
     expect(read(repo, '.devcontainer/gone.json')).toBeNull();
   });
 
+  // Review round 1 of PR #121 (A): the realpathSync of JavaScript resolves a `..` of a link target as text, the kernel
+  // physically: a link `../sub/../target.txt` whose `sub` leads out of the repository names a file of the repository for
+  // it (a decoy) and a file out of it for the open. Before this PR, its Dockerfile text was read; neither is read now.
+  it('reads no file through a link whose .. leads out of the repository after a folder link (review round 1 of PR #121, A)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(path.join(root, 'out', 'inner'), { recursive: true });
+    write(path.join(root, 'out', 'target.txt'), '{ "image": "OUTSIDE_SECRET" }');
+    write(path.join(repo, 'target.txt'), '{ "image": "decoy" }');
+    fs.symlinkSync(path.join(root, 'out', 'inner'), path.join(repo, 'sub'));
+    fs.mkdirSync(path.join(repo, 'a'), { recursive: true });
+    fs.symlinkSync('../sub/../target.txt', path.join(repo, 'a', 'devcontainer.json'));
+    // The setup holds: the open reaches the file out of the repository.
+    expect(fs.readFileSync(path.join(repo, 'a', 'devcontainer.json'), 'utf8')).toContain('OUTSIDE_SECRET');
+    const config = runNode(readFilesCommand(repo, 'a/devcontainer.json'));
+    expect(config.status).not.toBe(0);
+    expect(config.stderr).toContain('The configuration file is not a file of the repository.');
+    expect(`${config.stdout}${config.stderr}`).not.toContain('OUTSIDE_SECRET');
+    write(path.join(repo, 'b', 'devcontainer.json'), '{ "build": { "dockerfile": "Dockerfile" } }');
+    fs.symlinkSync('../sub/../target.txt', path.join(repo, 'b', 'Dockerfile'));
+    expect(read(repo, 'b/devcontainer.json')).toEqual({ configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: 'b/Dockerfile' });
+  });
+
+  // Review round 1 of PR #121 (A-1): a Dockerfile that links to standard input (a file of the system that the first version
+  // of the PR opened, and failed on in the batch helper, whose input is a socket) is not read, and the script ends well.
+  it('reads no Dockerfile that links to standard input (review round 1 of PR #121, A-1)', () => {
+    const repo = tempDir();
+    write(path.join(repo, 'b', 'devcontainer.json'), '{ "build": { "dockerfile": "Dockerfile" } }');
+    fs.symlinkSync('/dev/stdin', path.join(repo, 'b', 'Dockerfile'));
+    const result = spawnSync(process.execPath, readFilesCommand(repo, 'b/devcontainer.json').slice(1), { encoding: 'utf8', input: 'FROM stdin\n', timeout: 10_000 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: 'b/Dockerfile' });
+  });
+
   it('never waits on a FIFO of the repository, as the configuration or as its Dockerfile (decision of 2026-10-07)', () => {
     const repo = tempDir();
     fs.mkdirSync(path.join(repo, 'a'), { recursive: true });

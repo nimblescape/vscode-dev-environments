@@ -407,9 +407,12 @@ const fs = require('fs');
 const path = require('path');
 const root = path.posix.resolve(process.argv[1]);
 const inside = (file) => file === root || file.startsWith(root + '/');
+// Review round 1 of PR #121 (A): the real path as the kernel resolves it (realpath(3)): the realpathSync of JavaScript
+// resolves a \`..\` of a link target as text, so a link \`sub/../x\` whose \`sub\` leads out of the repository named a file of
+// the repository for it while the open reached the file out of it.
 ${READ_LIMITED}const realPath = (file) => {
   try {
-    return fs.realpathSync(file);
+    return fs.realpathSync.native(file);
   } catch {
     return null;
   }
@@ -423,7 +426,9 @@ ${READ_LIMITED}const realPath = (file) => {
 // file of the system is opened). The open never waits (O_NONBLOCK: a FIFO of the repository cannot hold the step) and
 // never takes a terminal (O_NOCTTY). undefined: no such file (or a folder; also when the repository folder does not
 // exist, review round 1 of PR #121, B-R14, as the batch helper reports it, batchHelper.ts A-R5-1); null: a file that is
-// not a plain file of the repository (a link out of it or in a circle, a FIFO, a socket).
+// not a plain file of the repository (a link out of it or in a circle, a FIFO, a socket, a file that cannot be opened,
+// review round 1 of PR #121, A-1). A hard link is the file itself: the repository cannot hold one of a file out of it
+// (Git creates none, and the volume holds only the repository and CONFIG_FOLDER of its owner).
 const realInRepository = (real) => {
   const rootReal = realPath(root);
   return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
@@ -436,7 +441,7 @@ const readInRepository = (file, limit) => {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
   } catch (error) {
     if (error && ['ENOENT', 'ENOTDIR'].includes(error.code)) return undefined;
-    if (error && ['ELOOP', 'ENXIO'].includes(error.code)) return null;
+    if (error && ['ELOOP', 'ENXIO', 'EACCES', 'EPERM', 'ENAMETOOLONG', 'ENODEV'].includes(error.code)) return null;
     throw error;
   }
   try {
