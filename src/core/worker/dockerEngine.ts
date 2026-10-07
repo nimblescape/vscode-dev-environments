@@ -9,6 +9,7 @@
 import { LABEL_COMPOSE_SERVICE } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
 import type { MonitorCreated, MonitorRunSpec } from '../remoteMonitor/monitorEngine';
+import type { StartedProcess } from '../ports';
 
 /**
  * A container as a flow needs it: the pipeline's ContainerInfo (one shape, read by toContainerInfo of
@@ -86,6 +87,52 @@ export interface EngineProxy {
   httpProxy?: string;
   httpsProxy?: string;
   noProxy?: string;
+}
+
+/** Plan step 11G3: a mount of an attached run (`--mount type=<type>,source=<source>,target=<target>` of `docker run`). */
+export interface EngineMount {
+  type: 'volume' | 'bind';
+  source: string;
+  target: string;
+}
+
+/**
+ * Plan step 11G3: a container that DockerEngine.runAttached runs as `docker run --rm -i` would: the image by its ID and
+ * never pulled, the command as the arguments after the image (the entrypoint of the image stays), the labels, the
+ * mounts, the tmpfs mounts with their options, the security options, no log of the engine, and the default network.
+ * No variable: a secret or a script goes only to the standard input of the process.
+ */
+export interface EngineAttachedSpec {
+  name: string;
+  image: string;
+  command: readonly string[];
+  labels: Readonly<Record<string, string>>;
+  mounts: readonly EngineMount[];
+  /** The target of each tmpfs mount, with its options (`--tmpfs <target>:<options>`). */
+  tmpfs: Readonly<Record<string, string>>;
+  securityOpt: readonly string[];
+}
+
+/** Plan step 11G3: the options of DockerEngine.runAttached. */
+export interface EngineAttachedOptions {
+  /** Ends the run: before it started, nothing runs (the call rejects with an AbortError); after, as `process.kill()`. */
+  signal?: AbortSignal;
+  /** The time from the SIGTERM of `process.kill()` to its SIGKILL (as `docker stop -t`); 10 s when not given. */
+  stopSeconds?: number;
+}
+
+/**
+ * Plan step 11G3: a container that runs attached (DockerEngine.runAttached). `process` is its standard input and output
+ * as a process of this worker: `end` closes its input (the engine closes it in the container, StdinOnce), `kill` stops
+ * it (SIGTERM, then SIGKILL after `stopSeconds`) and removes it, and `exited` resolves with its exit code once it ended
+ * (null with `error` when that cannot be read). `pause` and `resume` stop and resume the reading of its output.
+ */
+export interface EngineAttachedRun {
+  /** Its full ID. */
+  id: string;
+  process: StartedProcess;
+  pause(): void;
+  resume(): void;
 }
 
 /**
@@ -168,6 +215,15 @@ export interface DockerEngine {
    * labels. Rejects only when nothing was sent.
    */
   createAttached(spec: MonitorRunSpec, options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal }): Promise<MonitorCreated>;
+  /**
+   * Plan step 11G3 (decision of 2026-10-03, no `docker` process of the worker's own): `docker run --rm -i` of `spec` over
+   * the API: the create with an open input and AutoRemove, the attach (stdin, stdout, stderr) over a hijacked
+   * connection, the wait for its removal, and the start; the run goes on until it ends or is killed. Rejects with an
+   * EngineError when the engine refuses a request (409 for a name in use, 404 for a missing image), and with an
+   * AbortError when the signal aborts first; the container of a create that answered is then removed (by its ID). When
+   * the create itself did not answer, the caller removes what it may have created by its labels.
+   */
+  runAttached(spec: EngineAttachedSpec, options?: EngineAttachedOptions): Promise<EngineAttachedRun>;
 }
 
 /** Plan step 11G1: the largest file that DockerEngine.imageFile reads (in bytes). */

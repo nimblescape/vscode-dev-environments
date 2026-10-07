@@ -46,7 +46,7 @@ import { contextLogger, deleteCheckOperation, deleteOperation, listConfiguration
 import * as os from 'os';
 import { pullOperation, startContainersOperation } from './engineOperations';
 import { lockOperation } from './lock';
-import { OperationError, type OperationContext, type OperationHandler } from './server';
+import { OperationError, type OperationHandler } from './server';
 import monitorScript from 'devenv:monitor-script';
 
 /** `docker <args>`: its output goes back as it comes; the value is its exit code. */
@@ -128,8 +128,8 @@ const HIJACK = engineHijack();
 // Plan step 11E1 (review round 1 of PR #102, A-M1): the output of an exec masked with every secret of the operation.
 const ENGINE_OF: EngineOfOperation = (context) => dockerEngine(ENGINE, HIJACK, (name) => context.secrets[name], () => context.maskedValues());
 
-/** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations. */
-const BATCH = batchDeps();
+/** Plan step 6, PR B: the batch sessions of this worker, shared by its three operations; plan step 11G3: over its engine. */
+const BATCH = batchDeps(ENGINE_OF);
 
 /**
  * Plan step 11B3b: the worker's own helper image and socket, read once from the engine (the inspect of its own container,

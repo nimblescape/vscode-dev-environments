@@ -129,7 +129,7 @@ export function helperCliVariables(repository: string, env: Readonly<Record<stri
 
 /**
  * The variables of the process of the Dev Container CLI in the workspace helper whose values are known (hotfix review 1,
- * N4): HOME. The helper runs as root (resources/helper/Dockerfile has no USER, and batchRunArgs passes no `--user`), so
+ * N4): HOME. The helper runs as root (resources/helper/Dockerfile has no USER, and batchRunSpec sets no user), so
  * Docker sets HOME=/root; the steps of the Dev Container CLI run as root with the variables of the helper (plan step 7,
  * user decision of 2026-10-01: the per-step runs, whose helperRunArgs passed no `--user` either, are removed). The pipeline passes no variable to the CLI runs of a single container; those of Docker
  * Compose get COMPOSE_PROJECT_NAME (review round 18, D18-1: helperCliVariables with `env`).

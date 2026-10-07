@@ -9,6 +9,9 @@ import { publicInfo, toContainerInfo, toLabels } from '../core/docker/dockerObje
 import {
   EngineError,
   type DockerEngine,
+  type EngineAttachedOptions,
+  type EngineAttachedRun,
+  type EngineAttachedSpec,
   type EngineContainer,
   type EngineExecOptions,
   type EngineExecResult,
@@ -18,7 +21,7 @@ import {
   type EnginePullLogin,
   MAX_IMAGE_FILE_BYTES,
 } from '../core/worker/dockerEngine';
-import { abortError, isAbortError } from '../core/ports';
+import { abortError, isAbortError, type StartedProcess } from '../core/ports';
 import { errorMessage } from '../core/errors';
 import { readableStderr } from '../core/loader/pipeLoader';
 import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
@@ -354,6 +357,7 @@ export function dockerEngine(
       return { ...(httpProxy ? { httpProxy } : {}), ...(httpsProxy ? { httpsProxy } : {}), ...(noProxy ? { noProxy } : {}) };
     },
     createAttached: (spec, options) => createAttached(api, hijack, spec, options),
+    runAttached: (spec, options) => runAttached(api, hijack, spec, options),
   };
 }
 
@@ -539,6 +543,218 @@ async function execInContainer(
   }
 }
 
+/**
+ * Plan step 11G3: what `docker run -i` sets in a create for an open, attached input (no terminal), shared by the attached
+ * create of the Session Monitor and the attached run of the batch helper.
+ */
+const ATTACHED_INPUT = { AttachStdin: true, AttachStdout: true, AttachStderr: true, OpenStdin: true, StdinOnce: true, Tty: false } as const;
+
+/** Plan step 11G3: the ID of a container in the answer of its create, or undefined when the answer has none. */
+function createdId(created: EngineAnswer): string | undefined {
+  const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
+/** Plan step 11G3: whether the engine started the container (204), or found it running already (304). */
+function isStarted(answer: EngineAnswer): boolean {
+  return answer.status === 204 || answer.status === 304;
+}
+
+/**
+ * Plan step 11G3 (shared by createAttached of plan step 11D2 and runAttached): the attach to the standard input, output
+ * and error output of the created container `id` over a hijacked connection, `beforeStart`, then its start, as `docker
+ * run -i` does it (attached before the start, so that no output is lost). Answers the connection and the answer of the
+ * start, which the caller checks (and then ends the connection); a start that fails ends the connection before it throws.
+ */
+async function attachAndStart(
+  api: EngineApi,
+  hijack: EngineHijack,
+  id: string,
+  signal: AbortSignal | undefined,
+  onFrame: EngineHijackRequest['onFrame'],
+  beforeStart: () => void = () => {},
+): Promise<{ stream: EngineStream; started: EngineAnswer }> {
+  const stream = await hijack({ path: `/containers/${encodeURIComponent(id)}/attach?stream=1&stdin=1&stdout=1&stderr=1`, signal, onFrame });
+  try {
+    beforeStart();
+    const started = await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/start`, signal });
+    return { stream, started };
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+}
+
+/** Plan step 11G3: the time from the SIGTERM to the SIGKILL of the kill of an attached run, when it is not given (as `docker stop`). */
+export const ATTACHED_STOP_SECONDS = 10;
+/** Plan step 11G3: how long the end of an attached run waits for the rest of its output after the engine reported its end. */
+export const ATTACHED_DRAIN_MS = 2_000;
+/** Plan step 11G3: how long the end of an attached run waits for the answer of its wait after its kill removed it. */
+export const ATTACHED_KILL_WAIT_MS = 10_000;
+
+/**
+ * Plan step 11G3 (DockerEngine.runAttached): `docker run --rm -i` of the batch helper over the API instead of the
+ * worker's own `docker run`. The create maps each option of that `docker run` (see EngineAttachedSpec), and sets what the
+ * CLI sets for `--rm -i`: AutoRemove, an open input that the engine closes when the attached connection closes it
+ * (StdinOnce), and the default network. It is sent without the signal and within RUN_CLEANUP_TIMEOUT_MS (as labelImage),
+ * so that a cancel never leaves a container created but unknown. Then the attach, the wait for its removal (registered
+ * before the start, as the CLI does for `--rm`, so that its exit code is read although the engine removes it), and the
+ * start. What fails after the create answered removes the container by its ID.
+ */
+async function runAttached(api: EngineApi, hijack: EngineHijack, spec: EngineAttachedSpec, options: EngineAttachedOptions = {}): Promise<EngineAttachedRun> {
+  const signal = options.signal;
+  if (signal?.aborted) throw abortError();
+  const stopSeconds = options.stopSeconds ?? ATTACHED_STOP_SECONDS;
+  // As the removal of `--rm`: with its anonymous volumes; within a time limit of its own, never the cancel signal.
+  const remove = (id: string) =>
+    api({ method: 'DELETE', path: `/containers/${encodeURIComponent(id)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).then(
+      () => undefined,
+      () => undefined,
+    );
+  const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+  let created: EngineAnswer;
+  try {
+    created = await api({
+      method: 'POST',
+      path: `/containers/create?name=${encodeURIComponent(spec.name)}`,
+      signal: limit,
+      json: {
+        Image: spec.image,
+        Cmd: [...spec.command],
+        Labels: { ...spec.labels },
+        ...ATTACHED_INPUT,
+        HostConfig: {
+          AutoRemove: true,
+          NetworkMode: 'default',
+          LogConfig: { Type: 'none', Config: {} },
+          SecurityOpt: [...spec.securityOpt],
+          Mounts: spec.mounts.map((mount) => ({ Type: mount.type, Source: mount.source, Target: mount.target })),
+          Tmpfs: { ...spec.tmpfs },
+        },
+      },
+    });
+  } catch (error) {
+    if (!limit.aborted) throw error;
+    throw new EngineError(`The engine did not answer the create of the container ${spec.name} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+  }
+  if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
+  const id = createdId(created);
+  if (id === undefined) throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+
+  // The output by stream, decoded across frames; what comes before a listener is there is kept for it (bounded).
+  const decoders = { 1: new StringDecoder('utf8'), 2: new StringDecoder('utf8') };
+  const listeners: Record<1 | 2, ((text: string) => void) | undefined> = { 1: undefined, 2: undefined };
+  const early: Record<1 | 2, string> = { 1: '', 2: '' };
+  const deliver = (kind: 1 | 2, text: string) => {
+    if (text === '') return;
+    const listener = listeners[kind];
+    if (listener !== undefined) listener(text);
+    else if (early[kind].length < MAX_EXEC_OUTPUT_CHARACTERS) early[kind] += text.slice(0, MAX_EXEC_OUTPUT_CHARACTERS - early[kind].length);
+  };
+  const listen = (kind: 1 | 2, listener: (text: string) => void) => {
+    listeners[kind] = listener;
+    const text = early[kind];
+    early[kind] = '';
+    if (text !== '') listener(text);
+  };
+  // The wait ends only with the run (never with the cancel signal), so that `exited` follows a kill too.
+  const waitEnded = new AbortController();
+  let waited: Promise<EngineAnswer> | undefined;
+  let stream: EngineStream | undefined;
+  try {
+    if (signal?.aborted) throw abortError();
+    const attached = await attachAndStart(
+      api,
+      hijack,
+      id,
+      signal,
+      (kind, data) => deliver(kind, decoders[kind].write(data)),
+      () => {
+        waited = api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/wait?condition=removed`, signal: waitEnded.signal });
+        // Read by `exited`; a failure before must not be an unhandled rejection.
+        waited.catch(() => undefined);
+      },
+    );
+    stream = attached.stream;
+    if (!isStarted(attached.started)) throw new EngineError(engineErrorMessage({ ...attached.started, truncated: false }), attached.started.status);
+  } catch (error) {
+    stream?.destroy();
+    waitEnded.abort();
+    // Created, but never started (or refused): AutoRemove does not apply; removed here.
+    await remove(id);
+    throw error;
+  }
+  const connection = stream;
+  let done = false;
+  let inputEnded = false;
+  let killed: Promise<void> | undefined;
+  const kill = () => {
+    killed ??= (async () => {
+      // As `docker stop -t`, then the removal of `--rm` (AutoRemove removes it after the stop already; a missing one is fine).
+      await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/stop?t=${stopSeconds}`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS + stopSeconds * 1000) }).catch(
+        () => undefined,
+      );
+      await remove(id);
+      // The wait answers with the removal; one that does not answer is ended (the exit code is then unknown).
+      const timer = setTimeout(() => waitEnded.abort(), ATTACHED_KILL_WAIT_MS);
+      timer.unref?.();
+    })();
+  };
+  // A connection that broke (not by its end) leaves the helper without its input and output: it is ended.
+  connection.ended.catch(() => (done ? undefined : kill()));
+  const exited = (async (): Promise<{ exitCode: number | null; error?: Error }> => {
+    let result: { exitCode: number | null; error?: Error };
+    try {
+      const answer = await waited!;
+      const value = json(answer.body) as { StatusCode?: unknown } | undefined;
+      if (answer.status === 200 && typeof value?.StatusCode === 'number') result = { exitCode: value.StatusCode };
+      else result = { exitCode: null, error: new Error(answer.status === 200 ? 'The engine answered the wait of the container with an invalid value.' : engineErrorMessage({ ...answer, truncated: false })) };
+    } catch (error) {
+      result = { exitCode: null, error: isAbortError(error) ? new Error('The end of the container could not be read.') : error instanceof Error ? error : new Error(String(error)) };
+    }
+    // The rest of its output, then the connection ends. Review round 1 of PR #115 (A-L1): a paused output is read again
+    // first, so its end (often why the process ended) is not lost and its end does not wait out ATTACHED_DRAIN_MS.
+    connection.resume?.();
+    let drained: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([connection.ended.catch(() => undefined), new Promise<void>((resolve) => (drained = setTimeout(resolve, ATTACHED_DRAIN_MS)))]);
+    clearTimeout(drained);
+    done = true;
+    connection.destroy();
+    deliver(1, decoders[1].end());
+    deliver(2, decoders[2].end());
+    signal?.removeEventListener('abort', kill);
+    return result;
+  })();
+  const process: StartedProcess = {
+    write: (text) => {
+      if (done || inputEnded) return false;
+      try {
+        connection.write(text);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    end: () => {
+      if (done || inputEnded) return;
+      inputEnded = true;
+      try {
+        // The engine closes the input of the container (StdinOnce); the output goes on.
+        connection.end();
+      } catch {
+        // A connection that ended already.
+      }
+    },
+    kill,
+    onStdout: (listener) => listen(1, listener),
+    onStderr: (listener) => listen(2, listener),
+    exited,
+  };
+  if (signal?.aborted) kill();
+  else signal?.addEventListener('abort', kill, { once: true });
+  return { id, process, pause: () => connection.pause?.(), resume: () => connection.resume?.() };
+}
+
 /** Plan step 11D2: the characters of the end of the error output of an attached create that are kept (for the log). */
 const ATTACHED_STDERR_TAIL_LENGTH = 4_000;
 /** Review round 4 of PR #69 (A-R4-2): the engine's refusal of a create whose name is in use. */
@@ -585,12 +801,7 @@ async function createAttached(
           Cmd: [...spec.command],
           Labels: spec.labels,
           Env: Object.entries(spec.env).map(([key, value]) => `${key}=${value}`),
-          AttachStdin: true,
-          AttachStdout: true,
-          AttachStderr: true,
-          OpenStdin: true,
-          StdinOnce: true,
-          Tty: false,
+          ...ATTACHED_INPUT,
           HostConfig: {
             RestartPolicy: { Name: spec.restartPolicy },
             NetworkMode: spec.network === 'none' ? 'none' : 'default',
@@ -609,8 +820,8 @@ async function createAttached(
       const detail = engineErrorMessage({ ...created, truncated: false });
       return { kind: 'exited', detail, conflict: created.status === 409 && NAME_CONFLICT.test(detail) };
     }
-    const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
-    if (typeof id !== 'string' || id === '') return { kind: 'exited', detail: 'The engine answered the create of a container with an invalid value.', conflict: false };
+    const id = createdId(created);
+    if (id === undefined) return { kind: 'exited', detail: 'The engine answered the create of a container with an invalid value.', conflict: false };
     try {
       // Plan step 11D3 (option B of 2026-10-03): a container of a tag runs only from the pinned image; the tag may have
       // moved between its tag and this create (another window). Checked before the start.
@@ -622,22 +833,18 @@ async function createAttached(
           return { kind: 'exited', detail: `the container was created from the image ${typeof image === 'string' ? image : 'that cannot be read'}, not from ${spec.imageId}`, conflict: false };
         }
       }
-      stream = await hijack({
-        path: `/containers/${encodeURIComponent(id)}/attach?stream=1&stdin=1&stdout=1&stderr=1`,
-        signal,
-        onFrame: (kind, data) => {
-          const text = decoders[kind].write(data);
-          if (kind === 2) {
-            stderr = (stderr + text).slice(-ATTACHED_STDERR_TAIL_LENGTH);
-            return;
-          }
-          // Only the tail is kept: enough for the ready line across frames.
-          stdout = (stdout + text).slice(-8_192);
-          if (stdout.includes(options.readyText)) onReady();
-        },
+      const attached = await attachAndStart(api, hijack, id, signal, (kind, data) => {
+        const text = decoders[kind].write(data);
+        if (kind === 2) {
+          stderr = (stderr + text).slice(-ATTACHED_STDERR_TAIL_LENGTH);
+          return;
+        }
+        // Only the tail is kept: enough for the ready line across frames.
+        stdout = (stdout + text).slice(-8_192);
+        if (stdout.includes(options.readyText)) onReady();
       });
-      const started = await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/start`, signal });
-      if (started.status !== 204 && started.status !== 304) return { kind: 'exited', detail: engineErrorMessage({ ...started, truncated: false }), conflict: false };
+      stream = attached.stream;
+      if (!isStarted(attached.started)) return { kind: 'exited', detail: engineErrorMessage({ ...attached.started, truncated: false }), conflict: false };
       stream.write(options.input);
       const result = await Promise.race([
         ready.then((): MonitorCreated => ({ kind: 'ready' })),

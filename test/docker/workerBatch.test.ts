@@ -23,10 +23,11 @@ import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import type { HeldEnvironmentLock } from '../../src/core/docker/environmentLock';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import { BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
+import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
-import { newEnvironmentId } from '../../src/core/names';
+import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT, newEnvironmentId } from '../../src/core/names';
+import { bundleHash } from '../../src/core/loader/pipeLoader';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
@@ -205,6 +206,47 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     const inspected = JSON.parse(cli.ok(['inspect', container]))[0] as { Config: { Env: string[]; Cmd: string[] }; Args: string[] };
     expect([...inspected.Config.Env, ...inspected.Config.Cmd, ...inspected.Args].join('\n')).not.toContain(DUMMY_TOKEN);
     expect(inspected.Config.Env.some((entry) => entry.startsWith('DOCKER_HOST='))).toBe(false);
+    // Plan step 11G3: the worker creates the helper over the Engine API (DockerEngine.runAttached) instead of its own
+    // `docker run --rm -i --pull never`, with exactly its options: its name and labels, AutoRemove (`--rm`), an open input
+    // (`-i`), no log, no new privileges, the default network, the three mounts, the secrets tmpfs, the pinned image with
+    // the entrypoint of the image and the pipe loader as its command, and nothing more.
+    const created = JSON.parse(cli.ok(['inspect', container]))[0] as {
+      Name: string;
+      Image: string;
+      Config: { Labels: Record<string, string>; OpenStdin: boolean; StdinOnce: boolean; Tty: boolean; Entrypoint: string[] | null; Cmd: string[]; User: string };
+      HostConfig: {
+        AutoRemove: boolean;
+        LogConfig: { Type: string };
+        SecurityOpt: string[] | null;
+        NetworkMode: string;
+        Privileged: boolean;
+        CapAdd: string[] | null;
+        Binds: string[] | null;
+        Tmpfs: Record<string, string> | null;
+        Mounts: Array<{ Type: string; Source: string; Target: string }> | null;
+      };
+    };
+    const socket = helperDockerSocket(env, process.platform, (await targets.current()).endpoint);
+    expect(created.Name).toBe(`/devenv-batch-${session.session}`);
+    expect(created.Image).toBe(waitingGitImage);
+    expect(created.Config.Labels).toMatchObject({ [LABEL_HELPER_RUN]: 'true', [LABEL_CHANNEL_STEP]: session.session });
+    expect([created.Config.OpenStdin, created.Config.StdinOnce, created.Config.Tty]).toEqual([true, true, false]);
+    expect(created.Config.Entrypoint).toEqual(['/usr/bin/tini', '-g', '--']);
+    expect(created.Config.Cmd.slice(-3)).toEqual(['/opt/devenv/batch.js', bundleHash(script), 'startBatchHelper']);
+    expect(created.Config.User).toBe('');
+    expect(created.HostConfig.AutoRemove).toBe(true);
+    expect(created.HostConfig.LogConfig.Type).toBe('none');
+    expect(created.HostConfig.SecurityOpt).toEqual(['no-new-privileges']);
+    expect(['default', 'bridge']).toContain(created.HostConfig.NetworkMode);
+    expect(created.HostConfig.Privileged).toBe(false);
+    expect(created.HostConfig.CapAdd ?? []).toEqual([]);
+    expect(created.HostConfig.Binds ?? []).toEqual([]);
+    expect(created.HostConfig.Tmpfs).toEqual({ [SECRETS_FOLDER]: 'rw,noexec,nosuid,nodev,size=1m,mode=0700' });
+    expect((created.HostConfig.Mounts ?? []).map((mount) => [mount.Type, mount.Source, mount.Target])).toEqual([
+      ['volume', volume, WORKSPACES_ROOT],
+      ['volume', HELPER_CACHE_VOLUME, HELPER_CACHE_FOLDER],
+      ['bind', socket, BATCH_DOCKER_SOCKET],
+    ]);
 
     const timed = await clone;
     expect(timed.timedOut).toBe(true);

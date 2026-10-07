@@ -44,12 +44,6 @@ export function spawnDockerProcess(args: readonly string[], onStdout: (text: str
   });
   return {
     end: (input) => (input === undefined ? child.stdin.end() : child.stdin.end(input)),
-    // Plan step 6, PR B: the input of the batch helper stays open (Node.js buffers what the pipe cannot take yet).
-    write: (text) => {
-      if (child.stdin.destroyed || !child.stdin.writable) return false;
-      child.stdin.write(text);
-      return true;
-    },
     // Review round 2 (A2): with the reading paused, the pipe fills and the Docker CLI waits.
     pause: () => {
       child.stdout.pause();

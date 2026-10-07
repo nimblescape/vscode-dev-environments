@@ -11,7 +11,9 @@ import { HelperChannelError, HelperOperationError, collectBatchStep, type Operat
 import { OutputTooLargeError } from '../core/process';
 import { sessionOfHelper, workerBatchSession, type BatchHelperClient } from './batch';
 import { contextSecrets } from './operationContext.testkit';
-import type { ContextDockerOptions, ContextDockerResult, OperationContext } from './server';
+import type { OperationContext } from './server';
+import { EngineError, type DockerEngine, type EngineAttachedSpec } from '../core/worker/dockerEngine';
+import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 
 const SESSION = 'a'.repeat(24);
 
@@ -149,32 +151,47 @@ describe('the step of a batch session: its signal, its output cap, and the colle
 // Review round 1 of 11B3b (B-R1-2): the start of the worker's own batch helper when it fails: what it started is ended
 // and removed by its label; a cancel is cancelled; a removal that fails is logged, never thrown.
 describe('the start of the batch helper of a flow when it fails (review round 1 of 11B3b)', () => {
+  // Plan step 11G3: changed setup: the helper starts over the port of the engine (DockerEngine: the inspect of the volume,
+  // runAttached, and the removal by the label with containerIds and removeContainer) instead of `context.docker`.
   function context(options: { psFails?: boolean; abortOnInspect?: boolean } = {}) {
     const calls: string[][] = [];
     const order: string[] = [];
     const logs: string[] = [];
-    const runSignals: AbortSignal[] = [];
+    const kills: string[] = [];
+    const specs: EngineAttachedSpec[] = [];
     const controller = new AbortController();
-    const docker = async (args: readonly string[], callOptions: ContextDockerOptions = {}): Promise<ContextDockerResult> => {
-      calls.push([...args]);
-      if (args[0] === 'volume') {
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      inspect: async (kind, reference) => {
+        calls.push(['inspect', kind, reference]);
         if (options.abortOnInspect) controller.abort();
-        return { exitCode: 0, stdout: `${args[args.length - 1]}\n`, stderr: '' };
-      }
-      if (args[0] === 'run') {
-        // A helper that never says hello: it ends only when its call is ended.
-        callOptions.onInput?.({ write: () => true, end: () => {} });
-        if (callOptions.signal) runSignals.push(callOptions.signal);
-        return new Promise((resolve) =>
-          callOptions.signal?.addEventListener('abort', () => setTimeout(() => (order.push('run ended'), resolve({ exitCode: null, stdout: '', stderr: '', error: 'ended' })), 10)),
-        );
-      }
-      if (args[0] === 'ps') {
-        order.push('ps');
+        return { Name: reference };
+      },
+      runAttached: async (spec, runOptions = {}) => {
+        calls.push(['runAttached', spec.name]);
+        specs.push(spec);
+        // A helper that never says hello: it ends only when it is killed (by the start that failed, or by the cancel).
+        let ended!: (value: { exitCode: number | null }) => void;
+        const exited = new Promise<{ exitCode: number | null }>((resolve) => (ended = resolve));
+        // As the port's kill: idempotent (the failed open, the finish and the cancel may each kill it).
+        let killed = false;
+        const kill = () => {
+          kills.push('kill');
+          if (killed) return;
+          killed = true;
+          setTimeout(() => (order.push('run ended'), ended({ exitCode: 137 })), 10);
+        };
+        if (runOptions.signal?.aborted) kill();
+        else runOptions.signal?.addEventListener('abort', kill, { once: true });
+        return { id: 'e'.repeat(64), process: { write: () => true, end: () => {}, kill, onStdout: () => {}, onStderr: () => {}, exited }, pause: () => {}, resume: () => {} };
+      },
+      containerIds: async (filters) => {
+        calls.push(['containerIds', ...filters.label]);
+        order.push('containerIds');
         if (options.psFails) throw new Error('the engine is gone');
-        return { exitCode: 0, stdout: `${'f'.repeat(64)}\n`, stderr: '' };
-      }
-      return { exitCode: 0, stdout: '', stderr: '' };
+        return ['f'.repeat(64)];
+      },
+      removeContainer: async (container) => void calls.push(['removeContainer', container]),
     };
     const progress: string[] = [];
     const ctx = {
@@ -183,46 +200,84 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
       progress: (step: string, detail?: string) => progress.push(`${step} ${detail ?? ''}`),
       log: (text: string, level?: string) => logs.push(`${level ?? 'info'} ${text}`),
       output: () => {},
-      docker,
+      docker: async () => {
+        throw new Error('Plan step 11G3: the batch helper runs no Docker call of the worker.');
+      },
     } as unknown as OperationContext;
-    return { ctx, calls, logs, runSignals, controller, order, progress };
+    return { ctx, engine, calls, logs, kills, specs, controller, order, progress };
   }
-  const deps = () => ({ sessions: new Map(), readScript: () => 'script', openTimeoutMs: 100 });
+  const deps = (engine: DockerEngine) => ({ sessions: new Map(), engineOf: () => engine, readScript: () => 'script', openTimeoutMs: 100 });
   const target = { volume: 'devenv-v', image: `sha256:${'b'.repeat(64)}`, socket: '/var/run/docker.sock' };
 
   it('a helper that never answers is ended and removed by its label, and the start fails', async () => {
-    const { ctx, calls, runSignals } = context();
-    await expect(workerBatchSession(deps(), ctx, target)).rejects.toMatchObject({ code: 'failed' });
-    expect(runSignals[0]?.aborted).toBe(true);
-    expect(calls.map((call) => call[0])).toEqual(['volume', 'run', 'ps', 'rm']);
-    expect(calls[3]).toEqual(['rm', '-f', 'f'.repeat(64)]);
+    const { ctx, engine, calls, kills, specs } = context();
+    await expect(workerBatchSession(deps(engine), ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    // Plan step 11G3: changed expectation: the run of the port is killed (was: the signal of its `docker run` call), and
+    // the volume check, the run and the removal by the label are calls of the port (was: volume, run, ps, rm).
+    expect(kills).toContain('kill');
+    expect(calls.map((call) => call[0])).toEqual(['inspect', 'runAttached', 'containerIds', 'removeContainer']);
+    expect(calls[0]).toEqual(['inspect', 'volume', target.volume]);
+    expect(calls[2]).toEqual(['containerIds', `nimblescape.devenv.channel-step=${specs[0].labels['nimblescape.devenv.channel-step']}`]);
+    expect(calls[3]).toEqual(['removeContainer', 'f'.repeat(64)]);
     // The helper runs from the image and with the socket of the request; the removal waits for the end of its call.
-    expect(calls[1]).toContain(target.image);
-    expect(calls[1].join(' ')).toContain(`source=${target.socket}`);
+    expect(specs[0].image).toBe(target.image);
+    expect(specs[0].mounts).toContainEqual({ type: 'bind', source: target.socket, target: '/run/devenv-docker/docker.sock' });
   });
 
   it('removes only after the call of the helper ended; refuses a request beyond the checks; a cancel during the volume check is cancelled', async () => {
     const ordered = context();
-    await expect(workerBatchSession(deps(), ordered.ctx, target)).rejects.toMatchObject({ code: 'failed' });
-    expect(ordered.order).toEqual(['run ended', 'ps']);
+    await expect(workerBatchSession(deps(ordered.engine), ordered.ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    // Plan step 11G3: changed expectation: the list by the label is containerIds of the port (was: `docker ps`).
+    expect(ordered.order).toEqual(['run ended', 'containerIds']);
     const invalid = context();
-    await expect(workerBatchSession(deps(), invalid.ctx, { ...target, socket: '/var/run/a,b.sock' })).rejects.toMatchObject({ code: 'unsendable' });
+    await expect(workerBatchSession(deps(invalid.engine), invalid.ctx, { ...target, socket: '/var/run/a,b.sock' })).rejects.toMatchObject({ code: 'unsendable' });
     expect(invalid.calls).toEqual([]);
     const cancelled = context({ abortOnInspect: true });
-    await expect(workerBatchSession(deps(), cancelled.ctx, target)).rejects.toMatchObject({ code: 'cancelled' });
-    expect(cancelled.calls.map((call) => call[0])).toEqual(['volume']);
+    await expect(workerBatchSession(deps(cancelled.engine), cancelled.ctx, target)).rejects.toMatchObject({ code: 'cancelled' });
+    // Plan step 11G3: changed expectation: the inspect of the port (was: `docker volume inspect`); nothing to remove.
+    expect(cancelled.calls.map((call) => call[0])).toEqual(['inspect']);
   });
 
   it('a cancel during the start is cancelled; a removal that fails is logged and the start still fails as it did', async () => {
     const cancelled = context();
-    const starting = workerBatchSession(deps(), cancelled.ctx, target);
+    const starting = workerBatchSession(deps(cancelled.engine), cancelled.ctx, target);
     await new Promise((resolve) => setTimeout(resolve, 20));
     cancelled.controller.abort();
     await expect(starting).rejects.toMatchObject({ code: 'cancelled' });
+    // Plan step 11G3: added expectation: the cancel killed the run, and its containers were removed by the label (the
+    // server removes nothing for it anymore: it started no Docker call).
+    expect(cancelled.kills).toContain('kill');
+    expect(cancelled.calls.map((call) => call[0])).toEqual(['inspect', 'runAttached', 'containerIds', 'removeContainer']);
     const failing = context({ psFails: true });
-    await expect(workerBatchSession(deps(), failing.ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    await expect(workerBatchSession(deps(failing.engine), failing.ctx, target)).rejects.toMatchObject({ code: 'failed' });
     // Review round 2 of 11B3b (B-R2-9): as a warning, and the start is reported as the progress step `batch`.
     expect(failing.logs.some((line) => line.startsWith('warn ') && line.includes('could not be removed: the engine is gone'))).toBe(true);
     expect(failing.progress).toEqual([`batch ${target.volume}`]);
+  });
+
+  it('plan step 11G3: a volume that the engine does not find, or with another name, starts nothing; a failed run is failed and removed by the label', async () => {
+    const missing = context();
+    missing.engine.inspect = async (kind, reference) => (missing.calls.push(['inspect', kind, reference]), undefined);
+    await expect(workerBatchSession(deps(missing.engine), missing.ctx, target)).rejects.toMatchObject({ code: 'missingVolume' });
+    expect(missing.calls.map((call) => call[0])).toEqual(['inspect']);
+    const renamed = context();
+    renamed.engine.inspect = async () => ({ Name: 'devenv-other' });
+    await expect(workerBatchSession(deps(renamed.engine), renamed.ctx, target)).rejects.toMatchObject({ code: 'missingVolume' });
+    expect(renamed.calls).toEqual([]);
+    const broken = context();
+    broken.engine.inspect = async () => {
+      throw new EngineError('the engine failed', 500);
+    };
+    await expect(workerBatchSession(deps(broken.engine), broken.ctx, target)).rejects.toMatchObject({ code: 'failed' });
+    const refused = context();
+    refused.engine.runAttached = async (spec) => {
+      refused.calls.push(['runAttached', spec.name]);
+      throw new EngineError('Conflict. The container name "/x" is already in use', 409);
+    };
+    const failure = await workerBatchSession(deps(refused.engine), refused.ctx, target).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: 'failed' });
+    expect((failure as Error).message).toContain('already in use');
+    // The create was sent: whatever it left is removed by the label (never by the name).
+    expect(refused.calls.map((call) => call[0])).toEqual(['inspect', 'runAttached', 'containerIds', 'removeContainer']);
   });
 });

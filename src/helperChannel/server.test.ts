@@ -402,6 +402,54 @@ describe('ChannelServer (user request 2026-09-28: the helper channel)', () => {
     server.shutdown();
   });
 
+  it('plan step 11G3: pauses and resumes the output that an operation reads from the engine itself with the calls, until it is removed or the operation ends', async () => {
+    let congested = false;
+    let drain: (() => void) | undefined;
+    const docker = fakeDocker();
+    const events: string[] = [];
+    let remove: (() => void) | undefined;
+    const endHolder: Record<string, () => void> = {};
+    const holders: Record<string, OperationHandler> = {
+      // As the batch helper of the worker: its output comes over the Engine API, not from a Docker call of the script.
+      holder: (params, context) => {
+        const name = String(params);
+        remove = context.pausable?.({ pause: () => events.push(`pause ${name}`), resume: () => events.push(`resume ${name}`) });
+        return new Promise((resolve) => (endHolder[name] = () => resolve({})));
+      },
+    };
+    const server = new ChannelServer({
+      write: () => true,
+      spawnDocker: docker.spawn,
+      operations: { ...OPERATIONS, ...holders },
+      exit: () => {},
+      congested: () => congested,
+      onDrain: (listener) => (drain = listener),
+    });
+    server.start();
+    server.input(encodeMessage({ t: 'op', id: 1, op: 'holder', params: 'a' }));
+    server.input(encodeMessage({ t: 'op', id: 2, op: 'docker', params: { args: ['logs', 'c'] } }));
+    congested = true;
+    docker.children[0].stdout('lots of output');
+    expect(events).toEqual(['pause a']);
+    // One that registers while the output is paused starts paused; its removal resumes it, so it never stays paused.
+    server.input(encodeMessage({ t: 'op', id: 3, op: 'holder', params: 'b' }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events).toEqual(['pause a', 'pause b']);
+    remove?.();
+    expect(events).toEqual(['pause a', 'pause b', 'resume b']);
+    congested = false;
+    drain?.();
+    expect(events).toEqual(['pause a', 'pause b', 'resume b', 'resume a']);
+    // The end of its operation removes it: a later congestion no longer pauses it.
+    endHolder.a();
+    endHolder.b();
+    await vi.advanceTimersByTimeAsync(0);
+    congested = true;
+    docker.children[0].stdout('more output');
+    expect(events).toEqual(['pause a', 'pause b', 'resume b', 'resume a']);
+    server.shutdown();
+  });
+
   it('cuts a log line that would be longer than the extension reads, and fails a result that is too large (review round 2, C1)', async () => {
     const operations: Record<string, OperationHandler> = {
       big: async () => 'x'.repeat(MAX_SERVER_LINE),

@@ -43,8 +43,6 @@ export { StreamRedactor, redact };
 export interface ServerChild {
   /** Writes the input (if any) and closes the standard input. */
   end(input?: string): void;
-  /** Plan step 6, PR B: writes to the standard input and keeps it open (ContextDockerOptions.onInput). False when closed. */
-  write?(text: string): boolean;
   kill(signal: 'SIGTERM' | 'SIGKILL'): void;
   /** Review round 2 (A2): stops and resumes the reading of its output (the pipe fills, so the call waits). */
   pause?(): void;
@@ -99,11 +97,6 @@ export interface ContextDockerOptions {
   stream?: boolean;
   /** Plan step 5, PR C: ends this call alone (SIGTERM, then SIGKILL), for example after its own time limit. */
   signal?: AbortSignal;
-  /**
-   * Plan step 6, PR B: the standard input stays open (instead of `input`): `onInput` gets its writer once the call
-   * started (the batch helper, which the worker talks to through it). Never logged.
-   */
-  onInput?(input: { write(text: string): boolean; end(): void }): void;
 }
 
 /** What an operation can do. Every Docker call ends when the operation is cancelled. */
@@ -138,6 +131,19 @@ export interface OperationContext {
   log(text: string, level?: 'info' | 'warn'): void;
   output(stream: 'stdout' | 'stderr', text: string): void;
   docker(args: readonly string[], options?: ContextDockerOptions): Promise<ContextDockerResult>;
+  /**
+   * Plan step 11G3: output that the operation reads from the engine itself (the attached batch helper, no Docker call of
+   * the script) is paused and resumed with the output of the Docker calls while the connection of the extension is
+   * congested (review round 2, A2), until the returned function removes it or the operation ends. Optional, for the
+   * fake contexts of the tests.
+   */
+  pausable?(target: Pausable): () => void;
+}
+
+/** Plan step 11G3: output whose reading can be paused (OperationContext.pausable). */
+export interface Pausable {
+  pause(): void;
+  resume(): void;
 }
 
 /** A failure with a code for the extension (for example `invalid` for parameters that the check refused). */
@@ -177,6 +183,8 @@ interface Running {
   request: OperationRequest;
   controller: AbortController;
   children: Set<ServerChild>;
+  /** Plan step 11G3: the output that the operation reads from the engine itself (OperationContext.pausable). */
+  pausables: Set<Pausable>;
   cleanup: Set<string>;
   cancelled: boolean;
   timedOut: boolean;
@@ -283,10 +291,17 @@ export class ChannelServer {
   /** Review round 2 (A2): pauses the output of every call until the waiting answers are written. */
   private pauseOutput(): void {
     this.outputPaused = true;
-    for (const run of this.running.values()) for (const child of run.children) child.pause?.();
+    for (const run of this.running.values()) {
+      for (const child of run.children) child.pause?.();
+      // Plan step 11G3: and the output that an operation reads from the engine itself.
+      for (const target of run.pausables) target.pause();
+    }
     this.deps.onDrain?.(() => {
       this.outputPaused = false;
-      for (const run of this.running.values()) for (const child of run.children) child.resume?.();
+      for (const run of this.running.values()) {
+        for (const child of run.children) child.resume?.();
+        for (const target of run.pausables) target.resume();
+      }
     });
   }
 
@@ -437,6 +452,7 @@ export class ChannelServer {
       request,
       controller: new AbortController(),
       children: new Set(),
+      pausables: new Set(),
       cleanup: new Set(),
       cancelled: false,
       timedOut: false,
@@ -470,6 +486,9 @@ export class ChannelServer {
       this.endAsks(run);
       // Its Docker calls may still run when the handler did not wait for them: end them.
       await this.endChildren(run);
+      // Plan step 11G3: the output that it read from the engine itself is no longer paused with the others.
+      for (const target of run.pausables) if (this.outputPaused) target.resume();
+      run.pausables.clear();
       run.redactors.stdout.flush();
       run.redactors.stderr.flush();
       const aborted = run.cancelled || run.timedOut;
@@ -517,6 +536,15 @@ export class ChannelServer {
       log: (text, level = 'info') => this.send({ t: 'log', id, level, text: clip(mask(text)) }),
       output: (stream, text) => run.redactors[stream].push(text),
       docker: (args, options = {}) => this.docker(run, args, options),
+      pausable: (target) => {
+        if (this.running.get(id) !== run) return () => {};
+        run.pausables.add(target);
+        if (this.outputPaused) target.pause();
+        return () => {
+          // Never left paused: it may still be read after it was removed (the end of the batch helper).
+          if (run.pausables.delete(target) && this.outputPaused) target.resume();
+        };
+      },
     };
   }
 
@@ -574,11 +602,7 @@ export class ChannelServer {
     run.children.add(child);
     if (this.outputPaused) child.pause?.();
     try {
-      // Plan step 6, PR B: an input that stays open goes to its caller.
-      if (options.onInput !== undefined && child.write !== undefined) {
-        const write = child.write.bind(child);
-        options.onInput({ write, end: () => child.end() });
-      } else child.end(options.input);
+      child.end(options.input);
     } catch {
       // The process ended before it read its input; its exit is reported below.
     }

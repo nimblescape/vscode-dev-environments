@@ -5,15 +5,16 @@
 // Plan step 6, PR B: the batch helper of the worker (decision 2026-09-29: the steps that need the volume of an
 // environment run in one helper container per operation, never one container per step; Q1 and Q2 of 2026-10-01). The
 // worker cannot see the volume (a running container cannot get a volume mounted later), so it starts the helper with
-// it: `batch` checks that the volume exists, starts `docker run --rm -i` of the pinned helper image with the volume, the
-// cache, the secrets tmpfs and the socket, pipe-loads the same script as itself with the entry BATCH_ENTRY (a second
+// it: `batch` checks that the volume exists, starts the pinned helper image with the volume, the cache, the secrets
+// tmpfs and the socket (plan step 11G3: over the Engine API, as `docker run --rm -i` did; batchRunSpec), pipe-loads the same script as itself with the entry BATCH_ENTRY (a second
 // ChannelServer with the fixed step table of src/core/helper/batchSteps.ts), reports BATCH_READY_STEP and holds the
 // helper until it is cancelled (at most BATCH_HOLD_LIMIT_MS). `batchStep` relays one step to it; `batchChunk` carries an
 // input that is longer than one request of the channel, in pieces before the step. Pure functions and constants. No `vscode`.
 import { loaderCommand } from '../loader/pipeLoader';
-import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
+import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
 import { isBatchStepKind, type BatchStepKind } from '../helper/batchStepKinds';
-import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, channelStepLabel, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
+import type { EngineAttachedSpec } from '../worker/dockerEngine';
+import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
 
 /** Starts a batch helper and holds it (BatchParams; the value is `{}`). Long-lived, like `lock`. */
 export const OP_BATCH = 'batch';
@@ -91,7 +92,8 @@ export function parseBatchParams(value: unknown): BatchParams | undefined {
   const { session, volume, image, socket } = value;
   if (!isCleanupLabel(session) || typeof volume !== 'string' || !VOLUME_NAME.test(volume)) return undefined;
   if (typeof image !== 'string' || !IMAGE_ID.test(image)) return undefined;
-  // --mount is CSV: a path with a comma or a quote would change the mount.
+  // --mount is CSV: a path with a comma or a quote would change the mount. Plan step 11G3: the API takes the path as it
+  // is, and the check stays as strict (the parameters of the extension are unchanged).
   if (typeof socket !== 'string' || !socket.startsWith('/') || socket.length > 4096 || /[",\0\n\r]/.test(socket)) return undefined;
   return { session, volume, image, socket };
 }
@@ -125,44 +127,32 @@ export function parseBatchStepValue(value: unknown): BatchStepValue | undefined 
   return exitCode === null || (typeof exitCode === 'number' && Number.isInteger(exitCode)) ? { exitCode } : undefined;
 }
 
-/** `volume inspect` of the volume of a batch: it must exist (a `--mount` of a missing volume would create an empty one). */
-export function batchVolumeArgs(volume: string): string[] {
-  return ['volume', 'inspect', '--format', '{{.Name}}', volume];
+/** Plan step 11G3: the name of the container of a batch helper (never used to find or remove it: the session label is). */
+export function batchContainerName(session: string): string {
+  return `devenv-batch-${session}`;
 }
 
 /**
- * `docker run` arguments of a batch helper: `--rm -i`, never a pull, the label of the helper runs and the session label
- * (channelStepLabel: the cleanup of the worker removes it by that label, never by a name), no log of the engine, no new
- * privileges, the volume at /workspaces, the cache volume, the socket in BATCH_SOCKET_FOLDER, the secrets tmpfs (0700,
- * in memory), the pinned image, and the pipe loader with BATCH_SCRIPT_PATH, the hash of the script and BATCH_ENTRY. No
- * variable (`-e`) and no part of the script or of a secret.
+ * The batch helper as the worker runs it over the Engine API (plan step 11G3, DockerEngine.runAttached; before: the
+ * arguments of its own `docker run --rm -i --pull never`): never a pull, the label of the helper runs and the session
+ * label (channelStepLabel: the worker removes it by that label, never by a name), no log of the engine (runAttached), no
+ * new privileges, the volume at /workspaces, the cache volume, the socket in BATCH_SOCKET_FOLDER, the secrets tmpfs
+ * (0700, in memory), the pinned image, and the pipe loader with BATCH_SCRIPT_PATH, the hash of the script and
+ * BATCH_ENTRY as its command (the entrypoint of the image, tini, stays). No variable and no part of the script or of a
+ * secret.
  */
-export function batchRunArgs(p: BatchParams & { scriptHash: string }): string[] {
-  return [
-    'run',
-    '--rm',
-    '-i',
-    '--pull',
-    'never',
-    '--name',
-    `devenv-batch-${p.session}`,
-    '--label',
-    `${LABEL_HELPER_RUN}=true`,
-    '--label',
-    channelStepLabel(p.session),
-    '--log-driver',
-    'none',
-    '--security-opt',
-    'no-new-privileges',
-    '--mount',
-    `type=volume,source=${p.volume},target=${WORKSPACES_ROOT}`,
-    '--mount',
-    `type=volume,source=${HELPER_CACHE_VOLUME},target=${HELPER_CACHE_FOLDER}`,
-    '--mount',
-    `type=bind,source=${p.socket},target=${BATCH_DOCKER_SOCKET}`,
-    '--tmpfs',
-    `${SECRETS_FOLDER}:rw,noexec,nosuid,nodev,size=1m,mode=0700`,
-    p.image,
-    ...loaderCommand({ path: BATCH_SCRIPT_PATH, hash: p.scriptHash, entry: BATCH_ENTRY }),
-  ];
+export function batchRunSpec(p: BatchParams & { scriptHash: string }): EngineAttachedSpec {
+  return {
+    name: batchContainerName(p.session),
+    image: p.image,
+    command: loaderCommand({ path: BATCH_SCRIPT_PATH, hash: p.scriptHash, entry: BATCH_ENTRY }),
+    labels: { [LABEL_HELPER_RUN]: 'true', [LABEL_CHANNEL_STEP]: p.session },
+    mounts: [
+      { type: 'volume', source: p.volume, target: WORKSPACES_ROOT },
+      { type: 'volume', source: HELPER_CACHE_VOLUME, target: HELPER_CACHE_FOLDER },
+      { type: 'bind', source: p.socket, target: BATCH_DOCKER_SOCKET },
+    ],
+    tmpfs: { [SECRETS_FOLDER]: 'rw,noexec,nosuid,nodev,size=1m,mode=0700' },
+    securityOpt: ['no-new-privileges'],
+  };
 }
