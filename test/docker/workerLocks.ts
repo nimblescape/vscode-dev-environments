@@ -65,6 +65,8 @@ export interface WorkerLocks {
   flow(op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown>;
   /** Plan step 11C1: EnvironmentServiceDeps.workerRefresh, the refresh in the worker of the current Docker target (as extension.ts). */
   refresh(environments: readonly StateEnvironment[]): Promise<EnvironmentStates>;
+  /** Plan step 11I1, PR A2: the names of the worker containers that this object started, in order. */
+  readonly workerNames: string[];
   /** The batch helper sessions opened through the locks of `take`, per environment ID, in order. */
   readonly batches: Map<string, string[]>;
   /** The worker and batch helper containers of this object that still exist. */
@@ -83,10 +85,13 @@ export function workerLocks(
   targets: Pick<DockerTargets, 'current'>,
   name: string,
   socketPath: (target: DockerTarget) => Promise<string>,
+  /** Plan step 11I1, PR A2 (decision D1 of 2026-10-07): `none` starts the workers without network (the offline scenarios). */
+  options: { network?: 'none' } = {},
 ): WorkerLocks {
   const { run, cli, log } = context;
   const helperTag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
   const batches = new Map<string, string[]>();
+  const workerNames: string[] = [];
   const channels = new HelperChannels({
     logger: log,
     open: (target) =>
@@ -95,6 +100,8 @@ export function workerLocks(
           start: (args) => {
             const all = [...args];
             all.splice(all.indexOf(helperTag), 0, '--label', `${TEST_RUN_LABEL}=${run.runId}`);
+            if (options.network !== undefined) all[all.indexOf('--network') + 1] = options.network;
+            workerNames.push(all[all.indexOf('--name') + 1]);
             return docker.start(all);
           },
           runDirect: (args, options) => docker.runDirect(args, options),
@@ -112,6 +119,7 @@ export function workerLocks(
   const leftovers = () => [...workerContainers(), ...batchContainers()];
   return {
     channels,
+    workerNames,
     batches,
     leftovers,
     flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),

@@ -11,16 +11,17 @@
 // again without a build. Package C of unit 6: the host name of the dev container; Delete (all containers, the network,
 // and the images of the project; the data volumes of the services only when the user ticks them); the label
 // nimblescape.devenv.host-access=unrestricted on every container, and ports as the model writes them, while the host
-// access checks are off for the repository.
+// access checks are off for the repository. Plan step 11I1, PR A2: the operations are the flows of the worker, as the
+// window sends them (workerWindow.ts), instead of the pipeline of the test process over the relay of the worker (removed
+// by 11I1); Delete asks its questions through the requests of its check (deleteCheckInWorker), as the window does. The
+// opens make sure of the real Session Monitor (decision D9 of 2026-10-07).
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
 import { supportsVolumeSubpath } from '../../src/core/helper/compose';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,
@@ -42,10 +43,6 @@ import {
 } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
-import { StoragePaths } from '../../src/core/storage/paths';
-import { EnvironmentRegistry } from '../../src/core/storage/registry';
-import { SessionFiles } from '../../src/core/storage/sessionFiles';
-import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
@@ -55,12 +52,8 @@ import {
   TEST_ACCOUNT,
   dockerTestContext,
   expectLabelledEnvironmentImage,
-  fakeAuth,
-  registryClient,
-  registryTransport,
-  runInVolume, pipelineWithOperations } from './harness';
-import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
-import { workerLocks } from './workerLocks';
+  runInVolume } from './harness';
+import { monitorOfUser, removeTestMonitor, workerWindow } from './workerWindow';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const INIT_SQL = 'select 1;';
@@ -85,57 +78,48 @@ git add -A
 git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
 `;
 
-let settings: ExtensionSettings = {
-  reopenLastOnStartup: true,
-  stopOnClose: true,
-  waitingTimeSeconds: 30,
-  updateImagesOnConnect: true,
-  respectShutdownActionNone: false,
-  owners: [],
-  includeArchived: false,
-  includeForks: false,
-  refreshIntervalMinutes: 60,
-  hostAccessChecksOff: [],
-};
+/** Plan step 11I1, PR A2: the questions of Delete, with the data volumes of the services that it offers (recorded). */
+class DeleteUi extends FakeUi {
+  /** The data volumes of the services that the last check of Delete offered (both lists of the question). */
+  offered: string[] = [];
+  /** Which of them the user ticks (default: none). */
+  tick: (offered: readonly string[]) => string[] = () => [];
+  override async deleteServiceData(volumes: readonly string[], possibly: readonly string[]): Promise<string[] | undefined> {
+    this.offered = [...volumes, ...possibly];
+    return this.tick(this.offered);
+  }
+}
 
 describe('open pipeline for a Docker Compose configuration', () => {
   const { run, env, cli, log } = dockerTestContext('compose');
   const runner = new NodeProcessRunner();
   const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
-  const paths = new StoragePaths(path.join(run.runDir, 'compose-storage'));
-  const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
-  const sessionFiles = new SessionFiles(paths);
-  const ui = new FakeUi();
-  // Plan step 6, PR C: the real locks of the workers (the opens run their helper steps in the batch helper of the worker
-  // that holds the lock; there is no other path, D1).
-  const targets = new DockerTargets(docker, env, log);
-  const locks = workerLocks({ run, cli, log }, docker, targets, 'compose', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
-  const service = pipelineWithOperations({
-    analyzer: inProcessAnalyzer,
-    // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
-    // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs the
-    // helper steps of the opens.
-    environmentLock: locks.take,
-    flow: (op, params, options) => locks.flow(op, params, options),
-    // Plan step 11C1: the refresh through the worker, as extension.ts.
-    workerRefresh: (environments) => locks.refresh(environments),
-    docker,
-    runner,
-    helper,
-    registry,
-    sessionFiles,
-    imageChecker: new ImageChecker(registryClient(registryTransport, runner, env, log), log),
-    auth: fakeAuth,
-    ui,
-    logger: log,
-    clock: systemClock,
-    platform: process.platform,
-    env,
-    owner: { windowId: 'docker-test-compose', pid: process.pid },
-    settings: () => settings,
-    windowStatuses: () => sessionFiles.readWindowStatuses(),
-  });
+  const ui = new DeleteUi();
+  // Plan step 11I1, PR A2: the window of the shared harness; its operations run in the worker (was: the pipeline of the
+  // test process over the `lock` relay of the worker).
+  const window = workerWindow({ run, env, cli, log }, docker, { name: 'compose', windowId: 'docker-test-compose', ui, settings: { updateImagesOnConnect: true } });
+  const { registry, service, settings } = window;
+  // Decision D9 of 2026-10-07: the opens make sure of the real Session Monitor; a monitor of the user is never touched.
+  const skipped = monitorOfUser({ run });
+
+  /**
+   * Plan step 11I1, PR A2: Delete as the window runs it: the check in the worker (its questions: Delete, the data volumes
+   * of the services, of which `tick` picks those to remove), then the Delete with the volumes that the user picked.
+   * Answers the volumes that the check offered.
+   */
+  async function deleteEnvironment(target: { id: string; repository: string }, tick: (offered: readonly string[]) => string[]): Promise<string[]> {
+    ui.tick = tick;
+    ui.offered = [];
+    try {
+      const decision = await service.deleteCheckInWorker(target.id, { progress: new RecordingProgress(), repository: target.repository, otherWindow: false });
+      expect(decision.decision).toBe('delete');
+      if (decision.decision === 'delete') await service.deleteInWorker(target.id, { progress: new RecordingProgress(), additionalVolumesToRemove: decision.additionalVolumesToRemove });
+    } finally {
+      ui.tick = () => [];
+    }
+    return ui.offered;
+  }
 
   /**
    * A seeded environment: its workspace volume with the repository, and its registry entry.
@@ -253,8 +237,11 @@ ${extra}volumes:
   }
 
   beforeAll(async () => {
+    if (skipped) {
+      log.info('The engine has a Session Monitor before the tests; the Compose opens through a real worker are skipped.');
+      return;
+    }
     await helper.ensureImage();
-    paths.ensureDirectoriesSync();
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     log.info(`Docker Engine API ${apiVersion}`);
     // Review round 17 (D17-1): with a volume named with `${devcontainerId}`, which read-configuration leaves as written.
@@ -272,16 +259,17 @@ ${extra}volumes:
 
   afterAll(async () => {
     // Plan step 6, PR C: no worker and no batch helper is left over.
-    const leftovers = await locks.dispose();
+    const leftovers = await window.dispose();
     removeProjectObjects();
     removeRunObjects(cli, run.runId);
+    removeTestMonitor({ run, cli });
     expect(leftovers).toEqual([]);
     expect(containers(app)).toEqual([]);
     expect(cli.volume(app.name)).toBeUndefined();
   });
 
-  it('refuses a privileged service before any build: no image, no container, the volume stays', async () => {
-    const error = await service.openEnvironment(refused.id, { progress: new RecordingProgress() }).then(
+  it.skipIf(skipped)('refuses a privileged service before any build: no image, no container, the volume stays', async () => {
+    const error = await service.openEnvironmentInWorker(refused.id, { progress: new RecordingProgress() }).then(
       () => undefined,
       (reason: unknown) => reason as Error & { code?: string },
     );
@@ -293,16 +281,16 @@ ${extra}volumes:
     expect(cli.volume(`${refused.project}_dbdata`)).toBeUndefined();
   });
 
-  it('refuses a tmpfs mount with a source, which the CLI writes as a bind mount, also with the checks off: no container (review round 15, K1)', async () => {
-    settings = { ...settings, hostAccessChecksOff: [tmpfsSource.repository] };
+  it.skipIf(skipped)('refuses a tmpfs mount with a source, which the CLI writes as a bind mount, also with the checks off: no container (review round 15, K1)', async () => {
+    settings.hostAccessChecksOff = [tmpfsSource.repository];
     let error: (Error & { code?: string }) | undefined;
     try {
-      error = await service.openEnvironment(tmpfsSource.id, { progress: new RecordingProgress() }).then(
+      error = await service.openEnvironmentInWorker(tmpfsSource.id, { progress: new RecordingProgress() }).then(
         () => undefined,
         (reason: unknown) => reason as Error & { code?: string },
       );
     } finally {
-      settings = { ...settings, hostAccessChecksOff: [] };
+      settings.hostAccessChecksOff = [];
     }
     expect(error?.code).toBe('hostAccess');
     expect(error?.message).toContain(`mount ${JSON.stringify(TMPFS_SOURCE_MOUNT)} is written differently by the Dev Container CLI and is not supported`);
@@ -310,20 +298,21 @@ ${extra}volumes:
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${environmentImageRepository(tmpfsSource.repository, tmpfsSource.id)}*`])).toEqual([]);
   });
 
-  it('first open: both services run with the labels, the port on 127.0.0.1, and repository files from the volume', async () => {
+  it.skipIf(skipped)('first open: both services run with the labels, the port on 127.0.0.1, and repository files from the volume', async () => {
     if (!supportsVolumeSubpath(apiVersion)) {
       // Docker Engine before 26 has no volume.subpath: the bind mounts of repository files are refused (tested in the unit tests).
       log.info(`Docker Engine API ${apiVersion} has no volume.subpath; the open is refused.`);
       return;
     }
     const progress = new RecordingProgress();
-    const batchesBefore = locks.batches.get(app.id)?.length ?? 0;
-    const result = await service.openEnvironment(app.id, { progress });
+    // Plan step 11I1, PR A2: the batch helpers counted by the progress steps of the worker (was: the locks of the relay).
+    const batchesBefore = window.steps.length;
+    const result = await service.openEnvironmentInWorker(app.id, { progress });
     expect(result).toMatchObject({ containerName: app.name, remoteWorkspaceFolder: app.folder });
     expect(progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
     // Plan step 6, PR C: the whole open (the reads, the Compose model and hashes, the folders, the build, `up`, the
     // lifecycle commands, the Git files) ran in exactly one batch helper container.
-    expect((locks.batches.get(app.id) ?? []).length - batchesBefore).toBe(1);
+    expect(window.batchesOf(app.name, batchesBefore)).toBe(1);
 
     // The dev container: the name of the environment, the labels, the project, the environment image, the workspace volume.
     const dev = cli.container(app.name);
@@ -437,15 +426,15 @@ ${extra}volumes:
     expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
   });
 
-  it('Stop stops both containers; the next open starts them again without a build', async () => {
+  it.skipIf(skipped)('Stop stops both containers; the next open starts them again without a build', async () => {
     if (!supportsVolumeSubpath(apiVersion)) return;
     const before = containers(app).sort();
-    await service.operations.stop(app.id);
+    await service.stop(app.id);
     expect(cli.container(app.name)?.State.Running).toBe(false);
     expect(cli.container(dbContainer())?.State.Running).toBe(false);
 
     const progress = new RecordingProgress();
-    await service.openEnvironment(app.id, { progress });
+    await service.openEnvironmentInWorker(app.id, { progress });
     expect(progress.steps).not.toContain('preparing');
     expect(containers(app).sort()).toEqual(before);
     expect(cli.container(app.name)?.State.Running).toBe(true);
@@ -456,7 +445,7 @@ ${extra}volumes:
     expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
   });
 
-  it('Delete removes the containers, the network, and the images of the project, and only the ticked data volumes', async () => {
+  it.skipIf(skipped)('Delete removes the containers, the network, and the images of the project, and only the ticked data volumes', async () => {
     if (!supportsVolumeSubpath(apiVersion)) return;
     // A one-off container of the project (`docker compose run`), without the labels of the environment.
     const oneOff = cli.ok([
@@ -472,13 +461,16 @@ ${extra}volumes:
     expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`]).length).toBeGreaterThan(0);
     // Review round 17 (D17-1): with the `${devcontainerId}` volume, which Delete lists like the other volumes of the project.
     const history = `${app.project}_history-${environmentDevcontainerId(app.id)}`;
-    expect(await service.removableServiceDataVolumes(app.id)).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`, history]));
+    // Plan step 11I1, PR A2: the data volumes are the ones that the check of Delete offers (was: the method of the service
+    // that the check uses); the user ticks the cache and the history volume.
+    const ticked = [`${app.project}_cache`, history];
     // Review round 7 (D7-1): a running db is stopped (its stop time) before `docker rm -f`, so that it shuts down cleanly.
     const db = dbContainer();
     cli.ok(['start', db]);
     const logBefore = fs.readFileSync(log.file, 'utf8').length;
 
-    await service.delete(app.id, { progress: new RecordingProgress(), additionalVolumesToRemove: [`${app.project}_cache`, history] });
+    const offered = await deleteEnvironment(app, (volumes) => volumes.filter((volume) => ticked.includes(volume)));
+    expect(offered).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`, history]));
 
     const deleteLog = fs.readFileSync(log.file, 'utf8').slice(logBefore);
     expect(deleteLog.indexOf(`Stopping container ${db}`)).toBeGreaterThanOrEqual(0);
@@ -497,13 +489,13 @@ ${extra}volumes:
     expect(await registry.get(app.id)).toBeUndefined();
   });
 
-  it('labels every container nimblescape.devenv.host-access=unrestricted and keeps the ports while the checks are off', async () => {
+  it.skipIf(skipped)('labels every container nimblescape.devenv.host-access=unrestricted and keeps the ports while the checks are off', async () => {
     if (!supportsVolumeSubpath(apiVersion)) return;
-    settings = { ...settings, hostAccessChecksOff: [unrestricted.repository] };
+    settings.hostAccessChecksOff = [unrestricted.repository];
     try {
-      await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
+      await service.openEnvironmentInWorker(unrestricted.id, { progress: new RecordingProgress() });
     } finally {
-      settings = { ...settings, hostAccessChecksOff: [] };
+      settings.hostAccessChecksOff = [];
     }
     const dev = cli.container(unrestricted.name);
     expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
@@ -517,16 +509,15 @@ ${extra}volumes:
     // With the checks on again, the next open creates the containers again with nimblescape.devenv.host-access=checked
     // (review round 2, D2-2: the model sets the label on every service, so an image label cannot claim "unrestricted"),
     // the port on 127.0.0.1.
-    await service.openEnvironment(unrestricted.id, { progress: new RecordingProgress() });
+    await service.openEnvironmentInWorker(unrestricted.id, { progress: new RecordingProgress() });
     expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
     const again = dbContainer(unrestricted);
     expect(cli.container(again)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
     for (const binding of cli.lines(['port', again, '5432/tcp'])) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
 
-    await service.delete(unrestricted.id, {
-      progress: new RecordingProgress(),
-      additionalVolumesToRemove: await service.removableServiceDataVolumes(unrestricted.id),
-    });
+    // Plan step 11I1, PR A2: Delete as the window runs it, with every data volume that its check offers ticked (was: the
+    // list of the service's method).
+    await deleteEnvironment(unrestricted, (volumes) => [...volumes]);
     expect(containers(unrestricted)).toEqual([]);
     expect(cli.volume(`${unrestricted.project}_dbdata`)).toBeUndefined();
   });

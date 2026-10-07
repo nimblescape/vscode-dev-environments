@@ -10,41 +10,27 @@
 // The test makes sure of the Session Monitor of the engine (devenv-session-monitor); it is skipped where one exists before
 // the tests (a monitor of the user is never touched), and removes the one it made.
 import * as fs from 'fs';
-import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { helperImageTag } from '../../src/core/helper/helperImage';
-import { monitorImageTag } from '../../src/core/helper/helperState';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
-import { EnvironmentOperations } from '../../src/core/pipeline/environmentOperations';
-import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
-import { REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_VOLUME } from '../../src/core/remoteMonitor/protocol';
-import { StoragePaths } from '../../src/core/storage/paths';
-import { EnvironmentRegistry } from '../../src/core/storage/registry';
-import { SessionFiles } from '../../src/core/storage/sessionFiles';
-import type { ExtensionSettings } from '../../src/core/types';
-import { extensionFlow, extensionHostSide } from '../../src/vscode/hostSide';
-import { TEST_BASE_IMAGE, TEST_RUN_LABEL, readBaseline, removeRunObjects } from './dockerRun';
+import { REMOTE_MONITOR_CONTAINER } from '../../src/core/remoteMonitor/protocol';
+import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import {
-  FakeUi,
   HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
   dockerTestContext,
-  fakeAuth,
   runInVolume,
 } from './harness';
-import { workerLocks } from './workerLocks';
+import { monitorOfUser as engineHadMonitor, removeTestMonitor, workerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/worker-open';
 const FOLDER = '/workspaces/worker-open';
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const REMOTE_USER = 'dev';
-const SOURCE = '0123456789abcdef0123456789abcdef';
 const CREATED_LOG = '/tmp/devenv-post-create';
 
 /** Creates the repository in the volume as the helper creates a clone: as root, on the branch main, with one commit. */
@@ -58,81 +44,21 @@ git add -A
 git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
 `;
 
-const settings: ExtensionSettings = {
-  reopenLastOnStartup: true,
-  stopOnClose: true,
-  waitingTimeSeconds: 30,
-  // No registry question: the open builds from the base image that the engine has or pulls.
-  updateImagesOnConnect: false,
-  respectShutdownActionNone: false,
-  owners: [],
-  includeArchived: false,
-  includeForks: false,
-  refreshIntervalMinutes: 60,
-  hostAccessChecksOff: [],
-};
-
 describe('the open through a real worker (plan step 11E6)', () => {
   const { run, env, cli, log } = dockerTestContext('workerOpen');
   const runner = new NodeProcessRunner();
   const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
-  const paths = new StoragePaths(path.join(run.runDir, 'worker-open-storage'));
-  const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
-  const sessionFiles = new SessionFiles(paths);
-  const ui = new FakeUi();
-  const owner = { windowId: 'docker-test-window', pid: process.pid };
-  const targets = new DockerTargets(docker, env, log);
-  const locks = workerLocks({ run, cli, log }, docker, targets, 'workerOpen', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
-  const memory = windowLifecycleMemory();
-  // The extension's side of the requests, as extension.ts wires it.
-  const flow = extensionFlow(
-    locks.channels,
-    () => targets.current(),
-    extensionHostSide({
-      registry,
-      sessionFiles,
-      ui,
-      auth: fakeAuth,
-      credentials: { getForPull: async () => undefined },
-      settings: () => settings,
-      windowId: owner.windowId,
-      pid: owner.pid,
-      clock: systemClock,
-      isProcessAlive: (pid) => pid === process.pid,
-      lifecycleMemory: memory,
-      logger: log,
-    }),
-    log,
-  );
-  // Plan step 11F1: the operations of the window (the pipeline runs in the worker).
-  const service = new EnvironmentOperations({
-    flow,
-    workerRefresh: (environments) => locks.refresh(environments),
-    dockerRunning: () => docker.isRunning(),
-    registry,
-    sessionFiles,
-    auth: fakeAuth,
-    ui,
-    logger: log,
-    clock: systemClock,
-    owner,
-    settings: () => settings,
-    windowStatuses: () => sessionFiles.readWindowStatuses(),
-    lifecycleMemory: memory,
-    // The Docker engine of the tests runs; nothing to start here.
-    startDocker: async () => {},
-    monitorSource: () => SOURCE,
-    openMonitor: () => ({ images: { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, listSent: () => {} }),
-  });
+  // Plan step 11I1, PR A2: the window of the shared harness (workerWindow.ts), as this file wired it before. No registry
+  // question: the open builds from the base image that the engine has or pulls (updateImagesOnConnect off).
+  const window = workerWindow({ run, env, cli, log }, docker, { name: 'workerOpen', windowId: 'docker-test-window' });
+  const { registry, sessionFiles, service, paths } = window;
 
   const environmentId = newEnvironmentId();
   const volumeName = resourceName(REPOSITORY, environmentId);
   const containerName = volumeName;
-  const helperTag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
   // A Session Monitor of the user (or of another run) is never touched: the test is skipped then.
-  const baseline = readBaseline(run);
-  const monitorOfUser = baseline.containers.some((container) => container.name === REMOTE_MONITOR_CONTAINER) || baseline.volumes.includes(REMOTE_MONITOR_VOLUME);
+  const monitorOfUser = engineHadMonitor({ run });
 
   function execIn(user: string, script: string): { code: number | null; out: string } {
     const result = cli.run(['exec', '-u', user, containerName, 'sh', '-c', script]);
@@ -167,15 +93,11 @@ describe('the open through a real worker (plan step 11E6)', () => {
   });
 
   afterAll(async () => {
-    const leftovers = await locks.dispose();
+    const leftovers = await window.dispose();
     removeRunObjects(cli, run.runId);
-    if (!monitorOfUser) {
-      // The Session Monitor that the open made sure of, its state volume and its tag (plan step 11D3).
-      cli.run(['rm', '-f', REMOTE_MONITOR_CONTAINER]);
-      cli.run(['volume', 'rm', REMOTE_MONITOR_VOLUME]);
-      const tag = monitorImageTag(helperTag);
-      if (tag !== undefined) cli.run(['image', 'rm', tag]);
-    }
+    // The Session Monitor that the open made sure of, its state volume and its tag (plan step 11D3; nothing when the
+    // engine had one before the tests).
+    removeTestMonitor({ run, cli });
     expect(leftovers).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.volume(volumeName)).toBeUndefined();

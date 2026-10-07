@@ -11,7 +11,11 @@
 // Checked: the test of a host and the plain reasons of its failures (unknown host key, login failed, unreachable), the
 // context switch and the detection of the remote mode, the open pipeline of a seeded environment through the context
 // (every Docker call goes through SSH: the SSH server logs each connection), the containers and volumes on the engine
-// reached through SSH, the token file in the tmpfs, and the Docker host recorded in the registry.
+// reached through SSH, the token file in the tmpfs, and the Docker host recorded in the registry. Plan step 11I1, PR A2:
+// the operations are the flows of the worker, as the window sends them (workerWindow.ts), instead of the pipeline of the
+// test process over the relay of the worker (removed by 11I1): the worker on the remote engine is started through SSH
+// and talks to its socket there (decision D6 of 2026-10-07: so not every Docker call is an SSH connection any more). The
+// open makes sure of the real Session Monitor (decision D9 of 2026-10-07).
 import * as fs from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
@@ -32,9 +36,7 @@ import {
   useRemoteContext,
   type SshCheckDeps,
 } from '../../src/core/docker/remoteDocker';
-import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
 import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import {
   GITHUB_TOKEN_FILE,
   LABEL_ENVIRONMENT_ID,
@@ -45,27 +47,19 @@ import {
   resourceName,
 } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
-import { workerLocks, type WorkerLocks } from './workerLocks';
 import { NodeProcessRunner } from '../../src/core/process';
-import { StoragePaths } from '../../src/core/storage/paths';
-import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
-import { SessionFiles } from '../../src/core/storage/sessionFiles';
-import type { ExtensionSettings } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
-  FakeUi,
   HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
   Timings,
   dockerTestContext,
   expectLabelledEnvironmentImage,
-  fakeAuth,
-  registryClient,
-  registryTransport,
-  runInVolume, pipelineWithOperations } from './harness';
+  runInVolume } from './harness';
+import { monitorOfUser, removeTestMonitor, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
 
 const ALIAS = 'devenv-test-remote';
 const REPOSITORY = 'devenv-test/remote';
@@ -84,19 +78,6 @@ git init -q -b main
 git add -A
 git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
 `;
-
-const settings: ExtensionSettings = {
-  reopenLastOnStartup: true,
-  stopOnClose: true,
-  waitingTimeSeconds: 30,
-  updateImagesOnConnect: true,
-  respectShutdownActionNone: false,
-  owners: [],
-  includeArchived: false,
-  includeForks: false,
-  refreshIntervalMinutes: 60,
-  hostAccessChecksOff: [],
-};
 
 /** A free TCP port on 127.0.0.1 (nothing listens on it afterwards). */
 async function freePort(): Promise<number> {
@@ -207,12 +188,15 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
   });
 
   /** Plan step 6, PR C: the workers of the open through SSH (disposed by the test, and here after a failure). */
-  let remoteLocks: WorkerLocks | undefined;
+  let remoteWindow: WorkerWindow | undefined;
+  // Decision D9 of 2026-10-07: the open makes sure of the real Session Monitor; a monitor of the user is never touched.
+  const skipped = monitorOfUser({ run });
 
   afterAll(async () => {
     timings.print('Timings of the remote Docker host scenarios:');
-    await remoteLocks?.dispose();
+    await remoteWindow?.dispose();
     removeRunObjects(localCli, run.runId);
+    removeTestMonitor({ run, cli: localCli });
     expect(localCli.container(containerName)).toBeUndefined();
     expect(localCli.volume(volumeName)).toBeUndefined();
     expect(localCli.container(sshdContainer)).toBeUndefined();
@@ -256,7 +240,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     expect((await listContextInfos(docker)).filter((info) => info.endpoint === `ssh://${ALIAS}`).map((info) => info.name)).toEqual([ALIAS]);
   });
 
-  it('opens a seeded environment through the context: containers, volumes, and the token on the engine reached through SSH', async () => {
+  it.skipIf(skipped)('opens a seeded environment through the context: containers, volumes, and the token on the engine reached through SSH', async () => {
     await useRemoteContext(docker, ALIAS);
     const state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
     const sshPath = findExecutable('ssh', env, process.platform);
@@ -272,40 +256,16 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
         return { key: target.host, socket: (await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
       },
     });
-    const paths = new StoragePaths(path.join(dir, 'storage'));
-    paths.ensureDirectoriesSync();
-    const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
-    const sessionFiles = new SessionFiles(paths);
     // Plan step 6, PR C: the real worker of the engine reached through SSH (as extension.ts: the socket of that computer),
-    // whose batch helper runs the helper steps of the open; there is no other path (D1).
-    const locks = workerLocks({ run, cli: localCli, log }, docker, targets, 'remoteHost', async (target) =>
-      target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint),
-    );
-    remoteLocks = locks;
-    const service = pipelineWithOperations({
-      analyzer: inProcessAnalyzer,
-      // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
-      // was always granted, whose plain Docker calls ran directly): the real lock of the worker on the remote engine.
-      environmentLock: locks.take,
-    flow: (op, params, options) => locks.flow(op, params, options),
-    // Plan step 11C1: the refresh through the worker, as extension.ts.
-    workerRefresh: (environments) => locks.refresh(environments),
-      docker,
-      runner,
-      helper,
-      registry,
-      sessionFiles,
-      imageChecker: new ImageChecker(registryClient(registryTransport, runner, env, log), log),
-      auth: fakeAuth,
-      ui: new FakeUi(),
-      logger: log,
-      clock: systemClock,
-      platform: process.platform,
-      env,
-      owner: { windowId: 'docker-test-remote-window', pid: process.pid },
-      settings: () => settings,
-      windowStatuses: () => sessionFiles.readWindowStatuses(),
-      dockerTarget: () => targets.current(),
+    // whose batch helper runs the helper steps of the open; there is no other path (D1). Plan step 11I1, PR A2: the
+    // window of the shared harness, whose operations run in that worker (was: the pipeline of the test process over the
+    // `lock` relay of the worker).
+    const window = workerWindow({ run, env, cli: localCli, log }, docker, {
+      name: 'remoteHost',
+      computer: testComputer({ run, log }, 'remote-host'),
+      windowId: 'docker-test-remote-window',
+      settings: { updateImagesOnConnect: true },
+      socketPath: async (target) => (target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint)),
       startDocker: async ({ onStarting, signal }) =>
         startDockerFor(
           await targets.current(),
@@ -314,8 +274,11 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
           signal,
         ),
     });
+    remoteWindow = window;
+    const { registry, service } = window;
 
     const before = acceptedConnections();
+    const stepsBefore = window.steps.length;
     const progress = new RecordingProgress();
     await timings.measure(
       'seed and open through SSH',
@@ -345,16 +308,18 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
             owner: TEST_ACCOUNT,
             dockerHost: await targets.host(),
           });
-          return service.openEnvironment(environmentId, { progress });
+          return service.openEnvironmentInWorker(environmentId, { progress });
         }),
       () => progress.summary(),
     );
 
     // No Docker Desktop start for a remote host: no step "Starting Docker".
     expect(progress.steps).not.toContain('startingDocker');
-    // Every Docker call went through SSH to the "remote computer".
-    expect(acceptedConnections() - before).toBeGreaterThan(5);
+    // Decision D6 of 2026-10-07 (was: every Docker call went through SSH, more than 5 connections): the worker was started
+    // through SSH to the "remote computer", and talks to its engine there.
+    expect(acceptedConnections() - before).toBeGreaterThan(0);
     expect(sshLog).toContain('Starting session: command for root');
+    expect(window.locks.workerNames).toHaveLength(1);
     // The objects are on the engine that the SSH server reaches (the engine of the runner).
     expect(localCli.volume(volumeName)).toBeDefined();
     const container = localCli.container(containerName);
@@ -372,16 +337,17 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
 
     // Back on the local Docker, the environment of the remote host is never acted on.
     await useContext(docker, 'default');
-    await expect(targets.withOperation(() => service.operations.stop(environmentId))).rejects.toMatchObject({ code: 'otherDockerHost' });
+    await expect(targets.withOperation(() => service.stop(environmentId))).rejects.toMatchObject({ code: 'otherDockerHost' });
     expect(localCli.container(containerName)?.State.Running).toBe(true);
 
     // On the remote host again, the stop goes through SSH.
     await useRemoteContext(docker, ALIAS);
-    await targets.withOperation(() => service.operations.stop(environmentId));
+    await targets.withOperation(() => service.stop(environmentId));
     expect(localCli.container(containerName)?.State.Running).toBe(false);
     // Plan step 6, PR C: the open ran its helper steps in one batch helper of the worker on the remote engine; no worker
     // and no batch helper is left over.
-    expect(locks.batches.get(environmentId)).toHaveLength(1);
-    expect(await locks.dispose()).toEqual([]);
+    // Plan step 11I1, PR A2: counted by the progress steps of the worker (was: the locks of the relay).
+    expect(window.batchesOf(volumeName, stepsBefore)).toBe(1);
+    expect(await window.dispose()).toEqual([]);
   });
 });

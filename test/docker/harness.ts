@@ -251,7 +251,7 @@ export class FakeUi implements PipelineUi {
     return this.additionalVolumesAnswer;
   }
 
-  async deleteServiceData(): Promise<string[] | undefined> {
+  async deleteServiceData(_volumes: readonly string[], _possibly: readonly string[]): Promise<string[] | undefined> {
     return this.serviceDataAnswer;
   }
 
