@@ -215,7 +215,11 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
 
   /** Tags of the images of this run, one list per image. */
   function runImages(): string[][] {
-    const lines = cli.lines(['image', 'ls', '-a', '--no-trunc', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']);
+    // Plan step 11I1, PR A2 (first CI run of PR #117): without `-a`. The worker labels the image over the Engine API
+    // (EngineDocker.labelImage, a commit), which on the classic image store is a child of the previous image: that parent
+    // is kept as an untagged layer of the labelled image (review round 1 of 11B3a, A-R1-6) and goes with it. An untagged
+    // image without a child (a leftover) is still listed.
+    const lines = cli.lines(['image', 'ls', '--no-trunc', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']);
     const images = new Map<string, string[]>();
     for (const line of lines) {
       const [id, tag] = line.split(' ');
