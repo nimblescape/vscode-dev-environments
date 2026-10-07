@@ -15,7 +15,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
-import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import type { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import type { DockerTarget } from '../../src/core/docker/dockerHost';
 import type { DockerTargets } from '../../src/core/docker/dockerTargets';
 import type { HeldEnvironmentLock } from '../../src/core/docker/environmentLock';
@@ -75,7 +76,7 @@ export interface WorkerLocks {
  */
 export function workerLocks(
   context: Pick<DockerTestContext, 'run' | 'cli' | 'log'>,
-  docker: ContainerAdapter,
+  docker: BootstrapDocker,
   targets: Pick<DockerTargets, 'current'>,
   name: string,
   socketPath: (target: DockerTarget) => Promise<string>,

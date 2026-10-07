@@ -267,7 +267,7 @@ describe('Use a Remote Docker Host…', () => {
     cli.hosts.set('gpu', engineInfo());
     answer('build-box');
     await commands.useRemoteHost();
-    // An operation of another window started on build-box: its Docker calls name the context it read (ContainerAdapter).
+    // An operation of another window started on build-box: its Docker calls name the context it read (BootstrapDocker).
     const pinned = dockerTargetOf(cli.contexts.get(cli.current) ?? '', cli.current);
     await runWithDockerTarget(pinned, async () => {
       answer('gpu');

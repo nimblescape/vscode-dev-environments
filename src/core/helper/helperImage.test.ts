@@ -7,7 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { devcontainerCliVersion } from '../../../scripts/cliVersion.mjs';
-import type { ImageInfo } from '../docker/containerAdapter';
+import type { ImageInfo } from '../docker/dockerObjects';
 import { CommandError } from '../errors';
 import type { HttpTransport } from '../http';
 import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/imageCheck';
@@ -73,7 +73,7 @@ class FakeDocker implements HelperImageDocker {
   listError: Error | undefined;
   imageIdError: Error | undefined;
   /**
-   * Review round 3 of PR #64 (P4): the build returns the ID of its image, as ContainerAdapter.buildImage finds it by its
+   * Review round 3 of PR #64 (P4): the build returns the ID of its image, as BootstrapDocker.buildImage finds it by its
    * build label (review round 4 of PR #64, R4-2/R4-3); with this flag it returns none (a lookup that failed).
    */
   builtIdMissing = false;

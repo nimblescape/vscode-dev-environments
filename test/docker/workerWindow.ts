@@ -12,7 +12,8 @@
 // (monitorOfUser), and removes the one that it made (removeTestMonitor).
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import type { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { monitorImageTag } from '../../src/core/helper/helperState';
@@ -107,7 +108,7 @@ export interface WorkerWindowOptions {
 }
 
 /** A window of the extension for a Docker test file (see the module comment). */
-export function workerWindow(context: DockerTestContext, docker: ContainerAdapter, options: WorkerWindowOptions): WorkerWindow {
+export function workerWindow(context: DockerTestContext, docker: BootstrapDocker, options: WorkerWindowOptions): WorkerWindow {
   const { run, env, cli, log } = context;
   const computer = options.computer ?? testComputer(context, options.name);
   const ui = options.ui ?? new FakeUi();

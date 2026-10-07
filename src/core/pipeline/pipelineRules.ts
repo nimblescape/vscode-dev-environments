@@ -5,7 +5,7 @@
 // Pure decisions and helpers of the open pipeline (concept 7.6, 7.7, 7.12). No I/O.
 import * as crypto from 'crypto';
 import * as path from 'path';
-import type { ContainerInfo, MountTarget } from '../docker/containerAdapter';
+import type { ContainerInfo, MountTarget } from '../docker/dockerObjects';
 import { CommandError, errorMessage } from '../errors';
 import type { CheckedOutcome } from '../imageCheck/imageCheck';
 import { serviceFolderPaths } from '../git/gitSummary';

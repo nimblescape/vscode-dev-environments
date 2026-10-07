@@ -9,7 +9,8 @@
 // the batch helper is started from the test process as the worker's own flow starts it (inProcessBatches), without the
 // relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { parseJsonc } from '../../src/core/jsonc';
@@ -25,7 +26,7 @@ const FOLDER = `/workspaces/${splitRepository(REPOSITORY).name}`;
 
 describe(`clone of ${REPOSITORY}`, () => {
   const { run, env, cli, log } = dockerTestContext('clone');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volumeName = `devenv-test-clone-${run.runId}`;
   const timings = new Timings();

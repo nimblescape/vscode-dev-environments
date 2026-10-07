@@ -14,7 +14,8 @@
 // by 11I1); the lock is the worker's own, with its own wait (ENVIRONMENT_LOCK_WAIT_SECONDS; the relay took a shorter one
 // of the test). The opens make sure of the real Session Monitor (decision D9 of 2026-10-07).
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts } from '../../src/core/pipeline/environmentService';
@@ -30,7 +31,7 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
   const context = dockerTestContext('workerLock');
   const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
-  const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   // Decision D9 of 2026-10-07: the opens make sure of the real Session Monitor; a monitor of the user is never touched.
   const skipped = monitorOfUser({ run });

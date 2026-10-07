@@ -11,7 +11,8 @@
 // the tests (a monitor of the user is never touched), and removes the one it made.
 import * as fs from 'fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
@@ -22,6 +23,7 @@ import {
   HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
+  createVolume,
   dockerTestContext,
   runInVolume,
 } from './harness';
@@ -47,7 +49,7 @@ git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial c
 describe('the open through a real worker (plan step 11E6)', () => {
   const { run, env, cli, log } = dockerTestContext('workerOpen');
   const runner = new NodeProcessRunner();
-  const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   // Plan step 11I1, PR A2: the window of the shared harness (workerWindow.ts), as this file wired it before. No registry
   // question: the open builds from the base image that the engine has or pulls (updateImagesOnConnect off).
@@ -85,7 +87,7 @@ describe('the open through a real worker (plan step 11E6)', () => {
       2,
     );
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(volumeName, { [LABEL_ENVIRONMENT_ID]: environmentId, [LABEL_REPOSITORY]: REPOSITORY, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, volumeName, { [LABEL_ENVIRONMENT_ID]: environmentId, [LABEL_REPOSITORY]: REPOSITORY, [TEST_RUN_LABEL]: run.runId });
     const seeded = await runInVolume(docker, volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);

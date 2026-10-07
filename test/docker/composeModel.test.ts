@@ -12,7 +12,9 @@
 // image (runInVolume). Plan step 11I1, PR A1: the batch helper is started from the test process as the worker's own flow
 // starts it (inProcessBatches), without the relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { toNetworkInfo } from '../../src/core/docker/dockerObjects';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
@@ -68,7 +70,7 @@ volumes:
 
 describe('model run of a Docker Compose configuration', () => {
   const { run, env, cli, log } = dockerTestContext('composeModel');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volumeName = `devenv-test-compose-${run.runId}`;
   let apiVersion: string;
@@ -218,7 +220,10 @@ describe('model run of a Docker Compose configuration', () => {
     cli.ok(['network', 'create', '--label', 'com.docker.compose.project=devenv-11111111', '--label', `${TEST_RUN_LABEL}=${run.runId}`, network]);
     const container = cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--label', 'nimblescape.devenv.environment-id=other', '--network', network, TEST_BASE_IMAGE, 'true']);
     try {
-      const networks = await docker.inspectNetworks([network, `devenv-test-missing-${run.runId}`]);
+      // Plan step 11I2: the inspect by the Docker CLI of the test harness, read as the pipeline reads it (toNetworkInfo), in
+      // place of inspectNetworks of the removed CLI adapter ContainerAdapter, which did the same (a missing network is left out).
+      expect(cli.run(['network', 'inspect', `devenv-test-missing-${run.runId}`]).code).not.toBe(0);
+      const networks = (JSON.parse(cli.ok(['network', 'inspect', network])) as unknown[]).map(toNetworkInfo).filter((info) => info !== undefined);
       expect(networks).toHaveLength(1);
       expect(networks[0]).toMatchObject({ name: network, labels: expect.objectContaining({ 'com.docker.compose.project': 'devenv-11111111' }) });
       // A created container is attached only once it runs; the labels decide here.

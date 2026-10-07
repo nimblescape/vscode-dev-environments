@@ -245,15 +245,15 @@ export class DockerSetup implements vscode.Disposable {
   }
 
   /**
-   * Asks ContainerAdapter whether the CLI is found. A missing CLI is looked up again (at most every 10 seconds); a CLI
-   * that was found counts as found until a call of it fails with ENOENT (then ContainerAdapter reports `reportCliLost`).
+   * Asks BootstrapDocker whether the CLI is found. A missing CLI is looked up again (at most every 10 seconds); a CLI
+   * that was found counts as found until a call of it fails with ENOENT (then BootstrapDocker reports `reportCliLost`).
    */
   checkCli(): boolean {
     return this.lookUp(() => this.deps.docker.isInstalled());
   }
 
   /**
-   * ContainerAdapter option `onCliLost`: a CLI that was found cannot be started anymore. The sidebar shows the setup at
+   * BootstrapDocker option `onCliLost`: a CLI that was found cannot be started anymore. The sidebar shows the setup at
    * once; no lookup runs here, so the next call of the adapter (or the check every 10 seconds) looks the CLI up again,
    * for example after Docker Desktop has updated itself.
    */

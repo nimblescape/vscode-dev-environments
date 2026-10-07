@@ -3,12 +3,15 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11B3: the Docker of the pipeline over the Engine API (EngineDocker on the port of engineClient.ts) answers
-// as ContainerAdapter answers over the Docker CLI, against the real engine of the runner: the same objects, asked both
-// ways. Also what only the API way does: the labels of an image by a commit, and (plan step 11G1) the read of a file of
-// an image without running anything.
+// as the Docker CLI answers, against the real engine of the runner: the same objects, asked both ways. Plan step 11I2:
+// the CLI side is the Docker CLI of the test harness (`docker inspect` and friends, read with the pipeline's reading of
+// the inspect JSON, dockerObjects.ts) instead of the removed CLI adapter ContainerAdapter, which read it the same way.
+// Also what only the API way does: the labels of an image by a commit, and (plan step 11G1) the read of a file of an
+// image without running anything.
 import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { mapContainerState, publicInfo, toContainerInfo, toLabels, toVolumeInfo, type ContainerInfo } from '../../src/core/docker/dockerObjects';
 import { helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -21,7 +24,8 @@ import { dockerTestContext } from './harness';
 describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () => {
   const { run, env, cli, log } = dockerTestContext('engineDocker');
   const runLabel = `${TEST_RUN_LABEL}=${run.runId}`;
-  const cliDocker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) for the one call that it still has (removeImage).
+  const cliDocker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const socket = helperDockerSocket(env, process.platform);
   const apiDocker = new EngineDocker(dockerEngine(engineApi(socket), engineHijack(socket)), log);
   const id = newEnvironmentId();
@@ -44,27 +48,54 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     cli.run(['image', 'rm', '-f', withVolume]);
   });
 
+  /** Plan step 11I2: a container as the Docker CLI describes it (`docker container inspect`), read as the pipeline reads it. */
+  const cliContainer = (reference: string): ContainerInfo | undefined => {
+    const inspected = toContainerInfo((JSON.parse(cli.ok(['container', 'inspect', reference])) as unknown[])[0]);
+    return inspected === undefined ? undefined : publicInfo(inspected);
+  };
+
+  // Plan step 11I2: changed expectation (before: each answer of EngineDocker equal to the answer of the removed CLI
+  // adapter ContainerAdapter): each answer equal to what the Docker CLI of the test harness reports for the same object,
+  // read with the same functions as the adapter read it (dockerObjects.ts) or as it read the CLI's answer.
   it('answers the reads as the Docker CLI does', async () => {
-    const [cliContainer, apiContainer] = [await cliDocker.findContainer(id, name), await apiDocker.findContainer(id, name)];
-    expect(apiContainer).toEqual(cliContainer);
+    const apiContainer = await apiDocker.findContainer(id, name);
+    expect(apiContainer).toEqual(cliContainer(name));
     expect(apiContainer).toMatchObject({ name, state: 'running', volumes: [name] });
     const byId = (list: { id: string }[]) => [...list].sort((a, b) => a.id.localeCompare(b.id));
-    expect(byId((await apiDocker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === id))).toEqual(
-      byId((await cliDocker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === id)),
-    );
-    expect(await apiDocker.containerState(`${name}-db-1`)).toBe(await cliDocker.containerState(`${name}-db-1`));
+    const listed = cli.lines(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${id}`]);
+    expect(listed).toHaveLength(2);
+    expect(byId((await apiDocker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === id))).toEqual(byId(listed.map((listedId) => cliContainer(listedId)!)));
+    expect(await apiDocker.containerState(`${name}-db-1`)).toBe(mapContainerState(cli.container(`${name}-db-1`)!.State.Status));
+    expect(await apiDocker.containerState(`${name}-db-1`)).toBe('stopped');
     expect(await apiDocker.containerState('devenv-test-missing')).toBe('missing');
-    expect(await apiDocker.inspectVolumes([name, 'devenv-test-missing'])).toEqual(await cliDocker.inspectVolumes([name, 'devenv-test-missing']));
+    expect(await apiDocker.inspectVolumes([name, 'devenv-test-missing'])).toEqual([toVolumeInfo(cli.volume(name))]);
     expect([await apiDocker.volumeExists(name), await apiDocker.volumeExists('devenv-test-missing')]).toEqual([true, false]);
-    expect(await apiDocker.imageId(image)).toBe(await cliDocker.imageId(image));
-    expect(await apiDocker.imageNames(image)).toEqual(await cliDocker.imageNames(image));
-    expect(await apiDocker.imageLabels(image)).toEqual(await cliDocker.imageLabels(image));
-    expect(await apiDocker.imageConfig(image)).toEqual(await cliDocker.imageConfig(image));
-    expect(await apiDocker.listImageTags(`devenv-test-engine-${tag}`)).toEqual(await cliDocker.listImageTags(`devenv-test-engine-${tag}`));
+    const details = cli.image(image)!;
+    expect(await apiDocker.imageId(image)).toBe(details.Id);
+    expect(await apiDocker.imageNames(image)).toEqual({ repoTags: details.RepoTags ?? [], repoDigests: details.RepoDigests ?? [] });
+    expect(await apiDocker.imageLabels(image)).toEqual(toLabels(details.Config.Labels));
+    expect(await apiDocker.imageConfig(image)).toEqual(JSON.parse(cli.ok(['image', 'inspect', '--format', '{{json .Config}}', image])));
+    // The tags of exactly this repository, sorted by tag, numbers numerically (as listImageTags sorts them).
+    const repository = `devenv-test-engine-${tag}`;
+    const tags = cli
+      .lines(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository])
+      .filter((reference) => reference.startsWith(`${repository}:`) && !reference.endsWith(':<none>'))
+      .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
+    expect(tags).toContain(image);
+    expect(await apiDocker.listImageTags(repository)).toEqual([...new Set(tags)]);
     const references = [image, 'devenv-test-missing:1', 'Not A Reference'];
-    expect(await apiDocker.inspectImageNames(references)).toEqual(await cliDocker.inspectImageNames(references));
-    expect((await apiDocker.inspectImageNames(references)).images.map((found) => found.id)).toEqual([await cliDocker.imageId(image)]);
-    expect(await apiDocker.engineApiVersion()).toBe(await cliDocker.engineApiVersion());
+    // As the Docker CLI answers about each reference: a missing image is left out; a reference that the CLI refuses as such
+    // (an invalid reference, as the removed adapter classified the CLI's answer) is `invalid`.
+    expect(cli.run(['image', 'inspect', 'devenv-test-missing:1']).err).toMatch(/no such image/i);
+    const refused = cli.run(['image', 'inspect', 'Not A Reference']);
+    expect(refused.code).not.toBe(0);
+    const unchecked = /no such image/i.test(refused.err) ? [] : [{ reference: 'Not A Reference', reason: 'invalid' }];
+    expect(unchecked.length === 0 || /invalid reference|reference format/i.test(refused.err), refused.err).toBe(true);
+    expect(await apiDocker.inspectImageNames(references)).toEqual({
+      images: [{ id: details.Id, repoTags: details.RepoTags ?? [], repoDigests: details.RepoDigests ?? [] }],
+      unchecked,
+    });
+    expect(await apiDocker.engineApiVersion()).toBe(cli.ok(['version', '--format', '{{.Server.APIVersion}}']));
     expect(await apiDocker.isRunning()).toBe(true);
   });
 
@@ -117,14 +148,18 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
   it('exec: a refusal of the engine is a result, over the API as over the Docker CLI (review round 1 of 11B3a, A-R1-3)', async () => {
     const target = `${name}-exec`;
     cli.ok(['run', '-d', '--name', target, '--network', 'none', '--init', '--label', runLabel, TEST_BASE_IMAGE, 'sleep', '600']);
-    for (const docker of [cliDocker, apiDocker]) {
-      const unknownUser = await docker.exec(target, ['id'], { user: 'nobody2' });
+    // Plan step 11I2: changed arrangement (before: the exec of the removed CLI adapter ContainerAdapter on the CLI side):
+    // the same `docker exec` by the Docker CLI of the test harness, with the same expectations on both sides.
+    const viaCli = (args: string[]) => {
+      const result = cli.run(['exec', ...args]);
+      return { exitCode: result.code, stdout: result.out, stderr: result.err };
+    };
+    for (const unknownUser of [viaCli(['-u', 'nobody2', target, 'id']), await apiDocker.exec(target, ['id'], { user: 'nobody2' })]) {
       expect(unknownUser.exitCode).not.toBe(0);
       expect(unknownUser.stdout + unknownUser.stderr).toMatch(/nobody2/);
     }
     cli.ok(['stop', '-t', '0', target]);
-    for (const docker of [cliDocker, apiDocker]) {
-      const stopped = await docker.exec(target, ['id']);
+    for (const stopped of [viaCli([target, 'id']), await apiDocker.exec(target, ['id'])]) {
       expect(stopped.exitCode).not.toBe(0);
       expect(stopped.stderr).toMatch(/is not running/);
     }

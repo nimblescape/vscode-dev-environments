@@ -130,12 +130,12 @@ export const COMPOSE_CLEARED_LABELS: readonly string[] = ['com.docker.compose.pr
 export const LABEL_HELPER = 'nimblescape.devenv.helper';
 export const LABEL_HELPER_RUN = 'nimblescape.devenv.helper-run';
 /**
- * Review round 4 of PR #64 (R4-2/R4-3): a label with a random nonce per build of ContainerAdapter.buildImage, by which it
+ * Review round 4 of PR #64 (R4-2/R4-3): a label with a random nonce per build of BootstrapDocker.buildImage, by which it
  * finds the ID of the image that the build made (`docker image ls --filter label=…`).
  */
 export const LABEL_BUILD_ID = 'nimblescape.devenv.build-id';
 /**
- * User decisions 2026-10-03: a label of the environment image (ContainerAdapter.labelImage, after each build), with the
+ * User decisions 2026-10-03: a label of the environment image (EngineDocker.labelImage, after each build), with the
  * build record of that image as JSON, next to nimblescape.devenv.environment-id, nimblescape.devenv.repository, and
  * nimblescape.devenv.owner-id. The open of an environment that another computer created, or of one restored after a lost
  * registry, takes the record from its newest image (imageBuildRecord), so its image check works as on the first computer.

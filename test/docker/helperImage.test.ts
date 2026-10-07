@@ -9,7 +9,9 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter, type ImageInfo } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import type { ImageInfo } from '../../src/core/docker/dockerObjects';
 import {
   HELPER_CHECK_INTERVAL_MS,
   HELPER_CLEANUP_INTERVAL_MS,
@@ -39,9 +41,9 @@ function otherHelperTag(): string {
 }
 
 /**
- * The real ContainerAdapter, limited to the images of this run: the listing of the helper images shows only images with
- * the label devenv-test.run=<run ID>, and the removal of any other image fails (the helper logs the failure; the test
- * checks that none was tried). It records the builds and the removals.
+ * The real BootstrapDocker (plan step 11I2: was ContainerAdapter), limited to the images of this run: the listing of the
+ * helper images shows only images with the label devenv-test.run=<run ID>, and the removal of any other image fails (the
+ * helper logs the failure; the test checks that none was tried). It records the builds and the removals.
  */
 class RunScopedDocker implements HelperDocker {
   readonly builds: Array<{ tag: string; pull: boolean; noCache: boolean }> = [];
@@ -49,11 +51,11 @@ class RunScopedDocker implements HelperDocker {
   readonly refused: string[] = [];
 
   constructor(
-    private readonly docker: ContainerAdapter,
+    private readonly docker: BootstrapDocker,
     private readonly runLabel: string,
   ) {}
 
-  run(...args: Parameters<ContainerAdapter['run']>): ReturnType<ContainerAdapter['run']> {
+  run(...args: Parameters<BootstrapDocker['run']>): ReturnType<BootstrapDocker['run']> {
     return this.docker.run(...args);
   }
 
@@ -65,7 +67,7 @@ class RunScopedDocker implements HelperDocker {
     return this.docker.imageId(reference);
   }
 
-  async buildImage(options: Parameters<ContainerAdapter['buildImage']>[0]): Promise<string | undefined> {
+  async buildImage(options: Parameters<BootstrapDocker['buildImage']>[0]): Promise<string | undefined> {
     this.builds.push({ tag: options.tag, pull: options.pull === true, noCache: options.noCache === true });
     // Review round 3 of PR #64 (P4): the ID of the built image (found by its build label, review round 4 of PR #64, R4-2/R4-3).
     return this.docker.buildImage(options);
@@ -94,7 +96,7 @@ class RunScopedDocker implements HelperDocker {
 describe('workspace helper image: weekly refresh and daily cleanup', () => {
   const { run, env, cli, log } = dockerTestContext('helperImage');
   const runner = new NodeProcessRunner();
-  const docker = new RunScopedDocker(new ContainerAdapter(runner, run.dockerPath, env, log), `${TEST_RUN_LABEL}=${run.runId}`);
+  const docker = new RunScopedDocker(new BootstrapDocker(runner, run.dockerPath, env, log), `${TEST_RUN_LABEL}=${run.runId}`);
   const client = registryClient(registryTransport, runner, env, log);
   const digestChecker = new ImageChecker(client, log);
   const lookUp = registryBaseDigest(client);

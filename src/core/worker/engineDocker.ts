@@ -3,13 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11B3 (section 0 of the plan, one concept for commanding Docker): the Docker of the pipeline
-// (EnvironmentDocker) over the port of the worker's engine (DockerEngine, the Engine API). It answers as ContainerAdapter
-// answers over the Docker CLI, method by method, so that EnvironmentService runs unchanged in the worker (plan steps
-// 11B3 and 11E); the inspect JSON is read by the same functions (dockerObjects.ts). Pure over the port; no I/O, no
+// (EnvironmentDocker) over the port of the worker's engine (DockerEngine, the Engine API). It answers as the Docker CLI
+// answers (as the CLI adapter ContainerAdapter answered, method by method, until plan step 11I2 removed it; it is the one
+// implementation of EnvironmentDocker now), so that EnvironmentService runs in the worker (plan steps 11B3 and 11E); the
+// inspect JSON is read by the same functions as `docker inspect` (dockerObjects.ts). Pure over the port; no I/O, no
 // `vscode`.
-import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
+import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type ImageInspection, type ImageNames, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/bootstrapDocker';
-import type { ImageInspection, ImageNames } from '../docker/containerAdapter';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
@@ -28,7 +28,7 @@ const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /** An Engine API answer about the reference itself (400): an invalid reference, as `docker image inspect` reports it. */
 const INVALID_REFERENCE = 400;
 
-/** As ContainerAdapter.listImageTags: sorted by tag, numbers numerically. */
+/** As listImageTags sorts them (as the Docker CLI adapter did): by tag, numbers numerically. */
 function sortedTags(repository: string, tags: Iterable<string>): string[] {
   return [...new Set(tags)].sort((a, b) => a.localeCompare(b, 'en', { numeric: true })).map((tag) => `${repository}:${tag}`);
 }
@@ -61,7 +61,7 @@ export class EngineDocker implements EnvironmentDocker {
   ) {}
 
   /**
-   * Review round 1 of 11B3a (A-R1-2): every request has a time limit, as each `docker` call of ContainerAdapter has
+   * Review round 1 of 11B3a (A-R1-2): every request has a time limit, as each `docker` call of ContainerAdapter had
    * (DOCKER_QUERY_TIMEOUT_MS unless the caller gives one); a request that the engine does not answer in time fails with an
    * EngineError, and a cancel of `signal` stays its AbortError.
    */
@@ -125,7 +125,7 @@ export class EngineDocker implements EnvironmentDocker {
     return this.call(`the inspect of ${reference}`, signal, (limited) => this.engine.inspect(kind, reference, limited));
   }
 
-  /** As ContainerAdapter.findContainer: the dev container (isDevContainer), the named one first, else running, else newest. */
+  /** EnvironmentDocker.findContainer: the dev container (isDevContainer), the named one first, else running, else newest. */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
     const containers = (await this.containersWithLabel(`${LABEL_ENVIRONMENT_ID}=${environmentId}`)).filter((container) => isDevContainer(container, containerName));
     if (containers.length === 0) return undefined;
@@ -153,7 +153,7 @@ export class EngineDocker implements EnvironmentDocker {
     await this.call(`the removal of ${name}`, undefined, (limited) => this.engine.removeNetwork(name, limited));
   }
 
-  /** As ContainerAdapter.listProjectImages: `<project>-*` images with a tag; with `environmentId`, only its own. */
+  /** EnvironmentDocker.listProjectImages: `<project>-*` images with a tag; with `environmentId`, only its own. */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
     const images = await this.call('the list of the images', undefined, (limited) => this.engine.images({ reference: [`${project}-*`] }, limited));
     const tags = new Set<string>();
@@ -281,7 +281,7 @@ export class EngineDocker implements EnvironmentDocker {
     return value === undefined ? undefined : toLabels(value.Config?.Labels);
   }
 
-  /** As ContainerAdapter.imageLabelsOf: the labels by full image ID; a missing image is left out. */
+  /** EnvironmentDocker.imageLabelsOf: the labels by full image ID; a missing image is left out. */
   async imageLabelsOf(references: readonly string[], signal?: AbortSignal): Promise<Map<string, Record<string, string>>> {
     const labels = new Map<string, Record<string, string>>();
     for (const reference of references) {
@@ -294,7 +294,7 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   /**
-   * As ContainerAdapter.labelImage (user decisions 2026-10-03), without a build (decision of 2026-10-03, no extra
+   * EnvironmentDocker.labelImage (user decisions 2026-10-03), without a build (decision of 2026-10-03, no extra
    * containers where the API suffices: DockerEngine.labelImage). The previous image is removed only when nothing names it.
    */
   async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
@@ -311,7 +311,7 @@ export class EngineDocker implements EnvironmentDocker {
     }
   }
 
-  /** As ContainerAdapter.imageNames. */
+  /** The tags and digests of an image (`RepoTags`, `RepoDigests`), undefined for a missing image. */
   async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
     const value = (await this.inspect('image', reference)) as { RepoTags?: unknown; RepoDigests?: unknown } | undefined;
     if (value === undefined) return undefined;
@@ -320,7 +320,7 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   /**
-   * As ContainerAdapter.inspectImageNames (review rounds 9 to 11 of PR #64): the images that the references find; a
+   * EnvironmentDocker.inspectImageNames (review rounds 9 to 11 of PR #64): the images that the references find; a
    * reference that the engine refuses as such (400) is `invalid`; after the first other failure it asks no more, and
    * that reference and the rest are `transient`. Over the API each reference is one request (there is no batch).
    */
@@ -357,7 +357,7 @@ export class EngineDocker implements EnvironmentDocker {
     return outcome === 'removed';
   }
 
-  /** As ContainerAdapter.listEnvironmentImages: the named images `devenv-*`, each once with its references. */
+  /** EnvironmentDocker.listEnvironmentImages: the named images `devenv-*`, each once with its references. */
   async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {
     const images = await this.call('the list of the images', signal, (limited) => this.engine.images({ reference: ['devenv-*'] }, limited));
     if (signal?.aborted) throw abortError();
@@ -384,7 +384,7 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   /**
-   * As ContainerAdapter.pullImage over the API. With `credentials`, their password must be the registry secret that the
+   * EnvironmentDocker.pullImage over the API. With `credentials`, their password must be the registry secret that the
    * operation holds (SECRET_REGISTRY: the worker got it through its request); it goes only into the header of the pull.
    * Without `credentials` it pulls anonymously: the logins that the Docker CLI of the host would read are not here (review
    * round 1 of 11B3a, A-R1-4; plan step 11B3b hands them in as the registry secret).

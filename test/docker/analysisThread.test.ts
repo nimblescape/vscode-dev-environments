@@ -12,7 +12,8 @@ import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { NodeProcessRunner } from '../../src/core/process';
 import { HELPER_DOCKERFILE, dockerTestContext } from './harness';
@@ -35,7 +36,7 @@ main();
 
 describe('the analysis thread of the worker in the helper image (plan step 11E2)', () => {
   const { run, env, cli, log } = dockerTestContext('analysisThread');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const root = path.resolve(__dirname, '../..');
   let bundle = '';

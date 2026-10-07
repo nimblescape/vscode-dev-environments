@@ -18,7 +18,7 @@ export const OPERATION_FAILED = 'The operation failed.';
 const SIGN_IN_COMMAND = 'devEnvironments.signIn';
 /**
  * Command of the action "Install Docker…" (Show Docker Setup, hidden): shows the sidebar view, whose welcome view has
- * the steps of the Docker setup while the CLI is missing (a CLI lost since it was found is reported by ContainerAdapter).
+ * the steps of the Docker setup while the CLI is missing (a CLI lost since it was found is reported by BootstrapDocker).
  */
 const INSTALL_DOCKER_COMMAND = 'devEnvironments.dockerSetup.show';
 /**

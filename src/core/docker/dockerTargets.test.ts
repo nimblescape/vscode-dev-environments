@@ -4,7 +4,9 @@
 
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
-import { ContainerAdapter } from './containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter,
+// which only passed these calls on to it.
+import { BootstrapDocker } from './bootstrapDocker';
 import { CONTEXT_INSPECT_TIMEOUT_MS, DockerTargets, operationDockerTarget, runWithDockerTarget } from './dockerTargets';
 
 const DOCKER = '/usr/local/bin/docker';
@@ -40,7 +42,7 @@ class FakeDockerCli implements ProcessRunner {
 function setup(env: NodeJS.ProcessEnv = { PATH: '/usr/bin' }, cliFound = true) {
   const dockerPath = cliFound ? DOCKER : undefined;
   const cli = new FakeDockerCli();
-  const docker = new ContainerAdapter(cli, dockerPath, env, silentLogger, 'linux');
+  const docker = new BootstrapDocker(cli, dockerPath, env, silentLogger, 'linux');
   const targets = new DockerTargets(docker, env, silentLogger, 'linux');
   return { cli, docker, targets };
 }

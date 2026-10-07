@@ -22,7 +22,7 @@ export interface BuildRecord {
   environmentImage: string;
   /**
    * User decisions 2026-10-03 (option 1): the full ID of environmentImage as this computer built it (after its labels,
-   * ContainerAdapter.labelImage) or took it over (from the labels of the newest image of a restored environment). An
+   * EnvironmentDocker.labelImage) or took it over (from the labels of the newest image of a restored environment). An
    * image under that name with another ID was swapped: it is not used (the open builds again). Not in the label of the
    * build record (the label is part of the ID).
    */

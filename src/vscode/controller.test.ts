@@ -11,7 +11,7 @@ import { VsCodePipelineUi } from './pipelineUi';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import type { ContainerInfo } from '../core/docker/containerAdapter';
+import type { ContainerInfo } from '../core/docker/dockerObjects';
 import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
 import { hostAccessChecks } from '../core/policy/hostAccessChecks';
 import type { WindowStateValue } from '../core/helperChannel/protocol';

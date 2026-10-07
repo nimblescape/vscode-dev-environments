@@ -2,8 +2,8 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 11B3: the Docker of the pipeline over the port of the worker's engine answers as ContainerAdapter answers
-// over the Docker CLI.
+// Plan step 11B3: the Docker of the pipeline over the port of the worker's engine answers as the Docker CLI answers (as
+// the CLI adapter ContainerAdapter answered, until plan step 11I2 removed it).
 import { describe, expect, it } from 'vitest';
 import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';

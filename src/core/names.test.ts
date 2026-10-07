@@ -75,9 +75,9 @@ describe('EXTENSION_LABEL_KEYS', () => {
 
   it('holds exactly the labels of the extension', () => {
     expect([...EXTENSION_LABEL_KEYS].map((key) => key.slice(LABEL_PREFIX.length)).sort()).toEqual([
-      // Changed expectation (review round 4 of PR #64, R4-2/R4-3): the build label of ContainerAdapter.buildImage.
+      // Changed expectation (review round 4 of PR #64, R4-2/R4-3): the build label of BootstrapDocker.buildImage.
       'build-id',
-      // User decisions 2026-10-03: the build record on the environment image (ContainerAdapter.labelImage).
+      // User decisions 2026-10-03: the build record on the environment image (EngineDocker.labelImage).
       'build-record',
       // Review round 1 of the helper channel (S1): the label of the containers that a cancel of an operation removes.
       'channel-step',

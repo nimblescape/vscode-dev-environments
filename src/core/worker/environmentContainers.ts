@@ -14,7 +14,7 @@ export function environmentContainers(engine: DockerEngine, environmentId: strin
 }
 
 /**
- * The running dev container among `containers` (as ContainerAdapter.findContainer found it): the side services of Docker
+ * The running dev container among `containers` (as EngineDocker.findContainer finds it): the side services of Docker
  * Compose are not it, the one with the recorded name comes first, and else the newest one. Review round 1 of plan step
  * 11B1 (A-R1-6): the recorded name is a preference, not a condition, so a dev container that was created again under
  * another name is still found; `log` names it then.

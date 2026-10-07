@@ -66,7 +66,9 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
 
 /** Plan step 11F2: the modules that left the extension's bundle in this step (the Docker CLI adapter and the steps). */
 const BOOTSTRAP_ONLY_REMOVED = [
-  'src/core/docker/containerAdapter.ts',
+  // Plan step 11I2: changed list: containerAdapter.ts (the Docker CLI adapter of the flows) is removed as a whole
+  // (decision D8 of 2026-10-07; a module that does not exist cannot be named here, bootstrapDocker.test.ts checks that it
+  // is gone).
   // Plan step 11I1, PR B2: changed list: dockerRouting.ts is removed with the routing through the worker (a module that
   // does not exist cannot be named here).
   'src/core/helper/workspaceHelper.ts',
