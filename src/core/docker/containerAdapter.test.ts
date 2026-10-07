@@ -10,6 +10,7 @@ import { abortError, isAbortError, silentLogger, type Logger, type ProcessRunner
 import {
   ContainerAdapter,
   DOCKER_CLI_LOOKUP_RETRY_MS,
+  directCommandName,
   SSH_DROP_RETRY_DELAY_MS,
   isProtectedDockerEndpoint,
   isReadOnlyDockerCall,
@@ -22,6 +23,7 @@ import {
   volumeRunArgs,
 } from './containerAdapter';
 import { MAX_IMAGE_INSPECT_SINGLE_CALLS } from '../helper/analysisLimits';
+import { dockerCommandWords } from './dockerCli';
 import { dockerTargetOf, remoteContextNames } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
@@ -2008,5 +2010,237 @@ describe('the typed calls of the ownership fix (plan step 11B3)', () => {
     expect(await docker.containerIdsWithLabel('k=v')).toEqual(['a', 'b']);
     answer = fail('boom', 125);
     await expect(docker.runOnVolume(run)).rejects.toBeInstanceOf(CommandError);
+  });
+});
+
+// Plan step 11I1, PR B2: the routing of ContainerAdapter through the worker (setRouter, setWorkerEngine, the calls under
+// a held lock) is gone; every call runs directly. The tests below were moved from containerAdapter.engine.test.ts and
+// dockerRouting.test.ts (both removed with that routing) and keep only what still holds: the direct calls and their log.
+describe('ContainerAdapter: every call runs directly (plan step 11I1, PR B2)', () => {
+  function recordingAdapter(handler: Handler = () => ok(), clock?: { now(): number }) {
+    const runner = new FakeRunner(handler);
+    const lines: string[] = [];
+    const logger: Logger = { ...silentLogger, info: (text) => lines.push(`info ${text}`), warn: (text) => lines.push(`warn ${text}`) };
+    const docker = new ContainerAdapter(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', clock ? { clock } : {});
+    return { docker, runner, lines };
+  }
+  const REMOTE = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+  const ID = 'a'.repeat(64);
+
+  it('has no route through the worker any more', () => {
+    const own = Object.getOwnPropertyNames(ContainerAdapter.prototype);
+    for (const name of ['setRouter', 'setWorkerEngine', 'engineRoute', 'throughWorker', 'runLocked', 'runRouted', 'pullThroughWorker', 'runWithSecretInput', 'run']) {
+      expect(own, name).not.toContain(name);
+    }
+  });
+
+  // Moved from containerAdapter.engine.test.ts ('pulls directly outside an operation and while the worker is prepared
+  // (bootstrap), and logs that call'). Changed expectation (before: within an operation only in the scope of the worker
+  // preparation, which is gone): also within an operation the pull runs directly.
+  it('pulls directly, outside and within an operation, and logs that call', async () => {
+    const { docker, runner, lines } = recordingAdapter();
+    await docker.pullImage('alpine:1');
+    await runWithDockerTarget(REMOTE, () => docker.pullImage('alpine:2'));
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['pull', 'alpine:1'],
+      ['pull', 'alpine:2'],
+    ]);
+    expect(runner.calls[1].options.env?.DOCKER_CONTEXT).toBe(remoteContextNames('build-box')[0]);
+    expect(lines.filter((line) => line.includes('(direct)'))).toEqual([
+      'info docker pull (direct): exit code 0 after 0.0 s.',
+      'info docker pull (direct): exit code 0 after 0.0 s.',
+    ]);
+  });
+
+  // Moved from containerAdapter.engine.test.ts ('starts through the worker of the operation, through the lock, or directly
+  // outside an operation'; 'B-R1-5: the time limit and the signal of startContainer reach the worker and the lock').
+  // Changed expectation (before: within an operation through the worker): `docker start` directly, with its options.
+  it('starts a container directly, outside and within an operation, with its time limit and signal', async () => {
+    const { docker, runner } = recordingAdapter();
+    const signal = new AbortController().signal;
+    await docker.startContainer(ID);
+    await runWithDockerTarget(REMOTE, () => docker.startContainer(ID, { timeoutMs: 1_000, signal }));
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['start', ID],
+      ['start', ID],
+    ]);
+    expect(runner.calls[1].options).toMatchObject({ timeoutMs: 1_000, signal });
+    const failing = recordingAdapter(() => fail('Error response from daemon: port is already allocated'));
+    await expect(failing.docker.startContainer(ID)).rejects.toThrow('port is already allocated');
+  });
+
+  // Moved from environmentLock.test.ts ('is refused without a held lock, and after the lock was lost; nothing runs
+  // directly'). Changed expectation (before: it went through the worker that held the lock, a way that is gone): a docker
+  // exec with a secret input is always refused, and the secret never reaches the Docker CLI.
+  it('refuses a docker exec with a secret input; nothing runs, and the secret is in no error', async () => {
+    const SECRET = 'gho_0123456789abcdefSECRET';
+    const { docker, runner } = recordingAdapter();
+    const error = await runWithDockerTarget(REMOTE, () => docker.exec('c1', ['sh', '-c', 'cat > /run/token'], { user: 'root', secretInput: SECRET })).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(CommandError);
+    expect((error as Error).message).toContain('was not run');
+    expect(JSON.stringify(error)).not.toContain(SECRET);
+    expect((error as Error).message).not.toContain(SECRET);
+    expect(() => docker.exec('c1', ['sh'], { input: 'a', secretInput: SECRET })).toThrow('either an input or a secret input');
+    expect(runner.calls).toEqual([]);
+  });
+
+  // Moved unchanged from containerAdapter.engine.test.ts ('the log of the direct calls (plan step 10A)').
+  it('logs a direct call with only its command, never an argument; a call that only reads is not logged', async () => {
+    expect(directCommandName(['pull', 'ghcr.io/o/private:1'])).toBe('pull');
+    expect(directCommandName(['context', 'create', 'box', '--docker', 'host=ssh://box'])).toBe('context create');
+    expect(directCommandName(['--context', 'x', 'image', 'rm', 'i'])).toBe('image rm');
+    expect(directCommandName(['compose', '-f', 'x.yml', 'up'])).toBe('compose');
+    let now = 1_000;
+    const { docker, lines } = recordingAdapter(
+      (call) => {
+        if (call.options.signal?.aborted) throw abortError();
+        now += 12_100;
+        if (call.args[0] === 'stop') return { exitCode: null, stdout: '', stderr: '', timedOut: true };
+        if (call.args[0] === 'start') throw new Error('spawn failed');
+        return ok();
+      },
+      { now: () => now },
+    );
+    await docker.runDirect(['ps']);
+    await docker.runDirect(['build', '--quiet', '-t', 'secret-name', '-'], { input: 'FROM secret-name\n' });
+    await docker.runDirect(['stop', 'c']);
+    await expect(docker.runDirect(['start', 'c'])).rejects.toThrow('spawn failed');
+    const controller = new AbortController();
+    controller.abort();
+    await expect(docker.runDirect(['rm', 'c'], { signal: controller.signal })).rejects.toThrow();
+    expect(lines).toEqual([
+      'info docker build (direct): exit code 0 after 12.1 s.',
+      'info docker stop (direct): timed out after 12.1 s.',
+      'info docker start (direct): failed after 12.1 s.',
+      'info docker rm (direct): cancelled after 0.0 s.',
+    ]);
+  });
+
+  // Moved from dockerRouting.test.ts ('the classification of every Docker call of ContainerAdapter (plan step 5, PR A)').
+  // Changed expectation (before: also whether each call went through the router, which is gone): whether each call only
+  // reads (runDirect repeats only those after an SSH drop), and every call of the adapter is classified.
+  it('classifies every Docker call of the adapter as one that only reads or not', async () => {
+    /** Key: the command, or the object and its command; `--config pull` for a pull with its own config folder; `exec -i` for an exec with its input. */
+    const READ_ONLY: Record<string, boolean> = {
+      info: true,
+      version: true,
+      ps: true,
+      'container inspect': true,
+      'image inspect': true,
+      'image ls': true,
+      'volume inspect': true,
+      'volume ls': true,
+      'network inspect': true,
+      'network ls': true,
+      'context inspect': true,
+      stop: false,
+      rename: false,
+      rm: false,
+      exec: false,
+      'exec -i': false,
+      'image rm': false,
+      'volume create': false,
+      'volume rm': false,
+      'network rm': false,
+      pull: false,
+      '--config pull': false,
+      build: false,
+      start: false,
+      run: false,
+    };
+    const objects = new Set(['container', 'image', 'volume', 'network', 'context']);
+    const commandKey = (args: readonly string[]): string => {
+      if (args[0] === '--config') return `--config ${args[2]}`;
+      if (args[0] === 'exec' && args.includes('-i')) return 'exec -i';
+      return objects.has(args[0]) ? `${args[0]} ${args[1]}` : args[0];
+    };
+    /** Members of ContainerAdapter that issue no Docker call of their own, or only pass one through. */
+    const noOwnCall = new Set(['constructor', 'envForOwnConfig', 'containerIds', 'inspectContainers', 'inspectBatch']);
+    const { docker, runner } = recordingAdapter((call) => {
+      const key = commandKey(call.args);
+      if (key === 'ps') return ok('"c1"\n');
+      if (key === 'image ls') return ok(`${JSON.stringify({ ID: 'sha256:1', Repository: 'p-s', Tag: '1', CreatedAt: 'x' })}\n`);
+      if (key === 'volume ls' || key === 'network ls') return ok('"x"\n');
+      if (key === 'context inspect') return ok('"unix:///var/run/docker.sock"\n');
+      return ok(call.args.includes('--format') ? '"x"\n' : '[]\n');
+    });
+    const exercised: Record<string, (d: ContainerAdapter) => Promise<unknown>> = {
+      daemonStatus: (d) => d.daemonStatus(),
+      isRunning: (d) => d.isRunning(),
+      findContainer: (d) => d.findContainer('e', 'n'),
+      engineApiVersion: (d) => d.engineApiVersion(),
+      listEnvironmentContainers: (d) => d.listEnvironmentContainers(),
+      listProjectContainers: (d) => d.listProjectContainers('p'),
+      listProjectNetworks: (d) => d.listProjectNetworks('p'),
+      removeNetwork: (d) => d.removeNetwork('n'),
+      listProjectImages: (d) => d.listProjectImages('p', 'e'),
+      containerState: (d) => d.containerState('c'),
+      stopContainer: (d) => d.stopContainer('c'),
+      renameContainer: (d) => d.renameContainer('c', 'd'),
+      removeContainer: (d) => d.removeContainer('c'),
+      exec: async (d) => {
+        await d.exec('c', ['git', 'status'], { user: 'u', workdir: '/w' });
+        await d.exec('c', ['cat'], { input: 'secret' });
+      },
+      volumeExists: (d) => d.volumeExists('v'),
+      createVolume: (d) => d.createVolume('v', { a: 'b' }),
+      removeVolume: (d) => d.removeVolume('v'),
+      listEnvironmentVolumes: (d) => d.listEnvironmentVolumes(),
+      inspectVolumes: (d) => d.inspectVolumes(['v']),
+      inspectNetworks: (d) => d.inspectNetworks(['n']),
+      imageExists: (d) => d.imageExists('i'),
+      imageId: (d) => d.imageId('i'),
+      imageNames: (d) => d.imageNames('i'),
+      inspectImageNames: (d) => d.inspectImageNames(['i']),
+      listImagesByLabel: (d) => d.listImagesByLabel('l'),
+      removeImage: (d) => d.removeImage('i'),
+      listEnvironmentImages: (d) => d.listEnvironmentImages(),
+      listImageTags: (d) => d.listImageTags('p-s'),
+      pullImage: async (d) => {
+        await d.pullImage('i', { onOutput: () => {} });
+        await d.pullImage('ghcr.io/o/i:1', { onOutput: () => {}, credentials: { registry: 'ghcr.io', username: 'u', password: 'token' } });
+      },
+      buildImage: (d) => d.buildImage({ tag: 't', dockerfile: 'D', context: '.', onOutput: () => {} }),
+      imageLabels: (d) => d.imageLabels('i'),
+      imageLabelsOf: (d) => d.imageLabelsOf(['i', 'j']),
+      labelImage: (d) => d.labelImage('i', { a: 'b' }),
+      startContainer: (d) => d.startContainer('c'),
+      imageConfig: (d) => d.imageConfig('i'),
+      runOnVolume: (d) => d.runOnVolume({ image: 'i', volume: 'v', target: '/w', entrypoint: 'sh', args: ['-c', 'true'], user: 'root', labels: { a: 'b' } }),
+      containerIdsWithLabel: (d) => d.containerIdsWithLabel('a=b'),
+      imageUserIds: (d) => d.imageUserIds('i', 'u'),
+    };
+    const unknown = Object.getOwnPropertyNames(ContainerAdapter.prototype).filter((name) => !noOwnCall.has(name) && !(name in exercised));
+    expect(unknown, 'a new member of ContainerAdapter: exercise it here and classify its calls').toEqual([]);
+    const all: string[][] = [];
+    await runWithDockerTarget(REMOTE, async () => {
+      for (const [name, call] of Object.entries(exercised)) {
+        runner.calls.length = 0;
+        // Only the calls count here; a method may reject the fake output of a later call (for example imageNames).
+        await call(docker).catch(() => undefined);
+        expect(runner.calls.length, `${name} issued no Docker call`).toBeGreaterThan(0);
+        all.push(...runner.calls.map((c) => c.args));
+      }
+    });
+    const keys = new Set<string>();
+    for (const args of all) {
+      const key = commandKey(args);
+      keys.add(key);
+      expect(READ_ONLY[key], `unclassified Docker call: docker ${args.join(' ')}`).toBeDefined();
+      expect(isReadOnlyDockerCall(args), `read-only: docker ${args.join(' ')}`).toBe(READ_ONLY[key]);
+    }
+    // Every entry of the table is issued by the adapter (no stale entry).
+    expect([...keys].sort()).toEqual(Object.keys(READ_ONLY).sort());
+  });
+
+  // Moved from dockerRouting.test.ts ('isReadOnlyDockerCall: the calls that may run again without any effect').
+  it('isReadOnlyDockerCall and dockerCommandWords: the calls that may run again without any effect', () => {
+    expect(isReadOnlyDockerCall(['info'])).toBe(true);
+    expect(isReadOnlyDockerCall(['volume', 'ls'])).toBe(true);
+    expect(isReadOnlyDockerCall(['stop', 'c'])).toBe(false);
+    expect(isReadOnlyDockerCall(['exec', 'c', 'git', 'status'])).toBe(false);
+    expect(dockerCommandWords(['--context', 'x', 'volume', 'rm', 'v'])).toEqual(['volume', 'rm']);
   });
 });

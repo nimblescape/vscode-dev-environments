@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { HelperBatchSession } from '../helperChannel/helperChannel';
-import { silentLogger, type RunResult } from '../ports';
+import { silentLogger } from '../ports';
 import { runWithBatchScope } from './batchScope';
 import { WorkspaceHelper, type HelperDocker, type HelperEngine } from './workspaceHelper';
 
@@ -35,9 +35,6 @@ class SocketLock implements HeldEnvironmentLock {
   readonly environmentId = 'e';
   readonly lost = new Promise<string>(() => {});
   readonly opens: { image: string; socket: string }[] = [];
-  async docker(): Promise<RunResult> {
-    throw new Error('no plain Docker call');
-  }
   async release(): Promise<void> {}
   async batch(p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> {
     this.opens.push({ image: p.image, socket: p.socket });

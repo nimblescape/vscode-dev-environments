@@ -38,16 +38,8 @@ import {
   type BootstrapDockerOptions,
   type ObjectKind,
 } from './bootstrapDocker';
-import type { DockerTarget } from './dockerHost';
-import { dockerCommandWords, isReadOnlyDockerCall, isRoutableDockerCall } from './dockerRouting';
-import { operationDockerTarget } from './dockerTargets';
-import { heldEnvironmentLock, type HeldEnvironmentLock } from './environmentLock';
-import { preparingWorker } from './workerPreparation';
+import { isReadOnlyDockerCall } from './dockerCli';
 import { isDevContainer } from '../worker/dockerEngine';
-import { HelperChannelError, HelperOperationError, type ChannelPullOptions } from '../helperChannel/helperChannel';
-import { pullReference } from '../helperChannel/protocol';
-import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
-import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 
 import {
   mapContainerState,
@@ -69,7 +61,7 @@ import {
 // Plan step 11B3: the Docker objects and their reading moved to dockerObjects.ts (one definition for both adapters).
 export { mapContainerState, toLabels, type ContainerInfo, type ImageInfo, type MountTarget, type NetworkInfo, type VolumeInfo, type VolumeSubpathMount };
 
-// Plan step 5, PR A: the classification moved to dockerRouting.ts.
+// Plan step 5, PR A: the classification of the calls that only read (plan step 11F2: in dockerCli.ts).
 export { isReadOnlyDockerCall };
 
 // Plan step 11F2: the Docker CLI of the bootstrap moved to bootstrapDocker.ts.
@@ -93,37 +85,6 @@ const INSPECT_BATCH_SIZE = 50;
 export interface RegistryLogin extends Credentials {
   /** Registry host, for example `ghcr.io`. */
   registry: string;
-}
-
-/**
- * Plan step 5, PR A: runs one plain Docker call (isRoutableDockerCall) on the engine of `target` through the worker.
- * Plan step 5, PR D (rule D1 of 2026-09-30): it makes the worker ready first and never returns without the call:
- * rejects like HelperChannels.docker (an AbortError; HelperChannelError `unavailable`: the worker could not be made ready;
- * `unsendable` or `closed`: not sent; `lost` or `protocol`, HelperOperationError: the outcome is not known).
- */
-export type DockerRouter = (
-  target: DockerTarget,
-  args: readonly string[],
-  options: Pick<RunOptions, 'timeoutMs' | 'signal'>,
-) => Promise<RunResult>;
-
-/**
- * Plan step 10A (decision of 2026-10-03): the operations of the worker over the Engine API (HelperChannels.pull and
- * startContainers in the extension), for an operation on `target`. They reject like HelperChannels.docker.
- */
-export interface WorkerEngine {
-  pull(target: DockerTarget, reference: string, options: ChannelPullOptions): Promise<void>;
-  startContainers(target: DockerTarget, ids: readonly string[], options: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;
-}
-
-/** Plan step 11F2: the options of BootstrapDocker, and the credentials of a pull through the worker. */
-export interface ContainerAdapterOptions extends BootstrapDockerOptions {
-  /**
-   * Plan step 10A (decision of 2026-10-03): the registry credentials that Docker has stored on this computer
-   * (DockerCredentialStore.getForPull: an identity token as `{ username: '<token>', password: <token> }`). A pull through the worker sends them as the secret of the operation, as the Docker CLI on
-   * this computer sent them to the engine before (the worker has no credentials of its own).
-   */
-  storedCredentials?: (registry: string, signal?: AbortSignal) => Promise<Credentials | undefined>;
 }
 
 /** Label that Docker Compose gives each container, network, and volume of a project. */
@@ -246,14 +207,12 @@ export function isProtectedDockerEndpoint(host: string | undefined, env: NodeJS.
 
 /**
  * The Docker CLI of the pipeline before the worker ran it (concept 7.2): the bootstrap's calls (BootstrapDocker) and the
- * calls of the flows, routed through the worker within an operation. Plan step 11F2: no longer used by the extension;
- * removed with the rest of the CLI adapter beyond the bootstrap (plan step 11I).
+ * calls of the flows, each directly by the Docker CLI of this computer. Plan step 11F2: no longer used by the extension;
+ * removed with the rest of the CLI adapter beyond the bootstrap (plan step 11I). Plan step 11I1, PR B2: no call goes
+ * through the worker any more (the routing of the plain calls, of the pull and of the start of containers is gone with
+ * the relay of the worker, PR B1).
  */
 export class ContainerAdapter extends BootstrapDocker {
-  private router: DockerRouter | undefined;
-  private workerEngine: WorkerEngine | undefined;
-  private readonly storedCredentials: ContainerAdapterOptions['storedCredentials'];
-
   /** See BootstrapDocker. */
   constructor(
     runner: ProcessRunner,
@@ -261,194 +220,14 @@ export class ContainerAdapter extends BootstrapDocker {
     env: NodeJS.ProcessEnv,
     logger: Logger,
     platform: NodeJS.Platform = process.platform,
-    options: ContainerAdapterOptions = {},
+    options: BootstrapDockerOptions = {},
   ) {
     super(runner, dockerPath, env, logger, platform, options);
-    this.storedCredentials = options.storedCredentials;
   }
 
-  /**
-   * Plan step 5, PR A: the worker for the plain Docker calls of an operation (HelperChannels.docker in the extension).
-   * Undefined: every call runs directly.
-   */
-  setRouter(router: DockerRouter | undefined): void {
-    this.router = router;
-  }
-
-  /** Plan step 10A: the operations of the worker over the Engine API (WorkerEngine). Undefined: they run directly. */
-  setWorkerEngine(engine: WorkerEngine | undefined): void {
-    this.workerEngine = engine;
-  }
-
-  /**
-   * Plan step 10A (decision of 2026-10-03): where an operation of the Engine API goes, like `run`: the worker that holds
-   * the lock of the environment, the worker of the operation's engine, or (outside an operation, while the worker is
-   * prepared, or without a worker) the Docker CLI of this computer.
-   */
-  private engineRoute(): { kind: 'lock'; lock: HeldEnvironmentLock } | { kind: 'worker'; target: DockerTarget; engine: WorkerEngine } | { kind: 'direct' } {
-    const held = heldEnvironmentLock();
-    if (held !== undefined) return { kind: 'lock', lock: held.lock };
-    const target = this.workerEngine === undefined ? undefined : operationDockerTarget();
-    if (target !== undefined && this.workerEngine !== undefined && !preparingWorker()) return { kind: 'worker', target, engine: this.workerEngine };
-    return { kind: 'direct' };
-  }
-
-  /**
-   * Plan step 10A: an operation of the Engine API through the lock's worker (`viaLock`) or the operation's worker
-   * (`viaWorker`); `command` names it in errors (`pull <image>`). Never the way without the worker (D1). Errors as in
-   * runRouted: the worker could not be prepared → UserFacingError('helperFailed'); not sent → CommandError (it did not
-   * run); a failure of the operation → CommandError with its message; a lost worker → CommandError (outcome not known).
-   */
-  private async throughWorker(
-    command: string,
-    signal: AbortSignal | undefined,
-    route: Exclude<ReturnType<ContainerAdapter['engineRoute']>, { kind: 'direct' }>,
-    viaLock: (lock: HeldEnvironmentLock) => Promise<void>,
-    viaWorker: (engine: WorkerEngine, target: DockerTarget) => Promise<void>,
-  ): Promise<void> {
-    if (route.kind === 'lock') {
-      const lost = heldEnvironmentLock()?.lostReason();
-      if (lost !== undefined) throw new CommandError(`docker ${command}`, null, '', `The lock of the environment on the Docker host was lost (${lost}); docker ${command} was not run.`);
-    }
-    try {
-      if (route.kind === 'lock') await viaLock(route.lock);
-      else await viaWorker(route.engine, route.target);
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      if (signal?.aborted) throw abortError();
-      if (error instanceof HelperChannelError && error.code === 'unavailable') {
-        this.logger.warn(`docker ${command} was refused: the worker on the Docker host could not be prepared (${error.message}).`);
-        throw new UserFacingError('helperFailed', Messages.workerUnavailable(error.message), error.message);
-      }
-      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
-        throw new CommandError(`docker ${command}`, null, '', `docker ${command} was not sent to the worker on the Docker host (${errorMessage(error)}); it did not run.`);
-      }
-      if (error instanceof HelperOperationError) throw new CommandError(`docker ${command}`, 1, '', error.message);
-      if (error instanceof HelperChannelError) {
-        throw new CommandError(`docker ${command}`, null, '', `The connection to the Docker host was lost; the outcome of docker ${command} is not known.`);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Plan step 10A (decision of 2026-10-03): `docker start <id>` of a container by its full ID; within an operation by the
-   * worker (the operation `startContainers` over the Engine API), else by the Docker CLI. Throws CommandError.
-   */
+  /** `docker start <id>` of a container by its full ID, by the Docker CLI. Throws CommandError. */
   async startContainer(id: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
-    const route = this.engineRoute();
-    if (route.kind === 'direct') {
-      await this.runChecked(['start', id], options);
-      return;
-    }
-    await this.throughWorker(
-      `start ${id.slice(0, 12)}`,
-      options.signal,
-      route,
-      async (lock) => {
-        if (lock.startContainers === undefined) throw new HelperChannelError('unsendable', 'the worker that holds the lock cannot start containers');
-        await lock.startContainers([id], options);
-      },
-      (engine, target) => engine.startContainers(target, [id], options),
-    );
-  }
-
-  /**
-   * Raw call. Resolves also for a non-zero exit code. Throws UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled)
-   * without a CLI, or when the CLI cannot be started anymore (removed after it was found).
-   *
-   * Plan step 5, PR A: within an operation (operationDockerTarget), a routable call (isRoutableDockerCall) goes through
-   * the router when one is set. Plan step 5, PR D (rule D1 of 2026-09-30): only through it, never directly (see
-   * runRouted); the exception are the calls that make the state for the worker consistent (workerPreparation.ts: the
-   * check whether Docker runs, the helper image), which run directly.
-   */
-  override async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    // Plan step 5, PR B: an operation that holds the lock of an environment (environmentLock.ts).
-    const held = heldEnvironmentLock();
-    if (held !== undefined) return this.runLocked(held, args, options);
-    const target = this.router === undefined ? undefined : operationDockerTarget();
-    // Plan step 5, PR D (rule D1 of 2026-09-30): no direct way after the router.
-    if (target !== undefined && isRoutableDockerCall(args, options) && !preparingWorker()) return this.runRouted(target, args, options);
-    return this.runDirect(args, options);
-  }
-
-  /**
-   * Plan step 5, PR B: a call while the operation holds the lock of an environment. After the lock was lost, no call runs
-   * (CommandError). A routable call goes only through the worker that holds the lock: when it was not sent, or the worker
-   * was lost or failed while it ran, it throws a CommandError and never runs directly (also a call that only reads), so
-   * a lost lock never lets the operation go on without it. Any other call runs directly, as without the lock.
-   */
-  private async runLocked(held: NonNullable<ReturnType<typeof heldEnvironmentLock>>, args: readonly string[], options: RunOptions): Promise<RunResult> {
-    const command = dockerCommandWords(args).join(' ');
-    const lost = held.lostReason();
-    if (lost !== undefined) {
-      throw new CommandError(commandText(args), null, '', `The lock of the environment on the Docker host was lost (${lost}); docker ${command} was not run.`);
-    }
-    if (!isRoutableDockerCall(args, options)) return this.runDirect(args, options);
-    try {
-      return await held.lock.docker(args, { timeoutMs: options.timeoutMs, signal: options.signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      if (options.signal?.aborted) throw abortError();
-      this.logger.warn(`docker ${command} through the worker that holds the lock failed (${errorMessage(error)}); it is not run directly.`);
-      // PR #74 review round 1 (A-R1-2): a call that was not sent (no place of its own, or a closed channel) did not run.
-      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
-        throw new CommandError(
-          commandText(args),
-          null,
-          '',
-          `docker ${command} was not sent to the worker that holds the lock of the environment (${errorMessage(error)}); it did not run.`,
-        );
-      }
-      throw new CommandError(
-        commandText(args),
-        null,
-        '',
-        `The connection to the worker that holds the lock of the environment failed; the outcome of docker ${command} is not known.`,
-      );
-    }
-  }
-
-  /**
-   * run through the router. Plan step 5, PR D (rule D1 of 2026-09-30): never directly, whatever happens. The worker could
-   * not be made ready (the helper image, the open): UserFacingError('helperFailed', Messages.workerUnavailable) with the
-   * cause, nothing ran. Not sent (`unsendable`, or `closed` twice): a CommandError, it did not run. The worker was lost,
-   * answered wrongly, or the operation failed in it: a call that only reads throws a CommandError that says it failed
-   * through the worker (it is not run directly); any other call throws a CommandError, because its outcome is not known,
-   * and is never repeated.
-   */
-  private async runRouted(target: DockerTarget, args: readonly string[], options: RunOptions): Promise<RunResult> {
-    const router = this.router;
-    if (router === undefined) return this.runDirect(args, options);
-    try {
-      return await router(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      if (options.signal?.aborted) throw abortError();
-      const command = dockerCommandWords(args).join(' ');
-      if (error instanceof HelperChannelError && error.code === 'unavailable') {
-        this.logger.warn(`docker ${command} was refused: the worker on the Docker host could not be prepared (${error.message}); it is not run directly.`);
-        throw new UserFacingError('helperFailed', Messages.workerUnavailable(error.message), error.message);
-      }
-      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
-        this.logger.warn(`docker ${command} was not sent to the worker (${errorMessage(error)}); it is not run directly.`);
-        throw new CommandError(commandText(args), null, '', `docker ${command} was not sent to the worker on the Docker host (${errorMessage(error)}); it did not run.`);
-      }
-      const unknownOutcome =
-        (error instanceof HelperChannelError && (error.code === 'lost' || error.code === 'protocol')) || error instanceof HelperOperationError;
-      if (!unknownOutcome) throw error;
-      if (isReadOnlyDockerCall(args)) {
-        this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); it is not run directly.`);
-        throw new CommandError(commandText(args), null, '', `docker ${command} failed through the worker on the Docker host (${errorMessage(error)}).`);
-      }
-      this.logger.warn(`docker ${command} through the worker failed (${errorMessage(error)}); its outcome is not known, and it is not repeated.`);
-      throw new CommandError(
-        commandText(args),
-        null,
-        '',
-        `The connection to the Docker host was lost; the outcome of docker ${command} is not known.`,
-      );
-    }
+    await this.runChecked(['start', id], options);
   }
 
   /**
@@ -603,13 +382,12 @@ export class ContainerAdapter extends BootstrapDocker {
 
   /**
    * `docker exec` in a running container. Resolves also for a non-zero exit code. Standard input is attached (`-i`) only
-   * when `input` or `secretInput` is given.
+   * when `input` is given.
    *
    * Plan step 6, PR C (Q4 of 2026-10-01): `secretInput` is a standard input that is a secret (the GitHub token written
-   * into the dev container). It goes only through the worker that holds the lock of the environment (`docker exec -i` in
-   * the worker, the token as the secret of the operation, masked in what comes back): never as a direct `docker exec`,
-   * never in an argument or a variable. Without a held lock, or after the lock was lost, the call is refused
-   * (CommandError) and nothing runs (rule D1).
+   * into the dev container): never a direct `docker exec`, never in an argument or a variable. Plan step 11I1, PR B2: it
+   * went only through the worker that held the lock of the environment, a way that is gone; the token is written by the
+   * worker's own pipeline (EngineDocker.exec), so here the call is always refused (CommandError) and nothing runs.
    */
   exec(
     container: string,
@@ -622,32 +400,10 @@ export class ContainerAdapter extends BootstrapDocker {
     if (options.user) args.push('-u', options.user);
     if (options.workdir) args.push('-w', options.workdir);
     args.push(container, ...command);
-    if (options.secretInput !== undefined) return this.runWithSecretInput(args, options.secretInput, { signal: options.signal, timeoutMs: options.timeoutMs });
+    if (options.secretInput !== undefined) {
+      return Promise.reject(new CommandError(commandText(args), null, '', 'docker exec with a secret input runs only in the worker on the Docker host; it was not run.'));
+    }
     return this.run(args, { input: options.input, signal: options.signal, timeoutMs: options.timeoutMs });
-  }
-
-  /** Plan step 6, PR C: see `exec` (`secretInput`). */
-  private async runWithSecretInput(args: readonly string[], secretInput: string, options: Pick<RunOptions, 'signal' | 'timeoutMs'>): Promise<RunResult> {
-    const command = dockerCommandWords(args).join(' ');
-    const held = heldEnvironmentLock();
-    if (held === undefined) {
-      throw new CommandError(commandText(args), null, '', `docker ${command} with a secret input runs only through the worker that holds the lock of the environment; it was not run.`);
-    }
-    const lost = held.lostReason();
-    if (lost !== undefined) {
-      throw new CommandError(commandText(args), null, '', `The lock of the environment on the Docker host was lost (${lost}); docker ${command} was not run.`);
-    }
-    try {
-      return await held.lock.docker(args, { timeoutMs: options.timeoutMs, signal: options.signal, secretInput });
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      if (options.signal?.aborted) throw abortError();
-      this.logger.warn(`docker ${command} with a secret input through the worker that holds the lock failed (${errorMessage(error)}); it is not run directly.`);
-      if (error instanceof HelperChannelError && (error.code === 'unsendable' || error.code === 'closed')) {
-        throw new CommandError(commandText(args), null, '', `docker ${command} was not sent to the worker that holds the lock of the environment (${errorMessage(error)}); it did not run.`);
-      }
-      throw new CommandError(commandText(args), null, '', `The connection to the worker that holds the lock of the environment failed; the outcome of docker ${command} is not known.`);
-    }
   }
 
   /** Plan step 11B3: `Config` of `docker image inspect` (a typed call instead of runChecked). Throws CommandError. */
@@ -950,12 +706,6 @@ export class ContainerAdapter extends BootstrapDocker {
   ): Promise<void> {
     const onOutput = options.onOutput ?? ((text: string) => this.logger.output(text));
     const login = options.credentials;
-    // Plan step 10A (decision of 2026-10-03): within an operation, the worker pulls over the Engine API.
-    const route = this.engineRoute();
-    if (route.kind !== 'direct') {
-      await this.pullThroughWorker(reference, login, onOutput, options.signal, route);
-      return;
-    }
     if (!login) {
       this.logger.info(`Pulling image ${reference}.`);
       await this.runChecked(['pull', reference], { signal: options.signal, onStdout: onOutput, onStderr: onOutput });
@@ -986,59 +736,6 @@ export class ContainerAdapter extends BootstrapDocker {
         .rm(configDir, { recursive: true, force: true })
         .catch((error: unknown) => this.logger.warn(`The folder ${configDir} could not be removed: ${errorMessage(error)}`));
     }
-  }
-
-  /**
-   * Plan step 10A (decision of 2026-10-03): the pull of `reference` (with `latest` when it has no tag) by the worker. The
-   * credentials are `login`, or else those that Docker has stored on this computer for the registry (storedCredentials);
-   * they travel only as the secret of the operation, and only to an engine behind a local socket or SSH (the worker's
-   * channel runs over the connection of the operation's engine): `login` to any other engine throws
-   * UserFacingError('unencryptedDockerConnection') before anything is sent; stored credentials are then left out.
-   */
-  private async pullThroughWorker(
-    reference: string,
-    login: RegistryLogin | undefined,
-    onOutput: (text: string) => void,
-    signal: AbortSignal | undefined,
-    route: Exclude<ReturnType<ContainerAdapter['engineRoute']>, { kind: 'direct' }>,
-  ): Promise<void> {
-    const target = route.kind === 'worker' ? route.target : operationDockerTarget();
-    const protectedEngine = target === undefined || target.kind === 'local' || target.kind === 'remote' || isProtectedDockerEndpoint(target.endpoint, this.env, this.platform);
-    if (login !== undefined && !protectedEngine) {
-      throw new UserFacingError(
-        'unencryptedDockerConnection',
-        Messages.unencryptedDockerConnection,
-        `The credentials for ${login.registry} are not sent to the Docker endpoint ${target?.endpoint ?? ''}: it is not local, and TLS is not set up with DOCKER_TLS_VERIFY and DOCKER_CERT_PATH.`,
-      );
-    }
-    const pulled = pullReference(reference);
-    let credentials: ChannelPullOptions['credentials'];
-    if (login !== undefined) {
-      credentials = { username: login.username, password: login.password, serveraddress: credentialServerName(login.registry) };
-    } else if (protectedEngine && this.storedCredentials !== undefined) {
-      const registry = parseImageReference(pulled)?.registry;
-      const stored = registry === undefined ? undefined : await this.storedCredentials(registry, signal);
-      if (signal?.aborted) throw abortError();
-      if (stored !== undefined && registry !== undefined) {
-        // Review round 1 of PR #89 (A-R1-3): an identity token of `docker login` goes as such (IDENTITY_TOKEN_USER).
-        credentials =
-          stored.username === IDENTITY_TOKEN_USER
-            ? { identityToken: stored.password, serveraddress: credentialServerName(registry) }
-            : { username: stored.username, password: stored.password, serveraddress: credentialServerName(registry) };
-      }
-    }
-    this.logger.info(`Pulling image ${pulled} through the worker${credentials !== undefined ? ` with the credentials for ${credentials.serveraddress}` : ''}.`);
-    const options: ChannelPullOptions = { signal, onOutput, ...(credentials !== undefined ? { credentials } : {}) };
-    await this.throughWorker(
-      `pull ${pulled}`,
-      signal,
-      route,
-      async (lock) => {
-        if (lock.pull === undefined) throw new HelperChannelError('unsendable', 'the worker that holds the lock cannot pull images');
-        await lock.pull(pulled, options);
-      },
-      (engine, workerTarget) => engine.pull(workerTarget, pulled, options),
-    );
   }
 
   /**

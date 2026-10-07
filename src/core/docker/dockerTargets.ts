@@ -5,7 +5,7 @@
 // The Docker host of an operation (unit 7). The current Docker context is read at the start of each operation
 // (`docker context inspect`), never cached beyond it: a context switch while VS Code runs takes effect for the next
 // operation. An operation keeps the host it started with: its Docker calls get DOCKER_CONTEXT with the name of the
-// context that it read (ContainerAdapter.run), so a switch in the middle does not move half of it to another engine.
+// context that it read (BootstrapDocker.run), so a switch in the middle does not move half of it to another engine.
 import { AsyncLocalStorage } from 'async_hooks';
 import { errorMessage } from '../errors';
 import type { Logger, RunOptions, RunResult } from '../ports';

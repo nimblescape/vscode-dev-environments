@@ -17,7 +17,6 @@ import { dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './do
 import { isSshClosedBeforeLogin } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
 import { operationDockerTarget } from './dockerTargets';
-import { runPreparingWorker } from './workerPreparation';
 
 /** Result of `docker info`. */
 export interface DaemonStatus {
@@ -373,8 +372,9 @@ export class BootstrapDocker {
     let result: RunResult;
     try {
       // Plan step 5, PR D (rule D1 of 2026-09-30): the check whether Docker runs comes before the worker (which needs it),
-      // so "Docker is not running" stays its own answer: directly, unless the lock of an environment is held.
-      result = await runPreparingWorker(() => this.run(['info', '--format', '{{json .ServerVersion}}'], { signal, timeoutMs }));
+      // so "Docker is not running" stays its own answer. Plan step 11I1, PR B2: directly, like every call (the scope of
+      // the worker preparation, which kept it from the routing through the worker, is gone with that routing).
+      result = await this.run(['info', '--format', '{{json .ServerVersion}}'], { signal, timeoutMs });
     } catch (error) {
       if (isAbortError(error)) throw error;
       return { running: false, detail: errorMessage(error) };

@@ -8,7 +8,6 @@
 // rebuilt when a check of its base image asked for it, and old helper images are removed. No `vscode`.
 import * as crypto from 'crypto';
 import type { BootstrapDocker } from '../docker/bootstrapDocker';
-import { runPreparingWorker } from '../docker/workerPreparation';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { HELPER_DOCKER_SOCKET } from '../names';
@@ -212,12 +211,6 @@ export class HelperImages {
    * does not answer, is no failed build).
    */
   async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
-    // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its calls
-    // run without the worker (workerPreparation.ts).
-    return runPreparingWorker(() => this.ensureImagePresentNow(options));
-  }
-
-  private async ensureImagePresentNow(options: PresentImageOptions): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     this.adoptEngine(engine.key);
     if (this.imagePromise && this.imageReadyAt !== undefined && !(await this.cachedImageCurrent())) this.resetImage();
@@ -234,22 +227,20 @@ export class HelperImages {
   /**
    * PR #76 review round 1 (A-R1-1, A-R1-2): whether the current helper tag exists on the engine of the operation, for the
    * refresh of the sidebar, which never builds it and never joins a pending build (its checks have time limits). Throws
-   * UserFacingError('helperFailed') when the tag is missing or cannot be checked; an AbortError when `signal` aborts. In
-   * the scope of the worker preparation, like ensureImagePresent (its check cannot go through the worker).
+   * UserFacingError('helperFailed') when the tag is missing or cannot be checked; an AbortError when `signal` aborts.
    */
   async checkImagePresent(options: { signal?: AbortSignal } = {}): Promise<void> {
-    const present = await runPreparingWorker(() => this.presentTag(options.signal));
+    const present = await this.presentTag(options.signal);
     if (present === undefined) throw new UserFacingError('helperFailed', Messages.helperImageNotPresent);
   }
 
   /**
    * Review round 4 of PR #85 (A-R4-1): the current helper tag with the ID of its image when the tag exists on the engine
    * of the operation, else `undefined` (missing, or it cannot be checked); never builds and never joins a build (its
-   * check has a time limit). An AbortError when `signal` aborts. In the scope of the worker preparation, like
-   * checkImagePresent.
+   * check has a time limit). An AbortError when `signal` aborts.
    */
   async presentImage(options: { signal?: AbortSignal } = {}): Promise<HelperImageUse | undefined> {
-    return runPreparingWorker(() => this.presentTag(options.signal));
+    return this.presentTag(options.signal);
   }
 
   /**
@@ -309,13 +300,7 @@ export class HelperImages {
    * a stop or a delete. Review round 2 of PR #64 (A-N1): a run with the helper image of an open
    * (`image`) does not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
-  private image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
-    // Plan step 5, PR D (rule D1 of 2026-09-30): the check and the build of the helper image run without the worker, which
-    // is opened from it (workerPreparation.ts); so also the shared promise of the cache never waits for the worker.
-    return runPreparingWorker(() => this.imageNow(options, recheck));
-  }
-
-  private async imageNow(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
+  private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
     // Unit 7: an image of another engine (the Docker context changed) is not reused.
     this.adoptEngine(engine.key);

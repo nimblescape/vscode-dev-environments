@@ -6546,7 +6546,8 @@ export class EnvironmentService extends OperationBase {
    * (the worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
-   * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in
+   * volume steps run in the batch helper of the lock (environmentLock.ts; plan step 11I1, PR B2: no Docker call goes
+   * through the lock any more, the pipeline of the worker uses its engine). The lock is released in
    * `finally`. Re-entrant: an operation that holds the lock of `env` runs `fn` at once. The caller took its busy mark
    * first (Delete), so a refusal leaves nothing behind that its own `finally` does not clear. Plan step 6, PR A: also
    * the opens (openExisting: Start, Rebuild, Select configuration, Clone again; openFirst), see there.

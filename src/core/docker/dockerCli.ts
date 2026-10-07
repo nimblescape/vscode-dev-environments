@@ -180,8 +180,8 @@ export function dockerProcessEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Platfo
   return result;
 }
 
-// Plan step 11F2: the words of a Docker command and the calls that only read (from dockerRouting.ts), for the Docker
-// CLI of the bootstrap.
+// Plan step 11F2: the words of a Docker command and the calls that only read (from dockerRouting.ts, removed in plan
+// step 11I1, PR B2), for the Docker CLI of the bootstrap.
 
 /** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */
 const GLOBAL_OPTIONS_WITH_VALUE = new Set(['-H', '--host', '-c', '--context', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']);

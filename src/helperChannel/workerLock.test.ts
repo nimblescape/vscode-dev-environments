@@ -53,7 +53,7 @@ function setup(flock: () => Promise<{ exitCode: number | null }>, options: { ope
 }
 
 describe("the lock of the worker's own pipeline (plan step 11B3b)", () => {
-  it('holds the lock until release; opens the batch session of the flow; refuses a Docker call', async () => {
+  it('holds the lock until release; opens the batch session of the flow; has no Docker call', async () => {
     const { lock, events, opened, session } = setup(async () => ({ exitCode: 0 }));
     const held = await lock(ID, 10, undefined);
     expect(held.environmentId).toBe(ID);
@@ -61,7 +61,9 @@ describe("the lock of the worker's own pipeline (plan step 11B3b)", () => {
     expect(events).toEqual(['open', `flock ${flockArgs(10, FLOCK_FD).join(' ')}`]);
     expect(await held.batch?.({ volume: 'v', image: 'sha256:x', socket: '/s' })).toBe(session);
     expect(opened).toEqual([{ volume: 'v', image: 'sha256:x', socket: '/s' }]);
-    await expect(held.docker(['ps'], {})).rejects.toThrow('not allowed');
+    // Plan step 11I1, PR B2: changed expectation (before: its `docker` refused a call with "not allowed"): a held lock
+    // has no Docker call at all any more (HeldEnvironmentLock.docker is gone with the routing of ContainerAdapter).
+    expect(Object.keys(held).sort()).toEqual(['batch', 'environmentId', 'lost', 'release']);
     await held.release();
     expect(events.at(-1)).toBe('close');
   });

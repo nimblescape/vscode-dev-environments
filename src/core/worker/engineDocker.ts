@@ -421,8 +421,8 @@ export class EngineDocker implements EnvironmentDocker {
       throw new EngineError(`The pull of ${reference} with the credentials for ${login.registry} needs them as the registry secret of the operation.`, 0);
     }
     this.logger.info(login === undefined ? `Pulling image ${reference}.` : `Pulling image ${reference} with the credentials for ${login.registry}.`);
-    // Review round 2 of 11B3a (A-R2-1): as ContainerAdapter.pullThroughWorker, a reference without a tag is pulled as
-    // `:latest`, never as every tag of the repository.
+    // Review round 2 of 11B3a (A-R2-1): a reference without a tag is pulled as `:latest` (pullReference), never as every
+    // tag of the repository.
     await this.engine.pull(pullReference(reference), {
       ...(login !== undefined
         ? {

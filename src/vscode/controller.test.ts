@@ -4397,7 +4397,7 @@ describe('the Docker host of the current Docker context (unit 7)', () => {
     let currentContext = 'devenv-remote-11111111';
     const cli = {
       isInstalled: () => true,
-      // As ContainerAdapter.run: the context of the running operation (DOCKER_CONTEXT) wins over the current one.
+      // As BootstrapDocker.run: the context of the running operation (DOCKER_CONTEXT) wins over the current one.
       run: vi.fn(async (_args: readonly string[]) => {
         const name = operationDockerTarget()?.context ?? currentContext;
         return { exitCode: 0, stdout: JSON.stringify({ Name: name, Endpoints: { docker: { Host: endpoints[name] } } }), stderr: '', timedOut: false };

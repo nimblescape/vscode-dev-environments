@@ -80,9 +80,6 @@ class FakeLock implements HeldEnvironmentLock {
   readonly events: string[] = [];
   openError: Error | undefined;
   stepResult: (kind: BatchStepKind, session: FakeSession) => Promise<RunResult> = async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
-  async docker(): Promise<RunResult> {
-    throw new Error('not used');
-  }
   async release(): Promise<void> {}
   batch = async (p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession> => {
     this.opens.push(p);
@@ -249,7 +246,7 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
 
   it('D1: a lock without batch, a step for another volume, and an image without an ID refuse', async () => {
     const cases: Array<[string, (helper: WorkspaceHelper) => Promise<unknown>, (lock: FakeLock) => HeldEnvironmentLock, string]> = [
-      ['no batch', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), (lock) => ({ ...lock, environmentId: lock.environmentId, lost: lock.lost, docker: lock.docker, release: lock.release, batch: undefined }), 'has no batch helper'],
+      ['no batch', (helper) => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), (lock) => ({ ...lock, environmentId: lock.environmentId, lost: lock.lost, release: lock.release, batch: undefined }), 'has no batch helper'],
       // Plan step 7 (user decision of 2026-10-01): the per-step path is removed, and with it WorkspaceHelper.run, the run without a batch kind
       // (was: the case 'run', refused with "has no step in the batch helper"; every run now names its kind).
       // user decision 2026-10-02: Delete runs no Git: WorkspaceHelper.gitSummary is removed (was: refused with "has no
