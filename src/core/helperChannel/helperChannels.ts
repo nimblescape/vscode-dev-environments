@@ -98,10 +98,10 @@ export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume
 }
 
 export interface ChannelOpenDeps {
-  /** ContainerAdapter.start: `docker <args>` with the environment of the operation (its Docker context). */
+  /** BootstrapDocker.start: `docker <args>` with the environment of the operation (its Docker context). */
   start(args: readonly string[]): StartedProcess | undefined;
   /**
-   * Plan step 5, PR A: ContainerAdapter.runDirect: `docker <args>` without the worker, with the environment of the
+   * Plan step 5, PR A: BootstrapDocker.runDirect: `docker <args>` without the worker, with the environment of the
    * operation (the engine identity of the open).
    */
   runDirect(args: readonly string[], options?: RunOptions): Promise<RunResult>;

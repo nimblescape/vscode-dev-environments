@@ -56,7 +56,7 @@ export const CHANNEL_RESULT_GRACE_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_T
  * 1, P2, S6): the channel cannot carry this request (a line longer than the script reads, parameters beyond the limits
  * of the operation, a secret that cannot be masked); it was not sent. Plan step 5, PR D (rule D1 of 2026-09-30): neither
  * is taken the way without the channel (HelperChannels sends a `closed` one once more through a channel made ready
- * again; ContainerAdapter refuses the call). `lost`: the connection ended while the operation ran (its
+ * again). `lost`: the connection ended while the operation ran (its
  * outcome is not known). `open`: it could not be opened. `protocol`: the script answered with something invalid.
  * Plan step 5, PR D (rule D1 of 2026-09-30): `unavailable`: HelperChannels could not make the worker ready (the helper
  * image could not be prepared, the worker could not be opened); the call was refused and nothing ran.

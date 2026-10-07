@@ -192,7 +192,8 @@ export class EngineDocker implements EnvironmentDocker {
   }
 
   /**
-   * As ContainerAdapter.exec. `secretInput` is a secret that the operation holds (the worker got it through its request,
+   * `docker exec` over the Engine API (review round 1 of PR #119, A-L1: the CLI adapter refuses a secret input since plan
+   * step 11I1, PR B2; the token is written only here). `secretInput` is a secret that the operation holds (the worker got it through its request,
    * plan step 11A); it is the standard input of the process, never an argument.
    */
   async exec(
