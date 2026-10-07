@@ -73,8 +73,8 @@ export function timesFromEnv(env: NodeJS.ProcessEnv): { silenceMs?: number; idle
 
 /**
  * The handler of an uncaught error. A defect of the script must never leave the container running. Review round 1 (P5):
- * it still cancels what runs and removes the containers of their cleanup (the shutdown ends the process by itself, with
- * its own deadline); a timer ends it later in any case, and when the shutdown itself fails, at once.
+ * it still cancels what runs (the shutdown ends the process by itself, with its own deadline); a timer ends it later in
+ * any case, and when the shutdown itself fails, at once.
  */
 export function fatalHandler(server: Pick<ChannelServer, 'shutdown'>, exit: (code: number) => void): () => void {
   return () => {

@@ -25,8 +25,8 @@ export function workerEnvironmentLock(
     try {
       release = await takeEnvironmentLock(lockDeps, environmentId, waitSeconds, signal ? AbortSignal.any([context.signal, signal]) : context.signal);
     } catch (error) {
-      // As HelperChannels.lock gives them to the pipeline: a cancel is an AbortError, a holder elsewhere `busy`, anything
-      // else `unavailable` (nothing has changed).
+      // As the pipeline expects them (as the removed HelperChannels.lock gave them, plan step 11I1, PR B1): a cancel is an
+      // AbortError, a holder elsewhere `busy`, anything else `unavailable` (nothing has changed).
       if (error instanceof OperationError && error.code === 'cancelled') throw abortError();
       if (error instanceof OperationError && error.code === LOCK_BUSY_CODE) throw new EnvironmentLockError('busy', error.message);
       throw new EnvironmentLockError('unavailable', error instanceof Error ? error.message : String(error));

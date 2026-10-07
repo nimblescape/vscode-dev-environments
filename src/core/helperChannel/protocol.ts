@@ -21,9 +21,9 @@
 //      to sleep): it exits. The extension sends a ping every CHANNEL_PING_INTERVAL_MS while the channel is open.
 //   3. No operation for CHANNEL_SERVER_IDLE_EXIT_MS and none runs (the extension did not close it): it exits.
 //   4. `--rm` removes the container when the script ended; tini (the entry point of the image) passes signals on.
-// Before it exits, it cancels the operations that still run: their Docker calls end (SIGTERM, then SIGKILL) and the
-// containers that they started with their cleanup label are removed (`docker rm -f`, review round 1, S1: by the label
-// of the operation, never by a name, so no container that the operation did not start can be removed).
+// Before it exits, it cancels the operations that still run: their Docker calls end (SIGTERM, then SIGKILL), and the
+// batch helpers of their flows are removed by their session label (review round 1, S1: never by a name, so no container
+// that the operation did not start can be removed; src/helperChannel/batch.ts).
 import { createHash, randomBytes } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
@@ -63,7 +63,7 @@ export const CHANNEL_IDLE_CLOSE_MS = 10 * 60_000;
 export const CHANNEL_SERVER_IDLE_EXIT_MS = 15 * 60_000;
 /** The script ends a Docker call with SIGTERM, then after this time with SIGKILL. */
 export const CHANNEL_KILL_GRACE_MS = 5_000;
-/** Time limit of the `docker rm -f` of the cleanup of an operation. */
+/** Time limit of the removal of the containers of an operation by their label (the batch helper of a flow). */
 export const CHANNEL_CLEANUP_TIMEOUT_MS = 30_000;
 
 /** At most this many characters in one line from the extension (an operation with its parameters and its secret). */
@@ -183,7 +183,7 @@ export interface LogAnswer {
   text: string;
 }
 
-/** A piece of output of the operation `id` (of a tool that it runs, for the log; or data of the `docker` operation). */
+/** A piece of output of the operation `id` (of a tool that it runs, for the log; or data of a batch step). */
 export interface OutputAnswer {
   t: 'out';
   id: number;
@@ -390,9 +390,9 @@ export function parseSecrets(value: unknown): Secrets | undefined {
 }
 
 /**
- * Review round 1 (S1): the label of the containers that an operation starts and that its cancel removes. The caller
- * puts `--label nimblescape.devenv.channel-step=<value>` (channelStepLabel) on each container that it starts and names
- * the value as the cleanup of the operation; the cleanup removes exactly the containers with that label.
+ * Review round 1 (S1): the label of the containers that an operation starts and removes by it, never by a name. Plan
+ * step 11I1, PR B1: now the session label of a batch helper (`nimblescape.devenv.channel-step=<session>`,
+ * channelStepLabel), which the worker removes by that label (src/helperChannel/batch.ts).
  */
 export { LABEL_CHANNEL_STEP };
 
@@ -405,9 +405,8 @@ export function isCleanupLabel(value: unknown): value is string {
 }
 
 /**
- * A new cleanup label value (96 random bits). Use one per call and never again: the containers of a cancelled or lost
- * operation can still be removed later (the cleanup of the script can run up to 35 s after the cancel, and after a lost
- * connection only when the script ends by its silence).
+ * A new cleanup label value (96 random bits). Use one per batch session and never again: its containers can still be
+ * removed by the label after the session ended.
  */
 export function newCleanupLabel(): string {
   return randomBytes(12).toString('hex');
@@ -590,8 +589,7 @@ export function channelLabelValue(script: string): string {
 
 // ---- The operations of step 1 ----
 
-/** `docker`: one Docker call. Its output comes as `out` messages; the value is DockerOperationValue. */
-export const OP_DOCKER = 'docker';
+// Plan step 11I1, PR B1: the operation `docker` (one Docker call relayed for the extension) is gone.
 /** `probe`: whether the Docker CLI of the container reaches its engine; the value is ProbeValue. */
 export const OP_PROBE = 'probe';
 /**
@@ -606,28 +604,6 @@ export const SWEEP_MIN_AGE = '10m';
 /** The arguments of the sweep (the `-f` of prune only skips its question; it removes stopped containers only). */
 export function sweepArgs(): string[] {
   return ['container', 'prune', '-f', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `until=${SWEEP_MIN_AGE}`];
-}
-
-/** Limits of the `docker` operation. */
-export const MAX_DOCKER_ARGS = 1_000;
-export const MAX_DOCKER_ARG_LENGTH = 64 * 1024;
-export const MAX_DOCKER_INPUT_LENGTH = 1024 * 1024;
-
-/**
- * Parameters of `docker`: `docker <args>` without a shell. `input`: its standard input, then closed (the secret of the
- * operation instead when `inputIsSecret`). `cleanup` (review round 1, S1): a cleanup label value (isCleanupLabel); when
- * the operation is cancelled, the containers with the label channelStepLabel(cleanup) are removed. The args must put
- * that label on a container that the call starts.
- */
-export interface DockerOperationParams {
-  args: string[];
-  input?: string;
-  inputIsSecret?: boolean;
-  cleanup?: string;
-}
-
-export interface DockerOperationValue {
-  exitCode: number | null;
 }
 
 export interface ProbeValue {
@@ -662,33 +638,6 @@ export function engineIdentity(stdout: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-function isDockerArg(value: unknown): value is string {
-  return typeof value === 'string' && value.length <= MAX_DOCKER_ARG_LENGTH && !value.includes('\0');
-}
-
-/** The strict check of DockerOperationParams (the script). */
-export function parseDockerOperationParams(value: unknown): DockerOperationParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['args'], ['input', 'inputIsSecret', 'cleanup'])) return undefined;
-  const { args, input, inputIsSecret, cleanup } = value;
-  if (!Array.isArray(args) || args.length === 0 || args.length > MAX_DOCKER_ARGS || !args.every(isDockerArg)) return undefined;
-  if (input !== undefined && (typeof input !== 'string' || input.length > MAX_DOCKER_INPUT_LENGTH)) return undefined;
-  if (inputIsSecret !== undefined && typeof inputIsSecret !== 'boolean') return undefined;
-  if (inputIsSecret === true && input !== undefined) return undefined;
-  if (cleanup !== undefined && !isCleanupLabel(cleanup)) return undefined;
-  const params: DockerOperationParams = { args: args as string[] };
-  if (input !== undefined) params.input = input as string;
-  if (inputIsSecret === true) params.inputIsSecret = true;
-  if (cleanup !== undefined) params.cleanup = cleanup;
-  return params;
-}
-
-/** The check of DockerOperationValue (the extension). */
-export function parseDockerOperationValue(value: unknown): DockerOperationValue | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['exitCode'])) return undefined;
-  const { exitCode } = value;
-  return exitCode === null || (typeof exitCode === 'number' && Number.isInteger(exitCode)) ? { exitCode } : undefined;
 }
 
 /** The check of ProbeValue (the extension). */
@@ -808,15 +757,13 @@ export function parseRefreshValue(value: unknown, params: RefreshParams): Enviro
 
 // ---- Plan step 5, PR B: the environment lock ----
 
-/**
- * `lock`: the lock of one environment on the Docker host (decision 2026-09-29, "Concurrency"): the worker opens
- * lockFilePath (in the volume of the Session Monitor, mounted into every worker; O_NOFOLLOW, folder 0700, file 0600),
- * runs `flock -w <waitSeconds> -E LOCK_BUSY_EXIT <fd>` on the inherited file descriptor, reports the progress
- * LOCK_HELD_STEP when it holds the lock, and holds it until the operation is cancelled (at most LOCK_HOLD_LIMIT_MS). The
- * kernel frees the lock when the worker ends, whatever the way. The lock files are never deleted. Parameters LockParams;
- * the value is `{}`; a lock that stayed held elsewhere fails with the code LOCK_BUSY_CODE. It carries no secret.
- */
-export const OP_LOCK = 'lock';
+// The lock of one environment on the Docker host (decision 2026-09-29, "Concurrency"): the worker opens lockFilePath (in
+// the volume of the Session Monitor, mounted into every worker; O_NOFOLLOW, folder 0700, file 0600) and runs
+// `flock -w <waitSeconds> -E LOCK_BUSY_EXIT <fd>` on the inherited file descriptor (src/helperChannel/lock.ts). The kernel
+// frees the lock when the worker ends, whatever the way. The lock files are never deleted; a lock that stayed held
+// elsewhere fails with the code LOCK_BUSY_CODE. Plan step 11I1, PR B1: the operation `lock` (the lock held for the
+// extension) is gone; the flows of the worker take the lock themselves.
+
 /** The mount point of the volume of the Session Monitor in the worker (as REMOTE_MONITOR_STATE_DIR in the monitor). */
 export const LOCK_STATE_DIR = '/state';
 /** The folder of the lock files in that volume. */
@@ -830,48 +777,22 @@ export const LOCK_BUSY_CODE = 'busy';
  * holder elsewhere (the lock file, flock): nothing was changed, as `unavailable` of the lock before the move.
  */
 export const LOCK_UNAVAILABLE_CODE = 'lockUnavailable';
-/** The progress step that says that the lock is held. */
-export const LOCK_HELD_STEP = 'locked';
 /** The longest wait for a lock, in seconds. */
 export const MAX_LOCK_WAIT_SECONDS = 60;
 /**
- * The backstop of a held lock: the worker lets go of it after this time (6 hours). Plan step 6, PR A: before 2 hours,
- * which a first open (a long build, `up`, the lifecycle commands, and a question to the user that stays open, all under
- * the lock) could exceed; now the same as the longest life of a busy mark (BUSY_MARK_MAX_AGE_MS in src/core/busy.ts).
+ * The backstop of a held lock: 6 hours (plan step 11I1, PR B1: now only the limit of a batch helper, BATCH_HOLD_LIMIT_MS).
+ * Plan step 6, PR A: before 2 hours, which a first open (a long build, `up`, the lifecycle commands, and a question to
+ * the user that stays open, all under the lock) could exceed; now the same as the longest life of a busy mark
+ * (BUSY_MARK_MAX_AGE_MS in src/core/busy.ts).
  */
 export const LOCK_HOLD_LIMIT_MS = 6 * 60 * 60_000;
-/**
- * The lock operations of one worker at the same time. They do not take one of the MAX_CONCURRENT_OPERATIONS places: a
- * held lock would keep its place for the whole operation, and the Docker calls of that operation would wait behind it.
- */
-export const MAX_CONCURRENT_LOCKS = 16;
-/**
- * PR #74 review round 1 (A-R1-2): the Docker calls under held locks (HelperChannel `reserved`) of one worker at the same
- * time. They take none of the MAX_CONCURRENT_OPERATIONS places and never wait for one, so the other operations of the
- * window cannot starve an operation that holds a lock halfway. One call at a time per held lock, like the locks.
- */
-export const MAX_CONCURRENT_LOCKED_OPERATIONS = MAX_CONCURRENT_LOCKS;
-
-export interface LockParams {
-  environmentId: string;
-  waitSeconds: number;
-}
-
-/** The strict check of LockParams (both sides): a storage ID (isStorageId) and a whole wait of 1..MAX_LOCK_WAIT_SECONDS s. */
-export function parseLockParams(value: unknown): LockParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['environmentId', 'waitSeconds'])) return undefined;
-  const { environmentId, waitSeconds } = value;
-  if (!isStorageId(environmentId)) return undefined;
-  if (typeof waitSeconds !== 'number' || !Number.isInteger(waitSeconds) || waitSeconds < 1 || waitSeconds > MAX_LOCK_WAIT_SECONDS) return undefined;
-  return { environmentId, waitSeconds };
-}
 
 /** The folder of the lock files under `stateDir`. */
 export function lockFolder(stateDir: string = LOCK_STATE_DIR): string {
   return `${stateDir}/${LOCK_FOLDER}`;
 }
 
-/** The lock file of an environment (its ID checked by parseLockParams). */
+/** The lock file of an environment (its ID a storage ID, isStorageId). */
 export function lockFilePath(environmentId: string, stateDir: string = LOCK_STATE_DIR): string {
   return `${lockFolder(stateDir)}/${environmentId}.lock`;
 }
@@ -889,28 +810,8 @@ export function flockNoWaitArgs(fd: number): string[] {
   return ['-n', '-E', String(LOCK_BUSY_EXIT), String(fd)];
 }
 
-/**
- * Plan step 10A (decision of 2026-10-03): `pull`, the download of an image by the worker over the Engine API
- * (`POST /images/create`). Parameters PullParams; the secret of the operation is the registry password (only with
- * `username` and `serveraddress`), which the worker sends only in the header X-Registry-Auth. Its output is the progress
- * of the download, as `docker pull` prints it. Value: `{}`.
- */
-export const OP_PULL = 'pull';
-/** The longest image reference of a pull. */
-export const MAX_PULL_REFERENCE_LENGTH = 512;
-
-export interface PullParams {
-  /** The image, always with a tag or a digest (pullReference), so the engine never pulls every tag of a repository. */
-  reference: string;
-  /** With a secret: the user of the registry, and its server (`https://index.docker.io/v1/` for Docker Hub). */
-  username?: string;
-  serveraddress?: string;
-  /**
-   * Review round 1 of PR #89 (A-R1-3): the secret is an identity token of `docker login` (sent as `identitytoken`, with
-   * `serveraddress` and without `username`).
-   */
-  identityToken?: true;
-}
+// Plan step 11I1, PR B1: the operations `pull` and `startContainers` (plan step 10A) are gone; the flows of the worker
+// pull over the port of its engine (DockerEngine.pull), with a reference that has a tag or a digest (pullReference).
 
 /** A tag (as the Docker reference grammar has it) and a digest. */
 const PULL_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
@@ -932,53 +833,6 @@ export function pullReference(reference: string): string {
   if (reference.includes('@')) return reference;
   const lastSlash = reference.lastIndexOf('/');
   return reference.lastIndexOf(':') > lastSlash ? reference : `${reference}:latest`;
-}
-
-/** The strict check of PullParams (both sides). */
-export function parsePullParams(value: unknown): PullParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['reference'], ['username', 'serveraddress', 'identityToken'])) return undefined;
-  const { reference, username, serveraddress } = value;
-  if (typeof reference !== 'string' || reference.length === 0 || reference.length > MAX_PULL_REFERENCE_LENGTH) return undefined;
-  if (/[\s\0]/.test(reference) || reference.startsWith('-') || !hasTagOrDigest(reference)) return undefined;
-  const { identityToken } = value;
-  if (identityToken !== undefined && (identityToken !== true || username !== undefined || typeof serveraddress !== 'string')) return undefined;
-  if (identityToken === undefined && (username === undefined) !== (serveraddress === undefined)) return undefined;
-  const params: PullParams = { reference };
-  if (identityToken === true && typeof serveraddress === 'string') {
-    if (serveraddress.length === 0 || serveraddress.length > 512 || /[\s\0]/.test(serveraddress)) return undefined;
-    params.serveraddress = serveraddress;
-    params.identityToken = true;
-    return params;
-  }
-  if (username !== undefined) {
-    if (typeof username !== 'string' || username.length === 0 || username.length > 256 || /[\0\n\r]/.test(username)) return undefined;
-    if (typeof serveraddress !== 'string' || serveraddress.length === 0 || serveraddress.length > 512 || /[\s\0]/.test(serveraddress)) return undefined;
-    params.username = username;
-    params.serveraddress = serveraddress;
-  }
-  return params;
-}
-
-/**
- * Plan step 10A (decision of 2026-10-03): `startContainers`, `POST /containers/<id>/start` of each container by its full
- * ID, in order (the stopped side services of a Docker Compose dev container). No secret. Value: `{}`; a container that
- * runs already counts as started.
- */
-export const OP_START_CONTAINERS = 'startContainers';
-/** The most containers of one startContainers. */
-export const MAX_START_CONTAINERS = 64;
-
-export interface StartContainersParams {
-  ids: string[];
-}
-
-/** The strict check of StartContainersParams (both sides). */
-export function parseStartContainersParams(value: unknown): StartContainersParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['ids'])) return undefined;
-  const { ids } = value;
-  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_START_CONTAINERS) return undefined;
-  if (!ids.every((id) => typeof id === 'string' && /^[0-9a-f]{64}$/.test(id))) return undefined;
-  return { ids: [...(ids as string[])] };
 }
 
 /**
@@ -1017,7 +871,7 @@ export function parseTokenRemoveValue(value: unknown): TokenRemoveValue | undefi
 
 /**
  * Plan step 11B2 (decision of 2026-10-03, the worker is the deputy): `stop`, the Stop of an environment in the worker.
- * Under the lock of the environment, which the worker takes itself (waitSeconds, as `lock`): the Git state of the
+ * Under the lock of the environment, which the worker takes itself (waitSeconds): the Git state of the
  * running dev container (as `user`, in `folder`), then the stop of the dev container and of the running containers of
  * the other services of Docker Compose. Parameters StopParams, value StopValue; no secret, no request to the extension.
  */

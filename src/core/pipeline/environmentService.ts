@@ -500,8 +500,8 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
    */
   analyzer: ConfigurationAnalyzer;
   /**
-   * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation
-   * (HelperChannels.lock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
+   * Plan step 5, PR B: takes the lock of an environment in the worker of the Docker target of the operation (plan step
+   * 11I1, PR B1: the worker's own, workerEnvironmentLock), waiting at most `waitSeconds`. Throws EnvironmentLockError (`busy`, `unavailable`) or an
    * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
    */
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
@@ -6543,7 +6543,7 @@ export class EnvironmentService extends OperationBase {
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
    * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
    * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent), then the worker with the lock
-   * (HelperChannels.lock opens it, also within the wait after a failed open). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
+   * (the worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
    * plain Docker calls go only through the worker that holds the lock (environmentLock.ts). The lock is released in

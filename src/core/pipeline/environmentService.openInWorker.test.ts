@@ -13,7 +13,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperChannelError } from '../helperChannel/helperChannel';
 import { OP_OPEN, OPEN_PROGRESS_DETAIL } from '../helperChannel/protocol';
-import { runWithEnvironmentLock } from '../docker/environmentLock';
 import { OPEN_FLOW_TIMEOUT_MS, type EnvironmentServiceDeps } from './environmentService';
 import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import { LIFECYCLE_UNKNOWN, windowLifecycleMemory } from './lifecycleMemory';
@@ -154,16 +153,6 @@ describe('the open in the worker, from the extension (plan step 11E6)', () => {
       expect(((await rejection(h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress }))) as Error).message).toContain('cannot be sent to the worker');
       expect(sent).toEqual([]);
     }
-  });
-
-  it('never under a lock of the environment that this window holds', async () => {
-    const { h, sent } = harness(async () => ({ opened: OPENED }));
-    await seedEnvironment(h, { container: 'stopped' });
-    const held = await h.lock.take(ENV_ID);
-    const error = await rejection(runWithEnvironmentLock(held, () => h.operations.openEnvironmentInWorker(ENV_ID, { progress: h.progress })));
-    expect((error as Error).message).toContain('under a lock of the environment that this window holds');
-    expect(sent).toEqual([]);
-    await held.release();
   });
 
   it('throws the refusal of the worker as the UserFacingError it was; the list that it gave counts', async () => {

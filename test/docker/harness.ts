@@ -14,13 +14,12 @@ import { findExecutable } from '../../src/core/docker/dockerCli';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/core/imageCheck/credentials';
-import type { CheckOutcome, ConfigReferences, ImageChecker } from '../../src/core/imageCheck/imageCheck';
+import type { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { RegistryClient } from '../../src/core/imageCheck/registryClient';
 import type { ProgressStep } from '../../src/core/messages';
 import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_HELPER_RUN, LABEL_OWNER_ID, LABEL_REPOSITORY, WORKSPACES_ROOT } from '../../src/core/names';
 import { errorDetail } from '../../src/core/pipeline/pipelineRules';
 import {
-  abortError,
   sleep,
   type GitHubAuth,
   type Logger,
@@ -31,9 +30,6 @@ import {
 } from '../../src/core/ports';
 import type { Environment } from '../../src/core/types';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
-import { EnvironmentService, type EnvironmentServiceDeps } from '../../src/core/pipeline/environmentService';
-import { EnvironmentOperations, type EnvironmentOperationsDeps } from '../../src/core/pipeline/environmentOperations';
-import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
@@ -301,24 +297,6 @@ export const registryTransport: HttpTransport = {
   },
 };
 
-/** A computer without network: each request fails at once, as a failed name resolution does. */
-export const offlineTransport: HttpTransport = {
-  async request(request) {
-    const error = new Error(`getaddrinfo ENOTFOUND ${new URL(request.url).host}`) as NodeJS.ErrnoException;
-    error.code = 'ENOTFOUND';
-    throw error;
-  },
-};
-
-/** A registry that never answers: only the time limit of the check ends the requests. */
-export const hangingTransport: HttpTransport = {
-  request(_request, signal) {
-    return new Promise((_resolve, reject) => {
-      signal?.addEventListener('abort', () => reject(abortError()), { once: true });
-    });
-  },
-};
-
 /**
  * The registry client of the extension (src/vscode/extension.ts): the Docker credentials, then the GitHub session for
  * ghcr.io. With the Docker configuration of the run (no credentials) and the fake session, it never has credentials.
@@ -334,31 +312,6 @@ export function registryClient(transport: HttpTransport, runner: ProcessRunner, 
   return new RegistryClient(transport, withGitHubPackagesFallback(credentials.provider(), fakeAuth), log);
 }
 
-export interface CheckRecord {
-  label: string;
-  /** Start of the check (Date.now()). */
-  startedAt: number;
-  ms: number;
-  status: string;
-}
-
-/** An image checker that records the duration and the result of each check. */
-export function timedChecker(inner: ImageChecker, label: string, records: CheckRecord[]): Pick<ImageChecker, 'check'> {
-  return {
-    async check(references: ConfigReferences, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<CheckOutcome> {
-      const started = Date.now();
-      try {
-        const outcome = await inner.check(references, options);
-        records.push({ label, startedAt: started, ms: Date.now() - started, status: outcome.status });
-        return outcome;
-      } catch (error) {
-        records.push({ label, startedAt: started, ms: Date.now() - started, status: `threw ${String(error)}` });
-        throw error;
-      }
-    },
-  };
-}
-
 /** The current registry digest of an image reference, read with the checker of the extension. */
 export async function registryDigest(checker: Pick<ImageChecker, 'check'>, reference: string): Promise<string> {
   const outcome = await checker.check({ images: [reference], features: [] });
@@ -366,23 +319,4 @@ export async function registryDigest(checker: Pick<ImageChecker, 'check'>, refer
     throw new Error(`The digest of ${reference} could not be read: ${JSON.stringify(outcome)}`);
   }
   return outcome.images[reference];
-}
-
-/** Plan step 11F1: the deps of a pipeline of a Docker test, with the flows of the window to the worker. */
-export type PipelineTestDeps = EnvironmentServiceDeps & Pick<EnvironmentOperationsDeps, 'flow' | 'workerRefresh'>;
-
-/**
- * Plan step 11F1: the pipeline of a Docker test (EnvironmentService, as the worker runs it) and, on the same records, the
- * operations of the window (EnvironmentOperations: Stop, the refresh and the opens that it sends to the worker).
- */
-export function pipelineWithOperations(deps: PipelineTestDeps): EnvironmentService & { operations: EnvironmentOperations } {
-  // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
-  const shared = { ...deps, lifecycleMemory: deps.lifecycleMemory ?? windowLifecycleMemory() };
-  const operations = new EnvironmentOperations({
-    ...shared,
-    // The engine of the tests runs; nothing to start.
-    startDocker: deps.startDocker ?? (async () => {}),
-    dockerRunning: () => deps.docker.isRunning(),
-  });
-  return Object.assign(new EnvironmentService(shared), { operations });
 }

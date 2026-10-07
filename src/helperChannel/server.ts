@@ -5,8 +5,9 @@
 // The logic of the script of the helper channel (src/core/helperChannel/protocol.ts): it reads the messages of the
 // extension, runs each operation (operations.ts) with an OperationContext, and answers with progress, output, and one
 // result per operation. It ends by itself when the connection is lost (the four ways in protocol.ts); before it exits,
-// it cancels every operation that runs: their Docker calls end (SIGTERM, then SIGKILL) and the containers that they
-// labelled for a cleanup are removed. It never writes the secret or the parameters of an operation anywhere.
+// it cancels every operation that runs: their Docker calls end (SIGTERM, then SIGKILL), and it waits for their results.
+// It never writes the secret or the parameters of an operation anywhere. Plan step 11I1, PR B1: the removal of the
+// containers of a cleanup label after a cancel (only the removed `docker` operation used it) is gone.
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
@@ -18,8 +19,6 @@ import {
   MAX_SERVER_LINE,
   OUTPUT_CHUNK_CHARACTERS,
   encodeMessage,
-  channelStepLabel,
-  isCleanupLabel,
   parseClientMessage,
   refusedOperationId,
   isAskKind,
@@ -73,26 +72,12 @@ export const MAX_CONTEXT_STDERR_CHARACTERS = 1024 * 1024;
 
 /** Review round 2 (C1): the longest text of a log or progress message (a longer one is cut, with `…`). */
 export const MAX_LOG_TEXT = 16 * 1024;
-/**
- * Review round 2 (A1): after an operation with cleanup labels ended by itself, a cancel that arrives within this time
- * (it crossed the result on the connection) still removes its containers: the caller took it as cancelled.
- */
-export const LATE_CANCEL_WINDOW_MS = 60_000;
-/** Review round 2 (C3): the second look for containers of a cleanup label, for a create that the engine still ran. */
-export const CLEANUP_SECOND_PASS_MS = 2_000;
 
 export interface ContextDockerOptions {
   input?: string;
   /** Output as it comes (in addition to the result). */
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
-  /** Keep the standard output out of the result (it only goes to onStdout). */
-  discardStdout?: boolean;
-  /**
-   * Review round 1 (S1): a cleanup label value (isCleanupLabel). The containers with the label channelStepLabel(cleanup)
-   * are removed when the operation is cancelled; the args must put that label on each container that the call starts.
-   */
-  cleanup?: string;
   /** Pipe its output to the log of the extension as it comes (the tools of a step; not data that it parses). */
   stream?: boolean;
   /** Plan step 5, PR C: ends this call alone (SIGTERM, then SIGKILL), for example after its own time limit. */
@@ -185,7 +170,6 @@ interface Running {
   children: Set<ServerChild>;
   /** Plan step 11G3: the output that the operation reads from the engine itself (OperationContext.pausable). */
   pausables: Set<Pausable>;
-  cleanup: Set<string>;
   cancelled: boolean;
   timedOut: boolean;
   timeoutTimer?: ReturnType<typeof setTimeout>;
@@ -210,10 +194,6 @@ interface Running {
 /** The logic of the script: one instance per process. */
 export class ChannelServer {
   private readonly running = new Map<number, Running>();
-  /** Review round 2 (A1): the cleanup labels of operations that ended by themselves, for a cancel that comes late. */
-  private readonly endedCleanups = new Map<number, { labels: string[]; timer: ReturnType<typeof setTimeout> }>();
-  /** Review round 3 (K1): the cleanups of late cancels that run; the exit waits for them. */
-  private readonly lateCleanups = new Set<Promise<void>>();
   /** Review round 2 (A2): the output of the calls is paused until the waiting answers are written. */
   private outputPaused = false;
   private readonly splitter: LineSplitter;
@@ -348,15 +328,6 @@ export class ChannelServer {
           this.cancel(run, false);
           return;
         }
-        // Review round 2 (A1): the cancel crossed the result; the caller took the operation as cancelled.
-        const ended = this.endedCleanups.get(message.id);
-        if (ended) {
-          this.endedCleanups.delete(message.id);
-          clearTimeout(ended.timer);
-          const cleanup = this.cleanupLabels(ended.labels);
-          this.lateCleanups.add(cleanup);
-          void cleanup.then(() => this.lateCleanups.delete(cleanup));
-        }
         // Review round 4 (M2): the extension reports the cancel only when the script confirmed it.
         this.send({ t: 'cancelled', id: message.id });
         return;
@@ -453,7 +424,6 @@ export class ChannelServer {
       controller: new AbortController(),
       children: new Set(),
       pausables: new Set(),
-      cleanup: new Set(),
       cancelled: false,
       timedOut: false,
       finished: new Promise<void>((resolve) => (resolveFinished = resolve)),
@@ -492,8 +462,6 @@ export class ChannelServer {
       run.redactors.stdout.flush();
       run.redactors.stderr.flush();
       const aborted = run.cancelled || run.timedOut;
-      if (aborted) await this.cleanupLabels([...run.cleanup]);
-      else if (run.cleanup.size > 0) this.rememberCleanup(request.id, [...run.cleanup]);
       this.running.delete(request.id);
       this.touchIdle();
       if (aborted) {
@@ -550,7 +518,6 @@ export class ChannelServer {
 
   private async docker(run: Running, args: readonly string[], options: ContextDockerOptions): Promise<ContextDockerResult> {
     if (run.controller.signal.aborted) return { exitCode: null, stdout: '', stderr: '', error: 'The operation was cancelled.' };
-    if (options.cleanup !== undefined && isCleanupLabel(options.cleanup)) run.cleanup.add(options.cleanup);
     let stdout = '';
     let stderr = '';
     let tooLarge = false;
@@ -576,14 +543,12 @@ export class ChannelServer {
         args,
         (text) => {
           if (tooLarge) return;
-          if (options.discardStdout !== true) {
-            stdout += text;
-            if (stdout.length > MAX_CONTEXT_STDOUT_CHARACTERS) {
-              tooLarge = true;
-              stdout = '';
-              this.terminate(child);
-              return;
-            }
+          stdout += text;
+          if (stdout.length > MAX_CONTEXT_STDOUT_CHARACTERS) {
+            tooLarge = true;
+            stdout = '';
+            this.terminate(child);
+            return;
           }
           streamed?.stdout.push(text);
           options.onStdout?.(text);
@@ -668,60 +633,7 @@ export class ChannelServer {
   }
 
   /**
-   * Review round 1 (S1): removes the containers with these cleanup labels: `docker ps -aq --filter label=…` per label,
-   * then `docker rm -f` of exactly those IDs. Never by a name, so a container that the operation did not start is never
-   * removed. Review round 2 (C3): a second pass after CLEANUP_SECOND_PASS_MS, for a create that the engine still ran
-   * when the call was ended. All within CHANNEL_CLEANUP_TIMEOUT_MS. Never rejects.
-   */
-  private async cleanupLabels(labels: readonly string[]): Promise<void> {
-    if (labels.length === 0) return;
-    const deadline = Date.now() + CHANNEL_CLEANUP_TIMEOUT_MS;
-    for (let pass = 0; pass < 2; pass++) {
-      if (pass === 1) {
-        if (deadline - Date.now() < CLEANUP_SECOND_PASS_MS * 2) return;
-        await new Promise((resolve) => setTimeout(resolve, CLEANUP_SECOND_PASS_MS));
-      }
-      const ids = new Set<string>();
-      for (const label of labels) {
-        const listed = await this.quietDocker(['ps', '-aq', '--no-trunc', '--filter', `label=${channelStepLabel(label)}`], deadline);
-        for (const line of listed.split('\n')) if (/^[0-9a-f]{12,64}$/.test(line.trim())) ids.add(line.trim());
-      }
-      if (ids.size > 0) await this.quietDocker(['rm', '-f', ...ids], deadline);
-    }
-  }
-
-  /** Review round 2 (A1): keeps the cleanup labels of an operation that ended by itself, for a cancel that comes late. */
-  private rememberCleanup(id: number, labels: string[]): void {
-    const timer = setTimeout(() => this.endedCleanups.delete(id), LATE_CANCEL_WINDOW_MS);
-    timer.unref?.();
-    this.endedCleanups.set(id, { labels, timer });
-  }
-
-  /** A Docker call of the script itself (no log), ended at `deadline`; resolves with its standard output. */
-  private async quietDocker(args: readonly string[], deadline: number): Promise<string> {
-    let stdout = '';
-    let child: ServerChild;
-    try {
-      child = this.deps.spawnDocker(args, (text) => (stdout += text), () => {});
-      child.end();
-    } catch {
-      return '';
-    }
-    const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // It ended already.
-      }
-    }, Math.max(0, deadline - Date.now()));
-    await child.exited;
-    clearTimeout(timer);
-    return stdout;
-  }
-
-  /**
-   * Ends the script: no more messages are read; every operation is cancelled (its Docker calls end, its cleanup runs);
-   * then exit. A hard deadline makes sure that it exits even when a call or a handler does not end.
+   * Ends the script: no more messages are read; every operation is cancelled (its Docker calls end); then exit. A hard deadline makes sure that it exits even when a call or a handler does not end.
    */
   shutdown(): void {
     if (this.stopping) return;
@@ -731,8 +643,7 @@ export class ChannelServer {
     const deadline = setTimeout(() => this.deps.exit(0), this.killGraceMs + CHANNEL_CLEANUP_TIMEOUT_MS + 5_000);
     const runs = [...this.running.values()];
     for (const run of runs) this.cancel(run, false);
-    // Review round 3 (K1): also the cleanups of late cancels (a cancel that crossed a result, then the input ended).
-    void Promise.all([...runs.map((run) => run.finished), ...this.lateCleanups]).then(() => {
+    void Promise.all(runs.map((run) => run.finished)).then(() => {
       clearTimeout(deadline);
       this.deps.exit(0);
     });

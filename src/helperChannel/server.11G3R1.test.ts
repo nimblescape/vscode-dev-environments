@@ -27,17 +27,22 @@ describe('the pausable output of an operation (plan step 11G3, review B)', () =>
       context.pausable?.({ pause: () => events.push('pause'), resume: () => events.push('resume') });
       return new Promise((resolve) => (endHolder = () => resolve({})));
     };
+    // Plan step 11I1, PR B1: a Docker call whose output goes back as it comes (before: the removed operation `docker`).
+    const logs: OperationHandler = async (_params, context) => {
+      await context.docker(['logs', 'c'], { onStdout: (text) => context.output('stdout', text) });
+      return {};
+    };
     const server = new ChannelServer({
       write: () => true,
       spawnDocker,
-      operations: { ...OPERATIONS, holder },
+      operations: { ...OPERATIONS, holder, logs },
       exit: () => {},
       congested: () => congested,
       onDrain: () => {},
     });
     server.start();
     server.input(encodeMessage({ t: 'op', id: 1, op: 'holder', params: null }));
-    server.input(encodeMessage({ t: 'op', id: 2, op: 'docker', params: { args: ['logs', 'c'] } }));
+    server.input(encodeMessage({ t: 'op', id: 2, op: 'logs', params: null }));
     await tick();
     expect(outputs).toHaveLength(1);
     congested = true;

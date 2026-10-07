@@ -2,35 +2,27 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 6, PR B: the batch helper in one process: the extension's HelperChannel, the worker's ChannelServer with
-// `batch`, `batchStep` and `batchChunk`, and, as the `docker run` of the helper, a second ChannelServer with the step
-// table of the helper (fake step processes and file system). Checked: one helper per session after the volume check
-// (a missing volume is refused and nothing is started); the relay of a step (its command from the builders, its
-// variables on the process only, its output masked); the token only as the `secret` and the standard input of the clone,
-// which runs as the Git user with the cleanup after it; unknown kinds refused; chunked input; the time limit and the
-// cancel of a step end that step alone; one step at a time; close and the end of the helper.
+// Plan step 6, PR B: the batch helper in one process: the worker's own batch session of a flow (workerBatchSession, with
+// a fake OperationContext of its operation) and, as the run of the helper, a second ChannelServer with the step table of
+// the helper (fake step processes and file system). Checked: one helper per session after the volume check (a missing
+// volume is refused and nothing is started); a step (its command from the builders, its variables on the process only,
+// its output masked); the token only as the secret of the step and the standard input of the clone, which runs as the
+// Git user with the cleanup after it; unknown kinds refused; a long input; the time limit and the cancel of a step end
+// that step alone; one step at a time; close and the end of the helper. Plan step 11I1, PR B1: before, the session was
+// the extension's HelperChannel.batch through the worker's operations `batch`, `batchStep` and `batchChunk` (removed);
+// the cases of that relay are gone, the others run on the worker's own session.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  BATCH_GIT_UID,
-  BATCH_HOLD_LIMIT_MS,
-  BATCH_READY_STEP,
-  MAX_BATCH_INPUT_CHARACTERS,
-  MAX_CONCURRENT_BATCHES,
-  OP_BATCH,
-  OP_BATCH_CHUNK,
-  OP_BATCH_STEP,
-  batchRunSpec,
-} from '../core/helperChannel/batch';
+import { BATCH_GIT_UID, BATCH_HOLD_LIMIT_MS, MAX_BATCH_INPUT_CHARACTERS, batchRunSpec } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
-import { HelperChannel, HelperChannelError, HelperOperationError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
-import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage } from '../core/helperChannel/protocol';
+import { HelperChannel, HelperChannelError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
+import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage, type ClientMessage } from '../core/helperChannel/protocol';
 import { bundleHash } from '../core/loader/pipeLoader';
 import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
-import { isAbortError, type Logger, type StartedProcess } from '../core/ports';
-import { BATCH_MISSING_VOLUME_CODE, batchChunkOperation, batchOperation, batchStepOperation, type BatchDeps } from './batch';
+import { isAbortError } from '../core/ports';
+import { BATCH_MISSING_VOLUME_CODE, workerBatchSession, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
-import { ChannelServer, type ContextDockerOptions, type ServerChild, type SpawnDocker } from './server';
+import { ChannelServer, OperationError, type ContextDockerOptions, type OperationContext, type ServerChild } from './server';
 import type { DockerEngine, EngineAttachedOptions, EngineAttachedRun, EngineAttachedSpec } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { contextSecrets } from './operationContext.testkit';
@@ -70,7 +62,7 @@ function afterLoader(next: (text: string) => void, onBundle: (line: string) => v
 interface SetupOptions {
   autoExit?: boolean;
   workspacesMode?: number;
-  /** Review round 1 of PR #80 (B-R1-12): the deps of the worker's batch operation (holdLimitMs, openTimeoutMs). */
+  /** Review round 1 of PR #80 (B-R1-12): the deps of the worker's batch helper (openTimeoutMs). */
   deps?: Partial<BatchDeps>;
   /**
    * Review round 1 of PR #80 (B-R1-12): the `docker run` of the helper: a ChannelServer (default); one that never
@@ -97,8 +89,6 @@ interface SetupOptions {
    * comes late; and it ignores SIGTERM (as Node.js as PID 1 of its container) and ends only by SIGKILL or its input.
    */
   lateHello?: Promise<void>;
-  /** Review round 3 of PR #80, B-R3-1: the kill grace time of the worker's ChannelServer (default 50 ms). */
-  workerKillGraceMs?: number;
   /**
    * User decision of 2026-10-01: Compose reads as the repository owner. What `lstat` of the repository folder
    * (/workspaces/hello) finds: a folder of 1000:1000 (default), of root, a symbolic link, or nothing.
@@ -120,7 +110,10 @@ function setup(options: SetupOptions = {}) {
   // The quiet commands and the file system calls in one order (review round 1 of PR #80, A-R1-1).
   const order: string[] = [];
   const logLines: string[] = [];
-  const clientLines: string[] = [];
+  /** Plan step 11I1, PR B1: the lines that the worker's client wrote to the helper after the bundle (was: to the worker). */
+  const helperLines: string[] = [];
+  /** Plan step 11I1, PR B1: the progress of the operation of the session (step and detail). */
+  const progress: string[] = [];
   const bundles: string[] = [];
   const servers: ChannelServer[] = [];
   // Review round 1 of PR #80 (B-R1-11, B-R1-12): what the helper child saw, and the options of the worker's Docker calls.
@@ -205,8 +198,13 @@ function setup(options: SetupOptions = {}) {
       for (const next of waiting.splice(0)) next();
     });
     const inOrder = (next: () => void) => (late ? waiting.push(next) : next());
+    let bundled = false;
     return {
       write: (text) => {
+        // The first line is the bundle; the rest are the messages of the worker's client.
+        const lines = text.split('\n').filter((line) => line !== '');
+        helperLines.push(...(bundled ? lines : lines.slice(1)));
+        bundled = true;
         inOrder(() => feed(text));
         return true;
       },
@@ -256,10 +254,6 @@ function setup(options: SetupOptions = {}) {
   // ['inspect', 'volume', <name>], ['run', <name>], ['ps', <label>] and ['rm', <id>]; the worker's ChannelServer gets no
   // Docker call of the batch helper (was: `docker volume inspect`, `docker run`, `docker ps`, `docker rm`).
   const runs: Array<{ spec: EngineAttachedSpec; options: EngineAttachedOptions }> = [];
-  const spawnDocker: SpawnDocker = (args) => {
-    calls.push(['docker', ...args]);
-    throw new Error('Plan step 11G3: the batch operation runs no Docker call of the worker.');
-  };
   /** The helper as a run of the port: its process over the child, a kill as `docker stop` (SIGTERM, later SIGKILL) and removal. */
   const runOf = (spec: EngineAttachedSpec, runOptions: EngineAttachedOptions): EngineAttachedRun => {
     let toStdout: (text: string) => void = () => {};
@@ -311,47 +305,48 @@ function setup(options: SetupOptions = {}) {
     },
     removeContainer: async (container) => void calls.push(['rm', container]),
   };
-  const deps: BatchDeps = { sessions: new Map(), engineOf: () => engine, readScript: () => HELPER_SCRIPT, ...options.deps };
-  // Review round 1 of PR #80 (B-R1-11): the options of each Docker call of the batch operation.
-  const batch = batchOperation(deps);
-  const recordedBatch: typeof batch = (params, context) =>
-    batch(params, {
-      ...context,
-      docker: (args, dockerOptionsOfCall) => {
-        dockerOptions.push({ args, options: dockerOptionsOfCall });
-        return context.docker(args, dockerOptionsOfCall);
-      },
-    });
-  let toClient: (text: string) => void = () => {};
-  const worker = new ChannelServer({
-    write: (text) => {
-      toClient(text);
-      return true;
+  const deps: BatchDeps = { engineOf: () => engine, readScript: () => HELPER_SCRIPT, ...options.deps };
+  // Plan step 11I1, PR B1: changed setup: the session is the worker's own (workerBatchSession) within a fake operation
+  // of the worker (was: HelperChannel.batch of the extension through the worker's ChannelServer with `batch`, `batchStep`
+  // and `batchChunk`); its log lines and progress are recorded, and the Docker calls of the operation (none: it runs over
+  // the port of the engine) with their options.
+  const operation = new AbortController();
+  const context: OperationContext = {
+    signal: operation.signal,
+    ...contextSecrets(),
+    progress: (step, detail) => progress.push(detail === undefined ? step : `${step} ${detail}`),
+    log: (text) => logLines.push(text),
+    output: () => {},
+    docker: async (args, dockerOptionsOfCall) => {
+      calls.push(['docker', ...args]);
+      dockerOptions.push({ args, options: dockerOptionsOfCall });
+      throw new Error('Plan step 11G3: the batch helper runs no Docker call of the worker.');
     },
-    spawnDocker,
-    operations: { [OP_BATCH]: recordedBatch, [OP_BATCH_STEP]: batchStepOperation(deps), [OP_BATCH_CHUNK]: batchChunkOperation(deps) },
-    exit: () => {},
-    killGraceMs: options.workerKillGraceMs ?? 50,
-  });
-  servers.push(worker);
-  worker.start();
-  const toWorker = afterLoader((text) => worker.input(text), () => {});
-  const process: StartedProcess = {
-    write: (text) => {
-      clientLines.push(...text.split('\n').filter((line) => line !== ''));
-      // As through a pipe: later, never within the write.
-      setImmediate(() => toWorker(text));
-      return true;
-    },
-    end: () => worker.inputEnded(),
-    kill: () => worker.shutdown(),
-    onStdout: (listener) => (toClient = listener),
-    onStderr: () => {},
-    exited: new Promise(() => {}),
   };
-  const logger: Logger = { info: (line) => logLines.push(line), warn: (line) => logLines.push(line), error: (line) => logLines.push(line), output: (text) => logLines.push(text) };
-  const open = () => HelperChannel.open(process, 'WORKER', { logger, name: 'host' });
-  return { calls, runs, steps, quiet, order, fsCalls, logLines, clientLines, bundles, servers, deps, helperEvents, dockerOptions, open, helperDeps, helperExit: (code: number | null) => helperExit?.(code) };
+  /** Opens a session of `p` (default: the volume, image and socket of the tests); `signal` ends its open. */
+  const open = (p: { volume: string; image: string; socket: string } = { volume: VOLUME, image: IMAGE, socket: SOCKET }, signal?: AbortSignal) =>
+    workerBatchSession(deps, signal === undefined ? context : { ...context, signal: AbortSignal.any([operation.signal, signal]) }, p);
+  const helperOps = () => helperLines.map((line) => parseClientMessage(line)).filter((message): message is Extract<ClientMessage, { t: 'op' }> => message?.t === 'op');
+  return {
+    calls,
+    runs,
+    steps,
+    quiet,
+    order,
+    fsCalls,
+    logLines,
+    progress,
+    helperOps,
+    bundles,
+    servers,
+    deps,
+    helperEvents,
+    dockerOptions,
+    open,
+    end: () => operation.abort(),
+    helperDeps,
+    helperExit: (code: number | null) => helperExit?.(code),
+  };
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -369,15 +364,22 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     cleanup = [];
   });
 
-  async function started(options: SetupOptions = {}): Promise<{ t: ReturnType<typeof setup>; channel: HelperChannel; session: HelperBatchSession }> {
+  /** A setup whose operation and helpers end after the test. */
+  function tracked(options: SetupOptions = {}): ReturnType<typeof setup> {
     const t = setup(options);
-    const channel = await t.open();
     cleanup.push(() => {
-      channel.close();
+      t.end();
       for (const server of t.servers) server.shutdown();
     });
-    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
-    return { t, channel, session };
+    return t;
+  }
+
+  // Plan step 11I1, PR B1: changed setup: the worker's own session (was: HelperChannel.batch through the worker).
+  async function started(options: SetupOptions = {}): Promise<{ t: ReturnType<typeof setup>; session: HelperBatchSession }> {
+    const t = tracked(options);
+    const session = await t.open();
+    cleanup.unshift(() => void session.close());
+    return { t, session };
   }
 
   it('checks the volume, then starts exactly one helper with the pinned image, the session label and no variable', async () => {
@@ -401,19 +403,15 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   });
 
   it('refuses a missing volume and starts nothing (the volume is never created)', async () => {
-    const t = setup();
-    const channel = await t.open();
-    cleanup.push(() => {
-      channel.close();
-      for (const server of t.servers) server.shutdown();
-    });
-    const failure = await channel.batch({ volume: 'devenv-missing', image: IMAGE, socket: SOCKET }).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(HelperOperationError);
-    expect((failure as HelperOperationError).code).toBe(BATCH_MISSING_VOLUME_CODE);
+    const t = tracked();
+    const failure = await t.open({ volume: 'devenv-missing', image: IMAGE, socket: SOCKET }).catch((error: unknown) => error);
+    // Plan step 11I1, PR B1: changed expectation: the OperationError of the worker's own session (was: the
+    // HelperOperationError of the extension's client, which the worker answered with that code).
+    expect(failure).toBeInstanceOf(OperationError);
+    expect((failure as OperationError).code).toBe(BATCH_MISSING_VOLUME_CODE);
     // Plan step 11G3: changed expectation: the inspect of the port (was: `docker volume inspect`).
     expect(t.calls).toEqual([['inspect', 'volume', 'devenv-missing']]);
-    expect(t.deps.sessions.size).toBe(0);
-    await expect(channel.batch({ volume: 'devenv-unnamed', image: IMAGE, socket: SOCKET })).rejects.toMatchObject({ code: BATCH_MISSING_VOLUME_CODE });
+    await expect(t.open({ volume: 'devenv-unnamed', image: IMAGE, socket: SOCKET })).rejects.toMatchObject({ code: BATCH_MISSING_VOLUME_CODE });
     expect(t.calls.filter((call) => call[0] === 'run')).toEqual([]);
   });
 
@@ -437,8 +435,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(result).toEqual({ exitCode: 0, stdout: 'log in with *** done\n', stderr: 'warning ***\n', timedOut: false });
     expect(seen.join('')).not.toContain(TOKEN);
     expect(t.logLines.join('\n')).not.toContain(TOKEN);
-    // The token travels only in the `secret` field of the request.
-    const request = t.clientLines.map((line) => parseClientMessage(line)).find((message) => message?.t === 'op' && message.op === OP_BATCH_STEP);
+    // The token travels only in the `secret` field of the request. Plan step 11I1, PR B1: changed expectation: the request
+    // of the worker's client to the helper (was: the request `batchStep` of the extension to the worker).
+    const request = t.helperOps().find((message) => message.op === 'up');
     // Plan step 11A: changed expectation (before: one `secret`): named secrets.
     expect(request).toMatchObject({ secrets: { token: TOKEN } });
     expect(JSON.stringify((request as { params: unknown }).params)).not.toContain(TOKEN);
@@ -870,30 +869,27 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     });
   }
 
+  // Plan step 11I1, PR B1: changed test: the refusal of the kind by the worker for a request of the extension that skipped
+  // the checks of its client is gone with the operation `batchStep`; the parameters beyond the builder go to the helper
+  // through the session itself (was: sent directly to the worker), which refuses them.
   it('refuses unknown kinds, a secret for a step without one, and a clone without one', async () => {
-    const { t, channel, session } = await started();
+    const { t, session } = await started();
     await expect(session.step('docker' as never, { args: ['ps'] })).rejects.toMatchObject({ name: 'HelperChannelError', code: 'unsendable' });
-    // Sent directly, the worker refuses the kind before the helper sees it.
-    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'docker', params: { args: ['ps'] } }, { reserved: true })).rejects.toMatchObject({ code: 'invalid' });
-    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'listConfigs', params: { repository: 'octo/hello', command: ['id'] } }, { reserved: true })).rejects.toMatchObject({
-      code: 'invalid',
-    });
+    await expect(session.step('listConfigs', { repository: 'octo/hello', command: ['id'] })).rejects.toMatchObject({ code: 'invalid' });
     await expect(session.step('listConfigs', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).rejects.toMatchObject({ code: 'invalid' });
     await expect(session.step('clone', { repository: 'octo/hello' })).rejects.toMatchObject({ code: 'invalid' });
     expect(t.steps).toHaveLength(0);
   });
 
-  it('sends an input longer than one request in pieces before the step, and refuses one beyond the limit', async () => {
+  // Plan step 11I1, PR B1: changed expectation: the long input goes to the helper in the one request of its step (the
+  // worker's client of the helper allows it, maxRequestBytes); the pieces of `batchChunk` and their bookkeeping in the
+  // worker (B-R1-15) are gone with that operation.
+  it('sends an input longer than a request of the extension to the helper in its step, and refuses one beyond the limit', async () => {
     const { t, session } = await started();
     const big = { ...UP, override: { text: 'ä'.repeat(300_000) } };
     await session.step('up', big);
-    const ops = t.clientLines.map((line) => parseClientMessage(line)).filter((message) => message?.t === 'op').map((message) => (message as { op: string }).op);
-    expect(ops.filter((op) => op === OP_BATCH_CHUNK).length).toBeGreaterThan(5);
-    expect(ops.indexOf(OP_BATCH_STEP)).toBeGreaterThan(ops.lastIndexOf(OP_BATCH_CHUNK));
+    expect(t.helperOps().map((message) => message.op)).toEqual(['up']);
     expect(t.steps[0].input).toBe(batchStepCommand('up', big).input);
-    expect(t.deps.sessions.get(session.session)?.inputSize).toBe(0);
-    // Review round 1 of PR #80 (B-R1-15): the consumed input is gone from the map too, not only from the count (W24).
-    expect(t.deps.sessions.get(session.session)?.inputs.size).toBe(0);
     await expect(session.step('up', { ...UP, override: { text: 'x'.repeat(MAX_BATCH_INPUT_CHARACTERS) } })).rejects.toMatchObject({ code: 'unsendable' });
     expect(t.steps).toHaveLength(1);
   });
@@ -921,6 +917,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(await next).toMatchObject({ exitCode: 3 });
   });
 
+  // Plan step 11I1, PR B1: the second step is refused by the helper (was: by the worker before the helper saw it).
   it('runs one step at a time', async () => {
     const { t, session } = await started({ autoExit: false });
     const first = session.step('listConfigs', { repository: 'octo/hello' });
@@ -966,54 +963,44 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(await first).toEqual({ exitCode: 0 });
   });
 
-  it('the worker refuses a second step of a session while one runs, before the helper sees it', async () => {
-    const { t, channel, session } = await started({ autoExit: false });
-    const first = session.step('listConfigs', { repository: 'octo/hello' });
-    await waitUntil(() => t.steps.length === 1, 'the step');
-    const helperOps = () => t.logLines.filter((line) => line.includes('[batch ') && line.includes(': started.')).length;
-    const before = helperOps();
-    await expect(channel.operation(OP_BATCH_STEP, { session: session.session, kind: 'listConfigs', params: { repository: 'octo/hello' } }, { reserved: true })).rejects.toMatchObject({ code: 'busy' });
-    expect(helperOps()).toBe(before);
-    t.steps[0].exit(0);
-    await first;
-  });
-
   it('close ends the helper and removes its container by the session label', async () => {
     const { t, session } = await started();
     await session.close();
     await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal');
     // Plan step 11G3: changed expectation: the list by the label is containerIds of the port (was: `docker ps -aq`).
     expect(t.calls).toContainEqual(['ps', channelStepLabel(session.session)]);
-    expect(t.deps.sessions.size).toBe(0);
-    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toBeInstanceOf(HelperOperationError);
+    // Plan step 11I1, PR B1: changed expectation: the client of the closed helper refuses the step (HelperChannelError
+    // `closed`; was: the worker's HelperOperationError for a session that it no longer held).
+    await expect(session.step('listConfigs', { repository: 'octo/hello' })).rejects.toMatchObject({ name: 'HelperChannelError', code: 'closed' });
   });
 
-  it('reports the end of the helper as lost, and removes what is left by the label', async () => {
+  // Plan step 11I1, PR B1: changed expectation: the reason is the one of the client of the helper (was: the `batch`
+  // operation's "The batch helper ended"), and what is left is removed at the close of the session, which the batch scope
+  // of the pipeline always runs (was: at the end of the `batch` operation).
+  it('reports the end of the helper as lost, and removes what is left by the label at the close', async () => {
     const { t, session } = await started();
     t.helperExit(1);
-    expect(await session.lost).toMatch(/batch helper ended/);
+    expect(await session.lost).toMatch(/helper ended/);
+    await session.close();
     await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal');
-    expect(t.deps.sessions.size).toBe(0);
   });
 
-  it('reports the ready step and refuses a batch with invalid parameters before sending it', async () => {
-    const t = setup();
-    const channel = await t.open();
-    cleanup.push(() => {
-      channel.close();
-      for (const server of t.servers) server.shutdown();
-    });
+  // Plan step 11I1, PR B1: changed expectation: the progress `batch` with the volume of the worker's own session (was: the
+  // ready step of the `batch` operation, BATCH_READY_STEP, removed with it).
+  it('reports the batch and refuses a batch with invalid parameters before it starts anything', async () => {
+    const t = tracked();
     for (const p of [
       { volume: '-v', image: IMAGE, socket: SOCKET },
       { volume: VOLUME, image: 'devenv-helper:latest', socket: SOCKET },
       { volume: VOLUME, image: IMAGE, socket: '/a,readonly=false' },
       { volume: VOLUME, image: IMAGE, socket: 'relative.sock' },
     ]) {
-      await expect(channel.batch(p)).rejects.toBeInstanceOf(HelperChannelError);
+      await expect(t.open(p)).rejects.toBeInstanceOf(HelperChannelError);
     }
     expect(t.calls).toEqual([]);
-    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
-    expect(t.logLines.some((line) => line.includes(`batch#`) && line.includes(BATCH_READY_STEP))).toBe(true);
+    expect(t.progress).toEqual([]);
+    const session = await t.open();
+    expect(t.progress).toEqual([`batch ${VOLUME}`]);
     await session.close();
   });
 
@@ -1021,46 +1008,6 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   function within<T>(promise: Promise<T>, ms: number): Promise<T | 'pending'> {
     return Promise.race([promise, new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), ms))]);
   }
-
-  /** Review round 1 of PR #80: an open channel to the worker of `t`, closed after the test. */
-  async function channelOf(t: ReturnType<typeof setup>): Promise<HelperChannel> {
-    const channel = await t.open();
-    cleanup.push(() => {
-      channel.close();
-      for (const server of t.servers) server.shutdown();
-    });
-    return channel;
-  }
-
-  it('review round 1 of PR #80, B-R1-9: the worker refuses a batch beyond its cap as busy and starts nothing (W3, W4, C32)', async () => {
-    expect(MAX_CONCURRENT_BATCHES).toBe(8);
-    // Review round 2 of PR #80, B-R2-4 (C47): the input cap of a step bounds the worker's memory per session (8 sessions).
-    expect(MAX_BATCH_INPUT_CHARACTERS).toBe(3 * 1024 * 1024);
-    const t = setup();
-    const channel = await channelOf(t);
-    // The batches of other windows on this worker.
-    for (let i = 0; i < MAX_CONCURRENT_BATCHES; i++) t.deps.sessions.set(`other-${i}`, { inputs: new Map(), inputSize: 0 });
-    await expect(channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET })).rejects.toMatchObject({ code: 'busy' });
-    expect(t.calls).toEqual([]);
-    expect(t.deps.sessions.size).toBe(MAX_CONCURRENT_BATCHES);
-    // One below the cap, it starts.
-    t.deps.sessions.delete('other-0');
-    const session = await channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET });
-    expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
-    await session.close();
-  });
-
-  it('review round 1 of PR #80, B-R1-10: a second batch with the same session is refused as invalid, and the first goes on (W2)', async () => {
-    const { t, channel, session } = await started();
-    const controller = new AbortController();
-    const second = channel.operation(OP_BATCH, { session: session.session, volume: VOLUME, image: IMAGE, socket: SOCKET }, { signal: controller.signal }).catch((error: unknown) => error);
-    const outcome = await within(second, 5_000);
-    controller.abort();
-    expect(outcome).toBeInstanceOf(HelperOperationError);
-    expect((outcome as HelperOperationError).code).toBe('invalid');
-    expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
-    expect(await session.step('listConfigs', { repository: 'octo/hello' })).toMatchObject({ exitCode: 0 });
-  });
 
   it('review round 1 of PR #80, B-R1-11: the channel traffic of the helper is not kept as the stdout of its docker run (W10)', async () => {
     const { t } = await started();
@@ -1070,42 +1017,31 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
   });
 
-  it('review round 1 of PR #80, B-R1-12: at its hold limit the batch fails as timeout, the helper input ends, its container goes (W11, W13)', async () => {
-    const { t, session } = await started({ deps: { holdLimitMs: 300 } });
-    const reason = await within(session.lost, 10_000);
-    expect(reason).toMatch(/longest time/);
-    await waitUntil(() => t.calls.some((call) => call[0] === 'rm'), 'the removal', 10_000);
-    expect(t.helperEvents.map((entry) => entry.event)).toContain('inputEnded');
-    // Plan step 11G3: changed expectation: containerIds and removeContainer of the port (was: `docker ps -aq`, `docker rm -f`).
-    expect(t.calls).toContainEqual(['ps', channelStepLabel(session.session)]);
-    expect(t.calls).toContainEqual(['rm', '0123456789abcdef0123456789abcdef']);
-    expect(t.deps.sessions.size).toBe(0);
-  });
-
+  // Plan step 11I1, PR B1: changed expectation: the OperationError of the worker's own session (was: the
+  // HelperOperationError of the extension's client).
   it('review round 1 of PR #80, B-R1-12: a helper that never answers fails the open at its time limit and is killed (W11)', async () => {
-    const t = setup({ helper: 'silent', deps: { openTimeoutMs: 300 } });
-    const channel = await channelOf(t);
+    const t = tracked({ helper: 'silent', deps: { openTimeoutMs: 300 } });
     const outcome = await within(
-      channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }).catch((error: unknown) => error),
+      t.open().catch((error: unknown) => error),
       10_000,
     );
-    expect(outcome).toBeInstanceOf(HelperOperationError);
-    expect((outcome as HelperOperationError).code).toBe('failed');
+    expect(outcome).toBeInstanceOf(OperationError);
+    expect((outcome as OperationError).code).toBe('failed');
     expect(t.helperEvents.map((entry) => entry.event)).toContain('kill SIGTERM');
-    expect(t.deps.sessions.size).toBe(0);
   });
 
   it(
     'review round 1 of PR #80, B-R1-12: a helper whose open failed is killed at once, not only after the close of its input (W14)',
     async () => {
-      const t = setup({ helper: 'wrongProtocol' });
-      const channel = await channelOf(t);
+      const t = tracked({ helper: 'wrongProtocol' });
       const outcome = await within(
-        channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }).catch((error: unknown) => error),
+        t.open().catch((error: unknown) => error),
         15_000,
       );
-      expect(outcome).toBeInstanceOf(HelperOperationError);
-      expect((outcome as HelperOperationError).code).toBe('failed');
+      // Plan step 11I1, PR B1: changed expectation: the OperationError of the worker's own session (was: the
+      // HelperOperationError of the extension's client).
+      expect(outcome).toBeInstanceOf(OperationError);
+      expect((outcome as OperationError).code).toBe('failed');
       const hello = t.helperEvents.find((entry) => entry.event === 'hello');
       const kill = t.helperEvents.find((entry) => entry.event === 'kill SIGTERM');
       expect(hello).toBeDefined();
@@ -1135,7 +1071,10 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // IDs of the answer of the engine; was: the output of `docker ps` with a warning line).
     const { t, session } = await started({ listedIds: [id, other] });
     t.helperExit(1);
-    expect(await session.lost).toMatch(/batch helper ended/);
+    // Plan step 11I1, PR B1: changed expectation: the reason of the client of the helper, and the removal at the close of
+    // the session (see the test of the end of the helper above).
+    expect(await session.lost).toMatch(/helper ended/);
+    await session.close();
     await waitUntil(() => t.calls.filter((call) => call[0] === 'rm').length === 2, 'the removal');
     const listed = t.calls.filter((call) => call[0] === 'ps');
     expect(listed.length).toBeGreaterThan(0);
@@ -1146,16 +1085,18 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(t.calls.some((call) => call.includes(`devenv-batch-${session.session}`) && call[0] !== 'run')).toBe(false);
   });
 
-  it('review round 3 of PR #80, B-R3-1: a cancel during the open of the helper ends the batch once the open is done, not at its hold limit', async () => {
+  // Plan step 11I1, PR B1: changed test: the cancel of the open of the worker's own session (was: of the `batch` operation
+  // through the extension, which had a hold limit); its outcome is the OperationError `cancelled` of the session (was: the
+  // AbortError of the extension's client once the worker confirmed the cancel).
+  it('review round 3 of PR #80, B-R3-1: a cancel during the open of the helper ends the helper once the open is done', async () => {
     let answer!: () => void;
     const lateHello = new Promise<void>((resolve) => (answer = resolve));
-    // Long times: only the cancel can end this batch within the bounds below.
+    // Long times: only the cancel can end this helper within the bounds below.
     // Plan step 11G3: changed setup: the stop time of the fake engine (the kill of the run is `docker stop`; was: the kill
     // grace of the worker for its `docker run`).
-    const t = setup({ lateHello, workerKillGraceMs: 60_000, engineStopMs: 60_000, deps: { holdLimitMs: 60_000, openTimeoutMs: 60_000 } });
-    const channel = await channelOf(t);
+    const t = tracked({ lateHello, engineStopMs: 60_000, deps: { openTimeoutMs: 60_000 } });
     const controller = new AbortController();
-    const starting = channel.batch({ volume: VOLUME, image: IMAGE, socket: SOCKET }, controller.signal).catch((error: unknown) => error);
+    const starting = t.open({ volume: VOLUME, image: IMAGE, socket: SOCKET }, controller.signal).catch((error: unknown) => error);
     await waitUntil(() => t.calls.some((call) => call[0] === 'run'), 'the docker run of the helper');
     controller.abort();
     // The worker took the cancel: its SIGTERM to the docker run, which the helper ignores. Plan step 11G3: the stop of the
@@ -1164,12 +1105,10 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // The helper answers its hello now: the open succeeds with the signal of the operation already aborted.
     answer();
     await waitUntil(() => t.helperEvents.some((entry) => entry.event === 'inputEnded'), 'the end of the helper input', 10_000);
-    await waitUntil(() => t.deps.sessions.size === 0, 'the end of the session', 10_000);
+    expect(await within(starting, 10_000)).toMatchObject({ name: 'OperationError', code: 'cancelled' });
     expect(t.helperEvents.map((entry) => entry.event)).not.toContain('kill SIGKILL');
-    // The worker confirms the cancel once its operation ended.
-    expect(isAbortError(await starting)).toBe(true);
-    // Plan step 11G3: added expectation: after the cancel, the batch operation itself removed the containers of the
-    // session label over the port (the server removes nothing for it: it started no Docker call).
+    // Plan step 11G3: added expectation: after the cancel, the session itself removed the containers of the session label
+    // over the port (the server removes nothing for it: it started no Docker call).
     const session = t.runs[0].spec.labels['nimblescape.devenv.channel-step'];
     expect(t.calls).toContainEqual(['ps', channelStepLabel(session)]);
     expect(t.calls).toContainEqual(['rm', '0123456789abcdef0123456789abcdef']);

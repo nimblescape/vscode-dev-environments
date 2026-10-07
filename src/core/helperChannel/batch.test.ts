@@ -9,7 +9,6 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { loaderCommand } from '../loader/pipeLoader';
 import {
-  BATCH_CHUNK_CHARACTERS,
   BATCH_DOCKER_SOCKET,
   BATCH_ENTRY,
   BATCH_GIT_UID,
@@ -17,7 +16,6 @@ import {
   BATCH_SOCKET_FOLDER,
   batchContainerName,
   batchRunSpec,
-  parseBatchChunkParams,
   parseBatchParams,
   parseBatchStepParams,
   parseBatchStepValue,
@@ -49,10 +47,13 @@ describe('the batch messages (plan step 6, PR B)', () => {
     }
   });
 
-  it('checks a step: a known kind, either its parameters or the ID of its pieces, and a whole time limit', () => {
+  // Plan step 11I1, PR B1: changed expectation: the operation `batchChunk` is gone, so a step always carries its
+  // parameters; one with the ID of its pieces (`input`) instead is refused (before: accepted).
+  it('checks a step: a known kind, its parameters, and a whole time limit', () => {
     expect(parseBatchStepParams({ session: SESSION, kind: 'clone', params: { repository: 'a/b' }, timeoutMs: 5 })).toEqual({ session: SESSION, kind: 'clone', params: { repository: 'a/b' }, timeoutMs: 5 });
-    expect(parseBatchStepParams({ session: SESSION, kind: 'up', input: INPUT })).toEqual({ session: SESSION, kind: 'up', input: INPUT });
+    expect(parseBatchStepParams({ session: SESSION, kind: 'up', params: null })).toEqual({ session: SESSION, kind: 'up', params: null });
     for (const bad of [
+      { session: SESSION, kind: 'up', input: INPUT },
       { session: SESSION, kind: 'docker', params: {} },
       { session: SESSION, kind: 'clone' },
       { session: SESSION, kind: 'clone', params: {}, input: INPUT },
@@ -66,10 +67,8 @@ describe('the batch messages (plan step 6, PR B)', () => {
     }
   });
 
-  it('checks a piece of input and the value of a step', () => {
-    expect(parseBatchChunkParams({ session: SESSION, input: INPUT, data: 'x' })).toEqual({ session: SESSION, input: INPUT, data: 'x' });
-    expect(parseBatchChunkParams({ session: SESSION, input: INPUT, data: '' })).toBeUndefined();
-    expect(parseBatchChunkParams({ session: SESSION, input: INPUT, data: 'x'.repeat(BATCH_CHUNK_CHARACTERS + 1) })).toBeUndefined();
+  // Plan step 11I1, PR B1: the checks of a piece of input (parseBatchChunkParams) are gone with the operation `batchChunk`.
+  it('checks the value of a step', () => {
     expect(parseBatchStepValue({ exitCode: 0 })).toEqual({ exitCode: 0 });
     expect(parseBatchStepValue({ exitCode: null })).toEqual({ exitCode: null });
     expect(parseBatchStepValue({ exitCode: '0' })).toBeUndefined();

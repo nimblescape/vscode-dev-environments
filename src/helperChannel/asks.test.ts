@@ -24,7 +24,6 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '../core/helperChannel/protocol';
-import { batchChunkOperation, type BatchDeps } from './batch';
 import { batchHelperOperations } from './batchHelper';
 import { contextSecrets } from './operationContext.testkit';
 import type { DockerEngine } from '../core/worker/dockerEngine';
@@ -32,7 +31,6 @@ import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { flowHost, tokenRemoveOperation } from './flowOperations';
 import { hostRegistryCredentials, registryLogins } from '../core/worker/workerServices';
 import { silentLogger } from '../core/ports';
-import { dockerOperation } from './operations';
 import { ChannelServer, OperationError, type OperationContext, type OperationHandler, type ServerChild } from './server';
 
 function setup(operations: Record<string, OperationHandler>) {
@@ -501,7 +499,7 @@ describe('named secrets and requests: the gaps of the mutation review (plan step
   });
 });
 
-// Review round 1 of plan step 11A, mutation review (B-R1-16 to B-R1-18): each operation takes only its own secret.
+// Review round 1 of plan step 11A, mutation review (B-R1-16): each operation takes only its own secret.
 describe('the secrets of the worker operations (plan step 11A)', () => {
   const base = {
     signal: new AbortController().signal,
@@ -516,19 +514,8 @@ describe('the secrets of the worker operations (plan step 11A)', () => {
     const context = { ...base, ...contextSecrets({ token: 'abcd1234', registry: 'wxyz1234' }) };
     await expect(operations.clone({ repository: 'octo/hello' }, context)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('but the token') });
   });
-
-  it('B-R1-17: a batch input takes no secret', async () => {
-    const handler = batchChunkOperation({} as BatchDeps);
-    const context = { ...base, ...contextSecrets({ token: 'abcd1234' }) };
-    await expect(handler({ session: '0123456789abcdef01234567', input: 'fedcba9876543210fedcba98', data: 'x' }, context)).rejects.toMatchObject({ code: 'invalid' });
-  });
-
-  it('B-R1-18: the secret input of a Docker call is only the token, never another secret', async () => {
-    const calls: unknown[] = [];
-    const context = { ...base, docker: async (...args: unknown[]) => (calls.push(args), { exitCode: 0, stdout: '', stderr: '' }), ...contextSecrets({ registry: 'abcd1234' }) };
-    await expect(dockerOperation({ args: ['exec', '-i', 'c', 'cat'], inputIsSecret: true }, context)).rejects.toThrow('expects a secret');
-    expect(calls).toEqual([]);
-  });
+  // Plan step 11I1, PR B1: B-R1-17 (a batch input takes no secret) and B-R1-18 (the secret input of a Docker call is only
+  // the token) are gone with the operations `batchChunk` and `docker`.
 });
 
 // Review round 2 of plan step 11A (A-R2-1, A-R2-2, A-R2-4, B-R2-1 to B-R2-7).

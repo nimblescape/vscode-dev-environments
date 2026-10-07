@@ -10,7 +10,6 @@
 import { type DeleteDecision } from './deleteCheck';
 import { waitingTimeMs } from '../busy';
 import { environmentsOfHost } from '../docker/dockerHost';
-import { holdsEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, errorMessage } from '../errors';
 import {
   LOCK_BUSY_CODE,
@@ -154,7 +153,6 @@ export class EnvironmentOperations extends OperationBase {
       try {
         const current = await this.deps.registry.get(environmentId);
         if (!current) throw environmentMissing(environment.repository);
-        if (holdsEnvironmentLock(current.id)) throw new Error(`The open of ${current.repository} under a lock of the environment that this window holds.`);
         return await this.openThroughWorker(current.repository, { environmentId: current.id }, options);
       } catch (error) {
         throw this.toUserError(error, options.signal);
@@ -314,8 +312,6 @@ export class EnvironmentOperations extends OperationBase {
       const env = await this.waitForOtherOperation((await this.deps.registry.get(environmentId)) ?? environment, undefined);
       // Plan step 11B2: the Stop runs in the worker, under the lock of the environment that the worker takes itself (user
       // decisions D1 to D3); this window records the Git state that it answers.
-      // Review round 1 (A-R1-4): never under a lock that this window holds (the worker would wait for it and refuse).
-      if (holdsEnvironmentLock(env.id)) throw new Error(`Stop of ${env.repository} under a lock of the environment that this window holds.`);
       // Review round 1 (A-R1-5): the parameters are checked here, so that one the worker would refuse is named.
       const params = parseStopParams({
         environmentId: env.id,
@@ -447,7 +443,7 @@ export class EnvironmentOperations extends OperationBase {
    * the environment through its requests, the lock there, `forget` in the Session Monitor). The caller made the safety
    * check and closed a connected window. An environment that is not in the registry has nothing on Docker: only its
    * session files are removed here. A refusal of that pipeline is thrown as it was before the move; a worker that cannot
-   * be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
+   * be reached or take the lock is refused as for Stop (workerFlow).
    */
   async deleteInWorker(environmentId: string, options: OperationOptions & { additionalVolumesToRemove: readonly string[] }): Promise<void> {
     const environment = await this.deps.registry.get(environmentId);
@@ -458,7 +454,6 @@ export class EnvironmentOperations extends OperationBase {
     await this.requireCurrentHost(environment);
     await this.exclusive(repositoryKey(environment.repository), options.signal, async () => {
       try {
-        if (holdsEnvironmentLock(environment.id)) throw new Error(`The Delete of ${environment.repository} under a lock of the environment that this window holds.`);
         const monitorSource = this.deps.monitorSource?.();
         const params = parseDeleteParams({
           environmentId: environment.id,
@@ -491,13 +486,12 @@ export class EnvironmentOperations extends OperationBase {
    * Plan step 11B3b (user decision of 2026-10-04): the listing of Select configuration in the worker of the Docker host of
    * the operation, where its own pipeline runs listConfigurations (the record and the account through its requests, the
    * lock and the batch helper there). A refusal of that pipeline is thrown here as it was before the move; a worker that
-   * cannot be reached or take the lock is refused as for Stop (workerFlow). Never under a lock that this window holds.
+   * cannot be reached or take the lock is refused as for Stop (workerFlow).
    */
   async listConfigurationsInWorker(environmentId: string, options: OperationOptions): Promise<string[]> {
     const env = await this.deps.registry.get(environmentId);
     if (!env) return [];
     try {
-      if (holdsEnvironmentLock(env.id)) throw new Error(`The listing of the configurations of ${env.repository} under a lock of the environment that this window holds.`);
       const params = parseListConfigurationsParams({ environmentId: env.id, dockerHost: await this.currentDockerHost(), owner: this.deps.owner });
       if (params === undefined) throw new Error(`The listing of the configurations of ${env.repository} cannot be sent to the worker.`);
       const value = parseListConfigurationsValue(await this.workerFlow(env, OP_LIST_CONFIGURATIONS, params, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, options.signal));

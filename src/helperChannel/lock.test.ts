@@ -2,21 +2,22 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 5, PR B: the operation `lock` of the worker. First with a fake `flock` (the order of the steps, the exit
-// codes, the cancel), then with real processes as in heartbeatLock.test.ts: `flock` as in the helper image, the kernel
-// lock, a killed holder, and a lock file that is a symbolic link. Plan step 11B2: the operation `stop` under its own lock.
+// Plan step 5, PR B: the lock of an environment as the worker takes it (takeEnvironmentLock; plan step 11I1, PR B1: the
+// operation `lock` is gone). First with a fake `flock` (the order of the steps, the exit codes, the cancel), then with
+// real processes as in heartbeatLock.test.ts: `flock` as in the helper image, the kernel lock, a killed holder, and a lock
+// file that is a symbolic link. Plan step 11B2: the operation `stop` under its own lock.
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { LOCK_BUSY_EXIT, LOCK_HELD_STEP, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
+import { LOCK_BUSY_EXIT, LOCK_UNAVAILABLE_CODE, MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, lockFilePath, lockFolder, parseStopParams, parseStopValue } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { scriptCommand } from '../core/worker/containerScripts';
 import { stopOperation } from './flowOperations';
-import { FLOCK_FD, LOCK_DEPS, abortedOrAfter, lockOperation, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
+import { FLOCK_FD, LOCK_DEPS, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 
@@ -85,131 +86,84 @@ function fakeDeps(options: { openFails?: boolean } = {}): { deps: LockDeps; even
 /** Lets the pending promise callbacks run. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-describe('the lock operation with a fake flock (plan step 5, PR B)', () => {
-  it('takes the lock with flock -w -E 75 on the inherited file, reports it, and holds it until the cancel', async () => {
+// Plan step 11I1, PR B1: the operation `lock` is gone; these cases now take the lock the one way that stays
+// (takeEnvironmentLock, which that operation ran), so the lock is held until its release instead of the cancel of the
+// operation. Gone with the operation: its progress (LOCK_HELD_STEP), its backstop (holdLimitMs), and its checks of the
+// parameters and the secret (each flow checks its own parameters, for example parseStopParams).
+describe('the lock of an environment with a fake flock (plan step 5, PR B)', () => {
+  it('takes the lock with flock -w -E 75 on the inherited file, and holds it until the release', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    const taking = takeEnvironmentLock(deps, ID, 10, h.controller.signal);
     await settle();
     expect(events).toEqual(['open /state ' + ID, `flock -w 10 -E ${LOCK_BUSY_EXIT} ${FLOCK_FD} fd=42`]);
     flocks[0].exit(0);
-    await settle();
-    expect(h.progress).toEqual(['lock', LOCK_HELD_STEP]);
-    // Held: the file stays open until the cancel.
+    const release = await taking;
+    // Held: the file stays open until the release.
     expect(events).not.toContain('close 42');
-    h.controller.abort();
-    await expect(done).resolves.toEqual({});
+    release();
     expect(events.at(-1)).toBe('close 42');
   });
 
   it('exit 75 of flock is a busy lock (code busy); the file is closed', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    const taking = takeEnvironmentLock(deps, ID, 10, h.controller.signal);
     await settle();
     flocks[0].exit(LOCK_BUSY_EXIT);
-    await expect(done).rejects.toMatchObject({ name: 'OperationError', code: 'busy' });
-    expect(h.progress).not.toContain(LOCK_HELD_STEP);
+    await expect(taking).rejects.toMatchObject({ name: 'OperationError', code: 'busy' });
     expect(events.at(-1)).toBe('close 42');
   });
 
-  it('another exit code of flock fails the operation (code failed) with its error output', async () => {
+  it('another exit code of flock fails (code failed) with its error output', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    const taking = takeEnvironmentLock(deps, ID, 10, h.controller.signal);
     await settle();
     flocks[0].exit(1, 'flock: 3: Bad file descriptor');
-    const error = await done.catch((caught: unknown) => caught);
+    const error = await taking.catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(OperationError);
     expect(error).toMatchObject({ code: 'failed' });
     expect((error as Error).message).toContain('Bad file descriptor');
-    expect(h.progress).not.toContain(LOCK_HELD_STEP);
     expect(events.at(-1)).toBe('close 42');
   });
 
   // PR #74 review round 1, B-R1-2: flock killed from outside (an OOM kill, a SIGKILL) while it waits has no lock.
-  it('B-R1-2: flock ended by a signal without a cancel fails the operation (code failed), without the lock', async () => {
+  it('B-R1-2: flock ended by a signal without a cancel fails (code failed), without the lock', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    const taking = takeEnvironmentLock(deps, ID, 10, h.controller.signal);
     await settle();
     flocks[0].exit(null);
-    const error = await done.catch((caught: unknown) => caught);
+    const error = await taking.catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(OperationError);
     expect(error).toMatchObject({ code: 'failed' });
     expect((error as Error).message).toContain('ended by a signal');
-    expect(h.progress).not.toContain(LOCK_HELD_STEP);
     expect(events.at(-1)).toBe('close 42');
   });
 
   it('a cancel while it waits kills flock and closes the file, without the lock', async () => {
     const { deps, events, flocks } = fakeDeps();
     const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
+    const taking = takeEnvironmentLock(deps, ID, 10, h.controller.signal);
     await settle();
     h.controller.abort();
-    await expect(done).rejects.toMatchObject({ code: 'cancelled' });
+    await expect(taking).rejects.toMatchObject({ code: 'cancelled' });
     expect(flocks[0].kills).toEqual(['SIGKILL']);
-    expect(h.progress).not.toContain(LOCK_HELD_STEP);
     expect(events.at(-1)).toBe('close 42');
-  });
-
-  it('a cancel after the lock was taken closes the file (the lock is let go)', async () => {
-    const { deps, events, flocks } = fakeDeps();
-    const h = harness();
-    const done = lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, h.context);
-    await settle();
-    flocks[0].exit(0);
-    await settle();
-    expect(events.filter((event) => event.startsWith('close'))).toEqual([]);
-    h.controller.abort();
-    await done;
-    expect(events.filter((event) => event.startsWith('close'))).toEqual(['close 42']);
-    expect(flocks[0].kills).toEqual([]);
-  });
-
-  it('lets go of the lock after its longest time (the backstop)', async () => {
-    const { deps, events, flocks } = fakeDeps();
-    const h = harness();
-    const done = lockOperation({ ...deps, holdLimitMs: 20 })({ environmentId: ID, waitSeconds: 10 }, h.context);
-    await settle();
-    flocks[0].exit(0);
-    await expect(done).rejects.toMatchObject({ code: 'timeout' });
-    expect(events.at(-1)).toBe('close 42');
-  });
-
-  it.each<[string, unknown]>([
-    ['a path in the id', { environmentId: '../../etc/passwd', waitSeconds: 10 }],
-    ['a dot in the id', { environmentId: 'a.b', waitSeconds: 10 }],
-    ['an empty id', { environmentId: '', waitSeconds: 10 }],
-    ['an id that is no string', { environmentId: 7, waitSeconds: 10 }],
-    ['no wait', { environmentId: ID, waitSeconds: 0 }],
-    ['a wait that is no whole number', { environmentId: ID, waitSeconds: 1.5 }],
-    ['a wait beyond the limit', { environmentId: ID, waitSeconds: 61 }],
-    ['a wait as text', { environmentId: ID, waitSeconds: '10' }],
-    ['a key too many', { environmentId: ID, waitSeconds: 10, force: true }],
-    ['no parameters', null],
-  ])('refuses %s, and opens nothing', async (_name, params) => {
-    const { deps, events } = fakeDeps();
-    await expect(lockOperation(deps)(params, harness().context)).rejects.toMatchObject({ code: 'invalid' });
-    expect(events).toEqual([]);
-  });
-
-  it('refuses a secret, and opens nothing', async () => {
-    const { deps, events } = fakeDeps();
-    await expect(lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, harness('a-secret-token').context)).rejects.toMatchObject({ code: 'invalid' });
-    expect(events).toEqual([]);
   });
 
   it('fails without flock when the lock file cannot be opened', async () => {
     const { deps, events } = fakeDeps({ openFails: true });
-    await expect(lockOperation(deps)({ environmentId: ID, waitSeconds: 10 }, harness().context)).rejects.toMatchObject({ code: 'failed' });
+    await expect(takeEnvironmentLock(deps, ID, 10, harness().controller.signal)).rejects.toMatchObject({ code: 'failed' });
     expect(events).toEqual([`open /state ${ID}`]);
   });
 });
 
 // As heartbeatLock.test.ts: `flock` and process groups exist on Linux only, where the helper image and CI run.
-describe.skipIf(process.platform !== 'linux')('the lock operation with real processes (plan step 5, PR B)', () => {
+// Plan step 11I1, PR B1: through takeEnvironmentLock instead of the removed operation `lock` (see above): held once it
+// resolves, let go by its release instead of the cancel of the operation.
+describe.skipIf(process.platform !== 'linux')('the lock of an environment with real processes (plan step 5, PR B)', () => {
   let stateDir: string;
   const started: ChildProcess[] = [];
   const deps = (): LockDeps => ({ ...LOCK_DEPS, stateDir });
@@ -257,48 +211,42 @@ describe.skipIf(process.platform !== 'linux')('the lock operation with real proc
     }
   }
 
-  it('takes the lock (folder 0700, file 0600), holds it against another flock, and lets go of it on the cancel', { timeout: 20_000 }, async () => {
-    const h = harness();
-    const done = lockOperation(deps())({ environmentId: ID, waitSeconds: 5 }, h.context);
-    while (!h.progress.includes(LOCK_HELD_STEP)) await new Promise((resolve) => setTimeout(resolve, 10));
+  it('takes the lock (folder 0700, file 0600), holds it against another flock, and lets go of it on the release', { timeout: 20_000 }, async () => {
+    const release = await takeEnvironmentLock(deps(), ID, 5, harness().controller.signal);
     expect(fs.statSync(lockFolder(stateDir)).mode & 0o777).toBe(0o700);
     expect(fs.statSync(lockFilePath(ID, stateDir)).mode & 0o777).toBe(0o600);
     expect(tryLock()).toBe(1);
-    h.controller.abort();
-    await done;
+    release();
     expect(tryLock()).toBe(0);
     // The lock file is never deleted.
     expect(fs.existsSync(lockFilePath(ID, stateDir))).toBe(true);
   });
 
   it('a second holder gets exit 75 of the real flock (busy) after its wait, and the first keeps the lock', { timeout: 20_000 }, async () => {
-    const first = harness();
-    const holding = lockOperation(deps())({ environmentId: ID, waitSeconds: 5 }, first.context);
-    while (!first.progress.includes(LOCK_HELD_STEP)) await new Promise((resolve) => setTimeout(resolve, 10));
-    const second = harness();
+    const release = await takeEnvironmentLock(deps(), ID, 5, harness().controller.signal);
     const startedAt = Date.now();
-    await expect(lockOperation(deps())({ environmentId: ID, waitSeconds: 1 }, second.context)).rejects.toMatchObject({ code: 'busy' });
+    await expect(takeEnvironmentLock(deps(), ID, 1, harness().controller.signal)).rejects.toMatchObject({ code: 'busy' });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
-    expect(second.progress).not.toContain(LOCK_HELD_STEP);
     expect(tryLock()).toBe(1);
-    first.controller.abort();
-    await holding;
+    release();
     expect(tryLock()).toBe(0);
   });
 
   it('a holder killed with SIGKILL frees the lock at once: the waiting lock takes it', { timeout: 20_000 }, async () => {
     const holder = await holdWithFlock();
-    const h = harness();
-    const done = lockOperation(deps())({ environmentId: ID, waitSeconds: 10 }, h.context);
+    let held = false;
+    const taking = takeEnvironmentLock(deps(), ID, 10, harness().controller.signal).then((release) => {
+      held = true;
+      return release;
+    });
     await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(h.progress).not.toContain(LOCK_HELD_STEP);
+    expect(held).toBe(false);
     process.kill(-(holder.pid as number), 'SIGKILL');
     await exited(holder);
     const killedAt = Date.now();
-    while (!h.progress.includes(LOCK_HELD_STEP)) await new Promise((resolve) => setTimeout(resolve, 10));
+    const release = await taking;
     expect(Date.now() - killedAt).toBeLessThan(3_000);
-    h.controller.abort();
-    await done;
+    release();
   });
 
   it('a lock file that is a symbolic link is refused, and its target is not touched', { timeout: 20_000 }, async () => {
@@ -307,7 +255,7 @@ describe.skipIf(process.platform !== 'linux')('the lock operation with real proc
     fs.writeFileSync(target, 'data', { mode: 0o644 });
     fs.symlinkSync(target, lockFilePath(ID, stateDir));
     expect(() => openLockFile(stateDir, ID)).toThrow(/ELOOP|symbolic/);
-    await expect(lockOperation(deps())({ environmentId: ID, waitSeconds: 1 }, harness().context)).rejects.toMatchObject({ code: 'failed' });
+    await expect(takeEnvironmentLock(deps(), ID, 1, harness().controller.signal)).rejects.toMatchObject({ code: 'failed' });
     expect(fs.readFileSync(target, 'utf8')).toBe('data');
     expect(fs.statSync(target).mode & 0o777).toBe(0o644);
   });
@@ -334,18 +282,8 @@ describe.skipIf(process.platform !== 'linux')('the lock operation with real proc
     const elsewhere = path.join(stateDir, 'elsewhere');
     fs.mkdirSync(elsewhere);
     fs.symlinkSync(elsewhere, lockFolder(stateDir));
-    await expect(lockOperation(deps())({ environmentId: ID, waitSeconds: 1 }, harness().context)).rejects.toMatchObject({ code: 'failed' });
+    await expect(takeEnvironmentLock(deps(), ID, 1, harness().controller.signal)).rejects.toMatchObject({ code: 'failed' });
     expect(fs.readdirSync(elsewhere)).toEqual([]);
-  });
-});
-
-describe('abortedOrAfter (review round 3 of PR #80, B-R3-1)', () => {
-  it('review round 3 of PR #80, B-R3-1: resolves at once for a signal that is already aborted, not after its time', async () => {
-    const outcome = await Promise.race([
-      abortedOrAfter(AbortSignal.abort(), 60_000).then(() => 'resolved'),
-      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 2_000)),
-    ]);
-    expect(outcome).toBe('resolved');
   });
 });
 

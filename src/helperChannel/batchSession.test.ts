@@ -206,7 +206,7 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
     } as unknown as OperationContext;
     return { ctx, engine, calls, logs, kills, specs, controller, order, progress };
   }
-  const deps = (engine: DockerEngine) => ({ sessions: new Map(), engineOf: () => engine, readScript: () => 'script', openTimeoutMs: 100 });
+  const deps = (engine: DockerEngine) => ({ engineOf: () => engine, readScript: () => 'script', openTimeoutMs: 100 });
   const target = { volume: 'devenv-v', image: `sha256:${'b'.repeat(64)}`, socket: '/var/run/docker.sock' };
 
   it('a helper that never answers is ended and removed by its label, and the start fails', async () => {

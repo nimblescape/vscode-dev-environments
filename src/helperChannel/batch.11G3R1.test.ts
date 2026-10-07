@@ -45,7 +45,7 @@ describe('the start of the batch helper (plan step 11G3, review B)', () => {
       },
       containerIds: async () => (calls.push('ps'), []),
     };
-    const deps: BatchDeps = { sessions: new Map(), engineOf: () => engine, readScript: () => 'the script' };
+    const deps: BatchDeps = { engineOf: () => engine, readScript: () => 'the script' };
     const failure = await workerBatchSession(deps, contextOf(), P).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(OperationError);
     expect(failure).toMatchObject({ code: 'failed' });
@@ -75,7 +75,7 @@ describe('the start of the batch helper (plan step 11G3, review B)', () => {
       registered.push(target);
       return () => events.push('removed');
     };
-    const deps: BatchDeps = { sessions: new Map(), engineOf: () => engine, readScript: () => 'the script', openTimeoutMs: 20 };
+    const deps: BatchDeps = { engineOf: () => engine, readScript: () => 'the script', openTimeoutMs: 20 };
     const failure = await workerBatchSession(deps, contextOf(pausable), P).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(OperationError);
     expect(registered).toEqual([run]);

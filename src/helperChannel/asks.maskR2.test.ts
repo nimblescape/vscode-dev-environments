@@ -5,7 +5,7 @@
 // masks the output of an exec with OperationContext.maskedValues (every value the operation ever held), read at each
 // call, not with the current secrets alone.
 import { describe, expect, it, vi } from 'vitest';
-import { OP_PULL } from '../core/helperChannel/protocol';
+import { OP_REFRESH } from '../core/helperChannel/protocol';
 import type { OperationContext } from './server';
 
 const seen = vi.hoisted(() => ({ args: [] as unknown[][] }));
@@ -35,7 +35,11 @@ describe('ENGINE_OF and maskedValues (review round 2 of PR #102, B)', () => {
       output: () => {},
       signal: new AbortController().signal,
     } as unknown as OperationContext;
-    await expect(OPERATIONS[OP_PULL]({ reference: 'alpine:3' }, context)).resolves.toEqual({});
+    // Plan step 11I1, PR B1: changed operation (before: `pull`, removed): the refresh, which builds the port of the engine
+    // of the operation the same way (ENGINE_OF); its outcome over the stand-in of the port does not matter here.
+    const before = seen.args.length;
+    await OPERATIONS[OP_REFRESH]({ environments: [] }, context).catch(() => undefined);
+    expect(seen.args.length).toBe(before + 1);
     const args = seen.args.at(-1);
     expect(typeof args?.[3]).toBe('function');
     const secrets = args?.[3] as () => Iterable<string>;

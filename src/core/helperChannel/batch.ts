@@ -5,40 +5,30 @@
 // Plan step 6, PR B: the batch helper of the worker (decision 2026-09-29: the steps that need the volume of an
 // environment run in one helper container per operation, never one container per step; Q1 and Q2 of 2026-10-01). The
 // worker cannot see the volume (a running container cannot get a volume mounted later), so it starts the helper with
-// it: `batch` checks that the volume exists, starts the pinned helper image with the volume, the cache, the secrets
-// tmpfs and the socket (plan step 11G3: over the Engine API, as `docker run --rm -i` did; batchRunSpec), pipe-loads the same script as itself with the entry BATCH_ENTRY (a second
-// ChannelServer with the fixed step table of src/core/helper/batchSteps.ts), reports BATCH_READY_STEP and holds the
-// helper until it is cancelled (at most BATCH_HOLD_LIMIT_MS). `batchStep` relays one step to it; `batchChunk` carries an
-// input that is longer than one request of the channel, in pieces before the step. Pure functions and constants. No `vscode`.
+// it (src/helperChannel/batch.ts): it checks that the volume exists, starts the pinned helper image with the volume, the
+// cache, the secrets tmpfs and the socket (plan step 11G3: over the Engine API, as `docker run --rm -i` did;
+// batchRunSpec), pipe-loads the same script as itself with the entry BATCH_ENTRY (a second ChannelServer with the fixed
+// step table of src/core/helper/batchSteps.ts), and sends the steps of its flow to it (BatchStepParams). Plan step 11I1,
+// PR B1: the operations `batch`, `batchStep` and `batchChunk` (the batch helper relayed for the extension) are gone.
+// Pure functions and constants. No `vscode`.
 import { loaderCommand } from '../loader/pipeLoader';
 import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
 import { isBatchStepKind, type BatchStepKind } from '../helper/batchStepKinds';
 import type { EngineAttachedSpec } from '../worker/dockerEngine';
 import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
 
-/** Starts a batch helper and holds it (BatchParams; the value is `{}`). Long-lived, like `lock`. */
-export const OP_BATCH = 'batch';
-/** One step in a batch helper (BatchStepParams; the value is BatchStepValue). */
-export const OP_BATCH_STEP = 'batchStep';
-/** A piece of the input of a later step (BatchChunkParams; the value is `{}`). */
-export const OP_BATCH_CHUNK = 'batchChunk';
 /** The failure code of a batch whose volume does not exist (it is never created). */
 export const BATCH_MISSING_VOLUME_CODE = 'missingVolume';
-/** The progress step of `batch` once the helper answered (the detail is the session). */
-export const BATCH_READY_STEP = 'ready';
 /** Where the loader of the helper stores the script, and its entry (src/helperChannel/main.ts). */
 export const BATCH_SCRIPT_PATH = '/opt/devenv/batch.js';
 export const BATCH_ENTRY = 'startBatchHelper';
-/** The backstop of a held helper: the one of the lock of its operation (6 h). */
-export const BATCH_HOLD_LIMIT_MS = LOCK_HOLD_LIMIT_MS;
 /**
- * The batch helpers of one worker at the same time. They take none of the MAX_CONCURRENT_OPERATIONS places (a helper
- * is held for the whole operation); their steps and pieces are `reserved` calls (MAX_CONCURRENT_LOCKED_OPERATIONS).
+ * The longest silence of a batch helper before the worker's client takes it as lost (its pong time limit): the backstop
+ * of the lock of its operation (6 h). The worker reads none of its answers (its pongs too) while the connection of the
+ * extension is congested.
  */
-export const MAX_CONCURRENT_BATCHES = 8;
-/** A piece of `batchChunk`: at most 6 bytes per character as JSON, so a piece stays far below MAX_CHANNEL_REQUEST_BYTES. */
-export const BATCH_CHUNK_CHARACTERS = 32 * 1024;
-/** The longest input (JSON of the parameters of a step) that the pieces of one session can hold. */
+export const BATCH_HOLD_LIMIT_MS = LOCK_HOLD_LIMIT_MS;
+/** The longest input (JSON of the parameters of a step) that one step of a session can carry. */
 export const MAX_BATCH_INPUT_CHARACTERS = 3 * 1024 * 1024;
 /**
  * Q2 of 2026-10-01: the socket is mounted in a folder that only root can enter (the image creates it 0700; the helper
@@ -63,18 +53,13 @@ export interface BatchParams {
 export interface BatchStepParams {
   session: string;
   kind: BatchStepKind;
-  /** The inputs of the step (batchStepCommand), or `input`: the ID of the pieces that hold their JSON. */
-  params?: unknown;
-  input?: string;
+  /**
+   * The inputs of the step (batchStepCommand). Plan step 11I1, PR B1: always in the step; the alternative `input` (the
+   * ID of the pieces of `batchChunk` that held their JSON) is gone with that operation.
+   */
+  params: unknown;
   /** The time limit of the step in the helper; it ends the step alone. */
   timeoutMs?: number;
-}
-
-export interface BatchChunkParams {
-  session: string;
-  /** The ID of the input (a cleanup label value). */
-  input: string;
-  data: string;
 }
 
 /** The value of a step: its exit code (null after a signal). */
@@ -86,41 +71,30 @@ export interface BatchStepValue {
 const VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
 
-/** The strict check of BatchParams (both sides). */
+/** The strict check of BatchParams. */
 export function parseBatchParams(value: unknown): BatchParams | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['session', 'volume', 'image', 'socket'])) return undefined;
   const { session, volume, image, socket } = value;
   if (!isCleanupLabel(session) || typeof volume !== 'string' || !VOLUME_NAME.test(volume)) return undefined;
   if (typeof image !== 'string' || !IMAGE_ID.test(image)) return undefined;
   // --mount is CSV: a path with a comma or a quote would change the mount. Plan step 11G3: the API takes the path as it
-  // is, and the check stays as strict (the parameters of the extension are unchanged).
+  // is, and the check stays as strict.
   if (typeof socket !== 'string' || !socket.startsWith('/') || socket.length > 4096 || /[",\0\n\r]/.test(socket)) return undefined;
   return { session, volume, image, socket };
 }
 
-/** The strict check of BatchStepParams (both sides): either `params` or `input`. */
+/** The strict check of BatchStepParams: the session, a step kind, its `params`, and an optional time limit. */
 export function parseBatchStepParams(value: unknown): BatchStepParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['session', 'kind'], ['params', 'input', 'timeoutMs'])) return undefined;
-  const { session, kind, params, input, timeoutMs } = value;
-  if (!isCleanupLabel(session) || !isBatchStepKind(kind)) return undefined;
-  if ((params === undefined) === (input === undefined) || (input !== undefined && !isCleanupLabel(input))) return undefined;
+  if (!isRecord(value) || !hasOnlyKeys(value, ['session', 'kind', 'params'], ['timeoutMs'])) return undefined;
+  const { session, kind, params, timeoutMs } = value;
+  if (!isCleanupLabel(session) || !isBatchStepKind(kind) || params === undefined) return undefined;
   if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPERATION_TIMEOUT_MS)) return undefined;
-  const step: BatchStepParams = { session, kind };
-  if (params !== undefined) step.params = params;
-  if (input !== undefined) step.input = input as string;
+  const step: BatchStepParams = { session, kind, params };
   if (timeoutMs !== undefined) step.timeoutMs = timeoutMs as number;
   return step;
 }
 
-/** The strict check of BatchChunkParams (both sides): a piece of 1..BATCH_CHUNK_CHARACTERS characters. */
-export function parseBatchChunkParams(value: unknown): BatchChunkParams | undefined {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['session', 'input', 'data'])) return undefined;
-  const { session, input, data } = value;
-  if (!isCleanupLabel(session) || !isCleanupLabel(input) || typeof data !== 'string' || data === '' || data.length > BATCH_CHUNK_CHARACTERS) return undefined;
-  return { session, input, data };
-}
-
-/** The check of BatchStepValue (the extension). */
+/** The check of BatchStepValue (the value of a step of the helper). */
 export function parseBatchStepValue(value: unknown): BatchStepValue | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['exitCode'])) return undefined;
   const { exitCode } = value;

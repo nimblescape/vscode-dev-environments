@@ -6,8 +6,9 @@
 // step 3, with a script path in a temporary folder) and the script bundled as esbuild.mjs does, in a Node.js process of this
 // computer, with a fake `docker` on PATH that records its calls. The extension's side is the real HelperChannel on
 // NodeProcessRunner.start. Checked above all: the script ends by itself when the connection is lost (the end of its
-// input, silence), and ends the Docker calls that still run and removes their containers before. The same with the
-// real container: test/docker/helperChannel.test.ts.
+// input, silence), and ends the Docker calls that still run before. The same with the real container:
+// test/docker/helperChannel.test.ts. Plan step 11I1, PR B1: the operation `docker` and the removal of the containers of
+// its cleanup label are gone; a running call is the prune of the operation `sweep`, which the fake `docker` holds.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -15,37 +16,30 @@ import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HelperChannel } from '../core/helperChannel/helperChannel';
-import { CHANNEL_ENTRY, OP_PROBE, encodeMessage, parseProbeValue } from '../core/helperChannel/protocol';
+import { CHANNEL_ENTRY, OP_PROBE, OP_SWEEP, encodeMessage, parseProbeValue, sweepArgs } from '../core/helperChannel/protocol';
 import { LOADER_EXIT_CODE, bundleHash, encodeBundle, loaderCommand } from '../core/loader/pipeLoader';
 import { silentLogger, type Logger, type StartedProcess } from '../core/ports';
 import { NodeProcessRunner } from '../core/process';
 
-// Review round 1 (P9): a \`sleep\` call sets its SIGTERM handler before anything else. Review round 2 (C2): that alone does
+// Review round 1 (P9): a held call sets its SIGTERM handler before anything else. Review round 2 (C2): that alone does
 // not order it before the SIGTERM of the script (its silence runs from the operation, not from the wait of the test);
-// the silence of the test (5 s) leaves the start of the fake time for it. \`ps\` answers a cleanup label with one ID.
+// the silence of the test (5 s) leaves the start of the fake time for it. Plan step 11I1, PR B1: the held call is the
+// prune of `sweep` (\`container\`; before: \`sleep\` through the removed operation \`docker\`).
 const FAKE_DOCKER = `#!/usr/bin/env node
 const fs = require('fs');
 const args = process.argv.slice(2);
 const log = process.env.FAKE_DOCKER_LOG;
-if (args[0] === 'sleep') {
+if (args[0] === 'container') {
   process.on('SIGTERM', () => { fs.appendFileSync(log, JSON.stringify(['SIGTERM', ...args]) + '\\n'); process.exit(143); });
   setInterval(() => {}, 1000);
 }
 fs.appendFileSync(log, JSON.stringify(args) + '\\n');
 if (args[0] === 'version') { process.stdout.write('27.1.0\\n'); process.exit(0); }
-else if (args[0] === 'ps') { process.stdout.write('0123456789abcdef0123456789abcdef\\n'); process.exit(0); }
-else if (args[0] === 'rm') process.exit(0);
-else if (args[0] === 'cat') { process.stdin.pipe(process.stdout); process.stdin.on('end', () => process.exit(0)); }
-else if (args[0] !== 'sleep') { process.stderr.write('unknown\\n'); process.exit(1); }
+else if (args[0] !== 'container') { process.stderr.write('unknown\\n'); process.exit(1); }
 `;
 
-// Review round 2 (B4): cleanup label values are 24 hex digits.
-const LABEL_ONE = '0000000000000000000000aa';
-const LABEL_TWO = '0000000000000000000000bb';
-/** The tests below take a few seconds (the silence, the second pass of the cleanup): review round 2, C2. */
+/** The tests below take a few seconds (the silence): review round 2, C2. */
 const SLOW_TEST_MS = 30_000;
-const psOf = (label: string) => ['ps', '-aq', '--no-trunc', '--filter', `label=nimblescape.devenv.channel-step=${label}`];
-const REMOVED = ['rm', '-f', '0123456789abcdef0123456789abcdef'];
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
 
@@ -115,7 +109,9 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
   });
 
   // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
-  it('opens, answers the probe and a Docker call with input, and ends when it is closed', { timeout: SLOW_TEST_MS }, async () => {
+  // Plan step 11I1, PR B1: changed test (before: also a Docker call with input through the operation `docker`, removed):
+  // the log line of the Docker call of the probe instead.
+  it('opens, answers the probe with the log line of its Docker call, and ends when it is closed', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     // Review round 4 (M1): with the sweep of never-started channel containers.
@@ -128,42 +124,43 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     // Plan step 11C2a: changed expectation, `delete`; plan step 11C2b: `deleteCheck`; plan step 11C3: `reconcile`; plan step 11D1: `heartbeat`,
     // `monitorSettings`, `recordGitState`; plan step 11D2: `monitorEnsure`; plan step 11E6: `open`, and `monitorSettings`
     // removed (decision D1 of 2026-10-05).
-    expect(channel.operations).toEqual(['batch', 'batchChunk', 'batchStep', 'delete', 'deleteCheck', 'docker', 'heartbeat', 'listConfigurations', 'lock', 'monitorEnsure', 'open', 'probe', 'pull', 'reconcile', 'recordGitState', 'refresh', 'startContainers', 'stop', 'sweep', 'tokenRemove', 'windowState']);
+    // Plan step 11I1, PR B1: changed expectation: the relay operations `batch`, `batchChunk`, `batchStep`, `docker`, `lock`,
+    // `pull` and `startContainers` are gone.
+    expect(channel.operations).toEqual(['delete', 'deleteCheck', 'heartbeat', 'listConfigurations', 'monitorEnsure', 'open', 'probe', 'reconcile', 'recordGitState', 'refresh', 'stop', 'sweep', 'tokenRemove', 'windowState']);
     expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
-    const result = await channel.docker(['cat'], { input: 'hello channel' });
-    expect(result).toEqual({ exitCode: 0, stdout: 'hello channel', stderr: '', timedOut: false });
-    expect(logLines.some((line) => line.includes('[fake-host] docker#') && line.includes('$ docker cat'))).toBe(true);
+    expect(logLines.some((line) => line.includes('[fake-host] probe#') && line.includes('$ docker version'))).toBe(true);
     channel.close();
     await waitUntil(ended, 'the end of the script');
   });
 
-  it('ends when its input ends: a running call gets SIGTERM and its container is removed', { timeout: SLOW_TEST_MS }, async () => {
+  // Plan step 11I1, PR B1: changed test (before: a `sleep` through the operation `docker`, whose container was then removed
+  // by its cleanup label): the held prune of `sweep`, which gets SIGTERM; the removal is gone with that operation.
+  it('ends when its input ends: a running call gets SIGTERM', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
-    const running = channel.docker(['sleep', 'one'], { cleanup: LABEL_ONE });
-    await waitUntil(() => calls().some((call) => call[0] === 'sleep' && call[1] === 'one'), 'the start of the call');
+    const running = channel.operation(OP_SWEEP, {});
+    await waitUntil(() => calls().some((call) => call[0] === 'container' && call[1] === 'prune'), 'the start of the call');
     // As when the connection closes: the input of the script ends.
     process.end();
     await expect(running).rejects.toThrow();
     await waitUntil(ended, 'the end of the script');
-    expect(calls()).toContainEqual(['SIGTERM', 'sleep', 'one']);
-    expect(calls()).toContainEqual(psOf(LABEL_ONE));
-    expect(calls()).toContainEqual(REMOVED);
+    expect(calls()).toContainEqual(['SIGTERM', ...sweepArgs()]);
   });
 
+  // Plan step 11I1, PR B1: changed test (before: a `sleep` through the operation `docker`, with the removal of its cleanup
+  // label): the held prune of `sweep`.
   it('ends after the silence when the connection hangs (no ping, the input stays open)', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start(5_000);
     let stdout = '';
     process.onStdout((text) => (stdout += text));
     process.write(encodeBundle(script));
     process.write(encodeMessage({ t: 'hello', protocol: 1 }));
-    process.write(encodeMessage({ t: 'op', id: 1, op: 'docker', params: { args: ['sleep', 'two'], cleanup: LABEL_TWO } }));
+    process.write(encodeMessage({ t: 'op', id: 1, op: OP_SWEEP, params: {} }));
     await waitUntil(() => stdout.includes('"t":"hello"'), 'the answer to hello');
-    await waitUntil(() => calls().some((call) => call[0] === 'sleep' && call[1] === 'two'), 'the start of the call');
+    await waitUntil(() => calls().some((call) => call[0] === 'container' && call[1] === 'prune'), 'the start of the call');
     // Nothing more is written and the input stays open.
     await waitUntil(ended, 'the end of the script after the silence');
-    expect(calls()).toContainEqual(['SIGTERM', 'sleep', 'two']);
-    expect(calls()).toContainEqual(psOf(LABEL_TWO));
+    expect(calls()).toContainEqual(['SIGTERM', ...sweepArgs()]);
     process.end();
   });
 

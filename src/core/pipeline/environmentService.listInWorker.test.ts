@@ -13,7 +13,6 @@ import { HelperChannelError, HelperOperationError } from '../helperChannel/helpe
 import { LOCK_BUSY_CODE, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
 import { DELETE_CHECK_FLOW_TIMEOUT_MS, DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
-import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { EnvironmentServiceDeps } from './environmentService';
 
 type FlowOptions = Parameters<OperationFlow>[2];
@@ -97,7 +96,7 @@ describe('the listing of Select configuration in the worker, from the extension 
   });
 });
 
-// Review round 1 of 11B3b (B-R1-7, B-R1-13): the Docker host of the operation, a lock that this window holds, the detail.
+// Review round 1 of 11B3b (B-R1-7, B-R1-13): the Docker host of the operation, the detail.
 describe('the listing in the worker from the extension: review round 1 of 11B3b', () => {
   it('sends the remote Docker host of the operation', async () => {
     const { h, sent } = harness(async () => ({ configPaths: [] }), { dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
@@ -109,14 +108,11 @@ describe('the listing in the worker from the extension: review round 1 of 11B3b'
     expect((sent[0].params as { dockerHost: string }).dockerHost).toBe('build-box');
   });
 
-  it('never sends the listing under a lock of the environment that this window holds; a refusal keeps its detail', async () => {
-    const { h, sent } = harness(async () => ({ refused: { code: 'startFailed', message: 'm', detail: 'd' } }));
+  // Plan step 11I1, PR B1 (user decision D7 of 2026-10-07): the guard against a lock that this window holds is gone (the
+  // extension takes no lock of an environment any more; the worker takes it), so only the refusal with its detail stays.
+  it('a refusal keeps its detail', async () => {
+    const { h } = harness(async () => ({ refused: { code: 'startFailed', message: 'm', detail: 'd' } }));
     await seedEnvironment(h, { container: 'stopped' });
-    const held = await h.lock.take(ENV_ID);
-    const error = await rejection(runWithEnvironmentLock(held, () => h.operations.listConfigurationsInWorker(ENV_ID, { progress: h.progress })));
-    expect((error as Error).message).toContain('under a lock of the environment that this window holds');
-    expect(sent).toEqual([]);
-    await held.release();
     expect(await rejection(h.operations.listConfigurationsInWorker(ENV_ID, { progress: h.progress }))).toMatchObject({ code: 'startFailed', message: 'm', detail: 'd' });
   });
 });
@@ -287,20 +283,16 @@ describe('the Delete in the worker, from the extension (plan step 11C2a)', () =>
     expect(sent).toEqual([]);
   });
 
-  it('never sends without this computer, under a lock that this window holds, or for another Docker host', async () => {
+  // Plan step 11I1, PR B1 (user decision D7 of 2026-10-07): the case under a lock that this window holds is gone with its
+  // guard (the extension takes no lock of an environment any more).
+  it('never sends without this computer, or for another Docker host', async () => {
     const { h, sent } = harness(async () => ({ deleted: true }));
     await seedEnvironment(h, { container: 'stopped' });
     expect(((await rejection(h.operations.deleteInWorker(ENV_ID, { progress: h.progress, additionalVolumesToRemove: [] }))) as Error).message).toContain('cannot be sent to the worker');
-    const withSource = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE });
-    await seedEnvironment(withSource.h, { container: 'stopped' });
-    const held = await withSource.h.lock.take(ENV_ID);
-    const error = await rejection(runWithEnvironmentLock(held, () => withSource.h.operations.deleteInWorker(ENV_ID, { progress: withSource.h.progress, additionalVolumesToRemove: [] })));
-    expect((error as Error).message).toContain('under a lock of the environment that this window holds');
-    await held.release();
     const other = harness(async () => ({ deleted: true }), { monitorSource: () => SOURCE, dockerTarget: async () => ({ kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' }) });
     await seedEnvironment(other.h, { container: 'stopped' });
     expect(await rejection(other.h.operations.deleteInWorker(ENV_ID, { progress: other.h.progress, additionalVolumesToRemove: [] }))).toMatchObject({ code: 'otherDockerHost' });
-    expect([...sent, ...withSource.sent, ...other.sent]).toEqual([]);
+    expect([...sent, ...other.sent]).toEqual([]);
   });
 });
 

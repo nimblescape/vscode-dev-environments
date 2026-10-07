@@ -7,10 +7,8 @@ import { dockerTargetOf, remoteContextNames, LOCAL_DOCKER_TARGET, type DockerTar
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { abortError, silentLogger, type Logger, type StartedProcess } from '../ports';
 import { UserFacingError } from '../errors';
-import { EnvironmentLockError } from '../docker/environmentLock';
-import { HelperChannel, HelperChannelError, HelperOperationError } from './helperChannel';
+import { HelperChannel, HelperChannelError } from './helperChannel';
 import {
-  CHANNEL_OPEN_WAIT_MS,
   CHANNEL_PASSIVE_OPEN_WAIT_MS,
   CHANNEL_PROBE_TIMEOUT_MS,
   CHANNEL_REFRESH_TIMEOUT_MS,
@@ -20,7 +18,7 @@ import {
   openHelperChannel,
 } from './helperChannels';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
-import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, LOCK_BUSY_CODE, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
+import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
 import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 
 // User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).
@@ -28,6 +26,13 @@ const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextName
 /** Plan step 5, PR A: the engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 const directEngine = async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false });
+/**
+ * Plan step 11I1, PR B1: the former CHANNEL_OPEN_WAIT_MS (5 s; removed with HelperChannels.docker, its last user): the wait
+ * for an opening channel that a call had before plan step 5, PR D, which the tests below still go beyond.
+ */
+const OLD_OPEN_WAIT_MS = 5_000;
+/** Plan step 11I1, PR B1: the value of the flow of the fake channel. */
+const FLOWED = { outcome: 'notRunning' };
 
 /** A channel stand-in with the parts that HelperChannels uses. */
 function fakeChannel() {
@@ -52,9 +57,6 @@ function fakeChannel() {
       channel.isOpen = false;
       for (const listener of closeListeners) listener('lost');
     },
-    docker: vi.fn(async () => ({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false })),
-    pull: vi.fn(async (_reference: string, _options?: unknown) => {}),
-    startContainers: vi.fn(async (_ids: readonly string[], _options?: unknown) => {}),
     flow: vi.fn(async (_op: string, _params: unknown, _options?: unknown): Promise<unknown> => ({ outcome: 'notRunning' })),
   };
   return channel;
@@ -81,14 +83,15 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     const open = vi.fn(async () => channel as unknown as HelperChannel);
     const channels = new HelperChannels({ open, logger: silentLogger });
     expect(await channels.get(LOCAL_DOCKER_TARGET)).toBe(channel);
-    expect(await channels.docker(LOCAL_DOCKER_TARGET, ['ps'])).toEqual({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false });
+    // Plan step 11I1, PR B1: changed call (before: HelperChannels.docker, removed): a flow.
+    expect(await channels.flow(LOCAL_DOCKER_TARGET, 'tokenRemove', {})).toEqual(FLOWED);
     expect(open).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledWith(LOCAL_DOCKER_TARGET);
     const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
     expect(unsupported.kind).toBe('unsupported');
     expect(await channels.get(unsupported)).toBeUndefined();
     // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: undefined, the call ran directly): refused.
-    await expect(channels.docker(unsupported, ['ps'])).rejects.toMatchObject({ code: 'unavailable', message: 'the Docker endpoint is neither local nor SSH' });
+    await expect(channels.flow(unsupported, 'tokenRemove', {})).rejects.toMatchObject({ code: 'unavailable', message: 'the Docker endpoint is neither local nor SSH' });
     expect(open).toHaveBeenCalledTimes(1);
     channels.dispose();
   });
@@ -161,7 +164,8 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
       .mockResolvedValueOnce(channel);
     const { logger, lines } = recordingLogger();
     const channels = new HelperChannels({ open, logger });
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({
+    // Plan step 11I1, PR B1: changed call (before: HelperChannels.docker, removed): a flow.
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({
       code: 'unavailable',
       message: 'The helper channel to build-box could not be opened: no image.',
     });
@@ -179,42 +183,22 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
   // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: undefined for a call that was not sent, which
   // then ran directly): a call that was not sent because the channel closed is sent once more through a channel made
   // ready again (it did not run); closed twice, or beyond what the channel carries, it rejects.
-  it('docker: sends once more when the channel closed before the call was sent; not sent twice, unsendable, or lost while it ran rejects', async () => {
+  // Plan step 11I1, PR B1: changed calls (before: HelperChannels.docker, removed): a flow, which is sent once more the same
+  // way (withChannel).
+  it('flow: sends once more when the channel closed before the call was sent; not sent twice, unsendable, or lost while it ran rejects', async () => {
     const channel = fakeChannel();
     const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
-    expect(await channels.docker(REMOTE, ['ps'])).toEqual({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false });
-    channel.docker.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
-    expect(await channels.docker(REMOTE, ['ps'])).toEqual({ exitCode: 0, stdout: 'out', stderr: '', timedOut: false });
-    expect(channel.docker).toHaveBeenCalledTimes(3);
-    channel.docker.mockRejectedValueOnce(new HelperChannelError('closed', 'closed')).mockRejectedValueOnce(new HelperChannelError('closed', 'closed again'));
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'closed', message: 'closed again' });
+    expect(await channels.flow(REMOTE, 'tokenRemove', {})).toEqual(FLOWED);
+    channel.flow.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
+    expect(await channels.flow(REMOTE, 'tokenRemove', {})).toEqual(FLOWED);
+    expect(channel.flow).toHaveBeenCalledTimes(3);
+    channel.flow.mockRejectedValueOnce(new HelperChannelError('closed', 'closed')).mockRejectedValueOnce(new HelperChannelError('closed', 'closed again'));
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({ code: 'closed', message: 'closed again' });
     // Review round 1 (P2): a call beyond what the channel carries is not sent either.
-    channel.docker.mockRejectedValueOnce(new HelperChannelError('unsendable', 'too long'));
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'unsendable' });
-    channel.docker.mockRejectedValueOnce(new HelperChannelError('lost', 'lost'));
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'lost' });
-    channels.dispose();
-  });
-
-  // Review round 1 of PR #89 (B-R1-7): pull and startContainers are sent once more only after `closed`, with their options.
-  it('pull and startContainers: once more after closed; not twice, not after unsendable or lost; options passed on', async () => {
-    const channel = fakeChannel();
-    const channels = new HelperChannels({ open: async () => channel as unknown as HelperChannel, logger: silentLogger });
-    const signal = new AbortController().signal;
-    channel.pull.mockRejectedValueOnce(new HelperChannelError('closed', 'closed'));
-    await channels.pull(REMOTE, 'alpine:1', { signal });
-    expect(channel.pull).toHaveBeenCalledTimes(2);
-    expect(channel.pull.mock.calls[1]).toEqual(['alpine:1', { signal }]);
-    channel.pull.mockRejectedValueOnce(new HelperChannelError('closed', 'a')).mockRejectedValueOnce(new HelperChannelError('closed', 'b'));
-    await expect(channels.pull(REMOTE, 'alpine:1')).rejects.toMatchObject({ code: 'closed', message: 'b' });
-    for (const code of ['unsendable', 'lost'] as const) {
-      const before = channel.startContainers.mock.calls.length;
-      channel.startContainers.mockRejectedValueOnce(new HelperChannelError(code, code));
-      await expect(channels.startContainers(REMOTE, ['a'.repeat(64)])).rejects.toMatchObject({ code });
-      expect(channel.startContainers.mock.calls.length - before).toBe(1);
-    }
-    await channels.startContainers(REMOTE, ['a'.repeat(64)], { signal, timeoutMs: 1_000 });
-    expect(channel.startContainers.mock.calls.at(-1)).toEqual([['a'.repeat(64)], { signal, timeoutMs: 1_000 }]);
+    channel.flow.mockRejectedValueOnce(new HelperChannelError('unsendable', 'too long'));
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({ code: 'unsendable' });
+    channel.flow.mockRejectedValueOnce(new HelperChannelError('lost', 'lost'));
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({ code: 'lost' });
     channels.dispose();
   });
 
@@ -236,49 +220,51 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
   // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: a call waited at most CHANNEL_OPEN_WAIT_MS or
   // its time limit, then took the way without the channel): a call awaits the open in full, as the lock does; its signal
   // still ends its wait (review round 2, A4), not the opening.
-  it('a call awaits an opening channel in full, also beyond CHANNEL_OPEN_WAIT_MS and its time limit; its signal ends the wait (review round 2, A4)', async () => {
+  // Plan step 11I1, PR B1: changed calls (before: HelperChannels.docker, removed): flows; CHANNEL_OPEN_WAIT_MS is gone with
+  // it (OLD_OPEN_WAIT_MS).
+  it('a call awaits an opening channel in full, also beyond the old open wait and its time limit; its signal ends the wait (review round 2, A4)', async () => {
     const channel = fakeChannel();
     let finishOpen!: (channel: HelperChannel) => void;
     const open = vi.fn(() => new Promise<HelperChannel>((resolve) => (finishOpen = resolve)));
     const channels = new HelperChannels({ open, logger: silentLogger });
     let firstDone = false;
-    const first = channels.docker(REMOTE, ['ps'], { timeoutMs: 1_000 }).finally(() => (firstDone = true));
-    const second = channels.docker(REMOTE, ['ps']);
-    await vi.advanceTimersByTimeAsync(CHANNEL_OPEN_WAIT_MS + 1_000);
+    const first = channels.flow(REMOTE, 'tokenRemove', {}, { timeoutMs: 1_000 }).finally(() => (firstDone = true));
+    const second = channels.flow(REMOTE, 'tokenRemove', {});
+    await vi.advanceTimersByTimeAsync(OLD_OPEN_WAIT_MS + 1_000);
     expect(firstDone).toBe(false);
     const controller = new AbortController();
-    const third = channels.docker(REMOTE, ['ps'], { signal: controller.signal });
+    const third = channels.flow(REMOTE, 'tokenRemove', {}, { signal: controller.signal });
     controller.abort();
     await expect(third).rejects.toMatchObject({ name: 'AbortError' });
     // The opening went on: the waiting calls use the channel.
     finishOpen(channel as unknown as HelperChannel);
-    expect(await first).toMatchObject({ exitCode: 0 });
-    expect(await second).toMatchObject({ exitCode: 0 });
+    expect(await first).toEqual(FLOWED);
+    expect(await second).toEqual(FLOWED);
     expect(open).toHaveBeenCalledTimes(1);
     channels.dispose();
   });
 
   // Review round 6 (R6-2): the wait for the channel, the wait for a place and the time limit added up. Plan step 5, PR D
   // (rule D1 of 2026-09-30): changed expectation (before: timeoutMs 7_000, slotWaitMs 2_000): the open is awaited in full
-  // like a state repair, so it is not taken from the time limit; the wait for a place stays at most CHANNEL_OPEN_WAIT_MS
-  // or the time limit (HelperChannel.operation takes it from the time limit that it sends).
-  it('awaits the open apart from the time limit, and waits for a place at most CHANNEL_OPEN_WAIT_MS or the time limit', async () => {
+  // like a state repair, so it is not taken from the time limit. Plan step 11I1, PR B1: changed call (before:
+  // HelperChannels.docker, removed): a flow; the bound of its wait for a place (slotWaitMs) was the docker call's own and is
+  // gone with it.
+  it('awaits the open apart from the time limit', async () => {
     const channel = fakeChannel();
     let finishOpen!: (channel: HelperChannel) => void;
     const channels = new HelperChannels({ open: () => new Promise<HelperChannel>((resolve) => (finishOpen = resolve)), logger: silentLogger });
-    const call = channels.docker(REMOTE, ['ps'], { timeoutMs: 10_000 });
+    const call = channels.flow(REMOTE, 'tokenRemove', {}, { timeoutMs: 10_000 });
     await vi.advanceTimersByTimeAsync(3_000);
     finishOpen(channel as unknown as HelperChannel);
-    expect(await call).toMatchObject({ exitCode: 0 });
-    expect(channel.docker).toHaveBeenCalledWith(['ps'], expect.objectContaining({ timeoutMs: 10_000, slotWaitMs: CHANNEL_OPEN_WAIT_MS }));
-    expect(await channels.docker(REMOTE, ['ps'], { timeoutMs: 2_000 })).toMatchObject({ exitCode: 0 });
-    expect(channel.docker).toHaveBeenLastCalledWith(['ps'], expect.objectContaining({ timeoutMs: 2_000, slotWaitMs: 2_000 }));
+    expect(await call).toEqual(FLOWED);
+    expect(channel.flow).toHaveBeenCalledWith('tokenRemove', {}, { timeoutMs: 10_000 });
     channels.dispose();
   });
 
   // Plan step 5, PR D (rule D1 of 2026-09-30): the state is made consistent before a call: the helper image, then the
   // open in full, also within the wait after a failed open.
-  it('docker: without an open worker, prepares the helper image and opens it in full, also within the wait after a failed open', async () => {
+  // Plan step 11I1, PR B1: changed calls (before: HelperChannels.docker, removed): flows.
+  it('flow: without an open worker, prepares the helper image and opens it in full, also within the wait after a failed open', async () => {
     const channel = fakeChannel();
     const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'no image.')).mockResolvedValueOnce(channel);
     const prepare = vi.fn(async () => {});
@@ -286,23 +272,24 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     expect(await channels.get(REMOTE)).toBeUndefined();
     expect(prepare).not.toHaveBeenCalled();
     const signal = new AbortController().signal;
-    expect(await channels.docker(REMOTE, ['ps'], { signal })).toMatchObject({ exitCode: 0 });
+    expect(await channels.flow(REMOTE, 'tokenRemove', {}, { signal })).toEqual(FLOWED);
     expect(prepare).toHaveBeenCalledWith(REMOTE, signal);
     expect(open).toHaveBeenCalledTimes(2);
     // With an open worker, nothing is prepared again.
-    expect(await channels.docker(REMOTE, ['ps'])).toMatchObject({ exitCode: 0 });
+    expect(await channels.flow(REMOTE, 'tokenRemove', {})).toEqual(FLOWED);
     expect(prepare).toHaveBeenCalledTimes(1);
     channels.dispose();
   });
 
-  it('docker: a helper image that cannot be prepared refuses the call with the cause, and opens nothing', async () => {
+  // Plan step 11I1, PR B1: changed calls (before: HelperChannels.docker, removed): flows.
+  it('flow: a helper image that cannot be prepared refuses the call with the cause, and opens nothing', async () => {
     const open = vi.fn(async () => fakeChannel() as unknown as HelperChannel);
     const prepare = vi.fn(async () => {
       throw new UserFacingError('helperFailed', 'The workspace helper could not be prepared.', 'no space left on device');
     });
     const { logger, lines } = recordingLogger();
     const channels = new HelperChannels({ open, prepare, logger });
-    await expect(channels.docker(REMOTE, ['stop', 'c'])).rejects.toMatchObject({
+    await expect(channels.flow(REMOTE, 'stop', {})).rejects.toMatchObject({
       name: 'HelperChannelError',
       code: 'unavailable',
       message: 'the helper image could not be prepared: The workspace helper could not be prepared. no space left on device',
@@ -313,11 +300,11 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
     prepare.mockImplementationOnce(async () => {
       throw abortError();
     });
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({ name: 'AbortError' });
     channels.dispose();
     // After dispose: refused, nothing prepared.
     prepare.mockClear();
-    await expect(channels.docker(REMOTE, ['ps'])).rejects.toMatchObject({ code: 'unavailable', message: 'the window is closing' });
+    await expect(channels.flow(REMOTE, 'tokenRemove', {})).rejects.toMatchObject({ code: 'unavailable', message: 'the window is closing' });
     expect(prepare).not.toHaveBeenCalled();
   });
 
@@ -682,8 +669,9 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
         );
         const channels = new HelperChannels({ open, logger });
         // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: undefined, the call ran directly, and the
-        // log said so): the call is refused with the cause.
-        await expect(channels.docker(LOCAL_DOCKER_TARGET, ['ps'])).rejects.toMatchObject({
+        // log said so): the call is refused with the cause. Plan step 11I1, PR B1: changed call (before:
+        // HelperChannels.docker, removed): a flow.
+        await expect(channels.flow(LOCAL_DOCKER_TARGET, 'tokenRemove', {})).rejects.toMatchObject({
           code: 'unavailable',
           message: expect.stringContaining('The helper channel to the local Docker was closed:'),
         });
@@ -759,11 +747,12 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     // and opens nothing (was: it opened again at once).
     await expect(channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable', message: 'no image.' });
     expect(open).toHaveBeenCalledTimes(1);
-    // An operation (a Docker call) opens again at once; the refresh then uses that worker.
-    await channels.docker(LOCAL_DOCKER_TARGET, ['ps']);
+    // An operation opens again at once; the refresh then uses that worker. Plan step 11I1, PR B1: changed call (before:
+    // HelperChannels.docker, removed): a flow.
+    await channels.flow(LOCAL_DOCKER_TARGET, 'tokenRemove', {});
     expect(await channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
-    // PR #76 review round 1 (A-R1-1, A-R1-2): checked, never prepared by the refresh (was: prepared twice); the Docker
-    // call prepared once.
+    // PR #76 review round 1 (A-R1-1, A-R1-2): checked, never prepared by the refresh (was: prepared twice); the flow
+    // prepared once.
     expect(checkPresent).toHaveBeenCalledTimes(2);
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledTimes(2);
@@ -786,8 +775,9 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
   });
 
   // PR #76 review round 1 (A-R1-1, A-R1-2): a missing helper image refuses each refresh at once and never starts a build,
-  // also after many refreshes; a Docker call of an operation still prepares (builds) it.
-  it('a missing helper image refuses each refresh without a build; a Docker call still prepares it', async () => {
+  // also after many refreshes; an operation still prepares (builds) it. Plan step 11I1, PR B1: changed call (before:
+  // HelperChannels.docker, removed): a flow.
+  it('a missing helper image refuses each refresh without a build; a flow still prepares it', async () => {
     const channel = { ...fakeChannel(), operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) };
     const open = vi.fn(async () => channel as unknown as HelperChannel);
     const prepare = vi.fn(async () => {});
@@ -804,7 +794,7 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     expect(checkPresent).toHaveBeenCalledTimes(5);
     expect(prepare).not.toHaveBeenCalled();
     expect(open).not.toHaveBeenCalled();
-    await channels.docker(REMOTE, ['ps']);
+    await channels.flow(REMOTE, 'tokenRemove', {});
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(checkPresent).toHaveBeenCalledTimes(5);
     channels.dispose();
@@ -831,8 +821,9 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
   });
 
   // PR #76 review round 3 (A-R3-1): the refresh waits at most CHANNEL_PASSIVE_OPEN_WAIT_MS for an open that is still
-  // running (not the whole open, up to about 3 minutes); the open goes on, and a Docker call of an operation still awaits
-  // it in full. An open within that time gives the states at once.
+  // running (not the whole open, up to about 3 minutes); the open goes on, and an operation still awaits it in full. An
+  // open within that time gives the states at once. Plan step 11I1, PR B1: changed call (before: HelperChannels.docker,
+  // removed): a flow; CHANNEL_OPEN_WAIT_MS is gone with it (OLD_OPEN_WAIT_MS).
   it('the refresh waits at most CHANNEL_PASSIVE_OPEN_WAIT_MS for an open; an operation awaits it in full', async () => {
     vi.useFakeTimers();
     try {
@@ -849,7 +840,7 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
         (error: unknown) => (error instanceof HelperChannelError ? `${error.code}: ${error.message}` : 'other'),
       );
       await vi.advanceTimersByTimeAsync(0);
-      const call = channels.docker(REMOTE, ['ps']).then(
+      const call = channels.flow(REMOTE, 'tokenRemove', {}).then(
         () => 'resolved',
         (error: unknown) => (error instanceof HelperChannelError ? `${error.code}: ${error.message}` : 'other'),
       );
@@ -875,12 +866,12 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
       });
       expect(open).toHaveBeenCalledTimes(1);
       channels.dispose();
-      // An open that takes longer than CHANNEL_OPEN_WAIT_MS but less than CHANNEL_PASSIVE_OPEN_WAIT_MS gives the states.
+      // An open that takes longer than the old open wait but less than CHANNEL_PASSIVE_OPEN_WAIT_MS gives the states.
       const channel = { ...fakeChannel(), operations: ['refresh'], operation: vi.fn(async () => refreshValue(EXPECTED_STATES)) };
-      const slow = vi.fn(() => new Promise<HelperChannel>((resolve) => setTimeout(() => resolve(channel as unknown as HelperChannel), 4 * CHANNEL_OPEN_WAIT_MS)));
+      const slow = vi.fn(() => new Promise<HelperChannel>((resolve) => setTimeout(() => resolve(channel as unknown as HelperChannel), 4 * OLD_OPEN_WAIT_MS)));
       const later = new HelperChannels({ open: slow, checkPresent: vi.fn(async () => {}), logger: silentLogger });
       const states = later.refresh(REMOTE, REFRESH_ENVIRONMENTS);
-      await vi.advanceTimersByTimeAsync(4 * CHANNEL_OPEN_WAIT_MS);
+      await vi.advanceTimersByTimeAsync(4 * OLD_OPEN_WAIT_MS);
       expect(await states).toEqual(EXPECTED_STATES);
       later.dispose();
     } finally {
@@ -971,58 +962,5 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
     const invalid = refreshChannel(['refresh'], async () => wrong);
     await expect(invalid.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'protocol' });
     invalid.channels.dispose();
-  });
-});
-
-// Plan step 5, PR B: HelperChannels.lock (user decisions D1 and D3).
-describe('HelperChannels.lock (plan step 5, PR B)', () => {
-  const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
-
-  function lockingChannel(lock: (id: string, wait: number) => Promise<unknown>) {
-    return { ...fakeChannel(), lock: vi.fn(lock) };
-  }
-
-  it('user decision D1: ends the wait after a failed open and opens the worker for the lock', async () => {
-    const held = { environmentId: ID };
-    const channel = lockingChannel(async () => held);
-    const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'The helper channel could not be opened: no image.')).mockResolvedValueOnce(channel);
-    // Plan step 5, PR D: the lock does not prepare the helper image itself (withEnvironmentLock ensured it before).
-    const prepare = vi.fn(async () => {});
-    const channels = new HelperChannels({ open, prepare, logger: silentLogger });
-    expect(await channels.get(REMOTE)).toBeUndefined();
-    // Within the wait after the failure, an explicit lock opens again.
-    expect(await channels.lock(REMOTE, ID, 10)).toBe(held);
-    expect(prepare).not.toHaveBeenCalled();
-    expect(open).toHaveBeenCalledTimes(2);
-    expect(channel.lock).toHaveBeenCalledWith(ID, 10, undefined);
-    channels.dispose();
-  });
-
-  it('user decision D1: without a worker it throws unavailable with the cause of the failed open, and never goes on', async () => {
-    const open = vi.fn().mockRejectedValue(new HelperChannelError('open', 'The helper channel to build-box was closed: it reaches another Docker engine.'));
-    const channels = new HelperChannels({ open, logger: silentLogger });
-    const error = await channels.lock(REMOTE, ID, 10).catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(EnvironmentLockError);
-    expect(error).toMatchObject({ kind: 'unavailable', message: expect.stringContaining('another Docker engine') });
-    const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
-    await expect(channels.lock(unsupported, ID, 10)).rejects.toMatchObject({ kind: 'unavailable' });
-    channels.dispose();
-  });
-
-  it('user decision D3: a busy lock of the worker is busy; any other failure is unavailable; an abort passes', async () => {
-    const busy = lockingChannel(async () => {
-      throw new HelperOperationError(LOCK_BUSY_CODE, 'held', false);
-    });
-    const channels = new HelperChannels({ open: async () => busy as unknown as HelperChannel, logger: silentLogger });
-    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ name: 'EnvironmentLockError', kind: 'busy' });
-    busy.lock.mockImplementationOnce(async () => {
-      throw new HelperChannelError('lost', 'lost');
-    });
-    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ kind: 'unavailable' });
-    busy.lock.mockImplementationOnce(async () => {
-      throw abortError();
-    });
-    await expect(channels.lock(REMOTE, ID, 10)).rejects.toMatchObject({ name: 'AbortError' });
-    channels.dispose();
   });
 });
