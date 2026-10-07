@@ -45,6 +45,8 @@ describe('11I1 A1 R1: the worker lock and the monitor stop lock on the same lock
     for (const c of controllers) c.abort();
     controllers.length = 0;
     for (const child of started) {
+      // Review round 2 (A-L1): only a holder that still runs (the group of one that ended may be another's by now).
+      if (child.exitCode !== null || child.signalCode !== null) continue;
       try {
         process.kill(-(child.pid as number), 'SIGKILL');
       } catch {

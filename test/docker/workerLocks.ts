@@ -199,7 +199,8 @@ export async function holdLockInContainer(
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  return { container, release: () => void cli.run(['rm', '-f', container]) };
+  // Review round 2 (A-L2): a removal that fails is an error (else the lock stays held, and a later check reads busy).
+  return { container, release: () => void cli.ok(['rm', '-f', container]) };
 }
 
 /**
