@@ -712,7 +712,9 @@ async function runAttached(api: EngineApi, hijack: EngineHijack, spec: EngineAtt
     } catch (error) {
       result = { exitCode: null, error: isAbortError(error) ? new Error('The end of the container could not be read.') : error instanceof Error ? error : new Error(String(error)) };
     }
-    // The rest of its output, then the connection ends.
+    // The rest of its output, then the connection ends. Review round 1 of PR #115 (A-L1): a paused output is read again
+    // first, so its end (often why the process ended) is not lost and its end does not wait out ATTACHED_DRAIN_MS.
+    connection.resume?.();
     let drained: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([connection.ended.catch(() => undefined), new Promise<void>((resolve) => (drained = setTimeout(resolve, ATTACHED_DRAIN_MS)))]);
     clearTimeout(drained);

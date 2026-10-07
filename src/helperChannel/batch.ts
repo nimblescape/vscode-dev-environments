@@ -29,7 +29,7 @@ import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, MAX_CLIENT_LINE, cha
 import { MAX_CAPTURED_OUTPUT_BYTES } from '../core/helper/analysisLimits';
 import { bundleHash } from '../core/loader/pipeLoader';
 import { abortError, isAbortError, type Logger } from '../core/ports';
-import type { DockerEngine, EngineAttachedRun } from '../core/worker/dockerEngine';
+import { EngineError, type DockerEngine, type EngineAttachedRun } from '../core/worker/dockerEngine';
 import { abortedOrAfter } from './lock';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
@@ -77,7 +77,18 @@ function sessionOf(deps: BatchDeps, session: string): BatchSession & { channel: 
 async function removeByLabel(engine: DockerEngine, session: string): Promise<void> {
   const limit = AbortSignal.timeout(CHANNEL_CLEANUP_TIMEOUT_MS);
   const ids = await engine.containerIds({ label: [channelStepLabel(session)] }, limit);
-  for (const id of ids) await engine.removeContainer(id, limit);
+  // Review round 1 of PR #115 (A-L3): each container on its own (one failure does not keep the others), and one that the
+  // engine is removing already (409: AutoRemove at the same time) is gone; the first other failure is thrown at the end.
+  let failure: unknown;
+  for (const id of ids) {
+    try {
+      await engine.removeContainer(id, limit);
+    } catch (error) {
+      if (error instanceof EngineError && error.status === 409) continue;
+      failure ??= error;
+    }
+  }
+  if (failure !== undefined) throw failure;
 }
 
 /** A batch helper that runs, with the client of its ChannelServer. */
@@ -199,8 +210,10 @@ export function batchOperation(deps: BatchDeps): OperationHandler {
       if (reason !== undefined) throw new OperationError('failed', `The batch helper ended: ${reason}.`);
       throw new OperationError('timeout', 'The batch helper was held for its longest time and was ended.');
     } finally {
-      deps.sessions.delete(p.session);
+      // Review round 1 of PR #115 (A-L4): the session is forgotten after its helper was removed, so a new batch of the same
+      // session cannot start meanwhile and lose its container to this removal by the session label.
       await helper?.finish();
+      deps.sessions.delete(p.session);
     }
   };
 }
