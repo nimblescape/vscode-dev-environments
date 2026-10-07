@@ -42,7 +42,8 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
     'dockerSetup.ts',
     'dockerStart.ts',
     'dockerTargets.ts',
-    'environmentLock.ts',
+    // Plan step 11I1, PR B1: changed list: environmentLock.ts left the bundle with the lock through the relay of the worker
+    // and the guards of the window against a lock that it held (decision D7).
     'remoteDocker.ts',
     'workerPreparation.ts',
   ],

@@ -2,8 +2,9 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 5, PR B: the lock of an environment on the Docker host (the operation `lock` of the worker, protocol.ts) and
-// the scope of an operation that holds it. While a lock is held, the plain Docker calls of the operation
+// Plan step 5, PR B: the lock of an environment on the Docker host (taken in the worker, src/helperChannel/workerLock.ts;
+// plan step 11I1, PR B1: the operation `lock` is gone) and the scope of an operation that holds it. While a lock is
+// held, the plain Docker calls of the operation
 // (isRoutableDockerCall) go only through the worker that holds it (ContainerAdapter.run), never directly: when that worker
 // is lost, the lock is gone with it, and the calls fail instead of going on without the lock. Every call after the loss
 // fails, whatever its kind. The scope is re-entrant: an operation that holds the lock of an environment does not take it
@@ -12,7 +13,7 @@ import { AsyncLocalStorage } from 'async_hooks';
 import type { ChannelPullOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import type { RunOptions, RunResult } from '../ports';
 
-/** A held lock of an environment (HelperChannel.lock). */
+/** A held lock of an environment (the worker's own, workerEnvironmentLock of src/helperChannel/workerLock.ts). */
 export interface HeldEnvironmentLock {
   readonly environmentId: string;
   /**
@@ -28,13 +29,14 @@ export interface HeldEnvironmentLock {
    */
   docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'> & { secretInput?: string }): Promise<RunResult>;
   /**
-   * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (HelperChannel.batch). Plan step
+   * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (workerBatchSession). Plan step
    * 6, PR C: the open pipeline runs its volume steps in it (src/core/helper/batchScope.ts).
    */
   batch?(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
   /**
    * Plan step 10A (decision of 2026-10-03): the pull of an image and the start of containers by the worker that holds the
-   * lock (HelperChannel.pull, HelperChannel.startContainers).
+   * lock. Plan step 11I1, PR B1: no lock has them any more (HelperChannel.pull and startContainers are gone); they go with
+   * the routing of ContainerAdapter in plan step 11I1, PR B2.
    */
   pull?(reference: string, options: ChannelPullOptions): Promise<void>;
   startContainers?(ids: readonly string[], options: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;

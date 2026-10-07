@@ -47,7 +47,6 @@ import {
 import { abortError } from '../ports';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_OPEN, OP_STOP, parseStopParams } from '../helperChannel/protocol';
-import { runWithEnvironmentLock } from '../docker/environmentLock';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
   ENVIRONMENT_LOCK_WAIT_SECONDS,
@@ -3854,14 +3853,11 @@ describe('stop', () => {
       expect((await entry())?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 3 });
     });
 
-    it('refuses before the worker: under a lock that this window holds, and parameters the worker would refuse (review round 1, A-R1-4, A-R1-5)', async () => {
+    // Plan step 11I1, PR B1 (user decision D7 of 2026-10-07): the refusal under a lock that this window holds (A-R1-4) is
+    // gone with its guard (the extension takes no lock of an environment any more); the refusal of parameters stays.
+    it('refuses before the worker parameters the worker would refuse (review round 1, A-R1-5)', async () => {
       const { sent } = withFlow(async () => ({ outcome: 'stopped', services: [], failures: [] }));
       await seedEnvironment(h, { container: 'running' });
-      const held = (await runWithEnvironmentLock(
-        { environmentId: ENV_ID, lost: new Promise(() => {}), docker: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }), release: async () => {} },
-        () => h.operations.stop(ENV_ID).catch((e: unknown) => e),
-      )) as Error;
-      expect(held.message).toBe(`Stop of ${REPO} under a lock of the environment that this window holds.`);
       await h.registry.updateEnvironment(ENV_ID, (env) => {
         env.remoteUser = '-u root';
       });

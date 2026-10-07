@@ -30,8 +30,6 @@ import {
   newCleanupLabel,
   encodeMessage,
   parseClientMessage,
-  parseDockerOperationParams,
-  parseDockerOperationValue,
   engineIdentity,
   parseProbeValue,
   parseServerMessage,
@@ -176,30 +174,8 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
     expect(channelLabelValue('a')).not.toBe(`3-${createHash('sha256').update('a').digest('hex').slice(0, 12)}`);
   });
 
-  it('checks the parameters and values of docker and probe', () => {
-    // Review round 1 (S1): the cleanup is a label value, no longer container names; review round 2 (B4): 24 hex digits.
-    expect(parseDockerOperationParams({ args: ['ps'], input: 'x', cleanup: '0a1b2c3d4e5f60718293a4b5' })).toEqual({
-      args: ['ps'],
-      input: 'x',
-      cleanup: '0a1b2c3d4e5f60718293a4b5',
-    });
-    expect(parseDockerOperationParams({ args: ['exec'], inputIsSecret: true })).toEqual({ args: ['exec'], inputIsSecret: true });
-    for (const params of [
-      null,
-      { args: [] },
-      { args: ['a\0b'] },
-      { args: ['ps'], extra: 1 },
-      { args: ['ps'], input: 'x', inputIsSecret: true },
-      { args: ['ps'], cleanup: ['step-0a1b2c3d'] },
-      { args: ['ps'], cleanup: 'short' },
-      { args: ['ps'], cleanup: '-step-0a1b2c3d' },
-      { args: ['ps'], cleanup: 'step-0a1b2c3d4e5f60718293' },
-      { args: ['ps'], cleanup: 'Step-0A1B2C3D' },
-    ]) {
-      expect(parseDockerOperationParams(params), JSON.stringify(params)).toBeUndefined();
-    }
-    expect(parseDockerOperationValue({ exitCode: null })).toEqual({ exitCode: null });
-    expect(parseDockerOperationValue({ exitCode: 1.5 })).toBeUndefined();
+  // Plan step 11I1, PR B1: the checks of the parameters and the value of `docker` are gone with that operation.
+  it('checks the value of probe', () => {
     expect(parseProbeValue({ serverVersion: '27', detail: 'd' })).toEqual({ serverVersion: '27', detail: 'd' });
     expect(parseProbeValue({ detail: 3 })).toBeUndefined();
   });

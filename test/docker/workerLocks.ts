@@ -2,15 +2,14 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 6, PR C: the real environment lock of the workers for the Docker test files of the open pipeline. Since this
-// PR, every helper step of an open runs in the batch helper of the operation, which the worker that holds the lock starts
-// (HeldEnvironmentLock.batch; rule D1: never a `docker run` of its own), so these files need the real workers, as
-// extension.ts wires them (HelperChannels, openHelperChannel, the bundled worker script), with a state volume of the test.
-// Records the batch helpers of each lock, so that a test can count them (one per operation). `dispose` closes the
-// workers and returns the worker and batch helper containers that are left over.
+// Plan step 6, PR C: the real workers for the Docker test files of the open pipeline, as extension.ts wires them
+// (HelperChannels, openHelperChannel, the bundled worker script), with a state volume of the test. Their flows take the
+// environment lock and start the batch helper of an operation in the worker. `dispose` closes the workers and returns
+// the worker and batch helper containers that are left over.
 // Plan step 11I1, PR A1: also the pieces that replace the relay of the worker in these files (11I1 removes the `lock` and
 // `batch` operations): a holder of a lock in a plain container (holdLockInContainer, lockIsFree), and the batch helper of
-// the worker started from the test process (inProcessBatches).
+// the worker started from the test process (inProcessBatches). Plan step 11I1, PR B1: the lock through the relay
+// (WorkerLocks.take, its batch helpers, inBatchScope) is gone with those operations.
 import type { EnvironmentStates, StateEnvironment } from '../../src/core/pipeline/refreshStates';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -25,7 +24,6 @@ import { helperImageTag } from '../../src/core/helper/helperImage';
 import type { HelperBatchSession } from '../../src/core/helperChannel/helperChannel';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LOCK_BUSY_EXIT, LOCK_STATE_DIR } from '../../src/core/helperChannel/protocol';
-import type { Logger } from '../../src/core/ports';
 import { workerBatchSession } from '../../src/helperChannel/batch';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
@@ -59,16 +57,12 @@ export function workerScript(): Promise<string> {
 
 export interface WorkerLocks {
   readonly channels: HelperChannels;
-  /** EnvironmentServiceDeps.environmentLock: the lock of the worker of the current Docker target. */
-  take(environmentId: string, waitSeconds: number, signal: AbortSignal | undefined): Promise<HeldEnvironmentLock>;
   /** Plan step 11B2: EnvironmentServiceDeps.flow, a flow in the worker of the current Docker target (as extension.ts). */
   flow(op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown>;
   /** Plan step 11C1: EnvironmentServiceDeps.workerRefresh, the refresh in the worker of the current Docker target (as extension.ts). */
   refresh(environments: readonly StateEnvironment[]): Promise<EnvironmentStates>;
   /** Plan step 11I1, PR A2: the names of the worker containers that this object started, in order. */
   readonly workerNames: string[];
-  /** The batch helper sessions opened through the locks of `take`, per environment ID, in order. */
-  readonly batches: Map<string, string[]>;
   /** The worker and batch helper containers of this object that still exist. */
   leftovers(): string[];
   /** Closes the workers; waits for their containers and the batch helpers to be gone, and returns those left over. */
@@ -90,7 +84,6 @@ export function workerLocks(
 ): WorkerLocks {
   const { run, cli, log } = context;
   const helperTag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
-  const batches = new Map<string, string[]>();
   const workerNames: string[] = [];
   const channels = new HelperChannels({
     logger: log,
@@ -118,37 +111,18 @@ export function workerLocks(
   // other windows of a test file do not hold up).
   const workerContainers = () =>
     cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.Names}}']).filter((name) => workerNames.includes(name));
-  const batchContainers = () => [...batches.values()].flat().flatMap((session) => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_CHANNEL_STEP}=${session}`]));
   // Review round 1 of PR #117 (A-M1): the batch helpers that the flows of the workers start (workerBatchSession) carry no
   // label of the run; the test files run one at a time, so every batch helper that the engine did not have before the
   // tests is one of this file.
   const baselineNames = new Set(readBaseline(run).containers.map((container) => container.name));
   const flowBatchContainers = () => cli.lines(['ps', '-a', '--filter', `label=${LABEL_CHANNEL_STEP}`, '--format', '{{.Names}}']).filter((name) => !baselineNames.has(name));
-  const leftovers = () => [...new Set([...workerContainers(), ...batchContainers(), ...flowBatchContainers()])];
+  const leftovers = () => [...new Set([...workerContainers(), ...flowBatchContainers()])];
   return {
     channels,
     workerNames,
-    batches,
     leftovers,
     flow: async (op, params, options) => channels.flow(await targets.current(), op, params, options),
     refresh: async (environments) => channels.refresh(await targets.current(), environments),
-    take: async (environmentId, waitSeconds, signal) => {
-      const lock = await channels.lock(await targets.current(), environmentId, waitSeconds, signal);
-      return {
-        environmentId: lock.environmentId,
-        lost: lock.lost,
-        docker: (args, options) => lock.docker(args, options),
-        // Plan step 10A: the operations over the Engine API of the worker that holds the lock.
-        pull: (reference, options) => lock.pull!(reference, options),
-        startContainers: (ids, options) => lock.startContainers!(ids, options),
-        release: () => lock.release(),
-        batch: async (p, batchSignal) => {
-          const session = await lock.batch!(p, batchSignal);
-          batches.set(environmentId, [...(batches.get(environmentId) ?? []), session.session]);
-          return session;
-        },
-      };
-    },
     dispose: async () => {
       channels.dispose();
       const deadline = Date.now() + 60_000;
@@ -156,20 +130,6 @@ export function workerLocks(
       return leftovers();
     },
   };
-}
-
-/**
- * Plan step 7 (user decision of 2026-10-01): the per-step path is removed, so a volume step of WorkspaceHelper runs only
- * in the batch scope of an operation. Runs `fn` as an operation does: under the lock of `lockId` (a storage ID) taken
- * through `locks` (10 s, D3), in the batch scope of `volume`; its batch helper is closed and the lock released at the end.
- */
-export async function inBatchScope<T>(locks: WorkerLocks, lockId: string, volume: string, logger: Logger, fn: () => Promise<T>): Promise<T> {
-  const lock = await locks.take(lockId, 10, undefined);
-  try {
-    return await runWithBatchScope(lock, volume, logger, fn);
-  } finally {
-    await lock.release();
-  }
 }
 
 let lockHolderBundle: Promise<string> | undefined;
@@ -267,7 +227,7 @@ export async function inProcessBatches(context: Pick<DockerTestContext, 'cli' | 
     },
   };
   const engine = dockerEngine(engineApi(socket), engineHijack(socket));
-  const deps = { sessions: new Map(), engineOf: () => engine, readScript: () => script };
+  const deps = { engineOf: () => engine, readScript: () => script };
   const sessions: string[] = [];
   // Review round 1 (A-L3): the cancel of an open (its `signal`) ends that open, as the worker's operation would.
   const open = async (p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession> => {
