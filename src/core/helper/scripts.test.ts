@@ -466,6 +466,20 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(parsed.dockerfiles.s0.startsWith('FROM alpine\nRUN echo aaa')).toBe(true);
   });
 
+  it('never waits on a FIFO of the repository as a Dockerfile, and reads no text of it (decision of 2026-10-07)', () => {
+    const { repo, env } = setup();
+    expect(spawnSync('mkfifo', [path.join(repo, 'fifo.Dockerfile')]).status).toBe(0);
+    const model = { name: PROJECT, services: { fifo: { build: { context: repo, dockerfile: 'fifo.Dockerfile' } }, app: { build: { context: `${repo}/.devcontainer`, dockerfile: 'Dockerfile' } } } };
+    const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+    const result = spawnSync(process.execPath, command.slice(1), { encoding: 'utf8', timeout: 10_000, env: { ...env, FAKE_MODEL: JSON.stringify(model) } });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const parsed = parseComposeModelOutput(result.stdout.trim());
+    if ('error' in parsed) throw new Error(parsed.error);
+    expect(parsed.dockerfiles.fifo).toBeUndefined();
+    expect(parsed.dockerfiles.app).toBe('FROM node:24\n');
+  });
+
   it('prints the model of all profiles, the Dockerfiles in the repository, and the real paths', () => {
     const { dir, repo, argsFile, env } = setup();
     const files = [path.join(repo, 'compose.yml'), path.join(repo, '.devcontainer', 'compose.yml')];
@@ -1317,6 +1331,62 @@ describe('READ_FILES_SCRIPT', () => {
     const result = runNode(readFilesCommand(path.join(root, 'repo'), '../devcontainer.json'));
     expect(result.status).not.toBe(0);
     expect(result.stdout).toBe('');
+  });
+  // Decision of the user of 2026-10-07: the configuration file was read through a link with a check of its path text
+  // only, so a repository could name a file of the token (or any file that root reads in the batch helper) as its
+  // devcontainer.json. A configuration file that is no plain file of the repository after links fails the script and is
+  // never read; one that a link of the repository leads to is read as before.
+  it('refuses a configuration file that links out of the repository, and never reads it (decision of 2026-10-07)', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    write(path.join(root, '.devenv+', 'github-token'), 'gho_SECRET_TOKEN');
+    write(path.join(repo, 'README.md'), 'x');
+    fs.mkdirSync(path.join(repo, '.devcontainer'), { recursive: true });
+    for (const target of ['../../.devenv+/github-token', path.join(root, '.devenv+', 'github-token')]) {
+      fs.rmSync(path.join(repo, '.devcontainer', 'devcontainer.json'), { force: true });
+      fs.symlinkSync(target, path.join(repo, '.devcontainer', 'devcontainer.json'));
+      const result = runNode(readFilesCommand(repo, '.devcontainer/devcontainer.json'));
+      expect(result.status, target).not.toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('The configuration file is not a file of the repository.');
+      expect(`${result.stdout}${result.stderr}`).not.toContain('gho_SECRET_TOKEN');
+    }
+    // Also through a folder link of the repository that leads out of it.
+    fs.rmSync(path.join(repo, '.devcontainer'), { recursive: true, force: true });
+    fs.symlinkSync(path.join(root, '.devenv+'), path.join(repo, '.devcontainer'));
+    const through = runNode(readFilesCommand(repo, '.devcontainer/github-token'));
+    expect(through.status).not.toBe(0);
+    expect(`${through.stdout}${through.stderr}`).not.toContain('gho_SECRET_TOKEN');
+  });
+
+  it('reads a configuration file that a link of the repository leads to (decision of 2026-10-07)', () => {
+    const repo = tempDir();
+    write(path.join(repo, 'config', 'real.json'), '{ "image": "alpine" }');
+    fs.mkdirSync(path.join(repo, '.devcontainer'), { recursive: true });
+    fs.symlinkSync('../config/real.json', path.join(repo, '.devcontainer', 'devcontainer.json'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toEqual({ configText: '{ "image": "alpine" }' });
+    // A link that leads nowhere is a configuration that does not exist, as before.
+    fs.symlinkSync('../config/gone.json', path.join(repo, '.devcontainer', 'gone.json'));
+    expect(read(repo, '.devcontainer/gone.json')).toBeNull();
+  });
+
+  it('never waits on a FIFO of the repository, as the configuration or as its Dockerfile (decision of 2026-10-07)', () => {
+    const repo = tempDir();
+    fs.mkdirSync(path.join(repo, 'a'), { recursive: true });
+    expect(spawnSync('mkfifo', [path.join(repo, 'a', 'devcontainer.json')]).status).toBe(0);
+    const started = Date.now();
+    const fifoConfig = spawnSync(process.execPath, readFilesCommand(repo, 'a/devcontainer.json').slice(1), { encoding: 'utf8', timeout: 10_000 });
+    expect(fifoConfig.error).toBeUndefined();
+    expect(fifoConfig.status).not.toBe(0);
+    expect(fifoConfig.stderr).toContain('The configuration file is not a file of the repository.');
+    write(path.join(repo, 'b', 'devcontainer.json'), '{ "build": { "dockerfile": "Dockerfile" } }');
+    expect(spawnSync('mkfifo', [path.join(repo, 'b', 'Dockerfile')]).status).toBe(0);
+    const fifoDockerfile = spawnSync(process.execPath, readFilesCommand(repo, 'b/devcontainer.json').slice(1), { encoding: 'utf8', timeout: 10_000 });
+    expect(fifoDockerfile.error).toBeUndefined();
+    expect(fifoDockerfile.status).toBe(0);
+    // Not read, and not missing: the extension refuses the Dockerfile (dockerfileUnreadable), as for a link out.
+    expect(JSON.parse(fifoDockerfile.stdout)).toEqual({ configText: '{ "build": { "dockerfile": "Dockerfile" } }', dockerfilePath: 'b/Dockerfile' });
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 });
 
