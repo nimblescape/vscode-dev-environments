@@ -9,7 +9,7 @@
 // socket and cannot read CONFIG_FOLDER, and outside its step it cannot read the secrets tmpfs; the token is absent from
 // `docker inspect` (Env, Args) and from the log; a step time limit ends that step and the session goes on; the modes
 // are restored after the Git step; Docker Compose refuses remote includes in the helper; the helper container is gone
-// after a close (cancel), after a kill of the worker, and after its silence when the worker hangs. The clone uses a
+// after a close (cancel). The clone uses a
 // derived image whose `git` only waits (so the Git step is deterministic and needs no network).
 // User decision of 2026-10-01 ("we shall run as the repo owner user. that is what a real user would do as well."; it
 // replaces option A): a Compose model step runs as the owner of the repository (1000 here): it cannot read a file in
@@ -17,21 +17,20 @@
 // in the repository (an `.env`); createFolders (agreed extension) creates folders of the owner.
 // Plan step 11I1, PR A1: the batch helper of the checks of one session is started from the test process as the worker's
 // own flow starts it (inProcessBatches: workerBatchSession over the Engine API), without the `lock` and `batch` relay of
-// the worker; only the end of the helper with its worker (kill, silence) still goes through a worker (PR A2 moves it).
+// the worker. Plan step 11I1, PR A2 (decision D5 of 2026-10-07): the end of the helper with its worker (a kill, a
+// silence) is tested at unit level only (src/helperChannel/batch.e2e.test.ts).
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import type { HeldEnvironmentLock } from '../../src/core/docker/environmentLock';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
-import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
-import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT, newEnvironmentId } from '../../src/core/names';
+import { LABEL_CHANNEL_STEP } from '../../src/core/helperChannel/protocol';
+import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../../src/core/names';
 import { bundleHash } from '../../src/core/loader/pipeLoader';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
+import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext } from './harness';
 import { inProcessBatches, workerScript, type InProcessBatches } from './workerLocks';
 
 const REPOSITORY = 'devenv-test/worker-batch';
@@ -60,48 +59,12 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   let helperTag = '';
   /** The helper image with a `git` that only waits (deterministic Git steps). */
   let waitingGitImage = '';
-  const allChannels: HelperChannels[] = [];
   /** Plan step 11I1, PR A1: the batch helpers started from the test process. */
   let batches: InProcessBatches | undefined;
   const sessions: string[] = [];
 
   const helpersOf = (session: string) => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_CHANNEL_STEP}=${session}`]);
   const execIn = (container: string, user: string, command: string) => cli.run(['exec', '--user', user, container, 'sh', '-c', command]);
-
-  /** The workers of one window, with the state volume of the test; `names` gets their container names. */
-  function windowChannels(names: string[] = []): HelperChannels {
-    const channels = new HelperChannels({
-      logger: log,
-      open: (target) =>
-        openHelperChannel(
-          {
-            start: (args) => {
-              const all = [...args];
-              all.splice(all.indexOf(helperTag), 0, '--label', `${TEST_RUN_LABEL}=${run.runId}`);
-              names.push(all[all.indexOf('--name') + 1]);
-              return docker.start(all);
-            },
-            runDirect: (args, options) => docker.runDirect(args, options),
-            logger: log,
-            script: async () => script,
-            helperTag: async () => helperTag,
-            socketPath: async () => helperDockerSocket(env, process.platform, target.endpoint),
-            stateVolume: testStateVolume(context, 'workerBatch'),
-          },
-          target,
-        ),
-    });
-    allChannels.push(channels);
-    return channels;
-  }
-
-  async function lockAndBatch(channels: HelperChannels, image: string) {
-    const target = await targets.current();
-    const lock: HeldEnvironmentLock = await channels.lock(target, newEnvironmentId(), 5);
-    const session = await lock.batch!({ volume, image, socket: helperDockerSocket(env, process.platform, target.endpoint) });
-    sessions.push(session.session);
-    return { lock, session };
-  }
 
   /** Plan step 11I1, PR A1: a batch session as the worker's own flow opens it, from the test process (no lock needed). */
   async function openBatch(image: string) {
@@ -143,17 +106,10 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // Plan step 11I1, PR A1: no in-process batch helper is left over.
     // Review round 1 (A-L2): also when the setup failed before the batch helpers.
     const batchLeftovers = batches === undefined ? [] : await batches.dispose();
-    for (const channels of allChannels) channels.dispose();
     for (const session of sessions) for (const id of helpersOf(session)) cli.run(['rm', '-f', id]);
-    let leftovers: string[] = [];
-    try {
-      await waitUntil(() => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`]).length === 0, 'the removal of the workers');
-    } catch {
-      leftovers = cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--format', '{{.Names}}']);
-    }
     cli.run(['rmi', '-f', `devenv-test-batch-git:${run.runId}`]);
     removeRunObjects(cli, run.runId);
-    expect(leftovers).toEqual([]);
+    // Plan step 11I1, PR A2: no worker is started any more (decision D5 of 2026-10-07), so none can be left over.
     expect(batchLeftovers).toEqual([]);
   });
 
@@ -316,27 +272,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(execIn(container, '0:0', `stat -c %u:%g ${FOLDER}/data ${FOLDER}/data/pg`).out.split('\n')).toEqual(['1000:1000', '1000:1000']);
     await session.close();
   });
-
-  it('the helper is gone after a kill of the worker', async () => {
-    const names: string[] = [];
-    const channels = windowChannels(names);
-    const { session } = await lockAndBatch(channels, waitingGitImage);
-    expect(helpersOf(session.session)).toHaveLength(1);
-    cli.ok(['kill', '--signal', 'KILL', names[0]]);
-    await waitUntil(() => helpersOf(session.session).length === 0, 'the end of the helper after the worker', 90_000);
-  });
-
-  it('the helper is gone after its silence when the worker hangs', { timeout: 5 * 60_000 }, async () => {
-    const names: string[] = [];
-    const channels = windowChannels(names);
-    const { session } = await lockAndBatch(channels, waitingGitImage);
-    expect(helpersOf(session.session)).toHaveLength(1);
-    cli.ok(['pause', names[0]]);
-    try {
-      // No ping reaches the helper; it ends after CHANNEL_SILENCE_EXIT_MS (60 s).
-      await waitUntil(() => helpersOf(session.session).length === 0, 'the end of the helper by its silence', 150_000);
-    } finally {
-      cli.run(['unpause', names[0]]);
-    }
-  });
+  // Plan step 11I1, PR A2 (decision D5 of 2026-10-07): the end of the helper with its worker (after a kill of the worker,
+  // and after its silence when the worker hangs) is tested at unit level only (src/helperChannel/batch.e2e.test.ts); the
+  // two Docker tests here took their helper through the `lock` and `batch` relay of the worker, which 11I1 removes.
 });

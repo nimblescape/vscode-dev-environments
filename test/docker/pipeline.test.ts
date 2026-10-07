@@ -9,18 +9,18 @@
 // Configurations that the host access policy refuses are checked on further seeded environments. Real core modules and
 // the real workspace helper; only the user interface, the GitHub session, and (for the offline scenarios) the network
 // are fakes.
+// Plan step 11I1, PR A2 (section 3b of the plan): every scenario runs through the flows of a real worker, as the
+// extension sends them: the operations of a window (EnvironmentOperations, workerWindow.ts) send the open, Stop, the
+// listing, the check of Delete, Delete, and the rebuild of the registry to the worker, whose own pipeline runs them (before:
+// the pipeline in the test process over the relay of the worker, `lock` and `batch`, which 11I1 removes). The opens make
+// sure of the real Session Monitor of the engine (decision D9 of 2026-10-07): the file is skipped when the engine had one
+// before the tests, and removes the one that it made.
 import * as http from 'http';
 import type { AddressInfo } from 'net';
 import * as fs from 'fs';
-import * as path from 'path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { helperImageTag, registryBaseDigest } from '../../src/core/helper/helperImage';
-import { readHelperState } from '../../src/core/helper/helperState';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
-import type { HttpTransport } from '../../src/core/http';
-import { extractBaseImages } from '../../src/core/imageCheck/dockerfile';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import {
   CONTAINER_CREDENTIAL_HELPER,
@@ -47,15 +47,11 @@ import {
   newEnvironmentId,
   resourceName,
 } from '../../src/core/names';
-import { isoTime, systemClock, type GitHubAuth } from '../../src/core/ports';
+import type { DeleteConfirmation } from '../../src/core/pipeline/deleteCheck';
+import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
-import { StoragePaths } from '../../src/core/storage/paths';
-import { EnvironmentRegistry } from '../../src/core/storage/registry';
-import { SessionFiles } from '../../src/core/storage/sessionFiles';
-import type { ExtensionSettings } from '../../src/core/types';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
 import { cliEngine } from './cliEngine';
-import { workerLocks } from './workerLocks';
 import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
@@ -67,16 +63,13 @@ import {
   dockerTestContext,
   expectLabelledEnvironmentImage,
   fakeAuth,
-  hangingTransport,
   inConceptOrder,
-  offlineTransport,
   registryClient,
   registryDigest,
   registryTransport,
   runInVolume,
-  timedChecker,
-  type CheckRecord, pipelineWithOperations } from './harness';
-import { inProcessAnalyzer } from '../../src/core/helper/configurationAnalysis';
+} from './harness';
+import { monitorOfUser, removeTestMonitor, workerWindow, type WorkerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/tiny';
 const FOLDER = '/workspaces/tiny';
@@ -86,7 +79,6 @@ const REMOTE_USER = 'dev';
 const CONTAINER_PORT = 8080;
 const UNTRACKED = 'untracked.txt';
 const FAKE_DIGEST = `sha256:${'0'.repeat(64)}`;
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Creates the repository in the volume as the helper creates a clone: as root, on the branch main, with one commit. */
 const SEED_SCRIPT = `set -eu
@@ -100,18 +92,11 @@ git add -A
 git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
 `;
 
-const settings: ExtensionSettings = {
-  reopenLastOnStartup: true,
-  stopOnClose: true,
-  waitingTimeSeconds: 30,
-  updateImagesOnConnect: true,
-  respectShutdownActionNone: false,
-  owners: [],
-  includeArchived: false,
-  includeForks: false,
-  refreshIntervalMinutes: 60,
-  hostAccessChecksOff: [],
-};
+/**
+ * Plan step 11I1, PR A2: the settings of the windows of this file (testSettings, with the image check of each open). The
+ * test of the switched-off host access checks changes `hostAccessChecksOff` of the window in place.
+ */
+const SETTINGS = { updateImagesOnConnect: true };
 
 /** Lifecycle token (user decision 2026-09-27): the files in the dev container where the lifecycle commands note each run. */
 const POST_CREATE_LOG = '/tmp/devenv-post-create';
@@ -122,104 +107,76 @@ function lifecycleTokenCommand(log: string): string {
   return `if test -s ${GITHUB_TOKEN_FILE}; then echo present; else echo missing; fi >> ${log}`;
 }
 
-describe('open pipeline on a seeded environment', () => {
-  const { run, env, cli, log } = dockerTestContext('pipeline');
+/**
+ * Plan step 11I1, PR A2: the user interface of the windows of this file, which also records what each confirmation of
+ * Delete names. The check of Delete runs in the worker and answers the decision of the user (a DeleteDecision); the Git
+ * state that it names reaches the window only in this question (before: the value of the safety check of the pipeline in the test process).
+ */
+class DeleteRecordingUi extends FakeUi {
+  readonly deleteConfirmations: Array<{ repository: string; confirmation?: DeleteConfirmation }> = [];
+
+  override async confirmDelete(repository: string, confirmation?: DeleteConfirmation): Promise<'delete' | 'open' | undefined> {
+    this.deleteConfirmations.push({ repository, ...(confirmation === undefined ? {} : { confirmation }) });
+    return super.confirmDelete(repository, confirmation);
+  }
+}
+
+/** The time of a line of a TestLog in seconds since the log was opened (`[  12.3] INFO …`), of the first line that matches. */
+function logSeconds(logged: string, pattern: RegExp): number {
+  const line = logged.split('\n').find((candidate) => pattern.test(candidate));
+  const seconds = line === undefined ? undefined : /^\[\s*(\d+(?:\.\d+)?)\]/.exec(line)?.[1];
+  if (seconds === undefined) throw new Error(`No line of the log matches ${pattern}.`);
+  return Number(seconds);
+}
+
+// Decision D9 of 2026-10-07: the opens through a real worker make sure of the Session Monitor of the engine; a monitor of
+// the user (or of another run) is never touched, so the file is skipped then (its hooks do not run either).
+const engineHadMonitor = monitorOfUser({ run: inject('dockerTest') });
+
+describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () => {
+  const context = dockerTestContext('pipeline');
+  const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
   const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
-  const paths = new StoragePaths(path.join(run.runDir, 'pipeline-storage'));
-  const registry = new EnvironmentRegistry(paths, systemClock, { logger: log });
-  const sessionFiles = new SessionFiles(paths);
-  const ui = new FakeUi();
-  const owner = { windowId: 'docker-test-window', pid: process.pid };
-  const checks: CheckRecord[] = [];
+  const ui = new DeleteRecordingUi();
   const timings = new Timings();
-  const onlineClient = registryClient(registryTransport, runner, env, log);
-  const digestChecker = new ImageChecker(onlineClient, log);
-  // Plan step 6, PR C: the real locks of the workers (the opens run their helper steps in the batch helper of the worker
-  // that holds the lock; there is no other path, D1).
-  const targets = new DockerTargets(docker, env, log);
-  const locks = workerLocks({ run, cli, log }, docker, targets, 'pipeline', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
+  // The reference reading of the registry digests that the build records must name (a test oracle in this process, never
+  // a part of the pipeline: the image check of the opens runs in the worker).
+  const digestChecker = new ImageChecker(registryClient(registryTransport, runner, env, log), log);
+  // Plan step 11I1, PR A2: the window of the opens (before: the pipeline in this process over the relay of the worker,
+  // the lock and the batch operations). Its workers hold the locks in the state volume of this file.
+  const window = workerWindow(context, docker, { name: 'pipeline', windowId: 'docker-test-window', ui, settings: SETTINGS });
+  const { registry, sessionFiles, paths, service } = window;
+  // Plan step 11I1, PR A2 (decision D1 of 2026-10-07): the offline scenarios run through a window of the same computer
+  // whose workers have no network (before: a service whose registry transport failed at once). The same window ID and
+  // user interface as the window above (as the services of this file had before), so that its pending files and busy
+  // marks are those of this window for the later operations; the same state volume, so the same locks.
+  const offline = workerWindow(context, docker, {
+    name: 'pipeline',
+    computer: { paths, registry, sessionFiles },
+    windowId: 'docker-test-window',
+    ui,
+    settings: SETTINGS,
+    network: 'none',
+  });
+  /** The windows of this file; afterAll closes them all. */
+  const windows: WorkerWindow[] = [window, offline];
+
+  /** Plan step 11I1, PR A2 (decision D2): the length of the log now, to read what an open logged after it (logSince). */
+  const logMark = (): number => fs.readFileSync(log.file, 'utf8').length;
+  const logSince = (mark: number): string => fs.readFileSync(log.file, 'utf8').slice(mark);
 
   /**
-   * The workspace helper of a new window whose weekly check of the base image of the helper is due, with a state file
-   * of its own, and a digest lookup through `transport`, like the image check of its service. The cleanup ran today, so
-   * it never sees the helper images of the user; the transports of these helpers never return a digest, so they never
-   * rebuild the helper image.
+   * Plan step 11I1, PR A2 (decision D2; before: the record of the image checker of the service, one check with the status
+   * `checked`): the worker's image check of the open (its log lines reach the log of the window) read the digest of the
+   * base image once, and found every registry.
    */
-  function helperWithDueCheck(transport: HttpTransport, name: string) {
-    const statePath = path.join(run.runDir, `${name}-helper-state`, 'helper.json');
-    const content = fs.readFileSync(HELPER_DOCKERFILE, 'utf8');
-    const tag = helperImageTag(content);
-    const eightDaysAgo = new Date(Date.now() - 8 * DAY_MS).toISOString();
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    const record = { baseImage: extractBaseImages(content)[0], baseDigest: FAKE_DIGEST, checkedAt: eightDaysAgo, lastUsedAt: eightDaysAgo };
-    fs.writeFileSync(statePath, JSON.stringify({ version: 1, images: { [tag]: record }, lastCleanupAt: new Date().toISOString() }));
-    const lookUp = registryBaseDigest(registryClient(transport, runner, env, log));
-    const lookups: Array<{ startedAt: number; endedAt?: number }> = [];
-    const checks: Array<Promise<void>> = [];
-    const windowHelper = new WorkspaceHelper({
-      docker,
-      logger: log,
-      dockerfilePath: HELPER_DOCKERFILE,
-      env,
-      statePath,
-      baseDigest: async (reference, signal) => {
-        const lookup: { startedAt: number; endedAt?: number } = { startedAt: Date.now() };
-        lookups.push(lookup);
-        try {
-          return await lookUp(reference, signal);
-        } finally {
-          lookup.endedAt = Date.now();
-        }
-      },
-      onBaseImageCheck: (check) => checks.push(check),
-    });
-    return {
-      helper: windowHelper,
-      lookups,
-      eightDaysAgo,
-      /** The record of the helper tag, after the checks in the background ended. */
-      record: async () => {
-        await Promise.all(checks.splice(0));
-        return (await readHelperState(statePath)).images[tag];
-      },
-    };
+  function expectImageChecked(logged: string): void {
+    expect(logged.split(`Image check: ${TEST_BASE_IMAGE} → sha256:`).length - 1).toBe(1);
+    expect(logged).not.toContain('Image check skipped');
+    expect(logged).not.toContain('The update step is skipped.');
   }
-  const offlineHelper = helperWithDueCheck(offlineTransport, 'offline');
-  const hangingHelper = helperWithDueCheck(hangingTransport, 'hanging');
-
-  function service(transport: HttpTransport, label: string, workspaceHelper: WorkspaceHelper = helper, auth: GitHubAuth = fakeAuth): ReturnType<typeof pipelineWithOperations> {
-    const client = transport === registryTransport ? onlineClient : registryClient(transport, runner, env, log);
-    return pipelineWithOperations({
-      analyzer: inProcessAnalyzer,
-      // Plan step 5, PR B (D1: no unlocked path): the lock is required. Plan step 6, PR C: changed (before: a fake lock that
-      // was always granted, whose plain Docker calls ran directly): the real lock of the worker, whose batch helper runs
-      // the helper steps of the opens.
-      environmentLock: locks.take,
-    flow: (op, params, options) => locks.flow(op, params, options),
-    // Plan step 11C1: the refresh through the worker, as extension.ts.
-    workerRefresh: (environments) => locks.refresh(environments),
-      docker,
-      runner,
-      helper: workspaceHelper,
-      registry,
-      sessionFiles,
-      imageChecker: timedChecker(new ImageChecker(client, log), label, checks),
-      auth,
-      ui,
-      logger: log,
-      clock: systemClock,
-      platform: process.platform,
-      env,
-      owner,
-      settings: () => settings,
-      windowStatuses: () => sessionFiles.readWindowStatuses(),
-    });
-  }
-  const online = service(registryTransport, 'online');
-  const offline = service(offlineTransport, 'offline', offlineHelper.helper);
-  const hanging = service(hangingTransport, 'hanging', hangingHelper.helper);
 
   // Plan step 11B1: the removal of the token is a flow of the worker (Controller.removeGitToken sends the operation);
   // here it runs against the real engine through the port of the tests.
@@ -258,7 +215,11 @@ describe('open pipeline on a seeded environment', () => {
 
   /** Tags of the images of this run, one list per image. */
   function runImages(): string[][] {
-    const lines = cli.lines(['image', 'ls', '-a', '--no-trunc', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']);
+    // Plan step 11I1, PR A2 (first CI run of PR #117): without `-a`. The worker labels the image over the Engine API
+    // (EngineDocker.labelImage, a commit), which on the classic image store is a child of the previous image: that parent
+    // is kept as an untagged layer of the labelled image (review round 1 of 11B3a, A-R1-6) and goes with it. An untagged
+    // image without a child (a leftover) is still listed.
+    const lines = cli.lines(['image', 'ls', '--no-trunc', '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']);
     const images = new Map<string, string[]>();
     for (const line of lines) {
       const [id, tag] = line.split(' ');
@@ -367,10 +328,13 @@ describe('open pipeline on a seeded environment', () => {
 
   afterAll(async () => {
     timings.print(`Timings of the pipeline scenarios (${TEST_BASE_IMAGE}):`);
-    // Plan step 6, PR C: no worker and no batch helper is left over.
-    const leftovers = await locks.dispose();
+    // Plan step 6, PR C: no worker and no batch helper is left over. Plan step 11I1, PR A2: of any window of this file;
+    // they close together, since each waits until the workers of the run are gone.
+    const leftovers = [...new Set((await Promise.all(windows.map((one) => one.dispose()))).flat())];
     restoreBaseImageTag();
     removeRunObjects(cli, run.runId);
+    // Decision D9 of 2026-10-07: the Session Monitor that the opens made sure of, its state volume and its tag.
+    removeTestMonitor(context);
     expect(leftovers).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.volume(volumeName)).toBeUndefined();
@@ -400,17 +364,18 @@ describe('open pipeline on a seeded environment', () => {
   it('first open: builds devenv-<short>:1 and starts the container', async () => {
     const progress = new RecordingProgress();
     const events = ui.events.length;
-    const checked = checks.length;
-    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
+    const mark = logMark();
+    const stepsBefore = window.steps.length;
     const result = await timings.measure(
       'first open: pull, build :1, up',
-      () => online.openEnvironment(environmentId, { progress }),
+      () => service.openEnvironmentInWorker(environmentId, { progress }),
       () => progress.summary(),
     );
 
     expect(progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
     expect(progress.details).not.toContain(Messages.newerImage);
-    expect(checks.slice(checked).map((check) => check.status)).toEqual(['checked']);
+    // Plan step 11I1, PR A2 (decision D2): changed expectation (before: the record of the image checker, ['checked']).
+    expectImageChecked(logSince(mark));
     expect(result).toMatchObject({ containerName, remoteWorkspaceFolder: FOLDER });
 
     const entry = await registry.get(environmentId);
@@ -448,10 +413,11 @@ describe('open pipeline on a seeded environment', () => {
     expect(helperContainers()).toEqual([]);
     // Plan step 6, PR C: the whole open (the reads, the build, `up`, the lifecycle commands, the Git files, the ownership
     // fix after `up`) ran in exactly one batch helper container, which is gone now. Plan step 11G1: the ownership fix
-    // before the container is created is a step of that batch helper too (repositoryOwnershipFix); only the read of
-    // /etc/passwd of the environment image is a `docker run` of its own here (ContainerAdapter.imageUserIds; the worker
-    // reads it through the Engine API without running anything).
-    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    // before the container is created is a step of that batch helper too (repositoryOwnershipFix); the worker reads
+    // /etc/passwd of the environment image through the Engine API without running anything. Plan step 11I1, PR A2:
+    // counted by the step `batch` that the worker reports for each batch helper session (workerBatchSession; before: the
+    // batch sessions of the relay's lock).
+    expect(window.batchesOf(volumeName, stepsBefore)).toBe(1);
     expect(ui.since(events)).toEqual([]);
     // Lifecycle token (user decision 2026-09-27): postCreateCommand and postStartCommand ran once each, with the token.
     expect(execIn(REMOTE_USER, `cat ${POST_CREATE_LOG}`)).toBe('present');
@@ -599,7 +565,7 @@ describe('open pipeline on a seeded environment', () => {
   it('stop: records the Git summary, then stops the container', async () => {
     expect(execIn(REMOTE_USER, `cd ${FOLDER} && printf kept > ${UNTRACKED} && echo ok`)).toBe('ok');
     const started = Date.now();
-    await timings.measure('stop', () => online.operations.stop(environmentId));
+    await timings.measure('stop', () => service.stop(environmentId));
 
     const summary = (await registry.get(environmentId))?.gitSummary;
     expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
@@ -626,15 +592,16 @@ describe('open pipeline on a seeded environment', () => {
     const containerId = cli.container(containerName)?.Id;
     const progress = new RecordingProgress();
     const events = ui.events.length;
-    const checked = checks.length;
+    const mark = logMark();
     const result = await timings.measure(
       'open again, up to date',
-      () => online.openEnvironment(environmentId, { progress }),
+      () => service.openEnvironmentInWorker(environmentId, { progress }),
       () => progress.summary(),
     );
 
     expect(progress.steps).toEqual(['checkingImage', 'starting']);
-    expect(checks.slice(checked).map((check) => check.status)).toEqual(['checked']);
+    // Plan step 11I1, PR A2 (decision D2): changed expectation (before: the record of the image checker, ['checked']).
+    expectImageChecked(logSince(mark));
     const container = cli.container(containerName);
     expect(container?.Id).toBe(containerId);
     expect(container?.State.Running).toBe(true);
@@ -668,7 +635,7 @@ describe('open pipeline on a seeded environment', () => {
     expect(github.code).not.toBe(0);
     expect(github.out).not.toContain('password=');
     // The next open of the owner writes it again.
-    await online.openEnvironment(environmentId, { progress: new RecordingProgress() });
+    await service.openEnvironmentInWorker(environmentId, { progress: new RecordingProgress() });
     expect(execIn(REMOTE_USER, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
   });
 
@@ -693,7 +660,7 @@ describe('open pipeline on a seeded environment', () => {
     ]);
     const progress = new RecordingProgress();
     const events = ui.events.length;
-    await timings.measure('create an old container again', () => online.openEnvironment(environmentId, { progress }), () => progress.summary());
+    await timings.measure('create an old container again', () => service.openEnvironmentInWorker(environmentId, { progress }), () => progress.summary());
 
     expect(progress.steps).toEqual(['checkingImage', 'starting']);
     const container = cli.container(containerName);
@@ -721,7 +688,7 @@ describe('open pipeline on a seeded environment', () => {
     const started = Date.now();
     const result = await timings.measure(
       'update: pull, build :2, replace the container',
-      () => online.openEnvironment(environmentId, { progress }),
+      () => service.openEnvironmentInWorker(environmentId, { progress }),
       () => progress.summary(),
     );
 
@@ -758,46 +725,32 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('offline: an information message, and the container starts within the time limit of the check', async () => {
-    await online.operations.stop(environmentId);
+    await service.stop(environmentId);
     expect(cli.container(containerName)?.State.Status).toBe('exited');
     const containerId = cli.container(containerName)?.Id;
     const record = (await registry.get(environmentId))?.buildRecord;
 
-    // No network: each request fails at once. The window is new: the weekly check of the helper's base image is due.
-    let progress = new RecordingProgress();
-    let events = ui.events.length;
-    let checked = checks.length;
-    await timings.measure('open offline (no network)', () => offline.openEnvironment(environmentId, { progress }), () => progress.summary());
-    expect(checks.slice(checked)).toEqual([expect.objectContaining({ label: 'offline', status: 'unreachable' })]);
-    expect(checks[checks.length - 1].ms).toBeLessThanOrEqual(5000);
+    // No network: each request fails at once. Plan step 11I1, PR A2 (decision D1 of 2026-10-07): the open of the window
+    // whose workers have no network. Deleted with D1 (they test behaviour that the worker no longer has): the open with a
+    // registry that never answers (the 5 seconds of NFR-08 there), and the due weekly check of the base image of the
+    // helper of a new window (its lookup, its record, and its overlap with the image check).
+    const progress = new RecordingProgress();
+    const events = ui.events.length;
+    const mark = logMark();
+    await timings.measure('open offline (no network)', () => offline.service.openEnvironmentInWorker(environmentId, { progress }), () => progress.summary());
+    // Decision D2 of 2026-10-07: changed expectation (before: the record of the image checker, one check `unreachable`
+    // within 5000 ms): the worker logged one check that reached no registry, and its time from the step `checkingImage`
+    // (the progress line of the window) to that line is within the limit of the check (the log has tenths of seconds).
+    const logged = logSince(mark);
+    expect(logged.split('The update step is skipped.').length - 1).toBe(1);
+    const skipped = /No connection to .+\. The update step is skipped\./;
+    expect(logged).toMatch(skipped);
+    const waited = logSeconds(logged, skipped) - logSeconds(logged, /: checkingImage$/);
+    timings.add('  check without network, from the step to its end in the log', waited * 1000);
+    expect(waited).toBeLessThanOrEqual(5.1);
     expect(ui.since(events)).toEqual([{ kind: 'info', text: Messages.registryUnreachable }]);
     expect(progress.steps).toEqual(['checkingImage', 'starting']);
     expect(cli.container(containerName)).toMatchObject({ Id: containerId, State: { Running: true } });
-    expect(offlineHelper.lookups).toHaveLength(1);
-    expect(await offlineHelper.record()).toMatchObject({ checkedAt: offlineHelper.eightDaysAgo, attemptedAt: expect.any(String) });
-
-    // A registry that never answers: the check ends after 5 seconds (NFR-08), then the container starts. The helper of
-    // this new window checks its base image at the same time, in the background: its 5 seconds overlap with those of
-    // the image check, instead of coming first.
-    await online.operations.stop(environmentId);
-    progress = new RecordingProgress();
-    events = ui.events.length;
-    checked = checks.length;
-    await timings.measure('open with a registry that never answers', () => hanging.openEnvironment(environmentId, { progress }), () => progress.summary());
-    expect(checks.slice(checked)).toEqual([expect.objectContaining({ label: 'hanging', status: 'unreachable' })]);
-    const check = checks[checks.length - 1];
-    const waited = check.ms;
-    timings.add('  check with a registry that never answers', waited);
-    expect(waited).toBeGreaterThanOrEqual(4900);
-    expect(waited).toBeLessThanOrEqual(5500);
-    expect(hangingHelper.lookups).toHaveLength(1);
-    const helperLookup = hangingHelper.lookups[0];
-    timings.add('  image check started after the start of the helper check', check.startedAt - helperLookup.startedAt);
-    expect(check.startedAt).toBeLessThan(helperLookup.endedAt ?? Number.POSITIVE_INFINITY);
-    expect(ui.since(events)).toEqual([{ kind: 'info', text: Messages.registryUnreachable }]);
-    expect(cli.container(containerName)).toMatchObject({ Id: containerId, State: { Running: true } });
-    expect(await hangingHelper.record()).toMatchObject({ checkedAt: hangingHelper.eightDaysAgo, attemptedAt: expect.any(String) });
-    expect(helperLookup.endedAt! - helperLookup.startedAt).toBeLessThanOrEqual(5500);
 
     expect((await registry.get(environmentId))?.buildRecord).toEqual(record);
     expect(cli.image(`${imageRepository}:3`)).toBeUndefined();
@@ -810,7 +763,8 @@ describe('open pipeline on a seeded environment', () => {
     const events = ui.events.length;
     const result = await timings.measure(
       'create the removed container again, offline',
-      () => offline.openEnvironment(environmentId, { progress }),
+      // Plan step 11I1, PR A2 (decision D1): the window whose workers have no network.
+      () => offline.service.openEnvironmentInWorker(environmentId, { progress }),
       () => progress.summary(),
     );
 
@@ -837,10 +791,13 @@ describe('open pipeline on a seeded environment', () => {
     cli.ok(['stop', '-t', '1', containerName]);
 
     // Cancel: `up` of the stopped container fails in the Dev Container CLI (it cannot exec as the user); nothing is removed.
+    // Plan step 11I1, PR A2: through the window without network (decision D1), as before through the offline service; the
+    // question comes through the requests of the worker to the user interface of the window. The worker answers the
+    // refusal of its pipeline as its value, which the window throws as the UserFacingError (code and detail) it was.
     ui.recreateAnswer = false;
     let events = ui.events.length;
     const cancelled = await timings.measure('damaged container, Cancel', () =>
-      offline.openEnvironment(environmentId, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught),
+      offline.service.openEnvironmentInWorker(environmentId, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught),
     );
     expect(cancelled).toMatchObject({ code: 'startFailed' });
     expect((cancelled as { detail?: string }).detail).toContain(`unable to find user ${REMOTE_USER}`);
@@ -854,7 +811,7 @@ describe('open pipeline on a seeded environment', () => {
     ui.recreateAnswer = true;
     events = ui.events.length;
     const progress = new RecordingProgress();
-    const result = await timings.measure('damaged container, Recreate', () => offline.openEnvironment(environmentId, { progress }), () => progress.summary());
+    const result = await timings.measure('damaged container, Recreate', () => offline.service.openEnvironmentInWorker(environmentId, { progress }), () => progress.summary());
 
     expect(ui.since(events).filter((event) => event.kind === 'recreateContainer')).toHaveLength(1);
     expect(progress.details).toContain(Messages.containerRecreatedDamaged());
@@ -908,7 +865,9 @@ describe('open pipeline on a seeded environment', () => {
     await registry.add({ id, repository: 'devenv-test/refused', configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
     try {
       const progress = new RecordingProgress();
-      const error = await timings.measure(`refuse ${item}`, () => online.openEnvironment(id, { progress }).then(() => undefined, (caught: unknown) => caught));
+      const error = await timings.measure(`refuse ${item}`, () => service.openEnvironmentInWorker(id, { progress }).then(() => undefined, (caught: unknown) => caught));
+      // Plan step 11I1, PR A2: the worker answers the refusal of its pipeline as its value; the window throws it as the
+      // UserFacingError that it was (refusalError: its code and message).
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain(item);
       expect(progress.steps).not.toContain('preparing');
@@ -945,7 +904,7 @@ describe('open pipeline on a seeded environment', () => {
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
     try {
       const progress = new RecordingProgress();
-      const error = await online.openEnvironment(id, { progress }).then(() => undefined, (caught: unknown) => caught);
+      const error = await service.openEnvironmentInWorker(id, { progress }).then(() => undefined, (caught: unknown) => caught);
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain(`volume ${composeVolume} of the Docker Compose project devenv-test`);
       expect(progress.steps).not.toContain('preparing');
@@ -977,7 +936,7 @@ describe('open pipeline on a seeded environment', () => {
     const asUser = (args: string[], input?: string) => cli.run(['exec', ...(input === undefined ? [] : ['-i']), '-u', REMOTE_USER, '-e', 'GIT_TERMINAL_PROMPT=0', name, ...args], input);
     try {
       const events = ui.events.length;
-      await timings.measure('first open with Git 2.30', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      await timings.measure('first open with Git 2.30', () => service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }));
       const version = asUser(['git', '--version']).out;
       expect(containerGitSupport(version), version).toBe('noGlobalVariable');
       // Git 2.9 to 2.31 gets no warning (only a log line).
@@ -1020,7 +979,7 @@ describe('open pipeline on a seeded environment', () => {
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
     try {
-      await timings.measure('first open with --platform linux/amd64, --cap-drop ALL, --rm, -it', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      await timings.measure('first open with --platform linux/amd64, --cap-drop ALL, --rm, -it', () => service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }));
       const container = cli.container(name);
       expect(container?.State.Running).toBe(true);
       expect(container?.HostConfig.AutoRemove).toBe(false);
@@ -1063,7 +1022,7 @@ describe('open pipeline on a seeded environment', () => {
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
     try {
-      await timings.measure(`first open of ${repository}`, () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      await timings.measure(`first open of ${repository}`, () => service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }));
       expect(cli.container(name)?.State.Running).toBe(true);
       await check(name, id);
     } finally {
@@ -1097,7 +1056,7 @@ describe('open pipeline on a seeded environment', () => {
       // What the user may do in its folder, then a second open (the container runs).
       expect(asUser(`cd ${TOKEN_FOLDER} && mkdir -p x/y && ln -s / l && chmod 000 x/y x gh && chmod 000 ${TOKEN_FOLDER}`).code).toBe(0);
       const events = ui.events.length;
-      await online.openEnvironment(id, { progress: new RecordingProgress() });
+      await service.openEnvironmentInWorker(id, { progress: new RecordingProgress() });
       expect(ui.since(events).some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(false);
       expect(asUser(`cat ${GITHUB_TOKEN_FILE}`).out).toBe(DUMMY_TOKEN);
       expect(asUser(`cat ${GH_HOSTS_FILE}`).out).toContain(`oauth_token: "${DUMMY_TOKEN}"`);
@@ -1125,25 +1084,27 @@ describe('open pipeline on a seeded environment', () => {
     expect(seeded.exitCode, seeded.stderr).toBe(0);
     const now = isoTime(systemClock);
     await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT });
-    // The setting names the repository in another case: compared without case.
-    settings.hostAccessChecksOff = ['DevEnv-Test/Privileged'];
+    // The setting names the repository in another case: compared without case. Plan step 11I1, PR A2: the settings of the
+    // window, which the open sends to the worker (its hostAccessChecks).
+    window.settings.hostAccessChecksOff = ['DevEnv-Test/Privileged'];
     try {
-      await timings.measure('first open with privileged: true, checks off', () => online.openEnvironment(id, { progress: new RecordingProgress() }));
+      await timings.measure('first open with privileged: true, checks off', () => service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }));
       const container = cli.container(name);
       expect(container?.State.Running).toBe(true);
       expect(container?.HostConfig.Privileged).toBe(true);
       expect(container?.Config.Labels?.['nimblescape.devenv.host-access']).toBe('unrestricted');
+      // Plan step 11I1, PR A2: the worker logs it to its operation, whose log lines the window writes to its log.
       expect(fs.readFileSync(log.file, 'utf8')).toContain(`The host access checks are off for ${repository}`);
 
       // Checks on again: the open stops with the normal refusal, and the container is not started.
-      settings.hostAccessChecksOff = [];
+      window.settings.hostAccessChecksOff = [];
       await docker.stopContainer(name);
-      const error = await online.openEnvironment(id, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught);
+      const error = await service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught);
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain('privileged mode');
       expect(cli.container(name)?.State.Running).toBe(false);
     } finally {
-      settings.hostAccessChecksOff = [];
+      window.settings.hostAccessChecksOff = [];
       await registry.remove(id);
       cli.run(['rm', '-f', name]);
       for (const image of cli.lines(['image', 'ls', '-q', environmentImageRepository(repository, id)])) cli.run(['image', 'rm', '-f', image]);
@@ -1154,7 +1115,18 @@ describe('open pipeline on a seeded environment', () => {
   it('two accounts, one repository: two volumes and two containers, each with the identity of its owner; both come back after a lost registry (D-3)', async () => {
     const repository = 'devenv-test/shared';
     const second = { id: '4343', login: 'devenv-test-second' };
-    const secondService = service(registryTransport, 'second account', helper, { ...fakeAuth, getAccount: async () => second });
+    // Plan step 11I1, PR A2: a second window of the same computer (its registry and session files), signed in with the
+    // second account, whose workers share the state volume (the locks) of this file (before: a second service over the
+    // relay). A window ID of its own: it is another window. afterAll closes it with the others.
+    const secondWindow = workerWindow(context, docker, {
+      name: 'pipeline',
+      computer: { paths, registry, sessionFiles },
+      windowId: 'docker-test-second-account',
+      ui,
+      settings: SETTINGS,
+      auth: { ...fakeAuth, getAccount: async () => second },
+    });
+    windows.push(secondWindow);
     const config = JSON.stringify({ name: 'Shared', build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`] });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     const owners = [TEST_ACCOUNT, second];
@@ -1172,10 +1144,10 @@ describe('open pipeline on a seeded environment', () => {
         // The registry keeps one environment per repository and account, so both entries are added.
         await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: account });
       }
-      await timings.measure('first open of the first account', () => online.openEnvironment(entries[0].id, { progress: new RecordingProgress() }));
-      await timings.measure('first open of the second account', () => secondService.openEnvironment(entries[1].id, { progress: new RecordingProgress() }));
-      // Each account's own environment cannot be opened by the other one.
-      await expect(online.openEnvironment(entries[1].id, { progress: new RecordingProgress() })).rejects.toMatchObject({ code: 'otherAccount' });
+      await timings.measure('first open of the first account', () => service.openEnvironmentInWorker(entries[0].id, { progress: new RecordingProgress() }));
+      await timings.measure('first open of the second account', () => secondWindow.service.openEnvironmentInWorker(entries[1].id, { progress: new RecordingProgress() }));
+      // Each account's own environment cannot be opened by the other one (the window refuses it before it sends the open).
+      await expect(service.openEnvironmentInWorker(entries[1].id, { progress: new RecordingProgress() })).rejects.toMatchObject({ code: 'otherAccount' });
       expect(new Set(entries.map(({ name }) => name)).size).toBe(2);
       for (const { account, name } of entries) {
         expect(cli.volume(name)).toBeDefined();
@@ -1183,9 +1155,10 @@ describe('open pipeline on a seeded environment', () => {
         const email = cli.run(['exec', '-u', REMOTE_USER, name, 'git', 'config', '--get', 'user.email']);
         expect(email.out, email.err).toBe(`${account.id}+${account.login}@users.noreply.github.com`);
       }
-      // A lost registry: both environments come back from the labels of their volumes, each with its owner.
+      // A lost registry: both environments come back from the labels of their volumes, each with its owner. Plan step
+      // 11I1, PR A2: the rebuild of the registry by the worker (`reconcile`; its entries come back as `record restore`).
       for (const { id } of entries) await registry.remove(id);
-      expect(await online.reconcileFromVolumes()).toBeGreaterThanOrEqual(2);
+      expect(await service.reconcileInWorker({ passive: false })).toBeGreaterThanOrEqual(2);
       for (const { account, id } of entries) expect((await registry.get(id))?.owner?.id).toBe(account.id);
     } finally {
       for (const { id, name } of entries) {
@@ -1203,9 +1176,11 @@ describe('open pipeline on a seeded environment', () => {
   });
 
   it('plan step 7: the listing of the configuration picker runs in exactly one batch helper under the lock and leaves none', async () => {
-    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
-    expect(await online.listConfigurations(environmentId, { progress: new RecordingProgress() })).toEqual([CONFIG_PATH]);
-    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(1);
+    // Plan step 11I1, PR A2: the listing in the worker (`listConfigurations`); its batch helpers are counted by the step
+    // `batch` that the worker reports (before: the batch sessions of the relay's lock).
+    const stepsBefore = window.steps.length;
+    expect(await service.listConfigurationsInWorker(environmentId, { progress: new RecordingProgress() })).toEqual([CONFIG_PATH]);
+    expect(window.batchesOf(volumeName, stepsBefore)).toBe(1);
     expect(helperContainers()).toEqual([]);
   });
 
@@ -1220,8 +1195,18 @@ describe('open pipeline on a seeded environment', () => {
       await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
       // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: one batch helper, its
       // step as nobody): no container runs, so the check gives the recorded state without any helper or lock.
-      expect(await online.safetyCheck(id, { progress: new RecordingProgress() })).toEqual(recorded);
-      expect(locks.batches.get(id) ?? []).toHaveLength(0);
+      // Plan step 11I1, PR A2: changed expectation (before: the value of the safety check, `recorded`): the check of
+      // Delete runs in the worker (`deleteCheck`), which answers the decision of the user (Delete); the recorded state
+      // reaches the window in the confirmation, which names its counts and its time (not its branch). The entry keeps it.
+      const stepsBefore = window.steps.length;
+      const confirmations = ui.deleteConfirmations.length;
+      const decision = await service.deleteCheckInWorker(id, { progress: new RecordingProgress(), repository, otherWindow: false });
+      expect(decision).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
+      expect(ui.deleteConfirmations.slice(confirmations)).toMatchObject([
+        { repository, confirmation: { changes: { uncommittedFiles: 3, unpushedCommits: 2, stashes: 1 }, recordedAt: recorded.recordedAt, otherWindow: false } },
+      ]);
+      expect((await registry.get(id))?.gitSummary).toEqual(recorded);
+      expect(window.batchesOf(name, stepsBefore)).toBe(0);
       expect(cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_RUN}=true`, '--filter', `volume=${name}`])).toEqual([]);
     } finally {
       await registry.remove(id);
@@ -1231,17 +1216,25 @@ describe('open pipeline on a seeded environment', () => {
 
   it('safety check and delete: the container, the images, the volume, and the registry entry are removed', async () => {
     const progress = new RecordingProgress();
-    const batchesBefore = locks.batches.get(environmentId)?.length ?? 0;
-    const summary = await timings.measure('safety check', () => online.safetyCheck(environmentId, { progress }));
+    const stepsBefore = window.steps.length;
+    const confirmations = ui.deleteConfirmations.length;
+    // Plan step 11I1, PR A2: the check of Delete and Delete in the worker (`deleteCheck`, `delete`; before: safetyCheck and
+    // delete of the pipeline in this process). The user interface answers Delete, with no additional volume.
+    const decision = await timings.measure('safety check', () => service.deleteCheckInWorker(environmentId, { progress, repository: REPOSITORY, otherWindow: false }));
+    expect(decision).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
     // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: the Git summary in exactly
     // one batch helper under the lock): the check opens no batch helper; it names the recorded state, refreshed in the
     // dev container when it runs. Its counts are those of before (the untracked file, the one commit without a remote).
-    expect(summary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
+    // Plan step 11I1, PR A2: changed expectation (before: the value of the safety check, with the branch): the counts that
+    // the confirmation names; the entry holds the whole state with its branch.
+    expect(ui.deleteConfirmations.slice(confirmations)).toMatchObject([
+      { repository: REPOSITORY, confirmation: { changes: { uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 }, otherWindow: false } },
+    ]);
     expect((await registry.get(environmentId))?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 1, unpushedCommits: 1, stashes: 0 });
-    expect((locks.batches.get(environmentId) ?? []).length - batchesBefore).toBe(0);
+    expect(window.batchesOf(volumeName, stepsBefore)).toBe(0);
     expect(helperContainers()).toEqual([]);
 
-    await timings.measure('delete', () => online.delete(environmentId, { progress, additionalVolumesToRemove: [] }));
+    await timings.measure('delete', () => service.deleteInWorker(environmentId, { progress, additionalVolumesToRemove: decision.decision === 'delete' ? decision.additionalVolumesToRemove : [] }));
     expect(containersOfEnvironment()).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
     expect(cli.lines(['image', 'ls', '-q', imageRepository])).toEqual([]);
