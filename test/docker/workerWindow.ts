@@ -44,6 +44,9 @@ export function testSettings(overrides: Partial<ExtensionSettings> = {}): Extens
     includeForks: false,
     refreshIntervalMinutes: 60,
     hostAccessChecksOff: [],
+    // Review round 1 of PR #117 (A-L1): the real Session Monitor of the opens (decision D9) never stops a container of a
+    // test for want of heartbeats while the test file runs.
+    stopAfterMinutes: 1440,
     ...overrides,
   };
 }

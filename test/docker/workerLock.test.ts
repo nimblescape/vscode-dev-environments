@@ -81,8 +81,8 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
   });
 
   afterAll(async () => {
-    const leftovers: string[] = [];
-    for (const one of windows) leftovers.push(...(await one.dispose()));
+    // Review round 1 of PR #117 (A-H2): all windows close together (each waits for its batch helpers to be gone).
+    const leftovers = [...new Set((await Promise.all(windows.map((one) => one.dispose()))).flat())];
     removeRunObjects(cli, run.runId);
     removeTestMonitor({ run, cli });
     expect(leftovers).toEqual([]);

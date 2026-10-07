@@ -31,7 +31,7 @@ import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { contextSecrets } from '../../src/helperChannel/operationContext.testkit';
 import type { OperationContext } from '../../src/helperChannel/server';
-import { TEST_RUN_LABEL } from './dockerRun';
+import { TEST_RUN_LABEL, readBaseline } from './dockerRun';
 import { HELPER_DOCKERFILE, testStateVolume, type DockerTestContext } from './harness';
 
 let bundled: Promise<string> | undefined;
@@ -114,9 +114,17 @@ export function workerLocks(
         target,
       ),
   });
-  const workerContainers = () => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`]);
+  // Review round 1 of PR #117 (A-H2): only the workers that this object started (the leftovers of one window, which the
+  // other windows of a test file do not hold up).
+  const workerContainers = () =>
+    cli.lines(['ps', '-a', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `label=${TEST_RUN_LABEL}=${run.runId}`, '--format', '{{.Names}}']).filter((name) => workerNames.includes(name));
   const batchContainers = () => [...batches.values()].flat().flatMap((session) => cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_CHANNEL_STEP}=${session}`]));
-  const leftovers = () => [...workerContainers(), ...batchContainers()];
+  // Review round 1 of PR #117 (A-M1): the batch helpers that the flows of the workers start (workerBatchSession) carry no
+  // label of the run; the test files run one at a time, so every batch helper that the engine did not have before the
+  // tests is one of this file.
+  const baselineNames = new Set(readBaseline(run).containers.map((container) => container.name));
+  const flowBatchContainers = () => cli.lines(['ps', '-a', '--filter', `label=${LABEL_CHANNEL_STEP}`, '--format', '{{.Names}}']).filter((name) => !baselineNames.has(name));
+  const leftovers = () => [...new Set([...workerContainers(), ...batchContainers(), ...flowBatchContainers()])];
   return {
     channels,
     workerNames,

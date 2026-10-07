@@ -277,7 +277,8 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     remoteWindow = window;
     const { registry, service } = window;
 
-    const before = acceptedConnections();
+    let beforeOpen = 0;
+    let logBeforeOpen = 0;
     const stepsBefore = window.steps.length;
     const progress = new RecordingProgress();
     await timings.measure(
@@ -308,6 +309,9 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
             owner: TEST_ACCOUNT,
             dockerHost: await targets.host(),
           });
+          // Review round 1 of PR #117 (A-M2): the SSH connections of the open alone (the seed above uses SSH too).
+          beforeOpen = acceptedConnections();
+          logBeforeOpen = fs.readFileSync(log.file, 'utf8').length;
           return service.openEnvironmentInWorker(environmentId, { progress });
         }),
       () => progress.summary(),
@@ -317,9 +321,10 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     expect(progress.steps).not.toContain('startingDocker');
     // Decision D6 of 2026-10-07 (was: every Docker call went through SSH, more than 5 connections): the worker was started
     // through SSH to the "remote computer", and talks to its engine there.
-    expect(acceptedConnections() - before).toBeGreaterThan(0);
+    expect(acceptedConnections() - beforeOpen).toBeGreaterThan(0);
     expect(sshLog).toContain('Starting session: command for root');
     expect(window.locks.workerNames).toHaveLength(1);
+    expect(fs.readFileSync(log.file, 'utf8').slice(logBeforeOpen)).toContain(`Helper channel to ${ALIAS} is open`);
     // The objects are on the engine that the SSH server reaches (the engine of the runner).
     expect(localCli.volume(volumeName)).toBeDefined();
     const container = localCli.container(containerName);
