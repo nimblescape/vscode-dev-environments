@@ -56,7 +56,7 @@ export const CHANNEL_RESULT_GRACE_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_T
  * 1, P2, S6): the channel cannot carry this request (a line longer than the script reads, parameters beyond the limits
  * of the operation, a secret that cannot be masked); it was not sent. Plan step 5, PR D (rule D1 of 2026-09-30): neither
  * is taken the way without the channel (HelperChannels sends a `closed` one once more through a channel made ready
- * again; ContainerAdapter refuses the call). `lost`: the connection ended while the operation ran (its
+ * again). `lost`: the connection ended while the operation ran (its
  * outcome is not known). `open`: it could not be opened. `protocol`: the script answered with something invalid.
  * Plan step 5, PR D (rule D1 of 2026-09-30): `unavailable`: HelperChannels could not make the worker ready (the helper
  * image could not be prepared, the worker could not be opened); the call was refused and nothing ran.
@@ -112,19 +112,6 @@ export interface OperationOptions {
    * PR B1: HelperChannels.docker, which gave what was left of its wait for the channel, is gone.
    */
   slotWaitMs?: number;
-}
-
-/**
- * Plan step 10A (decision of 2026-10-03): the options of the pull of an image by the worker. `credentials`: the registry
- * login; its password is a secret (masked, only in the header of the request to the engine). Plan step 11I1, PR B1: the
- * pull operation of the worker and HelperChannel.pull are gone; this type stays for the routing of ContainerAdapter and
- * HeldEnvironmentLock.pull until plan step 11I1, PR B2 removes them.
- */
-export interface ChannelPullOptions extends Pick<OperationOptions, 'signal'> {
-  /** Review round 1 of PR #89 (A-R1-3): or an identity token of `docker login` (sent as `identitytoken`). */
-  credentials?: { username: string; password: string; serveraddress: string } | { identityToken: string; serveraddress: string };
-  /** The progress of the download, line by line (default: the log). */
-  onOutput?: (text: string) => void;
 }
 
 /** Plan step 6, PR B: the options of one step of a batch helper (HelperBatchSession.step). */

@@ -45,7 +45,8 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
     // Plan step 11I1, PR B1: changed list: environmentLock.ts left the bundle with the lock through the relay of the worker
     // and the guards of the window against a lock that it held (decision D7).
     'remoteDocker.ts',
-    'workerPreparation.ts',
+    // Plan step 11I1, PR B2: changed list: workerPreparation.ts is removed (its scope only kept the bootstrap's calls from
+    // the routing of ContainerAdapter through the worker, which is gone).
   ],
   'src/core/helper': ['analysisLimits.ts', 'batchStepKinds.ts', 'helperImage.ts', 'helperImages.ts', 'helperPrebuild.ts', 'helperState.ts'],
   'src/core/imageCheck': ['credentials.ts', 'dockerfile.ts', 'reference.ts', 'registryClient.ts'],
@@ -66,7 +67,8 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
 /** Plan step 11F2: the modules that left the extension's bundle in this step (the Docker CLI adapter and the steps). */
 const BOOTSTRAP_ONLY_REMOVED = [
   'src/core/docker/containerAdapter.ts',
-  'src/core/docker/dockerRouting.ts',
+  // Plan step 11I1, PR B2: changed list: dockerRouting.ts is removed with the routing through the worker (a module that
+  // does not exist cannot be named here).
   'src/core/helper/workspaceHelper.ts',
   'src/core/helper/batchSteps.ts',
   'src/core/helper/scripts.ts',

@@ -3,15 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 5, PR B: the lock of an environment on the Docker host (taken in the worker, src/helperChannel/workerLock.ts;
-// plan step 11I1, PR B1: the operation `lock` is gone) and the scope of an operation that holds it. While a lock is
-// held, the plain Docker calls of the operation
-// (isRoutableDockerCall) go only through the worker that holds it (ContainerAdapter.run), never directly: when that worker
-// is lost, the lock is gone with it, and the calls fail instead of going on without the lock. Every call after the loss
-// fails, whatever its kind. The scope is re-entrant: an operation that holds the lock of an environment does not take it
-// again. No `vscode`.
+// plan step 11I1, PR B1: the operation `lock` is gone) and the scope of an operation that holds it: the pipeline of the
+// worker knows the environments whose lock it holds (holdsEnvironmentLock) and runs its volume steps in the batch helper
+// of the lock (src/core/helper/batchScope.ts). Plan step 11I1, PR B2: no Docker call goes through the lock any more (the
+// routing of ContainerAdapter is gone). The scope is re-entrant: an operation that holds the lock of an environment does
+// not take it again. No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
-import type { ChannelPullOptions, HelperBatchSession } from '../helperChannel/helperChannel';
-import type { RunOptions, RunResult } from '../ports';
+import type { HelperBatchSession } from '../helperChannel/helperChannel';
 
 /** A held lock of an environment (the worker's own, workerEnvironmentLock of src/helperChannel/workerLock.ts). */
 export interface HeldEnvironmentLock {
@@ -22,24 +20,10 @@ export interface HeldEnvironmentLock {
    */
   readonly lost: Promise<string>;
   /**
-   * One plain Docker call through the worker that holds the lock. Rejects when it was not sent or its outcome is not known.
-   * Plan step 6, PR C (Q4 of 2026-10-01): `secretInput` is the standard input of the call when it is a secret (the token
-   * written into the dev container, `docker exec -i`): it travels as the secret of the operation, never in its parameters,
-   * and is masked in everything that comes back.
-   */
-  docker(args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'> & { secretInput?: string }): Promise<RunResult>;
-  /**
    * Plan step 6, PR B: a batch helper of the operation in the worker that holds the lock (workerBatchSession). Plan step
    * 6, PR C: the open pipeline runs its volume steps in it (src/core/helper/batchScope.ts).
    */
   batch?(p: { volume: string; image: string; socket: string }, signal?: AbortSignal): Promise<HelperBatchSession>;
-  /**
-   * Plan step 10A (decision of 2026-10-03): the pull of an image and the start of containers by the worker that holds the
-   * lock. Plan step 11I1, PR B1: no lock has them any more (HelperChannel.pull and startContainers are gone); they go with
-   * the routing of ContainerAdapter in plan step 11I1, PR B2.
-   */
-  pull?(reference: string, options: ChannelPullOptions): Promise<void>;
-  startContainers?(ids: readonly string[], options: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;
   /** Lets go of the lock and resolves when the worker confirmed it, or the worker was lost (the kernel frees it). Never rejects. */
   release(): Promise<void>;
 }
@@ -61,9 +45,6 @@ export class EnvironmentLockError extends Error {
 
 interface LockScope {
   readonly environmentIds: ReadonlySet<string>;
-  readonly lock: HeldEnvironmentLock;
-  readonly parent: LockScope | undefined;
-  lostReason: string | undefined;
   active: boolean;
 }
 
@@ -80,34 +61,13 @@ export function holdsEnvironmentLock(environmentId: string): boolean {
   return currentScope()?.environmentIds.has(environmentId) === true;
 }
 
-/** The held lock of the running operation: its worker, and why a lock of the scope was lost (undefined while all hold). */
-export function heldEnvironmentLock(): { lock: HeldEnvironmentLock; lostReason: () => string | undefined } | undefined {
-  const scope = currentScope();
-  if (scope === undefined) return undefined;
-  return {
-    lock: scope.lock,
-    lostReason: () => {
-      for (let item: LockScope | undefined = scope; item !== undefined; item = item.parent) {
-        if (item.lostReason !== undefined) return item.lostReason;
-      }
-      return undefined;
-    },
-  };
-}
-
 /** Runs `fn` in the scope of the held `lock` (see the module comment). The caller releases the lock after it. */
 export async function runWithEnvironmentLock<T>(lock: HeldEnvironmentLock, fn: () => Promise<T>): Promise<T> {
   const parent = currentScope();
   const scope: LockScope = {
     environmentIds: new Set([...(parent?.environmentIds ?? []), lock.environmentId]),
-    lock,
-    parent,
-    lostReason: undefined,
     active: true,
   };
-  void lock.lost.then((reason) => {
-    scope.lostReason = reason;
-  });
   try {
     return await lockScopes.run(scope, fn);
   } finally {

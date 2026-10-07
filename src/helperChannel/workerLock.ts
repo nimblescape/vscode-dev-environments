@@ -5,7 +5,8 @@
 // Plan step 11B3b (decision of 2026-10-03, the worker is the deputy): the lock of an environment as the worker's own
 // pipeline holds it (EnvironmentServiceDeps.environmentLock): taken here, the one way (takeEnvironmentLock, user
 // decisions D1 to D3), with the batch helper of the flow started here too (workerBatchSession). Nothing goes through the
-// extension: a Docker call through the lock is refused in the worker (its pipeline uses the engine of the worker).
+// extension, and no Docker call goes through the lock (plan step 11I1, PR B2: HeldEnvironmentLock has none any more; the
+// pipeline of the worker uses the engine of the worker).
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../core/docker/environmentLock';
 import { LOCK_BUSY_CODE } from '../core/helperChannel/protocol';
 import { abortError } from '../core/ports';
@@ -46,9 +47,6 @@ export function workerEnvironmentLock(
     return {
       environmentId,
       lost,
-      docker: async () => {
-        throw new Error('A Docker call through the lock of the environment in the worker is not allowed: the pipeline of the worker uses its engine.');
-      },
       // Review round 1 of 11B3b (A-R1-4): the open ends with the operation (its signal and time limit), not with a signal
       // of its own; the listing has none narrower. Plan step 11E passes the signal of the open through.
       batch: (p) => openBatch(p),

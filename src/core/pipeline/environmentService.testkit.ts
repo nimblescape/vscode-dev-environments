@@ -46,7 +46,7 @@ import { readEnvironmentStates } from './refreshStates';
 import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
-import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunOptions, type RunResult } from '../ports';
+import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunResult } from '../ports';
 import { StoragePaths } from '../storage/paths';
 import { EnvironmentRegistry } from '../storage/registry';
 import { SessionFiles } from '../storage/sessionFiles';
@@ -1429,23 +1429,17 @@ export interface Harness {
 /**
  * Plan step 5, PR B (D1: no unlocked path): the lock of the environments for the tests that are not about the lock
  * (EnvironmentServiceDeps.environmentLock is required). It grants every lock and records each acquire and release.
- * `docker`: the plain Docker calls under the lock (a ContainerAdapter sends them to the lock); without it they fail.
+ * Plan step 11I1, PR B2: no Docker call goes through a lock any more (its `docker` is gone).
  */
 export class FakeEnvironmentLock {
   readonly acquired: string[] = [];
   readonly released: string[] = [];
-
-  constructor(private readonly docker?: (args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>) => Promise<RunResult>) {}
 
   readonly take = async (environmentId: string): Promise<HeldEnvironmentLock> => {
     this.acquired.push(environmentId);
     return {
       environmentId,
       lost: new Promise<string>(() => {}),
-      docker: async (args, options) => {
-        if (this.docker === undefined) throw new Error('The fake lock runs no Docker call.');
-        return this.docker(args, options);
-      },
       release: async () => {
         this.released.push(environmentId);
       },

@@ -96,9 +96,6 @@ function batchLock(environmentId: string): HeldEnvironmentLock {
   return {
     environmentId,
     lost: new Promise(() => {}),
-    docker: async () => {
-      throw new Error('The fake Docker of the service runs no call through the worker.');
-    },
     batch: async (p) => {
       if (batchError !== undefined) {
         events.push(`open refused ${p.volume}`);

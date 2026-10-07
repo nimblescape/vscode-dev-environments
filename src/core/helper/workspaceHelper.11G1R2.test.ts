@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
-import { silentLogger, type RunResult } from '../ports';
+import { silentLogger } from '../ports';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand } from './batchSteps';
 import { WorkspaceHelper, type HelperDocker } from './workspaceHelper';
@@ -32,9 +32,6 @@ class StepLock implements HeldEnvironmentLock {
   readonly environmentId = 'e';
   readonly lost = new Promise<string>(() => {});
   readonly steps: { kind: string; params: unknown; options: BatchStepOptions }[] = [];
-  async docker(): Promise<RunResult> {
-    throw new Error('no plain Docker call');
-  }
   async release(): Promise<void> {}
   async batch(): Promise<HelperBatchSession> {
     return {

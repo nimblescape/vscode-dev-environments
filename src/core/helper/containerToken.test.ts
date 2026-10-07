@@ -693,7 +693,7 @@ describe('writeContainerToken', () => {
     expect(container).toBe('c1');
     expect(command).toEqual(tokenWriteCommand('dev', 'scalarion'));
     // Plan step 6, PR C (Q4 of 2026-10-01): changed expectation (before: `input: TOKEN`): the token is the secret input of
-    // the call, which goes only through the worker that holds the lock (ContainerAdapter.exec), never a plain input.
+    // the call, which only the worker runs (EngineDocker.exec; plan step 11I1, PR B2), never a plain input.
     expect(options).toMatchObject({ user: 'root', secretInput: TOKEN, timeoutMs: 1000 });
     expect(options).not.toHaveProperty('input');
     expect(command.some((arg) => arg.includes(TOKEN))).toBe(false);

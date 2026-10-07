@@ -245,9 +245,6 @@ export async function inProcessBatches(context: Pick<DockerTestContext, 'cli' | 
       const lock: HeldEnvironmentLock = {
         environmentId,
         lost: new Promise<string>(() => {}),
-        docker: async () => {
-          throw new Error('Plan step 11I1: no Docker call through the lock.');
-        },
         batch: (p, signal) => open(p, signal),
         release: async () => {},
       };

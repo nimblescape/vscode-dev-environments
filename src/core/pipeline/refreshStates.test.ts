@@ -5,7 +5,7 @@
 // Plan step 5, PR C: readEnvironmentStates, the refresh that runs directly and in the worker.
 import { describe, expect, it } from 'vitest';
 import { ContainerAdapter, type ContainerInfo } from '../docker/containerAdapter';
-import { isReadOnlyDockerCall, isRoutableDockerCall } from '../docker/dockerRouting';
+import { isReadOnlyDockerCall } from '../docker/dockerCli';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import { silentLogger, type RunResult } from '../ports';
 import { BRANCH_EXEC_TIMEOUT_MS, BRANCH_READ_CONCURRENCY, readEnvironmentStates, type StateDocker, type StateEnvironment } from './refreshStates';
@@ -30,8 +30,14 @@ describe('readEnvironmentStates (plan step 5, PR C)', () => {
       expect(args).not.toContain('-i');
       expect(args).not.toContain('-e');
       expect(args).not.toContain('--env');
-      // The environment is the one that runDirect adds (the adapter's own, with the Docker context of the operation).
-      expect(isRoutableDockerCall(args, { ...options, env: undefined })).toBe(true);
+      // Plan step 11I1, PR B2: changed expectation (before: isRoutableDockerCall, removed with the routing through the
+      // worker): the same plainness checked directly: no global option, no folder, no streamed output (the environment
+      // is the one that runDirect adds, the adapter's own with the Docker context of the operation).
+      expect(args[0]?.startsWith('-')).toBe(false);
+      expect(args.some((arg) => arg === '--env-file' || arg.startsWith('--env=') || arg.startsWith('--env-file='))).toBe(false);
+      expect(options.cwd).toBeUndefined();
+      expect(options.onStdout).toBeUndefined();
+      expect(options.onStderr).toBeUndefined();
       if (args[0] !== 'exec') expect(isReadOnlyDockerCall(args)).toBe(true);
     }
     // No branch of an environment whose branch was not asked for (another account).

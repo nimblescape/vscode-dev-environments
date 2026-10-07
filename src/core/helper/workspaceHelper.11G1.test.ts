@@ -34,9 +34,6 @@ class StepLock implements HeldEnvironmentLock {
   readonly lost = new Promise<string>(() => {});
   readonly steps: { kind: string; params: unknown; options: BatchStepOptions }[] = [];
   constructor(private readonly result: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false }) {}
-  async docker(): Promise<RunResult> {
-    throw new Error('no plain Docker call');
-  }
   async release(): Promise<void> {}
   async batch(): Promise<HelperBatchSession> {
     return {

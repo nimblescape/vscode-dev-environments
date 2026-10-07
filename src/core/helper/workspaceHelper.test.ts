@@ -11,7 +11,6 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { composeProjectName } from '../names';
 import type { ImageInfo } from '../docker/containerAdapter';
-import { preparingWorker } from '../docker/workerPreparation';
 import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
@@ -198,9 +197,6 @@ class BridgeLock implements HeldEnvironmentLock {
   /** The kind of each step, in order. */
   readonly kinds: BatchStepKind[] = [];
   openError: Error | undefined;
-  async docker(): Promise<RunResult> {
-    throw new Error('The fake lock runs no plain Docker call.');
-  }
   async release(): Promise<void> {}
   batch = async (p: { volume: string; image: string; socket: string }): Promise<HelperBatchSession> => {
     this.opens.push(p.image);
@@ -2793,45 +2789,46 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(docker.builds[0]).toMatchObject({ tag: TAG });
   });
 
-  // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent, so its Docker
-  // calls run in the scope of the worker preparation (ContainerAdapter runs them directly; the worker is opened from it).
-  it('checks and builds the helper image in the scope of the worker preparation, also for an open', async () => {
-    const scopes: boolean[] = [];
+  // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image makes the state for the worker consistent. Plan step
+  // 11I1, PR B2: changed expectation (before: each check and build also ran in the scope of the worker preparation,
+  // workerPreparation.ts, which kept them from the routing through the worker; both are gone): the checks and builds
+  // themselves are still counted.
+  it('checks and builds the helper image, also for an open', async () => {
+    const calls: string[] = [];
     const imageId = docker.imageId.bind(docker);
     docker.imageId = async (reference: string) => {
-      scopes.push(preparingWorker());
+      calls.push('check');
       return imageId(reference);
     };
     docker.buildHandler = async () => {
-      scopes.push(preparingWorker());
+      calls.push('build');
     };
     const helper = helperOn(REMOTE);
     expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(docker.builds).toHaveLength(1);
-    // PR #76 review round 1 (B-R1-1): with a warm cache, the check of the cached image runs in the scope too (else it
-    // would go through the router, which prepares the image again, without end).
-    const warm = scopes.length;
+    // PR #76 review round 1 (B-R1-1): with a warm cache, the cached image is checked again.
+    const warm = calls.length;
     expect(await helper.ensureImagePresent()).toEqual({ tag: TAG, id: fakeImageId(TAG) });
-    expect(scopes.length).toBeGreaterThan(warm);
+    expect(calls.length).toBeGreaterThan(warm);
     docker.images.delete(TAG);
     await helper.ensureImageUse();
     expect(docker.builds).toHaveLength(2);
-    expect(scopes.length).toBeGreaterThanOrEqual(4);
-    expect(scopes.every((inScope) => inScope)).toBe(true);
-    expect(preparingWorker()).toBe(false);
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    expect(calls.filter((call) => call === 'build')).toHaveLength(2);
   });
 
   // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks the helper tag: it never builds it and
-  // never waits for a pending build; its check runs in the scope of the worker preparation.
+  // never waits for a pending build. Plan step 11I1, PR B2: changed expectation (before: its check also ran in the scope
+  // of the worker preparation, which is gone with the routing through the worker): the checks are still counted.
   it.each([
     ['the local Docker', { key: '' }],
     ['a remote engine', REMOTE],
   ])('on %s, checkImagePresent checks the tag, never builds it, and never waits for a pending build', async (_name, engine) => {
     const helper = helperOn(engine);
-    const scopes: boolean[] = [];
+    let checks = 0;
     const imageId = docker.imageId.bind(docker);
     docker.imageId = async (reference: string) => {
-      scopes.push(preparingWorker());
+      checks++;
       return imageId(reference);
     };
     await expect(helper.checkImagePresent()).rejects.toMatchObject({ code: 'helperFailed' });
@@ -2845,8 +2842,7 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     await open;
     await expect(helper.checkImagePresent()).resolves.toBeUndefined();
     expect(docker.builds).toHaveLength(1);
-    expect(scopes.length).toBeGreaterThanOrEqual(3);
-    expect(scopes.every((inScope) => inScope)).toBe(true);
+    expect(checks).toBeGreaterThanOrEqual(3);
   });
 
   it('builds the tag again when it was deleted after it was cached (by itself or by an open)', async () => {
@@ -2906,20 +2902,19 @@ describe('WorkspaceHelper.ensureImagePresent (PR #74 review round 1, A-R1-1)', (
     expect(docker.builds).toHaveLength(builds);
   });
 
-  // Review round 5 of PR #85 (B-R5-4, B-R5-5): presentImage checks the tag in the scope of the worker preparation (its
-  // check cannot go through the worker), and an aborted signal ends it with an AbortError.
-  it('presentImage checks the tag in the scope of the worker preparation, and passes the abort of its signal through', async () => {
+  // Review round 5 of PR #85 (B-R5-4, B-R5-5): presentImage checks the tag, and an aborted signal ends it with an
+  // AbortError. Plan step 11I1, PR B2: changed expectation (before: the check also ran in the scope of the worker
+  // preparation, which is gone with the routing through the worker): the check is still counted.
+  it('presentImage checks the tag, and passes the abort of its signal through', async () => {
     const helper = helperOn(REMOTE);
-    const scopes: boolean[] = [];
+    let checks = 0;
     const imageId = docker.imageId.bind(docker);
     docker.imageId = async (reference: string) => {
-      scopes.push(preparingWorker());
+      checks++;
       return imageId(reference);
     };
     expect(await helper.presentImage()).toBeUndefined();
-    expect(scopes.length).toBeGreaterThanOrEqual(1);
-    expect(scopes.every((inScope) => inScope)).toBe(true);
-    expect(preparingWorker()).toBe(false);
+    expect(checks).toBeGreaterThanOrEqual(1);
     const aborted = new AbortController();
     aborted.abort();
     await expect(helper.presentImage({ signal: aborted.signal })).rejects.toSatisfy(isAbortError);
