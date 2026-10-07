@@ -319,7 +319,7 @@ const READ_LIMITED = String.raw`const readLimitedFd = (fd, limit) => {
 const readLimited = (file, limit) => {
   // Decision of the user of 2026-10-07: the open never waits (a FIFO of the repository cannot hold the step), and only a
   // plain file is read.
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
   try {
     if (!fs.fstatSync(fd).isFile()) throw new Error('Not a plain file: ' + file);
     return readLimitedFd(fd, limit);
@@ -418,17 +418,25 @@ ${READ_LIMITED}const realPath = (file) => {
 // the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
 // takes), read from the file that was opened, and only when that file is a plain file of the repository after links:
 // its real path is below the real folder of the repository and names the same file as the opened descriptor, so a link
-// that leads out of the repository, or one that is changed between the check and the read, is never read. The open
-// never waits (O_NONBLOCK: a FIFO of the repository cannot hold the step). undefined: no such file (or a folder); null:
-// a file that is not a plain file of the repository.
-const readInRepository = (file, limit) => {
+// that leads out of the repository, or one that is changed between the check and the read, is never read. A file that
+// is out of the repository after links before the open is not opened at all (review round 1 of PR #121: no device or
+// file of the system is opened). The open never waits (O_NONBLOCK: a FIFO of the repository cannot hold the step) and
+// never takes a terminal (O_NOCTTY). undefined: no such file (or a folder; also when the repository folder does not
+// exist, review round 1 of PR #121, B-R14, as the batch helper reports it, batchHelper.ts A-R5-1); null: a file that is
+// not a plain file of the repository (a link out of it or in a circle, a FIFO, a socket).
+const realInRepository = (real) => {
   const rootReal = realPath(root);
-  if (rootReal === null) return null;
+  return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
+};
+const readInRepository = (file, limit) => {
+  const before = realPath(file);
+  if (before !== null && !realInRepository(before)) return null;
   let fd;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
   } catch (error) {
-    if (error && ['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error.code)) return error.code === 'ELOOP' ? null : undefined;
+    if (error && ['ENOENT', 'ENOTDIR'].includes(error.code)) return undefined;
+    if (error && ['ELOOP', 'ENXIO'].includes(error.code)) return null;
     throw error;
   }
   try {
@@ -436,7 +444,7 @@ const readInRepository = (file, limit) => {
     if (opened.isDirectory()) return undefined;
     if (!opened.isFile()) return null;
     const real = realPath(file);
-    if (real === null || !real.startsWith(rootReal + '/')) return null;
+    if (!realInRepository(real)) return null;
     const named = fs.statSync(real);
     if (named.dev !== opened.dev || named.ino !== opened.ino) return null;
     return readLimitedFd(fd, limit);
