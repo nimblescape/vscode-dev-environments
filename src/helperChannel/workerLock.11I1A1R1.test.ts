@@ -68,7 +68,7 @@ describe('11I1 A1 R1: the worker lock and the monitor stop lock on the same lock
   /** As lockIsFree of test/docker/workerLocks.ts (lockHolder.ts `try`): 0 when taken, LOCK_BUSY_EXIT when held for the whole wait. */
   function lockIsFreeScript(waitSeconds: number): number {
     try {
-      execFileSync(process.execPath, ['-e', holderScript, 'try', ID, String(waitSeconds), stateDir], { stdio: 'ignore' });
+      execFileSync(process.execPath, ['-e', holderScript, 'try', ID, String(waitSeconds), stateDir], { stdio: 'ignore', timeout: 10_000 }); // Review round 2 (B nit): never blocks past the test.
       return 0;
     } catch (error) {
       return (error as { status?: number }).status ?? -1;
@@ -92,9 +92,13 @@ describe('11I1 A1 R1: the worker lock and the monitor stop lock on the same lock
 
   it('a lock held by the worker pipeline makes the monitor busy and the lockIsFree script busy; after release both take it', { timeout: 20_000 }, async () => {
     const held = await workerLock()(ID, 1, undefined);
-    expect((await stopLocker(stopLockDeps(stateDir))(ID)).kind).toBe('busy');
-    expect(lockIsFreeScript(1)).toBe(LOCK_BUSY_EXIT);
-    await held.release();
+    // Review round 2 (B nit): released also when a check fails.
+    try {
+      expect((await stopLocker(stopLockDeps(stateDir))(ID)).kind).toBe('busy');
+      expect(lockIsFreeScript(1)).toBe(LOCK_BUSY_EXIT);
+    } finally {
+      await held.release();
+    }
     const attempt = await stopLocker(stopLockDeps(stateDir))(ID);
     expect(attempt.kind).toBe('locked');
     if (attempt.kind === 'locked') attempt.release();
