@@ -349,6 +349,8 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     await useRemoteContext(docker, ALIAS);
     await targets.withOperation(() => service.stop(environmentId));
     expect(localCli.container(containerName)?.State.Running).toBe(false);
+    // Review round 2 of PR #117 (B-L3): the stop ran in the worker on the remote engine (no local worker was started).
+    expect(window.locks.workerNames).toHaveLength(1);
     // Plan step 6, PR C: the open ran its helper steps in one batch helper of the worker on the remote engine; no worker
     // and no batch helper is left over.
     // Plan step 11I1, PR A2: counted by the progress steps of the worker (was: the locks of the relay).
