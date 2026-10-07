@@ -9,7 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import { ContainerAdapter } from '../core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter,
+// which only passed these calls on to it.
+import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DownloadOptions } from '../core/docker/dockerDownload';
 import {
   DOCKER_DESKTOP_DOWNLOADS,
@@ -221,7 +223,7 @@ describe('DockerSetup: context keys and CLI checks', () => {
     };
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
     let dockerSetup: DockerSetup | undefined;
-    const docker = new ContainerAdapter(runner, found, {}, logger, 'darwin', {
+    const docker = new BootstrapDocker(runner, found, {}, logger, 'darwin', {
       findDocker: () => found,
       // As in extension.ts (review round 2, W2-2: reportCliLost instead of checkCli, which looked the CLI up at once).
       onCliLost: () => dockerSetup?.reportCliLost(),
@@ -261,7 +263,7 @@ describe('DockerSetup: context keys and CLI checks', () => {
     };
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
     let dockerSetup: DockerSetup | undefined;
-    const docker = new ContainerAdapter(runner, DOCKER, {}, logger, 'darwin', {
+    const docker = new BootstrapDocker(runner, DOCKER, {}, logger, 'darwin', {
       findDocker: () => {
         lookups.push(now);
         return found;
@@ -753,7 +755,7 @@ describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
     };
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
     let dockerSetup: DockerSetup | undefined;
-    const docker = new ContainerAdapter(runner, found, {}, logger, 'win32', {
+    const docker = new BootstrapDocker(runner, found, {}, logger, 'win32', {
       findDocker: () => found,
       onCliLost: () => dockerSetup?.reportCliLost(),
     });

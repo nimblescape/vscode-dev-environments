@@ -22,7 +22,7 @@ import {
   environmentImageName,
   resourceName,
 } from '../names';
-import type { ContainerInfo } from '../docker/containerAdapter';
+import type { ContainerInfo } from '../docker/dockerObjects';
 import type { BuildRecord } from '../types';
 import type { RepositoryTarget } from './environmentService';
 import {

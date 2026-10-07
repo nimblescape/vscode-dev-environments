@@ -7,9 +7,11 @@
 // directly in the extension). It only reads. Pure: no `vscode`, and nothing of the
 // service, so that the script of the worker stays small.
 import { Semaphore } from '../concurrency';
-import { isDevContainer, type ContainerAdapter } from '../docker/containerAdapter';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { ContainerState } from '../types';
+import { isDevContainer } from '../worker/dockerEngine';
+// Plan step 11I2: a type only (no code of the service in the worker's script).
+import type { EnvironmentDocker } from './environmentService';
 
 /** State of the container and the volume of an environment. */
 export interface EnvironmentRuntimeState {
@@ -43,8 +45,8 @@ export interface EnvironmentStates {
   branches: Map<string, string>;
 }
 
-/** The part of ContainerAdapter that readEnvironmentStates uses. */
-export type StateDocker = Pick<ContainerAdapter, 'listEnvironmentContainers' | 'listEnvironmentVolumes' | 'volumeExists' | 'exec'>;
+/** The part of the pipeline's Docker that readEnvironmentStates uses (plan step 11I2: of EnvironmentDocker, was of ContainerAdapter). */
+export type StateDocker = Pick<EnvironmentDocker, 'listEnvironmentContainers' | 'listEnvironmentVolumes' | 'volumeExists' | 'exec'>;
 
 /** At most this many branches are read at the same time. */
 export const BRANCH_READ_CONCURRENCY = 4;
@@ -56,7 +58,7 @@ export const BRANCH_EXEC_TIMEOUT_MS = 15_000;
  * aborts.
  */
 export async function readBranch(
-  docker: Pick<ContainerAdapter, 'exec'>,
+  docker: Pick<EnvironmentDocker, 'exec'>,
   container: string,
   user: string | undefined,
   folder: string,

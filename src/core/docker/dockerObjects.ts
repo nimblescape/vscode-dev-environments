@@ -4,8 +4,9 @@
 
 // Plan step 11B3 (section 0 of the plan, no duplicates): the Docker objects as the pipeline knows them, and the one
 // reading of their inspect JSON. `docker inspect` and the Engine API (`GET /containers/<id>/json`, `/volumes/<name>`,
-// `/networks/<id>`) answer with the same JSON, so ContainerAdapter (the extension's Docker CLI, until plan step 11F) and
-// the worker's adapter over the port (src/core/worker/engineDocker.ts) read it with the same functions. Pure; no I/O.
+// `/networks/<id>`) answer with the same JSON, so the worker's adapter over the port (src/core/worker/engineDocker.ts)
+// and the engine client of the helper channel read it with the same functions (plan step 11I2: the CLI adapter that read
+// `docker inspect` with them, ContainerAdapter, is removed). Pure; no I/O.
 import * as path from 'path';
 import type { ContainerState } from '../types';
 
@@ -89,6 +90,32 @@ export interface ImageInfo {
   tags: string[];
   /** Creation time as Docker prints it, for example `2026-09-25 02:31:55 +0200 CEST`. */
   createdAt: string;
+}
+
+/**
+ * Review round 9 (S9-3): an image as `docker image inspect` describes it: its ID, tags, and digests. Plan step 11I2: moved
+ * here from containerAdapter.ts, which is removed.
+ */
+export interface ImageNames {
+  id: string;
+  repoTags: string[];
+  repoDigests: string[];
+}
+
+/**
+ * Review round 11 (G1): why inspectImageNames could not check a reference. `invalid`: Docker's answer is about the
+ * reference itself (an invalid reference, or an image ID prefix that matches more than one image), the same at every
+ * call. `transient`: the answer says nothing about the reference (a timeout, a daemon that cannot be reached or fails, an
+ * unknown error, or a reference after the first such failure).
+ */
+export type ImageUncheckedReason = 'invalid' | 'transient';
+
+/** The result of inspectImageNames (review round 10, P10-1). */
+export interface ImageInspection {
+  /** The local images that the references found. */
+  images: ImageNames[];
+  /** The references that Docker could not inspect for another reason than a missing image, each with its reason. */
+  unchecked: Array<{ reference: string; reason: ImageUncheckedReason }>;
 }
 
 /**

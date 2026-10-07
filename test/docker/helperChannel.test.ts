@@ -14,7 +14,8 @@ import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { dockerTargetOf } from '../../src/core/docker/dockerHost';
 import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
@@ -61,7 +62,7 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_
 
 describe('the helper channel with the real Docker engine', () => {
   const { run, env, cli, log } = dockerTestContext('helperChannel');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const timings = new Timings();
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);

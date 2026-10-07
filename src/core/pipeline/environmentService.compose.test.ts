@@ -45,7 +45,7 @@ import {
   environmentImageName,
   resourceName,
 } from '../names';
-import type { ContainerInfo } from '../docker/containerAdapter';
+import type { ContainerInfo } from '../docker/dockerObjects';
 import type { BuildRecord, ContainerState, Environment, WindowStatus } from '../types';
 import { PipelineTexts, type EnvironmentSessionMonitor, type RepositoryTarget } from './environmentService';
 import {

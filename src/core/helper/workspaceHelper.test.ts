@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { composeProjectName } from '../names';
-import type { ImageInfo } from '../docker/containerAdapter';
+import type { ImageInfo } from '../docker/dockerObjects';
 import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS } from '../docker/remoteDocker';
@@ -112,7 +112,7 @@ class FakeDocker implements HelperDocker {
     return this.ids.get(tag) ?? fakeImageId(tag);
   }
 
-  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as ContainerAdapter.buildImage finds it by its build label. */
+  /** Review round 3 of PR #64 (P4): returns the ID of the built image, as BootstrapDocker.buildImage finds it by its build label. */
   async buildImage(options: BuildOptions): Promise<string | undefined> {
     this.builds.push(options);
     await this.buildHandler(options);

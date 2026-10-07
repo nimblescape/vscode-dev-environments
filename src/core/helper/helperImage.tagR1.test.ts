@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { ImageInfo } from '../docker/containerAdapter';
+import type { ImageInfo } from '../docker/dockerObjects';
 import type { Logger } from '../ports';
 import { ensureHelperImage, helperImageTag, type HelperImageDocker } from './helperImage';
 import type { HelperState } from './helperState';

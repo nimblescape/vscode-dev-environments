@@ -3,20 +3,22 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 5, PR C: the refresh of the sidebar in one operation of the worker (the helper channel) against the real
-// Docker engine of the runner, compared with the same refresh without the worker. The environments: one running from the
+// Docker engine of the runner, compared with what the Docker CLI reports (plan step 11I2: was the same refresh without the
+// worker, over the removed CLI adapter ContainerAdapter). The environments: one running from the
 // helper image with a Git repository on a branch, one stopped with a volume without the labels (found by its name), one
 // with nothing, and one running whose branch is not asked for. No worker container is left over.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { mapContainerState } from '../../src/core/docker/dockerObjects';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
-import { readEnvironmentStates, type StateEnvironment } from '../../src/core/pipeline/refreshStates';
+import type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment } from '../../src/core/pipeline/refreshStates';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
@@ -49,7 +51,9 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_
 
 describe('the refresh through the worker (plan step 5, PR C)', () => {
   const { run, env, cli, log } = dockerTestContext('workerRefresh');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker: the Docker context, the start of the worker) in place
+  // of the removed CLI adapter ContainerAdapter.
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
   const helper = new WorkspaceHelper({
     docker,
@@ -131,18 +135,39 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
     expect(leftovers).toEqual([]);
   });
 
-  it('gives the same states and branches through the worker as without it, and changes nothing', async () => {
+  /**
+   * Plan step 11I2: the states and branches as the Docker CLI of the test harness reports them (`docker inspect` of each
+   * container and volume, `git branch --show-current` by `docker exec` in each running dev container whose branch is asked
+   * for), in place of the refresh without the worker over the removed CLI adapter ContainerAdapter.
+   */
+  const reported = (): EnvironmentStates => {
+    const runtime = new Map<string, EnvironmentRuntimeState>();
+    const branches = new Map<string, string>();
+    for (const environment of environments) {
+      const container = cli.container(environment.containerName);
+      const state = container === undefined ? 'missing' : mapContainerState(container.State.Status);
+      runtime.set(environment.id, { container: state, volume: cli.volume(environment.volumeName) !== undefined });
+      if (state !== 'running' || !environment.branch) continue;
+      const branch = cli.run(['exec', ...(environment.user ? ['-u', environment.user] : []), environment.containerName, 'git', '-C', environment.folder, 'branch', '--show-current']);
+      if (branch.code === 0 && branch.out !== '') branches.set(environment.id, branch.out);
+    }
+    return { runtime, branches };
+  };
+
+  // Plan step 11I2: changed expectation (before: the same states and branches as readEnvironmentStates over the removed CLI
+  // adapter ContainerAdapter): the same as the Docker CLI reports, which are the states and the branch below.
+  it('gives the states and branches through the worker that the Docker CLI reports, and changes nothing', async () => {
     const target = await targets.current();
     expect(target.kind).toBe('local');
     expect(await channels.get(target)).toBeDefined();
     const before = cli.lines(['ps', '-a', '--filter', `label=${runLabel}`, '--format', '{{.Names}} {{.State}}']).sort();
 
     const viaWorker = await channels.refresh(target, environments);
-    const direct = await readEnvironmentStates(docker, environments);
+    const cliStates = reported();
     expect(viaWorker).toBeDefined();
-    expect(viaWorker).toEqual(direct);
+    expect(viaWorker).toEqual(cliStates);
     const [git, stopped, none, other] = environments;
-    expect(direct.runtime).toEqual(
+    expect(cliStates.runtime).toEqual(
       new Map([
         [git.id, { container: 'running', volume: true }],
         [stopped.id, { container: 'stopped', volume: true }],
@@ -150,7 +175,7 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
         [other.id, { container: 'running', volume: true }],
       ]),
     );
-    expect(direct.branches).toEqual(new Map([[git.id, 'feature/refresh']]));
+    expect(cliStates.branches).toEqual(new Map([[git.id, 'feature/refresh']]));
 
     // It only read: the same containers in the same states.
     expect(cli.lines(['ps', '-a', '--filter', `label=${runLabel}`, '--format', '{{.Names}} {{.State}}']).sort()).toEqual(before);

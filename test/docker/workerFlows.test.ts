@@ -11,7 +11,8 @@ import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
@@ -67,7 +68,7 @@ function hostWith(remoteUser: string | undefined, requests: string[]): HostSide 
 
 describe('the flows through a real worker (plan step 11B1)', () => {
   const { run, env, cli, log } = dockerTestContext('workerFlows');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
   const helper = new WorkspaceHelper({
     docker,

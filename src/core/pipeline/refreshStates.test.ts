@@ -4,50 +4,57 @@
 
 // Plan step 5, PR C: readEnvironmentStates, the refresh that runs directly and in the worker.
 import { describe, expect, it } from 'vitest';
-import { ContainerAdapter, type ContainerInfo } from '../docker/containerAdapter';
-import { isReadOnlyDockerCall } from '../docker/dockerCli';
+import type { ContainerInfo } from '../docker/dockerObjects';
 import { LABEL_ENVIRONMENT_ID } from '../names';
-import { silentLogger, type RunResult } from '../ports';
+import type { RunResult } from '../ports';
+import type { DockerEngine, EngineExecOptions } from '../worker/dockerEngine';
+import { EngineDocker } from '../worker/engineDocker';
 import { BRANCH_EXEC_TIMEOUT_MS, BRANCH_READ_CONCURRENCY, readEnvironmentStates, type StateDocker, type StateEnvironment } from './refreshStates';
-import { ENV_OPS, EXPECTED_STATES, FixtureRunner, REFRESH_ENVIRONMENTS } from './refreshStates.testkit';
+import { ENV_OPS, EXPECTED_STATES, REFRESH_ENVIRONMENTS, fixtureEngine } from './refreshStates.testkit';
 
-function adapter(runner: FixtureRunner): ContainerAdapter {
-  return new ContainerAdapter(runner, '/usr/bin/docker', {}, silentLogger, 'linux');
+/**
+ * Plan step 11I2: the Docker of the refresh is the worker's EngineDocker over the engine of the fixture (fixtureEngine,
+ * whose every other method fails: unusedEngine), in place of the removed CLI adapter ContainerAdapter over a fake Docker
+ * CLI. Records the options of each exec.
+ */
+function engineDocker(): { docker: EngineDocker; execs: Array<{ container: string; command: readonly string[]; options: EngineExecOptions }> } {
+  const { engine } = fixtureEngine();
+  const execs: Array<{ container: string; command: readonly string[]; options: EngineExecOptions }> = [];
+  const recording: DockerEngine = {
+    ...engine,
+    exec: (container, command, options = {}) => {
+      execs.push({ container, command, options });
+      return engine.exec(container, command, options);
+    },
+  };
+  return { docker: new EngineDocker(recording), execs };
 }
 
 describe('readEnvironmentStates (plan step 5, PR C)', () => {
   it('reads the states of the dev containers and volumes, and the branches of the running ones that were asked for', async () => {
-    const runner = new FixtureRunner();
-    expect(await readEnvironmentStates(adapter(runner), REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
+    expect(await readEnvironmentStates(engineDocker().docker, REFRESH_ENVIRONMENTS)).toEqual(EXPECTED_STATES);
   });
 
-  it('only reads, and every call can go through the worker: no input, no variables, no exec -i', async () => {
-    const runner = new FixtureRunner();
-    await readEnvironmentStates(adapter(runner), REFRESH_ENVIRONMENTS);
-    expect(runner.calls.length).toBeGreaterThan(0);
-    for (const { args, options } of runner.calls) {
+  it('only reads, and no exec has an input, a secret input or variables', async () => {
+    const { docker, execs } = engineDocker();
+    await readEnvironmentStates(docker, REFRESH_ENVIRONMENTS);
+    // Plan step 11I2: changed expectation (before: the arguments and options of each call of the Docker CLI of the removed
+    // ContainerAdapter, each one that only reads by isReadOnlyDockerCall): the refresh runs over the Engine API, whose
+    // fake answers only the reads of the refresh and exec (fixtureEngine over unusedEngine: any other call fails the
+    // refresh), and each exec has no standard input, no secret input and no variables (EngineExecOptions has no `env`).
+    for (const { command, options } of execs) {
       expect(options.input).toBeUndefined();
-      expect(args).not.toContain('-i');
-      expect(args).not.toContain('-e');
-      expect(args).not.toContain('--env');
-      // Plan step 11I1, PR B2: changed expectation (before: isRoutableDockerCall, removed with the routing through the
-      // worker): the same plainness checked directly: no global option, no folder, no streamed output (the environment
-      // is the one that runDirect adds, the adapter's own with the Docker context of the operation).
-      expect(args[0]?.startsWith('-')).toBe(false);
-      expect(args.some((arg) => arg === '--env-file' || arg.startsWith('--env=') || arg.startsWith('--env-file='))).toBe(false);
-      expect(options.cwd).toBeUndefined();
-      expect(options.onStdout).toBeUndefined();
-      expect(options.onStderr).toBeUndefined();
-      if (args[0] !== 'exec') expect(isReadOnlyDockerCall(args)).toBe(true);
+      expect(options.secretInputName).toBeUndefined();
+      expect(Object.keys(options).every((key) => ['user', 'timeoutMs', 'signal'].includes(key))).toBe(true);
+      expect(command.slice(0, 4)).toEqual(['git', '-c', 'safe.directory=*', '-C']);
     }
     // No branch of an environment whose branch was not asked for (another account).
-    const execs = runner.calls.filter((call) => call.args[0] === 'exec').map((call) => call.args[call.args.indexOf('git') - 1]);
-    expect(execs.sort()).toEqual(['devenv-api', 'devenv-detached', 'devenv-git-fails']);
-    expect(execs).not.toContain(REFRESH_ENVIRONMENTS.find((env) => env.id === ENV_OPS)?.containerName);
+    const containers = execs.map((exec) => exec.container);
+    expect([...containers].sort()).toEqual(['devenv-api', 'devenv-detached', 'devenv-git-fails']);
+    expect(containers).not.toContain(REFRESH_ENVIRONMENTS.find((env) => env.id === ENV_OPS)?.containerName);
     // PR #72 review round 1 (B-R1-1): every branch read has a time limit, so a stuck exec cannot hang the refresh.
-    const execCalls = runner.calls.filter((call) => call.args[0] === 'exec');
-    expect(execCalls.length).toBe(3);
-    for (const call of execCalls) expect(call.options.timeoutMs).toBe(BRANCH_EXEC_TIMEOUT_MS);
+    expect(execs.length).toBe(3);
+    for (const exec of execs) expect(exec.options.timeoutMs).toBe(BRANCH_EXEC_TIMEOUT_MS);
   });
 
   // PR #72 review round 1 (B-R1-2): a leftover stopped dev container never hides the running one.

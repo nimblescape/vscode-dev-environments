@@ -9,8 +9,8 @@
 // of the container, or in a log. They are gone when the container stops; a start without a window of the extension (the
 // Session Monitor, `docker start`) leaves the folder empty until the next open. Plan step 6, PR C (Q4 of 2026-10-01): the
 // token is the secret input of the call (`secretInput`), never a direct `docker exec` of the extension. Plan step 11I1,
-// PR B2: the worker writes it (EngineDocker.exec, the token as the secret of the operation); ContainerAdapter.exec
-// refuses a secret input. No vscode import.
+// PR B2: the worker writes it (EngineDocker.exec, the token as the secret of the operation). Plan step 11I2: the extension
+// has no `docker exec` at all (the CLI adapter ContainerAdapter, which refused a secret input, is removed). No vscode import.
 import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER } from '../names';
 import { isGitHubLogin } from './containerGit';
@@ -325,7 +325,7 @@ export function tokenLogin(login: string): string {
   return isGitHubLogin(login) ? login : '';
 }
 
-/** `docker exec` as the pipeline and the controller use it (ContainerAdapter.exec). */
+/** `docker exec` as the pipeline and the controller use it (EnvironmentDocker.exec). */
 export type ContainerExec = (
   container: string,
   command: readonly string[],

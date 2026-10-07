@@ -15,7 +15,7 @@ import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
-import { isDevContainer, type ContainerInfo, type ImageInfo, type ImageInspection, type MountTarget, type NetworkInfo, type VolumeInfo } from '../docker/containerAdapter';
+import type { ContainerInfo, ImageInfo, ImageInspection, MountTarget, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import { CommandError, UserFacingError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -43,7 +43,7 @@ import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, parseS
 import { EngineDocker } from '../worker/engineDocker';
 import { windowStateFlow } from '../worker/windowStateFlow';
 import { readEnvironmentStates } from './refreshStates';
-import type { DockerEngine, EngineContainer } from '../worker/dockerEngine';
+import { isDevContainer, type DockerEngine, type EngineContainer } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunResult } from '../ports';
@@ -215,7 +215,7 @@ export class FakeDocker implements EnvironmentDocker {
   }
 
   /**
-   * As ContainerAdapter.listProjectImages. User decisions 2026-10-03: with `environmentId`, only the images whose label
+   * As EngineDocker.listProjectImages. User decisions 2026-10-03: with `environmentId`, only the images whose label
    * nimblescape.devenv.environment-id is that ID (an unlabelled `<project>-*` image is left out too).
    */
   async listProjectImages(project: string, environmentId?: string): Promise<string[]> {
@@ -255,11 +255,11 @@ export class FakeDocker implements EnvironmentDocker {
   /**
    * Review round 2 of 11B3a (B-R2-12): the options of the typed calls of the ownership fix before up (imageConfig; plan
    * step 11G1: imageUserIds in place of runOnVolume and containerIdsWithLabel), in order; imageConfig also reaches
-   * runChecked, as it reaches the Docker CLI in ContainerAdapter.
+   * runChecked, as the Docker CLI was reached (plan step 11I2: by the removed CLI adapter ContainerAdapter).
    */
   readonly typedCalls: { method: 'imageConfig' | 'imageUserIds'; options: { signal?: AbortSignal; timeoutMs?: number } }[] = [];
 
-  /** Plan step 11B3: like ContainerAdapter.imageConfig (the `image inspect` of runChecked). */
+  /** Plan step 11B3: like EngineDocker.imageConfig (recorded as the `image inspect` of runChecked). */
   async imageConfig(reference: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<unknown> {
     this.typedCalls.push({ method: 'imageConfig', options });
     return JSON.parse((await this.runChecked(['image', 'inspect', '--format', '{{json .Config}}', reference], options)).trim()) as unknown;
@@ -279,13 +279,13 @@ export class FakeDocker implements EnvironmentDocker {
     return passwd === null || passwd === undefined ? undefined : passwdUserIds(passwd, user);
   }
 
-  /** Plan step 10A: like ContainerAdapter.startContainer (recorded as the `start` of runChecked). */
+  /** Plan step 10A: like EngineDocker.startContainer (recorded as the `start` of runChecked). */
   async startContainer(id: string, _options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<void> {
     await this.runChecked(['start', id]);
   }
 
   /**
-   * Like ContainerAdapter.findContainer: the other services of a Docker Compose environment are skipped; the container
+   * Like EngineDocker.findContainer: the other services of a Docker Compose environment are skipped; the container
    * with the name of the environment first (final review, FC-1), then a running one, then the newest (the order of
    * insertion is the order of creation).
    */
@@ -453,7 +453,7 @@ export class FakeDocker implements EnvironmentDocker {
   async inspectImageNames(references: readonly string[]): Promise<ImageInspection> {
     this.imageInspections.push([...references]);
     if (this.transientImages === 'all') return { images: [], unchecked: references.map((reference) => ({ reference, reason: 'transient' })) };
-    // Review round 13 (P13-1): like ContainerAdapter.inspectImageNames one by one, the first transient reference and all
+    // Review round 13 (P13-1): like EngineDocker.inspectImageNames, the first transient reference and all
     // after it are transient; the ones before it are answered.
     const first = references.findIndex((reference) => (this.transientImages as Set<string>).has(reference));
     if (first >= 0) {

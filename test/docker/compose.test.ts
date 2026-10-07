@@ -18,7 +18,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { toContainerInfo } from '../../src/core/docker/dockerObjects';
 import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
 import { supportsVolumeSubpath } from '../../src/core/helper/compose';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
@@ -50,6 +52,7 @@ import {
   HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
+  createVolume,
   dockerTestContext,
   expectLabelledEnvironmentImage,
   runInVolume } from './harness';
@@ -93,7 +96,7 @@ class DeleteUi extends FakeUi {
 describe('open pipeline for a Docker Compose configuration', () => {
   const { run, env, cli, log } = dockerTestContext('compose');
   const runner = new NodeProcessRunner();
-  const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const ui = new DeleteUi();
   // Plan step 11I1, PR A2: the window of the shared harness; its operations run in the worker (was: the pipeline of the
@@ -187,7 +190,7 @@ ${extra}volumes:
       'init.sql': `${INIT_SQL}\n`,
       'seed/data.txt': `${SEED_TEXT}\n`,
     };
-    await docker.createVolume(target.name, {
+    await createVolume(docker, target.name, {
       [LABEL_ENVIRONMENT_ID]: target.id,
       [LABEL_REPOSITORY]: target.repository,
       [TEST_RUN_LABEL]: run.runId,
@@ -412,8 +415,12 @@ ${extra}volumes:
     expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/seed`]));
     expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/init.sql`]));
     // Review round 11 (G3, G4): the inspect of the db container (with the list of the containers of the project) yields
-    // its subpaths of the workspace volume, read-only, as the list of the paths of the services reads them.
-    const listed = (await docker.listProjectContainers(app.project)).find((container) => container.id.startsWith(db));
+    // its subpaths of the workspace volume, read-only, as the list of the paths of the services reads them. Plan step 11I2:
+    // the list and the inspect by the Docker CLI of the test harness, read as the pipeline reads them (toContainerInfo), in
+    // place of listProjectContainers of the removed CLI adapter ContainerAdapter, which did the same.
+    const dbId = cli.lines(['ps', '-aq', '--no-trunc', '--filter', `label=com.docker.compose.project=${app.project}`]).find((id) => id.startsWith(db));
+    expect(dbId).toBeDefined();
+    const listed = toContainerInfo((JSON.parse(cli.ok(['container', 'inspect', dbId!])) as unknown[])[0]);
     expect(listed?.volumeSubpaths).toEqual(
       expect.arrayContaining([
         { volume: app.name, subpath: path.posix.relative('/workspaces', `${app.folder}/seed`), readOnly: true },

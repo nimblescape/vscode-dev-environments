@@ -21,7 +21,8 @@
 // silence) is tested at unit level only (src/helperChannel/batch.e2e.test.ts).
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
@@ -51,7 +52,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   const context = dockerTestContext('workerBatch');
   const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
-  const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volume = `devenv-test-batch-${run.runId}`;

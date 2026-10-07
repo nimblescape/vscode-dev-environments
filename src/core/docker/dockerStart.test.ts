@@ -6,7 +6,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { abortError, isAbortError, silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
-import { ContainerAdapter } from './containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter,
+// which only passed these calls on to it.
+import { BootstrapDocker } from './bootstrapDocker';
 import { ensureDockerRunning, launchDetachedProcess, type DockerStarterOptions } from './dockerStart';
 
 interface Call {
@@ -69,7 +71,7 @@ function setup(script: Script) {
     if (call.args[0] === 'desktop') return script.desktop ? script.desktop(call) : ok();
     throw new Error(`Unexpected call: ${call.file} ${call.args.join(' ')}`);
   });
-  const docker = new ContainerAdapter(runner, DOCKER, { PATH: '/usr/bin' }, silentLogger, 'darwin');
+  const docker = new BootstrapDocker(runner, DOCKER, { PATH: '/usr/bin' }, silentLogger, 'darwin');
   const time = fakeTime();
   const onStarting = vi.fn();
   const run = (options: Partial<DockerStarterOptions> & Pick<DockerStarterOptions, 'platform'>) =>
@@ -109,7 +111,7 @@ describe('ensureDockerRunning', () => {
 
   it('throws dockerNotInstalled without a CLI', async () => {
     const runner = new FakeRunner(() => ok());
-    const docker = new ContainerAdapter(runner, undefined, {}, silentLogger, 'darwin');
+    const docker = new BootstrapDocker(runner, undefined, {}, silentLogger, 'darwin');
     const error = await rejection(ensureDockerRunning(docker, runner, silentLogger, { platform: 'darwin' }));
     expect(error).toBeInstanceOf(UserFacingError);
     expect((error as UserFacingError).code).toBe('dockerNotInstalled');

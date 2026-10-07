@@ -24,7 +24,7 @@ import type { BuildRecord, Environment } from '../types';
 export const MAX_RECORD_LABEL_LENGTH = 8 * 1024;
 
 /**
- * The labels that ContainerAdapter.labelImage gives the environment image of `env` with the build record `record`
+ * The labels that EnvironmentDocker.labelImage gives the environment image of `env` with the build record `record`
  * (without its pinned image ID, which the labels change). Review round 1 of PR #88 (A-R1-3): the label of the record is
  * always set, empty when the record is longer than MAX_RECORD_LABEL_LENGTH, so that no such label of the base image or of
  * the Dockerfile stays on the image.

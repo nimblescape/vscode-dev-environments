@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { beforeEach, expect, inject } from 'vitest';
-import type { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+import { DOCKER_QUERY_TIMEOUT_MS, labelArgs, type BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { findExecutable } from '../../src/core/docker/dockerCli';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
@@ -35,13 +35,22 @@ import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTes
 export const HELPER_DOCKERFILE = path.resolve(__dirname, '../../resources/helper/Dockerfile');
 
 /**
+ * Plan step 11I2: the arrangement of a test that seeds a volume: `docker volume create` of `name` with `labels`, through
+ * `docker` (so with its Docker context, also within an operation on a remote Docker host), as the removed CLI adapter
+ * ContainerAdapter.createVolume ran it. Throws CommandError when it fails.
+ */
+export async function createVolume(docker: Pick<BootstrapDocker, 'runChecked'>, name: string, labels: Record<string, string>): Promise<void> {
+  await docker.runChecked(['volume', 'create', ...labelArgs(labels, '--label'), name], { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
+}
+
+/**
  * Plan step 7 (user decision of 2026-10-01): the per-step path of WorkspaceHelper (and WorkspaceHelper.run) is removed. A
  * command of a test (the seed of a volume, or a check of what it holds) in a plain container of the helper image (its
  * tag; the caller has ensured it) on `volume` at /workspaces, as root, without the Docker socket and without network,
  * through `docker` (so with its Docker context). It is the arrangement of a test, never a step of the extension; it
  * carries the label of the helper runs and is removed when it ends (`--rm`).
  */
-export function runInVolume(docker: Pick<ContainerAdapter, 'run'>, volume: string, command: readonly string[], input?: string): Promise<RunResult> {
+export function runInVolume(docker: Pick<BootstrapDocker, 'run'>, volume: string, command: readonly string[], input?: string): Promise<RunResult> {
   const tag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
   const args = ['run', '--rm', '-i', '--pull', 'never', '--label', `${LABEL_HELPER_RUN}=true`, '--network', 'none', '--mount', `type=volume,source=${volume},target=${WORKSPACES_ROOT}`, tag, ...command];
   return docker.run(args, { input });

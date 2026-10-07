@@ -17,7 +17,7 @@ function fakeSetup() {
   };
 }
 
-describe('dockerAdapterOptions (the ContainerAdapter options of extension.ts, review round 3, W3-2)', () => {
+describe('dockerAdapterOptions (the BootstrapDocker options of extension.ts, review round 3, W3-2; plan step 11I2: was named after ContainerAdapter)', () => {
   it('reports a lost CLI with reportCliLost and looks nothing up', () => {
     const setup = fakeSetup();
     const options = dockerAdapterOptions(() => setup);

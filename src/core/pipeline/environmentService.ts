@@ -10,13 +10,8 @@ import * as path from 'path';
 import { type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
-import {
-  ContainerAdapter,
-  isDevContainer,
-  type ContainerInfo,
-  type NetworkInfo,
-  type VolumeInfo,
-} from '../docker/containerAdapter';
+import type { ContainerInfo, ImageInfo, ImageInspection, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
+import { isDevContainer } from '../worker/dockerEngine';
 import {
   dockerHostField,
   dockerHostOf,
@@ -24,7 +19,6 @@ import {
   isOnDockerHost,
   type DockerTarget,
 } from '../docker/dockerHost';
-import { ensureDockerRunning } from '../docker/dockerStart';
 import {
   EnvironmentLockError,
   holdsEnvironmentLock,
@@ -194,12 +188,14 @@ import {
   type PipelineUi,
   type ProcessRunner,
   type ProgressReporter,
+  type RunResult,
 } from '../ports';
 import { isStorageId } from '../storage/paths';
 import type {
   BuildRecord,
   BusyMark,
   BusyOperation,
+  ContainerState,
   DevcontainerConfig,
   DevcontainerResult,
   Environment,
@@ -292,55 +288,103 @@ import {
 
 
 
-/** The part of ContainerAdapter that the service uses. A ContainerAdapter fits. */
-export type EnvironmentDocker = Pick<
-  ContainerAdapter,
-  | 'isRunning'
-  | 'imageConfig'
-  | 'findContainer'
-  | 'containerState'
-  | 'imageLabels'
-  | 'imageLabelsOf'
-  | 'labelImage'
-  | 'listEnvironmentContainers'
-  | 'removeContainer'
-  | 'renameContainer'
-  | 'stopContainer'
-  | 'exec'
-  | 'volumeExists'
-  | 'createVolume'
-  | 'removeVolume'
-  | 'listEnvironmentVolumes'
-  | 'inspectVolumes'
-  | 'imageExists'
-  | 'imageId'
-  | 'removeImage'
-  | 'listImageTags'
-  | 'listEnvironmentImages'
-  | 'engineApiVersion'
-  | 'listProjectContainers'
-  | 'listProjectNetworks'
-  | 'removeNetwork'
-  | 'listProjectImages'
-  | 'inspectNetworks'
-  | 'inspectImageNames'
-  | 'startContainer'
-> & {
+/**
+ * The Docker of the pipeline: the calls that the service and the refresh make (concept 7.2). Plan step 11I2 (decision D8
+ * of 2026-10-07): its own interface, no longer a part of the CLI adapter ContainerAdapter, which is removed; the worker's
+ * EngineDocker (src/core/worker/engineDocker.ts, over the Engine API) is the one implementation (section 0 of the plan,
+ * one concept for commanding Docker). The calls throw when Docker fails; a missing object is an answer where it says so.
+ */
+export interface EnvironmentDocker {
+  /** The engine answers. Rejects only with an AbortError. */
+  isRunning(signal?: AbortSignal): Promise<boolean>;
   /**
-   * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
-   * this pull (ContainerAdapter.pullImage).
+   * The API version of the engine (for example `1.48`), or `undefined` when the engine does not tell it. Docker Compose
+   * configurations need it for `volume.subpath` (supportsVolumeSubpath). Rejects only with an AbortError.
    */
-  pullImage(
-    reference: string,
-    options?: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials },
-  ): Promise<void>;
+  engineApiVersion(signal?: AbortSignal): Promise<string | undefined>;
+  /** `Config` of the inspect of the image `reference`. */
+  imageConfig(reference: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<unknown>;
   /**
    * Plan step 11G1 ("No extra containers"): the numeric user and group IDs of `user` in the image `image`, as `id -u` and
    * `id -g` would print them in a container of it, read from its `/etc/passwd` without running anything
    * (EngineDocker.imageUserIds). Undefined when they cannot be known that way.
    */
   imageUserIds(image: string, user: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<UserIds | undefined>;
-};
+  /**
+   * The dev container of the environment (label nimblescape.devenv.environment-id, isDevContainer): the container named
+   * `containerName` first, else a running one, else the newest.
+   */
+  findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined>;
+  /** All containers with the label nimblescape.devenv.environment-id, running or not. */
+  listEnvironmentContainers(): Promise<ContainerInfo[]>;
+  /** All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not. */
+  listProjectContainers(project: string): Promise<ContainerInfo[]>;
+  /** The names of the networks of the Docker Compose project `project`. */
+  listProjectNetworks(project: string): Promise<string[]>;
+  /** A missing network is not an error; a network in use is. */
+  removeNetwork(name: string): Promise<void>;
+  /**
+   * The images that Docker Compose built for the project `project` (`<project>-*` with a tag), as `repository:tag`; with
+   * `environmentId`, only those whose label nimblescape.devenv.environment-id names that environment.
+   */
+  listProjectImages(project: string, environmentId?: string): Promise<string[]>;
+  /** 'missing' if not found; running|restarting|paused → 'running'; else 'stopped'. */
+  containerState(nameOrId: string): Promise<ContainerState>;
+  /** A missing container is not an error. */
+  stopContainer(nameOrId: string): Promise<void>;
+  /** Review round 22 (D22-1): throws when the container does not exist or the name is taken. */
+  renameContainer(nameOrId: string, newName: string): Promise<void>;
+  /** Removes the container, also a running one. A missing container is not an error. */
+  removeContainer(nameOrId: string): Promise<void>;
+  /** `docker exec`; resolves also for a non-zero exit code. `secretInput` is the token that the operation holds. */
+  exec(
+    container: string,
+    command: readonly string[],
+    options?: { user?: string; workdir?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<RunResult>;
+  /** Plan step 10A: starts the container with the full ID `id`. */
+  startContainer(id: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;
+  volumeExists(name: string): Promise<boolean>;
+  createVolume(name: string, labels: Record<string, string>): Promise<void>;
+  removeVolume(name: string): Promise<void>;
+  /** The volumes with the label nimblescape.devenv.environment-id. */
+  listEnvironmentVolumes(signal?: AbortSignal): Promise<VolumeInfo[]>;
+  /** The volumes of `names` that exist, each once. */
+  inspectVolumes(names: readonly string[]): Promise<VolumeInfo[]>;
+  /** The networks of `names` that exist, each once. */
+  inspectNetworks(names: readonly string[]): Promise<NetworkInfo[]>;
+  imageExists(reference: string): Promise<boolean>;
+  /** The full ID of the image, or undefined for a missing image. */
+  imageId(reference: string): Promise<string | undefined>;
+  /** The labels of the image, or undefined for a missing image. */
+  imageLabels(reference: string): Promise<Record<string, string> | undefined>;
+  /** The labels of the images of `references` by their lower-case full IDs; a missing image is left out. */
+  imageLabelsOf(references: readonly string[], signal?: AbortSignal): Promise<Map<string, Record<string, string>>>;
+  /**
+   * User decisions 2026-10-03: gives the image `image` the labels `labels` (its build record); the previous image is
+   * removed only when nothing names it.
+   */
+  labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void>;
+  /**
+   * Review rounds 9 to 11 of PR #64: the images that the references find; the references that could not be checked, each
+   * with its reason (ImageUncheckedReason).
+   */
+  inspectImageNames(references: readonly string[], signal?: AbortSignal): Promise<ImageInspection>;
+  /** True when the image was removed; false for a missing image or one in use. */
+  removeImage(reference: string): Promise<boolean>;
+  /** The tags `repository:tag` of exactly this repository, sorted by tag, numbers numerically. */
+  listImageTags(repository: string): Promise<string[]>;
+  /** User decision 2026-09-28: the named images `devenv-*`, each once with its references. */
+  listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]>;
+  /**
+   * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
+   * this pull (EngineDocker.pullImage).
+   */
+  pullImage(
+    reference: string,
+    options?: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials },
+  ): Promise<void>;
+}
 
 /** The part of WorkspaceHelper that the service uses. */
 export type EnvironmentHelper = Pick<
@@ -400,7 +444,10 @@ export interface EnvironmentSessionMonitor {
 
 export interface EnvironmentServiceDeps extends OperationBaseDeps {
   docker: EnvironmentDocker;
-  /** For ensureDockerRunning. */
+  /**
+   * A process runner of the operation. Plan step 11I2: no longer read by the service (it served the default Docker start
+   * with the CLI adapter, which is removed with it); the worker gives one that refuses every process.
+   */
   runner: ProcessRunner;
   helper: EnvironmentHelper;
   registry: EnvironmentStore;
@@ -429,10 +476,10 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
    */
   pullCredentials?: PullCredentialsProvider;
   /**
-   * Default: `ensureDockerRunning` with `docker` (then it must be a ContainerAdapter) and `runner`. Unit 7: the extension
-   * gives a starter that follows the current Docker context (startDockerOn): no Docker Desktop start for a remote host.
+   * Unit 7: the start of Docker, or the check that it answers. Plan step 11I2: required; the default (`ensureDockerRunning`
+   * with the CLI adapter ContainerAdapter) is removed with that adapter. The worker gives a check that its engine answers.
    */
-  startDocker?: DockerStarter;
+  startDocker: DockerStarter;
   /**
    * Unit 7: the Docker host of the operation ('' = the local Docker; DockerTargets.host). New environments record it;
    * only environments of this host are opened, restored, or changed. Default: the local Docker.
@@ -1138,17 +1185,6 @@ const VIEWER_TIMEOUT_MS = 5_000;
 const IDENTITY_RETRY_MS = 10 * 60_000;
 
 
-function defaultDockerStarter(deps: EnvironmentServiceDeps): DockerStarter {
-  return async ({ onStarting, signal }) => {
-    const docker = deps.docker;
-    if (!(docker instanceof ContainerAdapter)) {
-      throw new Error('EnvironmentServiceDeps.startDocker is required when docker is not a ContainerAdapter.');
-    }
-    await ensureDockerRunning(docker, deps.runner, deps.logger, { platform: deps.platform, env: deps.env, onStarting, signal });
-  };
-}
-
-
 /**
  * The open pipeline and the environment operations (concept 7.5, 7.6, 7.7, 7.12, 7.14).
  * Operations on the same repository run one after the other in this window; busy marks in the registry keep other
@@ -1165,7 +1201,7 @@ export class EnvironmentService extends OperationBase {
 
   // Plan step 11F1: the rules of an operation of a window are OperationBase's (shared with EnvironmentOperations).
   constructor(protected override readonly deps: EnvironmentServiceDeps) {
-    super(deps, deps.startDocker ?? defaultDockerStarter(deps));
+    super(deps, deps.startDocker);
     this.pendingRefreshMs = Math.max(1, deps.pendingRefreshMs ?? DEFAULT_PENDING_REFRESH_MS);
   }
 
@@ -2224,7 +2260,7 @@ export class EnvironmentService extends OperationBase {
       return { unread: reason };
     };
     this.throwIfCancelled(signal);
-    let images: Awaited<ReturnType<ContainerAdapter['listEnvironmentImages']>>;
+    let images: ImageInfo[];
     try {
       images = await this.deps.docker.listEnvironmentImages(signal);
     } catch (error) {

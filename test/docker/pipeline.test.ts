@@ -19,7 +19,8 @@ import * as http from 'http';
 import type { AddressInfo } from 'net';
 import * as fs from 'fs';
 import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import {
@@ -60,6 +61,7 @@ import {
   TEST_ACCOUNT,
   RecordingProgress,
   Timings,
+  createVolume,
   dockerTestContext,
   expectLabelledEnvironmentImage,
   fakeAuth,
@@ -137,7 +139,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
   const context = dockerTestContext('pipeline');
   const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
-  const docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const ui = new DeleteRecordingUi();
   const timings = new Timings();
@@ -304,7 +306,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       'RUN apk add --no-cache git && adduser -D dev',
       `LABEL ${TEST_RUN_LABEL}=${run.runId}`,
     ].join('\n');
-    await docker.createVolume(volumeName, {
+    await createVolume(docker, volumeName, {
       [LABEL_ENVIRONMENT_ID]: environmentId,
       [LABEL_REPOSITORY]: REPOSITORY,
       [TEST_RUN_LABEL]: run.runId,
@@ -857,7 +859,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     const name = resourceName('devenv-test/refused', id);
     const config = JSON.stringify({ name: 'Refused', build: { dockerfile: 'Dockerfile' }, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`], ...extra });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: 'devenv-test/refused', [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: 'devenv-test/refused', [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/refused', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -896,7 +898,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       mounts: [`source=${composeVolume},target=/data,type=volume`],
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/compose-volume', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -927,7 +929,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     const dockerfile = [`FROM ${OLD_GIT_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
     // A base image that the user had stays; one that this test pulled goes at the end.
     const pulledHere = !readBaseline(run).images.some((image) => image.tags.map(familiarName).includes(familiarName(OLD_GIT_BASE_IMAGE)));
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/old-git', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -972,7 +974,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, '--platform', 'linux/amd64', '--cap-drop', 'ALL', '--rm', '-it'],
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/no-rights', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -995,8 +997,9 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       // in the environment could not be prepared.
       expect(cli.run(['exec', '-u', 'root', name, 'ls', '-A', TOKEN_FOLDER]).out).toBe('');
       expect(ui.events.some((event) => JSON.stringify(event).includes(Messages.gitSetupFailed))).toBe(true);
-      // Without --rm, a stop keeps the container.
-      await docker.stopContainer(name);
+      // Without --rm, a stop keeps the container. Plan step 11I2: `docker stop` by the Docker CLI of the test harness (was:
+      // stopContainer of the removed CLI adapter ContainerAdapter, the same call).
+      cli.ok(['stop', name]);
       expect(cli.container(name)?.State.Running).toBe(false);
     } finally {
       await registry.remove(id);
@@ -1015,7 +1018,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     const name = resourceName(repository, id);
     const config = JSON.stringify({ name: repository, build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`, ...runArgs] });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN adduser -D dev', ...dockerfileLines, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', `/workspaces/${repository.split('/')[1]}`, config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -1078,7 +1081,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
     });
     const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-    await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+    await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
     const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/privileged', config, dockerfile]);
     expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -1098,7 +1101,8 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
 
       // Checks on again: the open stops with the normal refusal, and the container is not started.
       window.settings.hostAccessChecksOff = [];
-      await docker.stopContainer(name);
+      // Plan step 11I2: `docker stop` by the Docker CLI of the test harness (was: stopContainer of the removed ContainerAdapter).
+      cli.ok(['stop', name]);
       const error = await service.openEnvironmentInWorker(id, { progress: new RecordingProgress() }).then(() => undefined, (caught: unknown) => caught);
       expect(error).toMatchObject({ code: 'hostAccess' });
       expect((error as Error).message).toContain('privileged mode');
@@ -1137,7 +1141,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     try {
       const now = isoTime(systemClock);
       for (const { account, id, name } of entries) {
-        await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: account.id, [TEST_RUN_LABEL]: run.runId });
+        await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [LABEL_OWNER_ID]: account.id, [TEST_RUN_LABEL]: run.runId });
         // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
         const seeded = await runInVolume(docker, name, ['sh', '-c', SEED_SCRIPT, 'sh', '/workspaces/shared', config, dockerfile]);
         expect(seeded.exitCode, seeded.stderr).toBe(0);
@@ -1190,7 +1194,7 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     const name = resourceName(repository, id);
     const recorded = { branch: 'old', uncommittedFiles: 3, unpushedCommits: 2, stashes: 1, recordedAt: '2026-09-20T10:00:00.000Z' };
     try {
-      await docker.createVolume(name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
+      await createVolume(docker, name, { [LABEL_ENVIRONMENT_ID]: id, [LABEL_REPOSITORY]: repository, [TEST_RUN_LABEL]: run.runId });
       const now = isoTime(systemClock);
       await registry.add({ id, repository, configPath: CONFIG_PATH, volumeName: name, containerName: name, createdAt: now, lastUsedAt: now, owner: TEST_ACCOUNT, gitSummary: recorded });
       // user decision 2026-10-02: Delete runs no Git: changed expectation (was in plan step 7: one batch helper, its

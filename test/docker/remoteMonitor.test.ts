@@ -26,7 +26,8 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -92,7 +93,7 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 90_
 
 describe('the Session Monitor container of a remote Docker host', () => {
   const { run, env, cli, log } = dockerTestContext('remoteMonitor');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const containerName = `devenv-test-monitor-${run.runId}`;
   const volumeName = `devenv-test-monitor-${run.runId}`;
@@ -535,7 +536,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
 // when it is idle and stays exited under its restart policy, until ensure starts it again.
 describe('the Session Monitor container: the environment lock of its stops and its exit when idle (plan step 8 PR B)', () => {
   const { run, env, cli, log } = dockerTestContext('remoteMonitor');
-  const docker = new ContainerAdapter(new NodeProcessRunner(), run.dockerPath, env, log);
+  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const containerName = `devenv-test-monitor-lock-${run.runId}`;
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);

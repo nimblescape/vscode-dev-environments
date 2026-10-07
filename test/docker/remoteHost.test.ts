@@ -21,7 +21,8 @@ import * as http from 'http';
 import type { AddressInfo } from 'net';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
+// Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { findExecutable } from '../../src/core/docker/dockerCli';
 import { ownContextDescription, remoteContextNames } from '../../src/core/docker/dockerHost';
 import { ensureDockerRunning } from '../../src/core/docker/dockerStart';
@@ -56,6 +57,7 @@ import {
   RecordingProgress,
   TEST_ACCOUNT,
   Timings,
+  createVolume,
   dockerTestContext,
   expectLabelledEnvironmentImage,
   runInVolume } from './harness';
@@ -102,7 +104,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
   // The environment of this file: its own Docker configuration (the context of the host lives there), the wrapper
   // `ssh` first on PATH, and neither DOCKER_HOST nor DOCKER_CONTEXT, so the current context decides.
   const env: NodeJS.ProcessEnv = { ...localEnv };
-  let docker: ContainerAdapter;
+  let docker: BootstrapDocker;
   let targets: DockerTargets;
   let sshDeps: () => SshCheckDeps;
   let sshLog = '';
@@ -172,7 +174,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     env.PATH = `${bin}${path.delimiter}${env.PATH ?? ''}`;
     delete env.DOCKER_HOST;
     delete env.DOCKER_CONTEXT;
-    docker = new ContainerAdapter(runner, run.dockerPath, env, log);
+    docker = new BootstrapDocker(runner, run.dockerPath, env, log);
     targets = new DockerTargets(docker, env, log);
     // Review, C3: the SSH check before the Docker calls uses the wrapper `ssh` (the test SSH config).
     sshDeps = () => ({ runner, sshPath: findExecutable('ssh', env, process.platform), env });
@@ -293,7 +295,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
             runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
           });
           const dockerfile = [`FROM ${TEST_BASE_IMAGE}`, 'RUN apk add --no-cache git && adduser -D dev', `LABEL ${TEST_RUN_LABEL}=${run.runId}`].join('\n');
-          await docker.createVolume(volumeName, { [LABEL_ENVIRONMENT_ID]: environmentId, [LABEL_REPOSITORY]: REPOSITORY, [TEST_RUN_LABEL]: run.runId });
+          await createVolume(docker, volumeName, { [LABEL_ENVIRONMENT_ID]: environmentId, [LABEL_REPOSITORY]: REPOSITORY, [TEST_RUN_LABEL]: run.runId });
           // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; the seed is a plain container of the helper image (runInVolume).
           const seeded = await runInVolume(docker, volumeName, ['sh', '-c', SEED_SCRIPT, 'sh', FOLDER, devcontainerJson, dockerfile]);
           expect(seeded.exitCode, seeded.stderr).toBe(0);

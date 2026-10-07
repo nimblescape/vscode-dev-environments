@@ -522,16 +522,6 @@ export class BootstrapDocker {
     return images[0].id;
   }
 
-  /**
-   * Review round 10 (P10-1): whether a failed command failed only for missing objects: every line of its (end of) stderr
-   * says so. Unlike isMissing, one "No such …" among other errors is not enough.
-   */
-  protected onlyMissing(result: RunResult, kind: ObjectKind): boolean {
-    if (result.timedOut || result.exitCode === 0) return false;
-    const errors = result.stderr.split(/\r?\n/).filter((line) => line.trim() !== '');
-    return errors.length > 0 && errors.every((line) => MISSING_PATTERNS[kind].test(line));
-  }
-
   protected isMissing(result: RunResult, kind: ObjectKind): boolean {
     return !result.timedOut && result.exitCode !== 0 && MISSING_PATTERNS[kind].test(result.stderr);
   }

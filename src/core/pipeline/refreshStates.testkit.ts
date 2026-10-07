@@ -2,11 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 5, PR C: one Docker engine as a table of answers, for the refresh without the worker (a ContainerAdapter over
-// a fake ProcessRunner) and in it (the operation `refresh` over the fake Docker CLI of the server tests).
+// Plan step 5, PR C: one Docker engine as a table of answers, for the refresh over the worker's EngineDocker
+// (fixtureEngine) and the operation `refresh` over the fake Docker CLI of the server tests (refreshFixture). Plan step
+// 11I2: the ProcessRunner over refreshFixture (FixtureRunner, for the removed CLI adapter ContainerAdapter) is gone.
 import { mapContainerState } from '../docker/dockerObjects';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
-import type { ProcessRunner, RunOptions, RunResult } from '../ports';
 import type { DockerEngine } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import type { EnvironmentStates, StateEnvironment } from './refreshStates';
@@ -132,16 +132,6 @@ export function refreshFixture(args: readonly string[]): FixtureAnswer {
     return { exitCode: 125, stdout: '', stderr: `unexpected exec in ${container}` };
   }
   return { exitCode: 125, stdout: '', stderr: `unexpected call: docker ${key}` };
-}
-
-/** A ProcessRunner over refreshFixture that records the arguments and options of each call. */
-export class FixtureRunner implements ProcessRunner {
-  readonly calls: Array<{ args: string[]; options: RunOptions }> = [];
-
-  async run(_file: string, args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    this.calls.push({ args: [...args], options });
-    return { ...refreshFixture(args), timedOut: false };
-  }
 }
 
 /**
