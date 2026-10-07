@@ -863,7 +863,6 @@ describe('BootstrapDocker: every call runs directly (plan step 11I1, PR B2)', ()
       'lookUpCliIfMissing',
       'runChecked',
       'queryDaemonStatus',
-      'onlyMissing',
       'isMissing',
       'commandError',
       'run',
