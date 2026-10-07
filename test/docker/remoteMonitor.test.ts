@@ -27,7 +27,6 @@ import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -53,7 +52,7 @@ import { SWITCH_RELEASE_BOUNDS, releaseEnvironment, releaseLimitSeconds } from '
 import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
-import { workerLocks } from './workerLocks';
+import { holdLockInContainer, lockIsFree } from './workerLocks';
 
 const SOURCE = crypto.randomBytes(16).toString('hex');
 const OTHER_SOURCE = crypto.randomBytes(16).toString('hex');
@@ -544,7 +543,6 @@ describe('the Session Monitor container: the environment lock of its stops and i
   let helperTag = '';
   let volumeName = '';
   let monitor: RemoteSessionMonitor;
-  let locks: ReturnType<typeof workerLocks>;
   const timings = new Timings();
 
   const running = (name: string): boolean => cli.container(name)?.State.Running === true;
@@ -584,9 +582,6 @@ describe('the Session Monitor container: the environment lock of its stops and i
     helperTag = await helper.ensureImage();
     // The volume of the workers' lock files is the volume of this monitor, as on an engine.
     volumeName = testStateVolume({ run, cli }, 'remoteMonitor-locks');
-    const targets = new DockerTargets(docker, env, log);
-    await targets.resolve();
-    locks = workerLocks({ run, cli, log }, docker, targets, 'remoteMonitor-locks', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
     // Long idle time: these tests do not wait for the exit.
     monitor = newMonitor(3_600_000);
   });
@@ -594,16 +589,16 @@ describe('the Session Monitor container: the environment lock of its stops and i
   afterAll(async () => {
     timings.print('Timings of the environment lock and the idle exit of the Session Monitor:');
     log.output(`docker logs ${containerName}:\n${cli.run(['logs', containerName]).out}\n`);
-    const left = await locks.dispose();
+    // Plan step 11I1, PR A1: no worker is started any more (the holders of the lock are containers of this run).
     removeRunObjects(cli, run.runId);
-    expect(left).toEqual([]);
     expect(cli.container(containerName)).toBeUndefined();
   });
 
   it('does not stop an environment while a worker holds its lock, and stops it after the release (D2)', async () => {
     const id = crypto.randomUUID();
     const name = `devenv-test-monitor-locked-${run.runId}`;
-    const lock = await locks.take(id, 10, undefined);
+    // Plan step 11I1, PR A1: held by a container of the helper image on the state volume (was: the `lock` operation of a worker).
+    const lock = await holdLockInContainer({ run, cli }, volumeName, helperTag, id);
     let released = false;
     try {
       expect(await monitor.ensure(helperTag, socket)).toBe('created');
@@ -615,15 +610,15 @@ describe('the Session Monitor container: the environment lock of its stops and i
       expect(running(name)).toBe(true);
       // Logged once per busy streak.
       expect(logs().split(`${id} is busy with an operation`).length - 1).toBe(1);
-      await lock.release();
+      lock.release();
       released = true;
       await timings.measure('stop after the release of the lock', () => waitUntil(() => !running(name), 'the stop after the release', 30_000));
       expect(logs()).toContain(`Stopping the container ${name} of ${id}`);
-      // The monitor released the lock after its stop: a worker takes it at once.
-      const again = await locks.take(id, 1, undefined);
-      await again.release();
+      // The monitor released the lock after its stop: a worker takes it at once (plan step 11I1, PR A1: taken with
+      // `flock` as a worker takes it, in a container of the helper image, instead of through the `lock` operation).
+      expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
     } finally {
-      if (!released) await lock.release();
+      if (!released) lock.release();
     }
   });
 
@@ -635,13 +630,13 @@ describe('the Session Monitor container: the environment lock of its stops and i
     startEnvironmentContainer(name, id, false);
     writeStaleRecord(id);
     await waitUntil(() => logs().includes(`Stopping the container ${name} of ${id}`), 'the start of the slow stop', 60_000);
-    // During the stop, the lock is held by the monitor: a worker is refused after its wait.
-    await expect(locks.take(id, 1, undefined)).rejects.toMatchObject({ kind: 'busy' });
+    // During the stop, the lock is held by the monitor: a worker is refused after its wait (plan step 11I1, PR A1: `flock`
+    // as a worker takes it, instead of the `lock` operation; busy is its LOCK_BUSY_EXIT).
+    expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(false);
     cli.ok(['kill', containerName]);
     await waitUntil(() => !running(containerName), 'the end of the killed monitor', 30_000);
-    // The kernel freed the lock with the process: a worker takes it at once.
-    const lock = await locks.take(id, 1, undefined);
-    await lock.release();
+    // The kernel freed the lock with the process: a worker takes it at once (plan step 11I1, PR A1: as above).
+    expect(lockIsFree({ run, cli }, volumeName, helperTag, id, 1)).toBe(true);
     cli.run(['rm', '-f', name]);
   });
 

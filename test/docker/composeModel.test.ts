@@ -7,19 +7,19 @@
 // project, the `$` probe, the configuration folder with the token hidden, and whether Compose reads our rewrite of its
 // own output again with the same values (L-6, D-1). The open, stop, and delete of a Compose environment are tested with
 // the pipeline (compose.test.ts). Plan step 7 (user decision of 2026-10-01): the per-step path is removed, so the model
-// runs in the batch helper of the real worker under a lock, as an operation runs it (inBatchScope), as the owner of the
-// repository (user decision of 2026-10-01; Q2: without `--network none`); the seeds and the checks run in a plain
-// container of the helper image (runInVolume).
+// runs in the batch helper of the real worker under a lock, as an operation runs it, as the owner of the repository (user
+// decision of 2026-10-01; Q2: without `--network none`); the seeds and the checks run in a plain container of the helper
+// image (runInVolume). Plan step 11I1, PR A1: the batch helper is started from the test process as the worker's own flow
+// starts it (inProcessBatches), without the relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ContainerAdapter } from '../../src/core/docker/containerAdapter';
-import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { composeProjectName, environmentImageName, resourceName } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, runInVolume } from './harness';
-import { inBatchScope, workerLocks } from './workerLocks';
+import { inProcessBatches, type InProcessBatches } from './workerLocks';
 import { composeAccessReport } from '../../src/core/policy';
 
 const ENVIRONMENT_ID = 'c0ffee00-0000-4000-8000-000000000000';
@@ -71,12 +71,13 @@ describe('model run of a Docker Compose configuration', () => {
   const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volumeName = `devenv-test-compose-${run.runId}`;
   let apiVersion: string;
-  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the real workers, whose batch helper runs the model.
-  const targets = new DockerTargets(docker, env, log);
-  const locks = workerLocks({ run, cli, log }, docker, targets, 'composeModel', async (target) => helperDockerSocket(env, process.platform, target.endpoint));
+  // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the batch helper of the worker runs the model.
+  // Plan step 11I1, PR A1: started from the test process (inProcessBatches) instead of through the lock of a worker.
+  let batches: InProcessBatches;
 
   beforeAll(async () => {
     await helper.ensureImage();
+    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform));
     cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, volumeName]);
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     const files = {
@@ -94,8 +95,9 @@ describe('model run of a Docker Compose configuration', () => {
   });
 
   afterAll(async () => {
-    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no worker and no batch helper is left over.
-    const leftovers = await locks.dispose();
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: no batch helper is left over (plan step
+    // 11I1, PR A1: no worker is started any more).
+    const leftovers = await batches.dispose();
     removeRunObjects(cli, run.runId);
     expect(leftovers).toEqual([]);
     expect(cli.volume(volumeName)).toBeUndefined();
@@ -105,7 +107,7 @@ describe('model run of a Docker Compose configuration', () => {
     const resolved = resolveComposeFiles('.devcontainer/devcontainer.json', 'app', names);
     if (!('files' in resolved)) throw new Error(resolved.problem);
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the step in the batch helper of an operation.
-    return inBatchScope(locks, ENVIRONMENT_ID, volumeName, log, () => helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT }));
+    return batches.inScope(ENVIRONMENT_ID, volumeName, () => helper.composeModel({ volumeName, repository: 'acme/app', files: resolved.files, project: PROJECT }));
   }
 
   it('prints the merged model of all profiles, and the policy allows it', async () => {
