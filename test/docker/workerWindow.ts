@@ -148,6 +148,8 @@ export function workerWindow(context: DockerTestContext, docker: ContainerAdapte
     flow,
     workerRefresh: (environments) => locks.refresh(environments),
     dockerRunning: () => docker.isRunning(),
+    // Review round 1 of PR #117 (B-H1): the Docker target of the window, as extension.ts (the Docker host of its records).
+    dockerTarget: () => targets.current(),
     registry: computer.registry,
     sessionFiles: computer.sessionFiles,
     auth,
