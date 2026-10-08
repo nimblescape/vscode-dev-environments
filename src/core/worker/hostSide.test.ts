@@ -22,8 +22,9 @@ const ALL: readonly HostCall[] = [
   ...['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message', 'confirmDelete', 'deleteAdditionalVolumes', 'deleteServiceData', 'unknown', 'Bad-Call'].map(
     (call) => `question ${call}` as const,
   ),
-  // Plan step 11I (PR D): `local settings` is removed (no flow sent it; the open carries its settings in its parameters).
-  ...['windowStatuses', 'pendings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
+  // Plan step 11I (PR D): `local settings` is removed (no flow sent it; the open carries its settings in its parameters). It
+  // stays allowed here, so its refusal is the handler's (PR #125 review round 1, A L-2).
+  ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
   // Plan step 11E4c: `add` and `update` are removed (they stay allowed here, so their refusal is the handler's); `configuration` is new.
   ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy', 'recordGitSummary', 'configuration'].map((call) => `record ${call}` as const),
   'secret token',
@@ -237,6 +238,9 @@ describe('the handler of the requests on the side of the extension (plan step 11
       ['record', { call: 'add', args: ['not an object'] }],
       ['record', { call: 'forgetKeptVolumes', args: [[1]] }],
       ['record', { call: 'sessionFile', args: ['writeEverything', 'e1'] }],
+      // PR #125 review round 1 (A L-2): the requests that plan step 11I (PR D) removed are refused.
+      ['local', { call: 'settings', args: [] }],
+      ['record', { call: 'sessionFile', args: ['removeReopen', 'e1'] }],
       ['secret', { call: 'unknown', args: [] }],
       // Plan step 11E6 (decision A1 of 2026-10-05): `connect` is no request kind any more (refused all the same).
       ['connect', { call: 'connect', args: ['x'] }],

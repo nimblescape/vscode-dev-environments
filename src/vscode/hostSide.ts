@@ -133,7 +133,9 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         else if (kind === 'removePending') await deps.sessionFiles.removePending(environmentId);
         else if (kind === 'removeOperation') await deps.sessionFiles.removeOperation(environmentId);
         else if (kind === 'removeReopenOf') await deps.sessionFiles.removeReopenOf(environmentId);
-        else await deps.sessionFiles.removeDisconnectRequest(environmentId);
+        else if (kind === 'removeDisconnectRequest') await deps.sessionFiles.removeDisconnectRequest(environmentId);
+        // PR #125 review round 1 (A L-3): a second guard behind the handler's allowlist.
+        else throw new Error(`The session file request ${String(kind)} is not known.`);
       },
       markBusy: (environmentId, operation, onReplaced) => busyMarks.mark(environmentId, operation, onReplaced),
       clearBusy: (environmentId) => busyMarks.clear(environmentId),

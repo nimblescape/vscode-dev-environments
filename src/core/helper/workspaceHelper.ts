@@ -32,7 +32,7 @@ import { parseComposeHashes } from './scripts';
 // helper (stepInputs.ts). Plan step 11I (PR D): the batch helper builds each command from the kind and the inputs of its
 // step (batchStepCommand); WorkspaceHelper builds none (fixRepositoryOwnership only asks batchStepCommand whether the
 // step takes its paths).
-import { checkConfigPath, checkRepository, isPassableEnvName, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
+import { checkConfigPath, checkRepository, isPassableEnvName, writeAndRunInput, type HelperFiles } from './stepInputs';
 // Plan step 6, PR C, plan step 7: the volume steps run only in the batch helper of an operation.
 import { currentBatchScope, type BatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
@@ -158,7 +158,6 @@ interface StreamOptions {
    * ended, and the run rejects with an Error that is not an AbortError.
    */
   timeoutMs?: number;
-  input?: string;
   /**
    * Plan step 6, PR C: the step of the batch helper that this run is, with the inputs of its builder (batchSteps.ts) and
    * the secret (the token: the standard input of the clone, or only masked). Plan step 7 (user decision of 2026-10-01):
@@ -388,6 +387,9 @@ export class WorkspaceHelper {
     checkRepository(p.repository);
     checkConfigPath(p.configPath);
     const withFiles = p.override !== undefined || p.files !== undefined;
+    // PR #125 review round 1 (B L2): only the local check of the files ("Invalid helper file"); the batch helper
+    // builds the input of the step itself.
+    if (withFiles) writeAndRunInput(p.files, p.override);
     const result = await this.runStreams(p.volumeName, {
       batch: {
         kind: 'readConfiguration',
@@ -400,7 +402,6 @@ export class WorkspaceHelper {
           ...(p.files !== undefined ? { files: p.files } : {}),
         },
       },
-      input: withFiles ? writeAndRunInput(p.files, p.override) : undefined,
       env: p.env,
       image: p.image,
       timeoutMs,
@@ -451,6 +452,9 @@ export class WorkspaceHelper {
     checkConfigPath(p.configPath);
     this.deps.logger.info(`Building the environment image ${p.imageName} from ${p.configPath}.`);
     // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (batchStepCommand).
+    // PR #125 review round 1 (B L2): only the local check of the files ("Invalid helper file"); the batch helper
+    // builds the input of the step itself.
+    writeAndRunInput(p.files, p.override);
     return this.runDevcontainer('devcontainer build', p.volumeName, {
       batch: {
         kind: 'build',
@@ -462,7 +466,6 @@ export class WorkspaceHelper {
           ...(p.files !== undefined ? { files: p.files } : {}),
         },
       },
-      input: writeAndRunInput(p.files, p.override),
       env: p.env,
       image: p.image,
       onOutput: p.onOutput,
@@ -522,7 +525,6 @@ export class WorkspaceHelper {
     const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'composeHash', params: { repository: p.repository, model: p.model, project: p.project } },
       image: p.image,
-      input: p.model,
       env: { COMPOSE_PROJECT_NAME: p.project },
       timeoutMs: COMPOSE_MODEL_TIMEOUT_MS,
       signal: p.signal,
@@ -592,6 +594,9 @@ export class WorkspaceHelper {
       `Starting the container of ${p.repository}${p.removeExistingContainer ? ' (replacing the existing container)' : ''}.`,
     );
     try {
+      // PR #125 review round 1 (B L2): only the local check of the files ("Invalid helper file"); the batch helper
+      // builds the input of the step itself.
+      if (p.files !== undefined) writeAndRunInput(p.files, p.override);
       return await this.runDevcontainer('devcontainer up', p.volumeName, {
         batch: {
           kind: 'up',
@@ -603,7 +608,6 @@ export class WorkspaceHelper {
             ...(p.files !== undefined ? { files: p.files } : {}),
           },
         },
-        input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
         image: p.image,
@@ -644,6 +648,9 @@ export class WorkspaceHelper {
     checkRepository(p.repository);
     this.deps.logger.info(`Running the lifecycle commands of ${p.repository} in the container ${p.containerId.slice(0, 12)}.`);
     try {
+      // PR #125 review round 1 (B L2): only the local check of the files ("Invalid helper file"); the batch helper
+      // builds the input of the step itself.
+      if (p.files !== undefined) writeAndRunInput(p.files, p.override);
       const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, {
         batch: {
           kind: 'runUserCommands',
@@ -655,7 +662,6 @@ export class WorkspaceHelper {
             ...(p.files !== undefined ? { files: p.files } : {}),
           },
         },
-        input: overrideInput(p.files, p.override),
         env: p.env,
         secret: p.token,
         image: p.image,
@@ -718,7 +724,7 @@ export class WorkspaceHelper {
    * ownershipFix of the batch helper, which mounts only the workspace volume of the dev container, with
    * CONFIG_OWNERSHIP_FIX_SCRIPT. No mount of the dev container (for example through a link of the repository,
    * `volumes_from`, or a tmpfs) is there: the fix walks only the folder of the volume. Throws for IDs that are not numbers
-   * (configOwnershipFixCommand); returns the result also for a non-zero exit code.
+   * (checkNumericIds); returns the result also for a non-zero exit code.
    */
   async fixConfigOwnership(p: {
     volumeName: string;
@@ -746,7 +752,7 @@ export class WorkspaceHelper {
    * NUMERIC_OWNERSHIP_FIX_SCRIPT, before the dev container is created (it replaced the short-lived container of the
    * environment image). The paths are bounded as the pipeline bounds them (boundServiceFolders; an overflow is
    * `'repository'`), so that the step's checks accept them. Throws for IDs that are not numbers
-   * (repositoryOwnershipFixCommand); returns the result also for a non-zero exit code.
+   * (checkNumericIds); returns the result also for a non-zero exit code.
    */
   async fixRepositoryOwnership(p: {
     volumeName: string;
@@ -842,7 +848,6 @@ export class WorkspaceHelper {
     options: {
       /** Plan step 6, PR C: the step of the batch helper (StreamOptions.batch); `secret` is added here. */
       batch: NonNullable<StreamOptions['batch']>;
-      input?: string;
       env?: Record<string, string>;
       secret?: string;
       image?: HelperImageUse;
@@ -860,7 +865,6 @@ export class WorkspaceHelper {
       result = await this.runStreams(volumeName, {
         // Plan step 6, PR C: `up` and run-user-commands take the token only to mask their output in the helper.
         batch: { ...options.batch, ...(secret !== undefined ? { secret } : {}) },
-        input: options.input,
         env: options.env,
         image: options.image,
         signal: options.signal,

@@ -691,7 +691,7 @@ Rules:
 | Situation | Behavior |
 |---|---|
 | No build record (first open, or registry lost) | Pull the images and build the environment image. |
-| Registry requires a sign-in | The extension uses the credentials that Docker uses (Docker credential helper). For private images on ghcr.io, it can use the VS Code GitHub session with the additional scope `read:packages`, but only when the connection to Docker is local or encrypted (socket, named pipe, SSH, or TCP with TLS verification). Otherwise the sign-in is not sent: "The image of this environment can only be downloaded with your GitHub sign-in. The connection to Docker is not encrypted, so Dev Environments does not send the sign-in. Use a local Docker, or connect to Docker over SSH or TLS." |
+| Registry requires a sign-in | The extension uses the credentials that Docker uses (Docker credential helper). For private images on ghcr.io, it can use the VS Code GitHub session with the additional scope `read:packages`. Dev Environments uses only a local Docker or Docker over SSH, so the sign-in never goes over another connection. |
 | Setting `devEnvLauncher.updateImagesOnConnect` is `false` | No check. |
 
 **Registry limits.** The Docker documentation says about Docker Hub: "Using GET emulates a real pull and counts towards the limit. Using HEAD won't." So the check at each connection does not use up the pull limit of Docker Hub. The extension pulls an image only when its digest has changed.
