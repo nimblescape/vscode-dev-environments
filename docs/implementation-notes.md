@@ -135,7 +135,7 @@ Rules:
 
 | Purpose | Commands (with `docker exec` in a running dev container, as its user; user decision 2026-10-02: no helper runs them, also not for Delete) |
 |---|---|
-| Branch | `git branch --show-current`; Git before 2.22: `git symbolic-ref --short -q HEAD` (its exit code 1 is a detached HEAD) |
+| Branch | `git symbolic-ref -q HEAD`, a branch only below `refs/heads/` (its exit code 1 is a detached HEAD; a HEAD that names a remote-tracking branch or a tag is no branch; review round 1 of PR #124) |
 | Uncommitted files | `git status --porcelain` (count of lines) |
 | Unpushed commits | `git rev-list --count HEAD --branches --not --remotes` (HEAD and all local branches, concept 7.5 / 7.14 step 1; with an unborn HEAD only `--branches`) |
 | Stashes | `git stash list` (count of lines) |
