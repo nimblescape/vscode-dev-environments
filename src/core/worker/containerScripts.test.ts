@@ -17,7 +17,7 @@ import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToke
 import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger } from '../ports';
 import { REMOTE_MONITOR_SCRIPT_PATH, isUnderRecordsLock } from '../remoteMonitor/protocol';
-import { CONTAINER_SCRIPTS, runScript, scriptCommand, type ContainerScript, type ScriptExec } from './containerScripts';
+import { CONTAINER_SCRIPTS, runScript, scriptCommand, type ContainerScript, type ScriptEntry, type ScriptExec } from './containerScripts';
 import type { DockerEngine, EngineExecOptions } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { EngineDocker } from './engineDocker';
@@ -226,6 +226,20 @@ describe('plan step 11I (U2, decision of 2026-10-08): the commands of the Sessio
       await expect(runScript(engine, 'c1', name, ['x'], { input: '' }), name).rejects.toThrow(`The script ${name} of the registry takes no input.`);
     }
     expect(execs).toHaveLength(2);
+  });
+
+  // Review round 1 of PR #126 (F3): the type of an entry keeps a plain input and a secret apart; tsc (run with the unit
+  // tests) refuses an entry with both, of either kind (each `@ts-expect-error` below fails tsc when the type accepts it,
+  // as it did before F3). Either `never` field alone makes the union discriminated, which already refuses both.
+  it('refuses an entry with both a plain input and a secret, in its type (review round 1 of PR #126, F3)', () => {
+    // @ts-expect-error: a program of the container takes no secret
+    const commandWithSecret: ScriptEntry = { command: ['cat'], plainInput: true, secretInputName: SECRET_TOKEN };
+    // @ts-expect-error: a script takes no plain input
+    const scriptWithInput: ScriptEntry = { program: 'sh', script: 'cat', secretInputName: SECRET_TOKEN, plainInput: true };
+    // Each kind alone is an entry.
+    const entries: ScriptEntry[] = [{ command: ['cat'], plainInput: true }, { program: 'sh', script: 'cat', secretInputName: SECRET_TOKEN }];
+    expect([commandWithSecret, scriptWithInput, ...entries]).toHaveLength(4);
+    for (const entry of Object.values(CONTAINER_SCRIPTS) as ScriptEntry[]) expect('plainInput' in entry && 'secretInputName' in entry).toBe(false);
   });
 });
 

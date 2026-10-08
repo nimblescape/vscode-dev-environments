@@ -22,15 +22,18 @@ import type { EngineExecOptions, EngineExecResult } from './dockerEngine';
 /**
  * How a script runs. A script for a program of the container: its text, whether it takes the token on its standard
  * input, and its program. Plan step 11I (PR B): or a program of the container itself with its fixed arguments
- * (`command`), run without a shell as the call site ran it before.
+ * (`command`), run without a shell as the call site ran it before. Review round 1 of PR #126 (F3): a secret input and a
+ * plain input exclude each other in the type (each kind declares the other's field as `never`), so no entry has both.
  */
-type ScriptEntry =
+export type ScriptEntry =
   | {
       /** The program that runs the script: `sh -c <script> sh <args…>`, or `node -e <script> <args…>`. */
       program: 'sh' | 'node';
       script: string;
       /** The secret that is its standard input (plan step 11A: never an argument, never a log line). */
       secretInputName?: typeof SECRET_TOKEN;
+      /** Review round 1 of PR #126 (F3): a script takes no plain input. */
+      plainInput?: never;
     }
   | {
       /** The program and its fixed arguments: `<command…> <args…>`. */
@@ -40,6 +43,8 @@ type ScriptEntry =
        * never a secret). runScript gives an input only to an entry with this, and refuses one for any other entry.
        */
       plainInput?: true;
+      /** Review round 1 of PR #126 (F3): a program of the container takes no secret. */
+      secretInputName?: never;
     };
 
 /**

@@ -6,7 +6,7 @@ import * as http from 'http';
 import { describe, expect, it, vi } from 'vitest';
 import { abortError } from '../core/ports';
 import { EngineError, type EngineFilters, type EngineImage } from '../core/worker/dockerEngine';
-import type { EngineApi, EngineAnswer, EngineRequest } from '../helperChannel/engineApi';
+import { MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineApi, type EngineAnswer, type EngineRequest } from '../helperChannel/engineApi';
 import { dockerEngine } from '../helperChannel/engineClient';
 import type { ImageEngine } from './engine';
 import {
@@ -749,8 +749,14 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     const log: string[] = [];
     await new ImageMaintenance({ engine, httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     const paths = requests.map((request) => `${request.method} ${decodeURIComponent(request.path)}`);
-    // The list without `all` (no intermediate images; none of a repository), with no filter.
+    // The list without `all` (no intermediate images; none of a repository), with no filter. Review round 1 of PR #126
+    // (F2): within the bound of a list of every image, not the 1 MiB of the other requests.
     expect(paths).toContain('GET /images/json?filters={}');
+    expect(requests.filter((request) => request.path.startsWith('/images/json')).map((request) => request.maxCharacters)).toEqual([
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+    ]);
     // The pull of the major tag, anonymous: no header of a login.
     const pull = requests.find((request) => request.path.startsWith('/images/create'))!;
     expect(decodeURIComponent(pull.path)).toBe(`/images/create?fromImage=${DEV}:2`);

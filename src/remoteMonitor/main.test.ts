@@ -7,11 +7,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mapContainerState } from '../core/docker/dockerObjects';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import { abortError } from '../core/ports';
 import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer } from '../core/remoteMonitor/protocol';
-import { EngineError, type EngineContainer } from '../core/worker/dockerEngine';
+import { EngineError, type EngineContainerSummary } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import {
   EXIT_INVALID,
@@ -38,6 +37,8 @@ import {
   type ExecFile,
   timingFromEnv,
 } from './main';
+import type { EngineAnswer, EngineApi, EngineRequest } from '../helperChannel/engineApi';
+import { dockerEngine } from '../helperChannel/engineClient';
 import type { LoopEngine } from './engine';
 import { lockFilePath, lockFolder } from '../core/helperChannel/protocol';
 import { REMOTE_GAP_MS, REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
@@ -59,27 +60,28 @@ const DB_ID = 'b'.repeat(64);
 const lockAlways = async () => ({ kind: 'locked' as const, release: () => {} });
 
 /**
- * Plan step 11I (U1, decision of 2026-10-08): a container of the list of a fake engine (DockerEngine.containers), with
- * what the monitor reads of it: its ID, name, state as the engine names it, and labels (the environment, and the Compose
- * service unless it is the dev container). Before, a line of `docker ps --format PS_FORMAT`.
+ * Plan step 11I (U1, decision of 2026-10-08): a container of the list of a fake engine (DockerEngine.containerSummaries
+ * since review round 1 of PR #126, F1), with what the monitor reads of it: its ID, name, state as the list names it, and
+ * labels (the environment, and the Compose service unless it is the dev container). Before, a line of `docker ps
+ * --format PS_FORMAT`.
  */
-function listedContainer(id: string, rawState: string, name: string, environmentId: string, composeService = ''): EngineContainer {
+function listedContainer(id: string, state: string, name: string, environmentId: string, composeService = ''): EngineContainerSummary {
   const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environmentId };
   if (composeService !== '') labels[LABEL_COMPOSE_SERVICE] = composeService;
-  return { id, name, state: mapContainerState(rawState), rawState, labels, image: 'devenv-test:1' };
+  return { id, name, state, labels };
 }
 
 /**
  * Plan step 11I (U1): the answer of a fake list: its containers, or its failure (an engine that does not answer, before
  * an exit code of `docker ps`).
  */
-function answerOf(listed: EngineContainer[] | Error): Promise<EngineContainer[]> {
+function answerOf(listed: EngineContainerSummary[] | Error): Promise<EngineContainerSummary[]> {
   return listed instanceof Error ? Promise.reject(listed) : Promise.resolve(listed);
 }
 
 /** Plan step 11I (U1): a fake engine of the loop whose list is `listed()` and whose stops all succeed. */
-function loopEngineOf(listed: () => EngineContainer[] | Error): LoopEngine {
-  return { containers: async () => answerOf(listed()), stop: async () => {} };
+function loopEngineOf(listed: () => EngineContainerSummary[] | Error): LoopEngine {
+  return { containerSummaries: async () => answerOf(listed()), stop: async () => {} };
 }
 
 /** Plan step 11I (U1): the failure of an engine that does not answer (the connection of its socket is refused). */
@@ -373,7 +375,7 @@ describe('remoteContainersOf', () => {
     ]);
   });
 
-  // Plan step 11I (U1): the state is the word of the engine (`State.Status`, as `{{.State}}` of `docker ps`), not the
+  // Plan step 11I (U1): the state is the word of the list of the engine (`State`, as `{{.State}}` of `docker ps`), not the
   // state of the extension, so `paused`, `restarting` and `created` reach the rules as they are; a container without the
   // label of an environment is never one of them.
   it('keeps the state word of the engine, and skips a container without the label of an environment (plan step 11I, U1)', () => {
@@ -401,7 +403,7 @@ describe('RemoteMonitorLoop', () => {
   let now: number;
   let lines: string[];
   /** Plan step 11I (U1): the list of the fake engine, or its failure (a `docker ps` result before). */
-  let ps: EngineContainer[] | Error;
+  let ps: EngineContainerSummary[] | Error;
   /** Plan step 11I (U1): the failure of the stop of a container, by its ID (a `docker stop` result before). */
   let stopResults: Map<string, Error>;
   let calls: string[][];
@@ -417,10 +419,11 @@ describe('RemoteMonitorLoop', () => {
     ps = [listedContainer(DB_ID, 'running', 'devenv-api-db-1', A, 'db'), listedContainer(DEV_ID, 'running', 'devenv-api', A)];
     beforeRemove = undefined;
     loop = new RemoteMonitorLoop({
-      // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI; each call is recorded as the
-      // name of the method and its container or label.
+      // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI; each call is recorded as
+      // `containers` (the list of the containers, containerSummaries since review round 1 of PR #126) with its label, or
+      // `stop` with its container.
       engine: {
-        containers: async (label) => {
+        containerSummaries: async (label) => {
           calls.push(['containers', label]);
           return answerOf(ps);
         },
@@ -551,7 +554,7 @@ describe('RemoteMonitorLoop', () => {
       const seen: Array<[string, string, number | undefined, number | undefined]> = [];
       const timed = new RemoteMonitorLoop({
         engine: {
-          containers: async (label, signal) => (seen.push(['containers', label, signal && limits.get(signal), undefined]), answerOf(ps)),
+          containerSummaries: async (label, signal) => (seen.push(['containers', label, signal && limits.get(signal), undefined]), answerOf(ps)),
           stop: async (id, timeoutSeconds, signal) => void seen.push(['stop', id, signal && limits.get(signal), timeoutSeconds]),
         },
         removeRecord: async () => false,
@@ -793,7 +796,7 @@ describe('RemoteMonitorLoop', () => {
     const DAY = 24 * 60 * MINUTE;
     const THIRD = '1'.repeat(32);
     let clock = T0 - 8 * DAY;
-    let listed: EngineContainer[] = [listedContainer('c'.repeat(64), 'exited', 'devenv-b', B)];
+    let listed: EngineContainerSummary[] = [listedContainer('c'.repeat(64), 'exited', 'devenv-b', B)];
     writeRecord(SOURCE, B, { at: T0 - 9 * DAY, keepRunning: false, limitSeconds: 600 });
     writeRecord(OTHER, B, { at: T0 + 6 * DAY, keepRunning: false, limitSeconds: 600 });
     const attempts: string[] = [];
@@ -882,6 +885,97 @@ describe('RemoteMonitorLoop', () => {
   });
 });
 
+// Review round 1 of PR #126 (F1, and the missing test of a loop over the real port): the loop over the engine client of the
+// worker (src/helperChannel/engineClient.ts) and an Engine API in memory, as the image pass in images.test.ts.
+describe('RemoteMonitorLoop over the real port (review round 1 of PR #126)', () => {
+  const BROKEN = 'c'.repeat(64);
+  const INSPECT_FAILS = '{"message":"RWLayer of container 1234 is unexpectedly nil"}';
+
+  /**
+   * The port over an Engine API in memory: the list of `entries` by the label filter of its request (as the engine
+   * filters it), the stop of a container with the status of `stops` (204 by default), and 500 for anything else, as the
+   * inspect of a container whose layer is broken answers.
+   */
+  function engineOver(entries: Array<{ Id: string; Names: string[]; State: string; Labels: Record<string, string> }>, stops: Record<string, number> = {}) {
+    const requests: string[] = [];
+    const api: EngineApi = async (request: EngineRequest): Promise<EngineAnswer> => {
+      const path = decodeURIComponent(request.path);
+      requests.push(`${request.method} ${path}`);
+      if (request.method === 'GET' && path.startsWith('/containers/json?')) {
+        const [key, value] = (/"label":\["([^"]*)"\]/.exec(path)?.[1] ?? '').split('=');
+        const listed = entries.filter((entry) => (value === undefined ? key in entry.Labels : entry.Labels[key] === value));
+        return { status: 200, body: JSON.stringify(listed), truncated: false };
+      }
+      const stopped = /^\/containers\/([0-9a-f]{64})\/stop$/.exec(path);
+      if (request.method === 'POST' && stopped !== null) {
+        const status = stops[stopped[1]] ?? 204;
+        return { status, body: status === 404 ? '{"message":"No such container"}' : '', truncated: false };
+      }
+      return { status: 500, body: INSPECT_FAILS, truncated: false };
+    };
+    return { engine: dockerEngine(api, async () => Promise.reject(new Error('no exec in this test'))), requests };
+  }
+
+  const entryOf = (id: string, name: string, environmentId: string, composeService?: string) => ({
+    Id: id,
+    Names: [`/${name}`],
+    State: 'running',
+    Labels: { [LABEL_ENVIRONMENT_ID]: environmentId, ...(composeService !== undefined ? { [LABEL_COMPOSE_SERVICE]: composeService } : {}) },
+  });
+
+  /** A loop over `engine` that has ticked through the grace of its start (the next tick at T0 + REMOTE_GRACE_MS may stop). */
+  async function pastGrace(engine: LoopEngine, lines: string[]): Promise<{ loop: RemoteMonitorLoop; at: (time: number) => Promise<string[]> }> {
+    let now = T0;
+    const loop = new RemoteMonitorLoop({ engine, removeRecord: async () => false, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => now, log: (message) => lines.push(message) });
+    const at = async (time: number) => {
+      now = time;
+      const stopped = await loop.tick();
+      await loop.removals;
+      return stopped;
+    };
+    for (let time = T0; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) expect(await at(time)).toEqual([]);
+    return { loop, at };
+  }
+
+  // The list of the engine (all=1 and the label filter, under the lock that of the environment), the state of the list,
+  // the stop without a time, and the answers 304 (it stopped meanwhile) and 404 (it is gone), each counted as stopped.
+  it('stops over the real port: the list with all=1 and the label filter, its state, the stop without a time; 304 and 404 count as stopped', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { engine, requests } = engineOver([entryOf(DB_ID, 'devenv-api-db-1', A, 'db'), entryOf(DEV_ID, 'devenv-api', A)], { [DEV_ID]: 304, [DB_ID]: 404 });
+    const lines: string[] = [];
+    const { at } = await pastGrace(engine, lines);
+    requests.length = 0;
+    expect(await at(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    expect(requests).toEqual([
+      `GET /containers/json?all=1&filters={"label":["${LABEL_ENVIRONMENT_ID}"]}`,
+      `GET /containers/json?all=1&filters={"label":["${LABEL_ENVIRONMENT_ID}=${A}"]}`,
+      // The dev container first; no `t`: the stop time of the container, as `docker stop` without `-t`.
+      `POST /containers/${DEV_ID}/stop`,
+      `POST /containers/${DB_ID}/stop`,
+    ]);
+    expect(lines.filter((line) => line.startsWith('Stopping the container'))).toEqual([
+      `Stopping the container devenv-api of ${A}: no computer sent a heartbeat for 32 minutes (limit 10 minutes).`,
+      `Stopping the container devenv-api-db-1 of ${A}: no computer sent a heartbeat for 32 minutes (limit 10 minutes).`,
+    ]);
+    expect(lines.filter((line) => line.includes('could not be stopped') || line.includes('does not answer'))).toEqual([]);
+  });
+
+  // F1: a container whose inspect fails (a broken layer, or its lock held by a start that hangs) is in the list as
+  // `docker ps` showed it; the loop never inspects, so it keeps no other environment of the engine from its stop.
+  it('a container whose inspect fails (500) keeps no other environment from its stop: the loop never inspects (F1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    const { engine, requests } = engineOver([entryOf(BROKEN, 'devenv-broken', B), entryOf(DEV_ID, 'devenv-api', A)]);
+    const lines: string[] = [];
+    const { at } = await pastGrace(engine, lines);
+    expect(await at(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    expect(requests.filter((request) => /^GET \/containers\/[0-9a-f]{64}\/json/.test(request))).toEqual([]);
+    expect(requests).toContain(`POST /containers/${DEV_ID}/stop`);
+    // B has no record: never acted on.
+    expect(requests.filter((request) => request.includes(BROKEN))).toEqual([]);
+    expect(lines.filter((line) => line.includes('does not answer'))).toEqual([]);
+  });
+});
+
 // Review round 2 of PR #63 (R2-4): the removal of the loop, `forget <source> <env id> <at>` under the lock of the records
 // (with the real script and `flock` in heartbeatLock.test.ts).
 // Plan step 8, PR B (user decision D2 of 2026-09-30): each automatic stop of the monitor takes the lock of its
@@ -892,7 +986,7 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
   let lines: string[];
   let events: string[];
   /** Plan step 11I (U1): the list of the fake engine, or its failure (a `docker ps` result before). */
-  let ps: EngineContainer[] | Error;
+  let ps: EngineContainerSummary[] | Error;
   let attempts: Array<() => StopLockAttempt>;
   let onLocked: (() => void) | undefined;
   let stopFails: Error | undefined;
@@ -912,7 +1006,7 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
       // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI. The events name its list by
       // the label as they named the filter of `docker ps` before (`ps`, `ps label=…=<id>`), and its stop.
       engine: {
-        containers: async (label) => {
+        containerSummaries: async (label) => {
           events.push(label === LABEL_ENVIRONMENT_ID ? 'ps' : `ps label=${label}`);
           return answerOf(ps);
         },
@@ -1119,7 +1213,7 @@ describe('monitor.js run: the lock files of the volume (review round 1 of PR #86
       // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI (`docker ps`, `docker stop`).
       engine: {
         ...unusedEngine(),
-        containers: async () => [listedContainer(DEV_ID, 'running', 'devenv-api', A)],
+        containerSummaries: async () => [listedContainer(DEV_ID, 'running', 'devenv-api', A)],
         stop: async (id) => void stops.push(`stop ${id}`),
       },
       exec: (_file, _args, _options, callback) => callback(null, 'removed\n', ''),
@@ -1157,7 +1251,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
    */
   function startRun(options: {
     env?: NodeJS.ProcessEnv;
-    ps: () => EngineContainer[] | Error;
+    ps: () => EngineContainerSummary[] | Error;
     onStop?: () => void;
     stopMs?: number;
     lock?: () => StopLockAttempt;
@@ -1173,7 +1267,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
       stateDir,
       engine: {
         ...unusedEngine(),
-        containers: async () => answerOf(options.ps()),
+        containerSummaries: async () => answerOf(options.ps()),
         stop: async (id) => {
           events.push(`stop ${id}`);
           mono += options.stopMs ?? 0;
@@ -1201,7 +1295,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   }
 
   /** Plan step 11I (U1): the list of the fake engine (the stdout of `docker ps` before). */
-  const listed = (...containers: EngineContainer[]): EngineContainer[] => containers;
+  const listed = (...containers: EngineContainerSummary[]): EngineContainerSummary[] => containers;
   const pending = async (promise: Promise<unknown>) =>
     (await Promise.race([promise.then(() => 'ended'), new Promise((resolve) => setTimeout(() => resolve('pending'), 200))])) as string;
 
@@ -1462,7 +1556,7 @@ describe('recordRemover', () => {
           env: {},
           stateDir,
           // Plan step 11I (U1, decision of 2026-10-08): a fake engine without containers (a `docker ps` without lines before).
-          engine: { ...unusedEngine(), containers: async () => [], stop: async () => {} },
+          engine: { ...unusedEngine(), containerSummaries: async () => [], stop: async () => {} },
           exec: (file, args, _options, callback) => {
             resolve([file, ...args]);
             callback(null, 'removed\n', '');

@@ -15,8 +15,12 @@ import type { DockerEngine } from '../core/worker/dockerEngine';
 import { engineApi, engineHijack } from '../helperChannel/engineApi';
 import { dockerEngine } from '../helperChannel/engineClient';
 
-/** What the loop asks of its engine: the containers with the label of an environment, and the stop of one. */
-export type LoopEngine = Pick<DockerEngine, 'containers' | 'stop'>;
+/**
+ * What the loop asks of its engine: the containers with the label of an environment, and the stop of one. Review round 1
+ * of PR #126 (F1): the containers as the list gives them (containerSummaries, what `docker ps` read), never with an
+ * inspect each, so a container whose inspect fails or waits for its lock does not hold the stops of the whole engine.
+ */
+export type LoopEngine = Pick<DockerEngine, 'containerSummaries' | 'stop'>;
 
 /**
  * What the image maintenance asks of its engine: the list of the images, the inspect of one, a pull, the containers of

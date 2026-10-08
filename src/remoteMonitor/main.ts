@@ -6,8 +6,9 @@
 // remote; implementation notes 16). Plan step 11D2: bundled into the worker's script as the module `devenv:monitor-script`
 // (scripts/workerScripts.mjs), which the worker gives the monitor container that it creates. The container
 // devenv-session-monitor (image: the worker's own helper image by its monitor tag, plan step 11D3, of which the monitor
-// runs only Node.js and, for the lock of the records, `flock` and `timeout`; the Docker socket of its engine at
-// /var/run/docker.sock; the volume devenv-session-monitor at /state) runs the pipe loader (plan step 3,
+// runs only Node.js, `flock` (the lock of the records, and the environment lock of an automatic stop: stopLock.ts over
+// src/core/helperChannel/lockFile.ts) and `timeout` (the run limit under the lock of the records); the Docker socket of
+// its engine at /var/run/docker.sock; the volume devenv-session-monitor at /state) runs the pipe loader (plan step 3,
 // src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
 // /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The workers run
 // the other subcommands in it as `node /opt/devenv/monitor.js …` (an exec over the Engine API of an entry of the registry
@@ -33,7 +34,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
-import { isMissing, type EngineContainer } from '../core/worker/dockerEngine';
+import { isMissing, type EngineContainerSummary } from '../core/worker/dockerEngine';
 import {
   HEARTBEAT_FOLDER,
   IMAGE_LIST_FILE,
@@ -85,7 +86,7 @@ import {
 import type { CronSchedule } from '../core/remoteMonitor/cron';
 import { stopLockDeps, stopLocker, type StopLocker } from './stopLock';
 
-/** Time limit of the container list (plan step 11I, U1: of the list of the engine and the inspects of its containers). */
+/** Time limit of the container list (plan step 11I, U1: of the list of the engine). */
 export const LIST_TIMEOUT_MS = 30_000;
 /**
  * Time limit of one stop (the container gets its own stop time, 10 s unless it sets another, before SIGKILL; plan step
@@ -103,18 +104,19 @@ export function heartbeatDir(stateDir: string = REMOTE_MONITOR_STATE_DIR): strin
 }
 
 /**
- * Plan step 11I (U1, decision of 2026-10-08): the containers of the list of the engine (LoopEngine.containers, by the
- * label of an environment) as the rules take them: the ID, the state as the engine names it (`State.Status`: `running`,
- * `exited`, `paused`, …, the word that `{{.State}}` of `docker ps` printed), the name, and the environment ID and the
- * Compose service of their labels (an empty service for the dev container, as `{{.Label …}}` printed a missing label). A
- * container with an invalid ID or environment ID is skipped (as an invalid line of `docker ps` was).
+ * Plan step 11I (U1, decision of 2026-10-08): the containers of the list of the engine (LoopEngine.containerSummaries, by
+ * the label of an environment; review round 1 of PR #126, F1: the list as it is, no inspect) as the rules take them: the
+ * ID, the state as the list names it (`running`, `exited`, `paused`, …, the word that `{{.State}}` of `docker ps`
+ * printed), the name, and the environment ID and the Compose service of their labels (an empty service for the dev
+ * container, as `{{.Label …}}` printed a missing label). A container with an invalid ID or environment ID is skipped (as
+ * an invalid line of `docker ps` was).
  */
-export function remoteContainersOf(containers: readonly EngineContainer[]): RemoteContainer[] {
+export function remoteContainersOf(containers: readonly EngineContainerSummary[]): RemoteContainer[] {
   const result: RemoteContainer[] = [];
   for (const container of containers) {
     const environmentId = container.labels[LABEL_ENVIRONMENT_ID];
     if (!/^[0-9a-f]{12,64}$/.test(container.id) || !isRemoteEnvironmentId(environmentId)) continue;
-    result.push({ id: container.id, state: container.rawState, name: container.name, environmentId, composeService: container.labels[LABEL_COMPOSE_SERVICE] ?? '' });
+    result.push({ id: container.id, state: container.state, name: container.name, environmentId, composeService: container.labels[LABEL_COMPOSE_SERVICE] ?? '' });
   }
   return result;
 }
@@ -345,10 +347,11 @@ export class RemoteMonitorLoop {
   async tick(): Promise<string[]> {
     const { engine, log } = this.deps;
     // Plan step 11I (U1, decision of 2026-10-08): the containers with the label of an environment, stopped ones included
-    // (as `docker ps -a --filter label=…` before), from the engine within the time limit of the list.
-    let listed: EngineContainer[];
+    // (as `docker ps -a --filter label=…` before), from the engine within the time limit of the list; review round 1 of
+    // PR #126 (F1): as its list gives them, without an inspect of each.
+    let listed: EngineContainerSummary[];
     try {
-      listed = await engine.containers(LABEL_ENVIRONMENT_ID, AbortSignal.timeout(LIST_TIMEOUT_MS));
+      listed = await engine.containerSummaries(LABEL_ENVIRONMENT_ID, AbortSignal.timeout(LIST_TIMEOUT_MS));
     } catch (error) {
       if (!this.listFailing) log(`Docker does not answer; nothing is stopped while it does not answer. ${engineFailure(error, LIST_TIMEOUT_MS)}`);
       this.listFailing = true;
@@ -474,10 +477,11 @@ export class RemoteMonitorLoop {
    */
   private async decideAgain(environmentId: string): Promise<RemoteStop | undefined> {
     // Plan step 11I (U1, decision of 2026-10-08): the containers with the label of this environment from the engine (as
-    // `docker ps -a --filter label=…=<id>` before), filtered by its ID again.
-    let listed: EngineContainer[];
+    // `docker ps -a --filter label=…=<id>` before), filtered by its ID again; review round 1 of PR #126 (F1): as its list
+    // gives them, without an inspect of each.
+    let listed: EngineContainerSummary[];
     try {
-      listed = await this.deps.engine.containers(`${LABEL_ENVIRONMENT_ID}=${environmentId}`, AbortSignal.timeout(LIST_TIMEOUT_MS));
+      listed = await this.deps.engine.containerSummaries(`${LABEL_ENVIRONMENT_ID}=${environmentId}`, AbortSignal.timeout(LIST_TIMEOUT_MS));
     } catch (error) {
       throw new Error(`its containers could not be listed again. ${engineFailure(error, LIST_TIMEOUT_MS)}`);
     }

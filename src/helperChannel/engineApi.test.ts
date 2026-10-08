@@ -13,7 +13,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SECRET_REGISTRY, pullReference } from '../core/helperChannel/protocol';
 import type { EnginePullLogin } from '../core/worker/dockerEngine';
-import { engineApi, engineErrorMessage, MAX_ENGINE_ANSWER_CHARACTERS, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
+import { engineApi, engineErrorMessage, MAX_ENGINE_ANSWER_CHARACTERS, MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
 import { dockerEngine, pullLine, registryAuthHeader } from './engineClient';
 
 /** The port of the engine over the fake Engine API, with the registry secret `secret` (SECRET_REGISTRY) if any. */
@@ -173,6 +173,27 @@ describe('engineApi over a Unix socket (plan step 10A)', () => {
     const long = await engine({ method: 'GET', path: '/long' });
     expect(long.truncated).toBe(true);
     expect(long.body).toHaveLength(MAX_ENGINE_ANSWER_CHARACTERS);
+  });
+
+  // Review round 1 of PR #126 (F2): a request may name a larger bound (the lists of every container or image of an engine,
+  // as the Session Monitor reads them, up to MAX_ENGINE_LIST_ANSWER_CHARACTERS, as the 16 MiB buffer of the Docker CLI it
+  // ran before); every other request keeps MAX_ENGINE_ANSWER_CHARACTERS.
+  it('keeps the bound of its request: a list reads past 1 MiB, and is cut at its own bound (review round 1 of PR #126, F2)', async () => {
+    const engine = await serve((req, res) => {
+      res.writeHead(200);
+      res.end(req.url === '/three' ? 'y'.repeat(3 * 1024 * 1024) : 'x'.repeat(MAX_ENGINE_ANSWER_CHARACTERS + 10));
+    });
+    expect(MAX_ENGINE_LIST_ANSWER_CHARACTERS).toBe(16 * 1024 * 1024);
+    const listed = await engine({ method: 'GET', path: '/long', maxCharacters: MAX_ENGINE_LIST_ANSWER_CHARACTERS });
+    expect(listed.truncated).toBe(false);
+    expect(listed.body).toHaveLength(MAX_ENGINE_ANSWER_CHARACTERS + 10);
+    const bounded = await engine({ method: 'GET', path: '/three', maxCharacters: 2 * 1024 * 1024 });
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.body).toHaveLength(2 * 1024 * 1024);
+    // Without a bound of its own: the default.
+    const plain = await engine({ method: 'GET', path: '/three' });
+    expect(plain.truncated).toBe(true);
+    expect(plain.body).toHaveLength(MAX_ENGINE_ANSWER_CHARACTERS);
   });
 
   it('rejects with an AbortError when the signal aborts, and with the error of a missing socket', async () => {

@@ -36,7 +36,7 @@ export const FUTURE_RECORD_TOLERANCE_MS = 5 * 60_000;
 /** A container with the label nimblescape.devenv.environment-id, as the engine lists it (main.ts, remoteContainersOf). */
 export interface RemoteContainer {
   id: string;
-  /** Its state as the engine names it (`State.Status`, the `.State` of `docker ps`), for example `running` or `exited`. */
+  /** Its state as the list of the engine names it (`State`, the `.State` of `docker ps`), for example `running` or `exited`. */
   state: string;
   name: string;
   environmentId: string;

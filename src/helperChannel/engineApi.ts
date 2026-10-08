@@ -13,8 +13,14 @@ import { HELPER_DOCKER_SOCKET } from '../core/names';
 import { abortError } from '../core/ports';
 import { EngineError } from '../core/worker/dockerEngine';
 
-/** The most text of an answer that is kept (beyond: cut, and `truncated` is set). */
+/** The most text of an answer that is kept (beyond: cut, and `truncated` is set), unless its request names another bound. */
 export const MAX_ENGINE_ANSWER_CHARACTERS = 1024 * 1024;
+/**
+ * Plan step 11I (review round 1 of PR #126, F2): the bound of the answer of a list that can hold every container or image
+ * of an engine (DockerEngine.containerSummaries and DockerEngine.images; the Session Monitor lists them all), as the
+ * 16 MiB output buffer of the Docker CLI that the monitor ran before.
+ */
+export const MAX_ENGINE_LIST_ANSWER_CHARACTERS = 16 * 1024 * 1024;
 
 export interface EngineRequest {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'HEAD';
@@ -32,11 +38,17 @@ export interface EngineRequest {
    * `GET /containers/<id>/archive`, whose offsets are byte offsets. MAX_ENGINE_ANSWER_CHARACTERS then counts bytes.
    */
   latin1?: boolean;
+  /**
+   * Plan step 11I (review round 1 of PR #126, F2): the most text of the answer that is kept (beyond: cut, and `truncated`
+   * is set); MAX_ENGINE_ANSWER_CHARACTERS when not given. A list of every container or image gives
+   * MAX_ENGINE_LIST_ANSWER_CHARACTERS.
+   */
+  maxCharacters?: number;
 }
 
 export interface EngineAnswer {
   status: number;
-  /** The text of the answer (empty with onChunk), at most MAX_ENGINE_ANSWER_CHARACTERS. */
+  /** The text of the answer (empty with onChunk), at most the bound of its request (MAX_ENGINE_ANSWER_CHARACTERS by default). */
   body: string;
   truncated: boolean;
 }
@@ -98,6 +110,8 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
         if (error !== undefined) reject(error);
         else resolve(answer!);
       };
+      // Plan step 11I (review round 1 of PR #126, F2): the bound of this request.
+      const max = request.maxCharacters ?? MAX_ENGINE_ANSWER_CHARACTERS;
       const req = http.request({ socketPath, method: request.method, path: request.path, headers }, (res) => {
         res.setEncoding(request.latin1 === true ? 'latin1' : 'utf8');
         let text = '';
@@ -107,8 +121,8 @@ export function engineApi(socketPath: string = HELPER_DOCKER_SOCKET): EngineApi 
             request.onChunk(chunk);
             return;
           }
-          if (text.length + chunk.length > MAX_ENGINE_ANSWER_CHARACTERS) {
-            text += chunk.slice(0, Math.max(0, MAX_ENGINE_ANSWER_CHARACTERS - text.length));
+          if (text.length + chunk.length > max) {
+            text += chunk.slice(0, Math.max(0, max - text.length));
             truncated = true;
             // Review round 1 of PR #114 (A-L3): the read of a file of an image (latin1) ends at the bound at once, instead of
             // reading the rest of a large file until its time limit; its caller counts a truncated answer as unknown.
