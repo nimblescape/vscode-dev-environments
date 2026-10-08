@@ -68,10 +68,18 @@ describe('review round 1 of PR #125 (reviewer B): the probe and the sweep of the
     const worker = workerProcess(ENGINE_IDENTITY);
     const channel = await open(worker);
     await settle();
-    expect(worker.sent).toEqual([
-      { op: 'probe', params: {}, timeoutMs: CHANNEL_PROBE_TIMEOUT_MS },
-      { op: 'sweep', params: {}, timeoutMs: CHANNEL_PROBE_TIMEOUT_MS },
+    // Plan step 11I (U9 PR): changed expectation, a range instead of the exact value: the time limit of a call counts from
+    // the call (review round 6, R6-2: HelperChannel.operation takes the time before the line is written from it), so
+    // under load it is a few milliseconds below CHANNEL_PROBE_TIMEOUT_MS (the test failed about 2 of 25 runs, found in
+    // review round 1 of PR #127). It still fails for a sweep without a time limit or with another one.
+    expect(worker.sent.map(({ op, params }) => ({ op, params }))).toEqual([
+      { op: 'probe', params: {} },
+      { op: 'sweep', params: {} },
     ]);
+    for (const sent of worker.sent) {
+      expect(sent.timeoutMs).toBeLessThanOrEqual(CHANNEL_PROBE_TIMEOUT_MS);
+      expect(sent.timeoutMs).toBeGreaterThan(CHANNEL_PROBE_TIMEOUT_MS - 1_000);
+    }
     channel.close();
   });
 

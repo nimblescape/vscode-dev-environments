@@ -32,7 +32,7 @@ import {
   listConfigurationsOperation,
   reconcileOperation,
   recordGitStateOperation,
-  workerAnalyzer, workerThreadAnalyzer,
+  workerThreadAnalyzer,
   type OpenWorkerBatch,
 } from './flowOperations';
 import { contextSecrets } from './operationContext.testkit';

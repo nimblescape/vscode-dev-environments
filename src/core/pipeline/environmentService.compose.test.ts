@@ -42,7 +42,6 @@ import {
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
-  configurationName,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -3816,7 +3815,6 @@ describe('review round 17 of unit 6 (D17-1): volumes of `mounts` with variables 
 describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev service and the size of a refusal', () => {
   const DEV_IMAGE = 'mcr.microsoft.com/devcontainers/python:3.12';
   const PRIVATE_IMAGE = 'registry.corp.example/prod/base:1';
-  const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
 
   /** The dev service builds `dockerfile` with `build` (target, args) from .devcontainer. */
   function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}): void {

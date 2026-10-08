@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
-import { ANALYSIS_FAILED_ITEM, analysisInternalItem } from '../helper/configurationAnalysis';
+import { analysisInternalItem } from '../helper/configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from '../helper/configurationAnalysisRunner';
 import { Messages } from '../messages';
 import type { RepositoryTarget } from './operationBase';

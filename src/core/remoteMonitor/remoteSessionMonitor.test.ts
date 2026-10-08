@@ -13,7 +13,6 @@ import {
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
-  heartbeatCommand,
   imagePrefixesOf,
   remoteMonitorLabelValue,
 } from './protocol';
@@ -34,8 +33,6 @@ const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';
 const SOCKET = '/var/run/docker.sock';
 const LABEL = remoteMonitorLabelValue(SCRIPT, TAG);
-const SOURCE = '0123456789abcdef0123456789abcdef';
-const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
 const result = (exitCode: number, stdout = '', stderr = ''): RunResult => ({ exitCode, stdout, stderr, timedOut: false });
 /** Review round 2 of PR #69 (A-R2-2): the ID of the inspected monitor container. */
