@@ -16,7 +16,6 @@ import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
 import {
   OVERRIDE_CONFIG_PATH,
-  buildCommand,
   cloneCommand,
   composeHashCommand,
   composeModelCommand,
@@ -243,9 +242,7 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const imageName = text(kind, p.imageName, 255);
       if (!/^[a-z0-9][^\s]*$/i.test(imageName)) fail(kind);
       const env = stepEnv(kind, p.env);
-      if (p.override === undefined && p.files === undefined) {
-        return { command: buildCommand(configFile, buildArgs({ workspaceFolder: folder, configPath: configFile, imageName })), env, git: false };
-      }
+      // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule.
       const override = p.override === undefined ? undefined : jsonObject(kind, p.override);
       const files = helperFiles(kind, p.files);
       const config = override !== undefined ? OVERRIDE_CONFIG_PATH : configFile;
