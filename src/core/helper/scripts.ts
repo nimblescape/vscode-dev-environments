@@ -440,6 +440,8 @@ const realInRepository = (real) => {
 };
 const READ_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY;
 const onLinux = process.platform === 'linux';
+// Review round 4 of PR #121 (A, L3): on Linux an O_PATH open never reaches a driver and only a plain file is opened
+// again, so ENXIO and ENODEV come only from the open by path off Linux; EPERM may still come from the second open.
 const REFUSED_OPEN = ['ELOOP', 'ENXIO', 'EACCES', 'EPERM', 'ENAMETOOLONG', 'ENODEV', 'EAGAIN'];
 const readInRepository = (file, limit) => {
   let handle;

@@ -263,7 +263,10 @@ fs.openSync = function (file, ...rest) {
     const { root, repo } = repository();
     fs.mkdirSync(path.join(repo, 'a'));
     fs.rmSync(path.join(repo, 'b', 'Dockerfile'));
-    for (const file of ['a/devcontainer.json', 'b/Dockerfile']) expect(spawnSync('mknod', [path.join(repo, file), 'c', '4', '1'], { timeout: 10_000 }).status).toBe(0);
+    // Review round 4 of PR #121 (A, L1): skipped, not failed, where mknod is refused (root without CAP_MKNOD).
+    for (const file of ['a/devcontainer.json', 'b/Dockerfile']) {
+      if (spawnSync('mknod', [path.join(repo, file), 'c', '4', '1'], { timeout: 10_000 }).status !== 0) context.skip();
+    }
     const prefix = ['setsid', '-w'];
     // Whether the setup holds here: an open without O_NOCTTY makes the terminal the controlling terminal of the script.
     const probe = runScript(['node', '-e', "const fs = require('fs'); try { fs.openSync(process.argv[1], fs.constants.O_RDONLY | fs.constants.O_NONBLOCK); } catch { process.exit(); } const stat = fs.readFileSync('/proc/self/stat', 'utf8'); process.stdout.write(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[4]);", path.join(repo, 'b', 'Dockerfile')], { prefix });
