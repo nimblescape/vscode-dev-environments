@@ -34,6 +34,7 @@ import {
   parseEngineIdentity,
   parseProbeParams,
   parseProbeValue,
+  MAX_PROBE_DETAIL_LENGTH,
   parseSweepParams,
   parseSweepValue,
   sameEngine,
@@ -185,6 +186,9 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   it('checks the value of probe', () => {
     expect(parseProbeValue({ serverVersion: '27', detail: 'd' })).toEqual({ serverVersion: '27', detail: 'd' });
     expect(parseProbeValue({ detail: 3 })).toBeUndefined();
+    // Review round 1 of PR #122 (B, L2): a detail longer than the worker sends is refused.
+    expect(parseProbeValue({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH) })).toEqual({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH) });
+    expect(parseProbeValue({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH + 1) })).toBeUndefined();
   });
 
   // Plan step 5, PR A: the engine identity of the probe is checked strictly. Plan step 11I (PR A): changed expectations:

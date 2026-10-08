@@ -22,6 +22,7 @@ import {
   OP_STOP,
   OP_TOKEN_REMOVE,
   OP_REFRESH,
+  MAX_PROBE_DETAIL_LENGTH,
   OP_SWEEP,
   SWEEP_FILTERS,
   parseProbeParams,
@@ -43,8 +44,8 @@ import * as os from 'os';
 import { OperationError, type OperationHandler } from './server';
 import monitorScript from 'devenv:monitor-script';
 
-/** The longest detail of a probe that did not reach the engine (the end of the reason is kept). */
-export const MAX_PROBE_DETAIL_LENGTH = 2_000;
+// Review round 1 of PR #122 (B, L2): MAX_PROBE_DETAIL_LENGTH moved to the protocol, whose parseProbeValue checks it.
+export { MAX_PROBE_DETAIL_LENGTH };
 
 /**
  * `probe` (plan step 5, PR A): the version of the engine behind the socket of the worker, and the identity of that
@@ -97,6 +98,8 @@ export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
     try {
       const removed = await engineOf(context).pruneContainers(SWEEP_FILTERS, context.signal);
       const value: SweepValue = { removed: removed.length };
+      // Review round 1 of PR #122 (A, L4): what the sweep did, in the log of the worker (before: the line of the CLI call).
+      context.log(`The sweep removed ${removed.length} stopped helper channel container(s) older than 10 minutes.`);
       return value;
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The sweep operation was cancelled.');

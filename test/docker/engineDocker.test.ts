@@ -184,10 +184,22 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     cli.ok(['run', '-d', '--name', `${name}-prune-running`, '--network', 'none', '--init', '--label', runLabel, '--label', pruneLabel, TEST_BASE_IMAGE, 'sleep', '600']);
     try {
       // Both are younger than 10 minutes, the age of the sweep (SWEEP_MIN_AGE): it keeps them.
-      expect(await engine.pruneContainers({ label: [pruneLabel], until: ['10m'] })).toEqual([]);
+      // Review round 1 of PR #122 (A, L2): the engine runs one prune at a time (the sweep of a channel of an earlier
+      // test may still run): a refusal for that reason is tried again.
+      const prune = async (filters: Record<string, string[]>): Promise<string[]> => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await engine.pruneContainers(filters);
+          } catch (error) {
+            if (attempt >= 10 || !(error instanceof Error) || !error.message.includes('a prune operation is already running')) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+      };
+      expect(await prune({ label: [pruneLabel], until: ['10m'] })).toEqual([]);
       expect(cli.container(`${name}-prune-stopped`)).toBeDefined();
       // Without the age: only the stopped one goes, named by its full ID.
-      expect(await engine.pruneContainers({ label: [pruneLabel] })).toEqual([stopped]);
+      expect(await prune({ label: [pruneLabel] })).toEqual([stopped]);
       expect(cli.container(`${name}-prune-stopped`)).toBeUndefined();
       expect(cli.container(`${name}-prune-running`)?.State.Running).toBe(true);
     } finally {

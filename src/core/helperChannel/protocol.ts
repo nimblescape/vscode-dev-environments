@@ -710,9 +710,14 @@ export function sameEngine(a: EngineIdentity, b: EngineIdentity): boolean {
   return a.id === b.id && a.rootDir === b.rootDir;
 }
 
+/** The longest detail of a probe that did not reach the engine (the worker keeps the end of the reason). */
+export const MAX_PROBE_DETAIL_LENGTH = 2_000;
+
 /** The check of ProbeValue (the extension). */
 export function parseProbeValue(value: unknown): ProbeValue | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['detail'], ['serverVersion', 'engine']) || typeof value.detail !== 'string') return undefined;
+  // Review round 1 of PR #122 (B, L2): the extension puts the detail into a message; the worker cuts it to this length.
+  if (value.detail.length > MAX_PROBE_DETAIL_LENGTH) return undefined;
   if (value.serverVersion !== undefined && typeof value.serverVersion !== 'string') return undefined;
   // Plan step 5, PR A; plan step 11I (PR A): the identity of the engine as its checked values (parseEngineIdentity).
   const engine = value.engine === undefined ? undefined : parseEngineIdentity(value.engine);

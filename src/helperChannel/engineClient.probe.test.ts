@@ -96,10 +96,13 @@ describe('the identity and the prune of the port over the Engine API (plan step 
     });
 
     it('a cancel ends the request with an AbortError', async () => {
-      const { engine, closed } = await serve(() => undefined);
+      const { engine, calls, closed } = await serve(() => undefined);
       const controller = new AbortController();
       const reading = engine.identity(controller.signal);
-      setTimeout(() => controller.abort(), 20);
+      // Review round 1 of PR #122 (A, L1): the abort once the engine has the request (was: after a fixed 20 ms, which a
+      // busy event loop could reach before the request).
+      for (let i = 0; i < 100 && calls.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+      controller.abort();
       await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
       for (let i = 0; i < 100 && closed.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
       expect(closed.map((call) => call.url)).toEqual(['/info']);
