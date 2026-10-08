@@ -419,42 +419,42 @@ ${READ_LIMITED}const realPath = (file) => {
 };
 // Decision of the user of 2026-10-07 (a configuration file was read through a link with a check of its path text only):
 // the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
-// takes), read from the file that was opened, and only when that file is a plain file of the repository after links:
-// its real path is below the real folder of the repository and names the same file as the opened descriptor, so a link
-// that leads out of the repository, or one that is changed between the check and the read, is never read. A file whose
-// real path before the open is out of the repository is not opened at all (review round 1 of PR #121; review round 2,
-// A-3: a magic link of /proc whose text names nothing is opened, and refused before any read). The open never waits
-// (O_NONBLOCK: a FIFO of the repository cannot hold the step) and never takes a terminal (O_NOCTTY). undefined: no
-// such file (or a folder; also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the
-// batch helper reports it, batchHelper.ts A-R5-1); null: a file that is not a plain file of the repository (a link out
-// of it or in a circle, a FIFO, a socket, a file that cannot be opened, review round 1 of PR #121, A-1). A hard link is
-// the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only the
-// repository and CONFIG_FOLDER of its owner).
+// takes), read only when it is a plain file of the repository after links. Review round 3 of PR #121 (A-R3-1): the path
+// is resolved once, with O_PATH (Linux), which follows the links but opens nothing: a FIFO or a device out of the
+// repository is never opened, whatever a writer of the repository changes. The real path of that handle (as the kernel
+// names the file, /proc/self/fd of the helper; review round 2, B-R2-1: never a second walk of \`file\`) must be below the
+// real folder of the repository, and the file there must be the file of the handle (dev, ino: a magic link of /proc
+// whose text names another file, review round 1 of PR #121). Only then is the file opened, through the handle (no walk
+// of the path), to read it; that open never waits (O_NONBLOCK) and never takes a terminal (O_NOCTTY). Without
+// /proc/self/fd on Linux, the real path is unknown and the file is refused (review round 3, A-R3-3). Off Linux (tests
+// only: the scripts run in the helper) the file is opened by its path. undefined: no such file, or a folder of the
+// repository (also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the batch helper
+// reports it, batchHelper.ts A-R5-1; review round 2, A-2: a link to the repository folder itself); null: a file that is
+// not a plain file of the repository (a link out of it, also to a folder, or in a circle, a FIFO, a socket, a device, a
+// file that cannot be opened, review round 1 of PR #121, A-1; review round 3, A-R3-2: EAGAIN of a lease). A hard link
+// is the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only
+// the repository and CONFIG_FOLDER of its owner).
 const realInRepository = (real) => {
   const rootReal = realPath(root);
   return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
 };
+const READ_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY;
+const onLinux = process.platform === 'linux';
+const REFUSED_OPEN = ['ELOOP', 'ENXIO', 'EACCES', 'EPERM', 'ENAMETOOLONG', 'ENODEV', 'EAGAIN'];
 const readInRepository = (file, limit) => {
-  const before = realPath(file);
-  // Review round 2 of PR #121 (A-2): a link to the repository folder itself is a folder, as a link to any other one.
-  if (before !== null && before !== realPath(root) && !realInRepository(before)) return null;
-  let fd;
+  let handle;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
+    handle = fs.openSync(file, onLinux ? 0o10000000 /* O_PATH */ : READ_FLAGS);
   } catch (error) {
     if (error && ['ENOENT', 'ENOTDIR'].includes(error.code)) return undefined;
-    if (error && ['ELOOP', 'ENXIO', 'EACCES', 'EPERM', 'ENAMETOOLONG', 'ENODEV'].includes(error.code)) return null;
+    if (error && REFUSED_OPEN.includes(error.code)) return null;
     throw error;
   }
   try {
-    const opened = fs.fstatSync(fd);
-    if (opened.isDirectory()) return undefined;
-    if (!opened.isFile()) return null;
-    // Review round 2 of PR #121 (B-R2-1): the real path of the opened descriptor, as the kernel names the file it opened
-    // (/proc/self/fd of the helper), not a second walk of \`file\`, whose links a writer of the repository may change
-    // between the open, that walk, and the stat below.
-    const real = realPath(fs.existsSync('/proc/self/fd') ? '/proc/self/fd/' + fd : file);
-    if (!realInRepository(real)) return null;
+    const found = fs.fstatSync(handle);
+    const real = realPath(onLinux ? '/proc/self/fd/' + handle : file);
+    if (found.isDirectory()) return real !== null && (real === realPath(root) || realInRepository(real)) ? undefined : null;
+    if (!found.isFile() || !realInRepository(real)) return null;
     // Review round 2 of PR #121 (A-1): a file that is gone or changed since is refused, never a failure of the script.
     let named;
     try {
@@ -462,10 +462,24 @@ const readInRepository = (file, limit) => {
     } catch {
       return null;
     }
-    if (named.dev !== opened.dev || named.ino !== opened.ino) return null;
-    return readLimitedFd(fd, limit);
+    if (named.dev !== found.dev || named.ino !== found.ino) return null;
+    if (!onLinux) return readLimitedFd(handle, limit);
+    let fd;
+    try {
+      fd = fs.openSync('/proc/self/fd/' + handle, READ_FLAGS);
+    } catch (error) {
+      if (error && REFUSED_OPEN.includes(error.code)) return null;
+      throw error;
+    }
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== found.dev || opened.ino !== found.ino) return null;
+      return readLimitedFd(fd, limit);
+    } finally {
+      fs.closeSync(fd);
+    }
   } finally {
-    fs.closeSync(fd);
+    fs.closeSync(handle);
   }
 };
 ${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {

@@ -140,10 +140,14 @@ describe('READ_FILES_SCRIPT, review round 2 of PR #121 (reviewer B)', () => {
         fs.symlinkSync(target, path.join(repo, file));
       }
       // The setup holds: the writer waits, and an open of the link for reading ends its wait.
+      // Review round 3 of PR #121 (A-R3-5): the probe's writer ends also when the setup fails.
       const probe = await waitingWriter(fifo);
-      fs.closeSync(fs.openSync(path.join(repo, 'a', 'devcontainer.json'), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK));
-      expect(await probe.opened(), target).toBe(true);
-      await probe.stop();
+      try {
+        fs.closeSync(fs.openSync(path.join(repo, 'a', 'devcontainer.json'), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK));
+        expect(await probe.opened(), target).toBe(true);
+      } finally {
+        await probe.stop();
+      }
       const writer = await waitingWriter(fifo);
       try {
         expectRefused(repo, 'a/devcontainer.json');
@@ -276,15 +280,18 @@ describe('READ_FILES_SCRIPT, review round 2 of PR #121 (reviewer B)', () => {
     ['EPERM', ['1', '11'], devices && kmsgRestricted],
     ['ENODEV', ['10', '251'], devices],
   ] as const) {
-    it.skipIf(!available)(`refuses a device file that cannot be opened (${code}) and reads none as the Dockerfile`, () => {
+    it.skipIf(!available)(`refuses a device file that cannot be opened (${code}) and reads none as the Dockerfile`, (context) => {
       const prefix = ['setpriv', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'];
       const repo = tempDir();
       fs.mkdirSync(path.join(repo, 'a'), { recursive: true });
       write(path.join(repo, 'b', 'devcontainer.json'), BUILD_CONFIG);
-      for (const file of ['a/devcontainer.json', 'b/Dockerfile']) expect(spawnSync('mknod', [path.join(repo, file), 'c', ...device]).status).toBe(0);
-      // The setup holds: the open of the script fails with that error.
+      // Review round 3 of PR #121 (A-R3-4): where the setup does not hold (mknod refused, or the device rules of a
+      // container give another error), the test is skipped, not failed.
+      for (const file of ['a/devcontainer.json', 'b/Dockerfile']) {
+        if (spawnSync('mknod', [path.join(repo, file), 'c', ...device]).status !== 0) context.skip();
+      }
       const probe = runScript(['node', '-e', "const fs = require('fs'); try { fs.openSync(process.argv[1], fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY); } catch (error) { process.stdout.write(error.code); }", path.join(repo, 'b', 'Dockerfile')], { prefix });
-      expect(probe.stdout).toBe(code);
+      if (probe.stdout !== code) context.skip();
       expectRefused(repo, 'a/devcontainer.json', { prefix });
       expectNotRead(repo, 'b/devcontainer.json', { prefix });
     });
@@ -336,6 +343,44 @@ fs.realpathSync.native = function (file, ...rest) {
     // The hook ran all three changes.
     expect(fs.readlinkSync(path.join(repo, 'decoy.json'))).toBe(secret);
   });
+
+  // Review round 3 of PR #121 (A-R3-1): a writer of the repository that makes a file a link to a FIFO out of the
+  // repository right after any check and right before the open (the hook, HOOK_AT=open) does not get it opened: the path
+  // is resolved with O_PATH, which opens nothing, and the file is opened only once it is a plain file of the repository.
+  it.skipIf(process.platform !== 'linux')('opens no FIFO out of the repository that a link becomes right before the open (A-R3-1)', async () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    const fifo = path.join(root, 'out', 'fifo');
+    fs.mkdirSync(path.dirname(fifo), { recursive: true });
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    write(path.join(repo, 'b', 'devcontainer.json'), BUILD_CONFIG);
+    write(path.join(repo, 'b', 'Dockerfile'), 'FROM alpine\n');
+    const preload = path.join(root, 'hook.js');
+    fs.writeFileSync(preload, HOOK);
+    for (const file of ['b/devcontainer.json', 'b/Dockerfile']) {
+      for (const [plain, text] of [['b/devcontainer.json', BUILD_CONFIG], ['b/Dockerfile', 'FROM alpine\n']]) {
+        fs.rmSync(path.join(repo, plain), { force: true });
+        fs.rmSync(path.join(repo, `${plain}.before`), { force: true });
+        write(path.join(repo, plain), text);
+      }
+      const writer = await waitingWriter(fifo);
+      try {
+        const result = runScript(readFilesCommand(repo, 'b/devcontainer.json'), { preload, env: { HOOK_AT: 'open', HOOK_FILE: path.join(repo, file), HOOK_TO: fifo } });
+        // The hook ran.
+        expect(fs.lstatSync(path.join(repo, file)).isSymbolicLink(), file).toBe(true);
+        if (file === 'b/devcontainer.json') {
+          expect(result.status).not.toBe(0);
+          expect(result.stderr).toContain(REFUSED);
+        } else {
+          expect(result.status, result.stderr).toBe(0);
+          expect(JSON.parse(result.stdout)).toEqual({ configText: BUILD_CONFIG, dockerfilePath: 'b/Dockerfile' });
+        }
+        expect(await writer.opened(), file).toBe(false);
+      } finally {
+        await writer.stop();
+      }
+    }
+  }, 30_000);
 
   // Mutant M73: the Dockerfile text taken when truthy (not when a string): an empty Dockerfile of the repository is its
   // text '', not a Dockerfile that was not read.
