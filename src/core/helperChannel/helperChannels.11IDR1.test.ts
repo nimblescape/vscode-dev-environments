@@ -5,7 +5,7 @@
 // Review round 1 of PR #125 (reviewer B): probes of the mutants of the open of a channel after plan step 11I (PR D) sends
 // the sweep without a check of the operations of the worker. The tests of the PR record the operation and the parameters
 // of what the open sends, not its time limit, and never what an open that fails sends; each probe names its mutant.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
 import { silentLogger, type StartedProcess } from '../ports';
 import { HelperChannelError } from './helperChannel';
@@ -65,22 +65,23 @@ describe('review round 1 of PR #125 (reviewer B): the probe and the sweep of the
   // Mutant HC-sweep-notimeout: the sweep without its time limit (a worker that never answers it would keep the channel
   // busy, so it never closed after its time without use).
   it('sends the sweep with the time limit of the probe', async () => {
-    const worker = workerProcess(ENGINE_IDENTITY);
-    const channel = await open(worker);
-    await settle();
-    // Plan step 11I (U9 PR): changed expectation, a range instead of the exact value: the time limit of a call counts from
-    // the call (review round 6, R6-2: HelperChannel.operation takes the time before the line is written from it), so
-    // under load it is a few milliseconds below CHANNEL_PROBE_TIMEOUT_MS (the test failed about 2 of 25 runs, found in
-    // review round 1 of PR #127). It still fails for a sweep without a time limit or with another one.
-    expect(worker.sent.map(({ op, params }) => ({ op, params }))).toEqual([
-      { op: 'probe', params: {} },
-      { op: 'sweep', params: {} },
-    ]);
-    for (const sent of worker.sent) {
-      expect(sent.timeoutMs).toBeLessThanOrEqual(CHANNEL_PROBE_TIMEOUT_MS);
-      expect(sent.timeoutMs).toBeGreaterThan(CHANNEL_PROBE_TIMEOUT_MS - 1_000);
+    // Plan step 11I (U9 PR; review round 1 of PR #128, B L1): the clock (Date only; the timers, the microtasks and the
+    // streams stay real) is held still in this test, so the exact value below holds: HelperChannel.operation takes the
+    // time that passed between the call and the write from the time limit (review round 6, R6-2), and under load a
+    // millisecond could pass (the test failed about 2 of 25 runs, found in review round 1 of PR #127).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const worker = workerProcess(ENGINE_IDENTITY);
+      const channel = await open(worker);
+      await settle();
+      expect(worker.sent).toEqual([
+        { op: 'probe', params: {}, timeoutMs: CHANNEL_PROBE_TIMEOUT_MS },
+        { op: 'sweep', params: {}, timeoutMs: CHANNEL_PROBE_TIMEOUT_MS },
+      ]);
+      channel.close();
+    } finally {
+      vi.useRealTimers();
     }
-    channel.close();
   });
 
   // Mutant HC-sweep-early: the sweep sent before the engine identity is compared. The sweep removes containers on the
