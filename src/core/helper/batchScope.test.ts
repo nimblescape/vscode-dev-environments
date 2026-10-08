@@ -16,7 +16,7 @@ import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
-import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
+import { abortError, silentLogger, type RunResult } from '../ports';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
@@ -34,7 +34,7 @@ import {
 } from './scripts';
 import { overrideCommand, overrideInput, writeAndRunInput } from './stepInputs';
 import { currentBatchScope, runWithBatchScope } from './batchScope';
-import { WorkspaceHelper, type HelperDeps, type HelperDocker, type HelperImageUse } from './workspaceHelper';
+import { WorkspaceHelper, type HelperImageUse } from './workspaceHelper';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
@@ -107,33 +107,26 @@ class FakeLock implements HeldEnvironmentLock {
   };
 }
 
-/** A HelperDocker that records every call; a `docker run` within the scope fails the test. */
-class RecordingDocker implements HelperDocker {
-  readonly runs: Array<{ args: readonly string[]; options: RunOptions }> = [];
-  async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    this.runs.push({ args, options });
-    return { exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false };
-  }
-  async imageExists(): Promise<boolean> {
+/**
+ * Plan step 11I (U7, decision of 2026-10-08): WorkspaceHelper has no Docker port any more (before: a HelperDocker that
+ * recorded every call, so that a `docker run` within the scope failed the test). The one call that it makes outside the
+ * session, whether a container runs (HelperDeps.containerRuns), is recorded in `runs` instead, so a step that reached
+ * the engine outside its session still fails these tests.
+ */
+class RecordingDocker {
+  readonly runs: Array<{ containerId: string }> = [];
+  readonly containerRuns = async (containerId: string): Promise<boolean> => {
+    this.runs.push({ containerId });
     return true;
-  }
-  async imageId(): Promise<string | undefined> {
-    return IMAGE.id;
-  }
-  async buildImage(): Promise<string | undefined> {
-    return IMAGE.id;
-  }
-  async listImagesByLabel() {
-    return [];
-  }
-  async removeImage(): Promise<boolean> {
-    return true;
-  }
+  };
 }
 
-function setup(engine?: HelperDeps['engine']) {
+/**
+ * Plan step 11I (U7): changed setup, the own image of the worker and its socket (before: an engine of the operation).
+ */
+function setup(socket = '/var/run/docker.sock') {
   const docker = new RecordingDocker();
-  const helper = new WorkspaceHelper({ docker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux', ...(engine ? { engine } : {}) });
+  const helper = new WorkspaceHelper({ logger: silentLogger, ownImage: IMAGE, socket, containerRuns: docker.containerRuns });
   const lock = new FakeLock();
   return { docker, helper, lock };
 }
@@ -770,8 +763,10 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(lock.events).toEqual(['open s1', 'close s1']);
   });
 
+  // Plan step 11I (U7, decision of 2026-10-08): changed setup, the socket is the worker's own (HelperDeps.socket;
+  // before: the recorded socket of the engine of the operation).
   it('review round 1 of PR #82, B-R1-7: the session opens with the socket of the engine of the operation', async () => {
-    const { helper, lock } = setup(async () => ({ key: 'build-box', socket: '/run/user/1000/docker.sock' }));
+    const { helper, lock } = setup('/run/user/1000/docker.sock');
     lock.stepResult = async () => ({ exitCode: 0, stdout: '["a"]\n', stderr: '', timedOut: false });
     await runWithBatchScope(lock, VOLUME, silentLogger, () => helper.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }));
     expect(lock.opens).toEqual([{ volume: VOLUME, image: IMAGE.id, socket: '/run/user/1000/docker.sock' }]);

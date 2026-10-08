@@ -37,7 +37,6 @@ import {
   useRemoteContext,
   type SshCheckDeps,
 } from '../../src/core/docker/remoteDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { DOCKER_SOCKET, helperDockerSocket } from '../../src/core/helper/helperImages';
 import {
   GITHUB_TOKEN_FILE,
@@ -54,14 +53,14 @@ import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
-  HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
   Timings,
   createVolume,
   dockerTestContext,
   expectLabelledEnvironmentImage,
-  runInVolume } from './harness';
+  runInVolume,
+  testHelperImage } from './harness';
 import { monitorOfUser, removeTestMonitor, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
 
 const ALIAS = 'devenv-test-remote';
@@ -247,18 +246,6 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
     await useRemoteContext(docker, ALIAS);
     const state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
     const sshPath = findExecutable('ssh', env, process.platform);
-    const helper = new WorkspaceHelper({
-      docker,
-      logger: log,
-      dockerfilePath: HELPER_DOCKERFILE,
-      env,
-      // As extension.ts: on a remote host, the socket of that computer.
-      engine: async () => {
-        const target = await targets.current();
-        if (target.kind !== 'remote') return { key: target.host, endpoint: target.endpoint };
-        return { key: target.host, socket: (await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
-      },
-    });
     // Plan step 6, PR C: the real worker of the engine reached through SSH (as extension.ts: the socket of that computer),
     // whose batch helper runs the helper steps of the open; there is no other path (D1). Plan step 11I1, PR A2: the
     // window of the shared harness, whose operations run in that worker (was: the pipeline of the test process over the
@@ -288,7 +275,10 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       'seed and open through SSH',
       () =>
         targets.withOperation(async () => {
-          await helper.ensureImage();
+          // Plan step 11I (U7, decision of 2026-10-08): the helper image on the engine reached through SSH, through the
+          // harness (before: ensureImage of a WorkspaceHelper with the engine of the target, whose key and socket a
+          // build without a state file does not read).
+          await testHelperImage(docker, log, env);
           const devcontainerJson = JSON.stringify({
             name: 'Remote',
             build: { dockerfile: 'Dockerfile' },

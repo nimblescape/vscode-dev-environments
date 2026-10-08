@@ -11,22 +11,11 @@ import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/help
 import { silentLogger } from '../ports';
 import { runWithBatchScope } from './batchScope';
 import { batchStepCommand } from './batchSteps';
-import { WorkspaceHelper, type HelperDocker } from './workspaceHelper';
+import { WorkspaceHelper } from './workspaceHelper';
 
 const OWN = { tag: 'devenv-helper:own', id: `sha256:${'b'.repeat(64)}` };
 const REPO = 'octo/hello';
 const FOLDER = '/workspaces/hello';
-
-const noDocker: HelperDocker = {
-  imageExists: async () => true,
-  imageId: async () => OWN.id,
-  buildImage: async () => OWN.id,
-  listImagesByLabel: async () => [],
-  removeImage: async () => true,
-  run: async () => {
-    throw new Error('no docker run');
-  },
-};
 
 class StepLock implements HeldEnvironmentLock {
   readonly environmentId = 'e';
@@ -46,15 +35,16 @@ class StepLock implements HeldEnvironmentLock {
   }
 }
 
+// Plan step 11I (U7, decision of 2026-10-08): changed setup, the helper of the worker takes its own image, the socket
+// and containerRuns (before: a Docker port whose image calls answered and whose `docker run` threw, and an engine).
 function helper(): WorkspaceHelper {
   return new WorkspaceHelper({
-    docker: noDocker,
     logger: silentLogger,
-    dockerfilePath: '/nonexistent/Dockerfile',
-    env: {},
-    platform: 'linux',
-    engine: async () => ({ key: 'box', socket: '/s.sock' }),
     ownImage: OWN,
+    socket: '/s.sock',
+    containerRuns: async () => {
+      throw new Error('no container query');
+    },
   });
 }
 

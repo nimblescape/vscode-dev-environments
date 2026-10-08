@@ -12,13 +12,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import type { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { parseJsonc } from '../../src/core/jsonc';
 import { newEnvironmentId, splitRepository } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, HELPER_DOCKERFILE, Timings, dockerTestContext, runInVolume } from './harness';
+import { DUMMY_TOKEN, Timings, dockerTestContext, runInVolume, testHelperImage, testWorkspaceHelper } from './harness';
 import { inProcessBatches, type InProcessBatches } from './workerLocks';
 
 /** A small public repository with a Dev Container configuration. */
@@ -28,7 +28,9 @@ const FOLDER = `/workspaces/${splitRepository(REPOSITORY).name}`;
 describe(`clone of ${REPOSITORY}`, () => {
   const { run, env, cli, log } = dockerTestContext('clone');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
+  // Plan step 11I (U7, decision of 2026-10-08): the helper of the worker, on the helper image of the tests as its own
+  // image (before: a WorkspaceHelper that built that image itself); set in beforeAll.
+  let helper: WorkspaceHelper;
   const volumeName = `devenv-test-clone-${run.runId}`;
   const timings = new Timings();
   // Plan step 7 (user decision of 2026-10-01): the per-step path is removed: the batch helper of the worker runs the steps.
@@ -45,9 +47,12 @@ describe(`clone of ${REPOSITORY}`, () => {
   }
 
   beforeAll(async () => {
-    await timings.measure('workspace helper image ready', () => helper.ensureImage());
+    const image = await timings.measure('workspace helper image ready', () => testHelperImage(docker, log, env));
     // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
-    batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await new DockerTargets(docker, env, log).current()).endpoint));
+    const socket = helperDockerSocket(env, process.platform, (await new DockerTargets(docker, env, log).current()).endpoint);
+    batches = await inProcessBatches({ cli, log }, socket);
+    // Plan step 11I (U7, decision of 2026-10-08): the steps run from that image with that socket, as in the worker.
+    helper = testWorkspaceHelper(image, socket, cli, log);
     cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, volumeName]);
   });
 

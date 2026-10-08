@@ -36,12 +36,11 @@ import {
   parseSweepValue,
 } from '../../src/core/helperChannel/protocol';
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
+import { Timings, dockerTestContext, testHelperImage, testStateVolume } from './harness';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -88,7 +87,6 @@ async function sweepThrough(channel: HelperChannel): Promise<unknown> {
 describe('the helper channel with the real Docker engine', () => {
   const { run, env, cli, log } = dockerTestContext('helperChannel');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const timings = new Timings();
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);
   // A remote target without a context name: the calls go to the engine of the runner.
@@ -134,7 +132,9 @@ describe('the helper channel with the real Docker engine', () => {
 
   beforeAll(async () => {
     script = await timings.measure('bundle the script', bundleScript);
-    helperTag = await timings.measure('workspace helper image ready', () => helper.ensureImage());
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    helperTag = (await timings.measure('workspace helper image ready', () => testHelperImage(docker, log, env))).tag;
   });
 
   afterAll(() => {

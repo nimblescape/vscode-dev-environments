@@ -678,7 +678,7 @@ async function activateExtension(
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
   // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
-  // The build is shared with the open pipeline of this window (WorkspaceHelper.prebuildImage) and cancelled when the
+  // The build is shared with the open pipeline of this window (HelperImages.prebuildImage) and cancelled when the
   // extension is deactivated. Plan step 6, PR D: on the Docker engine of the current Docker context, local or remote
   // alike, as an operation on it (the state file and engine key of an open there); a remote host gets our own SSH check
   // without questions before its `docker info` (dockerEngineAnswers). A host switch starts no new prebuild: the next

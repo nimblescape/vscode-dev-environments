@@ -16,13 +16,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts } from '../../src/core/pipeline/operationBase';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, RecordingProgress, TEST_ACCOUNT, dockerTestContext } from './harness';
+import { FakeUi, RecordingProgress, TEST_ACCOUNT, dockerTestContext, testHelperImage } from './harness';
 import { monitorOfUser, removeTestMonitor, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/worker-lock';
@@ -32,7 +31,6 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
   const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
   const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   // Decision D9 of 2026-10-07: the opens make sure of the real Session Monitor; a monitor of the user is never touched.
   const skipped = monitorOfUser({ run });
   const windows: WorkerWindow[] = [];
@@ -78,7 +76,9 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
       log.info('The engine has a Session Monitor before the tests; the lock tests through real workers are skipped.');
       return;
     }
-    await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    await testHelperImage(docker, log, env);
   });
 
   afterAll(async () => {

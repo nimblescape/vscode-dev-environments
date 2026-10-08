@@ -4,7 +4,9 @@
 
 // Refresh and cleanup of the workspace helper image (implementation notes 7) against the real Docker engine and the real
 // registry, with a tiny helper Dockerfile of this run (so its own tag). The Docker adapter of the helper is limited to
-// the images of the run, so the cleanup under test never sees or removes a helper image of the user.
+// the images of the run, so the cleanup under test never sees or removes a helper image of the user. Plan step 11I (U7,
+// decision of 2026-10-08): the helper image of a window is HelperImages' (the extension's), so the tests use it itself
+// (before: through a WorkspaceHelper, which delegated to it and no longer has the helper image of the extension).
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -21,7 +23,7 @@ import {
   type BaseDigestLookup,
 } from '../../src/core/helper/helperImage';
 import { readHelperState, updateHelperState } from '../../src/core/helper/helperState';
-import { WorkspaceHelper, type HelperDocker } from '../../src/core/helper/workspaceHelper';
+import { HelperImages, type HelperImageDocker } from '../../src/core/helper/helperImages';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { LABEL_HELPER } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -43,9 +45,10 @@ function otherHelperTag(): string {
 /**
  * The real BootstrapDocker (plan step 11I2: was ContainerAdapter), limited to the images of this run: the listing of the
  * helper images shows only images with the label devenv-test.run=<run ID>, and the removal of any other image fails (the
- * helper logs the failure; the test checks that none was tried). It records the builds and the removals.
+ * helper logs the failure; the test checks that none was tried). It records the builds and the removals. Plan step 11I
+ * (U7, decision of 2026-10-08): the Docker port of HelperImages (before: of WorkspaceHelper, with its `run`).
  */
-class RunScopedDocker implements HelperDocker {
+class RunScopedDocker implements HelperImageDocker {
   readonly builds: Array<{ tag: string; pull: boolean; noCache: boolean }> = [];
   readonly removals: string[] = [];
   readonly refused: string[] = [];
@@ -54,10 +57,6 @@ class RunScopedDocker implements HelperDocker {
     private readonly docker: BootstrapDocker,
     private readonly runLabel: string,
   ) {}
-
-  run(...args: Parameters<BootstrapDocker['run']>): ReturnType<BootstrapDocker['run']> {
-    return this.docker.run(...args);
-  }
 
   imageExists(reference: string): Promise<boolean> {
     return this.docker.imageExists(reference);
@@ -115,9 +114,9 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
   /** Checks of the base image that the helpers started in the background. */
   const checks: Array<Promise<void>> = [];
 
-  /** The helper of a new window: nothing cached. */
-  function newWindowHelper(): WorkspaceHelper {
-    return new WorkspaceHelper({ docker, logger: log, dockerfilePath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
+  /** The helper image of a new window: nothing cached. Plan step 11I (U7): HelperImages (before: a WorkspaceHelper). */
+  function newWindowHelper(): HelperImages {
+    return new HelperImages({ docker, logger: log, dockerfilePath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
   }
 
   /** Waits for the checks of the base image in the background. */
@@ -267,7 +266,8 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     expect(updatedTag).not.toBe(tag);
     const currentId = cli.image(tag)?.Id;
     expect((await readHelperState(statePath)).images[tag]?.imageId).toBe(currentId);
-    const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
+    // Plan step 11I (U7, decision of 2026-10-08): HelperImages (before: a WorkspaceHelper).
+    const helper = new HelperImages({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
 
     const failure = await timings.measure('failed build', () => helper.ensureImage().catch((error: unknown) => error));
     await settled();

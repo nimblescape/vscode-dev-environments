@@ -23,7 +23,6 @@ import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { toContainerInfo } from '../../src/core/docker/dockerObjects';
 import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
 import { supportsVolumeSubpath } from '../../src/core/helper/compose';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,
@@ -49,13 +48,13 @@ import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
   FakeUi,
-  HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
   createVolume,
   dockerTestContext,
   expectLabelledEnvironmentImage,
-  runInVolume } from './harness';
+  runInVolume,
+  testHelperImage } from './harness';
 import { monitorOfUser, removeTestMonitor, workerWindow } from './workerWindow';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
@@ -97,7 +96,6 @@ describe('open pipeline for a Docker Compose configuration', () => {
   const { run, env, cli, log } = dockerTestContext('compose');
   const runner = new NodeProcessRunner();
   const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const ui = new DeleteUi();
   // Plan step 11I1, PR A2: the window of the shared harness; its operations run in the worker (was: the pipeline of the
   // test process over the `lock` relay of the worker).
@@ -244,7 +242,9 @@ ${extra}volumes:
       log.info('The engine has a Session Monitor before the tests; the Compose opens through a real worker are skipped.');
       return;
     }
-    await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    await testHelperImage(docker, log, env);
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     log.info(`Docker Engine API ${apiVersion}`);
     // Review round 17 (D17-1): with a volume named with `${devcontainerId}`, which read-configuration leaves as written.

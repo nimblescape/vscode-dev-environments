@@ -8,20 +8,21 @@
 // of its own; a step outside the batch scope of an operation is an internal error. In the batch helper the runs of the
 // Dev Container CLI get the Docker socket, so the CLI builds and starts dev containers with the Docker engine; the clone
 // runs as an unprivileged Git user and the read steps as the owner of the repository, without the socket: Git runs
-// programs that the repository configuration names (for example filter drivers).
+// programs that the repository configuration names (for example filter drivers). Plan step 11I (U7, decision of
+// 2026-10-08): only the worker builds a WorkspaceHelper (workerServices.ts), and every step runs from the worker's own
+// helper image (section 3b of the plan); the helper image of the extension (its build, check, maintenance and record)
+// is HelperImages' (helperImages.ts), of which this module imports only types, so the worker's bundle holds none of it.
 import { SECRET_TOKEN } from '../helperChannel/protocol';
-import type { BootstrapDocker } from '../docker/bootstrapDocker';
-import { DOCKER_QUERY_TIMEOUT_MS } from '../docker/dockerTimeouts';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
 import { boundServiceFolders, checkNumericIds, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
 import { WORKSPACES_ROOT } from '../names';
-import { abortError, isAbortError, type RunResult } from '../ports';
+import { abortError, isAbortError, type Logger, type RunResult } from '../ports';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { DevcontainerCommandError, isLifecycleCommandFailure, parseDevcontainerResult, tryParseDevcontainerResult } from './devcontainerCli';
-import type { HelperBuildKind, HelperImageUse } from './helperImage';
-// Plan step 11F2: the helper image moved to helperImages.ts.
-import { HelperImages, type EnsureImageOptions, type HelperImageDocker, type HelperImagesDeps, type PresentImageOptions } from './helperImages';
+import type { HelperImageUse } from './helperImage';
+// Plan step 11I (U7): only the types of the options that the pipeline passes to the two image calls (no code).
+import type { EnsureImageOptions, PresentImageOptions } from './helperImages';
 
 // Plan step 11I (PR D): only what the pipeline takes from here (the rest of helperImages.ts is imported from there).
 export type { HelperImageUse };
@@ -37,29 +38,35 @@ import { checkConfigPath, checkRepository, isPassableEnvName, writeAndRunInput, 
 import { currentBatchScope, type BatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
 
-/** The part of the Docker port that the helper uses: the helper image's, and `run` (containerRuns without the dep). */
-export type HelperDocker = HelperImageDocker & Pick<BootstrapDocker, 'run'>;
-
 /** Result of WorkspaceHelper.up. */
 export interface UpResult extends DevcontainerResult {
   /** The description of the CLI when a lifecycle command failed and the running container was kept. */
   lifecycleCommandFailure?: string;
 }
 
-/** Plan step 11F2: the deps of the helper image (HelperImagesDeps), and the ones of the steps. */
-export interface HelperDeps extends HelperImagesDeps {
-  docker: HelperDocker;
+/**
+ * Plan step 11I (U7, decision of 2026-10-08): what the worker gives its WorkspaceHelper (workerServices.ts, from its
+ * OwnHelper): no Docker port, no Dockerfile, and no environment or platform of the computer (before: the deps of the
+ * helper image of the extension, HelperImagesDeps, with stubs that threw in the worker).
+ */
+export interface HelperDeps {
+  logger: Logger;
   /**
-   * Plan step 11B3b: the helper image of the worker in which this helper runs (its tag and ID). With it, every helper
-   * image of an operation is that one (section 3b of the plan: the helper image of an open is the worker's own image):
-   * nothing is checked, built, maintained or recorded, and the Dockerfile is never read.
+   * Plan step 11B3b: the helper image of the worker in which this helper runs (its tag and ID). Every helper image of
+   * an operation is that one (section 3b of the plan: the helper image of an operation is the worker's own image):
+   * nothing is checked, built, maintained or recorded.
    */
-  ownImage?: HelperImageUse;
+  ownImage: HelperImageUse;
   /**
-   * Plan step 11E6 (review round 1 of PR #111, A-M2): whether a container runs, for the open in the worker, which
-   * runs no Docker CLI of its own (its engine answers). Default: `docker container inspect` through `docker.run`.
+   * The source of the socket mount of the engine on its host (the worker's own, OwnHelper.socket), for each batch
+   * helper.
    */
-  containerRuns?: (containerId: string, signal?: AbortSignal) => Promise<boolean>;
+  socket: string;
+  /**
+   * Plan step 11E6 (review round 1 of PR #111, A-M2): whether a container runs; the engine of the worker answers. Plan
+   * step 11I (U7): required; the fallback over the Docker CLI (`docker container inspect`) is removed.
+   */
+  containerRuns: (containerId: string, signal?: AbortSignal) => Promise<boolean>;
 }
 
 /**
@@ -154,8 +161,8 @@ class ResultLineFilter {
 interface StreamOptions {
   env?: Record<string, string>;
   /**
-   * Time limit of the step in the batch helper (not of a build of the helper image before it). When it ends, the step is
-   * ended, and the run rejects with an Error that is not an AbortError.
+   * Time limit of the step in the batch helper. When it ends, the step is ended, and the run rejects with an Error that
+   * is not an AbortError.
    */
   timeoutMs?: number;
   /**
@@ -164,7 +171,7 @@ interface StreamOptions {
    * every run is such a step, and runs only in the batch scope of an operation (batchScope.ts).
    */
   batch: { kind: BatchStepKind; params: Record<string, unknown>; secret?: string };
-  /** The helper image of the open (see HelperImageUse); without it, the image of this instance (WorkspaceHelper.image). */
+  /** The helper image of the open (see HelperImageUse); without it, the worker's own image (HelperDeps.ownImage). */
   image?: HelperImageUse;
   signal?: AbortSignal;
   onStdout?: (text: string) => void;
@@ -189,54 +196,23 @@ export const COMPOSE_MODEL_TIMEOUT_MS = 60_000;
 
 /** Workspace helper (implementation notes 7, concept 7.6). */
 export class WorkspaceHelper {
-  /** Plan step 11F2: the helper image (helperImages.ts); unused with HelperDeps.ownImage. */
-  private readonly images: HelperImages;
+  constructor(private readonly deps: HelperDeps) {}
 
-  constructor(private readonly deps: HelperDeps) {
-    this.images = new HelperImages(deps);
-  }
-
-  /** HelperImages.ensureImage; with HelperDeps.ownImage, its tag. */
-  async ensureImage(options: EnsureImageOptions = {}): Promise<string> {
-    return (await this.ensureImageUse(options)).tag;
-  }
-
-  /** HelperImages.ensureImageUse; with HelperDeps.ownImage, that image. */
+  /**
+   * The helper image of an open (the pipeline's prepareHelper). Plan step 11I (U7, decision of 2026-10-08): the
+   * worker's own image (HelperDeps.ownImage); nothing is checked, built or recorded, so of the options of the pipeline
+   * (those of HelperImages.ensureImageUse) only `signal` is read: an abort passes through.
+   */
   async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
-    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.ensureImageUse(options);
+    return this.ownImageUse(options.signal);
   }
 
-  /** HelperImages.ensureImagePresent; with HelperDeps.ownImage, that image. */
+  /**
+   * The helper image before the lock of an operation (the pipeline's withEnvironmentLock): the own image, as
+   * ensureImageUse.
+   */
   async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
-    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.ensureImagePresent(options);
-  }
-
-  /** HelperImages.checkImagePresent; with HelperDeps.ownImage, present. */
-  async checkImagePresent(options: { signal?: AbortSignal } = {}): Promise<void> {
-    if (this.deps.ownImage !== undefined) {
-      await this.ownImageUse(options.signal);
-      return;
-    }
-    await this.images.checkImagePresent(options);
-  }
-
-  /** HelperImages.presentImage; with HelperDeps.ownImage, that image. */
-  async presentImage(options: { signal?: AbortSignal } = {}): Promise<HelperImageUse | undefined> {
-    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.presentImage(options);
-  }
-
-  /** HelperImages.engineKey. */
-  async engineKey(): Promise<string> {
-    return this.images.engineKey();
-  }
-
-  /** HelperImages.prebuildImage; with HelperDeps.ownImage, that image. */
-  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse> {
-    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.prebuildImage(options);
+    return this.ownImageUse(options.signal);
   }
 
   /**
@@ -803,30 +779,19 @@ export class WorkspaceHelper {
 
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
 
-  /**
-   * The helper image of a run without the image of an open: HelperDeps.ownImage, else the image of HelperImages without
-   * its maintenance (only a missing tag is built).
-   */
-  private runImage(options: EnsureImageOptions): Promise<HelperImageUse> {
-    if (this.deps.ownImage !== undefined) return this.ownImageUse(options.signal);
-    return this.images.runImage(options);
-  }
-
   /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
   private async ownImageUse(signal: AbortSignal | undefined): Promise<HelperImageUse> {
     if (signal?.aborted) throw abortError();
-    return { ...(this.deps.ownImage as HelperImageUse) };
+    return { ...this.deps.ownImage };
   }
 
-  /** Whether the container has the state `running`. A failed query counts as `false`; an abort passes through. */
+  /**
+   * Whether the container has the state `running` (HelperDeps.containerRuns). A failed query counts as `false`; an
+   * abort passes through.
+   */
   private async containerRuns(containerId: string, signal?: AbortSignal): Promise<boolean> {
     try {
-      if (this.deps.containerRuns !== undefined) return await this.deps.containerRuns(containerId, signal);
-      const result = await this.deps.docker.run(['container', 'inspect', '--format', '{{json .State.Status}}', containerId], {
-        timeoutMs: DOCKER_QUERY_TIMEOUT_MS,
-        signal,
-      });
-      return result.exitCode === 0 && result.stdout.trim() === '"running"';
+      return await this.deps.containerRuns(containerId, signal);
     } catch (error) {
       if (isAbortError(error)) throw error;
       this.deps.logger.warn(`The state of the container ${containerId.slice(0, 12)} could not be read: ${errorMessage(error)}`);
@@ -904,7 +869,7 @@ export class WorkspaceHelper {
    * the exit code, the output, and for the time limit an Error that is not an AbortError. User decision D1: a run is
    * never a `docker run` of its own (plan step 7: that path is removed). The variables pass the same
    * checks as for `-e` (helperEnv) and go on the process of the step in the helper. The session opens with the pinned
-   * helper image of the open (its ID) and the socket of the engine.
+   * helper image of the open (its ID), else the worker's own image, and the socket of the engine (HelperDeps.socket).
    */
   private async runInBatch(scope: BatchScope, volumeName: string, options: StreamOptions): Promise<RunResult> {
     const batch = options.batch;
@@ -928,9 +893,9 @@ export class WorkspaceHelper {
         },
       },
       async () => {
-        const use = options.image ?? (await this.runImage({ onOutput: options.onStderr, signal: options.signal }));
+        const use = options.image ?? (await this.ownImageUse(options.signal));
         if (use.id === undefined) throw new Error(`the ID of the helper image ${use.tag} is not known`);
-        return { image: use.id, socket: this.images.socketPathFor(await this.images.currentEngine()) };
+        return { image: use.id, socket: this.deps.socket };
       },
     );
     if (result.timedOut) {

@@ -21,7 +21,6 @@ import * as fs from 'fs';
 import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import {
   CONTAINER_CREDENTIAL_HELPER,
@@ -58,7 +57,6 @@ import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, read
 import {
   DUMMY_TOKEN,
   FakeUi,
-  HELPER_DOCKERFILE,
   TEST_ACCOUNT,
   RecordingProgress,
   Timings,
@@ -71,6 +69,7 @@ import {
   registryDigest,
   registryTransport,
   runInVolume,
+  testHelperImage,
 } from './harness';
 import { monitorOfUser, removeTestMonitor, workerWindow, type WorkerWindow } from './workerWindow';
 
@@ -141,7 +140,6 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
   const { run, env, cli, log } = context;
   const runner = new NodeProcessRunner();
   const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const ui = new DeleteRecordingUi();
   const timings = new Timings();
   // The reference reading of the registry digests that the build records must name (a test oracle in this process, never
@@ -283,7 +281,9 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
       cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--name', `devenv-test-guard-${run.runId}`, TEST_BASE_IMAGE, 'true']);
     }
 
-    await timings.measure('workspace helper image ready', () => helper.ensureImage());
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    await timings.measure('workspace helper image ready', () => testHelperImage(docker, log, env));
     paths.ensureDirectoriesSync();
     hostPort = await freePort();
     const devcontainerJson = JSON.stringify(

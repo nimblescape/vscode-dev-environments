@@ -226,7 +226,10 @@ describe('the core services in the worker (plan step 11B3b)', () => {
     });
     expect(await helper.ensureImagePresent()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
     expect(await helper.ensureImageUse()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
-    expect(await helper.presentImage()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
+    // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the worker's helper has no image call besides
+    // the two of the pipeline (before: presentImage gave the own image too; it is removed with the helper image code of
+    // the extension, which the worker's bundle no longer holds).
+    expect((helper as unknown as Record<string, unknown>).presentImage).toBeUndefined();
     const controller = new AbortController();
     controller.abort();
     await expect(helper.ensureImagePresent({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
@@ -350,7 +353,9 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     const withExec = deps({ engine: { ...unusedEngine(), exec: async (_c, _command, options) => (execs.push(options), { exitCode: 0, stdout: '', stderr: '', timedOut: false }) } }).all;
     await withExec.docker.exec('c', ['cat'], { secretInputName: SECRET_TOKEN });
     expect(execs).toEqual([{ secretInputName: SECRET_TOKEN }]);
-    await expect(all.helper.ensureImage()).resolves.toBe('devenv-helper:abc');
+    // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the image call of the pipeline (ensureImageUse;
+    // before: ensureImage, its tag only, which is removed with the helper image code of the extension).
+    await expect(all.helper.ensureImageUse()).resolves.toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
   });
 });
 

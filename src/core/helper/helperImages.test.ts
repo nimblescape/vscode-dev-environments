@@ -3,8 +3,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11F2: the helper image of the bootstrap on its own (HelperImages), as the extension uses it without the
-// steps of the workspace helper. Its rules are tested through the workspace helper (workspaceHelper.test.ts), which
-// delegates to it; here: that it works alone, on the Docker port of the bootstrap.
+// steps of the workspace helper. Its rules are tested in helperImages.rules.test.ts (plan step 11I, U7, decision of
+// 2026-10-08: moved from workspaceHelper.test.ts, which tested them through the workspace helper while it delegated to
+// HelperImages); here: that it works alone, on the Docker port of the bootstrap.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';

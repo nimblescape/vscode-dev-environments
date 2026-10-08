@@ -24,7 +24,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
 import { LABEL_CHANNEL_STEP } from '../../src/core/helperChannel/protocol';
@@ -32,7 +31,7 @@ import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOL
 import { bundleHash } from '../../src/core/loader/pipeLoader';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext } from './harness';
+import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testHelperImage } from './harness';
 import { inProcessBatches, workerScript, type InProcessBatches } from './workerLocks';
 
 const REPOSITORY = 'devenv-test/worker-batch';
@@ -55,7 +54,6 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   const runner = new NodeProcessRunner();
   const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const volume = `devenv-test-batch-${run.runId}`;
   let script = '';
   let helperTag = '';
@@ -81,7 +79,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     script = await workerScript();
     // Review round 1 (A-L4): the engine of the Docker context, as the worker's socket follows it.
     batches = await inProcessBatches({ cli, log }, helperDockerSocket(env, process.platform, (await targets.current()).endpoint));
-    const use = await helper.ensureImageUse();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImageUse of a
+    // WorkspaceHelper).
+    const use = await testHelperImage(docker, log, env);
     helperTag = use.tag;
     // A `git` first on PATH that only waits: the clone runs as the Git user until its time limit.
     const dockerfile = `FROM ${helperTag}\nRUN printf '#!/bin/sh\\nexec sleep 300\\n' > /usr/local/bin/git && chmod 0755 /usr/local/bin/git\nLABEL ${TEST_RUN_LABEL}=${run.runId}\n`;

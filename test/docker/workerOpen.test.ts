@@ -13,19 +13,18 @@ import * as fs from 'fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { REMOTE_MONITOR_CONTAINER } from '../../src/core/remoteMonitor/protocol';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import {
-  HELPER_DOCKERFILE,
   RecordingProgress,
   TEST_ACCOUNT,
   createVolume,
   dockerTestContext,
   runInVolume,
+  testHelperImage,
 } from './harness';
 import { monitorOfUser as engineHadMonitor, removeTestMonitor, workerWindow } from './workerWindow';
 
@@ -50,7 +49,6 @@ describe('the open through a real worker (plan step 11E6)', () => {
   const { run, env, cli, log } = dockerTestContext('workerOpen');
   const runner = new NodeProcessRunner();
   const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   // Plan step 11I1, PR A2: the window of the shared harness (workerWindow.ts), as this file wired it before. No registry
   // question: the open builds from the base image that the engine has or pulls (updateImagesOnConnect off).
   const window = workerWindow({ run, env, cli, log }, docker, { name: 'workerOpen', windowId: 'docker-test-window' });
@@ -72,7 +70,9 @@ describe('the open through a real worker (plan step 11E6)', () => {
       log.info(`The engine has a Session Monitor (${REMOTE_MONITOR_CONTAINER}) before the tests; the open through a real worker is skipped.`);
       return;
     }
-    await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    await testHelperImage(docker, log, env);
     paths.ensureDirectoriesSync();
     const devcontainerJson = JSON.stringify(
       {
