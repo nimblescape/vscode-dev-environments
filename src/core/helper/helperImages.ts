@@ -31,10 +31,6 @@ export interface HelperImagesDeps {
   logger: Logger;
   /** resources/helper/Dockerfile of the installed extension. */
   dockerfilePath: string;
-  /** Environment of the extension host. Only DOCKER_HOST is read (for the socket path); nothing of it enters the helper. */
-  env: NodeJS.ProcessEnv;
-  /** Default: the platform of this process. */
-  platform?: NodeJS.Platform;
   clock?: Clock;
   /**
    * `helper.json` in the global storage folder (StoragePaths.helperState). With it, ensureImage also checks the base
@@ -50,9 +46,9 @@ export interface HelperImagesDeps {
   /**
    * Unit 7: the Docker engine that the operation uses (the current Docker context). `key` names it ('' for the local
    * Docker, else the remote host): the image found or built for one engine is not reused for another, and a remote
-   * engine has its own state file. `socket`: the source of the socket mount on the machine of that engine (for a remote
-   * host `/var/run/docker.sock`, or the recorded socket of a rootless engine); `endpoint`: the local endpoint of the
-   * context, for helperDockerSocket. Without it, the local Docker of DOCKER_HOST.
+   * engine has its own state file. Without it, the local Docker of DOCKER_HOST. Review round 1 of PR #129 (A-L3): the
+   * socket of the engine is no longer part of it (HelperImages starts no container; the socket mount of the worker is
+   * extension.ts' engineSocket, and the batch helpers take the worker's own).
    */
   engine?: () => Promise<HelperEngine>;
   /** Plan step 5, PR A: called after a build of the helper image succeeded (the worker can be opened again at once). */
@@ -71,8 +67,6 @@ export interface PresentImageOptions {
 /** See HelperImagesDeps.engine. */
 export interface HelperEngine {
   key: string;
-  socket?: string;
-  endpoint?: string;
 }
 
 /**
@@ -163,12 +157,6 @@ export class HelperImages {
   /** The engine of the operation (HelperImagesDeps.engine); the local Docker without it. */
   async currentEngine(): Promise<HelperEngine> {
     return (await this.deps.engine?.()) ?? { key: '' };
-  }
-
-  /** The source of the socket mount for the engine (see HelperImagesDeps.engine and helperDockerSocket). */
-  socketPathFor(engine: HelperEngine): string {
-    if (engine.socket !== undefined) return engine.socket;
-    return helperDockerSocket(this.deps.env, this.deps.platform ?? process.platform, engine.endpoint);
   }
 
   private statePathFor(engine: HelperEngine): string | undefined {

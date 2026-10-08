@@ -366,7 +366,8 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     socket: deps.ownHelper.socket,
     // Review round 1 of PR #111 (A-M2): a container that runs after its lifecycle commands failed is kept (the helper's own
     // inspect would fail closed in the worker, so every such open failed).
-    containerRuns: async (containerId) => (await docker.containerState(containerId)) === 'running',
+    // Review round 1 of PR #129 (B-L4): with the signal of the step, so a cancel does not wait for the inspect.
+    containerRuns: async (containerId, signal) => (await docker.containerState(containerId, signal)) === 'running',
   });
   return {
     docker,

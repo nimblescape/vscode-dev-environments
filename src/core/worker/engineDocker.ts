@@ -171,8 +171,8 @@ export class EngineDocker implements EnvironmentDocker {
     return [...tags].sort().filter((tag) => !foreign.has(tag));
   }
 
-  async containerState(nameOrId: string): Promise<ContainerState> {
-    const container = await this.call(`the inspect of ${nameOrId}`, undefined, (limited) => this.engine.container(nameOrId, limited));
+  async containerState(nameOrId: string, signal?: AbortSignal): Promise<ContainerState> {
+    const container = await this.call(`the inspect of ${nameOrId}`, signal, (limited) => this.engine.container(nameOrId, limited));
     return container === undefined ? 'missing' : mapContainerState(container.rawState);
   }
 

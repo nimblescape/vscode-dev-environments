@@ -132,8 +132,6 @@ function createImages(): HelperImages {
     docker,
     logger,
     dockerfilePath: path.join(dir, 'Dockerfile'),
-    env: {},
-    platform: 'darwin',
     clock: { now: () => Date.parse('2026-09-24T17:10:00Z') },
   });
 }
@@ -234,8 +232,6 @@ describe('HelperImages.ensureImage with a state file (implementation notes 7)', 
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'darwin',
       clock: { now: () => now },
       statePath,
       baseDigest,
@@ -336,7 +332,7 @@ describe('HelperImages reuses its cached helper image only while the tag still h
     const now = START;
     const statePath = path.join(dir, 'storage', 'helper.json');
     const window = (baseDigest?: BaseDigestLookup) =>
-      new HelperImages({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'darwin', clock: { now: () => now }, statePath, baseDigest });
+      new HelperImages({ docker, logger, dockerfilePath: path.join(dir, 'Dockerfile'), clock: { now: () => now }, statePath, baseDigest });
     // Plan step 11I (U7, decision of 2026-10-08): changed setup, no `docker run` that answers "No such image" for an
     // image ID that no tag has anymore: a run of the pinned image of an open is checked with `present`.
     return { a: window(), b: window(async () => DIGEST_B), statePath };
@@ -453,8 +449,6 @@ describe('HelperImages keeps the helper image of each engine apart for overlappi
       docker: dispatch,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'linux',
       clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
       statePath: path.join(dir, 'storage', 'helper.json'),
       engine: async () => ({ key: als.getStore() ?? '' }),
@@ -602,8 +596,6 @@ describe('HelperImages without a previous helper image (user decision 2026-09-29
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'darwin',
       clock: { now: () => now },
       statePath,
     });
@@ -700,8 +692,6 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'darwin',
       clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
       statePath: statePath(),
       engine,
@@ -774,7 +764,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
   });
 
   it('PR #77 review round 1 (A-R1-1): a prebuild whose build stalls ends at its time limit; an open and a worker preparation that waited for it build for themselves', async () => {
-    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    const helper = stateHelper(async () => ({ key: 'build-box' }));
     blockingBuild();
     const pre = prebuild(helper, { timeoutMs: 200 }).start(REMOTE_TARGET);
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
@@ -797,7 +787,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const gate = blockingBuild();
     try {
-      const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+      const helper = stateHelper(async () => ({ key: 'build-box' }));
       let settled = false;
       const pre = prebuild(helper).start(REMOTE_TARGET);
       void pre.then(() => { settled = true; });
@@ -852,7 +842,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
   // Changed expectation (Plan step 6, PR D: the prebuild runs on every engine): this was "builds nothing when the Docker
   // context is a remote host" (prebuildImage returned undefined, HelperPrebuild answered `remote`).
   it('builds the missing tag also when the Docker context is a remote host (Plan step 6, PR D)', async () => {
-    const helper = stateHelper(async () => ({ key: 'build-box', socket: DOCKER_SOCKET }));
+    const helper = stateHelper(async () => ({ key: 'build-box' }));
     expect(await helper.prebuildImage({ signal: new AbortController().signal })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(await helper.engineKey()).toBe('build-box');
     expect(docker.builds).toHaveLength(1);
@@ -863,7 +853,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
   // `docker info` goes to that host (with our own SSH check first, dockerEngineAnswers), and only when the state file of
   // that host does not know the tag (the test below: not due, nothing asked).
   it('prebuilds a remote target as an operation on it, with the state file of that engine (Plan step 6, PR D)', async () => {
-    const helper = stateHelper(async () => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET }));
+    const helper = stateHelper(async () => ({ key: operationDockerTarget()?.host ?? '' }));
     const targetsOfBuild: Array<DockerTarget | undefined> = [];
     docker.buildHandler = async () => {
       targetsOfBuild.push(operationDockerTarget());
@@ -886,7 +876,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
       helperStatePathFor(statePath(), 'build-box'),
       JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }),
     );
-    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET });
+    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '' });
     // The remote host knows the tag: not due, and neither it nor its Docker is asked.
     const running = vi.fn(async () => true);
     expect(await prebuild(stateHelper(engine), { dockerRunning: running }).start(REMOTE_TARGET)).toBe('notDue');
@@ -906,7 +896,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
   });
 
   it('does nothing on a remote host whose Docker does not answer, and never on an unsupported endpoint (Plan step 6, PR D)', async () => {
-    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '', socket: DOCKER_SOCKET });
+    const engine = async (): Promise<HelperEngine> => ({ key: operationDockerTarget()?.host ?? '' });
     expect(await prebuild(stateHelper(engine), { dockerRunning: async () => false }).start(REMOTE_TARGET)).toBe('dockerNotRunning');
     expect(docker.builds).toEqual([]);
     expect(docker.imageIdCalls).toBe(0);
@@ -1329,8 +1319,6 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
         docker,
         logger,
         dockerfilePath: path.join(dir, 'Dockerfile'),
-        env: {},
-        platform: 'darwin',
         clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
         statePath: statePath(),
         baseDigest: () => {
@@ -1379,8 +1367,6 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
         docker,
         logger,
         dockerfilePath: path.join(dir, 'Dockerfile'),
-        env: {},
-        platform: 'darwin',
         clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
         statePath: statePath(),
         baseDigest: () => {
@@ -1448,8 +1434,6 @@ describe('HelperImages: the helper runs in a new window (implementation notes 7)
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'darwin',
       clock: { now: () => now },
       statePath,
       baseDigest: async (reference) => {
@@ -1534,8 +1518,6 @@ describe('Docker access of the helper runs', () => {
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'linux',
       statePath,
       engine: async () => engine,
     });
@@ -1543,7 +1525,7 @@ describe('Docker access of the helper runs', () => {
     expect(docker.builds).toHaveLength(1);
     // The remote engine does not have the image: it is built there, with its own state file.
     docker.images.clear();
-    engine = { key: 'box', socket: '/var/run/docker.sock' };
+    engine = { key: 'box' };
     await helper.ensureImage();
     expect(docker.builds).toHaveLength(2);
     expect(fs.existsSync(helperStatePathFor(statePath, 'box'))).toBe(true);
@@ -1557,15 +1539,13 @@ describe('Docker access of the helper runs', () => {
 // tag exists on the engine of the operation (local or remote alike); it does no maintenance.
 describe('HelperImages.ensureImagePresent (PR #74 review round 1, A-R1-1)', () => {
   const statePath = () => path.join(dir, 'storage', 'helper.json');
-  const REMOTE: HelperEngine = { key: 'ssh://build-box', socket: '/var/run/docker.sock' };
+  const REMOTE: HelperEngine = { key: 'ssh://build-box' };
 
   function helperOn(engine: HelperEngine, baseDigest?: BaseDigestLookup): HelperImages {
     return new HelperImages({
       docker,
       logger,
       dockerfilePath: path.join(dir, 'Dockerfile'),
-      env: {},
-      platform: 'linux',
       clock: { now: () => Date.parse('2026-09-24T12:00:00Z') },
       statePath: statePath(),
       engine: async () => engine,

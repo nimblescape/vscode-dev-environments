@@ -24,9 +24,12 @@ export const WORKER_SCRIPT_ENTRIES = {
 /**
  * @param {string} root The folder of the repository.
  * @param {Record<string, string>} define The compile-time constants of the bundles.
+ * @param {(script: string, inputs: string[]) => void} [onScriptInputs] Called with the inputs of each script that was
+ *   built (relative to `root`, as in a metafile of esbuild); review round 1 of PR #129 (A-L1): src/workerBundle.test.ts
+ *   checks them, since the builds of the scripts never reach the metafile of the worker's bundle.
  * @returns {import('esbuild').Plugin}
  */
-export function workerScriptsPlugin(root, define) {
+export function workerScriptsPlugin(root, define, onScriptInputs) {
   return {
     name: 'worker-scripts',
     setup(build) {
@@ -61,6 +64,7 @@ export function workerScriptsPlugin(root, define) {
           const fallback = known.length > 0 ? known : sourcesOf(folder);
           return { errors, watchFiles: [...new Set([...fallback, ...files])], watchDirs: [folder] };
         }
+        onScriptInputs?.(args.path, Object.keys(result.metafile.inputs));
         const inputs = Object.keys(result.metafile.inputs).map((file) => path.resolve(root, file));
         watched.set(args.path, inputs);
         return {
@@ -70,6 +74,26 @@ export function workerScriptsPlugin(root, define) {
         };
       });
     },
+  };
+}
+
+/**
+ * The options of the worker's bundle (dist/helperChannel.js) on top of the options that every bundle shares (`shared` in
+ * esbuild.mjs): its entry, always minified and without a source map (the extension sends it over SSH as the first input
+ * line of the pipe loader, plan step 3), and the plugin of its scripts after the shared plugins. Review round 1 of PR
+ * #129 (A-L2): esbuild.mjs and src/workerBundle.test.ts build the worker from these, so the test checks the real bundle.
+ * @param {string} root The folder of the repository.
+ * @param {{ define: Record<string, string>, plugins: import('esbuild').Plugin[] } & import('esbuild').BuildOptions} shared
+ * @param {(script: string, inputs: string[]) => void} [onScriptInputs] See workerScriptsPlugin.
+ * @returns {import('esbuild').BuildOptions}
+ */
+export function workerBundleOptions(root, shared, onScriptInputs) {
+  return {
+    ...shared,
+    entryPoints: ['src/helperChannel/main.ts'],
+    minify: true,
+    sourcemap: false,
+    plugins: [...shared.plugins, workerScriptsPlugin(root, shared.define, onScriptInputs)],
   };
 }
 

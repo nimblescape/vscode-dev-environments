@@ -116,7 +116,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
 
   /** The helper image of a new window: nothing cached. Plan step 11I (U7): HelperImages (before: a WorkspaceHelper). */
   function newWindowHelper(): HelperImages {
-    return new HelperImages({ docker, logger: log, dockerfilePath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
+    return new HelperImages({ docker, logger: log, dockerfilePath, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
   }
 
   /** Waits for the checks of the base image in the background. */
@@ -267,7 +267,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     const currentId = cli.image(tag)?.Id;
     expect((await readHelperState(statePath)).images[tag]?.imageId).toBe(currentId);
     // Plan step 11I (U7, decision of 2026-10-08): HelperImages (before: a WorkspaceHelper).
-    const helper = new HelperImages({ docker, logger: log, dockerfilePath: updatedPath, env, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
+    const helper = new HelperImages({ docker, logger: log, dockerfilePath: updatedPath, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
 
     const failure = await timings.measure('failed build', () => helper.ensureImage().catch((error: unknown) => error));
     await settled();

@@ -52,6 +52,28 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     expect(await docker.findContainer(ENV, NAME)).not.toHaveProperty('created');
   });
 
+  // Review round 1 of PR #129 (B-L4): the read of a container's state ends with the abort of its caller (before, the
+  // signal was not passed on, so a cancelled open waited up to DOCKER_QUERY_TIMEOUT_MS for an engine that hung).
+  it('containerState passes the abort of its caller to the engine', async () => {
+    const seen: AbortSignal[] = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      container: (_reference, signal) =>
+        new Promise((_resolve, reject) => {
+          if (signal) seen.push(signal);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }),
+    };
+    const controller = new AbortController();
+    const state = new EngineDocker(engine).containerState('c', controller.signal);
+    await Promise.resolve();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].aborted).toBe(false);
+    controller.abort();
+    await expect(state).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen[0].aborted).toBe(true);
+  });
+
   it('containerState, imageExists, imageId, volumeExists: missing is an answer, not a failure', async () => {
     const engine: DockerEngine = {
       ...unusedEngine(),

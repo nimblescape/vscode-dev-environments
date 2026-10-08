@@ -11,6 +11,7 @@ import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { runWithBatchScope } from '../helper/batchScope';
 import type { HelperBatchSession } from '../helperChannel/helperChannel';
 import { silentLogger } from '../ports';
+import type { DockerEngine } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { workerServiceDeps } from './workerServices';
@@ -19,10 +20,10 @@ const OWN = { tag: 'devenv-helper:abc', id: `sha256:${'a'.repeat(64)}` };
 /** The socket of a rootless engine, so that a default socket (/var/run/docker.sock) would show. */
 const SOCKET = '/run/user/1000/docker.sock';
 
-function workerHelper() {
+function workerHelper(engine: DockerEngine = unusedEngine()) {
   return workerServiceDeps({
     host: { questions: {}, state: {}, records: {}, secrets: {} } as unknown as HostSide,
-    engine: unusedEngine(),
+    engine,
     secretOf: () => undefined,
     forgetSecret: () => undefined,
     logger: silentLogger,
@@ -67,5 +68,27 @@ describe("the worker's WorkspaceHelper (plan step 11I, U7)", () => {
     }
     expect(await helper.ensureImageUse()).toEqual(OWN);
     expect(await helper.ensureImagePresent()).toEqual(OWN);
+  });
+
+  // Review round 1 of PR #129 (B-L4): whether a container runs (after a failed lifecycle command of `up`) is read with
+  // the signal of the step, so a cancelled open does not wait for an inspect that the engine does not answer.
+  it('reads whether a container runs with the signal of the step', async () => {
+    const seen: AbortSignal[] = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      container: (_reference, signal) =>
+        new Promise((_resolve, reject) => {
+          if (signal) seen.push(signal);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }),
+    };
+    const deps = (workerHelper(engine) as unknown as { deps: { containerRuns: (id: string, signal?: AbortSignal) => Promise<boolean> } }).deps;
+    const controller = new AbortController();
+    const runs = deps.containerRuns('c'.repeat(64), controller.signal);
+    await Promise.resolve();
+    expect(seen).toHaveLength(1);
+    controller.abort();
+    await expect(runs).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen[0].aborted).toBe(true);
   });
 });

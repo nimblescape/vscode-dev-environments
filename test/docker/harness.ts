@@ -67,7 +67,7 @@ export function runInVolume(docker: Pick<BootstrapDocker, 'run'>, volume: string
  * the plan). Each test file calls it once, in its `beforeAll` (before: the `ensureImage` of its WorkspaceHelper).
  */
 export async function testHelperImage(docker: HelperImageDocker, log: Logger, env: NodeJS.ProcessEnv): Promise<HelperImageUse> {
-  const use = await new HelperImages({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env }).ensureImageUse();
+  const use = await new HelperImages({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE }).ensureImageUse();
   if (use.id === undefined) throw new Error(`The ID of the helper image ${use.tag} could not be read.`);
   return use;
 }

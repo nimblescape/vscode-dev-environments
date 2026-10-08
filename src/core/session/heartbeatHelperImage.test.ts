@@ -124,7 +124,7 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
     const preparation = new HeartbeatPreparation(HELPER_PREBUILD_TIMEOUT_MS, { now: () => T0 });
     const ambient = new AsyncLocalStorage<DockerTarget>();
     const builds: DockerTarget[] = [];
-    // Like WorkspaceHelper: one cache of the image per window, reset by a preparation on another engine.
+    // Like HelperImages: one cache of the image per window, reset by a preparation on another engine.
     let cache: { target: DockerTarget; image: Promise<HelperImageUse> } | undefined;
     const helper = {
       ensureImagePresent: (options: PresentImageOptions): Promise<HelperImageUse> => {
