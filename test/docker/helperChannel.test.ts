@@ -9,7 +9,9 @@
 // the `docker run` process of the computer is killed, or the connection stays silent). Review round 1 (P7): afterAll
 // fails when a channel container is left over. Plan step 11I1, PR B1: the operation `docker` and the removal of the
 // containers of its cleanup label are gone, so the cases of a step container started through the channel are gone too
-// (the end of a batch helper with its worker is tested in src/helperChannel/batch.e2e.test.ts, decision D5).
+// (the end of a batch helper with its worker is tested in src/helperChannel/batch.e2e.test.ts, decision D5). Plan step
+// 11I (PR A): the probe and the sweep of the worker go over the Engine API of its socket (no Docker CLI of the worker), so
+// their answers are checked against what the Docker CLI of the runner reports.
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
@@ -21,11 +23,17 @@ import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import {
   CHANNEL_PROTOCOL_VERSION,
+  ENGINE_IDENTITY_ARGS,
   LABEL_HELPER_CHANNEL,
   OP_PROBE,
+  OP_SWEEP,
   channelLabelValue,
   encodeMessage,
+  engineIdentity,
+  parseProbeParams,
   parseProbeValue,
+  parseSweepParams,
+  parseSweepValue,
 } from '../../src/core/helperChannel/protocol';
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
 import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
@@ -57,6 +65,22 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 60_
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
     await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+/**
+ * Plan step 11I (PR A): the operation `sweep` through `channel`. The engine runs one prune at a time and refuses another
+ * meanwhile (409, "a prune operation is already running"), and the open of the channel sends its own sweep in the
+ * background, so a refusal for that reason alone is tried again, a few times.
+ */
+async function sweepThrough(channel: HelperChannel): Promise<unknown> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await channel.operation(OP_SWEEP, parseSweepParams({}), { timeoutMs: 30_000 });
+    } catch (error) {
+      if (attempt >= 5 || !(error instanceof Error) || !error.message.includes('a prune operation is already running')) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
   }
 }
 
@@ -144,9 +168,27 @@ describe('the helper channel with the real Docker engine', () => {
 
     // Plan step 11I1, PR B1: changed call (before: `docker version` through the operation `docker`, removed): the
     // operation `probe`, which runs the same call in the worker; the check of the input of a Docker call is gone with the
-    // operation `docker`.
-    const probe = parseProbeValue(await timings.measure('probe through the channel', () => channel.operation(OP_PROBE, {}, { timeoutMs: 30_000 })));
+    // operation `docker`. Plan step 11I (PR A): the probe reads the Engine API (`GET /version`, `GET /info`) instead of
+    // the worker's Docker CLI: the same version as the Docker CLI of the runner, and the same identity, compared as values
+    // (as the open compared them already).
+    const probe = parseProbeValue(await timings.measure('probe through the channel', () => channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 })));
     expect(probe?.serverVersion).toBe(cli.ok(['version', '--format', '{{.Server.Version}}']));
+    expect(probe?.engine).toBeDefined();
+    expect(probe?.engine).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
+
+    // Plan step 11I (PR A): the sweep prunes over the Engine API with the label and the age of before: a channel container
+    // that was created but never started, younger than 10 minutes, is kept (an open that runs now), and the value says
+    // how many it removed (others of this engine older than 10 minutes may go, as at every open).
+    const young = `devenv-channel-young-${run.runId}`;
+    cli.ok(['create', '--name', young, '--label', `${LABEL_HELPER_CHANNEL}=${channelLabelValue(script)}`, ...runLabelArgs, helperTag, 'true']);
+    try {
+      const swept = parseSweepValue(await timings.measure('sweep through the channel', () => sweepThrough(channel)));
+      expect(swept).toBeDefined();
+      expect(swept!.removed).toBeGreaterThanOrEqual(0);
+      expect(cli.container(young)?.State.Status).toBe('created');
+    } finally {
+      cli.run(['rm', '-f', young]);
+    }
 
     channel.close();
     await timings.measure('end after close', () => waitUntil(() => cli.container(name) === undefined, 'the removal of the container'));

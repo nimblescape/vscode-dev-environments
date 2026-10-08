@@ -8,6 +8,7 @@
 // in the batch helper, and in the extension only for the bootstrap. Pure types and checks; no I/O, no `vscode`.
 import { LABEL_COMPOSE_SERVICE } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
+import type { EngineIdentity } from '../helperChannel/protocol';
 import type { MonitorCreated, MonitorRunSpec } from '../remoteMonitor/monitorEngine';
 import type { StartedProcess } from '../ports';
 
@@ -154,8 +155,22 @@ export interface DockerEngine {
   stop(container: string, timeoutSeconds?: number, signal?: AbortSignal): Promise<void>;
   /** Starts the container; one that runs already is left alone. */
   start(container: string, signal?: AbortSignal): Promise<void>;
-  /** Plan step 11B3: the API version (`GET /version`, for example `1.48`) and the version of the engine. */
+  /**
+   * Plan step 11B3: the API version (`GET /version`, for example `1.48`) and the version of the engine (empty when the
+   * engine names none). Plan step 11I (PR A): the version is also the answer of the worker's probe (ProbeValue).
+   */
   version(signal?: AbortSignal): Promise<{ apiVersion: string; version: string }>;
+  /**
+   * Plan step 11I (PR A): the identity of the engine (`GET /info`: its `ID` and `DockerRootDir`), which the probe of the
+   * worker answers so that the extension can check that the worker reaches the engine of the target (plan step 5, PR A).
+   * Rejects with an EngineError when the answer has no such identity (parseEngineIdentity).
+   */
+  identity(signal?: AbortSignal): Promise<EngineIdentity>;
+  /**
+   * Plan step 11I (PR A): removes the stopped containers that match `filters` (`POST /containers/prune`, as `docker
+   * container prune -f --filter …`; a running container is never removed), and answers the IDs of the removed ones.
+   */
+  pruneContainers(filters: EngineFilters, signal?: AbortSignal): Promise<string[]>;
   /** Plan step 11B3: the inspect JSON of an object (the same as `docker inspect`), or undefined when it does not exist. */
   inspect(kind: EngineObjectKind, reference: string, signal?: AbortSignal): Promise<unknown>;
   /** Plan step 11B3: the full IDs of the containers that match `filters`, stopped ones included. */

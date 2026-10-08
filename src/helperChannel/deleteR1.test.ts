@@ -79,9 +79,6 @@ function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
     progress: (step) => events.push(`progress ${step}`),
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('Delete runs no Docker CLI call.');
-    },
   };
   const containers: EngineContainer[] =
     setup.container === 'missing' ? [] : [{ id: 'c'.repeat(64), name: NAME, state: 'running', rawState: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ID }, image: `${NAME}:1` }];

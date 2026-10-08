@@ -25,6 +25,11 @@ import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 /** Plan step 5, PR A: the engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
+/**
+ * Plan step 11I (PR A): the same identity as the worker answers it (ProbeValue.engine, the values of `GET /info`); ENGINE
+ * stays the output of the extension's own Docker CLI.
+ */
+const ENGINE_IDENTITY = { id: '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11', rootDir: '/var/lib/docker' };
 const directEngine = async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false });
 /**
  * Plan step 11I1, PR B1: the former CHANNEL_OPEN_WAIT_MS (5 s; removed with HelperChannels.docker, its last user): the wait
@@ -386,8 +391,9 @@ describe('channelRunArgs and openHelperChannel', () => {
             queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
           }
           if (message?.t === 'op' && message.op === 'probe') {
-            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine).
-            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
+            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine). Plan step 11I (PR A):
+            // changed answer: as its values (before: the text of ENGINE_IDENTITY_ARGS).
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE_IDENTITY } })));
           }
         }
         return true;
@@ -435,7 +441,8 @@ describe('channelRunArgs and openHelperChannel', () => {
             const message = parseClientMessage(line);
             if (message?.t === 'hello') queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
             if (message?.t === 'op' && message.op === 'probe') {
-              queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
+              // Plan step 11I (PR A): changed answer: the engine as its values (before: the text of ENGINE_IDENTITY_ARGS).
+              queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE_IDENTITY } })));
             }
           }
           return true;
@@ -509,8 +516,9 @@ describe('channelRunArgs and openHelperChannel', () => {
             queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe'] })));
           }
           if (message?.t === 'op' && message.op === 'probe') {
-            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine).
-            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
+            // Plan step 5, PR A: changed answer: the probe names its engine (ProbeValue.engine). Plan step 11I (PR A):
+            // changed answer: as its values (before: the text of ENGINE_IDENTITY_ARGS).
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE_IDENTITY } })));
           }
         }
         return true;
@@ -588,8 +596,11 @@ describe('channelRunArgs and openHelperChannel', () => {
 
 // Plan step 5, PR A: a worker that talks to another engine is refused.
 describe('the engine identity at the open (plan step 5, PR A)', () => {
-  /** A channel process that answers hello and a probe with `engine`; `ended()` after the extension closed it. */
-  function probeProcess(engine: string | undefined) {
+  /**
+   * A channel process that answers hello and a probe with `engine`; `ended()` after the extension closed it. Plan step 11I
+   * (PR A): `engine` as the values of the worker (before: the text of ENGINE_IDENTITY_ARGS).
+   */
+  function probeProcess(engine: unknown) {
     let stdout: ((text: string) => void) | undefined;
     let ended = false;
     const process: StartedProcess = {
@@ -616,7 +627,7 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
   }
 
   it('opens for the local Docker when the engine is the one without the worker, compared in the context of the target', async () => {
-    const worker = probeProcess(ENGINE);
+    const worker = probeProcess(ENGINE_IDENTITY);
     const direct: { args: readonly string[]; context: string | undefined; timeoutMs: number | undefined }[] = [];
     const target = dockerTargetOf('unix:///run/user/1000/docker.sock', 'rootless');
     expect(target.kind).toBe('local');
@@ -643,10 +654,13 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
     channel.close();
   });
 
+  // Plan step 11I (PR A): changed cases: the engine of the worker as its values (before: the text of ENGINE_IDENTITY_ARGS),
+  // and another root folder of the same ID is another engine too.
   for (const [what, engine, directStdout] of [
-    ['another engine', '"other-id" "/var/lib/docker"', ENGINE],
+    ['another engine', { id: 'other-id', rootDir: '/var/lib/docker' }, ENGINE],
+    ['another root folder of the engine', { id: ENGINE_IDENTITY.id, rootDir: '/srv/docker' }, ENGINE],
     ['a worker that names no engine', undefined, ENGINE],
-    ['an engine that cannot be identified without the worker', ENGINE, ''],
+    ['an engine that cannot be identified without the worker', ENGINE_IDENTITY, ''],
   ] as const) {
     it(`refuses ${what}: the worker is closed, the open fails, and the next attempt waits`, async () => {
       vi.useFakeTimers();
@@ -684,6 +698,126 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  }
+});
+
+// Plan step 11I (PR A): the worker reads its identity over the Engine API, the extension with its Docker CLI; both are
+// compared as values, and the value of the worker is checked as everything that it answers.
+describe('the engine identity as values (plan step 11I, PR A)', () => {
+  /** A channel process that answers hello and a probe whose engine is `engine`; `ended()` after the extension closed it. */
+  function probeProcess(engine: unknown) {
+    let stdout: ((text: string) => void) | undefined;
+    let ended = false;
+    const process: StartedProcess = {
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) {
+          const message = parseClientMessage(line);
+          if (message?.t === 'hello') queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['probe'] })));
+          if (message?.t === 'op' && message.op === 'probe') {
+            queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine } })));
+          }
+        }
+        return true;
+      },
+      end: () => (ended = true),
+      kill: () => {},
+      onStdout: (listener) => (stdout = listener),
+      onStderr: () => {},
+      exited: new Promise(() => {}),
+    };
+    return { process, ended: () => ended };
+  }
+  const deps = (process: StartedProcess, directStdout = `${ENGINE}\n`) => ({
+    start: () => process,
+    runDirect: async () => ({ exitCode: 0, stdout: directStdout, stderr: '', timedOut: false }),
+    logger: silentLogger,
+    script: async () => 'S',
+    helperTag: async () => 't',
+    socketPath: async () => '/var/run/docker.sock',
+    stateVolume: 'devenv-session-monitor',
+  });
+
+  // Go's `{{json}}` escapes `&`, `<` and `>` (\u0026, \u003c, \u003e); the Engine API answers the plain value.
+  it('opens when the Docker CLI prints the root folder in the escapes of Go and the worker answers its plain value', async () => {
+    const worker = probeProcess({ id: 'id-1', rootDir: '/srv/docker&<data>' });
+    const channel = await openHelperChannel(deps(worker.process, '"id-1" "/srv/docker\\u0026\\u003cdata\\u003e"\n'), REMOTE);
+    expect(channel.isOpen).toBe(true);
+    channel.close();
+  });
+
+  it('names both engines when they differ, each part as a JSON string', async () => {
+    const worker = probeProcess({ id: 'other\nid', rootDir: '/var/lib/docker' });
+    await expect(openHelperChannel(deps(worker.process), REMOTE)).rejects.toThrow(
+      'The helper channel to build-box was closed: it reaches another Docker engine ("other\\nid" "/var/lib/docker") than the Docker calls without it ("7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker").',
+    );
+    expect(worker.ended()).toBe(true);
+  });
+
+  it('refuses a worker whose engine is no identity: an invalid answer, never compared', async () => {
+    for (const engine of [ENGINE, { id: '', rootDir: '/var/lib/docker' }, { ...ENGINE_IDENTITY, extra: 1 }, { id: ENGINE_IDENTITY.id, rootDir: 'r'.repeat(1_025) }]) {
+      const worker = probeProcess(engine);
+      await expect(openHelperChannel(deps(worker.process), REMOTE), JSON.stringify(engine)).rejects.toThrow('The helper channel to build-box does not reach Docker: an invalid answer');
+      expect(worker.ended()).toBe(true);
+    }
+  });
+});
+
+// Review round 4 (M1): the sweep of never-started channel containers after the open. Plan step 11I (PR A, O1): sent with
+// the parameters of its schema (none), and its value checked (parseSweepValue).
+describe('the sweep at the open (review round 4, M1; plan step 11I, PR A)', () => {
+  function sweepProcess(sweep: Record<string, unknown>) {
+    let stdout: ((text: string) => void) | undefined;
+    const sent: Array<{ op: string; params: unknown }> = [];
+    const process: StartedProcess = {
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) {
+          const message = parseClientMessage(line);
+          if (message?.t === 'hello') queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['probe', 'sweep'] })));
+          if (message?.t !== 'op') continue;
+          sent.push({ op: message.op, params: message.params });
+          const result = message.op === 'probe' ? { ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE_IDENTITY } } : sweep;
+          queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ...result } as never)));
+        }
+        return true;
+      },
+      end: () => {},
+      kill: () => {},
+      onStdout: (listener) => (stdout = listener),
+      onStderr: () => {},
+      exited: new Promise(() => {}),
+    };
+    return { process, sent };
+  }
+
+  for (const [what, sweep, expected] of [
+    ['logs how many it removed', { ok: true, value: { removed: 2 } }, ['info Removed 2 stopped helper channel containers on build-box.']],
+    ['logs one removed container', { ok: true, value: { removed: 1 } }, ['info Removed 1 stopped helper channel container on build-box.']],
+    ['logs nothing when it removed none', { ok: true, value: { removed: 0 } }, []],
+    // The value of before (the output of `docker container prune`) is no value any more.
+    ['warns about a value that is not one', { ok: true, value: { output: 'Deleted Containers:' } }, ['warn The worker on build-box answered the removal of the stopped helper channel containers with an invalid value.']],
+    [
+      'logs a failure',
+      { ok: false, error: { code: 'failed', message: 'a prune operation is already running' }, cancelled: false, timedOut: false },
+      ['info The stopped helper channel containers on build-box could not be removed: a prune operation is already running'],
+    ],
+  ] as const) {
+    it(`sends the probe and the sweep without parameters, and ${what}`, async () => {
+      const worker = sweepProcess(sweep);
+      const lines: string[] = [];
+      const logger: Logger = { ...silentLogger, info: (text) => lines.push(`info ${text}`), warn: (text) => lines.push(`warn ${text}`) };
+      const channel = await openHelperChannel(
+        { start: () => worker.process, runDirect: directEngine, logger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
+        REMOTE,
+      );
+      for (let i = 0; i < 20 && worker.sent.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(worker.sent).toEqual([
+        { op: 'probe', params: {} },
+        { op: 'sweep', params: {} },
+      ]);
+      expect(lines.filter((line) => line.includes('stopped helper channel container'))).toEqual(expected);
+      channel.close();
     });
   }
 });

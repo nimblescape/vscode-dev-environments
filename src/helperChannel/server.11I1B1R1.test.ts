@@ -6,37 +6,23 @@
 // it exits. On origin/main the cleanup tests covered this (they waited for `docker rm`); without the cleanup, a shutdown
 // that exits at once (Promise.all of the runs dropped) survived the remaining tests.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CHANNEL_KILL_GRACE_MS, encodeMessage, type ServerMessage } from '../core/helperChannel/protocol';
-import { ChannelServer, type OperationHandler, type ServerChild } from './server';
+import { encodeMessage, type ServerMessage } from '../core/helperChannel/protocol';
+import { ChannelServer, type OperationHandler } from './server';
 
 function setup(operations: Record<string, OperationHandler>) {
   const messages: ServerMessage[] = [];
   const exits: number[] = [];
-  const children: { signals: string[]; exit: () => void }[] = [];
+  // Plan step 11I (PR A): changed setup: no `spawnDocker` (the server starts no Docker call any more).
   const server = new ChannelServer({
     write: (text) => {
       for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
       return true;
     },
-    spawnDocker: (): ServerChild => {
-      let resolveExit!: (value: { exitCode: number | null }) => void;
-      const exited = new Promise<{ exitCode: number | null }>((resolve) => (resolveExit = resolve));
-      const entry = { signals: [] as string[], exit: () => resolveExit({ exitCode: null }) };
-      children.push(entry);
-      return {
-        end: () => {},
-        kill: (signal) => {
-          entry.signals.push(signal);
-          if (signal === 'SIGKILL') entry.exit();
-        },
-        exited,
-      };
-    },
     operations,
     exit: (code) => exits.push(code),
   });
   server.start();
-  return { server, messages, exits, children };
+  return { server, messages, exits };
 }
 
 describe('ChannelServer end of input (11I1 B1 review probe)', () => {
@@ -57,16 +43,7 @@ describe('ChannelServer end of input (11I1 B1 review probe)', () => {
     expect(messages.find((message) => message.t === 'result')).toMatchObject({ id: 1, ok: false, error: { code: 'cancelled' } });
   });
 
-  it('exits only after its Docker call ended (SIGKILL after the grace), not before', async () => {
-    const { server, exits, children } = setup({ run: async (_params, context) => (await context.docker(['run', 'img']), {}) });
-    server.input(encodeMessage({ t: 'op', id: 1, op: 'run', params: null }));
-    await vi.advanceTimersByTimeAsync(0);
-    server.inputEnded();
-    await vi.advanceTimersByTimeAsync(CHANNEL_KILL_GRACE_MS - 1);
-    expect(children[0].signals).toEqual(['SIGTERM']);
-    expect(exits).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(children[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
-    expect(exits).toEqual([0]);
-  });
+  // Plan step 11I (PR A): 'exits only after its Docker call ended (SIGKILL after the grace), not before' is deleted with
+  // the Docker calls of the server (OperationContext.docker); the wait for the result of a handler that ends late, the
+  // rule that it checked through such a call, is the test above.
 });

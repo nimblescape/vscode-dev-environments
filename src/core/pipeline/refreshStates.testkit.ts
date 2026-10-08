@@ -3,8 +3,10 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 5, PR C: one Docker engine as a table of answers, for the refresh over the worker's EngineDocker
-// (fixtureEngine) and the operation `refresh` over the fake Docker CLI of the server tests (refreshFixture). Plan step
-// 11I2: the ProcessRunner over refreshFixture (FixtureRunner, for the removed CLI adapter ContainerAdapter) is gone.
+// (fixtureEngine). Plan step 11I2: the ProcessRunner over refreshFixture (FixtureRunner, for the removed CLI adapter
+// ContainerAdapter) is gone. Plan step 11I (PR A): so are its answers to the fake Docker CLI of the server tests (`ps`,
+// `container inspect`, `volume ls`, `volume inspect`), whose last user went with OperationContext.docker; the answer of
+// the branch of a container (execAnswer) stays, for the exec of fixtureEngine.
 import { mapContainerState } from '../docker/dockerObjects';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import type { DockerEngine } from '../worker/dockerEngine';
@@ -81,62 +83,32 @@ const UNLABELLED_VOLUMES = new Set(['devenv-web-vol']);
 
 const BRANCH_COMMAND = ['git', '-c', 'safe.directory=*', '-C'];
 
-export interface FixtureAnswer {
+interface FixtureAnswer {
   exitCode: number;
   stdout: string;
   stderr: string;
 }
 
-/** The answer of the engine of the fixture to `docker <args>`. Anything unknown fails (exit code 125). */
-export function refreshFixture(args: readonly string[]): FixtureAnswer {
+/**
+ * The answer of the engine of the fixture to a process `command` as `user` in `container` (as `docker exec [-u <user>]
+ * <container> <command>` answered it): the branch of a running dev container. Anything else fails (exit code 125).
+ */
+function execAnswer(container: string, user: string | undefined, command: readonly string[]): FixtureAnswer {
   const ok = (stdout: string): FixtureAnswer => ({ exitCode: 0, stdout, stderr: '' });
-  const key = args.join(' ');
-  if (key === `ps -a --no-trunc --filter label=${LABEL_ENVIRONMENT_ID} --format {{json .ID}}`) {
-    return ok(CONTAINERS.map((container) => `${JSON.stringify(container.id)}\n`).join(''));
+  if (command.slice(0, 4).join(' ') !== BRANCH_COMMAND.join(' ') || command.slice(5).join(' ') !== 'branch --show-current') {
+    return { exitCode: 125, stdout: '', stderr: 'unexpected exec' };
   }
-  if (args[0] === 'container' && args[1] === 'inspect' && !args.includes('--format')) {
-    const wanted = args.slice(2);
-    const items = CONTAINERS.filter((container) => wanted.includes(container.id)).map((container) => ({
-      Id: container.id,
-      Name: `/${container.name}`,
-      State: { Status: container.status },
-      Config: { Image: 'img', Labels: container.labels },
-      Mounts: [],
-    }));
-    return ok(JSON.stringify(items));
+  if (container === 'devenv-api') {
+    return user === 'node' && command[4] === '/workspaces/api' ? ok('feature/x\n') : { exitCode: 125, stdout: '', stderr: 'wrong user' };
   }
-  if (key === `volume ls --filter label=${LABEL_ENVIRONMENT_ID} --format {{json .Name}}`) {
-    return ok(Object.keys(LABELLED_VOLUMES).map((name) => `${JSON.stringify(name)}\n`).join(''));
-  }
-  if (args[0] === 'volume' && args[1] === 'inspect' && args[2] === '--format') {
-    const name = args[4];
-    if (name in LABELLED_VOLUMES || UNLABELLED_VOLUMES.has(name)) return ok(`${JSON.stringify(name)}\n`);
-    return { exitCode: 1, stdout: '', stderr: `Error response from daemon: get ${name}: no such volume\n` };
-  }
-  if (args[0] === 'volume' && args[1] === 'inspect') {
-    const items = args.slice(2).filter((name) => name in LABELLED_VOLUMES).map((name) => ({ Name: name, Labels: LABELLED_VOLUMES[name] }));
-    return ok(JSON.stringify(items));
-  }
-  if (args[0] === 'exec') {
-    const at = args.indexOf('git');
-    const options = args.slice(1, at - 1);
-    const container = args[at - 1];
-    if (args.slice(at, at + 4).join(' ') !== BRANCH_COMMAND.join(' ') || args.slice(at + 5).join(' ') !== 'branch --show-current') {
-      return { exitCode: 125, stdout: '', stderr: 'unexpected exec' };
-    }
-    if (container === 'devenv-api') {
-      return options.join(' ') === '-u node' && args[at + 4] === '/workspaces/api' ? ok('feature/x\n') : { exitCode: 125, stdout: '', stderr: 'wrong user' };
-    }
-    if (container === 'devenv-detached') return ok('\n');
-    if (container === 'devenv-git-fails') return { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' };
-    return { exitCode: 125, stdout: '', stderr: `unexpected exec in ${container}` };
-  }
-  return { exitCode: 125, stdout: '', stderr: `unexpected call: docker ${key}` };
+  if (container === 'devenv-detached') return ok('\n');
+  if (container === 'devenv-git-fails') return { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' };
+  return { exitCode: 125, stdout: '', stderr: `unexpected exec in ${container}` };
 }
 
 /**
  * Plan step 11C1, review round 1 (B-R1-2): the same engine as a DockerEngine port (the refresh of the worker over
- * EngineDocker); its exec answers as refreshFixture answers `docker exec`. Records the exec calls with their options.
+ * EngineDocker); its exec answers the branch of a container (execAnswer). Records the exec calls with their options.
  */
 export function fixtureEngine(): { engine: DockerEngine; execs: { container: string; user?: string; signal?: AbortSignal }[] } {
   const execs: { container: string; user?: string; signal?: AbortSignal }[] = [];
@@ -160,7 +132,7 @@ export function fixtureEngine(): { engine: DockerEngine; execs: { container: str
     },
     exec: async (container, command, options = {}) => {
       execs.push({ container, user: options.user, signal: options.signal });
-      return { ...refreshFixture(['exec', ...(options.user ? ['-u', options.user] : []), container, ...command]), timedOut: false };
+      return { ...execAnswer(container, options.user, command), timedOut: false };
     },
   };
   return { engine, execs };

@@ -26,7 +26,7 @@ import { errorMessage } from '../core/errors';
 import { readableStderr } from '../core/loader/pipeLoader';
 import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
 import * as crypto from 'crypto';
-import { hasTagOrDigest, StreamRedactor } from '../core/helperChannel/protocol';
+import { hasTagOrDigest, parseEngineIdentity, StreamRedactor } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
 import { firstTarFile } from '../core/docker/tarFile';
 import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
@@ -180,6 +180,22 @@ export function dockerEngine(
     version: async (signal) => {
       const value = (await list('/version', signal)) as { ApiVersion?: unknown; Version?: unknown };
       return { apiVersion: typeof value?.ApiVersion === 'string' ? value.ApiVersion : '', version: typeof value?.Version === 'string' ? value.Version : '' };
+    },
+    // Plan step 11I (PR A): the identity of the probe, checked as the extension checks it (parseEngineIdentity).
+    identity: async (signal) => {
+      const value = (await list('/info', signal)) as { ID?: unknown; DockerRootDir?: unknown } | null;
+      const identity = parseEngineIdentity({ id: value?.ID, rootDir: value?.DockerRootDir });
+      if (identity === undefined) throw new EngineError('The engine answered /info without its ID and root folder.', 200);
+      return identity;
+    },
+    // Plan step 11I (PR A): the prune of the sweep; `ContainersDeleted` is null when nothing was removed.
+    pruneContainers: async (filters, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/prune?${filtersQuery(filters)}`, signal });
+      if (answer.status !== 200) fail(answer);
+      if (answer.truncated) throw new EngineError('The engine answered the prune of the containers with more than can be read.', answer.status);
+      const deleted = (json(answer.body) as { ContainersDeleted?: unknown } | undefined)?.ContainersDeleted;
+      if (deleted !== null && !Array.isArray(deleted)) throw new EngineError('The engine answered the prune of the containers with an invalid value.', answer.status);
+      return texts(deleted).filter((id) => id !== '');
     },
     inspect,
     containerIds,

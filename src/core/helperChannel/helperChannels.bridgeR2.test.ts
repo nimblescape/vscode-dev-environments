@@ -12,6 +12,8 @@ import { CHANNEL_PROTOCOL_VERSION, encodeMessage, parseClientMessage } from './p
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
+/** Plan step 11I (PR A): the same engine as the worker answers it (ProbeValue.engine: the values of `GET /info`). */
+const ENGINE_IDENTITY = { id: '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11', rootDir: '/var/lib/docker' };
 
 /** A channel process that answers hello and the probe. */
 function good(): StartedProcess {
@@ -22,7 +24,8 @@ function good(): StartedProcess {
         const message = parseClientMessage(line);
         if (message?.t === 'hello') queueMicrotask(() => stdout?.(encodeMessage({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24', ops: ['docker', 'probe', 'sweep'] })));
         if (message?.t === 'op' && message.op === 'probe') {
-          queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE } })));
+          // Plan step 11I (PR A): changed answer: the engine as its values (before: the text of ENGINE_IDENTITY_ARGS).
+          queueMicrotask(() => stdout?.(encodeMessage({ t: 'result', id: message.id, ok: true, value: { serverVersion: '27.1.0', detail: 'Docker 27.1.0', engine: ENGINE_IDENTITY } })));
         }
       }
       return true;

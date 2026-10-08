@@ -22,7 +22,7 @@ import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError } from '../core/ports';
 import { BATCH_MISSING_VOLUME_CODE, workerBatchSession, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
-import { ChannelServer, OperationError, type ContextDockerOptions, type OperationContext, type ServerChild } from './server';
+import { ChannelServer, OperationError, type OperationContext } from './server';
 import type { DockerEngine, EngineAttachedOptions, EngineAttachedRun, EngineAttachedSpec } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { contextSecrets } from './operationContext.testkit';
@@ -98,9 +98,16 @@ interface SetupOptions {
 
 /**
  * The helper process behind the run of the fake engine: its input stays open. Plan step 11G3: its own type (was a
- * ServerChild of the worker's `docker run`, whose `write` is removed with it).
+ * ServerChild of the worker's `docker run`, whose `write` is removed with it). Plan step 11I (PR A): written out, as
+ * ServerChild is gone with the Docker calls of the server.
  */
-type HelperChild = ServerChild & { write(text: string): boolean };
+interface HelperChild {
+  write(text: string): boolean;
+  /** Writes the input (if any) and closes the standard input. */
+  end(input?: string): void;
+  kill(signal: 'SIGTERM' | 'SIGKILL'): void;
+  readonly exited: Promise<{ exitCode: number | null; error?: string }>;
+}
 
 function setup(options: SetupOptions = {}) {
   const calls: string[][] = [];
@@ -116,9 +123,9 @@ function setup(options: SetupOptions = {}) {
   const progress: string[] = [];
   const bundles: string[] = [];
   const servers: ChannelServer[] = [];
-  // Review round 1 of PR #80 (B-R1-11, B-R1-12): what the helper child saw, and the options of the worker's Docker calls.
+  // Review round 1 of PR #80 (B-R1-11, B-R1-12): what the helper child saw. Plan step 11I (PR A): the options of the
+  // worker's Docker calls are gone with OperationContext.docker (the operation cannot make one).
   const helperEvents: Array<{ event: string; at: number }> = [];
-  const dockerOptions: Array<{ args: readonly string[]; options: ContextDockerOptions | undefined }> = [];
   let helperExit: ((code: number | null) => void) | undefined;
   const helperDeps: BatchHelperDeps = {
     spawnStep: (command, env, input, onStdout, onStderr) => {
@@ -176,12 +183,10 @@ function setup(options: SetupOptions = {}) {
         onStdout(text);
         return true;
       },
-      spawnDocker: () => {
-        throw new Error('The helper runs no Docker call of its own.');
-      },
+      // Plan step 11I (PR A): no `spawnDocker` (the server starts no Docker call) and no `killGraceMs` (the grace of the
+      // SIGKILL of such a call; the hard deadline of the shutdown is SHUTDOWN_DEADLINE_MS, which no test here reaches).
       operations: batchHelperOperations(helperDeps),
       exit: (code) => resolveExit({ exitCode: code }),
-      killGraceMs: 50,
     });
     servers.push(helper);
     helper.start();
@@ -308,8 +313,9 @@ function setup(options: SetupOptions = {}) {
   const deps: BatchDeps = { engineOf: () => engine, readScript: () => HELPER_SCRIPT, ...options.deps };
   // Plan step 11I1, PR B1: changed setup: the session is the worker's own (workerBatchSession) within a fake operation
   // of the worker (was: HelperChannel.batch of the extension through the worker's ChannelServer with `batch`, `batchStep`
-  // and `batchChunk`); its log lines and progress are recorded, and the Docker calls of the operation (none: it runs over
-  // the port of the engine) with their options.
+  // and `batchChunk`); its log lines and progress are recorded. Plan step 11I (PR A): changed setup: no record of the
+  // Docker calls of the operation (OperationContext.docker is removed, so it cannot make one; it runs over the port of
+  // the engine).
   const operation = new AbortController();
   const context: OperationContext = {
     signal: operation.signal,
@@ -317,11 +323,6 @@ function setup(options: SetupOptions = {}) {
     progress: (step, detail) => progress.push(detail === undefined ? step : `${step} ${detail}`),
     log: (text) => logLines.push(text),
     output: () => {},
-    docker: async (args, dockerOptionsOfCall) => {
-      calls.push(['docker', ...args]);
-      dockerOptions.push({ args, options: dockerOptionsOfCall });
-      throw new Error('Plan step 11G3: the batch helper runs no Docker call of the worker.');
-    },
   };
   /** Opens a session of `p` (default: the volume, image and socket of the tests); `signal` ends its open. */
   const open = (p: { volume: string; image: string; socket: string } = { volume: VOLUME, image: IMAGE, socket: SOCKET }, signal?: AbortSignal) =>
@@ -341,7 +342,6 @@ function setup(options: SetupOptions = {}) {
     servers,
     deps,
     helperEvents,
-    dockerOptions,
     open,
     end: () => operation.abort(),
     helperDeps,
@@ -394,7 +394,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(t.runs[0].spec.labels[channelStepLabel(session.session).split('=')[0]]).toBe(session.session);
     expect(Object.keys(t.runs[0].spec)).not.toContain('env');
     expect(t.runs[0].options.signal).toBeDefined();
-    expect(t.calls.filter((call) => call[0] === 'docker')).toEqual([]);
+    // Plan step 11I (PR A): changed expectation: no check that the context got no Docker call (OperationContext.docker is
+    // removed, so the session cannot make one); the run of the port above is the only start.
     // The helper got the script of the worker as its first line (the pipe loader).
     expect(t.bundles).toEqual([JSON.stringify(HELPER_SCRIPT)]);
     await session.step('listConfigs', { repository: 'octo/hello' });
@@ -955,7 +956,6 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       progress: () => {},
       log: () => {},
       output: () => {},
-      docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
     };
     const first = operations.listConfigs({ repository: 'octo/hello' }, context);
     await expect(operations.readFiles({ repository: 'octo/hello', configPath: 'a.json' }, context)).rejects.toMatchObject({ code: 'busy' });
@@ -1013,7 +1013,8 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     const { t } = await started();
     // Plan step 11G3: changed expectation: the helper is no Docker call of the worker anymore (its output goes only to the
     // client of its channel, over the attached run of the port), so no call keeps its output (was: `discardStdout`).
-    expect(t.dockerOptions).toEqual([]);
+    // Plan step 11I (PR A): changed expectation: no check of the options of the Docker calls of the operation (there are
+    // none to keep: OperationContext.docker is removed); the helper is the one run of the port.
     expect(t.calls.filter((call) => call[0] === 'run')).toHaveLength(1);
   });
 
@@ -1112,6 +1113,7 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     const session = t.runs[0].spec.labels['nimblescape.devenv.channel-step'];
     expect(t.calls).toContainEqual(['ps', channelStepLabel(session)]);
     expect(t.calls).toContainEqual(['rm', '0123456789abcdef0123456789abcdef']);
-    expect(t.calls.filter((call) => call[0] === 'docker')).toEqual([]);
+    // Plan step 11I (PR A): changed expectation: no check that the context got no Docker call (OperationContext.docker is
+    // removed, so the session cannot make one).
   }, 30_000);
 });

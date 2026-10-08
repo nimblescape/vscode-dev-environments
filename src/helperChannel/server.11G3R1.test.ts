@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeMessage } from '../core/helperChannel/protocol';
 import { OPERATIONS } from './operations';
-import { ChannelServer, type OperationHandler, type ServerChild } from './server';
+import { ChannelServer, type OperationHandler } from './server';
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -16,10 +16,6 @@ describe('the pausable output of an operation (plan step 11G3, review B)', () =>
   it('resumes a target that is still paused when its operation ends without removing it', async () => {
     let congested = false;
     const outputs: Array<(text: string) => void> = [];
-    const spawnDocker = (_args: readonly string[], onStdout: (text: string) => void): ServerChild => {
-      outputs.push(onStdout);
-      return { end: () => {}, kill: () => {}, exited: new Promise(() => {}) } as unknown as ServerChild;
-    };
     const events: string[] = [];
     let endHolder: (() => void) | undefined;
     const holder: OperationHandler = (_params, context) => {
@@ -28,13 +24,14 @@ describe('the pausable output of an operation (plan step 11G3, review B)', () =>
       return new Promise((resolve) => (endHolder = () => resolve({})));
     };
     // Plan step 11I1, PR B1: a Docker call whose output goes back as it comes (before: the removed operation `docker`).
-    const logs: OperationHandler = async (_params, context) => {
-      await context.docker(['logs', 'c'], { onStdout: (text) => context.output('stdout', text) });
-      return {};
+    // Plan step 11I (PR A): changed setup: an operation whose output goes back as it comes (OperationContext.output),
+    // and that runs until the test ends (before: the Docker call of the server, gone with OperationContext.docker).
+    const logs: OperationHandler = (_params, context) => {
+      outputs.push((text) => context.output('stdout', text));
+      return new Promise(() => {});
     };
     const server = new ChannelServer({
       write: () => true,
-      spawnDocker,
       operations: { ...OPERATIONS, holder, logs },
       exit: () => {},
       congested: () => congested,

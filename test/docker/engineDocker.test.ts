@@ -7,10 +7,12 @@
 // the CLI side is the Docker CLI of the test harness (`docker inspect` and friends, read with the pipeline's reading of
 // the inspect JSON, dockerObjects.ts) instead of the removed CLI adapter ContainerAdapter, which read it the same way.
 // Also what only the API way does: the labels of an image by a commit, and (plan step 11G1) the read of a file of an
-// image without running anything.
+// image without running anything. Plan step 11I (PR A): and what the probe and the sweep of the worker read and do over
+// the port (the version, the identity of the engine, the prune), against what the Docker CLI reports.
 import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { ENGINE_IDENTITY_ARGS, engineIdentity } from '../../src/core/helperChannel/protocol';
 import { mapContainerState, publicInfo, toContainerInfo, toLabels, toVolumeInfo, type ContainerInfo } from '../../src/core/docker/dockerObjects';
 import { helperDockerSocket } from '../../src/core/helper/workspaceHelper';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
@@ -164,6 +166,32 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     for (const stopped of [viaCli([target, 'id']), await apiDocker.exec(target, ['id'])]) {
       expect(stopped.exitCode).not.toBe(0);
       expect(stopped.stderr).toMatch(/is not running/);
+    }
+  });
+
+  // Plan step 11I (PR A): the requests of the probe and the sweep of the worker (before: its own Docker CLI): the version
+  // and the identity of the engine as the Docker CLI reports them (the identity as values, as the open compares them),
+  // and the prune of the stopped containers of filters: never a running one, never one younger than `until`.
+  it('plan step 11I (PR A): the version, the identity and the prune of the probe and the sweep, as the Docker CLI sees them', async () => {
+    const engine = dockerEngine(engineApi(socket), engineHijack(socket));
+    expect((await engine.version()).version).toBe(cli.ok(['version', '--format', '{{.Server.Version}}']));
+    const identity = await engine.identity();
+    expect(identity.id).not.toBe('');
+    expect(identity).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
+    // A label of this test alone, so that no prune here reaches another container of the run or of the user.
+    const pruneLabel = `devenv-test.prune=${tag}`;
+    const stopped = cli.ok(['create', '--name', `${name}-prune-stopped`, '--label', runLabel, '--label', pruneLabel, TEST_BASE_IMAGE, 'true']);
+    cli.ok(['run', '-d', '--name', `${name}-prune-running`, '--network', 'none', '--init', '--label', runLabel, '--label', pruneLabel, TEST_BASE_IMAGE, 'sleep', '600']);
+    try {
+      // Both are younger than 10 minutes, the age of the sweep (SWEEP_MIN_AGE): it keeps them.
+      expect(await engine.pruneContainers({ label: [pruneLabel], until: ['10m'] })).toEqual([]);
+      expect(cli.container(`${name}-prune-stopped`)).toBeDefined();
+      // Without the age: only the stopped one goes, named by its full ID.
+      expect(await engine.pruneContainers({ label: [pruneLabel] })).toEqual([stopped]);
+      expect(cli.container(`${name}-prune-stopped`)).toBeUndefined();
+      expect(cli.container(`${name}-prune-running`)?.State.Running).toBe(true);
+    } finally {
+      cli.run(['rm', '-f', `${name}-prune-stopped`, `${name}-prune-running`]);
     }
   });
 

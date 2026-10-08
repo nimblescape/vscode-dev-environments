@@ -223,9 +223,6 @@ export async function inProcessBatches(context: Pick<DockerTestContext, 'cli' | 
     progress: () => {},
     log: (text, level) => (level === 'warn' ? log.warn(text) : log.info(text)),
     output: () => {},
-    docker: async () => {
-      throw new Error('Plan step 11I1: the batch helper runs no Docker call of the worker.');
-    },
   };
   const engine = dockerEngine(engineApi(socket), engineHijack(socket));
   const deps = { engineOf: () => engine, readScript: () => script };

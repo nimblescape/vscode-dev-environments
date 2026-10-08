@@ -49,9 +49,6 @@ function context(): OperationContext {
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('No Docker CLI call.');
-    },
   };
 }
 

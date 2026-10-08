@@ -31,7 +31,7 @@ import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { flowHost, tokenRemoveOperation } from './flowOperations';
 import { hostRegistryCredentials, registryLogins } from '../core/worker/workerServices';
 import { silentLogger } from '../core/ports';
-import { ChannelServer, OperationError, type OperationContext, type OperationHandler, type ServerChild } from './server';
+import { ChannelServer, OperationError, type OperationContext, type OperationHandler } from './server';
 
 function setup(operations: Record<string, OperationHandler>) {
   const messages: ServerMessage[] = [];
@@ -39,9 +39,6 @@ function setup(operations: Record<string, OperationHandler>) {
     write: (text) => {
       for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
       return true;
-    },
-    spawnDocker: (): ServerChild => {
-      throw new Error('no Docker call in these tests');
     },
     operations,
     exit: () => {},
@@ -506,7 +503,6 @@ describe('the secrets of the worker operations (plan step 11A)', () => {
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
   };
 
   it('B-R1-16: a step that takes the token refuses another secret beside it', async () => {
@@ -526,39 +522,6 @@ describe('named secrets and requests: review round 2 (plan step 11A)', () => {
   afterEach(() => {
     vi.useRealTimers();
   });
-
-  /** A server whose Docker calls print `print` and end when `release` is called. */
-  function setupWithDocker(operations: Record<string, OperationHandler>, print = '') {
-    const messages: ServerMessage[] = [];
-    let release: () => void = () => {};
-    const server = new ChannelServer({
-      write: (text) => {
-        for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
-        return true;
-      },
-      spawnDocker: (_args, onStdout, onStderr): ServerChild => {
-        let resolve!: (value: { exitCode: number | null }) => void;
-        const exited = new Promise<{ exitCode: number | null }>((r) => (resolve = r));
-        release = () => resolve({ exitCode: 0 });
-        return {
-          end: () => {
-            if (print !== '') {
-              onStdout(`${print}\n`);
-              onStderr(`${print}\n`);
-            }
-          },
-          kill: () => resolve({ exitCode: null }),
-          exited,
-        };
-      },
-      operations,
-      exit: () => {},
-    });
-    server.start();
-    const send = (message: ClientMessage) => server.input(encodeMessage(message));
-    const of = (id: number) => messages.filter((message) => 'id' in message && message.id === id);
-    return { send, of, release: () => release() };
-  }
 
   it('A-R2-1: redactValue sends what JSON sends for an object with toJSON (a Date, a Buffer)', () => {
     const date = new Date('2026-10-03T00:00:00.000Z');
@@ -608,24 +571,23 @@ describe('named secrets and requests: review round 2 (plan step 11A)', () => {
     expect(resultOf(1)).toMatchObject({ ok: true, value: { refusedAt: MAX_MASKED_SECRETS - 1, code: 'invalid' } });
   });
 
-  it('B-R2-4 to B-R2-7: the old value of a redefined name stays masked in output, Docker output and log, and failure messages', async () => {
-    const { send, of, release } = setupWithDocker(
-      {
-        run: async (_params, context) => {
-          await context.ask('secret', null);
-          context.output('stdout', 'out old-token-1\n');
-          const docker = context.docker(['ps'], { stream: true });
-          release();
-          const result = await docker;
-          throw new OperationError('failed', `x old-token-1 ${result.stderr.includes('***') ? 'masked' : 'plain'}`);
-        },
-        plain: async (_params, context) => {
-          await context.ask('secret', null);
-          throw new Error('raw old-token-1');
-        },
+  // Plan step 11I (PR A): changed test (before: also the output and the log lines of a streamed Docker call, and its kept
+  // error output in the failure message, which are gone with OperationContext.docker): the output on both streams and
+  // the log of the operation itself.
+  it('B-R2-4 to B-R2-7: the old value of a redefined name stays masked in output and log, and failure messages', async () => {
+    const { send, of } = setup({
+      run: async (_params, context) => {
+        await context.ask('secret', null);
+        context.output('stdout', 'out old-token-1\n');
+        context.output('stderr', 'err old-token-1\n');
+        context.log('log old-token-1');
+        throw new OperationError('failed', 'x old-token-1');
       },
-      'docker old-token-1',
-    );
+      plain: async (_params, context) => {
+        await context.ask('secret', null);
+        throw new Error('raw old-token-1');
+      },
+    });
     send({ t: 'op', id: 1, op: 'run', params: null, secrets: { token: 'old-token-1' } });
     send({ t: 'op', id: 2, op: 'plain', params: null, secrets: { token: 'old-token-1' } });
     await vi.advanceTimersByTimeAsync(0);
@@ -634,27 +596,51 @@ describe('named secrets and requests: review round 2 (plan step 11A)', () => {
     await vi.advanceTimersByTimeAsync(10);
     const text = JSON.stringify([...of(1), ...of(2)]);
     expect(text).not.toContain('old-token-1');
-    expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { message: 'x *** masked' } });
+    // Plan step 11I (PR A): changed expectation: each stream and the log line, masked (before: the output of the Docker
+    // call, and `masked` in the failure for its kept error output).
+    expect(of(1).filter((message) => message.t === 'out')).toEqual([
+      { t: 'out', id: 1, stream: 'stdout', data: 'out ***\n' },
+      { t: 'out', id: 1, stream: 'stderr', data: 'err ***\n' },
+    ]);
+    expect(of(1).find((message) => message.t === 'log')).toMatchObject({ text: 'log ***' });
+    expect(of(1).at(-1)).toMatchObject({ t: 'result', ok: false, error: { message: 'x ***' } });
     expect(of(2).at(-1)).toMatchObject({ t: 'result', ok: false, error: { message: 'raw ***' } });
   });
 
-  it('B-R2-2: no request goes out while the operation ends (its Docker call still running)', async () => {
+  // Plan step 11I (PR A): changed test (before: 'B-R2-2: no request goes out while the operation ends (its Docker call
+  // still running)': the window was the wait for a Docker call that the operation left running, which the server ended
+  // before the result, gone with OperationContext.docker). The window that stays: at the end of the run the server resumes
+  // the output that it paused for the operation (OperationContext.pausable, while the connection is congested); a request
+  // made there is refused with an AbortError and never sent.
+  it('B-R2-2: no request goes out while the operation ends (its paused output is resumed then)', async () => {
+    const messages: ServerMessage[] = [];
+    let congested = false;
     let late: Promise<unknown> | undefined;
-    let ask: ((kind: 'local', payload: unknown) => Promise<unknown>) | undefined;
-    const { send, of, release } = setupWithDocker({
-      leaves: async (_params, context) => {
-        void context.docker(['ps']);
-        ask = context.ask;
-        return 'done';
+    const server = new ChannelServer({
+      write: (text) => {
+        for (const line of text.split('\n').filter((part) => part !== '')) messages.push(JSON.parse(line) as ServerMessage);
+        return true;
       },
+      operations: {
+        leaves: async (_params, context) => {
+          context.pausable?.({ pause: () => {}, resume: () => (late = context.ask('local', null).catch((error: unknown) => error)) });
+          // Its own output congests the connection, so its target is paused when it ends.
+          congested = true;
+          context.output('stdout', 'output\n');
+          return 'done';
+        },
+      },
+      exit: () => {},
+      congested: () => congested,
+      onDrain: () => {},
     });
-    send({ t: 'op', id: 1, op: 'leaves', params: null });
+    server.start();
+    server.input(encodeMessage({ t: 'op', id: 1, op: 'leaves', params: null }));
     await vi.advanceTimersByTimeAsync(0);
-    late = ask!('local', null).catch((error: unknown) => error);
+    expect(messages.filter((message) => message.t === 'ask')).toEqual([]);
+    expect(late).toBeDefined();
     expect(((await late) as Error).name).toBe('AbortError');
-    release();
-    await vi.advanceTimersByTimeAsync(10);
-    expect(of(1).filter((message) => message.t === 'ask')).toEqual([]);
+    expect(messages.find((message) => message.t === 'result')).toMatchObject({ id: 1, ok: true, value: 'done' });
   });
 
   it('B-R2-3: a request whose line is longer than MAX_SERVER_LINE is refused, and one just within goes out', async () => {
@@ -718,7 +704,6 @@ describe('the tokenRemove operation (plan step 11B1)', () => {
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
   };
 
   function engineOf(running: boolean): DockerEngine {

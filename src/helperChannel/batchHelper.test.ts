@@ -59,7 +59,6 @@ function context(secret?: string, signal: AbortSignal = new AbortController().si
     progress: () => {},
     log: (text) => logs.push(text),
     output: () => {},
-    docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
   };
 }
 

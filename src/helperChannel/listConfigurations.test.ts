@@ -37,7 +37,7 @@ const OWN: OwnHelper = { image: { tag: 'devenv-helper:abc', id: `sha256:${'a'.re
 const PARAMS = { environmentId: ID, dockerHost: '', owner: { windowId: 'window-1', pid: 4242 } };
 const PATHS = ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'];
 const CONTEXT = () =>
-  ({ signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {}, docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }) }) as unknown as OperationContext;
+  ({ signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {} }) as unknown as OperationContext;
 
 interface Setup {
   /** The record that `record get` answers (null: none). */
@@ -77,9 +77,6 @@ function run(setup: Setup = {}) {
     progress: (step) => events.push(`progress ${step}`),
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('The listing runs no Docker CLI call.');
-    },
   };
   const volumeLabels = setup.volumeLabels === undefined ? { [LABEL_ENVIRONMENT_ID]: ID } : setup.volumeLabels;
   const engine: DockerEngine = {
@@ -189,7 +186,7 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
         throw new Error('no batch');
       },
     );
-    const context = { signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {}, docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }) } as unknown as OperationContext;
+    const context = { signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {} } as unknown as OperationContext;
     for (const params of [{}, { ...PARAMS, environmentId: 'x/y' }, { ...PARAMS, owner: { windowId: 'w', pid: 0 } }, { ...PARAMS, dockerHost: 'a\nb' }, { ...PARAMS, extra: 1 }]) {
       await expect(operation(params, context)).rejects.toMatchObject({ code: 'invalid' });
     }
@@ -207,7 +204,7 @@ describe('listConfigurations in the worker (plan step 11B3b)', () => {
         throw new Error('no batch');
       },
     );
-    const context = { signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {}, docker: async () => ({ exitCode: 0, stdout: '', stderr: '' }) } as unknown as OperationContext;
+    const context = { signal: new AbortController().signal, ...contextSecrets({}), progress: () => {}, log: () => {}, output: () => {} } as unknown as OperationContext;
     await expect(operation(PARAMS, context)).rejects.toMatchObject({ code: LOCK_UNAVAILABLE_CODE, message: expect.stringContaining('no socket mount') });
   });
 });

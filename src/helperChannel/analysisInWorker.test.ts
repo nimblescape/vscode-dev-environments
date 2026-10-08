@@ -88,9 +88,6 @@ describe('the analysis thread in the worker (plan step 11E2)', () => {
       progress: () => {},
       log: (text: string, level?: string) => lines.push(`${level ?? 'info'}: ${text}`),
       output: () => {},
-      docker: async () => {
-        throw new Error('No Docker CLI call.');
-      },
     } satisfies OperationContext;
     // The unit tests' stub of `devenv:analysis-script` throws (analysisScript.stub.ts).
     const result = await workerAnalyzer(context).analyze({ kind: 'hostAccess', checksOn: true, input: { ownVolume: 'own' } });
@@ -108,9 +105,6 @@ describe('the analysis thread in the worker (plan step 11E2)', () => {
       progress: () => {},
       log: () => {},
       output: () => {},
-      docker: async () => {
-        throw new Error('No Docker CLI call.');
-      },
     } satisfies OperationContext;
   }
 

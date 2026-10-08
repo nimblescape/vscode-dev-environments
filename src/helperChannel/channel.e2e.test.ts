@@ -4,39 +4,75 @@
 
 // The helper channel end to end without a Docker engine (user request 2026-09-28): the real loader (the pipe loader of plan
 // step 3, with a script path in a temporary folder) and the script bundled as esbuild.mjs does, in a Node.js process of this
-// computer, with a fake `docker` on PATH that records its calls. The extension's side is the real HelperChannel on
-// NodeProcessRunner.start. Checked above all: the script ends by itself when the connection is lost (the end of its
-// input, silence), and ends the Docker calls that still run before. The same with the real container:
-// test/docker/helperChannel.test.ts. Plan step 11I1, PR B1: the operation `docker` and the removal of the containers of
-// its cleanup label are gone; a running call is the prune of the operation `sweep`, which the fake `docker` holds.
+// computer. The extension's side is the real HelperChannel on NodeProcessRunner.start. Checked above all: the script ends
+// by itself when the connection is lost (the end of its input, silence), and ends the calls that still run before. The
+// same with the real container: test/docker/helperChannel.test.ts. Plan step 11I1, PR B1: the operation `docker` and the
+// removal of the containers of its cleanup label are gone; a running call is the prune of the operation `sweep`. Plan
+// step 11I (PR A): changed setup: the probe and the sweep go over the Engine API (the port of the worker, no Docker CLI),
+// so a fake engine answers on a Unix socket of the test (the bundle of the worker is built with that socket instead of
+// /var/run/docker.sock, as in batch.e2e.test.ts) and holds the prune; a `docker` on PATH only records that no call
+// reaches it.
 import * as fs from 'fs';
+import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HelperChannel } from '../core/helperChannel/helperChannel';
-import { CHANNEL_ENTRY, OP_PROBE, OP_SWEEP, encodeMessage, parseProbeValue, sweepArgs } from '../core/helperChannel/protocol';
+import { CHANNEL_ENTRY, OP_PROBE, OP_SWEEP, SWEEP_FILTERS, encodeMessage, parseProbeParams, parseProbeValue, parseServerMessage, parseSweepParams } from '../core/helperChannel/protocol';
 import { LOADER_EXIT_CODE, bundleHash, encodeBundle, loaderCommand } from '../core/loader/pipeLoader';
 import { silentLogger, type Logger, type StartedProcess } from '../core/ports';
 import { NodeProcessRunner } from '../core/process';
+import { engineSocketPlugin } from './engineSocket.testkit';
 
-// Review round 1 (P9): a held call sets its SIGTERM handler before anything else. Review round 2 (C2): that alone does
-// not order it before the SIGTERM of the script (its silence runs from the operation, not from the wait of the test);
-// the silence of the test (5 s) leaves the start of the fake time for it. Plan step 11I1, PR B1: the held call is the
-// prune of `sweep` (\`container\`; before: \`sleep\` through the removed operation \`docker\`).
+// Plan step 11I (PR A): the worker runs no `docker` process (the probe and the sweep go over the Engine API); a call that
+// reached this `docker` on PATH would be recorded (before: a fake that answered `docker version` and held the prune).
 const FAKE_DOCKER = `#!/usr/bin/env node
-const fs = require('fs');
-const args = process.argv.slice(2);
-const log = process.env.FAKE_DOCKER_LOG;
-if (args[0] === 'container') {
-  process.on('SIGTERM', () => { fs.appendFileSync(log, JSON.stringify(['SIGTERM', ...args]) + '\\n'); process.exit(143); });
-  setInterval(() => {}, 1000);
-}
-fs.appendFileSync(log, JSON.stringify(args) + '\\n');
-if (args[0] === 'version') { process.stdout.write('27.1.0\\n'); process.exit(0); }
-else if (args[0] !== 'container') { process.stderr.write('unknown\\n'); process.exit(1); }
+require('fs').appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+process.stderr.write('unexpected\\n');
+process.exit(1);
 `;
+
+/** Plan step 11I (PR A): the identity of the fake engine. */
+const ENGINE_ID = '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11';
+/** Plan step 11I (PR A): the request of the prune of the sweep, with its two filters as the Engine API gets them. */
+const PRUNE = `POST /containers/prune?filters=${encodeURIComponent(JSON.stringify(SWEEP_FILTERS))}`;
+
+/**
+ * Plan step 11I (PR A): the Engine API as the probe and the sweep of the worker use it: the version, the identity
+ * (`/info`), and the prune, which it never answers: a call that runs until the worker ends it. `closed`: the requests
+ * whose connection ended before an answer.
+ */
+function fakeEngine(socketPath: string) {
+  const requests: string[] = [];
+  const closed: string[] = [];
+  const server = http.createServer((req, res) => {
+    const request = `${req.method} ${req.url}`;
+    requests.push(request);
+    req.resume();
+    const json = (status: number, value: unknown) => res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(value));
+    if (request === 'GET /version') return json(200, { Version: '27.1.0', ApiVersion: '1.47' });
+    if (request === 'GET /info') return json(200, { ID: ENGINE_ID, DockerRootDir: '/var/lib/docker', Containers: 3 });
+    if (request === PRUNE) {
+      res.on('close', () => {
+        if (!res.writableEnded) closed.push(request);
+      });
+      return;
+    }
+    json(500, { message: `unexpected: ${request}` });
+  });
+  return {
+    requests,
+    closed,
+    listen: () => new Promise<void>((resolve) => server.listen(socketPath, resolve)),
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
 
 /** The tests below take a few seconds (the silence): review round 2, C2. */
 const SLOW_TEST_MS = 30_000;
@@ -59,7 +95,11 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
   const runner = new NodeProcessRunner();
   const logLines: string[] = [];
   const logger: Logger = { ...silentLogger, info: (line) => logLines.push(line), warn: (line) => logLines.push(line) };
+  let engine: ReturnType<typeof fakeEngine>;
+  /** Plan step 11I (PR A): how many prunes reached the fake engine. */
+  const prunes = () => engine.requests.filter((request) => request === PRUNE).length;
 
+  /** The calls that reached the `docker` on PATH (plan step 11I, PR A: none). */
   const calls = (): string[][] => {
     const file = path.join(dir, 'calls.log');
     if (!fs.existsSync(file)) return [];
@@ -87,11 +127,16 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     fs.mkdirSync(path.join(dir, 'bin'));
     fs.writeFileSync(path.join(dir, 'bin', 'docker'), FAKE_DOCKER, { mode: 0o755 });
     env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`, FAKE_DOCKER_LOG: path.join(dir, 'calls.log') };
+    // Plan step 11I (PR A): the fake engine of the worker.
+    const socketPath = path.join(dir, 'engine.sock');
+    engine = fakeEngine(socketPath);
+    await engine.listen();
     const result = await esbuild.build({
       // Plan step 11B3b: the compile-time constants of esbuild.mjs (the worker now bundles the workspace helper).
       define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) },
-      // Plan step 11D2: the script of the Session Monitor in the worker, as esbuild.mjs bundles it.
-      plugins: [workerScriptsPlugin(path.resolve(__dirname, '..', '..'), { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) })],
+      // Plan step 11D2: the script of the Session Monitor in the worker, as esbuild.mjs bundles it. Plan step 11I (PR A):
+      // and the Engine API on the socket of the fake engine.
+      plugins: [workerScriptsPlugin(path.resolve(__dirname, '..', '..'), { __DEVCONTAINER_CLI_VERSION__: JSON.stringify(__DEVCONTAINER_CLI_VERSION__) }), engineSocketPlugin(socketPath)],
       entryPoints: [path.resolve(__dirname, 'main.ts')],
       bundle: true,
       platform: 'node',
@@ -104,7 +149,8 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     script = result.outputFiles[0].text;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    await engine?.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -117,8 +163,9 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
 
   // PR #69 review round 6, A-R6-3: an explicit time limit (before: the default of 5 s) for its real process spawns.
   // Plan step 11I1, PR B1: changed test (before: also a Docker call with input through the operation `docker`, removed):
-  // the log line of the Docker call of the probe instead.
-  it('opens, answers the probe with the log line of its Docker call, and ends when it is closed', { timeout: SLOW_TEST_MS }, async () => {
+  // the log line of the Docker call of the probe instead. Plan step 11I (PR A): changed test: the probe over the Engine
+  // API, its requests and its progress line (before: the log line of its Docker call, `$ docker version`).
+  it('opens, answers the probe over the Engine API, and ends when it is closed', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     // Review round 4 (M1): with the sweep of never-started channel containers.
@@ -134,40 +181,61 @@ describeUnix('the helper channel script in a Node.js process (user request 2026-
     // Plan step 11I1, PR B1: changed expectation: the relay operations `batch`, `batchChunk`, `batchStep`, `docker`, `lock`,
     // `pull` and `startContainers` are gone.
     expect(channel.operations).toEqual(['delete', 'deleteCheck', 'heartbeat', 'listConfigurations', 'monitorEnsure', 'open', 'probe', 'reconcile', 'recordGitState', 'refresh', 'stop', 'sweep', 'tokenRemove', 'windowState']);
-    expect(parseProbeValue(await channel.operation(OP_PROBE, {}))).toEqual({ serverVersion: '27.1.0', detail: 'Docker 27.1.0' });
-    expect(logLines.some((line) => line.includes('[fake-host] probe#') && line.includes('$ docker version'))).toBe(true);
+    const before = engine.requests.length;
+    // Plan step 11I (PR A): changed expectation: with the identity of the engine as its values (before: no identity, the
+    // fake `docker` did not answer `docker info`).
+    expect(parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({})))).toEqual({
+      serverVersion: '27.1.0',
+      detail: 'Docker 27.1.0',
+      engine: { id: ENGINE_ID, rootDir: '/var/lib/docker' },
+    });
+    expect(engine.requests.slice(before)).toEqual(['GET /version', 'GET /info']);
+    expect(logLines.some((line) => /^\[fake-host\] probe#\d+: probe$/.test(line))).toBe(true);
+    expect(calls()).toEqual([]);
     channel.close();
     await waitUntil(ended, 'the end of the script');
   });
 
   // Plan step 11I1, PR B1: changed test (before: a `sleep` through the operation `docker`, whose container was then removed
-  // by its cleanup label): the held prune of `sweep`, which gets SIGTERM; the removal is gone with that operation.
-  it('ends when its input ends: a running call gets SIGTERM', { timeout: SLOW_TEST_MS }, async () => {
+  // by its cleanup label): the held prune of `sweep`, which gets SIGTERM; the removal is gone with that operation. Plan
+  // step 11I (PR A): changed expectation: the held prune is a request to the fake engine, whose connection the worker ends
+  // (before: a `docker container prune` process that got SIGTERM).
+  it('ends when its input ends: a running call to the engine ends', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start();
     const channel = await HelperChannel.open(process, script, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
-    const running = channel.operation(OP_SWEEP, {});
-    await waitUntil(() => calls().some((call) => call[0] === 'container' && call[1] === 'prune'), 'the start of the call');
+    const [started, closed] = [prunes(), engine.closed.length];
+    const running = channel.operation(OP_SWEEP, parseSweepParams({}));
+    await waitUntil(() => prunes() > started, 'the start of the call');
     // As when the connection closes: the input of the script ends.
     process.end();
     await expect(running).rejects.toThrow();
     await waitUntil(ended, 'the end of the script');
-    expect(calls()).toContainEqual(['SIGTERM', ...sweepArgs()]);
+    await waitUntil(() => engine.closed.length > closed, 'the end of the call');
+    expect(engine.closed.slice(closed)).toEqual([PRUNE]);
+    expect(calls()).toEqual([]);
   });
 
   // Plan step 11I1, PR B1: changed test (before: a `sleep` through the operation `docker`, with the removal of its cleanup
-  // label): the held prune of `sweep`.
+  // label): the held prune of `sweep`. Plan step 11I (PR A): changed expectation: the held prune is a request to the fake
+  // engine, which the worker ends by the cancel of its operation, answered before the exit (before: a `docker container
+  // prune` process that got SIGTERM).
   it('ends after the silence when the connection hangs (no ping, the input stays open)', { timeout: SLOW_TEST_MS }, async () => {
     const { process, ended } = start(5_000);
     let stdout = '';
     process.onStdout((text) => (stdout += text));
+    const [started, closed] = [prunes(), engine.closed.length];
     process.write(encodeBundle(script));
     process.write(encodeMessage({ t: 'hello', protocol: 1 }));
     process.write(encodeMessage({ t: 'op', id: 1, op: OP_SWEEP, params: {} }));
     await waitUntil(() => stdout.includes('"t":"hello"'), 'the answer to hello');
-    await waitUntil(() => calls().some((call) => call[0] === 'container' && call[1] === 'prune'), 'the start of the call');
+    await waitUntil(() => prunes() > started, 'the start of the call');
     // Nothing more is written and the input stays open.
     await waitUntil(ended, 'the end of the script after the silence');
-    expect(calls()).toContainEqual(['SIGTERM', ...sweepArgs()]);
+    await waitUntil(() => engine.closed.length > closed, 'the end of the call');
+    expect(engine.closed.slice(closed)).toEqual([PRUNE]);
+    const results = stdout.split('\n').map((line) => parseServerMessage(line)).filter((message) => message?.t === 'result');
+    expect(results).toEqual([{ t: 'result', id: 1, ok: false, error: { code: 'cancelled', message: 'The operation was cancelled.' }, cancelled: true, timedOut: false }]);
+    expect(calls()).toEqual([]);
     process.end();
   });
 
