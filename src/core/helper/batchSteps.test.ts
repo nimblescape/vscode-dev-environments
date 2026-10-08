@@ -14,7 +14,6 @@ import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
 import {
   OVERRIDE_CONFIG_PATH,
-  buildCommand,
   cloneCommand,
   composeHashCommand,
   composeModelCommand,
@@ -139,8 +138,11 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
     });
     const configFile = `${FOLDER}/.devcontainer/devcontainer.json`;
+    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: buildCommand, with
+    // no input).
     expect(batchStepCommand('build', { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1' })).toEqual({
-      command: buildCommand(configFile, buildArgs({ workspaceFolder: FOLDER, configPath: configFile, imageName: 'devenv-x:1' })),
+      command: writeAndRunCommand({ repositoryConfig: configFile }, buildArgs({ workspaceFolder: FOLDER, configPath: configFile, imageName: 'devenv-x:1' })),
+      input: writeAndRunInput(undefined, undefined),
       env: {},
       git: false,
     });

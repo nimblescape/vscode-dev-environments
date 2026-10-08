@@ -35,6 +35,11 @@ export const OVERRIDE_FOLDER = '/tmp/devenv-override';
 export const COMPOSE_FILES_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Path of the override configuration of `devcontainer up` inside the helper. */
 export const OVERRIDE_CONFIG_PATH = `${OVERRIDE_FOLDER}/devcontainer.json`;
+/**
+ * Follow-up of PR #121: the longest lockfile of the Dev Container CLI that WRITE_AND_RUN_SCRIPT takes (characters; a
+ * lockfile names a version and a digest per Feature, a few KB).
+ */
+export const MAX_LOCKFILE_LENGTH = 1024 * 1024;
 
 /**
  * Git credential helper (a shell function, run by Git with `sh -c`). It answers only `get` requests for
@@ -235,25 +240,6 @@ cat > "$override"
 exec devcontainer "$@"
 `;
 
-/**
- * `$1` = path of devcontainer.json (absolute), then the arguments of `devcontainer build`. The Dev Container CLI writes
- * a lockfile next to the configuration by default. It is used (and kept up to date) only if the repository has one,
- * so that a build never adds a file to the repository.
- */
-export const BUILD_SCRIPT = `set -eu
-config="$1"
-shift
-dir=$(dirname "$config")
-case "$(basename "$config")" in
-  .*) lockfile="$dir/.devcontainer-lock.json" ;;
-  *) lockfile="$dir/devcontainer-lock.json" ;;
-esac
-if [ -e "$lockfile" ]; then
-  exec devcontainer "$@"
-fi
-exec devcontainer "$@" --no-lockfile
-`;
-
 // Node.js scripts. JSON with arbitrary file names and texts is simpler and safer in JavaScript than in sh.
 // They avoid process.exit(), so that the output to a pipe is always complete.
 
@@ -330,111 +316,42 @@ const readLimited = (file, limit) => {
 `;
 
 /**
- * The function `missingInRepository(file)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they define `fs`, `path`,
- * `root`, `inside`, and `realPath`): whether a path of the repository does not exist, as a plain error of the
- * configuration (review round 3, P3-1). Review round 4 (P4-1): a link that leads nowhere counts too when its chain stays
- * in the repository: each link is read with readlink and its target resolved against the real folder of the link, at
- * most 32 links; every step must stay in the repository (so never a folder of the workspace helper), and the last path
- * must not exist while the nearest folder above it that exists is in the repository after links. A link out of the
- * repository, a chain in a circle or longer than the limit, and a path that exists for the system (stat) are no missing
- * path: the check refuses them.
+ * The function `realPath(file)` of the scripts that check where a path of the repository leads (they define `fs`): its
+ * real path as the kernel resolves it (realpath(3)), or `null` when it does not exist. Review round 1 of PR #121 (A): the
+ * realpathSync of JavaScript resolves a `..` of a link target as text, so a link `sub/../x` whose `sub` leads out of the
+ * repository named a file of the repository for it while the system reached the file out of it.
  */
-const MISSING_IN_REPOSITORY = String.raw`const missingInRepository = (file) => {
-  if (!inside(file)) return false;
-  const rootReal = realPath(root);
-  if (rootReal === null) return false;
-  const inRepository = (candidate) => inside(candidate) || candidate === rootReal || candidate.startsWith(rootReal + '/');
-  const absent = (candidate) => {
-    try {
-      fs.lstatSync(candidate);
-      return false;
-    } catch (error) {
-      return Boolean(error) && ['ENOENT', 'ENOTDIR'].includes(error.code);
-    }
-  };
-  // The system follows the links physically: a path that exists for it is not missing, whatever its chain says.
-  try {
-    fs.statSync(file);
-    return false;
-  } catch (error) {
-    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
-  }
-  let current = file;
-  const seen = new Set();
-  for (let hop = 0; hop <= 32; hop++) {
-    if (!inRepository(current) || seen.has(current)) return false;
-    seen.add(current);
-    if (absent(current)) {
-      for (let folder = path.posix.dirname(current); inRepository(folder); folder = path.posix.dirname(folder)) {
-        if (absent(folder)) continue;
-        const real = realPath(folder);
-        return real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
-      }
-      return false;
-    }
-    let stat;
-    let target;
-    try {
-      stat = fs.lstatSync(current);
-      if (!stat.isSymbolicLink()) return false;
-      target = fs.readlinkSync(current);
-    } catch {
-      return false;
-    }
-    const folder = realPath(path.posix.dirname(current));
-    if (folder === null || !(folder === rootReal || folder.startsWith(rootReal + '/'))) return false;
-    current = path.posix.resolve(folder, target);
-  }
-  return false;
-};
-`;
-
-/**
- * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it, `argv[3]`
- * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
- * round 2, S2-01), in place of `build.dockerfile` of the text.
- * Prints one JSON line: `null` if the configuration file does not exist, otherwise
- * `{ configText, dockerfilePath?, dockerfileText?, dockerfileMissing? }`. `build.dockerfile` (or the old `dockerFile`) is
- * resolved relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
- * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved, nor a file whose
- * link leads out of the repository (review round 3, P3-1). `dockerfileMissing: true`: the Dockerfile does not exist in
- * the repository, and no link leads to or through its path (a missing file, not a link out). Decision of the user of
- * 2026-10-07: both files are read only as plain files of the repository after links, checked on the opened file; a
- * configuration file that is not one fails the script (it is never read).
- */
-export const READ_FILES_SCRIPT = String.raw`'use strict';
-const fs = require('fs');
-const path = require('path');
-const root = path.posix.resolve(process.argv[1]);
-const inside = (file) => file === root || file.startsWith(root + '/');
-// Review round 1 of PR #121 (A): the real path as the kernel resolves it (realpath(3)): the realpathSync of JavaScript
-// resolves a \`..\` of a link target as text, so a link \`sub/../x\` whose \`sub\` leads out of the repository named a file of
-// the repository for it while the open reached the file out of it.
-${READ_LIMITED}const realPath = (file) => {
+const REAL_PATH = String.raw`const realPath = (file) => {
   try {
     return fs.realpathSync.native(file);
   } catch {
     return null;
   }
 };
-// Decision of the user of 2026-10-07 (a configuration file was read through a link with a check of its path text only):
-// the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
-// takes), read only when it is a plain file of the repository after links. Review round 3 of PR #121 (A-R3-1): the path
-// is resolved once, with O_PATH (Linux), which follows the links but opens nothing: a FIFO or a device out of the
-// repository is never opened, whatever a writer of the repository changes. The real path of that handle (as the kernel
-// names the file, /proc/self/fd of the helper; review round 2, B-R2-1: never a second walk of \`file\`) must be below the
-// real folder of the repository, and the file there must be the file of the handle (dev, ino: a magic link of /proc
-// whose text names another file, review round 1 of PR #121). Only then is the file opened, through the handle (no walk
-// of the path), to read it; that open never waits (O_NONBLOCK) and never takes a terminal (O_NOCTTY). Without
-// /proc/self/fd on Linux, the real path is unknown and the file is refused (review round 3, A-R3-3). Off Linux (tests
-// only: the scripts run in the helper) the file is opened by its path. undefined: no such file, or a folder of the
-// repository (also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the batch helper
-// reports it, batchHelper.ts A-R5-1; review round 2, A-2: a link to the repository folder itself); null: a file that is
-// not a plain file of the repository (a link out of it, also to a folder, or in a circle, a FIFO, a socket, a device, a
-// file that cannot be opened, review round 1 of PR #121, A-1; review round 3, A-R3-2: EAGAIN of a lease). A hard link
-// is the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only
-// the repository and CONFIG_FOLDER of its owner).
-const realInRepository = (real) => {
+`;
+
+/**
+ * The functions `realInRepository(real)` and `readInRepository(file, limit)` of READ_FILES_SCRIPT and
+ * WRITE_AND_RUN_SCRIPT (they define `fs`, `root`, `readLimitedFd` of READ_LIMITED, and `realPath` of REAL_PATH).
+ * Decision of the user of 2026-10-07 (a configuration file was read through a link with a check of its path text only):
+ * the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
+ * takes), read only when it is a plain file of the repository after links. Review round 3 of PR #121 (A-R3-1): the path
+ * is resolved once, with O_PATH (Linux), which follows the links but opens nothing: a FIFO or a device out of the
+ * repository is never opened, whatever a writer of the repository changes. The real path of that handle (as the kernel
+ * names the file, /proc/self/fd of the helper; review round 2, B-R2-1: never a second walk of `file`) must be below the
+ * real folder of the repository, and the file there must be the file of the handle (dev, ino: a magic link of /proc
+ * whose text names another file, review round 1 of PR #121). Only then is the file opened, through the handle (no walk
+ * of the path), to read it; that open never waits (O_NONBLOCK) and never takes a terminal (O_NOCTTY). Without
+ * /proc/self/fd on Linux, the real path is unknown and the file is refused (review round 3, A-R3-3). Off Linux (tests
+ * only: the scripts run in the helper) the file is opened by its path. undefined: no such file, or a folder of the
+ * repository (also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the batch helper
+ * reports it, batchHelper.ts A-R5-1; review round 2, A-2: a link to the repository folder itself); null: a file that is
+ * not a plain file of the repository (a link out of it, also to a folder, or in a circle, a FIFO, a socket, a device, a
+ * file that cannot be opened, review round 1 of PR #121, A-1; review round 3, A-R3-2: EAGAIN of a lease). A hard link
+ * is the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only
+ * the repository and CONFIG_FOLDER of its owner).
+ */
+const READ_IN_REPOSITORY = String.raw`const realInRepository = (real) => {
   const rootReal = realPath(root);
   return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
 };
@@ -484,7 +401,93 @@ const readInRepository = (file, limit) => {
     fs.closeSync(handle);
   }
 };
-${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
+`;
+
+/**
+ * The function `missingInRepository(file)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they define `fs`, `path`,
+ * `root`, `inside`, and `realPath`): whether a path of the repository does not exist, as a plain error of the
+ * configuration (review round 3, P3-1). Review round 4 (P4-1): a link that leads nowhere counts too when its chain stays
+ * in the repository: each link is read with readlink and its target resolved against the real folder of the link, at
+ * most 32 links; every step must stay in the repository (so never a folder of the workspace helper), and the last path
+ * must not exist while the nearest folder above it that exists is in the repository after links. A link out of the
+ * repository, a chain in a circle or longer than the limit, and a path that exists for the system (stat) are no missing
+ * path: the check refuses them. Follow-up of PR #121 (review A): neither is a link whose target has a `..` after a name
+ * (`sub/../x`): the text of the target is resolved against the real folder of the link only when it has none, as the
+ * system resolves it then.
+ */
+const MISSING_IN_REPOSITORY = String.raw`const missingInRepository = (file) => {
+  if (!inside(file)) return false;
+  const rootReal = realPath(root);
+  if (rootReal === null) return false;
+  const inRepository = (candidate) => inside(candidate) || candidate === rootReal || candidate.startsWith(rootReal + '/');
+  const absent = (candidate) => {
+    try {
+      fs.lstatSync(candidate);
+      return false;
+    } catch (error) {
+      return Boolean(error) && ['ENOENT', 'ENOTDIR'].includes(error.code);
+    }
+  };
+  // The system follows the links physically: a path that exists for it is not missing, whatever its chain says.
+  try {
+    fs.statSync(file);
+    return false;
+  } catch (error) {
+    if (!error || !['ENOENT', 'ENOTDIR'].includes(error.code)) return false;
+  }
+  let current = file;
+  const seen = new Set();
+  for (let hop = 0; hop <= 32; hop++) {
+    if (!inRepository(current) || seen.has(current)) return false;
+    seen.add(current);
+    if (absent(current)) {
+      for (let folder = path.posix.dirname(current); inRepository(folder); folder = path.posix.dirname(folder)) {
+        if (absent(folder)) continue;
+        const real = realPath(folder);
+        return real !== null && (real === rootReal || real.startsWith(rootReal + '/'));
+      }
+      return false;
+    }
+    let stat;
+    let target;
+    try {
+      stat = fs.lstatSync(current);
+      if (!stat.isSymbolicLink()) return false;
+      target = fs.readlinkSync(current);
+    } catch {
+      return false;
+    }
+    const folder = realPath(path.posix.dirname(current));
+    if (folder === null || !(folder === rootReal || folder.startsWith(rootReal + '/'))) return false;
+    // Follow-up of PR #121 (review A): the system resolves a \`..\` after a name of the target after the link that name
+    // may be, not as text; such a target is no missing path (the check refuses it).
+    const names = target.split('/').filter((name) => name !== '' && name !== '.');
+    if (names.some((name, index) => name === '..' && names.slice(0, index).some((other) => other !== '..'))) return false;
+    current = path.posix.resolve(folder, target);
+  }
+  return false;
+};
+`;
+
+/**
+ * `node -e` script. `argv[1]` = repository folder (absolute), `argv[2]` = configuration path relative to it, `argv[3]`
+ * (optional) = the Dockerfile as the configuration names it after the Dev Container CLI resolved its variables (review
+ * round 2, S2-01), in place of `build.dockerfile` of the text.
+ * Prints one JSON line: `null` if the configuration file does not exist, otherwise
+ * `{ configText, dockerfilePath?, dockerfileText?, dockerfileMissing? }`. `build.dockerfile` (or the old `dockerFile`) is
+ * resolved relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
+ * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved, nor a file whose
+ * link leads out of the repository (review round 3, P3-1). `dockerfileMissing: true`: the Dockerfile does not exist in
+ * the repository, and no link leads to or through its path (a missing file, not a link out). Decision of the user of
+ * 2026-10-07: both files are read only as plain files of the repository after links, checked on the opened file; a
+ * configuration file that is not one fails the script (it is never read).
+ */
+export const READ_FILES_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const path = require('path');
+const root = path.posix.resolve(process.argv[1]);
+const inside = (file) => file === root || file.startsWith(root + '/');
+${READ_LIMITED}${REAL_PATH}${READ_IN_REPOSITORY}${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
   let result = '';
   let i = 0;
   const skipComment = (j) => {
@@ -570,18 +573,26 @@ process.stdout.write(JSON.stringify(main()) + '\n');
 
 /**
  * `node -e` script for the runs of the Dev Container CLI with files of the extension (Docker Compose: the override
- * configuration and our model, and the Dockerfile of a synthesized build). `argv[1]` = the folder for the files
- * (OVERRIDE_FOLDER), `argv[2]` = path of the repository's devcontainer.json for the lockfile rule of BUILD_SCRIPT (`''`:
- * none), `argv[3]` = path of our copy of the configuration that `--config` names (`''`: none), then the arguments of
+ * configuration and our model, and the Dockerfile of a synthesized build), and for every `devcontainer build` (the
+ * lockfile rule). `argv[1]` = the folder for the files (OVERRIDE_FOLDER), `argv[2]` = path of the repository's
+ * devcontainer.json for the lockfile rule (`''`: none; below the `--workspace-folder` of the arguments, the repository
+ * folder), `argv[3]` = path of our copy of the configuration that `--config` names (`''`: none), then the arguments of
  * `devcontainer`. Standard input: JSON `{ "files": { "<absolute path>": "<text>" } }`. Each path must be below the
  * folder, absolute and without `.`/`..` segments; the files get mode 0600, and the folder `context/` (the empty build
- * context of a synthesized build) is created. Lockfile: when the repository has one next to its configuration, it is
- * copied next to our copy (so the CLI uses it; a change that the CLI writes stays in the helper); without one,
- * `--no-lockfile` is added, so that a build never adds a file to the repository. Before `devcontainer up`, the compose
- * files that the Dev Container CLI generated in `<--user-data-folder>/docker-compose` (the shared cache volume) and that
- * are older than COMPOSE_FILES_MAX_AGE_MS are removed (limit L-5: nothing else removes them; the CLI writes a missing one
- * again without a build). Then `devcontainer` runs with the output of this process; its exit code is the exit code
- * (128 + the signal number after a signal), and a stop signal is passed on to it.
+ * context of a synthesized build) is created. The Dev Container CLI writes a lockfile next to the configuration by
+ * default; it is used (and kept up to date) only if the repository has one: without one, `--no-lockfile` is added, so
+ * that a build never adds a file to the repository. Follow-up of PR #121 (review A: the CLI runs as root and read and
+ * wrote the lockfile through a link, for example to the file of the token): the lockfile is taken only as a plain file of
+ * the repository after links (readInRepository, at most MAX_LOCKFILE_LENGTH characters); any other one fails the run
+ * before the CLI starts. With our copy of the configuration, its text is written next to the copy (so the CLI uses it; a
+ * change that the CLI writes stays in the helper); without one, the CLI uses the file of the repository. Limit (review
+ * round 1 of the follow-up, A L-1, B F1): there the CLI opens the lockfile again by its path, as root, after this check;
+ * a writer of the repository during the build could make it a link out of the repository in between, as it could for the
+ * configuration and the Dockerfile that the CLI reads. The rule closes a lockfile link in the content of the repository. Before
+ * `devcontainer up`, the compose files that the Dev Container CLI generated in `<--user-data-folder>/docker-compose` (the
+ * shared cache volume) and that are older than COMPOSE_FILES_MAX_AGE_MS are removed (limit L-5: nothing else removes
+ * them; the CLI writes a missing one again without a build). Then `devcontainer` runs with the output of this process;
+ * its exit code is the exit code (128 + the signal number after a signal), and a stop signal is passed on to it.
  */
 export const WRITE_AND_RUN_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -592,7 +603,10 @@ const folder = process.argv[1];
 const repositoryConfig = process.argv[2];
 const ownConfig = process.argv[3];
 const args = process.argv.slice(4);
-const lockfileOf = (config) =>
+// The repository folder: the workspace folder of the run (buildArgs).
+const workspaceIndex = args.indexOf('--workspace-folder');
+const root = workspaceIndex >= 0 ? args[workspaceIndex + 1] : undefined;
+${READ_LIMITED}${REAL_PATH}${READ_IN_REPOSITORY}const lockfileOf = (config) =>
   path.posix.join(path.posix.dirname(config), path.posix.basename(config).startsWith('.') ? '.devcontainer-lock.json' : 'devcontainer-lock.json');
 const prepare = () => {
   if (!folder || path.posix.resolve(folder) !== folder || folder === '/') throw new Error('Invalid folder: ' + folder);
@@ -611,13 +625,27 @@ const prepare = () => {
     throw new Error('Invalid configuration path: ' + ownConfig);
   }
   if (repositoryConfig) {
+    if (
+      typeof root !== 'string' ||
+      path.posix.resolve(root) !== root ||
+      root === '/' ||
+      path.posix.resolve(repositoryConfig) !== repositoryConfig ||
+      !repositoryConfig.startsWith(root + '/')
+    ) {
+      throw new Error('Invalid configuration path: ' + repositoryConfig);
+    }
     const lockfile = lockfileOf(repositoryConfig);
-    if (!fs.existsSync(lockfile)) {
+    const text = readInRepository(lockfile, ${MAX_LOCKFILE_LENGTH});
+    if (text === null) throw new Error('The lockfile ' + path.posix.relative(root, lockfile) + ' is not a file of the repository.');
+    if (text !== undefined && text.length > ${MAX_LOCKFILE_LENGTH}) {
+      throw new Error('The lockfile ' + path.posix.relative(root, lockfile) + ' is longer than ${MAX_LOCKFILE_LENGTH} characters.');
+    }
+    if (text === undefined) {
       args.push('--no-lockfile');
     } else if (ownConfig) {
       const copy = lockfileOf(ownConfig);
       fs.mkdirSync(path.posix.dirname(copy), { recursive: true, mode: 0o700 });
-      fs.copyFileSync(lockfile, copy);
+      fs.writeFileSync(copy, text, { mode: 0o600 });
       fs.chmodSync(copy, 0o600);
     }
   }
@@ -715,14 +743,8 @@ const failure = (result, what) => {
   const text = ((result.stderr || '') + (result.error ? ' ' + result.error.message : '')).trim();
   return { error: text || what + ' failed with exit code ' + result.status + '.' };
 };
-const realPath = (file) => {
-  try {
-    return fs.realpathSync(file);
-  } catch {
-    return null;
-  }
-};
-// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the folder with the token, the folders of the
+// Follow-up of PR #121 (review A): the real paths as the system resolves them (REAL_PATH).
+${REAL_PATH}// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the folder with the token, the folders of the
 // kernel (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one
 // of them. (The Docker socket of isHelperPath is not mounted in this run; the check refuses a Dockerfile there anyway.)
 const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
@@ -945,8 +967,8 @@ export function upCommand(overrideConfigPath: string, args: readonly string[]): 
 /**
  * `node -e` command of WRITE_AND_RUN_SCRIPT: writes the files of its standard input below OVERRIDE_FOLDER, then runs
  * `devcontainer <args…>`. For `build`: `repositoryConfig` (absolute path of the repository's devcontainer.json in the
- * helper) with the lockfile rule of BUILD_SCRIPT, and `config`, our copy of the configuration below OVERRIDE_FOLDER that
- * `--config` names, which gets the repository's lockfile.
+ * helper) with the lockfile rule, and for Docker Compose `config`, our copy of the configuration below OVERRIDE_FOLDER
+ * that `--config` names, which gets the repository's lockfile.
  */
 export function writeAndRunCommand(p: { repositoryConfig?: string; config?: string }, args: readonly string[]): string[] {
   return ['node', '-e', WRITE_AND_RUN_SCRIPT, OVERRIDE_FOLDER, p.repositoryConfig ?? '', p.config ?? '', ...args];
@@ -1019,9 +1041,11 @@ const fail = (message) => {
   process.stderr.write(message + '\n');
   process.exit(2);
 };
+// Follow-up of PR #121 (review A): the real paths as the system resolves them (realpath(3)), never a \`..\` of a link
+// target as text.
 let rootReal;
 try {
-  rootReal = fs.realpathSync(root);
+  rootReal = fs.realpathSync.native(root);
 } catch {
   fail('The repository folder ' + root + ' does not exist.');
 }
@@ -1041,7 +1065,7 @@ for (const folder of process.argv.slice(2)) {
     }
     let real;
     try {
-      real = fs.realpathSync(current);
+      real = fs.realpathSync.native(current);
     } catch {
       fail(current + ' is a link that leads nowhere.');
     }
@@ -1056,7 +1080,7 @@ for (const folder of process.argv.slice(2)) {
       fail('Cannot create ' + part + ': ' + String(error && error.code));
     }
     const stat = fs.lstatSync(part);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || !inRepository(fs.realpathSync(part))) fail(part + ' is no folder of the repository.');
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !inRepository(fs.realpathSync.native(part))) fail(part + ' is no folder of the repository.');
   }
 }
 `;
@@ -1064,9 +1088,4 @@ for (const folder of process.argv.slice(2)) {
 /** `node -e` command of CREATE_FOLDERS_SCRIPT. */
 export function createFoldersCommand(repoFolder: string, folders: readonly string[]): string[] {
   return ['node', '-e', CREATE_FOLDERS_SCRIPT, repoFolder, ...folders];
-}
-
-/** `sh -c` command for `devcontainer build`. `configFile` is the absolute path of devcontainer.json in the helper. */
-export function buildCommand(configFile: string, args: readonly string[]): string[] {
-  return ['sh', '-c', BUILD_SCRIPT, 'sh', configFile, ...args];
 }

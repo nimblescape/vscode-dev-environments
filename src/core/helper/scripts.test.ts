@@ -12,9 +12,9 @@ import { detectConfigurations } from '../discovery/detect';
 // does not re-export it; its syntax is still checked here (it runs in the dev container).
 import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
 import {
-  BUILD_SCRIPT,
   CLONE_SCRIPT,
   COMPOSE_FILES_MAX_AGE_MS,
+  MAX_LOCKFILE_LENGTH,
   COMPOSE_HASH_SCRIPT,
   composeHashCommand,
   parseComposeHashes,
@@ -29,7 +29,6 @@ import {
   TOKEN_FILE,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
-  buildCommand,
   cloneCommand,
   composeModelCommand,
   createFoldersCommand,
@@ -95,7 +94,7 @@ const SHELL_SCRIPTS: Array<[string, string]> = [
   ['GIT_FILES_SCRIPT', GIT_FILES_SCRIPT],
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
-  ['BUILD_SCRIPT', BUILD_SCRIPT],
+  // Follow-up of PR #121: BUILD_SCRIPT is gone (every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule).
 ];
 
 describe('shell scripts', () => {
@@ -118,14 +117,7 @@ describe('shell scripts', () => {
     // unit 15: no login argument (the sign-in of the GitHub CLI is written into the memory of the dev container).
     expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', 'Me', 'me@x', 'helper']);
     expect(upCommand(OVERRIDE_CONFIG_PATH, ['up', '--x'])).toEqual(['sh', '-c', UP_SCRIPT, 'sh', OVERRIDE_CONFIG_PATH, 'up', '--x']);
-    expect(buildCommand('/workspaces/api/.devcontainer/devcontainer.json', ['build'])).toEqual([
-      'sh',
-      '-c',
-      BUILD_SCRIPT,
-      'sh',
-      '/workspaces/api/.devcontainer/devcontainer.json',
-      'build',
-    ]);
+    // Follow-up of PR #121: buildCommand is gone (every build runs through writeAndRunCommand, whose test names it).
   });
 
   it.each([
@@ -178,25 +170,8 @@ describe('shell scripts', () => {
     expect(result.stdout).toBe('up|--flag|{"image":"x"}');
   });
 
-  it('BUILD_SCRIPT adds --no-lockfile unless the repository has a lockfile', () => {
-    const dir = tempDir();
-    write(path.join(dir, 'bin', 'devcontainer'), `#!/bin/sh\nprintf '%s|' "$@"\n`);
-    fs.chmodSync(path.join(dir, 'bin', 'devcontainer'), 0o755);
-    const env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}` };
-    const config = path.join(dir, 'repo', '.devcontainer', 'devcontainer.json');
-    const rootConfig = path.join(dir, 'repo', '.devcontainer.json');
-    write(config, '{}');
-    write(rootConfig, '{}');
-    const run = (file: string) => spawnSync('sh', ['-c', BUILD_SCRIPT, 'sh', file, 'build', '--x'], { encoding: 'utf8', env }).stdout;
-
-    expect(run(config)).toBe('build|--x|--no-lockfile|');
-    write(path.join(dir, 'repo', '.devcontainer', 'devcontainer-lock.json'), '{}');
-    expect(run(config)).toBe('build|--x|');
-    // A root .devcontainer.json has the lockfile .devcontainer-lock.json.
-    expect(run(rootConfig)).toBe('build|--x|--no-lockfile|');
-    write(path.join(dir, 'repo', '.devcontainer-lock.json'), '{}');
-    expect(run(rootConfig)).toBe('build|--x|');
-  });
+  // Follow-up of PR #121: the test of BUILD_SCRIPT is gone with it; the lockfile tests of WRITE_AND_RUN_SCRIPT cover
+  // a build without our copy of the configuration.
 });
 
 describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', () => {
@@ -220,6 +195,7 @@ describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', 
       encoding: 'utf8',
       input: JSON.stringify({ files }),
       env,
+      timeout: 10_000,
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
   }
@@ -307,22 +283,128 @@ describe('WRITE_AND_RUN_SCRIPT (Docker Compose runs of the Dev Container CLI)', 
     expect(result.stdout).toBe('');
   });
 
+  // Follow-up of PR #121: the arguments name the workspace folder (buildArgs), the repository folder of the lockfile
+  // rule, so the fake CLI prints it too.
   it('uses the lockfile of the repository next to our copy of the configuration, and adds --no-lockfile without one', () => {
     const { dir, folder, env } = setup();
-    const repositoryConfig = path.join(dir, 'repo', '.devcontainer', 'devcontainer.json');
+    const repo = path.join(dir, 'repo');
+    const build = ['build', '--workspace-folder', repo];
+    const printed = `build\n--workspace-folder\n${repo}\n`;
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
     write(repositoryConfig, '{}');
     const own = `${folder}/devcontainer.json`;
-    expect(run(folder, env, { [own]: '{}' }, ['build'], { repository: repositoryConfig, own }).stdout).toBe('build\n--no-lockfile\n');
+    expect(run(folder, env, { [own]: '{}' }, build, { repository: repositoryConfig, own }).stdout).toBe(`${printed}--no-lockfile\n`);
     expect(fs.existsSync(`${folder}/devcontainer-lock.json`)).toBe(false);
-    write(path.join(dir, 'repo', '.devcontainer', 'devcontainer-lock.json'), '{"features":{}}');
-    expect(run(folder, env, { [own]: '{}' }, ['build'], { repository: repositoryConfig, own }).stdout).toBe('build\n');
+    write(path.join(repo, '.devcontainer', 'devcontainer-lock.json'), '{"features":{}}');
+    expect(run(folder, env, { [own]: '{}' }, build, { repository: repositoryConfig, own }).stdout).toBe(printed);
     expect(fs.readFileSync(`${folder}/devcontainer-lock.json`, 'utf8')).toBe('{"features":{}}');
-    // Without a copy of the configuration, the rule of BUILD_SCRIPT alone.
-    expect(run(folder, env, {}, ['build'], { repository: repositoryConfig }).stdout).toBe('build\n');
+    expect(fs.statSync(`${folder}/devcontainer-lock.json`).mode & 0o777).toBe(0o600);
+    // Without a copy of the configuration (every build that is not one of Docker Compose), the CLI uses the file of the
+    // repository (follow-up of PR #121: the rule of BUILD_SCRIPT, which is gone).
+    expect(run(folder, env, {}, build, { repository: repositoryConfig }).stdout).toBe(printed);
     // A root .devcontainer.json has the lockfile .devcontainer-lock.json.
-    const rootConfig = path.join(dir, 'repo', '.devcontainer.json');
+    const rootConfig = path.join(repo, '.devcontainer.json');
     write(rootConfig, '{}');
-    expect(run(folder, env, {}, ['build'], { repository: rootConfig }).stdout).toBe('build\n--no-lockfile\n');
+    expect(run(folder, env, {}, build, { repository: rootConfig }).stdout).toBe(`${printed}--no-lockfile\n`);
+    write(path.join(repo, '.devcontainer-lock.json'), '{}');
+    expect(run(folder, env, {}, build, { repository: rootConfig }).stdout).toBe(printed);
+  });
+
+  // Follow-up of PR #121 (review A): the CLI runs as root, and read the lockfile of the repository through a link (here
+  // to the file of the token next to the repository), copied it, and wrote it. Such a lockfile fails the run before the
+  // CLI starts. A \`..\` after a link of the target is resolved as the system resolves it, not as text (the decoy).
+  it.each([
+    ['a link out of the repository', '../../.devenv+/gh/hosts.yml', false],
+    ['a link out of the repository', '../../.devenv+/gh/hosts.yml', true],
+    ['a link whose .. follows a link out of the repository', 'out/../hosts.yml', false],
+    ['a link whose .. follows a link out of the repository', 'out/../hosts.yml', true],
+  ])('refuses a lockfile that is %s (%s, our copy: %s), and never reads or writes it', (_name, target, withCopy) => {
+    const { dir, folder, env } = setup();
+    const repo = path.join(dir, 'repo');
+    const token = path.join(dir, '.devenv+', 'gh', 'hosts.yml');
+    write(token, 'github.com:\n  oauth_token: gho_LOCK_SECRET\n');
+    fs.mkdirSync(path.join(dir, '.devenv+', 'gh', 'cache'));
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    write(path.join(repo, '.devcontainer', 'hosts.yml'), '{"decoy":true}');
+    fs.symlinkSync(path.join(dir, '.devenv+', 'gh', 'cache'), path.join(repo, '.devcontainer', 'out'));
+    fs.symlinkSync(target, path.join(repo, '.devcontainer', 'devcontainer-lock.json'));
+    const own = `${folder}/devcontainer.json`;
+    const result = run(folder, env, withCopy ? { [own]: '{}' } : {}, ['build', '--workspace-folder', repo], {
+      repository: repositoryConfig,
+      ...(withCopy ? { own } : {}),
+    });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('The lockfile .devcontainer/devcontainer-lock.json is not a file of the repository.');
+    expect(`${result.stdout}${result.stderr}`).not.toContain('gho_LOCK_SECRET');
+    expect(fs.existsSync(`${folder}/devcontainer-lock.json`)).toBe(false);
+    expect(fs.readFileSync(token, 'utf8')).toBe('github.com:\n  oauth_token: gho_LOCK_SECRET\n');
+  });
+
+  it.skipIf(process.platform === 'win32')('refuses a lockfile that is a FIFO without waiting for a writer', () => {
+    const { dir, folder, env } = setup();
+    const repo = path.join(dir, 'repo');
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    expect(spawnSync('mkfifo', [path.join(repo, '.devcontainer', 'devcontainer-lock.json')]).status).toBe(0);
+    const own = `${folder}/devcontainer.json`;
+    const result = run(folder, env, { [own]: '{}' }, ['build', '--workspace-folder', repo], { repository: repositoryConfig, own });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('is not a file of the repository.');
+  });
+
+  it('uses a lockfile that is a link to a plain file of the repository, and takes a folder for no lockfile', () => {
+    const { dir, folder, env } = setup();
+    const repo = path.join(dir, 'repo');
+    const build = ['build', '--workspace-folder', repo];
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    write(path.join(repo, 'shared', 'lock.json'), '{"features":{"x":{}}}');
+    fs.symlinkSync('../shared/lock.json', path.join(repo, '.devcontainer', 'devcontainer-lock.json'));
+    const own = `${folder}/devcontainer.json`;
+    const linked = run(folder, env, { [own]: '{}' }, build, { repository: repositoryConfig, own });
+    expect(linked.stderr).toBe('');
+    expect(linked.stdout).toBe(`build\n--workspace-folder\n${repo}\n`);
+    expect(fs.readFileSync(`${folder}/devcontainer-lock.json`, 'utf8')).toBe('{"features":{"x":{}}}');
+    fs.rmSync(path.join(repo, '.devcontainer', 'devcontainer-lock.json'));
+    fs.mkdirSync(path.join(repo, '.devcontainer', 'devcontainer-lock.json'));
+    expect(run(folder, env, {}, build, { repository: repositoryConfig }).stdout).toBe(`build\n--workspace-folder\n${repo}\n--no-lockfile\n`);
+  });
+
+  it('refuses a lockfile longer than MAX_LOCKFILE_LENGTH characters, and takes one of that length', () => {
+    const { dir, folder, env } = setup();
+    const repo = path.join(dir, 'repo');
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
+    write(repositoryConfig, '{}');
+    const lockfile = path.join(repo, '.devcontainer', 'devcontainer-lock.json');
+    const own = `${folder}/devcontainer.json`;
+    write(lockfile, 'x'.repeat(MAX_LOCKFILE_LENGTH));
+    expect(run(folder, env, { [own]: '{}' }, ['build', '--workspace-folder', repo], { repository: repositoryConfig, own }).status).toBe(0);
+    expect(fs.readFileSync(`${folder}/devcontainer-lock.json`, 'utf8')).toHaveLength(MAX_LOCKFILE_LENGTH);
+    write(lockfile, 'x'.repeat(MAX_LOCKFILE_LENGTH + 1));
+    const result = run(folder, env, {}, ['build', '--workspace-folder', repo], { repository: repositoryConfig });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`is longer than ${MAX_LOCKFILE_LENGTH} characters.`);
+  });
+
+  it.each<[string, (repo: string) => { args: string[]; config: string }]>([
+    ['without the workspace folder', (repo) => ({ args: ['build'], config: `${repo}/devcontainer.json` })],
+    ['out of the workspace folder', (repo) => ({ args: ['build', '--workspace-folder', `${repo}/sub`], config: `${repo}/devcontainer.json` })],
+    ['with ..', (repo) => ({ args: ['build', '--workspace-folder', repo], config: `${repo}/x/../devcontainer.json` })],
+    ['with the root as the workspace folder', (repo) => ({ args: ['build', '--workspace-folder', '/'], config: `${repo}/devcontainer.json` })],
+    ['with a relative workspace folder', () => ({ args: ['build', '--workspace-folder', 'repo'], config: 'repo/devcontainer.json' })],
+  ])('refuses a configuration of the repository %s, and does not run the CLI', (_name, input) => {
+    const { dir, folder, env } = setup();
+    const repo = path.join(dir, 'repo');
+    write(path.join(repo, 'devcontainer.json'), '{}');
+    const { args, config } = input(repo);
+    const result = run(folder, env, {}, args, { repository: config });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('Invalid configuration path');
   });
 
   it('refuses a copy of the configuration outside the folder', () => {
@@ -1325,6 +1407,25 @@ describe('READ_FILES_SCRIPT', () => {
     expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfileText: 'FROM alpine\n' });
   });
 
+  // Follow-up of PR #121 (review A): the chain of missingInRepository resolved a \`..\` of a link target as text, so a link
+  // \`out/../gone\` whose \`out\` leads out of the repository was a missing Dockerfile of the repository; the system resolves
+  // the \`..\` after the link of \`out\`, out of the repository.
+  it('takes no link whose .. follows a link out of the repository for a missing Dockerfile', () => {
+    const root = tempDir();
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(path.join(root, 'outside', 'inner'), { recursive: true });
+    const config = '{ "build": { "dockerfile": "Dockerfile" } }';
+    const dev = path.join(repo, '.devcontainer');
+    write(path.join(dev, 'devcontainer.json'), config);
+    fs.symlinkSync(path.join(root, 'outside', 'inner'), path.join(dev, 'out'));
+    fs.symlinkSync('out/../gone', path.join(dev, 'Dockerfile'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toEqual({ configText: config, dockerfilePath: '.devcontainer/Dockerfile' });
+    // A \`..\` before every name of the target stays a missing Dockerfile of the repository.
+    fs.unlinkSync(path.join(dev, 'Dockerfile'));
+    fs.symlinkSync('../gone', path.join(dev, 'Dockerfile'));
+    expect(read(repo, '.devcontainer/devcontainer.json')).toMatchObject({ dockerfilePath: '.devcontainer/Dockerfile', dockerfileMissing: true });
+  });
+
   it('fails for a configuration path outside of the repository', () => {
     const root = tempDir();
     write(path.join(root, 'devcontainer.json'), '{}');
@@ -1517,6 +1618,62 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     }
     expect(fs.existsSync(path.join(dir, 'out', 'x'))).toBe(false);
     expect(fs.existsSync(path.join(dir, 'nowhere'))).toBe(false);
+  });
+
+  // Follow-up of PR #121 (review A): the realpathSync of JavaScript resolved a \`..\` of a link target as text. The link
+  // \`via\` -> \`out/..\` named the repository folder for it, while the system reaches the folder out of the repository
+  // that holds the target of \`out\`.
+  it('COMPOSE_MODEL_SCRIPT and CREATE_FOLDERS_SCRIPT resolve a .. of a link target as the system does', () => {
+    const dir = tempDir();
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(repo);
+    fs.mkdirSync(path.join(dir, 'outside', 'inner'), { recursive: true });
+    write(path.join(dir, 'outside', 'Dockerfile'), 'FROM secret\n');
+    write(path.join(repo, 'Dockerfile'), 'FROM decoy\n');
+    fs.symlinkSync(path.join(dir, 'outside', 'inner'), path.join(repo, 'out'));
+    fs.symlinkSync('out/..', path.join(repo, 'via'));
+    fs.symlinkSync('out/../nothing', path.join(repo, 'gone'));
+    const outside = fs.realpathSync.native(path.join(dir, 'outside'));
+    const bind = (source: string) => ({ type: 'bind', source, target: `/t${source.length}` });
+    const model = {
+      name: PROJECT,
+      services: {
+        app: { build: { context: `${repo}/via`, dockerfile: 'Dockerfile' }, volumes: [bind(`${repo}/via`), bind(`${repo}/via/new`)] },
+        tool: { build: { context: `${repo}/gone` } },
+      },
+    };
+    const bin = path.join(dir, 'bin');
+    write(path.join(bin, 'docker'), '#!/bin/sh\nshift\nif [ "$1 $2" = "version --short" ]; then echo 2.29.1; exit 0; fi\ncase "$*" in *"-p devenv-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;; esac\nprintf \'%s\\n\' "$FAKE_MODEL"\n');
+    fs.chmodSync(path.join(bin, 'docker'), 0o755);
+    const env = {
+      ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+      FAKE_PROBE: JSON.stringify({ services: { probe: { environment: { V: 'a$$b' } } } }),
+      FAKE_MODEL: JSON.stringify(model),
+    };
+    const result = spawnSync(process.execPath, composeModelCommand(repo, [path.join(repo, 'compose.yml')]).slice(1), { encoding: 'utf8', env });
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim()) as {
+      realPaths: Record<string, string | null>;
+      mountAncestors: Record<string, string | null>;
+      mountCreateTargets: Record<string, string>;
+      missing: string[];
+      dockerfileFiles: Record<string, string>;
+      dockerfileTexts: Record<string, string>;
+    };
+    expect(output.realPaths[`${repo}/via`]).toBe(outside);
+    expect(output.realPaths[`${repo}/via/Dockerfile`]).toBe(path.join(outside, 'Dockerfile'));
+    expect(output.mountAncestors[`${repo}/via/new`]).toBe(outside);
+    expect(output.mountCreateTargets[`${repo}/via/new`]).toBe(path.join(outside, 'new'));
+    // A Dockerfile out of the repository through a link is not read (neither the decoy nor the file out of it), and a
+    // link whose .. follows a link out of the repository is no missing path of the repository.
+    expect(output.dockerfileFiles).toEqual({});
+    expect(JSON.stringify(output.dockerfileTexts)).not.toMatch(/secret|decoy/);
+    expect(output.missing).toEqual([]);
+    const created = runNode(createFoldersCommand(repo, [`${repo}/via/new`]));
+    expect(created.status).toBe(2);
+    expect(created.stderr).toContain('leads out of the repository');
+    expect(fs.existsSync(path.join(outside, 'new'))).toBe(false);
   });
 });
 

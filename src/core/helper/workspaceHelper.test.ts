@@ -28,7 +28,6 @@ import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseD
 import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, dockerEngineAnswers, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
 import {
-  BUILD_SCRIPT,
   CLONE_SCRIPT,
   COMPOSE_HASH_SCRIPT,
   COMPOSE_MODEL_SCRIPT,
@@ -2165,12 +2164,15 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
     expect(output.join('')).toContain('docker buildx build');
     expect(output.join('')).not.toContain('"outcome"');
     const configFile = '/workspaces/api/.devcontainer/python/devcontainer.json';
+    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: BUILD_SCRIPT), with
+    // no files of the extension.
     expect(commandOf(docker.runs[0].args)).toEqual([
-      'sh',
-      '-c',
-      BUILD_SCRIPT,
-      'sh',
+      'node',
+      '-e',
+      WRITE_AND_RUN_SCRIPT,
+      '/tmp/devenv-override',
       configFile,
+      '',
       'build',
       '--workspace-folder',
       '/workspaces/api',
@@ -2181,6 +2183,7 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
       '--user-data-folder',
       '/devenv-cache',
     ]);
+    expect(JSON.parse(docker.runs[0].options.input ?? '')).toEqual({ files: {} });
   });
 
   it('build filters the result line also when it arrives in pieces', async () => {

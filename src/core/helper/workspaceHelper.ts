@@ -57,7 +57,6 @@ import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
 import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import {
   OVERRIDE_CONFIG_PATH,
-  buildCommand,
   cloneCommand,
   composeHashCommand,
   composeModelCommand,
@@ -488,7 +487,7 @@ export class WorkspaceHelper {
      * Docker Compose: our copy of the configuration (composeConfigOverride), written into the helper at
      * OVERRIDE_CONFIG_PATH and named by `--config` (`build` has no `--override-config`, buildArgs), with `files` (our
      * model, the Dockerfile of a synthesized build) and `env` (COMPOSE_PROJECT_NAME). The repository's lockfile is used
-     * (WRITE_AND_RUN_SCRIPT).
+     * (WRITE_AND_RUN_SCRIPT, as for every build).
      */
     override?: Record<string, unknown>;
     files?: HelperFiles;
@@ -501,16 +500,7 @@ export class WorkspaceHelper {
     const folder = this.repositoryFolder(p.repository);
     const configFile = `${folder}/${checkConfigPath(p.configPath)}`;
     this.deps.logger.info(`Building the environment image ${p.imageName} from ${p.configPath}.`);
-    if (p.override === undefined && p.files === undefined) {
-      const args = buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: p.imageName });
-      return this.runDevcontainer('devcontainer build', p.volumeName, buildCommand(configFile, args), {
-        batch: { kind: 'build', params: { repository: p.repository, configPath: p.configPath, imageName: p.imageName } },
-        env: p.env,
-        image: p.image,
-        onOutput: p.onOutput,
-        signal: p.signal,
-      });
-    }
+    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule.
     const config = p.override !== undefined ? OVERRIDE_CONFIG_PATH : configFile;
     const args = buildArgs({ workspaceFolder: folder, configPath: config, imageName: p.imageName });
     const command = writeAndRunCommand({ repositoryConfig: configFile, config: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined }, args);

@@ -13,7 +13,7 @@ import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { composeProjectName } from '../names';
 import { buildArgs, isLifecycleCommandFailure, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
-import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, buildCommand, upCommand, writeAndRunCommand } from './scripts';
+import { OVERRIDE_CONFIG_PATH, OVERRIDE_FOLDER, upCommand, writeAndRunCommand } from './scripts';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
@@ -62,7 +62,7 @@ function documentedOptions(command: string): Map<string, DocumentedOption> {
 
 /**
  * The arguments that reach `devcontainer` when the helper runs `command` (`sh -c <script> …`): a fake `devcontainer`
- * on PATH prints them. So options that a script adds (BUILD_SCRIPT: `--no-lockfile`) are included.
+ * on PATH prints them. So options that a script adds (WRITE_AND_RUN_SCRIPT: `--no-lockfile`) are included.
  */
 function argsThroughScript(command: string[], input = ''): string[] {
   const bin = path.join(tempDir(), 'bin');
@@ -115,17 +115,20 @@ describe('options of the helper against `devcontainer <command> --help`', () => 
     expect(contractProblems(args, documentedOptions('read-configuration'))).toEqual([]);
   });
 
-  it('build, through BUILD_SCRIPT (with --no-lockfile, as for a repository without a lockfile)', () => {
-    const config = path.join(tempDir(), 'repo', '.devcontainer', 'devcontainer.json');
+  // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: BUILD_SCRIPT); the
+  // workspace folder is the repository folder of that rule.
+  it('build, through WRITE_AND_RUN_SCRIPT (with --no-lockfile, as for a repository without a lockfile)', () => {
+    const repo = path.join(tempDir(), 'repo');
+    const config = path.join(repo, '.devcontainer', 'devcontainer.json');
     fs.mkdirSync(path.dirname(config), { recursive: true });
     fs.writeFileSync(config, '{}');
-    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: config, imageName: `${PROJECT}:2` });
-    const args = argsThroughScript(buildCommand(config, builderArgs));
+    const builderArgs = buildArgs({ workspaceFolder: repo, configPath: config, imageName: `${PROJECT}:2` });
+    const args = throughWriteAndRun(writeAndRunCommand({ repositoryConfig: config }, builderArgs));
     expect(args[0]).toBe('build');
     expect(contractProblems(args, documentedOptions('build'))).toEqual([]);
-    // Without a lockfile, BUILD_SCRIPT adds its own option to the arguments of buildArgs.
+    // Without a lockfile, WRITE_AND_RUN_SCRIPT adds its own option to the arguments of buildArgs.
     expect(args.slice(0, builderArgs.length)).toEqual(builderArgs);
-    expect(args.length).toBeGreaterThan(builderArgs.length);
+    expect(args).toEqual([...builderArgs, '--no-lockfile']);
   });
 
   it('up, through UP_SCRIPT (without and with a container to replace)', () => {
@@ -164,10 +167,12 @@ describe('options of the helper against `devcontainer <command> --help`', () => 
   it('build with our copy of the configuration as --config, through WRITE_AND_RUN_SCRIPT (build has no --override-config)', () => {
     const options = documentedOptions('build');
     expect(options.has('--override-config')).toBe(false);
-    const repositoryConfig = path.join(tempDir(), 'repo', '.devcontainer', 'devcontainer.json');
+    const repo = path.join(tempDir(), 'repo');
+    const repositoryConfig = path.join(repo, '.devcontainer', 'devcontainer.json');
     fs.mkdirSync(path.dirname(repositoryConfig), { recursive: true });
     fs.writeFileSync(repositoryConfig, '{}');
-    const builderArgs = buildArgs({ workspaceFolder: folder, configPath: OVERRIDE_CONFIG_PATH, imageName: `${PROJECT}:2` });
+    // Follow-up of PR #121: the workspace folder is the repository folder of the lockfile rule (was: /workspaces/api).
+    const builderArgs = buildArgs({ workspaceFolder: repo, configPath: OVERRIDE_CONFIG_PATH, imageName: `${PROJECT}:2` });
     const args = throughWriteAndRun(writeAndRunCommand({ repositoryConfig }, builderArgs));
     expect(args.slice(0, builderArgs.length)).toEqual(builderArgs);
     expect(args).toContain('--no-lockfile');
