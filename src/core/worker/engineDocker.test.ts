@@ -163,6 +163,12 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     // and the token is refused when the operation holds none.
     await expect(docker.exec('c', ['cat'], { secretInputName: SECRET_REGISTRY as typeof SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
     await expect(new EngineDocker(engine).exec('c', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
+    // Review round 1 of PR #124 (A, L-1): the token that the operation holds is checked where it is sent: empty, or with
+    // white space, it is refused before anything is sent.
+    for (const held of ['', 'ghp_a b', 'ghp_x\n']) {
+      await expect(new EngineDocker(engine, silentLogger, (name) => (name === SECRET_TOKEN ? held : undefined)).exec('c', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
+    }
+    expect(seen).toHaveLength(1);
     await docker.exec('c', ['id'], { input: 'plain', workdir: '/w' });
     expect(seen).toEqual([seen[0], ['c', ['id'], { input: 'plain', workdir: '/w' }]]);
   });

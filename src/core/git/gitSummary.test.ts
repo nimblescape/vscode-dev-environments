@@ -468,8 +468,10 @@ describe('plan step 11I (PR B): GIT_BRANCH_SCRIPT, the one read of the branch (t
     for (const script of [GIT_BRANCH_SCRIPT, GIT_SUMMARY_SCRIPT]) {
       expect(script.startsWith(GIT_SCRIPT_PRELUDE)).toBe(true);
       expect(script.split(GIT_BRANCH_FUNCTION)).toHaveLength(2);
-      expect(script.split('--show-current')).toHaveLength(2);
-      expect(script.split('symbolic-ref')).toHaveLength(2);
+      // Review round 1 of PR #124 (A, L-2): changed expectation, HEAD is read once, with `git symbolic-ref -q HEAD`
+      // (before: `git branch --show-current`, with `git symbolic-ref --short` for a Git before 2.22).
+      expect(script).not.toContain('--show-current');
+      expect(script.split('symbolic-ref -q HEAD')).toHaveLength(2);
     }
     // The hardening of the summary (review rounds 2, 5 and 6 of PR #84) in the start of both.
     for (const part of ["safe.directory='*'", 'core.hooksPath=/dev/null', 'core.fsmonitor=false', 'log.showSignature=false', 'command -v git']) {
@@ -528,6 +530,35 @@ describe('plan step 11I (PR B): GIT_BRANCH_SCRIPT, the one read of the branch (t
     expect(parseGitSummaryOutput(summary.stdout, RECORDED_AT).branch).toBe('feature/x');
   });
 
+  // Review round 1 of PR #124 (A, L-2): only a ref below refs/heads/ is a branch. Before, `git branch --show-current`
+  // failed for a HEAD outside refs/heads/ and the fallback `git symbolic-ref --short` read its short name (the summary
+  // showed `origin/main` or the tag); and a Git before 2.22 read a branch whose name a tag has too as `heads/<name>`.
+  it.skipIf(!hasGit)('takes a HEAD that names a remote-tracking branch or a tag for no branch, and reads a branch whose name a tag has too by its name', async () => {
+    const { onBranch } = branchRepos();
+    git(onBranch, 'tag', 'feature/x');
+    expect(runBranch(onBranch)).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    expect(runBranch(onBranch, oldGit())).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    const docker: Pick<EnvironmentDocker, 'exec'> = {
+      exec: async (_container, command) => {
+        const [program, ...args] = command;
+        const result = spawnSync(program === 'sh' ? '/bin/sh' : program, args, {
+          encoding: 'utf8',
+          env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+        });
+        return { exitCode: result.status, stdout: result.stdout, stderr: result.stderr, timedOut: false };
+      },
+    };
+    git(onBranch, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    for (const head of ['refs/remotes/origin/main', 'refs/tags/feature/x']) {
+      fs.writeFileSync(path.join(onBranch, '.git', 'HEAD'), `ref: ${head}\n`);
+      expect(runBranch(onBranch), head).toEqual({ status: 0, stdout: '\n', stderr: '' });
+      expect(await readBranch(docker, 'c', undefined, onBranch), head).toBeNull();
+      const summary = runSummary(onBranch);
+      expect(summary.status, head).toBe(0);
+      expect(parseGitSummaryOutput(summary.stdout, RECORDED_AT).branch, head).toBeNull();
+    }
+  });
+
   it.skipIf(!hasGit)('runs no hook or fsmonitor of the repository configuration', () => {
     const repo = tempDir();
     const marker = path.join(repo, 'marker');
@@ -577,7 +608,7 @@ describe('plan step 11I (PR B): GIT_BRANCH_SCRIPT, the one read of the branch (t
     const bin = path.join(root, 'bin');
     fs.mkdirSync(bin);
     const log = path.join(root, 'log');
-    // A stub of git that records its locale variables and fails as Git before 2.22 does, so that both reads run.
+    // A stub of git that records its locale variables and fails (exit code 1).
     fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s %s\\n' "\${LC_ALL-unset}" "\${LANG-unset}" >> '${log}'\nexit 1\n`, { mode: 0o755 });
     const repo = path.join(root, 'repo');
     fs.mkdirSync(repo);
@@ -588,7 +619,9 @@ describe('plan step 11I (PR B): GIT_BRANCH_SCRIPT, the one read of the branch (t
     });
     // Exit code 1 of `git symbolic-ref -q` is a detached HEAD.
     expect(result).toMatchObject({ status: 0, stdout: '\n' });
-    expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['C C', 'C C']);
+    // Review round 1 of PR #124 (A, L-2): changed expectation, one read of HEAD (before: two, the second for a Git before
+    // 2.22).
+    expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['C C']);
   });
 });
 

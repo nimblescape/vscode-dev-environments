@@ -175,6 +175,8 @@ describe('plan step 11I (PR B): every command of the pipeline in a container is 
  * Plan step 11I (PR B): `code` (JavaScript without comments) with the text of its strings, template literals (not their
  * `${…}`) and regular expressions blanked, so that only code is left to search. A `/` starts a regular expression where
  * no value ends before it (the characters and words of the language that can come before one, and the end of a block).
+ * Known limit (review round 1 of PR #124, A, L-3): a regular expression right after `)` (`if (x) /re/`) is read as a
+ * division, so a quote in it can blank the code after it.
  */
 function blankLiterals(code: string): string {
   const out = code.split('');
@@ -236,19 +238,29 @@ function blankLiterals(code: string): string {
 /**
  * Plan step 11I (PR B): the calls of `exec` in `code` (blankLiterals) that run a process in a container: two or more
  * arguments (the container, the command, the options; RegExp#exec takes one), and every indirect use (`exec.call`,
- * `exec.apply`, `exec.bind`), each with the code around it.
+ * `exec.apply`, `exec.bind`), each with the code around it. Review round 1 of PR #124 (A, L-3): also an optional call
+ * (`exec?.(`), a call whose first argument is spread (`exec(...args)`: its count is unknown), `exec` taken as a value
+ * (`const run = docker.exec`), by a computed name (`docker['exec']`, read in `original`, the code before the blanking),
+ * or by destructuring (`const { exec } = docker`).
  */
-function containerExecs(code: string): string[] {
+function containerExecs(code: string, original: string = code): string[] {
   const found: string[] = [];
-  for (const match of code.matchAll(/\.\s*exec\s*(\(|\.\s*(?:call|apply|bind)\b)/g)) {
+  const around = (at: number) => code.slice(Math.max(0, at - 40), at + 80);
+  for (const match of code.matchAll(/\.\s*exec\b\s*(\?\.\s*\(|\(|\.\s*(?:call|apply|bind)\b|)/g)) {
     const at = match.index ?? 0;
-    if (match[1] !== '(') {
-      found.push(code.slice(at, at + 80));
+    if (!match[1].endsWith('(')) {
+      // An indirect use, or `exec` as a value (no call).
+      found.push(around(at));
+      continue;
+    }
+    const first = at + match[0].length;
+    if (code.slice(first).trimStart().startsWith('...')) {
+      found.push(around(at));
       continue;
     }
     let depth = 0;
     let commas = 0;
-    for (let i = at + match[0].length; i < code.length; i++) {
+    for (let i = first; i < code.length; i++) {
       const c = code[i];
       if (c === '(' || c === '[' || c === '{') depth++;
       else if (c === ')' || c === ']' || c === '}') {
@@ -256,8 +268,15 @@ function containerExecs(code: string): string[] {
         depth--;
       } else if (c === ',' && depth === 0) commas++;
     }
-    if (commas > 0) found.push(code.slice(Math.max(0, at - 40), at + 80));
+    if (commas > 0) found.push(around(at));
   }
+  // A computed name: the brackets are code (they survive the blanking) and hold the string `exec`.
+  for (const match of original.matchAll(/\[\s*(['"`])exec\1\s*\]/g)) {
+    const at = match.index ?? 0;
+    if (code[at] === '[' && code[at + match[0].length - 1] === ']') found.push(around(at));
+  }
+  // Destructuring: an object pattern with `exec` that is assigned (`{ exec } =`, `{ exec: run } =`).
+  for (const match of code.matchAll(/\{(?:[^{}]*?[,\s])?exec\s*(?=[,}:=])[^{}]*\}\s*=(?![=>])/g)) found.push(around(match.index ?? 0));
   return found;
 }
 
@@ -286,11 +305,14 @@ const EXEC_CALLERS: Readonly<Record<string, number>> = {
   'core/worker/containerScripts.ts': 1,
   'core/worker/engineDocker.ts': 1,
   'core/worker/monitorFlow.ts': 1,
+  // Review round 1 of PR #124 (A, L-3): `exec` as a value is found too. The Session Monitor's process hands its own
+  // execFile of its container (`deps.exec`, the removal of a record) to its loop: no exec of a container of the engine.
+  'remoteMonitor/main.ts': 1,
 };
 
 describe('plan step 11I (PR B): no call site builds a command of its own (section 0 of the plan)', () => {
   it('finds a call of exec with a command, and none of RegExp#exec, in strings, comments or regular expressions', () => {
-    const scan = (source: string) => containerExecs(blankLiterals(source));
+    const scan = (source: string) => containerExecs(blankLiterals(source), source);
     // The calls that the pipeline made before this step.
     expect(scan("const r = await this.deps.docker.exec(container.id, ['cat', '/proc/self/mountinfo'], { user: 'root' });")).toHaveLength(1);
     expect(scan('const r=await docker.exec(container,["git","-c","safe.directory=*","-C",folder,"branch","--show-current"],{user,timeoutMs:BRANCH_EXEC_TIMEOUT_MS,signal})')).toHaveLength(1);
@@ -299,6 +321,24 @@ describe('plan step 11I (PR B): no call site builds a command of its own (sectio
     expect(scan('const m=/^(\\S+) (\\[.*\\])$/.exec(line.trim());const n=re.exec(text.slice(a,b));')).toEqual([]);
     expect(scan('const x=pattern.exec(s.replace(/[(,]/g,""));const t="docker.exec(a, b)";const u=`engine.exec(${"c"}, d)`;')).toEqual([]);
     expect(scan('if(a)return/,/.exec(b);const v=c/d.exec(e)')).toEqual([]);
+    // Review round 1 of PR #124 (A, L-3): the other ways to run a command through exec.
+    for (const call of [
+      'await docker.exec?.(c,cmd);',
+      'await docker?.exec(c,cmd);',
+      'await docker["exec"](c,cmd);',
+      "await docker['exec'](c,cmd);",
+      'const{exec}=docker;await exec(c,cmd);',
+      'const{exec:run}=this.deps.docker;',
+      'const run=(...a)=>docker.exec(...a);',
+      'const run=docker.exec;',
+      'run(docker.exec);',
+      // Review round 1 of PR #124 (B, B-L6, its mutant SCAN04).
+      'await Reflect.apply(this.deps.docker.exec,this.deps.docker,[c,cmd,{user}]);',
+    ]) {
+      expect(scan(call), call).toHaveLength(1);
+    }
+    // Still no call: the text of a string, and an object or a pattern without `exec`.
+    expect(scan('const t="docker[\'exec\'](c, cmd)";const{executable}=x;const o={exec:1};')).toEqual([]);
   });
 
   it('src runs a process in a container only through the registry (and the commands of the monitor, pending U2)', async () => {
@@ -307,7 +347,7 @@ describe('plan step 11I (PR B): no call site builds a command of its own (sectio
     expect(files.length).toBeGreaterThan(100);
     for (const file of files) {
       const { code } = await esbuild.transform(fs.readFileSync(file, 'utf8'), { loader: 'ts', minifyWhitespace: true, legalComments: 'none', target: 'es2022' });
-      const found = containerExecs(blankLiterals(code));
+      const found = containerExecs(blankLiterals(code), code);
       if (found.length > 0) calls[path.relative(SRC, file).split(path.sep).join('/')] = found.length;
     }
     expect(calls).toEqual(EXEC_CALLERS);

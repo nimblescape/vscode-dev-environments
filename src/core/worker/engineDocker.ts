@@ -205,8 +205,11 @@ export class EngineDocker implements EnvironmentDocker {
     if (options.input !== undefined && options.secretInputName !== undefined) throw new Error('A docker exec has either an input or a secret input.');
     // Review round 1 of 11B3a (A-R1-9): a secret input is the token that the operation holds, passed on by its name.
     // Plan step 11I (PR B): no other secret of the operation (a registry login) ever goes into a container, and a token
-    // that the operation does not hold is refused before anything is sent.
-    if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || this.secretOf(SECRET_TOKEN) === undefined)) {
+    // that the operation does not hold is refused before anything is sent. Review round 1 of PR #124 (A, L-1): the token
+    // that is sent is checked here, where it is sent (not only the token of the pipeline's session): a value that is
+    // empty or holds white space is refused too.
+    const token = options.secretInputName !== undefined ? this.secretOf(SECRET_TOKEN) : undefined;
+    if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || !token || /\s/.test(token))) {
       throw new EngineError('A docker exec with a secret input needs it as the token secret of the operation.', 0);
     }
     try {

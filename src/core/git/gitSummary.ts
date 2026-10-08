@@ -37,16 +37,22 @@ g() {
  * `git_branch` of GIT_SUMMARY_SCRIPT and GIT_BRANCH_SCRIPT (after GIT_SCRIPT_PRELUDE, whose `g` it uses). It sets
  * `branch` to the branch that HEAD names (also one without commits yet), or to '' for a detached HEAD, and ends with 0;
  * when Git fails (no repository, a HEAD that cannot be read), `branch` is '' and it ends with the exit code of Git.
- * `git branch --show-current` needs Git 2.22; an older Git reads `git symbolic-ref --short -q HEAD`, whose exit code 1
- * (without a message) is a detached HEAD.
+ * Review round 1 of PR #124 (A, L-2): HEAD is read once, with `git symbolic-ref -q HEAD`, which every Git has (no
+ * fallback for `git branch --show-current`, which needs Git 2.22); its exit code 1 (without a message) is a detached
+ * HEAD. Only a ref below `refs/heads/` is a branch: a HEAD that names a remote-tracking branch or a tag is no branch, as
+ * for a detached HEAD (before: its short name), and a branch whose name a tag has too is read by its name (before, with
+ * an older Git: `heads/<name>`).
  */
 export const GIT_BRANCH_FUNCTION = `git_branch() {
-  if branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short -q HEAD); then
+  branch=''
+  if ref=$(g symbolic-ref -q HEAD); then
+    case $ref in
+      refs/heads/*) branch=\${ref#refs/heads/} ;;
+    esac
     return 0
   else
     git_status=$?
   fi
-  branch=''
   [ "$git_status" -eq 1 ] || return "$git_status"
 }
 `;
