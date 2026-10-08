@@ -585,7 +585,10 @@ process.stdout.write(JSON.stringify(main()) + '\n');
  * wrote the lockfile through a link, for example to the file of the token): the lockfile is taken only as a plain file of
  * the repository after links (readInRepository, at most MAX_LOCKFILE_LENGTH characters); any other one fails the run
  * before the CLI starts. With our copy of the configuration, its text is written next to the copy (so the CLI uses it; a
- * change that the CLI writes stays in the helper); without one, the CLI uses the file of the repository. Before
+ * change that the CLI writes stays in the helper); without one, the CLI uses the file of the repository. Limit (review
+ * round 1 of the follow-up, A L-1, B F1): there the CLI opens the lockfile again by its path, as root, after this check;
+ * a writer of the repository during the build could make it a link out of the repository in between, as it could for the
+ * configuration and the Dockerfile that the CLI reads. The rule closes a lockfile link in the content of the repository. Before
  * `devcontainer up`, the compose files that the Dev Container CLI generated in `<--user-data-folder>/docker-compose` (the
  * shared cache volume) and that are older than COMPOSE_FILES_MAX_AGE_MS are removed (limit L-5: nothing else removes
  * them; the CLI writes a missing one again without a build). Then `devcontainer` runs with the output of this process;

@@ -62,7 +62,7 @@ function documentedOptions(command: string): Map<string, DocumentedOption> {
 
 /**
  * The arguments that reach `devcontainer` when the helper runs `command` (`sh -c <script> …`): a fake `devcontainer`
- * on PATH prints them. So options that a script adds (BUILD_SCRIPT: `--no-lockfile`) are included.
+ * on PATH prints them. So options that a script adds (WRITE_AND_RUN_SCRIPT: `--no-lockfile`) are included.
  */
 function argsThroughScript(command: string[], input = ''): string[] {
   const bin = path.join(tempDir(), 'bin');

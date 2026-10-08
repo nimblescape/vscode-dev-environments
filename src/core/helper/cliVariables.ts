@@ -63,7 +63,7 @@ export const DEVCONTAINER_ID_VARIABLE = 'devcontainerId';
  * Variables that can be set in the process of the Dev Container CLI in the workspace helper, whose values the extension
  * does not know exactly: the variables that the helper sets itself (HELPER_ENV_NAMES: HOME, PATH, and HOSTNAME of
  * Docker, NODE_VERSION and YARN_VERSION of the node base image of resources/helper/Dockerfile), those of the shell of
- * UP_SCRIPT and BUILD_SCRIPT (PWD, OLDPWD, SHLVL, `_`), TERM, and the proxy variables that the Docker CLI adds to
+ * UP_SCRIPT and WRITE_AND_RUN_SCRIPT (PWD, OLDPWD, SHLVL, `_`), TERM, and the proxy variables that the Docker CLI adds to
  * `docker run` from its configuration (`proxies` of ~/.docker/config.json). The pipeline passes no other variable to
  * the CLI runs, except COMPOSE_PROJECT_NAME to those of Docker Compose, whose value it knows (review round 18, D18-1:
  * helperCliVariables with `env`, not here). Case-sensitive, as on Linux.
