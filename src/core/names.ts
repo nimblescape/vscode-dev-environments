@@ -121,6 +121,11 @@ export const HOST_ACCESS_UNRESTRICTED_LABEL = `${LABEL_HOST_ACCESS}=${HOST_ACCES
  */
 export const HOST_ACCESS_CHECKED = 'checked';
 /**
+ * Label that Docker Compose gives each container, network, and volume of a project. Plan step 11I (PR D, audit D5): the
+ * one definition (the pipeline, the worker's Docker and the host access policy read it).
+ */
+export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+/**
  * `--label` values of the override configuration of a single container (review round 2, D2-1): the labels by which Docker
  * Compose finds the containers of a project, with empty values, so that labels that the image inherited (for example of
  * an image that Compose built for another project) cannot make `docker compose -p <project> down` of the user remove the

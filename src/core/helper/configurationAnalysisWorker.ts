@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Worker thread of the host access analysis (bundle dist/configurationAnalysisWorker.js, review round 8): runs one job of
-// configurationAnalysis.ts and posts its result, or the error it threw. configurationAnalysisRunner.ts starts it with
-// limits of memory and stops it after its time limit. No `vscode` import.
+// Worker thread of the host access analysis (review round 8; plan step 11E2: in the worker's bundle as the module
+// `devenv:analysis-script`, scripts/workerScripts.mjs): runs one job of configurationAnalysis.ts and posts its result, or
+// the error it threw. configurationAnalysisRunner.ts starts it from that text with limits of memory and stops it after its
+// time limit. No `vscode` import.
 import { parentPort } from 'worker_threads';
 import { runAnalysisJob, type AnalysisJob } from './configurationAnalysis';
 

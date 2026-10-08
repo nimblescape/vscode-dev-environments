@@ -8,7 +8,6 @@ import { CommandError } from '../errors';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
 import {
   baseImageKey,
-  composeContainerOrder,
   COMPOSE_VOLUME_KEY,
   composeMountVolumes,
   composeConfigurationChange,
@@ -561,14 +560,6 @@ describe('Docker Compose rules (unit 6)', () => {
   it('isComposeContainer: not by the labels that an image of the project gave a single container (review round 2, D2-4)', () => {
     const fromImage = { 'com.docker.compose.project': 'devenv-3f2a9c1e', 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
     expect(isComposeContainer(fromImage, 'devenv-3f2a9c1e')).toBe(false);
-  });
-
-  it('composeContainerOrder: the services start first and stop last', () => {
-    const dev = { id: 'dev', labels: {} };
-    const db = { id: 'db', labels: { 'nimblescape.devenv.compose-service': 'db' } };
-    const cache = { id: 'cache', labels: { 'nimblescape.devenv.compose-service': 'cache' } };
-    expect(composeContainerOrder([dev, db, cache], 'start').map((c) => c.id)).toEqual(['db', 'cache', 'dev']);
-    expect(composeContainerOrder([db, dev, cache], 'stop').map((c) => c.id)).toEqual(['dev', 'db', 'cache']);
   });
 
   it('composeMountVolumes: named volumes of mounts become volumes of the project, unless external', () => {

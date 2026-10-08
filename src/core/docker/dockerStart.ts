@@ -9,7 +9,8 @@ import * as path from 'path';
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { abortError, isAbortError, sleep as defaultSleep, systemClock, type Clock, type Logger, type ProcessRunner, type RunResult } from '../ports';
-import { DOCKER_INFO_TIMEOUT_MS, type BootstrapDocker } from './bootstrapDocker';
+import type { BootstrapDocker } from './bootstrapDocker';
+import { DOCKER_INFO_TIMEOUT_MS } from './dockerTimeouts';
 import { windowsDockerDesktopFolders } from './dockerCli';
 
 /** The start command gets this head start before the polling of `docker info` begins; it keeps running in parallel. */

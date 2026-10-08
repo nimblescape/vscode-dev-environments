@@ -2,12 +2,14 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Entry point of the Session Monitor on a remote Docker host (unit 7, PR 2; implementation notes 16), bundled to
-// dist/remoteMonitor.js. The container devenv-session-monitor (image: the workspace helper, which has Node.js and the
-// Docker CLI; the Docker socket of its engine; the volume devenv-session-monitor at /state) runs the pipe loader (plan step
-// 3, src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
-// /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The computers
-// run the other subcommands with `docker exec node /opt/devenv/monitor.js …`:
+// Entry point of the Session Monitor of a Docker engine (unit 7, PR 2; plan step 8, PR A: on every engine, local and
+// remote; implementation notes 16). Plan step 11D2: bundled into the worker's script as the module `devenv:monitor-script`
+// (scripts/workerScripts.mjs), which the worker gives the monitor container that it creates. The container
+// devenv-session-monitor (image: the worker's own helper image by its monitor tag, plan step 11D3, which has Node.js and
+// the Docker CLI; the Docker socket of its engine; the volume devenv-session-monitor at /state) runs the pipe loader (plan
+// step 3, src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
+// /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The workers run
+// the other subcommands in it as `node /opt/devenv/monitor.js …` (an exec over the Engine API, monitorFlow.ts):
 //   run                          the loop: a tick every 15 s (rules.ts); each automatic stop under the environment lock
 //                                (plan step 8, PR B, D2); exits with 0 after REMOTE_IDLE_EXIT_MS without a running
 //                                environment container and without a fresh record while it maintains no images (Q5;
@@ -17,6 +19,8 @@
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
 //   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
 //                                (the loop; review round 1 of PR #63, F2; review round 4, N4-2: no other meaning of an `at`)
+//   images -                     writes the image list of standard input (the image maintenance)
+//   settings -                   writes the image settings of standard input (the image maintenance)
 // It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
 // (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
 // nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)

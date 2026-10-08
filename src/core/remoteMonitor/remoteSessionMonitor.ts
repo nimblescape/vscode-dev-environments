@@ -52,7 +52,7 @@ export interface RemoteSessionMonitorOptions {
   /** Plan step 11D2: the engine of the monitor (the worker's, over the Engine API). */
   engine: MonitorEngine;
   logger: Logger;
-  /** The content of dist/remoteMonitor.js. */
+  /** The script of the monitor (plan step 11D2: the module `devenv:monitor-script` of the worker's bundle). */
   script: () => Promise<string>;
   /**
    * User requests 2026-09-28: the image maintenance of the monitor: the prefixes of the images that it updates and cleans

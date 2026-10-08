@@ -11,8 +11,8 @@ import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { environmentImageName } from '../names';
 import type { Environment, WindowStatus } from '../types';
-import type { EnvironmentServiceDeps, RepositoryTarget } from './environmentService';
-import { ENV_ID, PID, REPO, T0, WINDOW_ID, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import type { RepositoryTarget } from './operationBase';
+import { ENV_ID, PID, REPO, T0, WINDOW_ID, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
@@ -28,7 +28,7 @@ let asked: number[];
  * A harness whose pipeline asks `processAlive` (as the worker's asks the extension); `alive` answers it, and the
  * registry writes of this window (registryOpenRecords, which the worker sends as requests) ask it synchronously.
  */
-function harness(alive: (pid: number) => boolean, overrides: Partial<EnvironmentServiceDeps> = {}, processAlive?: (pid: number) => Promise<boolean>): Harness {
+function harness(alive: (pid: number) => boolean, overrides: HarnessOverrides = {}, processAlive?: (pid: number) => Promise<boolean>): Harness {
   h?.cleanup();
   asked = [];
   return createHarness({

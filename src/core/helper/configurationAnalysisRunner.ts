@@ -3,13 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Review round 8 (structural fix of the parser DoS class, S8-1, S8-2, S8-4 and later ones): runs each job of the host
-// access analysis (configurationAnalysis.ts) in a worker thread of its own (configurationAnalysisWorker.ts, bundled as
-// dist/configurationAnalysisWorker.js) with limits of memory (`resourceLimits`) and a time limit. When the time runs out,
-// the worker is stopped (Worker.terminate stops even a running loop); a worker that runs out of memory, crashes, exits,
-// or answers with anything but a result is stopped too. Each such failure refuses the configuration as not supported
-// (analysisFailure): fail closed, never allowed. The limits of the parser (the sizes and budgets of dockerfile.ts) stay
-// the first line; this is the bound on everything they miss. No `vscode` import: the extension passes the path of the
-// bundle (context.asAbsolutePath).
+// access analysis (configurationAnalysis.ts) in a worker thread of its own (configurationAnalysisWorker.ts; plan step
+// 11E2: the worker carries its script in its own bundle, `devenv:analysis-script`) with limits of memory
+// (`resourceLimits`) and a time limit. When the time runs out, the thread is stopped (Worker.terminate stops even a
+// running loop); a thread that runs out of memory, crashes, exits, or answers with anything but a result is stopped too.
+// Each such failure refuses the configuration as not supported (analysisFailure): fail closed, never allowed. The limits
+// of the parser (the sizes and budgets of dockerfile.ts) stay the first line; this is the bound on everything they miss.
+// No `vscode` import.
 //
 // V8 ignores `resourceLimits` when the process runs with `--max-old-space-size` (for example in NODE_OPTIONS): the flag
 // applies to every isolate of the process. So the runner also watches the memory of the worker itself (MemoryWatch): its
@@ -57,11 +57,12 @@ export const ANALYSIS_LIMITS: Readonly<AnalysisLimits> = {
  */
 export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
   /**
-   * `script`: the path of the bundle of the thread (the extension: dist/configurationAnalysisWorker.js), or (plan step
-   * 11E2) its text, which the worker carries in its own bundle (`devenv:analysis-script`) and starts with `eval`.
+   * `script`: the text of the script of the thread, which the worker carries in its own bundle (`devenv:analysis-script`,
+   * plan step 11E2) and starts with `eval`. Plan step 11I (PR D): no longer a path (the bundle
+   * dist/configurationAnalysisWorker.js of the extension, plan step 11F1, is gone).
    */
   constructor(
-    private readonly script: string | { code: string },
+    private readonly script: { code: string },
     private readonly logger?: Pick<Logger, 'warn'>,
     private readonly limits: Readonly<AnalysisLimits> = ANALYSIS_LIMITS,
     private readonly maxJobCharacters: number = MAX_ANALYSIS_JOB_CHARACTERS,
@@ -103,10 +104,9 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
         this.limits.timeoutMs,
       );
       try {
-        // A path, or (plan step 11E2) the text of the script, which `eval` runs.
-        const evaluated = typeof this.script !== 'string';
-        worker = new Worker(typeof this.script === 'string' ? this.script : this.script.code, {
-          eval: evaluated,
+        // Plan step 11E2: the text of the script, which `eval` runs.
+        worker = new Worker(this.script.code, {
+          eval: true,
           resourceLimits: {
             maxOldGenerationSizeMb: this.limits.maxOldGenerationSizeMb,
             maxYoungGenerationSizeMb: this.limits.maxYoungGenerationSizeMb,
@@ -127,8 +127,8 @@ export class WorkerConfigurationAnalyzer implements ConfigurationAnalyzer {
           fail(failure.reason, failure.kind);
         } else fail('an answer that is no result');
       });
-      // ERR_WORKER_OUT_OF_MEMORY for a limit of `resourceLimits`, or an error of the script (before `online`: it did not
-      // start, for example a missing bundle).
+      // ERR_WORKER_OUT_OF_MEMORY for a limit of `resourceLimits`, or an error of the script (before `online`, or a module
+      // that it cannot load: it did not start).
       worker.on('error', (error: Error & { code?: string }) =>
         error.code === 'ERR_WORKER_OUT_OF_MEMORY'
           ? fail('it used too much memory', 'limit')

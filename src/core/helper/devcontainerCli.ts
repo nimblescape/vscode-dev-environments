@@ -22,7 +22,6 @@ import {
   loopbackAppPorts,
   overrideRunArgs,
   runArgsDecideHostname,
-  withoutNameArgs,
   type HostAccessChecks,
 } from '../policy';
 
@@ -217,14 +216,6 @@ export class DevcontainerCommandError extends CommandError {
       this.message = `${command} failed with exit code ${exitCode}: ${text}`;
     }
   }
-}
-
-/**
- * Removes `--name <value>` and `--name=<value>` from docker run arguments, read as the host access policy and Docker read
- * them (withoutNameArgs): a `--name` that is the value of another flag stays.
- */
-export function stripNameArgs(runArgs: readonly string[]): string[] {
-  return withoutNameArgs(runArgs);
 }
 
 /**

@@ -14,7 +14,7 @@ import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { CONTAINER_SCRIPTS, type ContainerScript } from '../worker/containerScripts';
 import { BRANCH_EXEC_TIMEOUT_MS } from './refreshStates';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, REPO, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

@@ -12,7 +12,7 @@
 // the extension's HelperChannel.batch through the worker's operations `batch`, `batchStep` and `batchChunk` (removed);
 // the cases of that relay are gone, the others run on the worker's own session.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BATCH_GIT_UID, BATCH_HOLD_LIMIT_MS, MAX_BATCH_INPUT_CHARACTERS, batchRunSpec } from '../core/helperChannel/batch';
+import { BATCH_GIT_UID, BATCH_HOLD_LIMIT_MS, BATCH_MISSING_VOLUME_CODE, MAX_BATCH_INPUT_CHARACTERS, batchRunSpec } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
 import { HelperChannel, HelperChannelError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
@@ -20,7 +20,7 @@ import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientM
 import { bundleHash } from '../core/loader/pipeLoader';
 import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError } from '../core/ports';
-import { BATCH_MISSING_VOLUME_CODE, workerBatchSession, type BatchDeps } from './batch';
+import { workerBatchSession, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
 import { ChannelServer, OperationError, type OperationContext } from './server';
 import type { DockerEngine, EngineAttachedOptions, EngineAttachedRun, EngineAttachedSpec } from '../core/worker/dockerEngine';

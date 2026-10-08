@@ -42,18 +42,14 @@ import {
 import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
 import {
   COMPOSE_MODEL_TIMEOUT_MS,
-  DOCKER_SOCKET,
-  HELPER_IMAGE_RECHECK_MS,
   MERGED_CONFIGURATION_TIMEOUT_MS,
   WorkspaceHelper,
-  helperDockerSocket,
-  helperStatePathFor,
-  type HelperEngine,
-  isPassableEnvName,
   type HelperDeps,
   type HelperDocker,
   type HelperImageUse,
 } from './workspaceHelper';
+import { DOCKER_SOCKET, HELPER_IMAGE_RECHECK_MS, helperDockerSocket, helperStatePathFor, type HelperEngine } from './helperImages';
+import { isPassableEnvName } from './stepInputs';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
@@ -3114,7 +3110,9 @@ describe('plan step 7 (user decision of 2026-10-01): no volume step outside the 
         (reason: unknown) => reason,
       );
       expect(error, name).toBeInstanceOf(Error);
-      expect((error as Error).message, name).toMatch(/^Internal error: the workspace helper step \w+ \(.*\) on the volume vol ran outside the batch helper of an operation; it was not run\.$/s);
+      // Plan step 11I (PR D): changed, the message names the kind of the step without its command (WorkspaceHelper no longer
+      // builds one; before: "step <kind> (<command>) on the volume").
+      expect((error as Error).message, name).toMatch(/^Internal error: the workspace helper step \w+ on the volume vol ran outside the batch helper of an operation; it was not run\.$/);
       expect((error as Error).message, name).not.toContain(TOKEN);
       expect(isUserFacingError(error), name).toBe(false);
     }

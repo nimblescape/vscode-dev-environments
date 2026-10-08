@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { dockerHostOf, isOnDockerHost, sshEndpoint, type DockerTarget } from '../core/docker/dockerHost';
+import { dockerHostOf, isOnDockerHost, type DockerTarget } from '../core/docker/dockerHost';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, findRemoteContext, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
@@ -29,7 +29,7 @@ import { Messages } from '../core/messages';
 import { nodeHttpsTransport } from '../core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
-import { systemClock, type Logger } from '../core/ports';
+import { systemClock } from '../core/ports';
 import { DEFAULT_IMAGE_SCHEDULE, usableTimeZone } from '../core/remoteMonitor/cron';
 import { PACKAGES_TIMEOUT_MS, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
 import { imageLists } from './imageLists';
@@ -49,7 +49,7 @@ import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment
 import { workerMonitor } from './workerMonitor';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import type { Environment, ExtensionSettings } from '../core/types';
+import type { ExtensionSettings } from '../core/types';
 import { VsCodeGitHubAuth, ghcrRejectionReporter } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
@@ -257,7 +257,7 @@ async function activateExtension(
       openHelperChannel(
         {
           start: (args) => docker.start(args),
-          runDirect: (args, options) => docker.runDirect(args, options),
+          runDirect: (args, options) => docker.run(args, options),
           logger,
           script: () => {
             channelScript ??= fs.promises.readFile(channelScriptPath, 'utf8');
@@ -434,7 +434,6 @@ async function activateExtension(
       ui,
       auth,
       credentials,
-      settings: getSettings,
       windowId: sessionCoordinator.windowId,
       // Plan step 11C2a: the busy marks that a flow sets for this window, as its own pipeline sets them.
       pid: process.pid,

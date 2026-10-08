@@ -14,7 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { ENGINE_IDENTITY_ARGS, engineIdentity } from '../../src/core/helperChannel/protocol';
 import { mapContainerState, publicInfo, toContainerInfo, toLabels, toVolumeInfo, type ContainerInfo } from '../../src/core/docker/dockerObjects';
-import { helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { EngineDocker } from '../../src/core/worker/engineDocker';

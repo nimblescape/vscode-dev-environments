@@ -33,20 +33,6 @@ export async function readJson<T>(file: string): Promise<T | undefined> {
   }
 }
 
-export function readJsonSync<T>(file: string): T | undefined {
-  let text: string;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return undefined;
-  }
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    return undefined;
-  }
-}
-
 export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   const temp = atomicTemporaryPath(file);
@@ -79,10 +65,6 @@ export function writeJsonAtomicSync(file: string, value: unknown): void {
 /** Removes a file. A missing file is not an error. */
 export async function removeFile(file: string): Promise<void> {
   await fs.promises.rm(file, { force: true });
-}
-
-export function removeFileSync(file: string): void {
-  fs.rmSync(file, { force: true });
 }
 
 /**

@@ -25,7 +25,6 @@ import {
   findRemoteContext,
   isOwnContext,
   listContextInfos,
-  listContexts,
   localContextChoice,
   remoteContextChoice,
   noPromptEnv,
@@ -372,7 +371,7 @@ describe('the Docker context commands', () => {
       { name: 'bare', description: '', endpoint: '' },
     ]);
     expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS]);
-    await expect(listContexts(docker)).resolves.toEqual(['default', 'htldvm', 'bare']);
+    // Plan step 11I (PR D): changed, listContexts (only the names of listContextInfos) is removed: nothing used it.
   });
 
   it('refuses a line of `docker context ls` that is not JSON', async () => {
@@ -498,7 +497,8 @@ describe('the Docker context commands', () => {
   it('throws when a command fails', async () => {
     const docker = fakeDocker(() => fail('context "x" does not exist'));
     await expect(useContext(docker, 'x')).rejects.toThrow('docker context use x failed: context "x" does not exist');
-    await expect(listContexts(docker)).rejects.toThrow('docker context ls');
+    // Plan step 11I (PR D): listContextInfos (before: listContexts, which only took its names and is removed).
+    await expect(listContextInfos(docker)).rejects.toThrow('docker context ls');
   });
 
   it('goes back to the remembered context, else default; never to one of ours', () => {

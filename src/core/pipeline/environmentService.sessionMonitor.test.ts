@@ -9,7 +9,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { abortError } from '../ports';
 import type { DockerTarget } from '../docker/dockerHost';
-import type { EnvironmentSessionMonitor, RepositoryTarget } from './environmentService';
+import type { EnvironmentSessionMonitor } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 

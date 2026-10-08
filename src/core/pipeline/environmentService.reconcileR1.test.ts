@@ -4,7 +4,7 @@
 
 // Review round 1 of 11C3 (reviewer B, mutation probe): reconcileInWorker with parameters that cannot be sent.
 import { describe, expect, it } from 'vitest';
-import { RECONCILE_FLOW_TIMEOUT_MS } from './environmentService';
+import { RECONCILE_FLOW_TIMEOUT_MS } from './operationBase';
 import { createHarness } from './environmentService.testkit';
 
 describe('reconcileInWorker (review round 1 of 11C3, reviewer B)', () => {

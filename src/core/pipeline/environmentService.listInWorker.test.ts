@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { BatchHelperUnavailableError, UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_WINDOW_STATE } from '../helperChannel/protocol';
-import { DELETE_CHECK_FLOW_TIMEOUT_MS, DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './environmentService';
+import { DELETE_CHECK_FLOW_TIMEOUT_MS, DELETE_FLOW_TIMEOUT_MS, LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS, PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS } from './operationBase';
 import { ENV_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import type { EnvironmentServiceDeps } from './environmentService';
 

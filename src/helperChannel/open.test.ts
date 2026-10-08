@@ -8,7 +8,7 @@
 // A-I1: the signal of the operation when the pipeline gives none).
 import { describe, expect, it, vi } from 'vitest';
 import { LOCK_UNAVAILABLE_CODE, OP_OPEN, OPEN_PROGRESS_DETAIL, type AskKind } from '../core/helperChannel/protocol';
-import { PipelineTexts } from '../core/pipeline/environmentService';
+import { PipelineTexts } from '../core/pipeline/operationBase';
 import { silentLogger } from '../core/ports';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';

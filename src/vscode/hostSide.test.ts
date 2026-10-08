@@ -47,7 +47,6 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
     ui,
     auth,
     credentials,
-    settings: () => ({ stopAfterMinutes: 10 }) as unknown as ReturnType<HostSideDeps['settings']>,
     windowId: 'w1',
     // Plan step 11C2a: the busy marks of a flow.
     pid: 100,
@@ -102,8 +101,8 @@ describe('the HostSide of this computer (plan step 11B1)', () => {
     expect(host.records).not.toHaveProperty('add');
     await host.records.sessionFile('writePending', 'e1');
     expect(sessionFiles.writePending).toHaveBeenCalledWith('e1', 'w1');
-    await host.records.sessionFile('removeReopen', 'e1');
-    expect(sessionFiles.removeReopen).toHaveBeenCalledWith();
+    // Plan step 11I (PR D): changed, the session file `removeReopen` (the reopen record of any environment) is removed: no
+    // flow sent it (before: it removed the reopen record here); a flow removes it only by its environment (removeReopenOf).
   });
 
   // Plan step 11E6 (decision A1 of 2026-10-05): changed, the request `connect` is removed (the open answers with what the

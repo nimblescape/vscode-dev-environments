@@ -10,7 +10,7 @@ import { silentLogger } from '../ports';
 import { CommandError } from '../errors';
 import type { BusyMark, Environment, RefusedUpdate, WindowStatus } from '../types';
 import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, environmentImageName } from '../names';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import {
   ACCOUNT,
   BASE_IMAGE,

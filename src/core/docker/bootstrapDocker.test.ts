@@ -74,9 +74,9 @@ describe('BootstrapDocker (plan step 11F2)', () => {
     for (const name of ['setRouter', 'setWorkerEngine', 'pullImage', 'startContainer', 'exec', 'removeContainer', 'stopContainer', 'createVolume', 'removeVolume', 'labelImage', 'containerState']) {
       expect(own, name).not.toContain(name);
     }
-    expect(own).toEqual(
-      expect.arrayContaining(['isInstalled', 'run', 'runDirect', 'start', 'daemonStatus', 'isRunning', 'imageExists', 'imageId', 'buildImage', 'listImagesByLabel', 'removeImage']),
-    );
+    // Plan step 11I (PR D): changed, `run` is the one method of a call (before: also `runDirect`, which `run` called).
+    expect(own).toEqual(expect.arrayContaining(['isInstalled', 'run', 'start', 'daemonStatus', 'isRunning', 'imageExists', 'imageId', 'buildImage', 'listImagesByLabel', 'removeImage']));
+    expect(own).not.toContain('runDirect');
   });
 
   it('runs a call directly, also within an operation, with the Docker context of the operation', async () => {
@@ -96,7 +96,9 @@ describe('BootstrapDocker (plan step 11F2)', () => {
     const docker = new BootstrapDocker(new FakeRunner(), DOCKER, { PATH: '/usr/bin' }, logger, 'linux');
     await docker.run(['image', 'rm', 'secret-looking-reference:1']);
     await docker.run(['image', 'inspect', 'other-reference:1']);
-    expect(lines.filter((line) => line.includes('(direct)'))).toEqual([expect.stringMatching(/^docker image rm \(direct\): exit code 0 after /)]);
+    // Plan step 11I (PR D): changed, without "(direct)" (every call of BootstrapDocker is one; before: "docker image rm
+    // (direct): …").
+    expect(lines.filter((line) => line.startsWith('docker '))).toEqual([expect.stringMatching(/^docker image rm: exit code 0 after /)]);
     expect(lines.join('\n')).not.toContain('secret-looking-reference');
   });
 
@@ -814,18 +816,19 @@ describe('BootstrapDocker: every call runs directly (plan step 11I1, PR B2)', ()
       },
       { now: () => now },
     );
-    await docker.runDirect(['ps']);
-    await docker.runDirect(['build', '--quiet', '-t', 'secret-name', '-'], { input: 'FROM secret-name\n' });
-    await docker.runDirect(['stop', 'c']);
-    await expect(docker.runDirect(['start', 'c'])).rejects.toThrow('spawn failed');
+    // Plan step 11I (PR D): changed, `run` (before: `runDirect`, which it called), and the lines without "(direct)".
+    await docker.run(['ps']);
+    await docker.run(['build', '--quiet', '-t', 'secret-name', '-'], { input: 'FROM secret-name\n' });
+    await docker.run(['stop', 'c']);
+    await expect(docker.run(['start', 'c'])).rejects.toThrow('spawn failed');
     const controller = new AbortController();
     controller.abort();
-    await expect(docker.runDirect(['rm', 'c'], { signal: controller.signal })).rejects.toThrow();
+    await expect(docker.run(['rm', 'c'], { signal: controller.signal })).rejects.toThrow();
     expect(lines).toEqual([
-      'info docker build (direct): exit code 0 after 12.1 s.',
-      'info docker stop (direct): timed out after 12.1 s.',
-      'info docker start (direct): failed after 12.1 s.',
-      'info docker rm (direct): cancelled after 0.0 s.',
+      'info docker build: exit code 0 after 12.1 s.',
+      'info docker stop: timed out after 12.1 s.',
+      'info docker start: failed after 12.1 s.',
+      'info docker rm: cancelled after 0.0 s.',
     ]);
   });
 
@@ -852,8 +855,8 @@ describe('BootstrapDocker: every call runs directly (plan step 11I1, PR B2)', ()
       'constructor',
       'dockerPath',
       'isInstalled',
-      'runDirect',
-      'runDirectOnce',
+      // Plan step 11I (PR D): changed, runRepeated (before: runDirect and runDirectOnce; `run` is the one method).
+      'runRepeated',
       'runOnce',
       'start',
       'operationEnv',

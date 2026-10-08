@@ -17,7 +17,6 @@ export const USER_ERROR_CODES = [
   'filesMissing',
   'signInRequired',
   'hostAccess',
-  'unencryptedDockerConnection',
   'otherAccount',
   'dockerHostUnreachable',
   'dockerEndpointUnsupported',

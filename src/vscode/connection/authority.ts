@@ -115,16 +115,6 @@ export function folderUriParts(
   };
 }
 
-/** `vscode-remote://attached-container+<hex><folder>`. Path segments are percent-encoded where needed. */
-export function folderUriString(containerName: string, remoteWorkspaceFolder: string, dockerContext?: string): string {
-  const parts = folderUriParts(containerName, remoteWorkspaceFolder, dockerContext);
-  const encodedPath = parts.path
-    .split('/')
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  return `${parts.scheme}://${parts.authority}${encodedPath}`;
-}
-
 /**
  * Container name of a folder or workspace URI of an attached container window, or `undefined` for any other URI
  * (a local folder, another remote type).

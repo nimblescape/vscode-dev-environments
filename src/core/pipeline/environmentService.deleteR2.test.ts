@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE } from '../helperChannel/protocol';
-import { PipelineTexts } from './environmentService';
+import { PipelineTexts } from './operationBase';
 import { ENV_ID, REPO, createHarness, seedEnvironment } from './environmentService.testkit';
 
 describe('the clear after a flow without an answer (B-R2 C3)', () => {

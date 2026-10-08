@@ -25,7 +25,6 @@ import {
   parseClaimedOperationName,
   parseJson,
   readJsonTolerant,
-  readJsonTolerantSync,
   readTextFile,
   retryTransient,
   retryTransientSync,

@@ -166,7 +166,6 @@ export function workerHostSide(ask: AskHost, secretOf: SecretOf): HostSide {
     state: {
       windowStatuses: async () => ((await call('local', 'windowStatuses')) ?? []) as readonly WindowStatus[],
       pendings: async () => ((await call('local', 'pendings')) ?? []) as readonly { environmentId: string; windowId: string; createdAt: string }[],
-      settings: async () => ((await call('local', 'settings')) ?? {}) as Record<string, unknown>,
       // Plan step 11E4d: only `false` is an ended process; anything else counts as running (when in doubt, in use).
       processAlive: async (pid) => (await call('local', 'processAlive', pid)) !== false,
       viewer: async () => parseViewerAnswer(await call('local', 'viewer')),

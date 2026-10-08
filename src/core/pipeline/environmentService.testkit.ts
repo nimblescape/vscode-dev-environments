@@ -7,6 +7,9 @@
 // import this module.
 import { EnvironmentOperations, type EnvironmentOperationsDeps, type OperationFlow } from './environmentOperations';
 import { windowLifecycleMemory } from './lifecycleMemory';
+import { registryBusyMarks } from './busyMarks';
+import { markViewOf, type WindowEnvironmentStore } from './operationBase';
+import { registryOpenRecords } from './openRecords';
 import type { DeleteConfirmation } from './deleteCheck';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -61,14 +64,13 @@ import type {
 } from '../types';
 import {
   EnvironmentService,
-  type DockerStarter,
   type EnvironmentDocker,
   type EnvironmentHelper,
   type EnvironmentServiceDeps,
 } from './environmentService';
+import type { DockerStarter } from './operationBase';
 import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
-import type { PullCredentials } from './pullCredentials';
-import { inProcessAnalyzer } from '../helper/configurationAnalysis';
+import { inProcessAnalyzer } from '../helper/configurationAnalysis.testkit';
 
 export const REPO = 'acme/api';
 export const ENV_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -140,9 +142,9 @@ export class FakeDocker implements EnvironmentDocker {
   readonly log: string[] = [];
   /** Each `docker exec`; unit 15: with its standard input (the token of TOKEN_WRITE_SCRIPT). */
   readonly execs: Array<{ container: string; command: readonly string[]; user?: string; signal?: AbortSignal; input?: string; secret?: true }> = [];
-  /** Each `docker pull`, with the credentials that it got instead of those of Docker. */
-  readonly pulls: Array<{ reference: string; credentials?: PullCredentials }> = [];
-  pullError: (reference: string, credentials?: PullCredentials) => Error | undefined = () => undefined;
+  /** Each `docker pull`. */
+  readonly pulls: Array<{ reference: string }> = [];
+  pullError: (reference: string) => Error | undefined = () => undefined;
   execHandler: (container: string, command: readonly string[], user?: string) => Partial<RunResult> = () => ({});
   /**
    * Review round 14 (P14-1): links in the volumes (subpath → the subpath it leads to), which Docker follows when it mounts
@@ -560,11 +562,11 @@ export class FakeDocker implements EnvironmentDocker {
       .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
   }
 
-  async pullImage(reference: string, options: { signal?: AbortSignal; credentials?: PullCredentials } = {}): Promise<void> {
+  async pullImage(reference: string, options: { signal?: AbortSignal } = {}): Promise<void> {
     this.log.push(`pull ${reference}`);
-    this.pulls.push(options.credentials ? { reference, credentials: { ...options.credentials } } : { reference });
+    this.pulls.push({ reference });
     if (options.signal?.aborted) throw abortError();
-    const error = this.pullError(reference, options.credentials);
+    const error = this.pullError(reference);
     if (error) throw error;
     this.images.add(reference);
   }
@@ -1414,7 +1416,6 @@ export interface Harness {
   logger: RecordingLogger;
   progress: RecordingProgress;
   settings: ExtensionSettings;
-  env: NodeJS.ProcessEnv;
   /** The token that getToken returns; `undefined` = not signed in. */
   token: string | undefined;
   /** The account of the session (getAccount); none while `token` is `undefined`. */
@@ -1546,7 +1547,13 @@ export function fakeWorkerFlow(h: Pick<Harness, 'docker' | 'helper' | 'logger' |
   };
 }
 
-export function createHarness(overrides: Partial<EnvironmentServiceDeps & EnvironmentOperationsDeps> = {}): Harness {
+/**
+ * Plan step 11I (PR D): the overrides of the deps of the service and the operations of the harness. The registry is the
+ * window's (the service's EnvironmentStore is narrower), as both use it.
+ */
+export type HarnessOverrides = Partial<Omit<EnvironmentServiceDeps & EnvironmentOperationsDeps, 'registry'> & { registry: WindowEnvironmentStore }>;
+
+export function createHarness(overrides: HarnessOverrides = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   const paths = new StoragePaths(root);
   paths.ensureDirectoriesSync();
@@ -1566,7 +1573,6 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
     logger: new RecordingLogger(),
     progress: new RecordingProgress(),
     settings: { ...DEFAULT_SETTINGS },
-    env: { FOO: 'local-foo' } as NodeJS.ProcessEnv,
     token: TOKEN as string | undefined,
     account: { ...ACCOUNT },
     dockerStopped: false,
@@ -1594,7 +1600,6 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
   };
   const common = {
     docker: h.docker,
-    runner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }) },
     helper: h.helper,
     registry: h.registry,
     sessionFiles: h.sessionFiles,
@@ -1607,8 +1612,6 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
     ui: h.ui,
     logger: h.logger,
     clock,
-    platform: 'linux',
-    env: h.env,
     owner: { windowId: WINDOW_ID, pid: PID },
     settings: () => h.settings,
     startDocker,
@@ -1624,8 +1627,23 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
     environmentLock: h.lock.take,
     // Review 11F1 (A-L1): one lifecycle memory for the service and the operations, as the window has one.
     lifecycleMemory: windowLifecycleMemory(),
-  } satisfies EnvironmentServiceDeps;
-  h.service = new EnvironmentService({ ...common, ...overrides });
+  } satisfies Omit<EnvironmentServiceDeps, 'busyMarks' | 'openRecords' | 'recordGitSummary'>;
+  // Plan step 11I (PR D): the worker's pipeline always sends its busy marks, the registry writes of the open and the Git
+  // state to the extension (workerServiceDeps); here they are written to the registry of the harness, as the window does.
+  const serviceDeps = { ...common, ...overrides };
+  const view = markViewOf(serviceDeps);
+  h.service = new EnvironmentService({
+    ...serviceDeps,
+    busyMarks: serviceDeps.busyMarks ?? registryBusyMarks(serviceDeps.registry, view),
+    openRecords: serviceDeps.openRecords ?? registryOpenRecords(serviceDeps.registry, view),
+    recordGitSummary:
+      serviceDeps.recordGitSummary ??
+      (async (environmentId, summary) => {
+        await serviceDeps.registry.updateEnvironment(environmentId, (entry) => {
+          entry.gitSummary = summary;
+        });
+      }),
+  });
   // Plan step 11F1: the operations of the window (the extension's side) on the same registry, files and FakeDocker.
   h.operations = new EnvironmentOperations({
     ...common,

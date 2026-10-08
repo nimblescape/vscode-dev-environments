@@ -28,7 +28,6 @@ import {
   GITHUB_CLI_ACCOUNT_REASON,
   MAX_LISTED_ITEMS,
   MAX_STOP_TIMEOUT_SECONDS,
-  buildOptionProblems,
   foreignNetworkItem,
   hostAccessClassification,
   hostAccessProblems,
@@ -590,7 +589,8 @@ describe('host access policy: build options', () => {
     ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o', 'build option -o out (a relative path)']],
     ['an unknown option', ['--progress=plain'], ['build option --progress']],
   ])('%s', (_name, options, expected) => {
-    expect(buildOptionProblems(options)).toEqual(expected);
+    // Plan step 11I (PR D): changed, only through the configuration (buildOptionProblems, the same check of the options
+    // alone, is removed: nothing used it).
     expect(configProblems({ build: { dockerfile: 'Dockerfile', options } })).toEqual(expected);
   });
 });

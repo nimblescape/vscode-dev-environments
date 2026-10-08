@@ -59,7 +59,6 @@ function fakeHost(answers: Record<string, unknown> = {}) {
     state: {
       windowStatuses: () => answer<readonly WindowStatus[]>('windowStatuses'),
       pendings: () => answer('pendings').then((value) => (value ?? []) as readonly { environmentId: string; windowId: string; createdAt: string }[]),
-      settings: () => answer('settings'),
       processAlive: (pid) => answer('processAlive', pid),
       account: (interactive) => answer('account', interactive),
       // Plan step 11E4d.
@@ -152,7 +151,7 @@ describe("the worker's own helper image (plan step 11B3b)", () => {
 });
 
 describe('the core services in the worker (plan step 11B3b)', () => {
-  it('the registry goes through the record requests; a write by a function fails closed until plan steps 11D and 11E', async () => {
+  it('the registry goes through the record requests; it has no write by a function and no added entry', async () => {
     const { host, calls } = fakeHost({ get: { id: 'e1' }, restore: { added: 1, skipped: [] } });
     const store = hostStore(host.records);
     expect(await store.get('e1')).toEqual({ id: 'e1' });
@@ -161,22 +160,25 @@ describe('the core services in the worker (plan step 11B3b)', () => {
     // Plan step 11C3: the entries rebuilt from the volumes go as `record restore`.
     expect(await store.restore([{ id: 'e2' } as Environment])).toEqual({ added: 1, skipped: [] });
     expect(calls).toEqual(['get "e1"', 'findForAccount "acme/api" "42" ""', 'remove "e1" {}', 'restore ["e2"]']);
-    // Plan step 11C3: changed, the changes of an entry by a function come with the flows of plan steps 11D and 11E
-    // (EnvironmentStore.update, the change of the whole registry by a function, is removed with its test).
-    await expect(store.updateEnvironment('e1', () => {})).rejects.toThrow('before plan step 11D or 11E');
-    // Plan step 11E4c: changed (before: `record add`, which is removed): the entry of a first open is `record createEnvironment`.
-    await expect(store.add({ id: 'e3' } as Environment)).rejects.toThrow('record createEnvironment');
+    // Plan step 11I (PR D): changed, EnvironmentStore no longer has `updateEnvironment` and `add` (before: both failed
+    // closed here): each write of the pipeline is a specific request (hostBusyMarks, hostOpenRecords with the entry of a
+    // first open as `record createEnvironment`, `record recordGitSummary`).
+    expect(store).not.toHaveProperty('updateEnvironment');
+    expect(store).not.toHaveProperty('add');
     expect(calls).toHaveLength(4);
   });
 
-  it('the session files and the reads of the window go to the extension; the reopen record fails closed', async () => {
+  it('the session files and the reads of the window go to the extension; the reopen record only by its environment', async () => {
     const { host, calls } = fakeHost({ pendings: [{ environmentId: 'e1', windowId: 'w', createdAt: 't' }] });
     const files = hostSessionFiles(host);
     await files.writePending('e1', 'ignored-window');
     await files.removeDisconnectRequest('e1');
     expect(await files.readPendings()).toEqual([{ environmentId: 'e1', windowId: 'w', createdAt: 't' }]);
     expect(calls).toEqual(['sessionFile "writePending" "e1"', 'sessionFile "removeDisconnectRequest" "e1"', 'pendings']);
-    await expect(files.readReopen()).rejects.toThrow('before plan step 11E');
+    // Plan step 11I (PR D): changed, EnvironmentSessionFiles no longer has `readReopen` and `removeReopen` (before: the read
+    // failed closed here); the pipeline removes the reopen record only by its environment (`removeReopenOf`).
+    expect(files).not.toHaveProperty('readReopen');
+    expect(files).not.toHaveProperty('removeReopen');
   });
 
   // Plan step 11E6: changed, the token is asked without a dialog also for `interactive` (the extension signed in before it
@@ -252,15 +254,18 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     return { all, calls };
   }
 
-  it('fails closed where the worker has nothing yet: the analysis, a process, a flow, a helper container or build', async () => {
+  it('fails closed where the operation gives nothing: the analysis, the settings; no process runner and no flow', async () => {
     const { all } = deps();
-    await expect(all.analyzer.analyze({} as never)).rejects.toThrow('before plan step 11E');
+    // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E").
+    await expect(all.analyzer.analyze({} as never)).rejects.toThrow('The operation gives the worker no host access analysis.');
     // Plan step 11E3a: changed, the image check runs in the worker (before: it threw "before plan step 11E").
     expect(all.imageChecker).toBeInstanceOf(ImageChecker);
-    await expect(all.runner.run('docker', [])).rejects.toThrow('runs no process');
+    // Plan step 11I (PR D): changed, the pipeline has no process runner at all (before: one that refused every process).
+    expect(all).not.toHaveProperty('runner');
     // Plan step 11F1: changed, the pipeline has no flow at all (the flows are the window's: EnvironmentOperations).
     expect(all).not.toHaveProperty('flow');
-    expect(() => all.settings()).toThrow('before plan step 11E');
+    // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E").
+    expect(() => all.settings()).toThrow('The operation gives the worker no settings.');
     const settings = { stopAfterMinutes: 5 } as never;
     expect(deps({ settings }).all.settings()).toBe(settings);
   });
@@ -397,7 +402,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     ]);
   });
 
-  it('without the computer of the operation, it refuses; the rest of the monitor fails closed before plan step 11D', async () => {
+  it('without the computer of the operation, it refuses; the rest of the monitor fails closed', async () => {
     const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
     const monitor = workerSessionMonitor(engine, undefined, silentLogger);
     await expect(monitor.forget!(TARGET, ID)).rejects.toThrow('names no computer');
@@ -405,7 +410,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     // heartbeats of a window are the operation `heartbeat` (before: both named 11D). Plan step 11E4e: changed again, the
     // ensure fails closed without the ensure of its operation (until 11E6 gives it), and the first heartbeat is not sent
     // without the computer (before: both threw "before plan step 11D2" and "before plan step 11E").
-    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
+    // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E6").
+    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
     expect(await monitor.heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'The operation names no computer for the Session Monitor.' });
     expect(execs).toEqual([]);
   });
@@ -485,7 +491,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       expect(execs.map((exec) => exec.command)).toEqual([heartbeatCommand({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]);
       // Without them, the ensure fails closed and no heartbeat is sent.
       const bare = deps({});
-      await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('before plan step 11E6');
+      // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E6").
+      await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
       expect(await bare.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toMatchObject({ ok: false });
       expect(execs).toHaveLength(1);
     });
@@ -674,7 +681,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
         owner: { windowId: 'w', pid: 1 },
         environmentLock: async () => Promise.reject(new Error('no lock in this test')),
       });
-      expect(all.pullCredentials).toBeUndefined();
+      // Plan step 11I (PR D): changed, the pipeline has no such dep any more (before: it was not set).
+      expect(all).not.toHaveProperty('pullCredentials');
     });
 
     it('a use that fails still forgets, and the next login is still asked', async () => {

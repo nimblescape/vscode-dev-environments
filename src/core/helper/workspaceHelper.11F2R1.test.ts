@@ -11,7 +11,8 @@ import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { HelperBatchSession } from '../helperChannel/helperChannel';
 import { silentLogger } from '../ports';
 import { runWithBatchScope } from './batchScope';
-import { WorkspaceHelper, type HelperDocker, type HelperEngine } from './workspaceHelper';
+import { WorkspaceHelper, type HelperDocker } from './workspaceHelper';
+import type { HelperEngine } from './helperImages';
 
 const OWN = { tag: 'devenv-helper:own', id: `sha256:${'b'.repeat(64)}` };
 

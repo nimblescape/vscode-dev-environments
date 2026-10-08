@@ -40,12 +40,3 @@ export const MAX_ANALYSIS_JOB_CHARACTERS = 32 * 1024 * 1024;
 
 /** The most image references whose image IDs the pipeline asks Docker about (imageIdItems). */
 export const MAX_IMAGE_ID_REFERENCES = 1000;
-
-/** The most references of one `docker image inspect` call. */
-export const IMAGE_INSPECT_BATCH = 100;
-
-/**
- * Review round 11 (G2): the most `docker image inspect` calls of single references after failed batches
- * (inspectImageNames). The references beyond are not checked (`transient`).
- */
-export const MAX_IMAGE_INSPECT_SINGLE_CALLS = 100;

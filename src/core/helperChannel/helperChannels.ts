@@ -106,8 +106,8 @@ export interface ChannelOpenDeps {
   /** BootstrapDocker.start: `docker <args>` with the environment of the operation (its Docker context). */
   start(args: readonly string[]): StartedProcess | undefined;
   /**
-   * Plan step 5, PR A: BootstrapDocker.runDirect: `docker <args>` without the worker, with the environment of the
-   * operation (the engine identity of the open).
+   * Plan step 5, PR A: BootstrapDocker.run: `docker <args>` without the worker, with the environment of the operation
+   * (the engine identity of the open).
    */
   runDirect(args: readonly string[], options?: RunOptions): Promise<RunResult>;
   logger: Logger;
@@ -198,19 +198,18 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   }
   // Review round 4 (M1): channel containers that an earlier open created but never started are removed, in the
   // background (a failure is logged; the channel is open already). Plan step 11I (PR A): its value is checked
-  // (parseSweepValue) and the number of removed containers logged.
-  if (channel.operations.includes(OP_SWEEP)) {
-    void channel.operation(OP_SWEEP, parseSweepParams({}), { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).then(
-      (value) => {
-        const swept = parseSweepValue(value);
-        if (swept === undefined) deps.logger.warn(`The worker on ${name} answered the removal of the stopped helper channel containers with an invalid value.`);
-        else if (swept.removed > 0) deps.logger.info(`Removed ${swept.removed} stopped helper channel ${swept.removed === 1 ? 'container' : 'containers'} on ${name}.`);
-      },
-      (error: unknown) => {
-        deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
-      },
-    );
-  }
+  // (parseSweepValue) and the number of removed containers logged. Plan step 11I (PR D): always sent; the worker is this
+  // extension's own bundle (its hash checked by the loader, its protocol at `hello`), which knows `sweep`.
+  void channel.operation(OP_SWEEP, parseSweepParams({}), { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).then(
+    (value) => {
+      const swept = parseSweepValue(value);
+      if (swept === undefined) deps.logger.warn(`The worker on ${name} answered the removal of the stopped helper channel containers with an invalid value.`);
+      else if (swept.removed > 0) deps.logger.info(`Removed ${swept.removed} stopped helper channel ${swept.removed === 1 ? 'container' : 'containers'} on ${name}.`);
+    },
+    (error: unknown) => {
+      deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
+    },
+  );
   return channel;
 }
 
@@ -226,14 +225,13 @@ export interface HelperChannelsOptions {
   open(target: DockerTarget): Promise<HelperChannel>;
   /**
    * Plan step 5, PR D (rule D1 of 2026-09-30): makes the state that a worker of `target` needs consistent before it is
-   * opened for a call (a flow, the refresh): the helper image, built when its tag is missing (WorkspaceHelper.ensureImagePresent,
-   * as withEnvironmentLock does before the lock). Rejects when it cannot; the call is then refused. An AbortError when
-   * `signal` aborts.
+   * opened for a call (a flow, the refresh): the helper image, built when its tag is missing (HelperImages.ensureImagePresent).
+   * Rejects when it cannot; the call is then refused. An AbortError when `signal` aborts.
    */
   prepare?(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
   /**
    * PR #76 review round 1 (A-R1-1, A-R1-2): what the refresh of the sidebar, which no user starts, checks instead of
-   * `prepare`: that the helper image is present (WorkspaceHelper.checkImagePresent), never a build, so a refresh neither
+   * `prepare`: that the helper image is present (HelperImages.checkImagePresent), never a build, so a refresh neither
    * waits for a build without a time limit nor builds again after each failed build. Rejects when the image is missing or
    * cannot be checked; the refresh is then refused, and the next operation (Start, Stop, Delete) builds it.
    */
@@ -431,8 +429,9 @@ export class HelperChannels {
   /**
    * Plan step 5, PR C: readEnvironmentStates in the worker of `target` (the operation `refresh`), with the strict checks of
    * its parameters and its value (protocol.ts). Plan step 5, PR D (rule D1 of 2026-09-30): never the way without it. The
-   * worker is made ready first (ready: HelperChannelError('unavailable') when that fails, also for a worker without
-   * `refresh`); parameters beyond the check reject with HelperChannelError('unsendable'); a refresh that was not sent
+   * worker is made ready first (ready: HelperChannelError('unavailable') when that fails; plan step 11I, PR D: the worker
+   * is this extension's own bundle, which knows `refresh`); parameters beyond the check reject with
+   * HelperChannelError('unsendable'); a refresh that was not sent
    * because the channel closed before is sent once more through a channel made ready again. Rejects when it was sent and
    * failed, or answered with an invalid value.
    */
@@ -441,7 +440,6 @@ export class HelperChannels {
     if (params === undefined) throw new HelperChannelError('unsendable', 'The environments are beyond what the refresh of the worker carries.');
     for (let attempt = 0; ; attempt++) {
       const channel = await this.ready(target, signal, true);
-      if (!channel.operations.includes(OP_REFRESH)) throw new HelperChannelError('unavailable', 'the worker does not know the refresh');
       let value: unknown;
       try {
         value = await channel.operation(OP_REFRESH, params, { timeoutMs: CHANNEL_REFRESH_TIMEOUT_MS, signal });

@@ -21,7 +21,7 @@ import {
   resourceName,
 } from '../names';
 import type { RefusedUpdate } from '../types';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import {
   BASE_IMAGE,
   DEFAULT_CONFIG_TEXT,

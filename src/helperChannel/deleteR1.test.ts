@@ -17,7 +17,8 @@ import type { OwnHelper } from '../core/worker/ownHelper';
 import { deleteOperation } from './flowOperations';
 import { FLOW_REQUESTS } from '../core/worker/hostSide';
 import { OP_DELETE } from '../core/helperChannel/protocol';
-import type { FlockProcess, LockDeps } from './lock';
+import type { FlockProcess } from '../core/helperChannel/lockFile';
+import type { LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import { OperationError, type OperationContext } from './server';
 

@@ -4,7 +4,7 @@
 
 // Unit 15: the token of the owner account only in the memory of the dev container (concept section 9 "Git inside the
 // container"). The token file and the sign-in of the GitHub CLI are in the tmpfs TOKEN_FOLDER of the dev container, which
-// the override configuration adds (TOKEN_TMPFS). The extension writes them with `docker exec -i -u root` after each start
+// the override configuration adds (TOKEN_TMPFS). They are written as root (an exec with standard input) after each start
 // of an open (the container runs then), with the token on standard input only: never on a command line, in a variable
 // of the container, or in a log. They are gone when the container stops; a start without a window of the extension (the
 // Session Monitor, `docker start`) leaves the folder empty until the next open. Plan step 6, PR C (Q4 of 2026-10-01): the

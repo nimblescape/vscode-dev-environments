@@ -8,7 +8,7 @@
 // (one operation per repository at a time, the sign-in, the Docker host of the operation, the busy marks of the other
 // windows, the cleanup of the session files). It imports nothing of the pipeline, so the extension's bundle holds none
 // of it. No `vscode`.
-import { registryBusyMarks, type BusyMarkView, type EnvironmentBusyMarks } from './busyMarks';
+import { type BusyMarkView, type EnvironmentBusyMarks } from './busyMarks';
 import { dockerHostOf, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
 import { BatchHelperUnavailableError, UserFacingError, errorMessage, isUserFacingError } from '../errors';
@@ -32,7 +32,6 @@ import type { BusyMark, BusyOperation, Environment, ExtensionSettings, GitHubAcc
 import {
   otherWindowMarkIsLive,
   readLiveness,
-  registryOpenRecords,
   type MarkLiveness,
   type OpenRecords,
 } from './openRecords';
@@ -103,16 +102,24 @@ export const RECONCILE_FLOW_TIMEOUT_MS = 2 * 60_000;
  */
 export const OPEN_FLOW_TIMEOUT_MS = 4 * 60 * 60_000;
 
-/** The part of EnvironmentRegistry that the service uses. */
-export type EnvironmentStore = Pick<
-  EnvironmentRegistry,
-  'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'add' | 'restore' | 'updateEnvironment' | 'remove'
->;
+/**
+ * The part of EnvironmentRegistry that the service uses. Plan step 11I (PR D): no change of an entry by a function and
+ * no added entry: the worker's pipeline sends each of its writes to the extension as a specific request (busy marks,
+ * open records, the Git state).
+ */
+export type EnvironmentStore = Pick<EnvironmentRegistry, 'get' | 'list' | 'read' | 'forgetKeptVolumes' | 'findForAccount' | 'restore' | 'remove'>;
+
+/**
+ * Plan step 11I (PR D): the part of EnvironmentRegistry that the window's operations use (EnvironmentOperations): also
+ * the changes of an entry, and the busy marks and the registry writes of the open over it (registryBusyMarks,
+ * registryOpenRecords).
+ */
+export type WindowEnvironmentStore = EnvironmentStore & Pick<EnvironmentRegistry, 'add' | 'updateEnvironment'>;
 
 /** The part of SessionFiles that the service uses. */
 export type EnvironmentSessionFiles = Pick<
   SessionFiles,
-  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'readReopen' | 'removeReopen' | 'removeReopenOf' | 'readPendings'
+  'writePending' | 'removePending' | 'removeOperation' | 'removeDisconnectRequest' | 'removeReopenOf' | 'readPendings'
 >;
 
 /** Starts Docker when it does not run and waits until it is ready (concept 7.6 "Docker start"). */
@@ -263,26 +270,54 @@ export interface OperationBaseDeps {
   /** For busy marks and pending connection files. */
   owner: { windowId: string; pid: number };
   settings: () => ExtensionSettings;
-  /** Unit 7: the Docker host of the operation ('' = the local Docker). Default: the local Docker. */
+  /**
+   * Unit 7: the Docker host of the operation ('' = the local Docker; DockerTargets.host). New environments record it;
+   * only environments of this host are opened, restored, or changed. Default: the local Docker.
+   */
   dockerHost?: () => Promise<string>;
-  /** Unit 7, review D2: the Docker target of the operation; when given, it decides instead of `dockerHost`. */
+  /**
+   * Unit 7, review D2: the Docker target of the operation (DockerTargets.current), with its kind. When given, it decides
+   * instead of `dockerHost`: an endpoint that is neither local nor SSH ('unsupported') is refused by every operation
+   * (dockerEndpointUnsupported) and never read or recorded.
+   */
   dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
   /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
   isProcessAlive?: (pid: number) => boolean;
-  /** Plan step 11E4d: whether the process `pid` of this computer runs. Default: `isProcessAlive`. */
+  /**
+   * Plan step 11E4d: whether the process `pid` of this computer runs, asked before a decision about the other windows
+   * (processesAlive). Default: `isProcessAlive`; the worker's pipeline asks the extension (`local processAlive`).
+   */
   processAlive?: (pid: number) => Promise<boolean>;
-  /** Plan step 11E4d: the containers that the window remembers. Default: a memory of its own. */
+  /**
+   * Plan step 11E4d (decision of 2026-09-29): the containers that the window remembers because their lifecycle mark could
+   * not be recorded. Default: a memory of its own; the worker's pipeline uses the window's through requests.
+   */
   lifecycleMemory?: LifecycleMemory;
-  /** Plan step 11C2a: the busy marks of the window. Default: over `registry` (registryBusyMarks). */
-  busyMarks?: EnvironmentBusyMarks;
-  /** Plan step 11E4a: the registry writes of the open. Default: over `registry` (registryOpenRecords). */
-  openRecords?: OpenRecords;
-  /** All window status files (SessionFiles.readWindowStatuses), for the liveness of the busy marks. */
+  /**
+   * All window status files (SessionFiles.readWindowStatuses). When given, a busy mark of another window counts only
+   * while that window also has a recent status file of the same process (see `isBusyMarkLive`), so a process ID that
+   * was reused after a restart does not block the environment.
+   */
   windowStatuses?: () => Promise<readonly WindowStatus[]>;
   /** How long an operation waits for the busy mark of another live window. Default 10 s. */
   busyWaitMs?: number;
   /** For tests. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
+/**
+ * Plan step 11I (PR D): the busy marks and the registry writes of the open of an operation. The window's operations write
+ * them to the registry of this computer (registryBusyMarks, registryOpenRecords); the worker's pipeline sends them to the
+ * extension (hostBusyMarks, hostOpenRecords).
+ */
+export interface OperationRecords {
+  busyMarks: EnvironmentBusyMarks;
+  openRecords: OpenRecords;
+}
+
+/** Plan step 11E4a: the owner, clock, and view of the windows with which the window of `deps` decides busy marks. */
+export function markViewOf(deps: Pick<OperationBaseDeps, 'owner' | 'clock' | 'isProcessAlive' | 'windowStatuses' | 'logger'>): BusyMarkView {
+  return { owner: deps.owner, clock: deps.clock, isAlive: deps.isProcessAlive ?? processExists, windowStatuses: deps.windowStatuses, logger: deps.logger };
 }
 
 /** Plan step 11F1: the rules of an operation of a window (see the module comment). */
@@ -308,13 +343,16 @@ export abstract class OperationBase {
   constructor(
     protected readonly deps: OperationBaseDeps,
     private readonly startDockerFn: DockerStarter,
+    /** Plan step 11I (PR D): the busy marks and the registry writes of the open, over the view of the marks of this window. */
+    records: (view: BusyMarkView) => OperationRecords,
   ) {
     this.isAlive = deps.isProcessAlive ?? processExists;
     this.processAlive = deps.processAlive ?? (async (pid) => this.isAlive(pid));
     this.lifecycleMemory = deps.lifecycleMemory ?? windowLifecycleMemory();
-    this.markView = { owner: deps.owner, clock: deps.clock, isAlive: (pid) => this.isAlive(pid), windowStatuses: deps.windowStatuses, logger: deps.logger };
-    this.busyMarks = deps.busyMarks ?? registryBusyMarks(deps.registry, this.markView);
-    this.openRecords = deps.openRecords ?? registryOpenRecords(deps.registry, this.markView);
+    this.markView = markViewOf(deps);
+    const given = records(this.markView);
+    this.busyMarks = given.busyMarks;
+    this.openRecords = given.openRecords;
     this.busyWaitMs = Math.max(0, deps.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
     this.sleepFn = deps.sleep ?? defaultSleep;
   }

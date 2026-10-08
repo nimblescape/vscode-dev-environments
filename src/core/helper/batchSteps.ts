@@ -28,8 +28,8 @@ import {
 import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
 
 // Plan step 11F2: the step kinds moved to ./batchStepKinds (the window's helper channel checks them without the steps).
-import { BATCH_STEP_KINDS, isBatchStepKind, type BatchStepKind } from './batchStepKinds';
-export { BATCH_STEP_KINDS, isBatchStepKind, type BatchStepKind };
+import { BATCH_STEP_KINDS, type BatchStepKind } from './batchStepKinds';
+export { BATCH_STEP_KINDS, type BatchStepKind };
 
 /**
  * Decision 2026-10-01, Q2: Docker Compose fetches no remote `include` (Git or OCI) in the helper: these variables are set

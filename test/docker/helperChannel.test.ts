@@ -36,7 +36,8 @@ import {
   parseSweepValue,
 } from '../../src/core/helperChannel/protocol';
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
@@ -118,7 +119,7 @@ describe('the helper channel with the real Docker engine', () => {
           return started;
         },
         // Plan step 5, PR A: the engine identity of the open is compared with one call without the worker.
-        runDirect: (args, options) => docker.runDirect(args, options),
+        runDirect: (args, options) => docker.run(args, options),
         logger: log,
         script: async () => script,
         helperTag: async () => helperTag,

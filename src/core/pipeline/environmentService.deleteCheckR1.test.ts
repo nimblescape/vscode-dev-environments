@@ -4,10 +4,9 @@
 
 // Review round 1 of plan step 11C2b (mutation tests, B-R1) (EnvironmentService.deleteCheck / deleteCheckInWorker).
 import { describe, expect, it, vi } from 'vitest';
-import { ENV_ID, createHarness, seedEnvironment } from './environmentService.testkit';
-import type { EnvironmentServiceDeps } from './environmentService';
+import { ENV_ID, createHarness, seedEnvironment, type HarnessOverrides } from './environmentService.testkit';
 
-function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps> = {}) {
+function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: HarnessOverrides = {}) {
   const sent: { op: string; params: unknown }[] = [];
   const h = createHarness({ ...overrides, flow: async (op, params) => (sent.push({ op, params }), answer(op, params)) });
   return { h, sent };

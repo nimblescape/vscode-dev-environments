@@ -36,8 +36,6 @@ export interface HostState {
   windowStatuses(): Promise<readonly WindowStatus[]>;
   /** The pending files of this computer (SessionFiles.readPendings). */
   pendings(): Promise<readonly { environmentId: string; windowId: string; createdAt: string }[]>;
-  /** The settings of the extension that a flow reads (ExtensionSettings as JSON). */
-  settings(): Promise<Record<string, unknown>>;
   /** True while the process `pid` of this computer runs. */
   processAlive(pid: number): Promise<boolean>;
   /**
@@ -128,7 +126,7 @@ export interface HostRecords {
 }
 
 /** The session files that a flow writes or removes (HostRecords.sessionFile). */
-export const HOST_SESSION_FILES = ['writePending', 'removePending', 'removeOperation', 'removeReopen', 'removeReopenOf', 'removeDisconnectRequest'] as const;
+export const HOST_SESSION_FILES = ['writePending', 'removePending', 'removeOperation', 'removeReopenOf', 'removeDisconnectRequest'] as const;
 export type HostSessionFile = (typeof HOST_SESSION_FILES)[number];
 
 /** The secrets that only the user's computer has. `undefined`: there is none (an anonymous pull, no sign-in). */
@@ -240,8 +238,7 @@ export const FLOW_REQUESTS: Readonly<Record<string, readonly HostCall[]>> = {
   // window's lifecycle memory; it rebuilds the registry from the volumes before a first open (`record restore`); it writes
   // the records of the open (each for its environment: SCOPED_REQUESTS), the pending file of the window, and the busy
   // marks of the open (and of its Delete, when the files are missing and the user deletes the environment); it asks the
-  // questions of the open, the token and the registry logins. `local settings` is not sent: the settings come with the
-  // parameters.
+  // questions of the open, the token and the registry logins. The settings come with the parameters.
   [OP_OPEN]: [
     'record get',
     'record list',

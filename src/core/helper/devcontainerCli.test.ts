@@ -16,12 +16,12 @@ import {
   isLifecycleCommandFailure,
   parseDevcontainerResult,
   readConfigurationArgs,
-  stripNameArgs,
   tryParseDevcontainerResult,
   runUserCommandsArgs,
   upArgs,
 } from './devcontainerCli';
 import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { withoutNameArgs } from '../policy';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
@@ -337,18 +337,19 @@ describe('buildOverrideConfig', () => {
     expect(buildOverrideConfig(base)).not.toHaveProperty('initializeCommand');
   });
 
-  it('stripNameArgs handles a trailing --name without value', () => {
-    expect(stripNameArgs(['--init', '--name'])).toEqual(['--init']);
+  // Plan step 11I (PR D): withoutNameArgs of the policy (before: stripNameArgs, which only called it and is removed).
+  it('withoutNameArgs handles a trailing --name without value', () => {
+    expect(withoutNameArgs(['--init', '--name'])).toEqual(['--init']);
   });
 
-  it('stripNameArgs reads the flags as Docker does: a --name that is the value of another flag stays', () => {
-    expect(stripNameArgs(['--name', 'x', '--init'])).toEqual(['--init']);
-    expect(stripNameArgs(['--name=x', '--init'])).toEqual(['--init']);
-    expect(stripNameArgs(['-e', 'A=--name', '--init'])).toEqual(['-e', 'A=--name', '--init']);
-    expect(stripNameArgs(['-e', '--name', '--init'])).toEqual(['-e', '--name', '--init']);
+  it('withoutNameArgs reads the flags as Docker does: a --name that is the value of another flag stays', () => {
+    expect(withoutNameArgs(['--name', 'x', '--init'])).toEqual(['--init']);
+    expect(withoutNameArgs(['--name=x', '--init'])).toEqual(['--init']);
+    expect(withoutNameArgs(['-e', 'A=--name', '--init'])).toEqual(['-e', 'A=--name', '--init']);
+    expect(withoutNameArgs(['-e', '--name', '--init'])).toEqual(['-e', '--name', '--init']);
     // Removed word by word, `--privileged` would become a flag for Docker (the value of `--label` for the policy).
     const shifting = ['--label', '--name', '--init', '--label', '--privileged'];
-    expect(stripNameArgs(shifting)).toEqual(shifting);
+    expect(withoutNameArgs(shifting)).toEqual(shifting);
     expect(buildOverrideConfig({ ...base, runArgs: shifting }).runArgs).toEqual([
       ...shifting,
       '--label',

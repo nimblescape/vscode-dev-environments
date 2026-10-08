@@ -14,6 +14,7 @@ import { isAnonymousVolumeName, runArgsUser, type HostAccessChecks } from '../po
 import { HELPER_KNOWN_ENV, mayBeSetInHelper, resolveCliVariables, type CliVariables } from '../helper/cliVariables';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
 import {
+  COMPOSE_PROJECT_LABEL,
   CONTAINER_CONFIG_UNKNOWN,
   CONTAINER_VERSION,
   HOST_ACCESS_UNRESTRICTED,
@@ -484,8 +485,6 @@ export function nonEmptyString(value: unknown): string | undefined {
 // ---------------------------------------------------------------------------------------------------------------------
 // Docker Compose (implementation notes, section "Docker Compose")
 
-/** Label that Docker Compose gives each container, network, and volume of a project. */
-export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 /** Review round 22 (D22-1): label that Docker Compose gives each container of a project: the name of its service. */
 export const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
 /**
@@ -712,17 +711,6 @@ export const COMPOSE_CONTAINER_NUMBER_LABEL = 'com.docker.compose.container-numb
 export const COMPOSE_CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
 /** Recreate offer, review round 2: label of a one-off container of `docker compose run` (`True`); `up` leaves it. */
 export const COMPOSE_ONEOFF_LABEL = 'com.docker.compose.oneoff';
-
-/**
- * The containers of a Docker Compose environment in the order of `docker start` or `docker stop`: `start` puts the
- * other services (label nimblescape.devenv.compose-service) first and the dev container last, so that a database runs
- * before the lifecycle commands of the dev container need it; `stop` the reverse (the dev container first, D-20).
- */
-export function composeContainerOrder<T extends { labels: Readonly<Record<string, string>> }>(containers: readonly T[], order: 'start' | 'stop'): T[] {
-  const services = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
-  const dev = containers.filter((container) => container.labels[LABEL_COMPOSE_SERVICE] === undefined);
-  return order === 'start' ? [...services, ...dev] : [...dev, ...services];
-}
 
 /**
  * What Docker Compose accepts as the key of a top-level volume (compose-go schema, `volumes` patternProperties; Compose

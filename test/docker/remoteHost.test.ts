@@ -37,7 +37,8 @@ import {
   useRemoteContext,
   type SshCheckDeps,
 } from '../../src/core/docker/remoteDocker';
-import { DOCKER_SOCKET, WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { DOCKER_SOCKET, helperDockerSocket } from '../../src/core/helper/helperImages';
 import {
   GITHUB_TOKEN_FILE,
   LABEL_ENVIRONMENT_ID,

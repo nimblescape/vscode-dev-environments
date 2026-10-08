@@ -15,8 +15,6 @@ import { LOCK_BUSY_CODE, LOCK_BUSY_EXIT, LOCK_STATE_DIR, flockArgs } from '../co
 import { FLOCK_FD, openLockFile, startFlockProcess, type FlockProcess } from '../core/helperChannel/lockFile';
 import { OperationError } from './server';
 
-export { FLOCK_FD, openLockFile, startFlockProcess, type FlockProcess };
-
 export interface LockDeps {
   /** The mount point of the volume of the Session Monitor. */
   stateDir: string;

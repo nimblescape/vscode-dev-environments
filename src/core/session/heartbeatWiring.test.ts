@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperImageUse } from '../helper/helperImage';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
-import type { PresentImageOptions } from '../helper/workspaceHelper';
+import type { PresentImageOptions } from '../helper/helperImages';
 import { isAbortError } from '../ports';
 import { HeartbeatPreparation } from './heartbeatPreparation';
 import { heartbeatWiring } from './heartbeatWiring';

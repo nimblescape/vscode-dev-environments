@@ -398,8 +398,6 @@ async function local(host: HostSide, call: string, args: unknown[]): Promise<unk
       return host.state.windowStatuses();
     case 'pendings':
       return host.state.pendings();
-    case 'settings':
-      return host.state.settings();
     case 'processAlive': {
       const pid = args[0];
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw new HelperOperationError('invalid', 'The process id is invalid.', false);

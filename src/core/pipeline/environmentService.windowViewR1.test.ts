@@ -10,8 +10,8 @@ import { Messages } from '../messages';
 import { LABEL_CONTAINER_VERSION, environmentImageName } from '../names';
 import type { Environment, WindowStatus } from '../types';
 import type { ComposeModel, ComposeModelOutput } from '../helper/compose';
-import type { EnvironmentServiceDeps, RepositoryTarget } from './environmentService';
-import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, PID, REPO, T0, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import type { RepositoryTarget } from './operationBase';
+import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, PID, REPO, T0, checked, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 import { composeProjectName } from '../names';
 import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
@@ -33,7 +33,7 @@ afterEach(() => {
  * A harness whose synchronous isProcessAlive knows only this window's process (as the worker, which knows none), while
  * the pipeline's question (processAlive, which the worker sends to the extension) says `alive`.
  */
-function harness(alive: (pid: number) => boolean, overrides: Partial<EnvironmentServiceDeps> = {}): Harness {
+function harness(alive: (pid: number) => boolean, overrides: HarnessOverrides = {}): Harness {
   h?.cleanup();
   asked = [];
   h = createHarness({
