@@ -296,26 +296,33 @@ process.stdout.write(JSON.stringify(found) + '\n');
 `;
 
 /**
- * Review round 9 (S9-2): the function `readLimited(file, limit)` of READ_FILES_SCRIPT and COMPOSE_MODEL_SCRIPT (they
+ * Review round 9 (S9-2): the functions `readLimitedFd(fd, limit)` and `readLimited(file, limit)` of READ_FILES_SCRIPT
+ * and COMPOSE_MODEL_SCRIPT (they
  * define `fs`): the text of a file, at most `limit + 1` characters of it, so that the length check of the extension
  * still sees a longer file (MAX_CONFIG_TEXT_LENGTH refuses it, and MAX_DOCKERFILE_LENGTH refuses a Dockerfile of a
  * single container or of any service of a Docker Compose configuration, U1: the configuration hash sees only the text
  * that was read), while a file of any size costs at most
  * 4 · (`limit` + 1) bytes (4 bytes per character of UTF-8 at most), never the whole file. Throws what `fs` throws.
  */
-const READ_LIMITED = String.raw`const readLimited = (file, limit) => {
-  const fd = fs.openSync(file, 'r');
+const READ_LIMITED = String.raw`const readLimitedFd = (fd, limit) => {
+  const buffer = Buffer.alloc(4 * (limit + 1));
+  let length = 0;
+  for (;;) {
+    const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
+    if (count === 0) break;
+    length += count;
+    if (length === buffer.length) break;
+  }
+  const text = buffer.toString('utf8', 0, length);
+  return text.length > limit ? text.slice(0, limit + 1) : text;
+};
+const readLimited = (file, limit) => {
+  // Decision of the user of 2026-10-07: the open never waits (a FIFO of the repository cannot hold the step), and only a
+  // plain file is read.
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
   try {
-    const buffer = Buffer.alloc(4 * (limit + 1));
-    let length = 0;
-    for (;;) {
-      const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
-      if (count === 0) break;
-      length += count;
-      if (length === buffer.length) break;
-    }
-    const text = buffer.toString('utf8', 0, length);
-    return text.length > limit ? text.slice(0, limit + 1) : text;
+    if (!fs.fstatSync(fd).isFile()) throw new Error('Not a plain file: ' + file);
+    return readLimitedFd(fd, limit);
   } finally {
     fs.closeSync(fd);
   }
@@ -391,27 +398,90 @@ const MISSING_IN_REPOSITORY = String.raw`const missingInRepository = (file) => {
  * resolved relative to the folder of the configuration; `dockerfilePath` is relative to the repository folder.
  * Paths outside of the repository folder are not read, nor a path with a variable that is not resolved, nor a file whose
  * link leads out of the repository (review round 3, P3-1). `dockerfileMissing: true`: the Dockerfile does not exist in
- * the repository, and no link leads to or through its path (a missing file, not a link out).
+ * the repository, and no link leads to or through its path (a missing file, not a link out). Decision of the user of
+ * 2026-10-07: both files are read only as plain files of the repository after links, checked on the opened file; a
+ * configuration file that is not one fails the script (it is never read).
  */
 export const READ_FILES_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
 const path = require('path');
 const root = path.posix.resolve(process.argv[1]);
 const inside = (file) => file === root || file.startsWith(root + '/');
-${READ_LIMITED}// Review round 9 (S9-1, S9-2): at most one character more than the extension takes.
-const read = (file, limit) => {
+// Review round 1 of PR #121 (A): the real path as the kernel resolves it (realpath(3)): the realpathSync of JavaScript
+// resolves a \`..\` of a link target as text, so a link \`sub/../x\` whose \`sub\` leads out of the repository named a file of
+// the repository for it while the open reached the file out of it.
+${READ_LIMITED}const realPath = (file) => {
   try {
-    return readLimited(file, limit);
-  } catch (error) {
-    if (error && ['ENOENT', 'ENOTDIR', 'EISDIR'].includes(error.code)) return undefined;
-    throw error;
-  }
-};
-const realPath = (file) => {
-  try {
-    return fs.realpathSync(file);
+    return fs.realpathSync.native(file);
   } catch {
     return null;
+  }
+};
+// Decision of the user of 2026-10-07 (a configuration file was read through a link with a check of its path text only):
+// the text of a file of the repository (review round 9, S9-1, S9-2: at most one character more than the extension
+// takes), read only when it is a plain file of the repository after links. Review round 3 of PR #121 (A-R3-1): the path
+// is resolved once, with O_PATH (Linux), which follows the links but opens nothing: a FIFO or a device out of the
+// repository is never opened, whatever a writer of the repository changes. The real path of that handle (as the kernel
+// names the file, /proc/self/fd of the helper; review round 2, B-R2-1: never a second walk of \`file\`) must be below the
+// real folder of the repository, and the file there must be the file of the handle (dev, ino: a magic link of /proc
+// whose text names another file, review round 1 of PR #121). Only then is the file opened, through the handle (no walk
+// of the path), to read it; that open never waits (O_NONBLOCK) and never takes a terminal (O_NOCTTY). Without
+// /proc/self/fd on Linux, the real path is unknown and the file is refused (review round 3, A-R3-3). Off Linux (tests
+// only: the scripts run in the helper) the file is opened by its path. undefined: no such file, or a folder of the
+// repository (also when the repository folder does not exist, review round 1 of PR #121, B-R14, as the batch helper
+// reports it, batchHelper.ts A-R5-1; review round 2, A-2: a link to the repository folder itself); null: a file that is
+// not a plain file of the repository (a link out of it, also to a folder, or in a circle, a FIFO, a socket, a device, a
+// file that cannot be opened, review round 1 of PR #121, A-1; review round 3, A-R3-2: EAGAIN of a lease). A hard link
+// is the file itself: the repository cannot hold one of a file out of it (Git creates none, and the volume holds only
+// the repository and CONFIG_FOLDER of its owner).
+const realInRepository = (real) => {
+  const rootReal = realPath(root);
+  return real !== null && rootReal !== null && real.startsWith(rootReal + '/');
+};
+const READ_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY;
+const onLinux = process.platform === 'linux';
+// Review round 4 of PR #121 (A, L3): on Linux an O_PATH open never reaches a driver and only a plain file is opened
+// again, so ENXIO and ENODEV come only from the open by path off Linux; EPERM may still come from the second open.
+const REFUSED_OPEN = ['ELOOP', 'ENXIO', 'EACCES', 'EPERM', 'ENAMETOOLONG', 'ENODEV', 'EAGAIN'];
+const readInRepository = (file, limit) => {
+  let handle;
+  try {
+    handle = fs.openSync(file, onLinux ? 0o10000000 /* O_PATH */ : READ_FLAGS);
+  } catch (error) {
+    if (error && ['ENOENT', 'ENOTDIR'].includes(error.code)) return undefined;
+    if (error && REFUSED_OPEN.includes(error.code)) return null;
+    throw error;
+  }
+  try {
+    const found = fs.fstatSync(handle);
+    const real = realPath(onLinux ? '/proc/self/fd/' + handle : file);
+    if (found.isDirectory()) return real !== null && (real === realPath(root) || realInRepository(real)) ? undefined : null;
+    if (!found.isFile() || !realInRepository(real)) return null;
+    // Review round 2 of PR #121 (A-1): a file that is gone or changed since is refused, never a failure of the script.
+    let named;
+    try {
+      named = fs.statSync(real);
+    } catch {
+      return null;
+    }
+    if (named.dev !== found.dev || named.ino !== found.ino) return null;
+    if (!onLinux) return readLimitedFd(handle, limit);
+    let fd;
+    try {
+      fd = fs.openSync('/proc/self/fd/' + handle, READ_FLAGS);
+    } catch (error) {
+      if (error && REFUSED_OPEN.includes(error.code)) return null;
+      throw error;
+    }
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== found.dev || opened.ino !== found.ino) return null;
+      return readLimitedFd(fd, limit);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } finally {
+    fs.closeSync(handle);
   }
 };
 ${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
@@ -464,7 +534,10 @@ ${MISSING_IN_REPOSITORY}const stripJsonc = (text) => {
 const main = () => {
   const configFile = path.posix.resolve(root, process.argv[2] || '');
   if (!inside(configFile) || configFile === root) throw new Error('The configuration path is outside of the repository.');
-  const configText = read(configFile, ${MAX_CONFIG_TEXT_LENGTH});
+  const configText = readInRepository(configFile, ${MAX_CONFIG_TEXT_LENGTH});
+  // Decision of the user of 2026-10-07: a configuration file that is no plain file of the repository after links (a link
+  // out of it, for example to a file of the token) is refused, never read.
+  if (configText === null) throw new Error('The configuration file is not a file of the repository.');
   if (configText === undefined) return null;
   const result = { configText };
   let config;
@@ -486,12 +559,10 @@ const main = () => {
   }
   // Review round 3 (P3-1), U2: a link out of the repository (a real path outside of it, for example the folder with the
   // token or the cache volume) is not read: without a text or dockerfileMissing, the extension refuses the Dockerfile
-  // whatever the switch says (../policy/single.ts, dockerfileUnreadable).
-  const real = realPath(dockerfileFile);
-  const rootReal = realPath(root);
-  if (real === null || rootReal === null || !real.startsWith(rootReal + '/')) return result;
-  const dockerfileText = read(dockerfileFile, ${MAX_DOCKERFILE_LENGTH});
-  if (dockerfileText !== undefined) result.dockerfileText = dockerfileText;
+  // whatever the switch says (../policy/single.ts, dockerfileUnreadable). Decision of the user of 2026-10-07: checked on
+  // the file that was opened (readInRepository).
+  const dockerfileText = readInRepository(dockerfileFile, ${MAX_DOCKERFILE_LENGTH});
+  if (typeof dockerfileText === 'string') result.dockerfileText = dockerfileText;
   return result;
 };
 process.stdout.write(JSON.stringify(main()) + '\n');
