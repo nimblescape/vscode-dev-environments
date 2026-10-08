@@ -1297,9 +1297,9 @@ export function parseReconcileValue(value: unknown): ReconcileValue | undefined 
 /**
  * Plan step 11D1 (decisions of 2026-10-03, "every remote action is a worker operation"): `heartbeat`, one heartbeat of
  * this computer to the Session Monitor container of the worker's engine (`monitor.js heartbeat` under the lock of the
- * records, heartbeatCommand), over the Engine API. The window decides what it sends (its environments, their keep
- * flags, the limit); the worker sends it. No request to the extension, no secret. Parameters HeartbeatParams; value
- * HeartbeatValue.
+ * records, the entry monitorHeartbeat of the registry of the container scripts since plan step 11I, U2), over the Engine
+ * API. The window decides what it sends (its environments, their keep flags, the limit); the worker sends it. No request
+ * to the extension, no secret. Parameters HeartbeatParams; value HeartbeatValue.
  */
 export const OP_HEARTBEAT = 'heartbeat';
 

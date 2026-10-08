@@ -911,7 +911,7 @@ stateDiagram-v2
   Stopped --> [*]: delete
 ```
 
-At the first open, the extension creates the workspace volume and clones the repository into it. When the waiting time ends, the Session Monitor stops the container with `docker stop`. Without internet access, the transitions "connect, newer image" do not happen, because the update step is skipped. The action **Delete** is possible in every state. If the environment is connected or running, the extension first closes the connection. The state `No container` also covers the case that the container was removed outside of the extension.
+At the first open, the extension creates the workspace volume and clones the repository into it. When the waiting time ends, the Session Monitor stops the container (the stop of the Engine API, as `docker stop`). Without internet access, the transitions "connect, newer image" do not happen, because the update step is skipped. The action **Delete** is possible in every state. If the environment is connected or running, the extension first closes the connection. The state `No container` also covers the case that the container was removed outside of the extension.
 
 ### 7.16 Remote Docker host
 

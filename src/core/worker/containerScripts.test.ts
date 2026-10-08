@@ -4,7 +4,9 @@
 
 // Plan step 11B1 (section 0 of the plan): the one registry of the scripts that run in a container, and the one primitive
 // that runs them. Plan step 11I (PR B): every command of the pipeline in a container is an entry, run by the same
-// primitive over the exec that the caller has (DockerEngine or EnvironmentDocker), and no call site builds one.
+// primitive over the exec that the caller has (DockerEngine or EnvironmentDocker), and no call site builds one. Plan step
+// 11I (U2, decision of 2026-10-08): the commands of the Session Monitor container are entries too, and only the entries
+// that read a plain input get one.
 import * as fs from 'fs';
 import * as path from 'path';
 import * as esbuild from 'esbuild';
@@ -14,7 +16,7 @@ import { HOME_GIT_CONFIG_SCRIPT } from '../helper/containerGit';
 import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger } from '../ports';
-import { REMOTE_MONITOR_SCRIPT_PATH } from '../remoteMonitor/protocol';
+import { REMOTE_MONITOR_SCRIPT_PATH, isUnderRecordsLock } from '../remoteMonitor/protocol';
 import { CONTAINER_SCRIPTS, runScript, scriptCommand, type ContainerScript, type ScriptExec } from './containerScripts';
 import type { DockerEngine, EngineExecOptions } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
@@ -51,7 +53,8 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
     // Review round 2 of PR #114 (A2-L1): changed expectation, no `configOwnershipFix` (it runs only in the batch helper,
     // whose image has GNU find for its `-execdir`; review round 15, K3: never in the dev container). Plan step 11I (PR B):
     // changed expectation, every command of the pipeline in a container is an entry now (branch, check, gitVersion,
-    // groupId, mountInfo, monitorScriptHash, userId).
+    // groupId, mountInfo, monitorScriptHash, userId). Plan step 11I (U2, decision of 2026-10-08): changed expectation, the
+    // commands of the Session Monitor are entries too (monitorForget, monitorHeartbeat, monitorImages, monitorSettings).
     expect(Object.keys(CONTAINER_SCRIPTS).sort()).toEqual([
       'branch',
       'check',
@@ -60,7 +63,11 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
       'gitVersion',
       'groupId',
       'homeGitConfig',
+      'monitorForget',
+      'monitorHeartbeat',
+      'monitorImages',
       'monitorScriptHash',
+      'monitorSettings',
       'mountInfo',
       'ownershipFix',
       'tokenRemove',
@@ -146,7 +153,9 @@ describe('plan step 11I (PR B): every command of the pipeline in a container is 
     const { engine, execs } = fakeEngine();
     const signal = new AbortController().signal;
     // A caller that passes more than ScriptOptions (only possible past the types) still runs the script with its entry.
-    const options = { user: 'root', timeoutMs: 5, signal, input: 'ghp_value', secretInputName: SECRET_REGISTRY, workdir: '/' } as unknown as Parameters<typeof runScript>[4];
+    // Plan step 11I (U2, decision of 2026-10-08): changed fixture, without the input of the caller (`input: 'ghp_value'`
+    // before, which runScript dropped); an input for these entries is refused now, below.
+    const options = { user: 'root', timeoutMs: 5, signal, secretInputName: SECRET_REGISTRY, workdir: '/' } as unknown as Parameters<typeof runScript>[4];
     await runScript(engine, 'c1', 'gitVersion', [], options);
     await runScript(engine, 'c1', 'tokenWrite', ['dev', ''], options);
     expect(execs.map((exec) => exec.options)).toEqual([
@@ -156,6 +165,13 @@ describe('plan step 11I (PR B): every command of the pipeline in a container is 
     // Without options, none: the user of the container, the time limit of the port.
     await runScript(engine, 'c1', 'check', []);
     expect(execs[2].options).toEqual({});
+    // Plan step 11I (U2, decision of 2026-10-08): changed expectation, an input of the caller for an entry that reads none
+    // (before: dropped, and the script ran) rejects, and nothing runs; the token write keeps its secret by its name only.
+    const withInput = { ...options, input: 'ghp_value' } as Parameters<typeof runScript>[4];
+    await expect(runScript(engine, 'c1', 'gitVersion', [], withInput)).rejects.toThrow('The script gitVersion of the registry takes no input.');
+    await expect(runScript(engine, 'c1', 'tokenWrite', ['dev', ''], withInput)).rejects.toThrow('takes no input');
+    expect(execs).toHaveLength(3);
+    expect(JSON.stringify(execs)).not.toContain('ghp_value');
   });
 
   it('runs over the exec of the pipeline (EnvironmentDocker, served by EngineDocker) as over the engine: the token by its name only', async () => {
@@ -168,6 +184,48 @@ describe('plan step 11I (PR B): every command of the pipeline in a container is 
     const without: ScriptExec = new EngineDocker(engine);
     await expect(runScript(without, 'c1', 'tokenWrite', ['vscode', 'octo'], { user: 'root' })).rejects.toThrow('token secret of the operation');
     expect(execs).toHaveLength(1);
+  });
+});
+
+/** The lock of the records as underRecordsLock of src/core/remoteMonitor/protocol.ts puts it before a command. */
+const RECORDS_LOCK = ['flock', '-w', '5', '-E', '75', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10'];
+
+describe('plan step 11I (U2, decision of 2026-10-08): the commands of the Session Monitor are entries of the registry', () => {
+  const SOURCE = '0123456789abcdef0123456789abcdef';
+  const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+  const HEARTBEAT = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 5 }] };
+
+  // Moved from src/core/remoteMonitor/protocol.test.ts ('passes the heartbeat as one JSON argument, and the ids as
+  // arguments': the lines of the removed heartbeatCommand and forgetCommand; 'names the reason of a failed command under
+  // the lock of the records': which of them run under the lock) and from monitorFlow.test.ts (the lines of the removed
+  // imageSettingsCommand and imagesCommand): the same command lines, built by the registry.
+  it('builds exactly the command lines of the removed builders: a heartbeat and a forget under the lock of the records, the image settings and list without it', () => {
+    expect(scriptCommand('monitorHeartbeat', [JSON.stringify(HEARTBEAT)])).toEqual([...RECORDS_LOCK, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(HEARTBEAT)]);
+    expect(scriptCommand('monitorForget', [SOURCE, ID])).toEqual([...RECORDS_LOCK, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    expect(scriptCommand('monitorSettings', [])).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-']);
+    expect(scriptCommand('monitorImages', [])).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-']);
+    expect(isUnderRecordsLock(scriptCommand('monitorHeartbeat', [JSON.stringify(HEARTBEAT)]))).toBe(true);
+    expect(isUnderRecordsLock(scriptCommand('monitorForget', [SOURCE, ID]))).toBe(true);
+    expect(isUnderRecordsLock(scriptCommand('monitorSettings', []))).toBe(false);
+    expect(isUnderRecordsLock(scriptCommand('monitorImages', []))).toBe(false);
+  });
+
+  it('gives a plain input only to the entries that read one, without a secret, and refuses one for every other entry before anything runs', async () => {
+    const plain = (Object.keys(CONTAINER_SCRIPTS) as ContainerScript[]).filter((name) => 'plainInput' in CONTAINER_SCRIPTS[name]);
+    expect(plain.sort()).toEqual(['monitorImages', 'monitorSettings']);
+    const { engine, execs } = fakeEngine();
+    const signal = new AbortController().signal;
+    await runScript(engine, 'devenv-session-monitor', 'monitorSettings', [], { input: '{"prefixes":[]}', timeoutMs: 20_000, signal });
+    await runScript(engine, 'devenv-session-monitor', 'monitorImages', [], { input: '{"repositories":[]}' });
+    expect(execs).toEqual([
+      { container: 'devenv-session-monitor', command: ['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'], options: { input: '{"prefixes":[]}', timeoutMs: 20_000, signal } },
+      { container: 'devenv-session-monitor', command: ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'], options: { input: '{"repositories":[]}' } },
+    ]);
+    for (const name of Object.keys(CONTAINER_SCRIPTS) as ContainerScript[]) {
+      if (plain.includes(name)) continue;
+      await expect(runScript(engine, 'c1', name, ['x'], { input: '' }), name).rejects.toThrow(`The script ${name} of the registry takes no input.`);
+    }
+    expect(execs).toHaveLength(2);
   });
 });
 
@@ -297,14 +355,14 @@ function productSources(): string[] {
 }
 
 /**
- * The files that may call `exec` of a port with a command: the registry's runner, EngineDocker (the pipeline's port over
- * DockerEngine.exec, which passes the command of its caller on), and the commands of the Session Monitor container
- * (monitorFlow.ts over remoteMonitor/protocol.ts), whose fold into the registry waits for the user's decision U2.
+ * The files that may call `exec` of a port with a command: the registry's runner, and EngineDocker (the pipeline's port
+ * over DockerEngine.exec, which passes the command of its caller on). Plan step 11I (U2, decision of 2026-10-08): changed
+ * expectation, the commands of the Session Monitor container are entries of the registry (monitorFlow.ts runs them with
+ * runScript), so monitorFlow.ts is no exception any more.
  */
 const EXEC_CALLERS: Readonly<Record<string, number>> = {
   'core/worker/containerScripts.ts': 1,
   'core/worker/engineDocker.ts': 1,
-  'core/worker/monitorFlow.ts': 1,
   // Review round 1 of PR #124 (A, L-3): `exec` as a value is found too. The Session Monitor's process hands its own
   // execFile of its container (`deps.exec`, the removal of a record) to its loop: no exec of a container of the engine.
   'remoteMonitor/main.ts': 1,
@@ -341,7 +399,8 @@ describe('plan step 11I (PR B): no call site builds a command of its own (sectio
     expect(scan('const t="docker[\'exec\'](c, cmd)";const{executable}=x;const o={exec:1};')).toEqual([]);
   });
 
-  it('src runs a process in a container only through the registry (and the commands of the monitor, pending U2)', async () => {
+  // Plan step 11I (U2, decision of 2026-10-08): the name no longer says "(and the commands of the monitor, pending U2)".
+  it('src runs a process in a container only through the registry', async () => {
     const calls: Record<string, number> = {};
     const files = productSources();
     expect(files.length).toBeGreaterThan(100);

@@ -7,10 +7,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer, type RecordsOutput } from '../core/remoteMonitor/protocol';
+import { mapContainerState } from '../core/docker/dockerObjects';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
+import { abortError } from '../core/ports';
+import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer } from '../core/remoteMonitor/protocol';
+import { EngineError, type EngineContainer } from '../core/worker/dockerEngine';
+import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import {
   EXIT_INVALID,
-  PS_FORMAT,
+  LIST_TIMEOUT_MS,
+  STOP_TIMEOUT_MS,
   REMOTE_IDLE_EXIT_MS,
   idleExitFromEnv,
   RemoteMonitorLoop,
@@ -21,9 +27,9 @@ import {
   ImageSchedule,
   main,
   readImageList,
-  parseContainerLines,
   readRecords,
   recordRemover,
+  remoteContainersOf,
   removeRecord,
   removeStaleStateTemporaryFiles,
   runEntry,
@@ -31,8 +37,8 @@ import {
   type EntryDeps,
   type ExecFile,
   timingFromEnv,
-  type DockerResult,
 } from './main';
+import type { LoopEngine } from './engine';
 import { lockFilePath, lockFolder } from '../core/helperChannel/protocol';
 import { REMOTE_GAP_MS, REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
 import type { StopLockAttempt } from './stopLock';
@@ -51,6 +57,33 @@ const DB_ID = 'b'.repeat(64);
  * 'RemoteMonitorLoop: the environment lock of a stop').
  */
 const lockAlways = async () => ({ kind: 'locked' as const, release: () => {} });
+
+/**
+ * Plan step 11I (U1, decision of 2026-10-08): a container of the list of a fake engine (DockerEngine.containers), with
+ * what the monitor reads of it: its ID, name, state as the engine names it, and labels (the environment, and the Compose
+ * service unless it is the dev container). Before, a line of `docker ps --format PS_FORMAT`.
+ */
+function listedContainer(id: string, rawState: string, name: string, environmentId: string, composeService = ''): EngineContainer {
+  const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environmentId };
+  if (composeService !== '') labels[LABEL_COMPOSE_SERVICE] = composeService;
+  return { id, name, state: mapContainerState(rawState), rawState, labels, image: 'devenv-test:1' };
+}
+
+/**
+ * Plan step 11I (U1): the answer of a fake list: its containers, or its failure (an engine that does not answer, before
+ * an exit code of `docker ps`).
+ */
+function answerOf(listed: EngineContainer[] | Error): Promise<EngineContainer[]> {
+  return listed instanceof Error ? Promise.reject(listed) : Promise.resolve(listed);
+}
+
+/** Plan step 11I (U1): a fake engine of the loop whose list is `listed()` and whose stops all succeed. */
+function loopEngineOf(listed: () => EngineContainer[] | Error): LoopEngine {
+  return { containers: async () => answerOf(listed()), stop: async () => {} };
+}
+
+/** Plan step 11I (U1): the failure of an engine that does not answer (the connection of its socket is refused). */
+const NO_ENGINE = 'connect ECONNREFUSED /var/run/docker.sock';
 
 let stateDir: string;
 
@@ -173,8 +206,10 @@ describe('monitor.js heartbeat', () => {
     // The remote monitor keeps it.
     const records = await readRecords(heartbeatDir(stateDir));
     expect(decide({ now: T0, containers: [{ id: DEV_ID, state: 'running', name: 'x', environmentId: A, composeService: '' }], records, state: { lastTickAt: T0 - REMOTE_TICK_MS } }).kept).toEqual([A]);
-    // And B's own shared-engine check still blocks its stop.
-    const output = JSON.parse((await run(['records', A])).out) as RecordsOutput;
+    // And B's own shared-engine check still blocks its stop. Plan step 11I (U10, decision of 2026-10-08): changed test, the
+    // records of the environment as the volume holds them (before: printed by the removed subcommand `records`).
+    const output = { now: T0, records: records.filter((record) => record.environmentId === A).map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) };
+    expect(output.records).toEqual([{ source: OTHER, at: T0 - 5 * 24 * 60 * MINUTE, keepRunning: true }]);
     expect(inUseByOtherComputer(output, SOURCE)).toBe(true);
   });
 
@@ -185,8 +220,9 @@ describe('monitor.js heartbeat', () => {
   });
 
   // Review round 2 of PR #58: the lock of the records moved from files in this folder to the kernel lock `flock` around
-  // the `docker exec` (heartbeatCommand); the tests of two heartbeats at the same time, of a killed holder, and of the
-  // wait run real processes in heartbeatLock.test.ts. No lock file is written here anymore.
+  // the `docker exec` (heartbeatCommand then; the entry monitorHeartbeat of the registry since plan step 11I, U2); the
+  // tests of two heartbeats at the same time, of a killed holder, and of the wait run real processes in
+  // heartbeatLock.test.ts. No lock file is written here anymore.
   it('writes no lock file next to the records', async () => {
     await run(['heartbeat', JSON.stringify({ source: SOURCE, limitSeconds: 600, environments: [{ id: A, keepRunning: false, seq: 1 }] })]);
     expect(fs.readdirSync(heartbeatDir(stateDir))).toEqual([heartbeatFileName(SOURCE, A)]);
@@ -218,22 +254,10 @@ describe('monitor.js heartbeat', () => {
   });
 });
 
-describe('monitor.js records and forget', () => {
-  it('prints the records of one environment with the clock of the host', async () => {
-    writeRecord(SOURCE, A, { at: T0 - 1000, keepRunning: false, limitSeconds: 600 });
-    writeRecord(OTHER, A, { at: T0 - 2000, keepRunning: true, limitSeconds: 600 });
-    writeRecord(SOURCE, B, { at: T0 - 3000, keepRunning: false, limitSeconds: 600 });
-    const result = await run(['records', A]);
-    expect(result.code).toBe(0);
-    const output = JSON.parse(result.out) as { now: number; records: Array<{ source: string }> };
-    expect(output.now).toBe(T0);
-    expect(output.records.map((record) => record.source).sort()).toEqual([SOURCE, OTHER].sort());
-  });
-
-  it('prints no records when the folder does not exist yet', async () => {
-    expect(JSON.parse((await run(['records', A])).out)).toEqual({ now: T0, records: [] });
-  });
-
+// Plan step 11I (U10, decision of 2026-10-08): the describe was 'monitor.js records and forget'; the tests of `records`
+// alone ('prints the records of one environment with the clock of the host', 'prints no records when the folder does not
+// exist yet') are deleted with the subcommand.
+describe('monitor.js forget', () => {
   it('removes one record; a missing one is no error', async () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     writeRecord(OTHER, A, { at: T0, keepRunning: false, limitSeconds: 600 });
@@ -269,8 +293,11 @@ describe('monitor.js records and forget', () => {
   });
 
   it.each<[string[]]>([
+    // Plan step 11I (U10, decision of 2026-10-08): `records` is no subcommand any more, so it is refused with a valid
+    // environment id too (the first two refused an invalid argument before).
     [['records', '../x']],
     [['records']],
+    [['records', A]],
     [['forget', SOURCE, '../x']],
     [['forget', 'x', A]],
     [['forget', SOURCE]],
@@ -292,6 +319,16 @@ describe('monitor.js records and forget', () => {
       expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
     },
   );
+
+  // Plan step 11I (U10, decision of 2026-10-08): `records` is removed; the monitor answers it with its usage, which no
+  // longer names it, and prints no records.
+  it('answers the removed subcommand records with the usage, which names it no more (plan step 11I, U10)', async () => {
+    writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
+    const result = await run(['records', A]);
+    expect(result).toMatchObject({ code: EXIT_INVALID, out: '' });
+    expect(result.err).toMatch(/^Usage: monitor\.js run \| heartbeat <json> \| forget /);
+    expect(result.err).not.toContain('records');
+  });
 });
 
 describe('readRecords', () => {
@@ -318,19 +355,32 @@ describe('readRecords', () => {
   });
 });
 
-describe('parseContainerLines', () => {
-  it('reads the lines of docker ps and skips lines without a valid id', () => {
-    const lines = [
-      `${DEV_ID}\trunning\tdevenv-api\t${A}\t`,
-      `${DB_ID}\texited\tdevenv-api-db-1\t${A}\tdb`,
-      `${DEV_ID}\trunning\tforeign\tnot-an-id\t`,
-      `zz\trunning\tx\t${A}\t`,
-      '',
-    ].join('\n');
-    expect(parseContainerLines(lines)).toEqual([
+// Plan step 11I (U1, decision of 2026-10-08): the describe was 'parseContainerLines' (the lines of `docker ps --format
+// PS_FORMAT`); the containers come from the list of the engine now (remoteContainersOf), with the same checks.
+describe('remoteContainersOf', () => {
+  // Changed test: was "reads the lines of docker ps and skips lines without a valid id", with the same containers as
+  // lines (the empty line of that list has no counterpart in a list of the engine).
+  it('reads the containers of the engine and skips those without a valid id or environment id', () => {
+    const listed = [
+      listedContainer(DEV_ID, 'running', 'devenv-api', A),
+      listedContainer(DB_ID, 'exited', 'devenv-api-db-1', A, 'db'),
+      listedContainer(DEV_ID, 'running', 'foreign', 'not-an-id'),
+      listedContainer('zz', 'running', 'x', A),
+    ];
+    expect(remoteContainersOf(listed)).toEqual([
       { id: DEV_ID, state: 'running', name: 'devenv-api', environmentId: A, composeService: '' },
       { id: DB_ID, state: 'exited', name: 'devenv-api-db-1', environmentId: A, composeService: 'db' },
     ]);
+  });
+
+  // Plan step 11I (U1): the state is the word of the engine (`State.Status`, as `{{.State}}` of `docker ps`), not the
+  // state of the extension, so `paused`, `restarting` and `created` reach the rules as they are; a container without the
+  // label of an environment is never one of them.
+  it('keeps the state word of the engine, and skips a container without the label of an environment (plan step 11I, U1)', () => {
+    const states = ['paused', 'restarting', 'created', 'exited', 'dead', 'removing'];
+    expect(remoteContainersOf(states.map((state) => listedContainer(DEV_ID, state, 'devenv-api', A))).map((container) => container.state)).toEqual(states);
+    expect(remoteContainersOf([{ ...listedContainer(DEV_ID, 'running', 'devenv-api', A), labels: {} }])).toEqual([]);
+    expect(remoteContainersOf([{ ...listedContainer(DEV_ID, 'running', 'devenv-api', A), labels: { [LABEL_ENVIRONMENT_ID]: A.toUpperCase() } }])).toEqual([]);
   });
 });
 
@@ -350,8 +400,10 @@ describe('timingFromEnv', () => {
 describe('RemoteMonitorLoop', () => {
   let now: number;
   let lines: string[];
-  let ps: DockerResult;
-  let stopResults: Map<string, DockerResult>;
+  /** Plan step 11I (U1): the list of the fake engine, or its failure (a `docker ps` result before). */
+  let ps: EngineContainer[] | Error;
+  /** Plan step 11I (U1): the failure of the stop of a container, by its ID (a `docker stop` result before). */
+  let stopResults: Map<string, Error>;
   let calls: string[][];
   let loop: RemoteMonitorLoop;
   /** Runs right before a removal: a heartbeat that comes between the read and the removal. */
@@ -362,13 +414,21 @@ describe('RemoteMonitorLoop', () => {
     lines = [];
     calls = [];
     stopResults = new Map();
-    ps = { code: 0, stdout: `${DB_ID}\trunning\tdevenv-api-db-1\t${A}\tdb\n${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    ps = [listedContainer(DB_ID, 'running', 'devenv-api-db-1', A, 'db'), listedContainer(DEV_ID, 'running', 'devenv-api', A)];
     beforeRemove = undefined;
     loop = new RemoteMonitorLoop({
-      docker: async (args) => {
-        calls.push([...args]);
-        if (args[0] === 'ps') return ps;
-        return stopResults.get(args[1]) ?? { code: 0, stdout: '', stderr: '' };
+      // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI; each call is recorded as the
+      // name of the method and its container or label.
+      engine: {
+        containers: async (label) => {
+          calls.push(['containers', label]);
+          return answerOf(ps);
+        },
+        stop: async (id) => {
+          calls.push(['stop', id]);
+          const failure = stopResults.get(id);
+          if (failure !== undefined) throw failure;
+        },
       },
       // Review round 1 of PR #63 (F2): the removal of `forget <source> <env id> <at>`, in the process (the lock is tested in
       // heartbeatLock.test.ts).
@@ -395,7 +455,9 @@ describe('RemoteMonitorLoop', () => {
   it('lists only containers with the environment label, and stops a stale environment after the grace, dev container first', async () => {
     writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
     expect(await tickAt(T0)).toEqual([]);
-    expect(calls[0]).toEqual(['ps', '-a', '--no-trunc', '--filter', 'label=nimblescape.devenv.environment-id', '--format', PS_FORMAT]);
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the list of the engine by the label of an
+    // environment (was `docker ps -a --no-trunc --filter label=nimblescape.devenv.environment-id --format PS_FORMAT`).
+    expect(calls[0]).toEqual(['containers', 'nimblescape.devenv.environment-id']);
     expect(lines.some((line) => line.includes('nothing is stopped until'))).toBe(true);
     for (let time = T0 + REMOTE_TICK_MS; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
@@ -418,7 +480,9 @@ describe('RemoteMonitorLoop', () => {
 
   it('tries a failed stop again at the next tick, and logs the failure once', async () => {
     writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    stopResults.set(DEV_ID, { code: 1, stdout: '', stderr: 'Error response from daemon: cannot stop' });
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, the engine refuses the stop (an exit code of `docker
+    // stop` with "Error response from daemon: cannot stop" before).
+    stopResults.set(DEV_ID, new EngineError('cannot stop', 500));
     for (let time = T0; time <= T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) await tickAt(time);
     expect(await tickAt(T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS)).toEqual([]);
     expect(lines.filter((line) => line.includes('could not be stopped'))).toHaveLength(1);
@@ -428,10 +492,93 @@ describe('RemoteMonitorLoop', () => {
 
   it('stops nothing while Docker does not answer, and says so once', async () => {
     writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
-    ps = { code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' };
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, the list of the engine fails (an exit code of `docker
+    // ps` with "Cannot connect to the Docker daemon" before).
+    ps = new Error(NO_ENGINE);
     for (let time = T0; time <= T0 + 2 * REMOTE_GRACE_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
     expect(lines.filter((line) => line.includes('Docker does not answer'))).toHaveLength(1);
     expect(calls.filter((call) => call[0] === 'stop')).toEqual([]);
+  });
+
+  // Plan step 11I (U1, decision of 2026-10-08): the answers of the engine that the CLI hid.
+  it('an engine that does not answer within the time limit of the list: nothing is stopped, logged once, and its answer again once (plan step 11I, U1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    // The time limit ends the request with an AbortError (as the port rejects when its signal aborts).
+    ps = abortError();
+    for (let time = T0; time <= T0 + 2 * REMOTE_GRACE_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
+    expect(lines.filter((line) => line.includes('Docker does not answer'))).toEqual([
+      'Docker does not answer; nothing is stopped while it does not answer. Docker did not answer within 30 seconds.',
+    ]);
+    expect(calls.filter((call) => call[0] === 'stop')).toEqual([]);
+    ps = [listedContainer(DEV_ID, 'running', 'devenv-api', A)];
+    expect(await tickAt(T0 + 2 * REMOTE_GRACE_MS + REMOTE_TICK_MS)).toEqual([]);
+    expect(await tickAt(T0 + 2 * REMOTE_GRACE_MS + 2 * REMOTE_TICK_MS)).toEqual([]);
+    expect(lines.filter((line) => line === 'Docker answers again.')).toHaveLength(1);
+  });
+
+  it('a container that is gone when it is stopped (404) counts as stopped, and nothing is logged as failed (plan step 11I, U1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    stopResults.set(DEV_ID, new EngineError('No such container: devenv-api', 404));
+    for (let time = T0; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) await tickAt(time);
+    expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
+    // The dev container first, then the other one of the environment.
+    expect(calls.filter((call) => call[0] === 'stop')).toEqual([['stop', DEV_ID], ['stop', DB_ID]]);
+    expect(lines.filter((line) => line.includes('could not be stopped'))).toEqual([]);
+  });
+
+  it('a stop that the engine does not answer within its time limit fails, is tried again at the next tick, and is logged once (plan step 11I, U1)', async () => {
+    writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+    stopResults.set(DEV_ID, abortError());
+    for (let time = T0; time <= T0 + REMOTE_GRACE_MS + 2 * REMOTE_TICK_MS; time += REMOTE_TICK_MS) expect(await tickAt(time)).toEqual([]);
+    expect(lines.filter((line) => line.includes('could not be stopped'))).toEqual(['The container devenv-api could not be stopped: Docker did not answer within 60 seconds.']);
+    // Each tick past the grace tried the dev container again (and the other container of the environment after it).
+    expect(calls.filter((call) => call[0] === 'stop' && call[1] === DEV_ID)).toHaveLength(3);
+    stopResults.clear();
+    expect(await tickAt(T0 + REMOTE_GRACE_MS + 3 * REMOTE_TICK_MS)).toEqual([A]);
+  });
+
+  // Plan step 11I (U1, decision of 2026-10-08): each call of the engine keeps the time limit of its CLI command, as an
+  // AbortSignal (AbortSignal.timeout, read here through a spy): the list LIST_TIMEOUT_MS, also under the lock, and the
+  // stop STOP_TIMEOUT_MS, without a time of its own (the container's stop time, as `docker stop` without `-t`).
+  it('gives each call of the engine its time limit, and the stop no time of its own (plan step 11I, U1)', async () => {
+    const limits = new Map<AbortSignal, number>();
+    const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+      const signal = new AbortController().signal;
+      limits.set(signal, ms);
+      return signal;
+    });
+    try {
+      const seen: Array<[string, string, number | undefined, number | undefined]> = [];
+      const timed = new RemoteMonitorLoop({
+        engine: {
+          containers: async (label, signal) => (seen.push(['containers', label, signal && limits.get(signal), undefined]), answerOf(ps)),
+          stop: async (id, timeoutSeconds, signal) => void seen.push(['stop', id, signal && limits.get(signal), timeoutSeconds]),
+        },
+        removeRecord: async () => false,
+        dir: heartbeatDir(stateDir),
+        lockEnvironment: lockAlways,
+        now: () => now,
+        log: () => {},
+      });
+      writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
+      for (let time = T0; time < T0 + REMOTE_GRACE_MS; time += REMOTE_TICK_MS) {
+        now = time;
+        await timed.tick();
+      }
+      seen.length = 0;
+      now = T0 + REMOTE_GRACE_MS;
+      expect(await timed.tick()).toEqual([A]);
+      expect(seen).toEqual([
+        ['containers', LABEL_ENVIRONMENT_ID, LIST_TIMEOUT_MS, undefined],
+        ['containers', `${LABEL_ENVIRONMENT_ID}=${A}`, LIST_TIMEOUT_MS, undefined],
+        ['stop', DEV_ID, STOP_TIMEOUT_MS, undefined],
+        ['stop', DB_ID, STOP_TIMEOUT_MS, undefined],
+      ]);
+      expect([LIST_TIMEOUT_MS, STOP_TIMEOUT_MS]).toEqual([30_000, 60_000]);
+      await timed.removals;
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('removes old records of removed environments, and only those files', async () => {
@@ -477,13 +624,14 @@ describe('RemoteMonitorLoop', () => {
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([A]);
     // Changed expectation, review round 2 of PR #63 (R2-1): was ['ps', 'forget', 'stop', 'stop']. Changed expectation,
     // plan step 8 PR B (D2): was ['ps', 'stop', 'stop', 'forget']; the second `ps` lists the containers of A again under
-    // its lock.
-    expect(calls.map((call) => call[0])).toEqual(['ps', 'ps', 'stop', 'stop', 'forget']);
+    // its lock. Plan step 11I (U1, decision of 2026-10-08): changed expectation, the lists of the engine in place of the
+    // two `docker ps` (was ['ps', 'ps', 'stop', 'stop', 'forget']).
+    expect(calls.map((call) => call[0])).toEqual(['containers', 'containers', 'stop', 'stop', 'forget']);
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
   it('logs a removal that failed', async () => {
-    const failing = new RemoteMonitorLoop({ docker: async () => ps, removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
+    const failing = new RemoteMonitorLoop({ engine: loopEngineOf(() => ps), removeRecord: async () => Promise.reject(new Error('the heartbeat records stayed locked')), dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     await failing.tick();
     // Review round 4 of PR #63 (N4-5): the removals run in the background.
@@ -495,7 +643,7 @@ describe('RemoteMonitorLoop', () => {
   it('logs a removal that keeps failing once, and again after it succeeded or the record changed', async () => {
     let fail = true;
     const failing = new RemoteMonitorLoop({
-      docker: async () => ps,
+      engine: loopEngineOf(() => ps),
       removeRecord: async () => (fail ? Promise.reject(new Error('locked')) : false),
       dir: heartbeatDir(stateDir),
       lockEnvironment: lockAlways,
@@ -538,7 +686,7 @@ describe('RemoteMonitorLoop', () => {
     const pending: Array<(removed: boolean) => void> = [];
     const attempts: string[] = [];
     const slow = new RemoteMonitorLoop({
-      docker: async (args) => (args[0] === 'ps' ? ps : { code: 0, stdout: '', stderr: '' }),
+      engine: loopEngineOf(() => ps),
       removeRecord: (record) => {
         attempts.push(record.source);
         return new Promise<boolean>((resolve) => pending.push(resolve));
@@ -607,7 +755,7 @@ describe('RemoteMonitorLoop', () => {
     writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     const attempts: string[] = [];
     const removeRecord = (record: RemoteRecord) => (attempts.push(names[record.source]) === 1 ? first() : Promise.resolve(true));
-    const ordered = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
+    const ordered = new RemoteMonitorLoop({ engine: loopEngineOf(() => ps), removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     await ordered.tick();
     await ordered.removals;
     expect(attempts).toEqual(expected);
@@ -628,7 +776,7 @@ describe('RemoteMonitorLoop', () => {
       if (record.environmentId === B && record.source === OTHER) throw new Error('locked');
       return true;
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ engine: loopEngineOf(() => ps), removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     await loop.tick();
     await loop.removals;
     expect([...attempts].sort()).toEqual([`${A}.${SOURCE}`, `${B}.${OTHER}`, `${C}.${SOURCE}`].sort());
@@ -645,7 +793,7 @@ describe('RemoteMonitorLoop', () => {
     const DAY = 24 * 60 * MINUTE;
     const THIRD = '1'.repeat(32);
     let clock = T0 - 8 * DAY;
-    let listed: DockerResult = { code: 0, stdout: `${'c'.repeat(64)}\texited\tdevenv-b\t${B}\t\n`, stderr: '' };
+    let listed: EngineContainer[] = [listedContainer('c'.repeat(64), 'exited', 'devenv-b', B)];
     writeRecord(SOURCE, B, { at: T0 - 9 * DAY, keepRunning: false, limitSeconds: 600 });
     writeRecord(OTHER, B, { at: T0 + 6 * DAY, keepRunning: false, limitSeconds: 600 });
     const attempts: string[] = [];
@@ -654,13 +802,13 @@ describe('RemoteMonitorLoop', () => {
       if (record.source === SOURCE) throw new Error('locked');
       return removeRecord(heartbeatDir(stateDir), record.source, record.environmentId, record.at);
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => listed, removeRecord: remove, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => clock, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ engine: loopEngineOf(() => listed), removeRecord: remove, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => clock, log: (message) => lines.push(message) });
     await loop.tick();
     await loop.removals;
     expect(attempts).toEqual([]);
     // Eight days later the environment has no container any more, and another computer sent a heartbeat a day ago: the
     // record of SOURCE is forgotten, the one in the future (first seen more than 7 days ago) superseded.
-    listed = { code: 0, stdout: '', stderr: '' };
+    listed = [];
     writeRecord(THIRD, B, { at: T0 - DAY, keepRunning: false, limitSeconds: 600 });
     clock = T0;
     await loop.tick();
@@ -683,7 +831,7 @@ describe('RemoteMonitorLoop', () => {
       if (record.source === OTHER) return results.shift() ?? true;
       throw new Error('locked');
     };
-    const loop = new RemoteMonitorLoop({ docker: async () => ps, removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
+    const loop = new RemoteMonitorLoop({ engine: loopEngineOf(() => ps), removeRecord, dir: heartbeatDir(stateDir), lockEnvironment: lockAlways, now: () => T0, log: (message) => lines.push(message) });
     writeRecord(OTHER, B, { at: T0 - 9 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     writeRecord(SOURCE, B, { at: T0 - 8 * 24 * 60 * MINUTE, keepRunning: false, limitSeconds: 600 });
     for (let pass = 0; pass < 4; pass++) {
@@ -743,7 +891,8 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
   let now: number;
   let lines: string[];
   let events: string[];
-  let ps: DockerResult;
+  /** Plan step 11I (U1): the list of the fake engine, or its failure (a `docker ps` result before). */
+  let ps: EngineContainer[] | Error;
   let attempts: Array<() => StopLockAttempt>;
   let onLocked: (() => void) | undefined;
   let stopFails: Error | undefined;
@@ -758,17 +907,19 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
     attempts = [];
     onLocked = undefined;
     stopFails = undefined;
-    ps = { code: 0, stdout: `${DB_ID}\trunning\tdevenv-api-db-1\t${A}\tdb\n${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    ps = [listedContainer(DB_ID, 'running', 'devenv-api-db-1', A, 'db'), listedContainer(DEV_ID, 'running', 'devenv-api', A)];
     loop = new RemoteMonitorLoop({
-      docker: async (args) => {
-        if (args[0] === 'ps') {
-          const filter = args[args.indexOf('--filter') + 1];
-          events.push(filter === 'label=nimblescape.devenv.environment-id' ? 'ps' : `ps ${filter}`);
-          return ps;
-        }
-        events.push(`${args[0]} ${args[1]}`);
-        if (stopFails) throw stopFails;
-        return { code: 0, stdout: '', stderr: '' };
+      // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI. The events name its list by
+      // the label as they named the filter of `docker ps` before (`ps`, `ps label=…=<id>`), and its stop.
+      engine: {
+        containers: async (label) => {
+          events.push(label === LABEL_ENVIRONMENT_ID ? 'ps' : `ps label=${label}`);
+          return answerOf(ps);
+        },
+        stop: async (id) => {
+          events.push(`stop ${id}`);
+          if (stopFails) throw stopFails;
+        },
       },
       removeRecord: async () => false,
       dir: heartbeatDir(stateDir),
@@ -839,7 +990,7 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
 
   it('containers that stopped before the lock was taken: nothing to stop, released', async () => {
     await pastGrace();
-    onLocked = () => (ps = { code: 0, stdout: `${DEV_ID}\texited\tdevenv-api\t${A}\t\n`, stderr: '' });
+    onLocked = () => (ps = [listedContainer(DEV_ID, 'exited', 'devenv-api', A)]);
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
     expect(events.filter((event) => event.startsWith('stop'))).toEqual([]);
     expect(events.at(-1)).toBe('release');
@@ -847,18 +998,25 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
 
   it('releases the lock after a failed list, records that cannot be read, or a stop that throws', async () => {
     await pastGrace();
-    onLocked = () => (ps = { code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' });
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, the list of the engine fails (an exit code of `docker
+    // ps` before).
+    onLocked = () => (ps = new Error(NO_ENGINE));
     expect(await tickAt(T0 + REMOTE_GRACE_MS)).toEqual([]);
     expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, 'release']);
     expect(lines.some((line) => line.startsWith(`${A} is not stopped: its containers could not be listed again.`))).toBe(true);
+    expect(lines).toContain(`${A} is not stopped: its containers could not be listed again. ${NO_ENGINE}`);
 
-    ps = { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
+    ps = [listedContainer(DEV_ID, 'running', 'devenv-api', A)];
     onLocked = undefined;
-    stopFails = new Error('the Docker CLI broke');
+    stopFails = new Error('the engine broke');
     events = [];
     expect(await tickAt(T0 + REMOTE_GRACE_MS + REMOTE_TICK_MS)).toEqual([]);
     expect(events).toEqual(['ps', `lock ${A}`, `ps label=nimblescape.devenv.environment-id=${A}`, `stop ${DEV_ID}`, 'release']);
-    expect(lines).toContain(`${A} is not stopped: the Docker CLI broke`);
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, a stop that the engine rejects is a failed stop
+    // (logged once per series, tried again at the next tick), as an exit code of `docker stop` was; before, the runner of
+    // the CLI never rejected, and a stop that threw ended the stop of the environment ("A is not stopped: the Docker CLI
+    // broke"). The lock is released after it as before.
+    expect(lines).toContain('The container devenv-api could not be stopped: the engine broke');
 
     // The records folder is replaced by a file under the lock: readRecords fails.
     stopFails = undefined;
@@ -889,7 +1047,7 @@ describe('RemoteMonitorLoop: the environment lock of a stop (plan step 8 PR B, D
   // only its own stop; the next environment of the tick is still stopped, and the removal pass of the tick starts.
   it('an environment decided again to "no stop" does not end the tick: the next one is stopped, the removals start (review round 1 of PR #86, B-R1-3)', async () => {
     const OTHER_DEV = 'c'.repeat(64);
-    ps = { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n${OTHER_DEV}\trunning\tdevenv-web\t${B}\t\n`, stderr: '' };
+    ps = [listedContainer(DEV_ID, 'running', 'devenv-api', A), listedContainer(OTHER_DEV, 'running', 'devenv-web', B)];
     writeRecord(SOURCE, B, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
     // An old record of an environment without any container: `forget` of the tick.
     const C = '00000000-0000-4000-8000-00000000000c';
@@ -954,14 +1112,15 @@ describe('monitor.js run: the lock files of the volume (review round 1 of PR #86
     let mono = 0;
     let ticks = 0;
     let out = '';
-    const dockerCalls: string[] = [];
+    const stops: string[] = [];
     void main(['run'], {
       env: {},
       stateDir,
-      docker: async (args) => {
-        if (args[0] === 'ps') return { code: 0, stdout: `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`, stderr: '' };
-        dockerCalls.push(`${args[0]} ${args[1]}`);
-        return { code: 0, stdout: '', stderr: '' };
+      // Plan step 11I (U1, decision of 2026-10-08): a fake engine in place of the Docker CLI (`docker ps`, `docker stop`).
+      engine: {
+        ...unusedEngine(),
+        containers: async () => [listedContainer(DEV_ID, 'running', 'devenv-api', A)],
+        stop: async (id) => void stops.push(`stop ${id}`),
       },
       exec: (_file, _args, _options, callback) => callback(null, 'removed\n', ''),
       monotonic: () => mono,
@@ -976,7 +1135,8 @@ describe('monitor.js run: the lock files of the volume (review round 1 of PR #86
     });
     await vi.waitFor(() => expect(ticks).toBe(12), { timeout: 20_000 });
     expect(out).toContain(`${A} is busy with an operation; it is not stopped now and is checked again at the next tick.`);
-    expect(dockerCalls).toEqual([]);
+    // Plan step 11I (U1): no stop of the engine (`dockerCalls`, the calls of the CLI but `ps`, before).
+    expect(stops).toEqual([]);
   });
 });
 
@@ -991,10 +1151,13 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     mono: () => number;
   }
 
-  /** `run` with a clock that the waits between the ticks move; `ps` gives the containers of each tick. */
+  /**
+   * `run` with a clock that the waits between the ticks move; `ps` gives the containers of each tick. Plan step 11I (U1,
+   * decision of 2026-10-08): the containers of the list of a fake engine, or its failure (a `docker ps` result before).
+   */
   function startRun(options: {
     env?: NodeJS.ProcessEnv;
-    ps: () => DockerResult;
+    ps: () => EngineContainer[] | Error;
     onStop?: () => void;
     stopMs?: number;
     lock?: () => StopLockAttempt;
@@ -1008,12 +1171,14 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     const result = main(['run'], {
       env: options.env ?? {},
       stateDir,
-      docker: async (args) => {
-        if (args[0] === 'ps') return options.ps();
-        events.push(`${args[0]} ${args[1]}`);
-        mono += options.stopMs ?? 0;
-        options.onStop?.();
-        return { code: 0, stdout: '', stderr: '' };
+      engine: {
+        ...unusedEngine(),
+        containers: async () => answerOf(options.ps()),
+        stop: async (id) => {
+          events.push(`stop ${id}`);
+          mono += options.stopMs ?? 0;
+          options.onStop?.();
+        },
       },
       exec: options.exec ?? ((_file, _args, _options, callback) => callback(null, 'removed\n', '')),
       lockEnvironment: async (id) => {
@@ -1035,7 +1200,8 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     return { result, out: () => out, events, ticks: () => ticks, mono: () => mono };
   }
 
-  const listed = (stdout: string): DockerResult => ({ code: 0, stdout, stderr: '' });
+  /** Plan step 11I (U1): the list of the fake engine (the stdout of `docker ps` before). */
+  const listed = (...containers: EngineContainer[]): EngineContainer[] => containers;
   const pending = async (promise: Promise<unknown>) =>
     (await Promise.race([promise.then(() => 'ended'), new Promise((resolve) => setTimeout(() => resolve('pending'), 200))])) as string;
 
@@ -1050,7 +1216,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
 
   it('exits with 0 after the idle time without a labelled container and with image updates off; the records stay', async () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
-    const monitor = startRun({ ps: () => listed('') });
+    const monitor = startRun({ ps: () => listed() });
     expect(await monitor.result).toBe(0);
     // Changed expectation, review round 1 of PR #86, A-R1-1: the fresh record (10 minutes) counts as activity, so the
     // idle time starts when it aged past its limit (was: the idle time from the start of the loop).
@@ -1071,7 +1237,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     monitor = startRun({
       ps: () => {
         if (monitor !== undefined) writeRecord(SOURCE, A, { at: T0 + monitor.mono(), keepRunning: false, limitSeconds: 600 });
-        return listed('');
+        return listed();
       },
       maxTicks: 200,
     });
@@ -1087,12 +1253,12 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   it('exits once the record aged past its limit (review round 1 of PR #86, A-R1-1)', async () => {
     // Aged past its limit (1 minute) at the start: only the idle time counts.
     writeRecord(SOURCE, A, { at: T0 - 2 * MINUTE, keepRunning: false, limitSeconds: 60 });
-    const monitor = startRun({ ps: () => listed('') });
+    const monitor = startRun({ ps: () => listed() });
     expect(await monitor.result).toBe(0);
     expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
     // A record that is fresh at the start keeps it until its limit has passed, then the idle time.
     writeRecord(SOURCE, B, { at: T0, keepRunning: false, limitSeconds: 120 });
-    const later = startRun({ ps: () => listed('') });
+    const later = startRun({ ps: () => listed() });
     expect(await later.result).toBe(0);
     expect(later.mono()).toBeGreaterThanOrEqual(2 * MINUTE + REMOTE_IDLE_EXIT_MS);
     expect(later.mono()).toBeLessThan(2 * MINUTE + REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
@@ -1103,12 +1269,12 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   // for ever; with only stale records the monitor exits after the idle time.
   it('exits for a lone created container with only stale records (review round 2 of PR #86, A-R2-1)', async () => {
     writeRecord(SOURCE, A, { at: T0 - 2 * MINUTE, keepRunning: false, limitSeconds: 60 });
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`) });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'created', 'devenv-api', A)) });
     expect(await monitor.result).toBe(0);
     expect(monitor.mono()).toBeGreaterThanOrEqual(REMOTE_IDLE_EXIT_MS);
     expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
     // Without any record too.
-    const bare = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${B}\t\n`) });
+    const bare = startRun({ ps: () => listed(listedContainer(DEV_ID, 'created', 'devenv-api', B)) });
     expect(await bare.result).toBe(0);
     expect(bare.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
   });
@@ -1117,11 +1283,11 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   // an old keep counts only through a container of it that runs.
   it('exits for an old keep whose environment has only a created container; a running one keeps it (review round 2 of PR #86, A-R2-1)', async () => {
     writeRecord(SOURCE, A, { at: T0 - 60 * MINUTE, keepRunning: true, limitSeconds: 60 });
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\tcreated\tdevenv-api\t${A}\t\n`) });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'created', 'devenv-api', A)) });
     expect(await monitor.result).toBe(0);
     expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
     // A running one keeps it (running counts on its own).
-    const running = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    const running = startRun({ ps: () => listed(listedContainer(DEV_ID, 'running', 'devenv-api', A)), maxTicks: 100 });
     await vi.waitFor(() => expect(running.ticks()).toBe(100));
     expect(await pending(running.result)).toBe('pending');
   });
@@ -1129,7 +1295,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   it('exits for an old keep whose environment has only ended containers (review round 1 of PR #86, A-R1-1)', async () => {
     // Keep Running When Closed stays in the records after a Stop: it must not keep the monitor for ever.
     writeRecord(SOURCE, A, { at: T0 - 60 * MINUTE, keepRunning: true, limitSeconds: 60 });
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\texited\tdevenv-api\t${A}\t\n`) });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'exited', 'devenv-api', A)) });
     expect(await monitor.result).toBe(0);
     expect(monitor.mono()).toBeLessThan(REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
   });
@@ -1140,7 +1306,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: false, limitSeconds: 600 });
     let running = true;
     const monitor = startRun({
-      ps: () => listed(running ? `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n` : ''),
+      ps: () => (running ? listed(listedContainer(DEV_ID, 'running', 'devenv-api', A)) : listed()),
       onStop: () => (running = false),
     });
     expect(await monitor.result).toBe(0);
@@ -1151,13 +1317,13 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   });
 
   it('exits with 0 also when only stopped labelled containers exist', async () => {
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\texited\tdevenv-api\t${A}\t\n`) });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'exited', 'devenv-api', A)) });
     expect(await monitor.result).toBe(0);
   });
 
   it('does not exit while a labelled container runs, also one that a record keeps running', async () => {
     writeRecord(SOURCE, A, { at: T0, keepRunning: true, limitSeconds: 600 });
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'running', 'devenv-api', A)), maxTicks: 100 });
     await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
     expect(await pending(monitor.result)).toBe('pending');
     expect(monitor.out()).not.toContain('exits');
@@ -1165,7 +1331,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
 
   it('does not exit while a labelled container runs and the records cannot be read', async () => {
     fs.writeFileSync(heartbeatDir(stateDir), 'not a folder');
-    const monitor = startRun({ ps: () => listed(`${DEV_ID}\trunning\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+    const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, 'running', 'devenv-api', A)), maxTicks: 100 });
     await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
     expect(await pending(monitor.result)).toBe('pending');
     expect(monitor.out()).toContain('The heartbeat records could not be read');
@@ -1174,7 +1340,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   // Review round 1 of PR #86, B-R1-2 (mutant A25b): paused and restarting containers count as running.
   it('does not exit while a labelled container is paused or restarting (review round 1 of PR #86, B-R1-2)', async () => {
     for (const state of ['paused', 'restarting']) {
-      const monitor = startRun({ ps: () => listed(`${DEV_ID}\t${state}\tdevenv-api\t${A}\t\n`), maxTicks: 100 });
+      const monitor = startRun({ ps: () => listed(listedContainer(DEV_ID, state, 'devenv-api', A)), maxTicks: 100 });
       await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
       expect(monitor.mono()).toBeGreaterThan(REMOTE_IDLE_EXIT_MS);
       expect(await pending(monitor.result)).toBe('pending');
@@ -1187,7 +1353,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '000' })).toBe(REMOTE_IDLE_EXIT_MS);
     expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '099' })).toBe(REMOTE_IDLE_EXIT_MS);
     expect(idleExitFromEnv({ DEVENV_MONITOR_IDLE_MS: '100' })).toBe(100);
-    const monitor = startRun({ env: { DEVENV_MONITOR_IDLE_MS: '1000' }, ps: () => listed('') });
+    const monitor = startRun({ env: { DEVENV_MONITOR_IDLE_MS: '1000' }, ps: () => listed() });
     expect(await monitor.result).toBe(0);
     // The first tick at 0 ms is not idle long enough; the one after the wait of one tick is.
     expect(monitor.mono()).toBe(REMOTE_TICK_MS);
@@ -1195,7 +1361,9 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   });
 
   it('does not exit while Docker does not answer', async () => {
-    const monitor = startRun({ ps: () => ({ code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' }), maxTicks: 100 });
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, the list of the engine fails (an exit code of `docker ps`
+    // before).
+    const monitor = startRun({ ps: () => new Error(NO_ENGINE), maxTicks: 100 });
     await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
     expect(await pending(monitor.result)).toBe('pending');
   });
@@ -1203,7 +1371,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   it('does not exit with image updates on', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
     try {
-      const monitor = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']) }, ps: () => listed(''), maxTicks: 100 });
+      const monitor = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']) }, ps: () => listed(), maxTicks: 100 });
       await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
       expect(monitor.out()).not.toContain('exits');
     } finally {
@@ -1214,9 +1382,9 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
   it('counts the idle time from the end of the last stop, and exits only after the release', async () => {
     writeRecord(SOURCE, A, { at: T0 - 30 * MINUTE, keepRunning: false, limitSeconds: 600 });
     let running = true;
-    // The `docker stop` takes 4 minutes; after it the container is gone.
+    // The stop takes 4 minutes; after it the container is gone.
     const monitor = startRun({
-      ps: () => listed(running ? `${DEV_ID}\trunning\tdevenv-api\t${A}\t\n` : ''),
+      ps: () => (running ? listed(listedContainer(DEV_ID, 'running', 'devenv-api', A)) : listed()),
       stopMs: 4 * MINUTE,
       onStop: () => (running = false),
     });
@@ -1231,7 +1399,7 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     let finishRemoval: (() => void) | undefined;
     const monitor = startRun({
       env: { DEVENV_MONITOR_IDLE_MS: '1000' },
-      ps: () => listed(''),
+      ps: () => listed(),
       exec: (_file, _args, _options, callback) => {
         finishRemoval = () => callback(null, 'removed\n', '');
       },
@@ -1293,7 +1461,8 @@ describe('recordRemover', () => {
         void main(['run'], {
           env: {},
           stateDir,
-          docker: async () => ({ code: 0, stdout: '', stderr: '' }),
+          // Plan step 11I (U1, decision of 2026-10-08): a fake engine without containers (a `docker ps` without lines before).
+          engine: { ...unusedEngine(), containers: async () => [], stop: async () => {} },
           exec: (file, args, _options, callback) => {
             resolve([file, ...args]);
             callback(null, 'removed\n', '');
