@@ -21,14 +21,14 @@ import {
   ANALYSIS_FAILED_ITEM,
   analysisFailure,
   analysisInternalItem,
-  inProcessAnalyzer,
   type AnalysisFailure,
   type AnalysisJob,
   type ConfigurationAnalyzer,
 } from '../helper/configurationAnalysis';
+import { inProcessAnalyzer } from '../helper/configurationAnalysis.testkit';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import { ensureHelperImageUse, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
-import type { EnsureImageOptions } from '../helper/workspaceHelper';
+import type { EnsureImageOptions } from '../helper/helperImages';
 import { Messages } from '../messages';
 import {
   CONTAINER_VERSION,
@@ -51,17 +51,14 @@ import { HelperChannelError, HelperOperationError } from '../helperChannel/helpe
 import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_OPEN, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
-  ENVIRONMENT_LOCK_WAIT_SECONDS,
-  MAX_REFUSED_ITEMS_LENGTH,
-  PipelineTexts,
-  STOP_FLOW_TIMEOUT_MS,
   afterUpClause,
   kindSwitchFailure,
   lifecycleMarkClears,
   withdrawnOutcome,
   type EnvironmentServiceDeps,
-  type RepositoryTarget,
 } from './environmentService';
+import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, STOP_FLOW_TIMEOUT_MS, type RepositoryTarget } from './operationBase';
+import { MAX_REFUSED_ITEMS_LENGTH } from './pipelineRules';
 import {
   fakeWorkerFlow,
   ACCOUNT,
@@ -3671,81 +3668,6 @@ describe('open: failed lifecycle command', () => {
     const error = await rejection(h.service.open(TARGET, options()));
     expect(error.code).toBe('startFailed');
     expect(h.ui.warnings).toEqual([]);
-  });
-});
-
-describe('open: private image on ghcr.io', () => {
-  const PRIVATE_IMAGE = 'ghcr.io/acme/private-base:latest';
-  const SESSION = { registry: 'ghcr.io', username: 'octocat', password: 'gho_packages' };
-
-  function usePrivateImage(): void {
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${PRIVATE_IMAGE}" }` };
-    h.helper.config = { image: PRIVATE_IMAGE };
-    h.checker.outcome = checked({ [PRIVATE_IMAGE]: DIGEST_NEW });
-    // Docker has no credentials for ghcr.io.
-    h.docker.pullError = (_reference, credentials) =>
-      credentials ? undefined : new CommandError('docker pull', 1, '', 'Error response from daemon: denied');
-  }
-
-  it('downloads the image with the credentials of the GitHub session', async () => {
-    const asked: string[] = [];
-    h = recreate({
-      pullCredentials: async (reference) => {
-        asked.push(reference);
-        return reference.startsWith('ghcr.io/') ? { ...SESSION } : undefined;
-      },
-    });
-    usePrivateImage();
-    await h.service.open(TARGET, options());
-    expect(asked).toEqual([PRIVATE_IMAGE]);
-    expect(h.docker.pulls).toEqual([{ reference: PRIVATE_IMAGE, credentials: SESSION }]);
-    expect(h.helper.builds).toHaveLength(1);
-    expect([...h.logger.infos, ...h.logger.warnings].join('\n')).not.toContain(SESSION.password);
-  });
-
-  const UNENCRYPTED = () =>
-    new UserFacingError('unencryptedDockerConnection', Messages.unencryptedDockerConnection, 'The Docker endpoint tcp://10.0.0.5:2375 is not encrypted.');
-
-  it('downloads without the GitHub sign-in when the connection to Docker is not encrypted (a public image)', async () => {
-    h = recreate({ pullCredentials: async () => ({ ...SESSION }) });
-    h.helper.files[DEFAULT_CONFIG_PATH] = { configText: `{ "image": "${PRIVATE_IMAGE}" }` };
-    h.helper.config = { image: PRIVATE_IMAGE };
-    h.checker.outcome = checked({ [PRIVATE_IMAGE]: DIGEST_NEW });
-    h.docker.pullError = (_reference, credentials) => (credentials ? UNENCRYPTED() : undefined);
-    await h.service.open(TARGET, options());
-    expect(h.docker.pulls).toEqual([{ reference: PRIVATE_IMAGE, credentials: SESSION }, { reference: PRIVATE_IMAGE }]);
-    expect(h.helper.builds).toHaveLength(1);
-    expect(h.logger.warnings.some((w) => w.includes('tcp://10.0.0.5:2375') && w.includes('without the GitHub sign-in'))).toBe(true);
-  });
-
-  it('names the unencrypted connection when the image also fails without the sign-in', async () => {
-    h = recreate({ pullCredentials: async () => ({ ...SESSION }) });
-    usePrivateImage();
-    h.docker.pullError = (_reference, credentials) =>
-      credentials ? UNENCRYPTED() : new CommandError('docker pull', 1, '', 'Error response from daemon: denied');
-    const error = await rejection(h.service.open(TARGET, options()));
-    expect(error.code).toBe('unencryptedDockerConnection');
-    expect(error.message).toBe(Messages.unencryptedDockerConnection);
-    expect(error.detail).toContain('denied');
-    expect(h.docker.pulls).toEqual([{ reference: PRIVATE_IMAGE, credentials: SESSION }, { reference: PRIVATE_IMAGE }]);
-    expect(h.helper.builds).toEqual([]);
-  });
-
-  it('pulls with the credentials of Docker when there are no others', async () => {
-    h = recreate({ pullCredentials: async () => undefined });
-    await h.service.open(TARGET, options());
-    expect(h.docker.pulls).toEqual([{ reference: BASE_IMAGE }]);
-  });
-
-  it('pulls with the credentials of Docker when the credentials cannot be read', async () => {
-    h = recreate({
-      pullCredentials: async () => {
-        throw new Error('keychain locked');
-      },
-    });
-    await h.service.open(TARGET, options());
-    expect(h.docker.pulls).toEqual([{ reference: BASE_IMAGE }]);
-    expect(h.logger.warnings.some((w) => w.includes('keychain locked'))).toBe(true);
   });
 });
 

@@ -18,7 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, newEnvironmentId, resourceName } from '../../src/core/names';
-import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts } from '../../src/core/pipeline/environmentService';
+import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts } from '../../src/core/pipeline/operationBase';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';

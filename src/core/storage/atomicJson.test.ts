@@ -9,9 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   listJsonFiles,
   readJson,
-  readJsonSync,
   removeFile,
-  removeFileSync,
   withDirectoryLock,
   writeJsonAtomic,
   writeJsonAtomicSync,
@@ -36,16 +34,16 @@ describe('atomic JSON files', () => {
     const syncFile = path.join(root, 'c', 'y.json');
     writeJsonAtomicSync(syncFile, [1]);
     expect(fs.readdirSync(path.dirname(syncFile))).toEqual(['y.json']);
-    expect(readJsonSync(syncFile)).toEqual([1]);
+    // Plan step 11I (PR D): read with readJson (before: readJsonSync, which nothing else used and is removed).
+    await expect(readJson(syncFile)).resolves.toEqual([1]);
   });
 
   it('reads a missing or invalid file as undefined', async () => {
     const file = path.join(root, 'x.json');
+    // Plan step 11I (PR D): changed, without readJsonSync (nothing used it; removed).
     await expect(readJson(file)).resolves.toBeUndefined();
-    expect(readJsonSync(file)).toBeUndefined();
     fs.writeFileSync(file, '{');
     await expect(readJson(file)).resolves.toBeUndefined();
-    expect(readJsonSync(file)).toBeUndefined();
   });
 
   it('removes files, and a missing file is not an error', async () => {
@@ -53,9 +51,7 @@ describe('atomic JSON files', () => {
     fs.writeFileSync(file, '{}');
     await removeFile(file);
     await removeFile(file);
-    fs.writeFileSync(file, '{}');
-    removeFileSync(file);
-    removeFileSync(file);
+    // Plan step 11I (PR D): changed, without removeFileSync (nothing used it; removed).
     expect(fs.existsSync(file)).toBe(false);
   });
 

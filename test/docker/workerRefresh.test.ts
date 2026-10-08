@@ -14,7 +14,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { mapContainerState } from '../../src/core/docker/dockerObjects';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
@@ -92,7 +93,7 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
               all.splice(all.indexOf(helperTag), 0, '--label', runLabel);
               return docker.start(all);
             },
-            runDirect: (args, options) => docker.runDirect(args, options),
+            runDirect: (args, options) => docker.run(args, options),
             logger: log,
             script: async () => script,
             helperTag: async () => helperTag,

@@ -9,14 +9,14 @@ import { HelperOperationError } from '../helperChannel/helperChannel';
 import { OP_DELETE } from '../helperChannel/protocol';
 import type { BusyMark, Environment } from '../types';
 import type { BusyMarkResult, EnvironmentBusyMarks } from './busyMarks';
-import { PipelineTexts, type EnvironmentServiceDeps } from './environmentService';
-import { BASE_IMAGE, DIGEST_OLD, ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
+import { PipelineTexts } from './operationBase';
+import { BASE_IMAGE, DIGEST_OLD, ENV_ID, REPO, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 
 const OTHER: BusyMark = { operation: 'update', since: '2026-09-24T15:39:00.000Z', pid: 999, windowId: 'window-2' };
 const SOURCE = '0123456789abcdef0123456789abcdef';
 
 /** A service whose busy marks answer from `script` (per call), then the real entry. */
-function scripted(script: ('conflict' | 'missing')[], overrides: Partial<EnvironmentServiceDeps> = {}) {
+function scripted(script: ('conflict' | 'missing')[], overrides: HarnessOverrides = {}) {
   const holder: { h?: Harness } = {};
   const calls: string[] = [];
   const busyMarks: EnvironmentBusyMarks = {
@@ -123,7 +123,7 @@ describe('setBusyMark of a pipeline run (E5) and its quiet clear (E14) (review r
 });
 
 describe('deleteInWorker (review round 1 of 11C2a, B-R1)', () => {
-  function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: Partial<EnvironmentServiceDeps> = {}) {
+  function harness(answer: (op: string, params: unknown) => Promise<unknown>, overrides: HarnessOverrides = {}) {
     const sent: { op: string; params: unknown; signal?: AbortSignal }[] = [];
     const h = createHarness({
       monitorSource: () => SOURCE,

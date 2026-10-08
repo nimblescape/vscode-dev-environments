@@ -98,7 +98,7 @@ export function workerLocks(
             workerNames.push(all[all.indexOf('--name') + 1]);
             return docker.start(all);
           },
-          runDirect: (args, options) => docker.runDirect(args, options),
+          runDirect: (args, options) => docker.run(args, options),
           logger: log,
           script: workerScript,
           helperTag: async () => helperTag,

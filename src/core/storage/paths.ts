@@ -242,15 +242,6 @@ export async function readJsonTolerant(file: string): Promise<unknown> {
   }
 }
 
-export function readJsonTolerantSync(file: string): unknown {
-  try {
-    const text = readTextFileSync(file);
-    return text === undefined ? undefined : parseJson(text);
-  } catch {
-    return undefined;
-  }
-}
-
 /** Names of the entries of a folder, sorted. A missing folder gives an empty list. */
 export async function listNames(dir: string): Promise<string[]> {
   try {

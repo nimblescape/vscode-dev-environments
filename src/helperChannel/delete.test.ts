@@ -16,7 +16,8 @@ import { EngineError, type DockerEngine, type EngineContainer } from '../core/wo
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import type { OwnHelper } from '../core/worker/ownHelper';
 import { deleteOperation } from './flowOperations';
-import type { FlockProcess, LockDeps } from './lock';
+import type { FlockProcess } from '../core/helperChannel/lockFile';
+import type { LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import type { HostSide } from '../core/worker/hostSide';
 import { OperationError, type OperationContext } from './server';

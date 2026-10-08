@@ -13,7 +13,7 @@ import { namePair } from '../namePairs';
 import { availableEnvironments } from '../ownership';
 import { otherAccountImageItem } from '../policy';
 import type { Environment, GitHubAccount } from '../types';
-import type { EnvironmentServiceDeps, RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -26,6 +26,7 @@ import {
   createHarness,
   seedEnvironment,
   type Harness,
+  type HarnessOverrides,
 } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
@@ -42,7 +43,7 @@ afterEach(() => {
   h.cleanup();
 });
 
-function recreate(overrides: Partial<EnvironmentServiceDeps>): void {
+function recreate(overrides: HarnessOverrides): void {
   h.cleanup();
   h = createHarness(overrides);
 }

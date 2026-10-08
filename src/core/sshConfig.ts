@@ -36,12 +36,6 @@ const MAX_INCLUDE_DEPTH = 16;
 /** A config that is not reasonable (for example a loop of globs) is read to at most this many files. */
 const MAX_FILES = 256;
 
-/** The path of the user's SSH config. */
-export function userSshConfigPath(location: SshConfigLocation): string {
-  const api = location.pathApi ?? path;
-  return api.join(location.home, '.ssh', 'config');
-}
-
 /**
  * The concrete hosts of the SSH config, in the order of the files, each once (the first `Host` line that names it
  * wins, as ssh takes the first value of each option). HostName, User, and Port come from the blocks that name the alias

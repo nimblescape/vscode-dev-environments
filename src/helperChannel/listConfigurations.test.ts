@@ -17,7 +17,8 @@ import type { OwnHelper } from '../core/worker/ownHelper';
 import { OWN_HELPER_TIMEOUT_MS, flowRefusal, listConfigurationsOperation, ownHelperCache, ownHelperOfEngine, type OpenWorkerBatch } from './flowOperations';
 import { UserFacingError } from '../core/errors';
 import { MAX_REFUSAL_DETAIL_LENGTH, MAX_REFUSAL_MESSAGE_LENGTH, parseFlowRefusal } from '../core/helperChannel/protocol';
-import type { FlockProcess, LockDeps } from './lock';
+import type { FlockProcess } from '../core/helperChannel/lockFile';
+import type { LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import { OperationError, type OperationContext } from './server';
 

@@ -133,13 +133,7 @@ import { namePair } from '../namePairs';
 import { imageBuildRecord, imageRecordLabels } from './imageRecord';
 import { ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
-import {
-  BRANCH_EXEC_TIMEOUT_MS,
-  readBranch,
-  type EnvironmentRuntimeState,
-  type EnvironmentStates,
-  type StateEnvironment,
-} from './refreshStates';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -181,11 +175,8 @@ import {
 import {
   isAbortError,
   isoTime,
-  type Clock,
   type GitHubAuth,
-  type Logger,
   type PipelineUi,
-  type ProcessRunner,
   type ProgressReporter,
   type RunResult,
 } from '../ports';
@@ -198,7 +189,6 @@ import type {
   DevcontainerConfig,
   DevcontainerResult,
   Environment,
-  ExtensionSettings,
   GitHubAccount,
   GitSummary,
   PendingConnection,
@@ -260,8 +250,7 @@ import {
   type ImageCheckState,
 } from './pipelineRules';
 import { sameBusyMark, type OpenRecords } from './openRecords';
-import { rememberedFor, type LifecycleMemory } from './lifecycleMemory';
-import type { PullCredentials, PullCredentialsProvider } from './pullCredentials';
+import { rememberedFor } from './lifecycleMemory';
 import {
   OperationBase,
   PipelineTexts,
@@ -275,8 +264,6 @@ import {
   ENVIRONMENT_LOCK_WAIT_SECONDS,
   type DockerStarter,
   type GitHubSession,
-  type EnvironmentSessionFiles,
-  type EnvironmentStore,
   type OpenOptions,
   type OpenResult,
   type OperationBaseDeps,
@@ -381,13 +368,10 @@ export interface EnvironmentDocker {
   /** User decision 2026-09-28: the named images `devenv-*`, each once with its references. */
   listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]>;
   /**
-   * `docker pull`. With `credentials`, the pull uses them instead of the credentials that Docker has stored, only for
-   * this pull (EngineDocker.pullImage).
+   * `docker pull`. Plan step 11E3b: EngineDocker.pullImage asks for the login of the registry of the reference itself, and
+   * holds it only for this pull.
    */
-  pullImage(
-    reference: string,
-    options?: { onOutput?: (text: string) => void; signal?: AbortSignal; credentials?: PullCredentials },
-  ): Promise<void>;
+  pullImage(reference: string, options?: { onOutput?: (text: string) => void; signal?: AbortSignal }): Promise<void>;
 }
 
 /** The part of WorkspaceHelper that the service uses. */
@@ -446,17 +430,15 @@ export interface EnvironmentSessionMonitor {
 }
 
 
+/**
+ * The deps of the worker's pipeline. Plan step 11I (PR D, audit D6): what it shares with the window's operations is
+ * OperationBaseDeps; here only what is the pipeline's own, or wider for it.
+ */
 export interface EnvironmentServiceDeps extends OperationBaseDeps {
   docker: EnvironmentDocker;
-  /**
-   * A process runner of the operation. Plan step 11I2: no longer read by the service (it served the default Docker start
-   * with the CLI adapter, which is removed with it); the worker gives one that refuses every process.
-   */
-  runner: ProcessRunner;
   helper: EnvironmentHelper;
-  registry: EnvironmentStore;
-  sessionFiles: EnvironmentSessionFiles;
   imageChecker: Pick<ImageChecker, 'check'>;
+  /** Also the report of a token that GitHub rejected. */
   auth: Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'>;
   /**
    * The GitHub account of a token (DiscoveryService.viewer), for the Git identity of a new environment (concept section 9).
@@ -465,89 +447,44 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
   viewer?: (token: string, signal?: AbortSignal) => Promise<GitHubViewer>;
   /** Time limit of `viewer`. Default 5 s. */
   viewerTimeoutMs?: number;
+  /** All questions and messages of the pipeline. */
   ui: PipelineUi;
-  logger: Logger;
-  clock: Clock;
-  platform: NodeJS.Platform;
-  /** Local values for `${localEnv:…}`, and the Program Files folder for the Docker start on Windows. */
-  env: NodeJS.ProcessEnv;
-  /** For busy marks and pending connection files. */
-  owner: { windowId: string; pid: number };
-  settings: () => ExtensionSettings;
-  /**
-   * Credentials for a pull that Docker cannot do with its own credentials: the GitHub session for a private image on
-   * ghcr.io (githubPackagesPullCredentials). Default: none, Docker pulls with its own credentials.
-   */
-  pullCredentials?: PullCredentialsProvider;
   /**
    * Unit 7: the start of Docker, or the check that it answers. Plan step 11I2: required; the default (`ensureDockerRunning`
    * with the CLI adapter ContainerAdapter) is removed with that adapter. The worker gives a check that its engine answers.
    */
   startDocker: DockerStarter;
   /**
-   * Unit 7: the Docker host of the operation ('' = the local Docker; DockerTargets.host). New environments record it;
-   * only environments of this host are opened, restored, or changed. Default: the local Docker.
-   */
-  dockerHost?: () => Promise<string>;
-  /**
-   * Unit 7, review D2: the Docker target of the operation (DockerTargets.current), with its kind. When given, it decides
-   * instead of `dockerHost`: an endpoint that is neither local nor SSH ('unsupported') is refused by every operation
-   * (dockerEndpointUnsupported) and never read or recorded.
-   */
-  dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
-  /**
    * Unit 7, PR 2: the Session Monitor container of the engine. The open pipeline ensures it right after the helper image
    * (before the container is created or started); Delete removes the record of this computer there. Plan step 8, PR A:
    * on every engine, local and remote; an open is refused when it cannot be ensured (Q3). Without it (tests): nothing.
    */
   sessionMonitor?: EnvironmentSessionMonitor;
-  /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
-  isProcessAlive?: (pid: number) => boolean;
   /**
-   * Plan step 11E4d: whether the process `pid` of this computer runs, asked before a decision about the other windows
-   * (processesAlive). Default: `isProcessAlive`; the worker's pipeline asks the extension (`local processAlive`).
+   * Plan step 11C2a (decision of 2026-10-04): the busy marks of the window that runs the operation; the worker's pipeline
+   * sends them to the extension (`record markBusy`, `record clearBusy`). Plan step 11I (PR D): required, there is no
+   * write to the registry by a function in the pipeline.
    */
-  processAlive?: (pid: number) => Promise<boolean>;
+  busyMarks: EnvironmentBusyMarks;
   /**
-   * Plan step 11E4d (decision of 2026-09-29): the containers that the window remembers because their lifecycle mark could
-   * not be recorded. Default: the memory of this service; the worker's pipeline uses the window's through requests.
+   * Plan step 11E4a (decision of 2026-10-04): the registry writes of the open, as specific operations; the worker's
+   * pipeline sends them to the extension (hostOpenRecords, plan step 11E4b; the entry, configuration and build writes with
+   * 11E4c). Plan step 11I (PR D): required, as `busyMarks`.
    */
-  lifecycleMemory?: LifecycleMemory;
+  openRecords: OpenRecords;
   /**
-   * Plan step 11C2a (decision of 2026-10-04): the busy marks of the window that runs the operation. Default: over
-   * `registry` with this service's owner, clock, and view of the windows (registryBusyMarks); the worker's pipeline sends
-   * them to the extension (`record markBusy`, `record clearBusy`).
+   * Plan step 11C2b (decision of 2026-10-04): records the Git state of an environment (Environment.gitSummary); the
+   * worker's pipeline sends it to the extension (`record recordGitSummary`). Plan step 11I (PR D): required, as `busyMarks`.
    */
-  busyMarks?: EnvironmentBusyMarks;
-  /**
-   * Plan step 11E4a (decision of 2026-10-04): the registry writes of the open, as specific operations. Default: over
-   * `registry` with this service's owner, clock, and view of the windows (registryOpenRecords); the worker's pipeline
-   * sends them to the extension (hostOpenRecords, plan step 11E4b; the entry, configuration and build writes with 11E4c).
-   */
-  openRecords?: OpenRecords;
-  /**
-   * Plan step 11C2b (decision of 2026-10-04): records the Git state of an environment (Environment.gitSummary). Default:
-   * through `registry`; the worker's pipeline sends it to the extension (`record recordGitSummary`).
-   */
-  recordGitSummary?: (environmentId: string, summary: GitSummary) => Promise<void>;
-  /**
-   * All window status files (SessionFiles.readWindowStatuses). When given, a busy mark of another window counts only
-   * while that window also has a recent status file of the same process (see `isBusyMarkLive`), so a process ID that
-   * was reused after a restart does not block the environment.
-   */
-  windowStatuses?: () => Promise<readonly WindowStatus[]>;
-  /** How long an operation waits for the busy mark of another live window. Default 10 s. */
-  busyWaitMs?: number;
+  recordGitSummary: (environmentId: string, summary: GitSummary) => Promise<void>;
   /** Interval at which an open pipeline writes its pending connection file again. Default 15 s. */
   pendingRefreshMs?: number;
-  /** For tests. */
-  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** For tests. Default: newEnvironmentId of names.ts. */
   newEnvironmentId?: () => string;
   /**
    * Review round 8: runs the host access analysis of a configuration (checkContainer of the container policy, ../policy,
-   * and the FROM images of the Dockerfiles for the update check). The extension runs it in a worker thread with limits of time and memory
-   * (WorkerConfigurationAnalyzer); a failed analysis refuses the configuration.
+   * and the FROM images of the Dockerfiles for the update check). The worker runs it in its analysis thread with limits
+   * of time and memory (plan step 11E2); a failed analysis refuses the configuration.
    */
   analyzer: ConfigurationAnalyzer;
   /**
@@ -558,29 +495,6 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
 }
 
-
-
-
-
-/** Plan step 11F1: moved to ./operationBase (shared with EnvironmentOperations, the extension's side). */
-export {
-  PipelineTexts,
-  ENVIRONMENT_LOCK_WAIT_SECONDS,
-  STOP_FLOW_TIMEOUT_MS,
-  WINDOW_STATE_FLOW_TIMEOUT_MS,
-  LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS,
-  DELETE_FLOW_TIMEOUT_MS,
-  DELETE_CHECK_FLOW_TIMEOUT_MS,
-  RECONCILE_FLOW_TIMEOUT_MS,
-  OPEN_FLOW_TIMEOUT_MS,
-} from './operationBase';
-export type { DockerStarter, EnvironmentSessionFiles, EnvironmentStore, OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from './operationBase';
-
-/** Plan step 5, PR C: moved to ./refreshStates (shared with the worker). */
-export type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment };
-
-/** MAX_REFUSED_ITEMS_LENGTH of ./pipelineRules (hotfix review 3, C3-2; review 4, Q3). */
-export { MAX_REFUSED_ITEMS_LENGTH };
 
 /** Review round 4 of PR #68 (B-R4-2): the pause before the second write of Environment.lifecycleIncomplete. */
 const LIFECYCLE_MARK_RETRY_MS = 500;
@@ -1091,11 +1005,6 @@ function composeBuildFiles(build: ComposeBuildModelRewrite): HelperFiles {
   };
 }
 
-/** Review round 16 (Dp): whether the configuration names Features (the CLI then builds them into the image). */
-function hasFeatures(config: DevcontainerConfig | undefined): boolean {
-  return isRecord(config?.features) && Object.keys(config.features).length > 0;
-}
-
 function isHostAccess(error: unknown): boolean {
   return isUserFacingError(error) && error.code === 'hostAccess';
 }
@@ -1199,7 +1108,7 @@ export class EnvironmentService extends OperationBase {
 
   // Plan step 11F1: the rules of an operation of a window are OperationBase's (shared with EnvironmentOperations).
   constructor(protected override readonly deps: EnvironmentServiceDeps) {
-    super(deps, deps.startDocker);
+    super(deps, deps.startDocker, () => ({ busyMarks: deps.busyMarks, openRecords: deps.openRecords }));
     this.pendingRefreshMs = Math.max(1, deps.pendingRefreshMs ?? DEFAULT_PENDING_REFRESH_MS);
   }
 
@@ -2178,7 +2087,8 @@ export class EnvironmentService extends OperationBase {
     }
     const distinct = [...new Set(named.map((entry) => entry.reference))];
     if (distinct.length === 0) return { unsupported: [], hostAccess: [] };
-    // Review round 9 (S9-3): one `docker image inspect` for (up to IMAGE_INSPECT_BATCH of) them, not one per reference.
+    // Review round 9 (S9-3): one call of the port for all of them (inspectImageNames; the worker's engine answers each
+    // reference with a request of its own).
     if (distinct.length > MAX_IMAGE_ID_REFERENCES) throw tooLargeError(`${distinct.length} image references (at most ${MAX_IMAGE_ID_REFERENCES})`);
     this.throwIfCancelled(signal);
     // Review round 10 (P10-1): a reference that Docker cannot inspect (for another reason than a missing image) is
@@ -3017,8 +2927,8 @@ export class EnvironmentService extends OperationBase {
 
   private async pull(ctx: PipelineContext, reference: string, tolerateFailure: boolean, stale: Set<string>): Promise<void> {
     try {
-      const credentials = await this.pullCredentials(reference, ctx.signal);
-      await this.pullWith(ctx, reference, credentials);
+      // Plan step 11E3b: the worker's EngineDocker asks for the login of the registry of the reference itself.
+      await this.deps.docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal });
     } catch (error) {
       if (this.isCancellation(error, ctx.signal) || !tolerateFailure) throw error;
       const local = await this.deps.docker.imageExists(reference).catch(() => false);
@@ -3026,48 +2936,6 @@ export class EnvironmentService extends OperationBase {
       this.logger.warn(`${reference} could not be downloaded. The local image is used: ${errorMessage(error)}`);
       stale.add(reference);
     }
-  }
-
-  /**
-   * `docker pull` of `reference`, with `credentials` when there are any. The adapter sends them only over a local or
-   * encrypted connection to Docker (UserFacingError('unencryptedDockerConnection')); then the image is downloaded
-   * without them, as Docker does with its own credentials (a public image on ghcr.io still downloads), and the GitHub
-   * sign-in is never sent. When that download fails too, the error says why the sign-in was not used.
-   */
-  private async pullWith(ctx: PipelineContext, reference: string, credentials: PullCredentials | undefined): Promise<void> {
-    const docker = this.deps.docker;
-    try {
-      await docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal, ...(credentials ? { credentials } : {}) });
-      return;
-    } catch (error) {
-      if (!credentials || !isUserFacingError(error) || error.code !== 'unencryptedDockerConnection') throw error;
-      this.logger.warn(`${error.detail ?? error.message} ${reference} is downloaded without the GitHub sign-in.`);
-      try {
-        await docker.pullImage(reference, { onOutput: this.output, signal: ctx.signal });
-      } catch (plainError) {
-        if (this.isCancellation(plainError, ctx.signal)) throw plainError;
-        throw new UserFacingError(error.code, error.message, `${error.detail ?? ''} The download without the sign-in failed: ${errorMessage(plainError)}`.trim());
-      }
-    }
-  }
-
-  /**
-   * Credentials for the pull of `reference` that Docker lacks: the GitHub session for a private image on ghcr.io
-   * (concept 7.7 "Registry requires a sign-in"). The image check uses the same session, so an image that it can check can
-   * also be downloaded. `undefined`: Docker pulls with its own credentials.
-   */
-  private async pullCredentials(reference: string, signal: AbortSignal | undefined): Promise<PullCredentials | undefined> {
-    if (!this.deps.pullCredentials) return undefined;
-    let credentials: PullCredentials | undefined;
-    try {
-      credentials = await this.deps.pullCredentials(reference, signal);
-    } catch (error) {
-      this.logger.warn(`The credentials for ${reference} could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
-    // The secret is never logged.
-    if (credentials) this.logger.info(`${reference} is downloaded with the GitHub sign-in for ${credentials.registry}.`);
-    return credentials;
   }
 
   /** Step 9: start or create the container from the existing environment image. Also the fallback after a failed update. */
@@ -4960,12 +4828,7 @@ export class EnvironmentService extends OperationBase {
     return this.checkMetadataHostAccess(ctx, image, metadata, ctx.hostAccessChecks, labels);
   }
 
-  /** The entries of the label devcontainer.metadata of `image` (none when it has no valid label). */
-  private async imageMetadata(image: string, signal: AbortSignal | undefined): Promise<unknown[]> {
-    return (await this.imageMetadataAndLabels(image, signal)).metadata;
-  }
-
-  /** imageMetadata, and all labels of `image`. */
+  /** The entries of the label devcontainer.metadata of `image` (none when it has no valid label), and all its labels. */
   private async imageMetadataAndLabels(image: string, signal: AbortSignal | undefined): Promise<{ metadata: unknown[]; labels: Record<string, string> }> {
     const config = await this.imageConfig(image, signal);
     const labels = isRecord(config) && isRecord(config.Labels) ? config.Labels : {};
@@ -5634,7 +5497,7 @@ export class EnvironmentService extends OperationBase {
       this.throwIfCancelled(options.signal);
       if (refreshed === undefined) return env.gitSummary;
       // Plan step 11C2b: one specific write (record recordGitSummary from the worker).
-      await this.quietly('record the Git state', () => this.recordGitSummary(env.id, refreshed));
+      await this.quietly('record the Git state', () => this.deps.recordGitSummary(env.id, refreshed));
       return refreshed;
     } catch (error) {
       throw this.toUserError(error, options.signal);
@@ -5678,23 +5541,12 @@ export class EnvironmentService extends OperationBase {
       const summary = await this.gitSummaryInContainer(container.id, env.remoteUser, repositoryFolder(env.repository), signal);
       if (!summary || signal?.aborted) return false;
       // Plan step 11D1: in the worker, through `record recordGitSummary` (the operation `recordGitState`).
-      await this.recordGitSummary(env.id, summary);
+      await this.deps.recordGitSummary(env.id, summary);
       return true;
     } catch (error) {
       this.logger.info(`The Git state could not be recorded: ${errorMessage(error)}`);
       return false;
     }
-  }
-
-  /** Plan step 11C2b: records the Git state of an environment (EnvironmentServiceDeps.recordGitSummary). */
-  private async recordGitSummary(environmentId: string, summary: GitSummary): Promise<void> {
-    if (this.deps.recordGitSummary) {
-      await this.deps.recordGitSummary(environmentId, summary);
-      return;
-    }
-    await this.deps.registry.updateEnvironment(environmentId, (entry) => {
-      entry.gitSummary = summary;
-    });
   }
 
   /**

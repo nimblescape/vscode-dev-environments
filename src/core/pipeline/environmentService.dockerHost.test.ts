@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, resourceName } from '../names';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { ACCOUNT, ENV_ID, OTHER_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 

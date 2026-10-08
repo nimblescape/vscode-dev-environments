@@ -30,7 +30,6 @@ import {
   parseGitSummaryOutput,
   serviceFolderPaths,
   servicePathArguments,
-  servicePrunePatterns,
 } from './gitSummary';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
 import { devMountFolders, verifiedIdentityTargets, workspaceIdentityMounts } from '../pipeline/pipelineRules';
@@ -44,6 +43,15 @@ import { scriptCommand } from '../worker/containerScripts';
  */
 function ownershipFix(repo: string, user: string, folders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
   return scriptCommand('ownershipFix', [repo, user, ...servicePathArguments(repo, folders, gitPaths)]);
+}
+
+/**
+ * Plan step 11I (PR D): the `find -path` patterns of the paths of the services, as servicePathArguments gives them (each
+ * path as `-path <pattern> -o -path <pattern>/*`), in place of the removed servicePrunePatterns, which nothing used.
+ */
+function servicePrunePatterns(repo: string, folders: readonly string[] | undefined): string[] {
+  const args = servicePathArguments(repo, folders);
+  return args.filter((_arg, index) => args[index - 1] === '-path').filter((_pattern, index) => index % 2 === 0);
 }
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';

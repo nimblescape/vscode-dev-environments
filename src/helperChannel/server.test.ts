@@ -20,7 +20,8 @@ import { REFRESH_ENVIRONMENTS } from '../core/pipeline/refreshStates.testkit';
 import { abortError } from '../core/ports';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { OPERATIONS, refreshOperation } from './operations';
-import { ChannelServer, OperationError, MAX_LOG_TEXT, SHUTDOWN_DEADLINE_MS, StreamRedactor, redact, type OperationHandler } from './server';
+import { ChannelServer, OperationError, MAX_LOG_TEXT, SHUTDOWN_DEADLINE_MS, type OperationHandler } from './server';
+import { StreamRedactor, redact } from '../core/helperChannel/protocol';
 
 /** Plan step 11I (PR A): a run of the operation `hold` of the tests. */
 interface Held {

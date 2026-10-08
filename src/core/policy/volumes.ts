@@ -7,6 +7,7 @@
 // helper, another program), and the networks of other environments. Account separation: refused whatever the switch
 // says (class `protected`), a volume of another program is access to the computer. Pure functions, no I/O.
 import {
+  COMPOSE_PROJECT_LABEL,
   isEnvironmentResourceName,
   HELPER_CACHE_VOLUME,
   LABEL_ENVIRONMENT_ID,
@@ -147,7 +148,7 @@ export function volumeLabelOwner(labels: Readonly<Record<string, string>>): stri
   // the environment's own is decided by isOwnVolume first everywhere).
   if (keys.includes(LABEL_ENVIRONMENT_ID)) return 'another environment';
   if (keys.some((key) => key.startsWith('com.docker.compose.'))) {
-    const project = labels['com.docker.compose.project'];
+    const project = labels[COMPOSE_PROJECT_LABEL];
     return project ? `the Docker Compose project ${project}` : 'Docker Compose';
   }
   if (hasDevContainersVolumeLabel(labels)) return 'the Dev Containers extension';
@@ -267,9 +268,6 @@ export function resolveNetworkReference<T extends { name: string; id: string }>(
   const byPrefix = networks.filter((network) => network.id !== '' && network.id.startsWith(text));
   return new Set(byPrefix.map((network) => network.id)).size === 1 ? byPrefix[0] : undefined;
 }
-
-/** Label that Docker Compose gives each container, network, and volume of a project. */
-export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 
 /**
  * The item of a network that belongs to another environment, perhaps of another account (HostAccessClass `protected`):

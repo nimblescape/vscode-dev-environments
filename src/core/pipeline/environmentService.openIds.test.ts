@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resourceName } from '../names';
 import { namePair } from '../namePairs';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 

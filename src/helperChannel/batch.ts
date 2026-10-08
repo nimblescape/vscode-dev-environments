@@ -28,9 +28,6 @@ import { abortError, isAbortError, type Logger } from '../core/ports';
 import { EngineError, type DockerEngine, type EngineAttachedRun } from '../core/worker/dockerEngine';
 import { OperationError, type OperationContext } from './server';
 
-// Plan step 6, PR B: the code lives with the messages (the client names it).
-export { BATCH_MISSING_VOLUME_CODE };
-
 export interface BatchDeps {
   /** Plan step 11G3: the port of the worker's engine for an operation, over which the helper runs. */
   engineOf: (context: OperationContext) => DockerEngine;

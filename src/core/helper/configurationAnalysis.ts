@@ -5,8 +5,8 @@
 // Review round 8 (structural fix of the parser DoS class): the host access analysis of the configuration of a repository
 // (checkContainer of the container policy, ../policy, and the FROM images of its Dockerfiles for the update check) as jobs that run in a worker thread with
 // limits of time and memory (configurationAnalysisRunner.ts, configurationAnalysisWorker.ts). A Dockerfile or a Compose
-// model of a repository is hostile input: however its text is analysed, the extension host must not freeze or crash on
-// it. A job that fails (too slow, too much memory, a crash) refuses the configuration: never allowed on a failure.
+// model of a repository is hostile input: however its text is analysed, the worker that runs the pipeline must not freeze
+// or crash on it. A job that fails (too slow, too much memory, a crash) refuses the configuration: never allowed on a failure.
 // Pure: no `vscode` import, no I/O.
 import { collectReferences, type ConfigReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
@@ -214,20 +214,6 @@ export function isAnalysisResult(job: AnalysisJob, value: unknown): boolean {
     texts(references.features)
   );
 }
-
-/**
- * Runs each job in the calling thread, without limits: for the tests of the pipeline (the extension uses
- * WorkerConfigurationAnalyzer). An analysis that throws refuses the configuration, as a failed worker does.
- */
-export const inProcessAnalyzer: ConfigurationAnalyzer = {
-  analyze<J extends AnalysisJob>(job: J): Promise<AnalysisResult<J>> {
-    try {
-      return Promise.resolve(runAnalysisJob(job));
-    } catch (error) {
-      return Promise.resolve(analysisFailure(job, thrownFailure(error)));
-    }
-  },
-};
 
 /**
  * Review round 9 (P9-2): the kind of an error that the analysis threw: a stack or memory overflow is a limit (the

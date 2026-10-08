@@ -878,10 +878,6 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
 }
 
 /** `build.options` (`docker build` options of the configuration), with the rules of BUILD_FLAGS. */
-export function buildOptionProblems(options: readonly unknown[]): string[] {
-  return uniqueItems(buildOptionFindings(options));
-}
-
 function buildOptionFindings(options: readonly unknown[]): Problem[] {
   const problems: Problem[] = [];
   for (const flag of parseFlags(options, BUILD_FLAGS)) {

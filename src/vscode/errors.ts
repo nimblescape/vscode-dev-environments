@@ -107,7 +107,6 @@ const ACTIONS: Record<UserErrorCode, ErrorAction[] | 'retry' | 'retryOnly'> = {
   filesMissing: ['showDetails'],
   signInRequired: ['signIn'],
   hostAccess: ['showDetails'],
-  unencryptedDockerConnection: ['showDetails'],
   otherAccount: [],
   cancelled: [],
   // Unit 7: never Start Docker or Install Docker… for a remote host.
@@ -125,7 +124,6 @@ const WARNINGS = new Set<UserErrorCode>([
   'noConfiguration',
   'signInRequired',
   'hostAccess',
-  'unencryptedDockerConnection',
   'otherAccount',
   'dockerEndpointUnsupported',
   'otherDockerHost',

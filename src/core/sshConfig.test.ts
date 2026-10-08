@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { nodeSshConfigFiles, parseSshConfig, splitConfigLine, userSshConfigPath, type SshConfigFiles } from './sshConfig';
+import { nodeSshConfigFiles, parseSshConfig, splitConfigLine, type SshConfigFiles } from './sshConfig';
 
 /** An in-memory file system with POSIX paths. */
 function memoryFiles(files: Record<string, string>): SshConfigFiles {
@@ -107,7 +107,7 @@ describe('parseSshConfig', () => {
       readDir: (dir) => (dir === 'C:\\Users\\me\\.ssh\\conf.d' ? ['one'] : undefined),
     };
     const winLocation = { home: 'C:\\Users\\me', pathApi: path.win32 };
-    expect(userSshConfigPath(winLocation)).toBe('C:\\Users\\me\\.ssh\\config');
+    // Plan step 11I (PR D): changed, userSshConfigPath (nothing used it) is removed; parseSshConfig reads that path.
     expect(parseSshConfig(files, winLocation)).toEqual([{ alias: 'from-include' }, { alias: 'win-box', user: 'me' }]);
   });
 

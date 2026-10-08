@@ -10,7 +10,8 @@
 // the operation and is never repeated; the session is closed on success, failure and cancel. Plan step 7 (user decision
 // of 2026-10-01): outside a scope a volume step throws an internal error and runs nothing (the per-step run is removed).
 import { describe, expect, it } from 'vitest';
-import { composeProjectName, resourceName } from '../names';
+import { composeProjectName, environmentIdLabel, resourceName } from '../names';
+import { configOwnershipFixCommand } from '../git/gitSummary';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
@@ -18,6 +19,20 @@ import { Messages } from '../messages';
 import { abortError, silentLogger, type RunOptions, type RunResult } from '../ports';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
+import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
+import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
+import {
+  OVERRIDE_CONFIG_PATH,
+  cloneCommand,
+  composeHashCommand,
+  composeModelCommand,
+  createFoldersCommand,
+  gitFilesCommand,
+  listConfigsCommand,
+  readFilesCommand,
+  writeAndRunCommand,
+} from './scripts';
+import { overrideCommand } from './stepInputs';
 import { currentBatchScope, runWithBatchScope } from './batchScope';
 import { WorkspaceHelper, type HelperDeps, type HelperDocker, type HelperImageUse } from './workspaceHelper';
 
@@ -124,18 +139,19 @@ function setup(engine?: HelperDeps['engine']) {
 }
 
 /**
- * Plan step 7 (user decision of 2026-10-01): the per-step path is removed. The command, input and variables that
- * WorkspaceHelper builds for each of its steps (the arguments of its runInBatch), as the reference of the equivalence
- * tests below (was: the command, input and `-e` variables of the per-step run).
+ * Plan step 7 (user decision of 2026-10-01): the per-step path is removed. The input and variables that WorkspaceHelper
+ * gives each of its steps (the arguments of its runInBatch), as the reference of the equivalence tests below (was: the
+ * command, input and `-e` variables of the per-step run). Plan step 11I (PR D): changed, without the command, which
+ * WorkspaceHelper no longer builds (the batch helper builds it from the kind and the inputs of the step).
  */
-function recordBuilt(helper: WorkspaceHelper): Array<{ command: readonly string[]; input?: string; env: Record<string, string> }> {
-  type RunInBatch = (scope: unknown, volume: string, command: readonly string[], options: { input?: string; env?: Record<string, string> }) => Promise<RunResult>;
+function recordBuilt(helper: WorkspaceHelper): Array<{ input?: string; env: Record<string, string> }> {
+  type RunInBatch = (scope: unknown, volume: string, options: { input?: string; env?: Record<string, string> }) => Promise<RunResult>;
   const internal = helper as unknown as { runInBatch: RunInBatch };
   const inner = internal.runInBatch.bind(helper);
-  const built: Array<{ command: readonly string[]; input?: string; env: Record<string, string> }> = [];
-  internal.runInBatch = (scope, volume, command, options) => {
-    built.push({ command, input: options.input, env: options.env ?? {} });
-    return inner(scope, volume, command, options);
+  const built: Array<{ input?: string; env: Record<string, string> }> = [];
+  internal.runInBatch = (scope, volume, options) => {
+    built.push({ input: options.input, env: options.env ?? {} });
+    return inner(scope, volume, options);
   };
   return built;
 }
@@ -587,31 +603,75 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const E = ENVIRONMENT_ID;
     const env = { COMPOSE_PROJECT_NAME: 'p' };
     const override = { name: 'o' };
-    const calls: Array<[BatchStepKind, (helper: WorkspaceHelper) => Promise<unknown>]> = [
-      ['clone', (h) => h.clone({ volumeName: VOLUME, repository: 'acme/app', branch: 'dev', token: TOKEN, image: IMAGE })],
-      ['readFiles', (h) => h.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/a/devcontainer.json', dockerfile: 'Dockerfile.dev', image: IMAGE })],
-      ['listConfigs', (h) => h.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE })],
-      ['readConfiguration', (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: E, merged: true, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, env, image: IMAGE })],
-      ['build', (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE })],
-      ['composeModel', (h) => h.composeModel({ volumeName: VOLUME, repository: 'acme/app', files: ['/workspaces/app/compose.yml'], project: 'p', image: IMAGE })],
-      ['composeHash', (h) => h.composeServiceHashes({ volumeName: VOLUME, repository: 'acme/app', model: '{"a":1}', project: 'p', image: IMAGE })],
-      ['createFolders', (h) => h.createRepositoryFolders({ volumeName: VOLUME, repository: 'acme/app', folders: ['/workspaces/app/data'], image: IMAGE })],
-      ['up', (h) => h.up({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, removeExistingContainer: true, env, token: TOKEN, image: IMAGE })],
-      ['runUserCommands', (h) => h.runUserCommands({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, containerId: 'abcdef012345', env, token: TOKEN, image: IMAGE })],
-      ['gitFiles', (h) => h.prepareGit({ volumeName: VOLUME, repository: 'acme/app', identity: { name: 'Octo', email: 'octo@example.com' }, image: IMAGE })],
-      ['ownershipFix', (h) => h.fixConfigOwnership({ volumeName: VOLUME, folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 5000, image: IMAGE })],
+    // Plan step 11I (PR D): changed reference of the command, the builders of each step on the inputs of the call (as
+    // WorkspaceHelper built them and threw them away; it no longer builds a command).
+    const folder = '/workspaces/app';
+    const configFile = `${folder}/.devcontainer/devcontainer.json`;
+    const calls: Array<[BatchStepKind, (helper: WorkspaceHelper) => Promise<unknown>, readonly string[]]> = [
+      ['clone', (h) => h.clone({ volumeName: VOLUME, repository: 'acme/app', branch: 'dev', token: TOKEN, image: IMAGE }), cloneCommand('acme/app', 'app', 'dev')],
+      [
+        'readFiles',
+        (h) => h.readConfigFiles({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/a/devcontainer.json', dockerfile: 'Dockerfile.dev', image: IMAGE }),
+        readFilesCommand(folder, '.devcontainer/a/devcontainer.json', 'Dockerfile.dev'),
+      ],
+      ['listConfigs', (h) => h.listConfigurations({ volumeName: VOLUME, repository: 'acme/app', image: IMAGE }), listConfigsCommand(folder)],
+      [
+        'readConfiguration',
+        (h) => h.readConfiguration({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', environmentId: E, merged: true, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE }),
+        writeAndRunCommand({}, readConfigurationArgs({ workspaceFolder: folder, configPath: configFile, idLabel: environmentIdLabel(E), merged: true, overrideConfigPath: OVERRIDE_CONFIG_PATH })),
+      ],
+      [
+        'build',
+        (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, env, image: IMAGE }),
+        writeAndRunCommand({ repositoryConfig: configFile }, buildArgs({ workspaceFolder: folder, configPath: configFile, imageName: `${PROJECT}:7` })),
+      ],
+      [
+        'build',
+        (h) => h.build({ volumeName: VOLUME, repository: 'acme/app', configPath: '.devcontainer/devcontainer.json', imageName: `${PROJECT}:7`, override, files: { [COMPOSE_MODEL_PATH]: '{}' }, env, image: IMAGE }),
+        writeAndRunCommand({ repositoryConfig: configFile, config: OVERRIDE_CONFIG_PATH }, buildArgs({ workspaceFolder: folder, configPath: OVERRIDE_CONFIG_PATH, imageName: `${PROJECT}:7` })),
+      ],
+      [
+        'composeModel',
+        (h) => h.composeModel({ volumeName: VOLUME, repository: 'acme/app', files: ['/workspaces/app/compose.yml'], project: 'p', image: IMAGE }),
+        composeModelCommand(folder, ['/workspaces/app/compose.yml']),
+      ],
+      ['composeHash', (h) => h.composeServiceHashes({ volumeName: VOLUME, repository: 'acme/app', model: '{"a":1}', project: 'p', image: IMAGE }), composeHashCommand(COMPOSE_MODEL_PATH, 'p')],
+      [
+        'createFolders',
+        (h) => h.createRepositoryFolders({ volumeName: VOLUME, repository: 'acme/app', folders: ['/workspaces/app/data'], image: IMAGE }),
+        createFoldersCommand(folder, ['/workspaces/app/data']),
+      ],
+      [
+        'up',
+        (h) => h.up({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, removeExistingContainer: true, env, token: TOKEN, image: IMAGE }),
+        overrideCommand(upArgs({ workspaceFolder: folder, overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel: environmentIdLabel(E), removeExistingContainer: true }), undefined),
+      ],
+      [
+        'runUserCommands',
+        (h) => h.runUserCommands({ volumeName: VOLUME, repository: 'acme/app', override, environmentId: E, containerId: 'abcdef012345', env, token: TOKEN, image: IMAGE }),
+        overrideCommand(runUserCommandsArgs({ workspaceFolder: folder, overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel: environmentIdLabel(E), containerId: 'abcdef012345' }), undefined),
+      ],
+      [
+        'gitFiles',
+        (h) => h.prepareGit({ volumeName: VOLUME, repository: 'acme/app', identity: { name: 'Octo', email: 'octo@example.com' }, image: IMAGE }),
+        gitFilesCommand('app', { name: 'Octo', email: 'octo@example.com' }, CONTAINER_CREDENTIAL_HELPER),
+      ],
+      [
+        'ownershipFix',
+        (h) => h.fixConfigOwnership({ volumeName: VOLUME, folder: '/workspaces/.devenv+', uid: '1000', gid: '1001', timeoutMs: 5000, image: IMAGE }),
+        configOwnershipFixCommand('/workspaces/.devenv+', '1000', '1001'),
+      ],
     ];
-    for (const [kind, call] of calls) {
-      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed reference: the command, input and variables that
-      // WorkspaceHelper builds for the step (recordBuilt; was: those of its per-step run).
+    for (const [kind, call, expected] of calls) {
+      // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed reference: the input and variables
+      // that WorkspaceHelper gives the step (recordBuilt; was: those of its per-step run).
       const { helper, lock } = setup();
       const built = recordBuilt(helper);
       await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
       // (readConfiguration reads once more when its first output has no configuration.)
       expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
       const command = batchStepCommand(kind, lock.steps[0].params);
-      expect(command.command, kind).toEqual(built[0].command);
+      expect(command.command, kind).toEqual(expected);
       expect(command.env, kind).toEqual(built[0].env);
       // The clone takes the token as its secret, not as an input of the step.
       if (kind !== 'clone') expect(command.input, kind).toBe(built[0].input);
@@ -631,7 +691,9 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     expect(lock.steps.map((step) => step.kind)).toEqual(['up']);
     expect(lock.steps[0].params).toEqual(expect.objectContaining({ files }));
     const command = batchStepCommand('up', lock.steps[0].params);
-    expect(command.command).toEqual(built[0].command);
+    // Plan step 11I (PR D): changed, the command is the batch helper's only (WorkspaceHelper no longer builds one): with the
+    // Compose files it is WRITE_AND_RUN_SCRIPT.
+    expect(command.command).toEqual(overrideCommand(upArgs({ workspaceFolder: '/workspaces/app', overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel: environmentIdLabel(ENVIRONMENT_ID), removeExistingContainer: false }), files));
     expect(command.input).toBe(built[0].input);
   });
 
@@ -645,7 +707,7 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     const built = recordBuilt(helper);
     await runWithBatchScope(lock, VOLUME, silentLogger, () => call(helper).catch(() => undefined));
     expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
-    return { run: { command: built[0].command, input: built[0].input }, params: lock.steps[0].params, command: batchStepCommand(kind, lock.steps[0].params) };
+    return { run: { input: built[0].input }, params: lock.steps[0].params, command: batchStepCommand(kind, lock.steps[0].params) };
   }
 
   it('review round 3 of PR #82, B-R3-1: a runUserCommands with Compose override files makes in the helper the command and input of its per-step run (batchStepCommand)', async () => {
@@ -654,7 +716,11 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       h.runUserCommands({ volumeName: VOLUME, repository: 'acme/app', override: { name: 'o' }, environmentId: ENVIRONMENT_ID, containerId: 'abcdef012345', files, env: { COMPOSE_PROJECT_NAME: 'p' }, token: TOKEN, image: IMAGE }),
     );
     expect(params).toEqual(expect.objectContaining({ files }));
-    expect(command.command).toEqual(run.command);
+    // Plan step 11I (PR D): changed, the command is the batch helper's only (WorkspaceHelper no longer builds one): with the
+    // Compose files it is WRITE_AND_RUN_SCRIPT.
+    expect(command.command).toEqual(
+      overrideCommand(runUserCommandsArgs({ workspaceFolder: '/workspaces/app', overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel: environmentIdLabel(ENVIRONMENT_ID), containerId: 'abcdef012345' }), files),
+    );
     expect(command.input).toBe(run.input);
   });
 
@@ -671,8 +737,9 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
     for (const [kind, call] of calls) {
       const { run, params, command } = await perStepAndBatch(kind, call);
       expect(params, kind).toEqual(expect.objectContaining({ configPath }));
-      expect(run.command.join(' '), kind).toContain('b/devcontainer.json');
-      expect(command.command, kind).toEqual(run.command);
+      // Plan step 11I (PR D): changed, the command of the batch helper (WorkspaceHelper no longer builds one) names the
+      // configuration.
+      expect(command.command.join(' '), kind).toContain('b/devcontainer.json');
       expect(command.input, kind).toBe(run.input);
     }
   });

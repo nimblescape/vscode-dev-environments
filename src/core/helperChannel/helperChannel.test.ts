@@ -324,17 +324,14 @@ describe('HelperChannel (user request 2026-09-28: the helper channel)', () => {
   });
 
   // Review round 5 (F2): the wait for a place was unbounded, also for a call with a short time limit.
-  // Review round 6 (R6-2): the time limit counts from the call, so the wait for a place is taken from it; a call can
-  // wait less (slotWaitMs).
-  it('takes the wait for a place from the time limit that it sends, and waits no longer than its slotWaitMs', async () => {
+  // Review round 6 (R6-2): the time limit counts from the call, so the wait for a place is taken from it. Plan step 11I
+  // (PR D): changed, without the wait of a call of its own (OperationOptions.slotWaitMs, which nothing passed, is
+  // removed with the call `short` of this test).
+  it('takes the wait for a place from the time limit that it sends', async () => {
     const { channel, fake } = await openChannel();
     const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
     const waiting = channel.operation('step', { index: 'waiting' }, { timeoutMs: 10_000 });
-    const short = channel.operation('step', { index: 'short' }, { slotWaitMs: 500 });
-    const shortResult = expect(short).rejects.toMatchObject({ code: 'unsendable' });
-    await vi.advanceTimersByTimeAsync(500);
-    await shortResult;
-    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.advanceTimersByTimeAsync(2_000);
     const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
     fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
     await vi.advanceTimersByTimeAsync(0);

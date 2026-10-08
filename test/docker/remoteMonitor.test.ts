@@ -28,7 +28,8 @@ import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import { LOADER_EXIT_CODE, PIPE_LOADER, bundleHash } from '../../src/core/loader/pipeLoader';

@@ -107,11 +107,6 @@ export interface OperationOptions {
   onProgress?: (step: string, detail?: string) => void;
   /** Output of the operation. Without it, the output goes to the log. */
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
-  /**
-   * Review round 6 (R6-2): the longest wait of this call for a free place (default CHANNEL_SLOT_WAIT_MS). Plan step 11I1,
-   * PR B1: HelperChannels.docker, which gave what was left of its wait for the channel, is gone.
-   */
-  slotWaitMs?: number;
 }
 
 /** Plan step 6, PR B: the options of one step of a batch helper (HelperBatchSession.step). */
@@ -627,7 +622,7 @@ export class HelperChannel {
     const release = () => this.releaseSlot();
     if (this.slots < MAX_CONCURRENT_OPERATIONS) this.slots++;
     else {
-      const waitMs = Math.min(options.slotWaitMs ?? this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY);
+      const waitMs = Math.min(this.options.slotWaitMs ?? CHANNEL_SLOT_WAIT_MS, options.timeoutMs ?? Number.POSITIVE_INFINITY);
       await this.waitForSlot(options.signal, Math.max(0, waitMs));
     }
     // Review round 6 (R6-2): the time limit counts from the call, so the wait for a place is taken from it (the line only

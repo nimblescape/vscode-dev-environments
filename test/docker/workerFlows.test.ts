@@ -14,7 +14,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteCheckValue, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
 import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
@@ -97,7 +98,7 @@ describe('the flows through a real worker (plan step 11B1)', () => {
               all.splice(all.indexOf(helperTag), 0, '--label', runLabel);
               return docker.start(all);
             },
-            runDirect: (args, options) => docker.runDirect(args, options),
+            runDirect: (args, options) => docker.run(args, options),
             logger: log,
             script: async () => script,
             helperTag: async () => helperTag,

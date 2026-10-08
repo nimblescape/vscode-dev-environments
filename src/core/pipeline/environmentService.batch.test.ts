@@ -23,7 +23,7 @@ import { abortError, isAbortError, silentLogger, type RunResult } from '../ports
 import { batchStepCommand, type BatchStepKind } from '../helper/batchSteps';
 import { composeProjectName } from '../names';
 import { WorkspaceHelper, type HelperDocker, type HelperImageUse } from '../helper/workspaceHelper';
-import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './environmentService';
+import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './operationBase';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, REPO, TOKEN, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 import { resourceName } from '../names';

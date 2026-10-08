@@ -15,7 +15,6 @@ import {
   parseClaimedOperationName,
   parseJson,
   readJsonTolerant,
-  readJsonTolerantSync,
   readTextFile,
   readTextFileSync,
   retryTransient,
@@ -203,14 +202,12 @@ describe('reading files', () => {
     expect(parseJson('')).toBeUndefined();
     const file = path.join(root, 'b.json');
     fs.writeFileSync(file, 'not json');
+    // Plan step 11I (PR D): changed, without readJsonTolerantSync, which nothing used (removed with its assertions).
     await expect(readJsonTolerant(file)).resolves.toBeUndefined();
-    expect(readJsonTolerantSync(file)).toBeUndefined();
     await expect(readJsonTolerant(path.join(root, 'missing.json'))).resolves.toBeUndefined();
     await expect(readJsonTolerant(root)).resolves.toBeUndefined();
-    expect(readJsonTolerantSync(root)).toBeUndefined();
     fs.writeFileSync(file, '[1,2]');
     await expect(readJsonTolerant(file)).resolves.toEqual([1, 2]);
-    expect(readJsonTolerantSync(file)).toEqual([1, 2]);
   });
 
   it('lists names sorted, and a missing folder as empty', async () => {

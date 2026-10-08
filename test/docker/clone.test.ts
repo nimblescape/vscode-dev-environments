@@ -12,7 +12,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper, helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { parseJsonc } from '../../src/core/jsonc';
 import { newEnvironmentId, splitRepository } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';

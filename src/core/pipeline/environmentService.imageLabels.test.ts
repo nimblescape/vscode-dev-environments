@@ -24,7 +24,7 @@ import {
 } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
 import type { BuildRecord } from '../types';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import {
   ACCOUNT,
   BASE_IMAGE,
@@ -42,7 +42,8 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { COMPOSE_CONTAINER_NUMBER_LABEL, COMPOSE_PROJECT_LABEL, DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { COMPOSE_CONTAINER_NUMBER_LABEL, DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { COMPOSE_PROJECT_LABEL } from '../names';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);

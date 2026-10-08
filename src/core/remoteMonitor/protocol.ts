@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The protocol between the computers and the Session Monitor on a remote Docker host (unit 7, PR 2; implementation
-// notes 16): the names of its container, volume, and label, the heartbeat records in its volume, the subcommands of its
-// script (dist/remoteMonitor.js, src/remoteMonitor/main.ts), and the strict checks of everything that script reads.
+// The protocol between the computers and the Session Monitor of a Docker engine (unit 7, PR 2; plan step 8, PR A: on every
+// engine; implementation notes 16): the names of its container, volume, and label, the heartbeat records in its volume,
+// the subcommands of its script (src/remoteMonitor/main.ts, in the worker's bundle as `devenv:monitor-script`, plan step
+// 11D2), and the strict checks of everything that script reads.
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';

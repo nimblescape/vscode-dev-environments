@@ -9,21 +9,26 @@
 // inspect JSON is read by the same functions as `docker inspect` (dockerObjects.ts). Pure over the port; no I/O, no
 // `vscode`.
 import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type ImageInspection, type ImageNames, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
-import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/bootstrapDocker';
+import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/dockerTimeouts';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
-import { LABEL_ENVIRONMENT_ID } from '../names';
+import { COMPOSE_PROJECT_LABEL, LABEL_ENVIRONMENT_ID } from '../names';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
-import type { PullCredentials } from '../pipeline/pullCredentials';
-import { abortError, isAbortError, silentLogger, type Logger, type RunResult } from '../ports';
+import { abortError, isAbortError, silentLogger, type Credentials, type Logger, type RunResult } from '../ports';
 import type { ContainerState } from '../types';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { EngineError, isDevContainer, isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
 
-/** Label that Docker Compose gives each container, network, and volume of a project. */
-const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
+/**
+ * Registry credentials for one pull (pullImage). Plan step 11I (PR D): moved here from pipeline/pullCredentials.ts, whose
+ * GitHub session for ghcr.io was never given to the worker's pipeline (the extension sends that login: vscode/hostSide.ts).
+ */
+interface PullCredentials extends Credentials {
+  /** Registry host, for example `ghcr.io`. */
+  registry: string;
+}
 
 /** An Engine API answer about the reference itself (400): an invalid reference, as `docker image inspect` reports it. */
 const INVALID_REFERENCE = 400;

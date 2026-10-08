@@ -7,7 +7,7 @@
 // opens no running container of the environment as it is; `up` and its lifecycle commands run, then the window forgets it.
 import { afterEach, describe, expect, it } from 'vitest';
 import { environmentImageName } from '../names';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, PID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { LIFECYCLE_UNKNOWN, rememberedFor, windowLifecycleMemory } from './lifecycleMemory';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';

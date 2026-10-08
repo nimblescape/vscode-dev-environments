@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { describe, expect, it, vi } from 'vitest';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperImageUse } from '../helper/helperImage';
-import type { PresentImageOptions } from '../helper/workspaceHelper';
+import type { PresentImageOptions } from '../helper/helperImages';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import { isAbortError } from '../ports';
 import { heartbeatHelperImage } from './heartbeatHelperImage';

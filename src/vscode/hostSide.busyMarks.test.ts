@@ -49,7 +49,6 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
     ui,
     auth,
     credentials,
-    settings: () => ({ stopAfterMinutes: 10 }) as unknown as ReturnType<HostSideDeps['settings']>,
     windowId: 'w1',
     // Plan step 11C2a: the busy marks of a flow.
     pid: 100,

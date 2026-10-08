@@ -8,7 +8,6 @@
 import type { EnvironmentRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { GitHubAuth, Logger, PipelineUi } from '../core/ports';
-import type { ExtensionSettings } from '../core/types';
 import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
@@ -28,13 +27,12 @@ export interface HostSideDeps {
   registry: Pick<EnvironmentRegistry, 'read' | 'get' | 'list' | 'findForAccount' | 'restore' | 'update' | 'updateEnvironment' | 'remove' | 'forgetKeptVolumes'>;
   sessionFiles: Pick<
     SessionFiles,
-    'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopen' | 'removeReopenOf' | 'removeDisconnectRequest'
+    'readWindowStatuses' | 'readPendings' | 'writePending' | 'removePending' | 'removeOperation' | 'removeReopenOf' | 'removeDisconnectRequest'
   >;
   ui: PipelineUi;
   auth: Pick<GitHubAuth, 'getToken' | 'getPackagesCredentials' | 'getAccount'>;
   /** The registry logins that Docker stored on this computer (DockerCredentialStore.getForPull). */
   credentials: Pick<DockerCredentialStore, 'getForPull'>;
-  settings: () => ExtensionSettings;
   /** The window of this computer (its id, for the pending files that a flow writes). */
   windowId: string;
   /** Plan step 11C2a: the extension host of this window (its process id), for the busy marks of a flow. */
@@ -95,7 +93,6 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
     state: {
       windowStatuses: () => deps.sessionFiles.readWindowStatuses(),
       pendings: async () => (await deps.sessionFiles.readPendings()).map((pending) => ({ ...pending })),
-      settings: async () => ({ ...deps.settings() }) as unknown as Record<string, unknown>,
       processAlive: async (pid) => deps.isProcessAlive(pid),
       account: (interactive) => deps.auth.getAccount({ interactive }),
       // Plan step 11E4d: with the token of this window, never one of the worker; only the profile of the signed-in account.
@@ -135,7 +132,6 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
         if (kind === 'writePending') await deps.sessionFiles.writePending(environmentId, deps.windowId);
         else if (kind === 'removePending') await deps.sessionFiles.removePending(environmentId);
         else if (kind === 'removeOperation') await deps.sessionFiles.removeOperation(environmentId);
-        else if (kind === 'removeReopen') await deps.sessionFiles.removeReopen();
         else if (kind === 'removeReopenOf') await deps.sessionFiles.removeReopenOf(environmentId);
         else await deps.sessionFiles.removeDisconnectRequest(environmentId);
       },

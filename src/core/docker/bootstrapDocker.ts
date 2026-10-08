@@ -6,8 +6,8 @@
 // only for the bootstrap: whether the CLI is installed and the engine answers (`docker info`), the helper image (its
 // check, build and cleanup), the start of the worker (`docker run -i`), the Docker contexts, the test of a new remote
 // host, and the attach diagnostics (what the Dev Containers extension sees through the local CLI). Every other Docker
-// action runs in the worker. Each call runs directly; a call that does not only read is logged with its command
-// (directCommandName), never its arguments. Output is read as JSON, never as a table. No `vscode`.
+// action runs in the worker. A call that does not only read is logged with its command (directCommandName), never its
+// arguments. Output is read as JSON, never as a table. No `vscode`.
 import * as crypto from 'crypto';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { Messages } from '../messages';
@@ -16,6 +16,7 @@ import { isAbortError, sleep, systemClock, type Clock, type Logger, type Process
 import { dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './dockerCli';
 import { isSshClosedBeforeLogin } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
+import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
 import { operationDockerTarget } from './dockerTargets';
 
 /** Result of `docker info`. */
@@ -24,11 +25,6 @@ export interface DaemonStatus {
   /** Server version when running; otherwise the error of `docker info`, for the log. */
   detail: string;
 }
-
-/** Time limit of `docker info` (the engine can take some seconds to leave the Resource Saver mode). */
-export const DOCKER_INFO_TIMEOUT_MS = 20_000;
-/** Time limit of short Docker calls (queries, stop, remove), so that a hanging engine does not block forever. */
-export const DOCKER_QUERY_TIMEOUT_MS = 60_000;
 
 /**
  * A missing Docker CLI is looked up again at most this often (with `findDocker`), so that Docker Desktop installed or
@@ -60,8 +56,8 @@ export function sshDroppedReadCall(args: readonly string[], result: RunResult): 
 const DOCKER_OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context', 'system', 'builder', 'buildx', 'compose', 'plugin', 'manifest']);
 
 /**
- * Plan step 10A: the command of a direct call for its log line (`build`, `pull`, `image rm`), never an argument (an image
- * name, a path, or a value).
+ * Plan step 10A: the command of a call for its log line (`build`, `pull`, `image rm`), never an argument (an image name,
+ * a path, or a value).
  */
 export function directCommandName(args: readonly string[]): string {
   const [command, subcommand] = dockerCommandWords(args);
@@ -70,14 +66,8 @@ export function directCommandName(args: readonly string[]): string {
 }
 
 
-export type ObjectKind = 'container' | 'volume' | 'image' | 'network';
-
-export const MISSING_PATTERNS: Record<ObjectKind, RegExp> = {
-  container: /no such (container|object)/i,
-  volume: /no such (volume|object)/i,
-  image: /no such (image|object)/i,
-  network: /no such (network|object)|network \S+ not found/i,
-};
+/** Plan step 11I (PR D): what `docker image inspect` and `docker image rm` say of an image that does not exist. */
+const IMAGE_MISSING_PATTERN = /no such (image|object)/i;
 
 
 /** Docker refuses to remove an image that a container or another image uses. */
@@ -176,15 +166,15 @@ export interface BootstrapDockerOptions {
 
 /** Plan step 11F2: the Docker CLI of the bootstrap (see the module comment). */
 export class BootstrapDocker {
-  protected path: string | undefined;
-  protected env: NodeJS.ProcessEnv;
-  protected readonly rawEnv: NodeJS.ProcessEnv;
-  protected readonly findDocker: BootstrapDockerOptions['findDocker'];
-  protected readonly clock: Clock;
-  protected readonly onDaemonStatus: BootstrapDockerOptions['onDaemonStatus'];
-  protected readonly onCliLost: BootstrapDockerOptions['onCliLost'];
-  protected readonly sshDropRetryDelayMs: number;
-  protected lookedUpAt: number | undefined;
+  private path: string | undefined;
+  private env: NodeJS.ProcessEnv;
+  private readonly rawEnv: NodeJS.ProcessEnv;
+  private readonly findDocker: BootstrapDockerOptions['findDocker'];
+  private readonly clock: Clock;
+  private readonly onDaemonStatus: BootstrapDockerOptions['onDaemonStatus'];
+  private readonly onCliLost: BootstrapDockerOptions['onCliLost'];
+  private readonly sshDropRetryDelayMs: number;
+  private lookedUpAt: number | undefined;
 
   /**
    * @param dockerPath Full path of the Docker CLI (see `findDockerCli`), or `undefined` if Docker is not installed.
@@ -194,11 +184,11 @@ export class BootstrapDocker {
    * @param options `findDocker`: look the CLI up again while it is missing (see BootstrapDockerOptions).
    */
   constructor(
-    protected readonly runner: ProcessRunner,
+    private readonly runner: ProcessRunner,
     dockerPath: string | undefined,
     env: NodeJS.ProcessEnv,
-    protected readonly logger: Logger,
-    protected readonly platform: NodeJS.Platform = process.platform,
+    private readonly logger: Logger,
+    private readonly platform: NodeJS.Platform = process.platform,
     options: BootstrapDockerOptions = {},
   ) {
     this.path = dockerPath;
@@ -225,28 +215,31 @@ export class BootstrapDocker {
   }
 
   /**
-   * The call without the worker (the way of every call before plan step 5). A call that only reads is repeated once when
-   * the SSH server of a remote Docker host closed the connection before the login (sshDroppedReadCall). Plan step 10A
-   * (decision of 2026-10-03): a call that does not only read is logged with its command (directCommandName; never its
-   * arguments or its input), its exit code, and its time, so the calls that still bypass the worker are visible.
+   * Raw call with the Docker CLI of this computer. Resolves also for a non-zero exit code. Throws
+   * UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled) without a CLI, or when the CLI cannot be started
+   * anymore (removed after it was found). A call that only reads is repeated once when the SSH server of a remote Docker
+   * host closed the connection before the login (sshDroppedReadCall). Plan step 10A (decision of 2026-10-03): a call that
+   * does not only read is logged with its command (directCommandName; never its arguments or its input), its exit code,
+   * and its time. Plan step 11I (PR D): one method (before: `run` passed every call to `runDirect`).
    */
-  async runDirect(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    if (isReadOnlyDockerCall(args)) return this.runDirectOnce(args, options);
+  async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    if (isReadOnlyDockerCall(args)) return this.runRepeated(args, options);
     const startedAt = this.clock.now();
     const command = directCommandName(args);
     const seconds = (): string => (Math.max(0, this.clock.now() - startedAt) / 1000).toFixed(1);
     try {
-      const result = await this.runDirectOnce(args, options);
+      const result = await this.runRepeated(args, options);
       const end = result.timedOut ? 'timed out' : `exit code ${result.exitCode}`;
-      this.logger.info(`docker ${command} (direct): ${end} after ${seconds()} s.`);
+      this.logger.info(`docker ${command}: ${end} after ${seconds()} s.`);
       return result;
     } catch (error) {
-      this.logger.info(`docker ${command} (direct): ${isAbortError(error) ? 'cancelled' : 'failed'} after ${seconds()} s.`);
+      this.logger.info(`docker ${command}: ${isAbortError(error) ? 'cancelled' : 'failed'} after ${seconds()} s.`);
       throw error;
     }
   }
 
-  protected async runDirectOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
+  /** runOnce, repeated once after an SSH drop of a call that only reads (sshDroppedReadCall). */
+  private async runRepeated(args: readonly string[], options: RunOptions): Promise<RunResult> {
     const result = await this.runOnce(args, options);
     if (!sshDroppedReadCall(args, result) || options.signal?.aborted) return result;
     const command = dockerCommandWords(args).join(' ');
@@ -257,7 +250,7 @@ export class BootstrapDocker {
     return this.runOnce(args, options);
   }
 
-  protected async runOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
+  private async runOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
     this.lookUpCliIfMissing();
     const dockerPath = this.path;
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
@@ -296,7 +289,7 @@ export class BootstrapDocker {
    * even when the user switches the context meanwhile. DOCKER_HOST is never set here; when it is set for VS Code, it
    * decides the endpoint and the operation has no context name.
    */
-  protected operationEnv(): NodeJS.ProcessEnv {
+  private operationEnv(): NodeJS.ProcessEnv {
     const context = operationDockerTarget()?.context;
     if (context === undefined) return this.env;
     const env: NodeJS.ProcessEnv = { ...this.env };
@@ -319,7 +312,7 @@ export class BootstrapDocker {
     return this.path !== undefined;
   }
 
-  protected reportCliLost(): void {
+  private reportCliLost(): void {
     try {
       this.onCliLost?.();
     } catch (error) {
@@ -328,7 +321,7 @@ export class BootstrapDocker {
   }
 
   /** With `findDocker`: looks for a missing CLI again, at most every DOCKER_CLI_LOOKUP_RETRY_MS unless `force` is set. */
-  protected lookUpCliIfMissing(force = false): void {
+  private lookUpCliIfMissing(force = false): void {
     if (this.path !== undefined || !this.findDocker) return;
     const now = this.clock.now();
     if (!force && this.lookedUpAt !== undefined && Math.abs(now - this.lookedUpAt) < DOCKER_CLI_LOOKUP_RETRY_MS) return;
@@ -367,7 +360,7 @@ export class BootstrapDocker {
     return status;
   }
 
-  protected async queryDaemonStatus(signal: AbortSignal | undefined, timeoutMs: number): Promise<DaemonStatus> {
+  private async queryDaemonStatus(signal: AbortSignal | undefined, timeoutMs: number): Promise<DaemonStatus> {
     if (!this.isInstalled()) return { running: false, detail: 'The Docker CLI was not found.' };
     let result: RunResult;
     try {
@@ -403,7 +396,7 @@ export class BootstrapDocker {
     const args = ['image', 'inspect', '--format', '{{json .Id}}', reference];
     const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     if (result.exitCode === 0) return true;
-    if (this.isMissing(result, 'image')) return false;
+    if (this.isMissing(result)) return false;
     throw this.commandError(args, result);
   }
 
@@ -412,7 +405,7 @@ export class BootstrapDocker {
     const args = ['image', 'inspect', '--format', '{{json .Id}}', reference];
     const result = await this.run(args, { timeoutMs: DOCKER_QUERY_TIMEOUT_MS });
     if (result.exitCode !== 0) {
-      if (this.isMissing(result, 'image')) return undefined;
+      if (this.isMissing(result)) return undefined;
       throw this.commandError(args, result);
     }
     const id = parseJsonOutput(result.stdout);
@@ -458,7 +451,7 @@ export class BootstrapDocker {
       this.logger.info(`Removed image ${reference}.`);
       return true;
     }
-    if (this.isMissing(result, 'image')) return false;
+    if (this.isMissing(result)) return false;
     const message = `${result.stderr}\n${result.stdout}`;
     if (IMAGE_IN_USE_PATTERN.test(message)) {
       this.logger.info(`Image ${reference} is in use and was not removed: ${result.stderr.trim()}`);
@@ -522,22 +515,14 @@ export class BootstrapDocker {
     return images[0].id;
   }
 
-  protected isMissing(result: RunResult, kind: ObjectKind): boolean {
-    return !result.timedOut && result.exitCode !== 0 && MISSING_PATTERNS[kind].test(result.stderr);
+  /** The image of a failed call does not exist (IMAGE_MISSING_PATTERN). */
+  private isMissing(result: RunResult): boolean {
+    return !result.timedOut && result.exitCode !== 0 && IMAGE_MISSING_PATTERN.test(result.stderr);
   }
 
-  protected commandError(args: readonly string[], result: RunResult, note?: string): CommandError {
+  private commandError(args: readonly string[], result: RunResult, note?: string): CommandError {
     const notes = [result.timedOut ? 'The command did not end within the time limit.' : undefined, note].filter(Boolean);
     const stderr = notes.length > 0 ? `${result.stderr.trimEnd()}\n${notes.join('\n')}`.trim() : result.stderr;
     return new CommandError(commandText(args), result.exitCode, result.stdout, stderr);
-  }
-
-  /**
-   * Raw call, directly with the Docker CLI of this computer (runDirect). Resolves also for a non-zero exit code. Throws
-   * UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled) without a CLI, or when the CLI cannot be started
-   * anymore (removed after it was found).
-   */
-  async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    return this.runDirect(args, options);
   }
 }

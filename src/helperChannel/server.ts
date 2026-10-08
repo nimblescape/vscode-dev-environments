@@ -37,9 +37,6 @@ import {
 import { StreamRedactor, redact, redactValue } from '../core/helperChannel/protocol';
 import { abortError } from '../core/ports';
 
-// Plan step 6, PR B: moved to protocol.ts (the extension masks the output of a batch step too).
-export { StreamRedactor, redact };
-
 /** Review round 2 (C1): the longest text of a log or progress message (a longer one is cut, with `…`). */
 export const MAX_LOG_TEXT = 16 * 1024;
 

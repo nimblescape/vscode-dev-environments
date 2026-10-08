@@ -11,8 +11,8 @@
 // (hostOpenRecords); plan step 11E4d: the liveness of the processes of the computer, the GitHub profile and the window's
 // lifecycle memory are asked of the extension. Plan step 11E6: the open runs here (the operation `open`), with the
 // analysis thread, the image check, the settings and the Session Monitor that its operation gives; without them, they
-// fail closed, as does a record write by a function. The variables of the computer (`${localEnv:…}`) are never passed
-// (localEnv.ts). Pure over its deps; no `vscode`.
+// fail closed. Plan step 11I (PR D): the records have no write by a function at all (EnvironmentStore). The variables of
+// the computer (`${localEnv:…}`) are never passed (localEnv.ts). Pure over its deps; no `vscode`.
 import { UserFacingError, errorMessage } from '../errors';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { ConfigurationAnalyzer } from '../helper/configurationAnalysis';
@@ -23,7 +23,8 @@ import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { proxiedHttpsTransport } from '../proxyTransport';
 import { SECRET_REGISTRY } from '../helperChannel/protocol';
 import { Messages } from '../messages';
-import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionFiles, type EnvironmentSessionMonitor, type EnvironmentStore } from '../pipeline/environmentService';
+import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionMonitor } from '../pipeline/environmentService';
+import type { EnvironmentSessionFiles, EnvironmentStore } from '../pipeline/operationBase';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import type { OpenRecords } from '../pipeline/openRecords';
 import type { LifecycleMemory } from '../pipeline/lifecycleMemory';
@@ -43,8 +44,17 @@ function notInWorker(what: string, step: string): Error {
 }
 
 /**
- * EnvironmentStore over the `record` requests; a write by a function cannot cross the channel (plan step 11C: each write
- * is a specific request, decision of 2026-10-04).
+ * Plan step 11I (PR D): what a part of the pipeline throws when its operation did not give the worker what it needs (fail
+ * closed): only the operation `open` gives the settings and the ensure of the Session Monitor.
+ */
+function notGiven(what: string): Error {
+  return new Error(`The operation gives the worker no ${what}.`);
+}
+
+/**
+ * EnvironmentStore over the `record` requests. A write by a function cannot cross the channel (plan step 11C: each write
+ * is a specific request, decision of 2026-10-04): the busy marks (hostBusyMarks), the entry of a first open and the other
+ * writes of the open (hostOpenRecords), the Git state (`record recordGitSummary`).
  */
 export function hostStore(records: HostSide['records']): EnvironmentStore {
   return {
@@ -52,19 +62,10 @@ export function hostStore(records: HostSide['records']): EnvironmentStore {
     get: (id) => records.get(id),
     list: () => records.list(),
     findForAccount: (repository, accountId, dockerHost = '') => records.findForAccount(repository, accountId, dockerHost),
-    // Plan step 11E4c: the entry of a first open is `record createEnvironment` (hostOpenRecords); no other entry is added.
-    add: async () => {
-      throw new Error('The worker adds a registry entry only as the entry of a first open (record createEnvironment).');
-    },
     remove: (id, volumes = {}) => records.remove(id, volumes),
     forgetKeptVolumes: (names) => records.forgetKeptVolumes(names),
     // Plan step 11C3: the entries rebuilt from the volumes of the engine.
     restore: (entries) => records.restore(entries),
-    // The changes of an entry by the flows that still make them become specific requests when they move (plan steps 11D,
-    // 11E); plan step 11E4c: those of the open are the requests of hostOpenRecords.
-    updateEnvironment: async () => {
-      throw notInWorker('A change of a registry entry by a function', '11D or 11E');
-    },
   };
 }
 
@@ -76,13 +77,9 @@ export function hostSessionFiles(host: HostSide): EnvironmentSessionFiles {
     removePending: (environmentId) => host.records.sessionFile('removePending', environmentId),
     removeOperation: (environmentId) => host.records.sessionFile('removeOperation', environmentId),
     removeDisconnectRequest: (environmentId) => host.records.sessionFile('removeDisconnectRequest', environmentId),
-    removeReopen: () => host.records.sessionFile('removeReopen', ''),
     // Plan step 11C2a: the extension reads the reopen record and removes it when it names the environment.
     removeReopenOf: (environmentId) => host.records.sessionFile('removeReopenOf', environmentId),
     readPendings: async () => [...(await host.state.pendings())],
-    readReopen: async () => {
-      throw notInWorker('The reopen record', '11E');
-    },
   };
 }
 
@@ -161,7 +158,7 @@ export function workerSessionMonitor(
     ...(open.images !== undefined ? { images: (_target: unknown, signal?: AbortSignal) => open.images!(signal) } : {}),
     // The worker's own helper image runs the monitor (the operation knows it), never the tag or ID of the pipeline's run.
     ensure: async (_target, _helperTag, signal) => {
-      if (open.ensure === undefined) throw notInWorker('The ensure of the Session Monitor without the image maintenance of its operation', '11E6');
+      if (open.ensure === undefined) throw notGiven('ensure of the Session Monitor (with its image maintenance)');
       await open.ensure(signal);
     },
     heartbeat: async (_target, environmentId, keepRunning, seq) => {
@@ -310,9 +307,9 @@ export function hostUi(questions: HostSide['questions'], log: Logger): PipelineU
 }
 
 /** Without the analysis thread of the worker (WorkerServicesDeps.analyzer, plan step 11E2), nothing is analyzed. */
-const ANALYZER_NOT_IN_WORKER: ConfigurationAnalyzer = {
+const NO_ANALYZER: ConfigurationAnalyzer = {
   analyze: async () => {
-    throw notInWorker('The host access analysis', '11E');
+    throw notGiven('host access analysis');
   },
 };
 
@@ -332,7 +329,7 @@ export interface WorkerServicesDeps {
   owner: { windowId: string; pid: number };
   /** The lock of an environment, taken in the worker (workerEnvironmentLock). */
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
-  /** The settings of the extension, when the operation read them (`local settings`); a read without them fails closed. */
+  /** Plan step 11E6: the settings of the pipeline of an open (openSettingsOf of its parameters); a read without them fails closed. */
   settings?: ExtensionSettings;
   /** Plan step 11C2a: the id of the computer that sent the operation in the Session Monitor (Delete's `forget`). */
   monitorSource?: string;
@@ -394,11 +391,6 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
   });
   return {
     docker,
-    runner: {
-      run: async () => {
-        throw new Error('The pipeline of the worker runs no process of its own on the Docker host.');
-      },
-    },
     // Docker runs where the worker runs; the engine must answer.
     startDocker: async ({ signal }) => {
       if (!(await docker.isRunning(signal))) throw new UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning, 'The engine of the worker does not answer.');
@@ -440,14 +432,12 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     ui: hostUi(deps.host.questions, deps.logger),
     logger: deps.logger,
     clock: systemClock,
-    platform: 'linux',
-    env: {},
     owner: deps.owner,
     settings: () => {
-      if (deps.settings === undefined) throw notInWorker('A read of the settings without them', '11E');
+      if (deps.settings === undefined) throw notGiven('settings');
       return deps.settings;
     },
-    analyzer: deps.analyzer ?? ANALYZER_NOT_IN_WORKER,
+    analyzer: deps.analyzer ?? NO_ANALYZER,
     dockerTarget: async () => ({ kind: deps.dockerHost === '' ? 'local' : 'remote', host: deps.dockerHost, endpoint: '' }),
     environmentLock: deps.environmentLock,
     // Plan step 11F1: the flows and the refresh through a worker are the window's (EnvironmentOperations), not the pipeline's.

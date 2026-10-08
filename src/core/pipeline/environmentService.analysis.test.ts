@@ -15,7 +15,7 @@ import { UserFacingError } from '../errors';
 import { ANALYSIS_FAILED_ITEM, analysisInternalItem } from '../helper/configurationAnalysis';
 import { ANALYSIS_LIMITS, WorkerConfigurationAnalyzer, type AnalysisLimits } from '../helper/configurationAnalysisRunner';
 import { Messages } from '../messages';
-import type { RepositoryTarget } from './environmentService';
+import type { RepositoryTarget } from './operationBase';
 import { REPO, createHarness, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
 
@@ -24,6 +24,8 @@ const FAILED_LINE = /^The host access analysis of the configuration failed \((.*
 
 let outDir: string;
 let bundle: string;
+/** Plan step 11I (PR D): the text of the bundle, as the worker carries it (the analyzer no longer takes a path). */
+let bundleCode: string;
 let h: Harness | undefined;
 
 beforeAll(() => {
@@ -40,6 +42,7 @@ beforeAll(() => {
     logLevel: 'silent',
     define: { __DEVCONTAINER_CLI_VERSION__: JSON.stringify('0.0.0') },
   });
+  bundleCode = fs.readFileSync(bundle, 'utf8');
 });
 
 afterEach(() => {
@@ -51,11 +54,11 @@ afterAll(() => {
   fs.rmSync(outDir, { recursive: true, force: true });
 });
 
-/** A harness whose pipeline analyses in the worker at `script` with `limits`. */
-function harness(limits: Partial<AnalysisLimits> = {}, script = bundle): Harness {
+/** A harness whose pipeline analyses in the worker of the script `code` with `limits`. */
+function harness(limits: Partial<AnalysisLimits> = {}, code = bundleCode): Harness {
   let created: Harness | undefined;
   const logger = { warn: (message: string) => created?.logger.warn(message) };
-  created = createHarness({ analyzer: new WorkerConfigurationAnalyzer(script, logger, { ...ANALYSIS_LIMITS, ...limits }) });
+  created = createHarness({ analyzer: new WorkerConfigurationAnalyzer({ code }, logger, { ...ANALYSIS_LIMITS, ...limits }) });
   h = created;
   return created;
 }
@@ -101,7 +104,9 @@ describe('the open pipeline with the host access analysis in the worker (review 
   });
 
   it('refuses the configuration when the worker does not start, before anything is built', async () => {
-    const failing = harness({}, path.join(outDir, 'missing.js'));
+    // Plan step 11I (PR D): a script that cannot load a module, as Node names it (before: a missing file; the analyzer no
+    // longer takes a path; the require stack of a real one would break the lines of the message).
+    const failing = harness({}, 'throw Object.assign(new Error("Cannot find module \'./missing\'"), { code: "MODULE_NOT_FOUND" });');
     const error = await rejection(failing.service.open(TARGET, { progress: failing.progress }));
     expect(error.code).toBe('hostAccess');
     // Review round 9, P9-2: an internal error, not "too complex, change the configuration" (the configuration is not to

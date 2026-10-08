@@ -227,7 +227,7 @@ describe('showError (concept 6.5)', () => {
       // 2026-10-01: the Switch branch command was dropped (user decision). gitSwitchFailed is gone.
       'signInRequired',
       'hostAccess',
-      'unencryptedDockerConnection',
+      // Plan step 11I (PR D): unencryptedDockerConnection no longer exists (nothing could raise it).
       'otherAccount',
     ] as const;
     for (const code of codes) {

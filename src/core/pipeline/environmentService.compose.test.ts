@@ -48,7 +48,8 @@ import {
 } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
 import type { BuildRecord, ContainerState, Environment, WindowStatus } from '../types';
-import { PipelineTexts, type EnvironmentSessionMonitor, type RepositoryTarget } from './environmentService';
+import { type EnvironmentSessionMonitor } from './environmentService';
+import { PipelineTexts, type RepositoryTarget } from './operationBase';
 import {
   ACCOUNT,
   BASE_IMAGE,

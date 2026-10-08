@@ -839,12 +839,13 @@ describe('HelperChannels.refresh (plan step 5, PR C)', () => {
 
   // Plan step 5, PR D (rule D1 of 2026-09-30): changed expectation (before: undefined in each of these cases, and the
   // service read directly): each is refused; a refresh that was not sent because the channel closed is sent once more.
-  it('rejects without a worker with `refresh`, for parameters beyond the check, or when it was not sent', async () => {
-    const older = refreshChannel(['docker', 'probe', 'sweep'], async () => refreshValue(EXPECTED_STATES));
-    await expect(older.channels.refresh(LOCAL_DOCKER_TARGET, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable' });
-    expect(older.channel.operation).not.toHaveBeenCalled();
+  // Plan step 11I (PR D): changed, a worker without `refresh` is no case any more (the worker is this extension's own
+  // bundle, its hash checked by the loader, its protocol at `hello`); before: refused as `unavailable`, without a call.
+  it('rejects for an unsupported endpoint, for parameters beyond the check, or when it was not sent', async () => {
+    const older = refreshChannel(['refresh'], async () => refreshValue(EXPECTED_STATES));
     const unsupported = dockerTargetOf('tcp://build-box:2375', 'tcp-box');
     await expect(older.channels.refresh(unsupported, REFRESH_ENVIRONMENTS)).rejects.toMatchObject({ code: 'unavailable' });
+    expect(older.channel.operation).not.toHaveBeenCalled();
     older.channels.dispose();
 
     const current = refreshChannel(['refresh'], async () => refreshValue(EXPECTED_STATES));

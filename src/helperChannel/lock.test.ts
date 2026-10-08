@@ -17,7 +17,8 @@ import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOp
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { scriptCommand } from '../core/worker/containerScripts';
 import { stopOperation } from './flowOperations';
-import { FLOCK_FD, LOCK_DEPS, openLockFile, takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
+import { LOCK_DEPS, takeEnvironmentLock, type LockDeps } from './lock';
+import { FLOCK_FD, openLockFile, type FlockProcess } from '../core/helperChannel/lockFile';
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 

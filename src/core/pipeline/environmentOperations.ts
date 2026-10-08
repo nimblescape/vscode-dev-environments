@@ -7,6 +7,7 @@
 // Stop, Delete and its check, the listing of Select configuration, the reads of an attached window, the refresh and the
 // rebuild of the registry; the worker runs the pipeline (EnvironmentService). Nothing of the pipeline is imported here,
 // so the extension's bundle holds none of it. No `vscode`.
+import { registryBusyMarks, type EnvironmentBusyMarks } from './busyMarks';
 import { type DeleteDecision } from './deleteCheck';
 import { waitingTimeMs } from '../busy';
 import { environmentsOfHost } from '../docker/dockerHost';
@@ -49,6 +50,7 @@ import { hostAccessChecks } from '../policy/hostAccessChecks';
 import { isoTime } from '../ports';
 import type { Environment, GitHubAccount } from '../types';
 import { LIFECYCLE_UNKNOWN } from './lifecycleMemory';
+import { registryOpenRecords, type OpenRecords } from './openRecords';
 
 import {
   OperationBase,
@@ -72,6 +74,7 @@ import {
   type OperationBaseDeps,
   type OperationOptions,
   type RepositoryTarget,
+  type WindowEnvironmentStore,
 } from './operationBase';
 
 /** Plan step 11E6: the longest detail of a step of the open that the worker reports (the progress notification). */
@@ -101,6 +104,12 @@ export type OperationFlow = (
 
 /** The deps of the operations of a window. */
 export interface EnvironmentOperationsDeps extends OperationBaseDeps {
+  /** The registry of this computer (plan step 11I, PR D: the window's operations also change its entries). */
+  registry: WindowEnvironmentStore;
+  /** Plan step 11C2a: the busy marks of the window. Default: over `registry` (registryBusyMarks). */
+  busyMarks?: EnvironmentBusyMarks;
+  /** Plan step 11E4a: the registry writes of the open. Default: over `registry` (registryOpenRecords). */
+  openRecords?: OpenRecords;
   /** Starts Docker when it does not run (concept 7.6 "Docker start"; for a remote host only a check). */
   startDocker: DockerStarter;
   /** Whether the Docker engine of the operation answers (Stop does nothing without it). */
@@ -121,7 +130,10 @@ export interface EnvironmentOperationsDeps extends OperationBaseDeps {
 /** Plan step 11F1: the operations of a window, sent to the worker (see the module comment). */
 export class EnvironmentOperations extends OperationBase {
   constructor(protected override readonly deps: EnvironmentOperationsDeps) {
-    super(deps, deps.startDocker);
+    super(deps, deps.startDocker, (view) => ({
+      busyMarks: deps.busyMarks ?? registryBusyMarks(deps.registry, view),
+      openRecords: deps.openRecords ?? registryOpenRecords(deps.registry, view),
+    }));
   }
 
   /**

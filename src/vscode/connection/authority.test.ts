@@ -10,7 +10,6 @@ import {
   decodeAuthorityParts,
   encodeAuthority,
   folderUriParts,
-  folderUriString,
   REMOTE_SCHEME,
 } from './authority';
 
@@ -67,9 +66,7 @@ describe('Docker context in the authority', () => {
 
   it('puts the context into the folder URI', () => {
     expect(folderUriParts(NAME, '/workspaces/api', 'devenv-remote-2e9f507b').authority).toBe(encodeAuthority(NAME, 'devenv-remote-2e9f507b'));
-    expect(folderUriString(NAME, '/workspaces/api', 'devenv-remote-2e9f507b')).toBe(
-      `vscode-remote://${encodeAuthority(NAME, 'devenv-remote-2e9f507b')}/workspaces/api`,
-    );
+    // Plan step 11I (PR D): changed, without folderUriString (the URI as text), which nothing used and is removed.
   });
 });
 
@@ -138,20 +135,14 @@ describe('decodeAuthority', () => {
   });
 });
 
+// Plan step 11I (PR D): the tests of folderUriString (the URI as text: its form, its percent-encoding, and its parse with
+// the WHATWG URL parser) are removed with it; nothing used it (the extension builds the URI with vscode.Uri.from of
+// folderUriParts).
 describe('folder URI', () => {
-  it('builds vscode-remote://<authority><folder>', () => {
-    expect(folderUriString(NAME, '/workspaces/api')).toBe(`vscode-remote://attached-container+${HEX}/workspaces/api`);
-  });
-
   it('adds a missing leading slash to the folder', () => {
-    expect(folderUriString(NAME, 'workspaces/api')).toBe(`vscode-remote://attached-container+${HEX}/workspaces/api`);
+    // Plan step 11I (PR D): changed, the path of folderUriParts (before: of folderUriString).
+    expect(folderUriParts(NAME, 'workspaces/api').path).toBe('/workspaces/api');
     expect(folderUriParts(NAME, '').path).toBe('/');
-  });
-
-  it('percent-encodes characters that would end the path of the URI string', () => {
-    expect(folderUriString(NAME, '/workspaces/my repo#1?')).toBe(
-      `vscode-remote://attached-container+${HEX}/workspaces/my%20repo%231%3F`,
-    );
   });
 
   it('gives the unencoded parts for vscode.Uri.from', () => {
@@ -166,12 +157,5 @@ describe('folder URI', () => {
     expect(containerNameOfUri({ scheme: 'vscode-remote', authority: `attached-container+${HEX}` })).toBe(NAME);
     expect(containerNameOfUri({ scheme: 'file', authority: `attached-container+${HEX}` })).toBeUndefined();
     expect(containerNameOfUri({ scheme: 'vscode-remote', authority: 'ssh-remote+host' })).toBeUndefined();
-  });
-
-  it('parses back with the WHATWG URL parser to the same authority and path', () => {
-    const url = new URL(folderUriString(NAME, '/workspaces/my repo'));
-    expect(url.protocol).toBe('vscode-remote:');
-    expect(decodeAuthority(url.host)).toBe(NAME);
-    expect(decodeURIComponent(url.pathname)).toBe('/workspaces/my repo');
   });
 });

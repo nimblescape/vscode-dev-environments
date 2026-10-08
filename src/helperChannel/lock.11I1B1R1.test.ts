@@ -6,7 +6,8 @@
 // "a cancel after the lock was taken" case (of the removed operation `lock`) checked that flock is not killed by a later
 // cancel (its abort listener removed); the retargeted tests lost that check. Also a signal aborted before the start.
 import { describe, expect, it } from 'vitest';
-import { takeEnvironmentLock, type FlockProcess, type LockDeps } from './lock';
+import { takeEnvironmentLock, type LockDeps } from './lock';
+import type { FlockProcess } from '../core/helperChannel/lockFile';
 
 function fakeDeps() {
   const events: string[] = [];

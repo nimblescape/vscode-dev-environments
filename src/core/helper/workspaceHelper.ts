@@ -10,71 +10,32 @@
 // runs as an unprivileged Git user and the read steps as the owner of the repository, without the socket: Git runs
 // programs that the repository configuration names (for example filter drivers).
 import { SECRET_TOKEN } from '../helperChannel/protocol';
-import { DOCKER_QUERY_TIMEOUT_MS, type BootstrapDocker } from '../docker/bootstrapDocker';
+import type { BootstrapDocker } from '../docker/bootstrapDocker';
+import { DOCKER_QUERY_TIMEOUT_MS } from '../docker/dockerTimeouts';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
-import { boundServiceFolders, configOwnershipFixCommand, repositoryOwnershipFixCommand, type ServiceFolders } from '../git/gitSummary';
+import { boundServiceFolders, checkNumericIds, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
-import { WORKSPACES_ROOT, environmentIdLabel } from '../names';
+import { WORKSPACES_ROOT } from '../names';
 import { abortError, isAbortError, type RunResult } from '../ports';
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
-import {
-  DevcontainerCommandError,
-  buildArgs,
-  isLifecycleCommandFailure,
-  parseDevcontainerResult,
-  readConfigurationArgs,
-  runUserCommandsArgs,
-  tryParseDevcontainerResult,
-  upArgs,
-} from './devcontainerCli';
+import { DevcontainerCommandError, isLifecycleCommandFailure, parseDevcontainerResult, tryParseDevcontainerResult } from './devcontainerCli';
 import type { HelperBuildKind, HelperImageUse } from './helperImage';
 // Plan step 11F2: the helper image moved to helperImages.ts.
-import {
-  DOCKER_SOCKET,
-  HELPER_IMAGE_RECHECK_MS,
-  HelperImages,
-  helperDockerSocket,
-  helperStatePathFor,
-  type EnsureImageOptions,
-  type HelperEngine,
-  type HelperImageDocker,
-  type HelperImagesDeps,
-  type PresentImageOptions,
-} from './helperImages';
+import { HelperImages, type EnsureImageOptions, type HelperImageDocker, type HelperImagesDeps, type PresentImageOptions } from './helperImages';
 
-export {
-  DOCKER_SOCKET,
-  HELPER_IMAGE_RECHECK_MS,
-  helperDockerSocket,
-  helperStatePathFor,
-  type EnsureImageOptions,
-  type HelperEngine,
-  type HelperImagesDeps,
-  type HelperImageUse,
-  type PresentImageOptions,
-};
-import { CONTAINER_CREDENTIAL_HELPER, type GitIdentity } from './containerGit';
-import { COMPOSE_MODEL_PATH, parseComposeModelOutput, type ComposeModelOutput } from './compose';
-import {
-  OVERRIDE_CONFIG_PATH,
-  cloneCommand,
-  composeHashCommand,
-  composeModelCommand,
-  createFoldersCommand,
-  gitFilesCommand,
-  listConfigsCommand,
-  parseComposeHashes,
-  readFilesCommand,
-  writeAndRunCommand,
-} from './scripts';
-// Plan step 6, PR B: the checks of the inputs and the commands of the Dev Container CLI runs are shared with the batch
-// helper (stepInputs.ts), so that both build every command from the same builders.
-import { checkConfigPath, checkRepository, isPassableEnvName, overrideCommand, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
+// Plan step 11I (PR D): only what the pipeline takes from here (the rest of helperImages.ts is imported from there).
+export type { HelperImageUse };
+import type { GitIdentity } from './containerGit';
+import { parseComposeModelOutput, type ComposeModelOutput } from './compose';
+import { parseComposeHashes } from './scripts';
+// Plan step 6, PR B: the checks of the inputs and the inputs of the Dev Container CLI runs are shared with the batch
+// helper (stepInputs.ts). Plan step 11I (PR D): the batch helper builds each command from the kind and the inputs of its
+// step (batchStepCommand); WorkspaceHelper builds none (fixRepositoryOwnership only asks batchStepCommand whether the
+// step takes its paths).
+import { checkConfigPath, checkRepository, isPassableEnvName, overrideInput, writeAndRunInput, type HelperFiles } from './stepInputs';
 // Plan step 6, PR C, plan step 7: the volume steps run only in the batch helper of an operation.
 import { currentBatchScope, type BatchScope } from './batchScope';
 import { batchStepCommand, type BatchStepKind } from './batchSteps';
-
-export { isPassableEnvName };
 
 /** The part of the Docker port that the helper uses: the helper image's, and `run` (containerRuns without the dep). */
 export type HelperDocker = HelperImageDocker & Pick<BootstrapDocker, 'run'>;
@@ -163,12 +124,6 @@ function lastJsonLine(stdout: string): unknown {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function describeCommand(command: readonly string[]): string {
-  if (command[0] === 'sh' && command[1] === '-c') return ['sh', '<script>', ...command.slice(4)].join(' ');
-  if (command[0] === 'node' && command[1] === '-e') return ['node', '<script>', ...command.slice(3)].join(' ');
-  return command.join(' ');
 }
 
 /** Forwards stdout of `build`/`up` line by line, without the JSON result line. */
@@ -300,10 +255,10 @@ export class WorkspaceHelper {
     signal?: AbortSignal;
   }): Promise<void> {
     checkToken(p.token);
-    const { name } = checkRepository(p.repository);
+    checkRepository(p.repository);
     const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
-    const result = await this.runStreams(p.volumeName, cloneCommand(p.repository, name, p.branch || undefined), {
+    const result = await this.runStreams(p.volumeName, {
       // Plan step 6, PR C: in the batch helper the token travels only in the `secret` field.
       batch: { kind: 'clone', params: { repository: p.repository, ...(p.branch ? { branch: p.branch } : {}) }, secret: p.token },
       image: p.image,
@@ -331,8 +286,9 @@ export class WorkspaceHelper {
     image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<{ configText: string; dockerfilePath?: string; dockerfileText?: string; dockerfileMissing?: boolean } | undefined> {
-    const folder = this.repositoryFolder(p.repository);
-    const result = await this.runStreams(p.volumeName, readFilesCommand(folder, checkConfigPath(p.configPath), p.dockerfile), {
+    checkRepository(p.repository);
+    checkConfigPath(p.configPath);
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'readFiles', params: { repository: p.repository, configPath: p.configPath, ...(p.dockerfile !== undefined ? { dockerfile: p.dockerfile } : {}) } },
       image: p.image,
       signal: p.signal,
@@ -354,8 +310,8 @@ export class WorkspaceHelper {
 
   /** Configuration paths in the volume, in the order of precedence (concept 7.4). */
   async listConfigurations(p: { volumeName: string; repository: string; image?: HelperImageUse; signal?: AbortSignal }): Promise<string[]> {
-    const folder = this.repositoryFolder(p.repository);
-    const result = await this.runStreams(p.volumeName, listConfigsCommand(folder), {
+    checkRepository(p.repository);
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'listConfigs', params: { repository: p.repository } },
       image: p.image,
       signal: p.signal,
@@ -429,16 +385,10 @@ export class WorkspaceHelper {
     merged: boolean,
     timeoutMs?: number,
   ): Promise<Record<string, unknown> & { configuration: Record<string, unknown> }> {
-    const folder = this.repositoryFolder(p.repository);
+    checkRepository(p.repository);
+    checkConfigPath(p.configPath);
     const withFiles = p.override !== undefined || p.files !== undefined;
-    const args = readConfigurationArgs({
-      workspaceFolder: folder,
-      configPath: `${folder}/${checkConfigPath(p.configPath)}`,
-      idLabel: environmentIdLabel(p.environmentId),
-      merged,
-      overrideConfigPath: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined,
-    });
-    const result = await this.runStreams(p.volumeName, withFiles ? writeAndRunCommand({}, args) : ['devcontainer', ...args], {
+    const result = await this.runStreams(p.volumeName, {
       batch: {
         kind: 'readConfiguration',
         params: {
@@ -497,14 +447,11 @@ export class WorkspaceHelper {
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
-    const folder = this.repositoryFolder(p.repository);
-    const configFile = `${folder}/${checkConfigPath(p.configPath)}`;
+    checkRepository(p.repository);
+    checkConfigPath(p.configPath);
     this.deps.logger.info(`Building the environment image ${p.imageName} from ${p.configPath}.`);
-    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule.
-    const config = p.override !== undefined ? OVERRIDE_CONFIG_PATH : configFile;
-    const args = buildArgs({ workspaceFolder: folder, configPath: config, imageName: p.imageName });
-    const command = writeAndRunCommand({ repositoryConfig: configFile, config: p.override !== undefined ? OVERRIDE_CONFIG_PATH : undefined }, args);
-    return this.runDevcontainer('devcontainer build', p.volumeName, command, {
+    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (batchStepCommand).
+    return this.runDevcontainer('devcontainer build', p.volumeName, {
       batch: {
         kind: 'build',
         params: {
@@ -544,7 +491,7 @@ export class WorkspaceHelper {
       throw new Error(`Invalid compose files: ${p.files.join(', ')}`);
     }
     this.deps.logger.info(`Reading the Docker Compose configuration of ${p.repository} (${p.files.join(', ')}).`);
-    const result = await this.runStreams(p.volumeName, composeModelCommand(folder, p.files), {
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'composeModel', params: { repository: p.repository, files: [...p.files], project: p.project } },
       image: p.image,
       env: { COMPOSE_PROJECT_NAME: p.project },
@@ -572,7 +519,7 @@ export class WorkspaceHelper {
     signal?: AbortSignal;
   }): Promise<Map<string, string>> {
     this.deps.logger.info(`Computing the configuration hashes of the Docker Compose services of ${p.repository}.`);
-    const result = await this.runStreams(p.volumeName, composeHashCommand(COMPOSE_MODEL_PATH, p.project), {
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'composeHash', params: { repository: p.repository, model: p.model, project: p.project } },
       image: p.image,
       input: p.model,
@@ -606,7 +553,7 @@ export class WorkspaceHelper {
     }
     if (p.folders.length === 0) return;
     this.deps.logger.info(`Creating the folders ${p.folders.join(', ')} of ${p.repository} for the bind mounts of Docker Compose.`);
-    const result = await this.runStreams(p.volumeName, createFoldersCommand(folder, p.folders), {
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'createFolders', params: { repository: p.repository, folders: [...p.folders] } },
       image: p.image,
       signal: p.signal,
@@ -640,18 +587,12 @@ export class WorkspaceHelper {
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
-    const folder = this.repositoryFolder(p.repository);
-    const args = upArgs({
-      workspaceFolder: folder,
-      overrideConfigPath: OVERRIDE_CONFIG_PATH,
-      idLabel: environmentIdLabel(p.environmentId),
-      removeExistingContainer: p.removeExistingContainer,
-    });
+    checkRepository(p.repository);
     this.deps.logger.info(
       `Starting the container of ${p.repository}${p.removeExistingContainer ? ' (replacing the existing container)' : ''}.`,
     );
     try {
-      return await this.runDevcontainer('devcontainer up', p.volumeName, overrideCommand(args, p.files), {
+      return await this.runDevcontainer('devcontainer up', p.volumeName, {
         batch: {
           kind: 'up',
           params: {
@@ -700,15 +641,10 @@ export class WorkspaceHelper {
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<UpResult> {
-    const args = runUserCommandsArgs({
-      workspaceFolder: this.repositoryFolder(p.repository),
-      overrideConfigPath: OVERRIDE_CONFIG_PATH,
-      idLabel: environmentIdLabel(p.environmentId),
-      containerId: p.containerId,
-    });
+    checkRepository(p.repository);
     this.deps.logger.info(`Running the lifecycle commands of ${p.repository} in the container ${p.containerId.slice(0, 12)}.`);
     try {
-      const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, overrideCommand(args, p.files), {
+      const result = await this.runDevcontainer('devcontainer run-user-commands', p.volumeName, {
         batch: {
           kind: 'runUserCommands',
           params: {
@@ -763,10 +699,10 @@ export class WorkspaceHelper {
     onOutput?: (text: string) => void;
     signal?: AbortSignal;
   }): Promise<void> {
-    const { name } = checkRepository(p.repository);
+    checkRepository(p.repository);
     const output = p.onOutput ?? this.logOutput;
     this.deps.logger.info(`Writing the Git configuration of ${p.repository} into the volume ${p.volumeName}.`);
-    const result = await this.runStreams(p.volumeName, gitFilesCommand(name, p.identity, CONTAINER_CREDENTIAL_HELPER), {
+    const result = await this.runStreams(p.volumeName, {
       batch: { kind: 'gitFiles', params: { repository: p.repository, identity: { name: p.identity.name, email: p.identity.email } } },
       image: p.image,
       signal: p.signal,
@@ -794,7 +730,8 @@ export class WorkspaceHelper {
     image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<RunResult> {
-    return this.runStreams(p.volumeName, configOwnershipFixCommand(p.folder, p.uid, p.gid), {
+    checkNumericIds(p.uid, p.gid);
+    return this.runStreams(p.volumeName, {
       batch: { kind: 'ownershipFix', params: { folder: p.folder, uid: p.uid, gid: p.gid } },
       image: p.image,
       timeoutMs: p.timeoutMs,
@@ -846,8 +783,8 @@ export class WorkspaceHelper {
         serviceFolders = 'repository';
       }
     }
-    const command = repositoryOwnershipFixCommand(folder, p.uid, p.gid, serviceFolders);
-    return this.runStreams(p.volumeName, command, {
+    checkNumericIds(p.uid, p.gid);
+    return this.runStreams(p.volumeName, {
       batch: {
         kind: 'repositoryOwnershipFix',
         params: params(serviceFolders),
@@ -902,7 +839,6 @@ export class WorkspaceHelper {
   private async runDevcontainer(
     command: string,
     volumeName: string,
-    helperCommand: string[],
     options: {
       /** Plan step 6, PR C: the step of the batch helper (StreamOptions.batch); `secret` is added here. */
       batch: NonNullable<StreamOptions['batch']>;
@@ -921,7 +857,7 @@ export class WorkspaceHelper {
     const stderr = secret === undefined ? undefined : new RedactingStream(output, secret);
     let result: RunResult;
     try {
-      result = await this.runStreams(volumeName, helperCommand, {
+      result = await this.runStreams(volumeName, {
         // Plan step 6, PR C: `up` and run-user-commands take the token only to mask their output in the helper.
         batch: { ...options.batch, ...(secret !== undefined ? { secret } : {}) },
         input: options.input,
@@ -946,17 +882,17 @@ export class WorkspaceHelper {
     throw new DevcontainerCommandError(command, result.exitCode, result.stdout, result.stderr, parsed);
   }
 
-  private async runStreams(volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
+  private async runStreams(volumeName: string, options: StreamOptions): Promise<RunResult> {
     // Plan step 6, PR C: within an operation, only through the batch helper of the operation (never a `docker run` of its
     // own). Plan step 7 (user decision of 2026-10-01): the per-step `docker run` is removed; a volume step outside the
     // batch scope of an operation is an internal error (D1), and no container is started for it.
     const scope = currentBatchScope();
     if (scope === undefined) {
-      const message = `Internal error: the workspace helper step ${options.batch.kind} (${describeCommand(command)}) on the volume ${volumeName} ran outside the batch helper of an operation; it was not run.`;
+      const message = `Internal error: the workspace helper step ${options.batch.kind} on the volume ${volumeName} ran outside the batch helper of an operation; it was not run.`;
       this.deps.logger.error(message);
       throw new Error(message);
     }
-    return this.runInBatch(scope, volumeName, command, options);
+    return this.runInBatch(scope, volumeName, options);
   }
 
   /**
@@ -966,7 +902,7 @@ export class WorkspaceHelper {
    * checks as for `-e` (helperEnv) and go on the process of the step in the helper. The session opens with the pinned
    * helper image of the open (its ID) and the socket of the engine.
    */
-  private async runInBatch(scope: BatchScope, volumeName: string, command: readonly string[], options: StreamOptions): Promise<RunResult> {
+  private async runInBatch(scope: BatchScope, volumeName: string, options: StreamOptions): Promise<RunResult> {
     const batch = options.batch;
     const params: Record<string, unknown> = { ...batch.params };
     // The kinds with variables of the request; the Compose read steps set COMPOSE_PROJECT_NAME from their `project`.

@@ -22,7 +22,8 @@ const ALL: readonly HostCall[] = [
   ...['confirmUntrustedRepository', 'configurationChanged', 'configurationKindChanged', 'filesMissing', 'recreateContainer', 'message', 'confirmDelete', 'deleteAdditionalVolumes', 'deleteServiceData', 'unknown', 'Bad-Call'].map(
     (call) => `question ${call}` as const,
   ),
-  ...['windowStatuses', 'pendings', 'settings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
+  // Plan step 11I (PR D): `local settings` is removed (no flow sent it; the open carries its settings in its parameters).
+  ...['windowStatuses', 'pendings', 'processAlive', 'account', 'unknown'].map((call) => `local ${call}` as const),
   // Plan step 11E4c: `add` and `update` are removed (they stay allowed here, so their refusal is the handler's); `configuration` is new.
   ...['read', 'get', 'list', 'findForAccount', 'add', 'update', 'remove', 'forgetKeptVolumes', 'sessionFile', 'markBusy', 'clearBusy', 'recordGitSummary', 'configuration'].map((call) => `record ${call}` as const),
   'secret token',
@@ -53,7 +54,6 @@ function fakeHost(answers: Partial<Record<string, unknown>> = {}) {
     state: {
       windowStatuses: async () => (record('windowStatuses'), of('windowStatuses', [STATUS] as readonly WindowStatus[])),
       pendings: async () => (record('pendings'), of('pendings', [] as readonly { environmentId: string; windowId: string; createdAt: string }[])),
-      settings: async () => (record('settings'), of('settings', { stopAfterMinutes: 10 })),
       processAlive: async (pid) => (record('processAlive', pid), of('processAlive', true)),
       account: async (interactive) => (record('account', interactive), of('account', undefined as GitHubAccount | undefined)),
       // Plan step 11E4d.
@@ -155,7 +155,6 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
   it('reads the state of this computer and changes its records', async () => {
     const { worker, calls, requests } = wired({ get: ENVIRONMENT, list: [ENVIRONMENT], findForAccount: ENVIRONMENT, processAlive: false });
     expect(await worker.state.windowStatuses()).toEqual([STATUS]);
-    expect(await worker.state.settings()).toEqual({ stopAfterMinutes: 10 });
     expect(await worker.state.processAlive(42)).toBe(false);
     expect(await worker.records.get('e1')).toEqual(ENVIRONMENT);
     expect(await worker.records.list()).toEqual([ENVIRONMENT]);
@@ -163,8 +162,9 @@ describe('the requests of a flow in the worker (plan step 11B)', () => {
     await worker.records.remove('e1', { kept: ['v1'] });
     await worker.records.forgetKeptVolumes(['v1']);
     await worker.records.sessionFile('removePending', 'e1');
-    // Plan step 11E4c: changed expectation (before: also `record add` and `record update`, which are removed).
-    expect(requests.map((request) => request.kind)).toEqual(['local', 'local', 'local', 'record', 'record', 'record', 'record', 'record', 'record']);
+    // Plan step 11E4c: changed expectation (before: also `record add` and `record update`, which are removed). Plan step
+    // 11I (PR D): changed again, one `local` less (`local settings` is removed).
+    expect(requests.map((request) => request.kind)).toEqual(['local', 'local', 'record', 'record', 'record', 'record', 'record', 'record']);
     expect(calls.filter((call) => call.call === 'processAlive')).toEqual([{ call: 'processAlive', args: [42] }]);
     expect(calls.at(-1)).toEqual({ call: 'sessionFile', args: ['removePending', 'e1'] });
   });
@@ -287,7 +287,8 @@ describe('the handler of the requests on the side of the extension (plan step 11
     const { handler, calls } = wired();
     const controller = new AbortController();
     controller.abort();
-    await expect(handler('local', { call: 'settings', args: [] }, controller.signal)).rejects.toMatchObject({ code: 'cancelled' });
+    // Plan step 11I (PR D): `local windowStatuses` (before: `local settings`, which is removed).
+    await expect(handler('local', { call: 'windowStatuses', args: [] }, controller.signal)).rejects.toMatchObject({ code: 'cancelled' });
     expect(calls).toEqual([]);
   });
 

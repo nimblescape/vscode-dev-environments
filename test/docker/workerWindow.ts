@@ -17,7 +17,7 @@ import type { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { helperImageTag } from '../../src/core/helper/helperImage';
 import { monitorImageTag } from '../../src/core/helper/helperState';
-import { helperDockerSocket } from '../../src/core/helper/workspaceHelper';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { EnvironmentOperations, type EnvironmentOperationsDeps } from '../../src/core/pipeline/environmentOperations';
 import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 import { systemClock, type GitHubAuth } from '../../src/core/ports';
@@ -129,7 +129,6 @@ export function workerWindow(context: DockerTestContext, docker: BootstrapDocker
       ui,
       auth,
       credentials: { getForPull: async () => undefined },
-      settings: () => settings,
       windowId: owner.windowId,
       pid: owner.pid,
       clock: systemClock,

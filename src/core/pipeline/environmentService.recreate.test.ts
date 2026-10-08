@@ -13,7 +13,7 @@ import { Messages } from '../messages';
 import { CONTAINER_VERSION, LABEL_CONTAINER_VERSION, environmentImageName, resourceName } from '../names';
 import { abortError } from '../ports';
 import type { DevcontainerResult } from '../types';
-import { PipelineTexts, type RepositoryTarget } from './environmentService';
+import { PipelineTexts, type RepositoryTarget } from './operationBase';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH, isContainerFault } from './pipelineRules';
 

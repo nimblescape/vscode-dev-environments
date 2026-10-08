@@ -386,14 +386,6 @@ export function serviceFolderPaths(repoFolder: string, folders: readonly string[
 }
 
 /**
- * Review round 9 (D9-1): the `find -path` patterns of serviceFolderPaths: the characters that `-path` reads as a pattern
- * (`*`, `?`, `[`, `\\`) are escaped, so each pattern matches only its path.
- */
-export function servicePrunePatterns(repoFolder: string, folders: readonly string[] | undefined): string[] {
-  return serviceFolderPaths(repoFolder, folders).map(findPathPattern);
-}
-
-/**
  * Review round 11 (G3, G5): the paths of `groups` (in their order: the paths of the model and those that containers
  * mount first, then the recorded ones), as serviceFolderPaths filters them, at most MAX_SERVICE_FOLDERS. `overflow`: there
  * were more (or `overflow` was set before, since the paths beyond the bound are not recorded): the ownership fixes then
@@ -539,11 +531,19 @@ export function isNumericId(text: string): boolean {
 }
 
 /**
+ * Plan step 11I (PR D): throws for a user or group ID that is not a number (isNumericId), the check of the ownership
+ * fixes (also before WorkspaceHelper sends one of them to the batch helper).
+ */
+export function checkNumericIds(uid: string, gid: string): void {
+  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+}
+
+/**
  * Review round 15 (K3): the command of CONFIG_OWNERSHIP_FIX_SCRIPT for the folder `folder` and the numeric IDs `uid` and
  * `gid` (isNumericId; throws for anything else).
  */
 export function configOwnershipFixCommand(folder: string, uid: string, gid: string): string[] {
-  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+  checkNumericIds(uid, gid);
   return ['sh', '-c', CONFIG_OWNERSHIP_FIX_SCRIPT, 'sh', folder, uid, gid];
 }
 
@@ -592,7 +592,7 @@ export function parseGitSummaryOutput(stdout: string, recordedAt: string): GitSu
  * arguments as the script `ownershipFix` of the registry gets, servicePathArguments).
  */
 export function repositoryOwnershipFixCommand(repoFolder: string, uid: string, gid: string, serviceFolders?: ServiceFolders): string[] {
-  if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);
+  checkNumericIds(uid, gid);
   // Review round 3 of PR #114 (A3-M1): `serviceFolders` (also an empty list) is the mark of a resumed clone, whose containers
   // may run; only a new clone (none) keeps `-exec` in the branch without paths.
   const script = serviceFolders === undefined ? NUMERIC_OWNERSHIP_FIX_SCRIPT : RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT;

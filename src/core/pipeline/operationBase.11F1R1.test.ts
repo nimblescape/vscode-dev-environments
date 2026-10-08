@@ -7,12 +7,13 @@
 // known counts as running; processExists never counts an invalid PID as running, and counts a process of another user
 // (EPERM) as running.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OperationBase, processExists, type OperationBaseDeps } from './operationBase';
+import { OperationBase, processExists, type OperationBaseDeps, type OperationRecords } from './operationBase';
 
 class Probe extends OperationBase {
   constructor(deps: Partial<OperationBaseDeps> = {}) {
     const logger = { info: () => {}, warn: () => {}, error: () => {} };
-    super({ logger, clock: { now: () => 0 }, owner: { windowId: 'w', pid: 1 }, registry: {}, ...deps } as unknown as OperationBaseDeps, async () => {});
+    // Plan step 11I (PR D): the busy marks and the registry writes of the open come from the subclass (none used here).
+    super({ logger, clock: { now: () => 0 }, owner: { windowId: 'w', pid: 1 }, registry: {}, ...deps } as unknown as OperationBaseDeps, async () => {}, () => ({}) as OperationRecords);
   }
 
   run<T>(key: string, fn: () => Promise<T>): Promise<T> {

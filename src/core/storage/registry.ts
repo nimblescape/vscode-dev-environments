@@ -16,7 +16,6 @@ import type {
   BusyOperation,
   Environment,
   GitHubAccount,
-  GitSummary,
   KeptVolume,
   RefusedUpdate,
   RegistryFile,

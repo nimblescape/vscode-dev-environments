@@ -11,8 +11,6 @@ import {
   buildTreeModel,
   contextValue,
   environmentState,
-  findRowByEnvironmentId,
-  findRowByRepository,
   recentEnvironments,
   repositoriesForPicker,
   repositoryRows,
@@ -106,6 +104,17 @@ function runtime(entries: Record<string, EnvironmentRuntime>): Map<string, Envir
 
 function rows(groups: OwnerGroup[]): RepositoryRow[] {
   return repositoryRows(groups);
+}
+
+/** Plan step 11I (PR D): the row of an environment (moved here from treeModel.ts, where nothing else used it). */
+function findRowByEnvironmentId(groups: readonly OwnerGroup[], environmentId: string): RepositoryRow | undefined {
+  return repositoryRows(groups).find((entry) => entry.environment?.id === environmentId);
+}
+
+/** Plan step 11I (PR D): the row of a repository (`owner/name`, case-insensitive; moved here from treeModel.ts, as above). */
+function findRowByRepository(groups: readonly OwnerGroup[], repository: string): RepositoryRow | undefined {
+  const key = repository.toLowerCase();
+  return repositoryRows(groups).find((entry) => entry.repository.toLowerCase() === key);
 }
 
 function row(groups: OwnerGroup[], repository: string): RepositoryRow {
@@ -775,16 +784,8 @@ describe('buildTreeModel', () => {
     expect(rows(groups)).toHaveLength(1);
     expect(rows(groups)[0]).toMatchObject({ owner: 'broken', name: 'broken', id: 'repo:broken' });
   });
-
-  it('finds rows by environment ID and by repository', () => {
-    const groups = buildTreeModel(
-      input({ discovery: discovery([repo('acme/api'), repo('acme/web')]), environments: [environment('e1', 'acme/api')] }),
-    );
-    expect(findRowByEnvironmentId(groups, 'e1')?.repository).toBe('acme/api');
-    expect(findRowByEnvironmentId(groups, 'missing')).toBeUndefined();
-    expect(findRowByRepository(groups, 'ACME/WEB')?.repository).toBe('acme/web');
-    expect(findRowByRepository(groups, 'acme/none')).toBeUndefined();
-  });
+  // Plan step 11I (PR D): the test of findRowByEnvironmentId and findRowByRepository is removed with them (nothing of the
+  // extension used them; the tests here use their copies above).
 });
 
 describe('state texts and icons', () => {

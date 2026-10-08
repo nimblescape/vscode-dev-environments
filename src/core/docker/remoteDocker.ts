@@ -390,11 +390,6 @@ export async function listContextInfos(docker: RemoteDockerCli): Promise<Context
   return contexts;
 }
 
-/** The names of the Docker contexts (listContextInfos). */
-export async function listContexts(docker: RemoteDockerCli): Promise<string[]> {
-  return (await listContextInfos(docker)).map((context) => context.name);
-}
-
 /**
  * The endpoint of the context `name` (`docker context inspect <name> --format '{{json .}}'`); undefined when it cannot
  * be read.

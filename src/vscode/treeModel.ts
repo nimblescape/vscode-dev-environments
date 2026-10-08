@@ -596,17 +596,6 @@ export function repositoryRows(groups: readonly OwnerGroup[]): RepositoryRow[] {
   return rows;
 }
 
-/** The row of an environment. */
-export function findRowByEnvironmentId(groups: readonly OwnerGroup[], environmentId: string): RepositoryRow | undefined {
-  return repositoryRows(groups).find((row) => row.environment?.id === environmentId);
-}
-
-/** The row of a repository (`owner/name`, case-insensitive). */
-export function findRowByRepository(groups: readonly OwnerGroup[], repository: string): RepositoryRow | undefined {
-  const key = repository.toLowerCase();
-  return repositoryRows(groups).find((row) => row.repository.toLowerCase() === key);
-}
-
 /** One environment in the switcher (concept 6.4). */
 export interface RecentEnvironment {
   environmentId: string;
