@@ -12,22 +12,22 @@ import { readBranch } from '../pipeline/refreshStates';
 import type { EngineDocker } from './engineDocker';
 
 export interface WindowStateFlowDeps extends WindowStateParams {
-  docker: Pick<EngineDocker, 'findContainer' | 'exec'>;
+  docker: Pick<EngineDocker, 'environmentContainers' | 'exec'>;
   signal?: AbortSignal;
 }
 
 /**
  * The WindowStateValue of the dev container of `environmentId` that the window is attached to (`containerName`, the name
- * that it sends; see the module comment). Plan step 11I (U4, decision of 2026-10-08): one findContainer, the rule of the
- * dev container by which the open connects (devContainerOf), for all three reads: its state, whether it is current, and
- * the branch, read from it by its ID when it runs. A window reads only the container that it is attached to: when the
- * rule gives another one (the window's container is gone), the state is 'missing' as before, so that the window
- * reconnects through the open, which connects to the container of the rule. The state of the list maps the engine state
- * as containerState did (both mapContainerState of the inspect).
+ * that it sends; see the module comment). Plan step 11I (U4, decision of 2026-10-08): one read of the containers of the
+ * environment for all three reads: the state of the container with that name (the first choice of the rule of the dev
+ * container, devContainerOf), whether it is current, and the branch, read from it by its ID when it runs. A window reads
+ * only the container that it is attached to: when that one is gone, the state is 'missing' as before, so that the window
+ * reconnects through the open, which connects to the container of the rule. PR #127 review round 1 (A, L1): without the
+ * rule's line about another container (findContainer), which the window does not read, at each of its reads. The state of
+ * the list maps the engine state as containerState did (both mapContainerState of the inspect).
  */
 export async function windowStateFlow(deps: WindowStateFlowDeps): Promise<WindowStateValue> {
-  const found = await deps.docker.findContainer(deps.environmentId, deps.containerName);
-  const container = found?.name === deps.containerName ? found : undefined;
+  const container = (await deps.docker.environmentContainers(deps.environmentId)).find((each) => each.name === deps.containerName);
   if (container === undefined) return { state: 'missing' };
   const value: WindowStateValue = { state: container.state };
   if (!containerIsCurrent(container.labels, true, deps.checks)) {

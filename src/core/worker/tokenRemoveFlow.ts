@@ -38,6 +38,9 @@ export interface TokenRemoveFlow {
   signal?: AbortSignal;
 }
 
+/** The exit code of TOKEN_REMOVE_SCRIPT where the folder is not the tmpfs of the extension (the scripts never wrote there). */
+const TOKEN_REMOVE_NO_TMPFS_EXIT = 3;
+
 /** The most text of a failed try that goes into the message of the flow. */
 const MAX_REASON_CHARACTERS = 1000;
 
@@ -63,9 +66,16 @@ export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveRe
     ));
   let emptied: EngineContainer | undefined;
   const kept: string[] = [];
+  // PR #127 review round 1 (A, L3): the time limit of the extension (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts)
+  // covers the two tries of one container; the container of the request comes first (runningDevContainers: the named one
+  // first), so a later one may not be tried before that limit ends the operation.
   for (const container of running) {
-    const outcome = await emptyTokenFolder(p, container, userOfRecord);
+    const outcome = await emptyTokenFolder(p, container, container.name === p.containerName, userOfRecord);
     if (outcome === 'notRunning') continue;
+    if (outcome === 'noTokenFolder') {
+      p.log?.(`The container ${container.name} has no token folder of the extension; nothing to remove there.`);
+      continue;
+    }
     if (outcome === 'removed') {
       emptied ??= container;
       // Plan step 11I (U4): with more than one running dev container, the log names each one that was emptied.
@@ -81,15 +91,21 @@ export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveRe
 /**
  * Plan step 11I (U4): the two tries of plan step 11B1 in one running dev container: `removed` when its token folder is
  * empty now, `notRunning` when it stopped or was removed since the list, else why the token could still be there.
+ * PR #127 review round 1 (A, L2): for a container other than the one of the request (`requested`), the exit code 3 of the
+ * try as root (TOKEN_REMOVE_SCRIPT: the folder is not the tmpfs of the extension, so the scripts never wrote there) is
+ * `noTokenFolder`, nothing to remove (for example a container that the user started from the environment image); for the
+ * container of the request it stays a failure, as before.
  */
 async function emptyTokenFolder(
   p: TokenRemoveFlow,
   container: EngineContainer,
+  requested: boolean,
   userOfRecord: () => Promise<string | undefined>,
-): Promise<'removed' | 'notRunning' | { reason: string }> {
+): Promise<'removed' | 'notRunning' | 'noTokenFolder' | { reason: string }> {
   const asRoot = await tryRemoval(p, container.id, 'root');
   if (asRoot === 'notRunning') return 'notRunning';
   if (asRoot.exitCode === 0) return 'removed';
+  if (!requested && asRoot.exitCode === TOKEN_REMOVE_NO_TMPFS_EXIT) return 'noTokenFolder';
   p.log?.(`The removal as root failed in the container ${container.name}: ${reason(asRoot)}`);
   const user = await userOfRecord();
   if (user === undefined || user === '' || user === 'root' || user === '0') return { reason: reason(asRoot) };

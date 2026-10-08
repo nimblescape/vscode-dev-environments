@@ -172,3 +172,16 @@ describe('the reads of an attached window by the rule of the dev container (plan
     expect(execs).toEqual([]);
   });
 });
+
+// PR #127 review round 1 (A, L1): the window state reads the container of its name from the list of the environment; it
+// never logs the line of the rule about another container (which it does not read), at each of its reads.
+describe('the window state and the log of the rule (PR #127 review round 1, A L1)', () => {
+  it('logs nothing when the container of the window is gone and another dev container runs', async () => {
+    const other: EngineContainer = { ...container(CURRENT), id: 'c'.repeat(64), name: 'devenv-acme-api-other' };
+    const lines: string[] = [];
+    const logger = { ...silentLogger, info: (line: string) => lines.push(line), warn: (line: string) => lines.push(line) };
+    const port: DockerEngine = { ...unusedEngine(), containers: async () => [other], exec: async () => ({ exitCode: 0, stdout: 'main\n', stderr: '', timedOut: false }) };
+    expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker: new EngineDocker(port, logger) })).toEqual({ state: 'missing' });
+    expect(lines).toEqual([]);
+  });
+});

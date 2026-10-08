@@ -212,7 +212,8 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     await expect(flow(engine)).rejects.toThrow(/^said on stdout$/);
     const exact = fakeEngine([container()], () => ok(1, 'y'.repeat(1000)));
     expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
-    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts).
+    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts). PR #127
+    // review round 1 (A, L3): for the container of the request, which the flow tries first (plan step 11I, U4).
     expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(60_000);
   });
 
@@ -330,5 +331,36 @@ describe('the token removal in every running dev container (plan step 11I, U4, d
     expect(await flow(engine, { records: counted })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
     expect(execs.map((exec) => `${exec.container.slice(0, 2)} ${exec.options.user}`)).toEqual(['c0 root', 'c0 vscode', 'bb root', 'bb vscode']);
     expect(reads).toBe(1);
+  });
+});
+
+// PR #127 review round 1 (A, L2): a running dev container other than the one of the request whose folder is not the tmpfs
+// of the extension (for example one that the user started from the environment image) holds no token of the scripts:
+// nothing to remove there, no failure; for the container of the request the exit code 3 stays a failure, as before.
+describe('the token removal and a dev container without the tmpfs of the extension (PR #127 review round 1, A L2)', () => {
+  const other = container({ id: 'b'.repeat(64), name: 'other', created: '2026-10-08T09:00:00Z' });
+  const notOurs = ok(3, 'is not the tmpfs of the container');
+
+  it('another container whose folder is not the tmpfs of the extension: nothing to remove there, logged, no second try', async () => {
+    const lines: string[] = [];
+    const { engine, execs } = fakeEngine([other, container()], () => ok());
+    engine.exec = async (name, command, options = {}) => (execs.push({ container: name, command, options }), name === other.id ? notOurs : ok());
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }), log: (line) => lines.push(line) })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
+    expect(execs.map((exec) => `${exec.container.slice(0, 2)} ${exec.options.user}`)).toEqual(['c0 root', 'bb root']);
+    expect(lines).toContain('The container other has no token folder of the extension; nothing to remove there.');
+    // Only that one: notRunning, as no container could hold a token of the scripts.
+    const alone = fakeEngine([other], () => notOurs);
+    expect(await flow(alone.engine, { records: records({ remoteUser: 'vscode' }) })).toEqual({ outcome: 'notRunning' });
+  });
+
+  it('the container of the request whose folder is not the tmpfs of the extension still fails, with its reason', async () => {
+    const { engine } = fakeEngine([container()], () => notOurs);
+    await expect(flow(engine)).rejects.toThrow(/^is not the tmpfs of the container$/);
+  });
+
+  it('another exit code of another container stays a failure that names it', async () => {
+    const { engine } = fakeEngine([other, container()]);
+    engine.exec = async (name) => (name === other.id ? ok(1, 'cannot be read') : ok());
+    expect(((await flow(engine).catch((e: unknown) => e)) as Error).message).toBe('In the container other: cannot be read');
   });
 });

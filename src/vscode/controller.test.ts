@@ -193,6 +193,9 @@ interface Harness {
     windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; signal?: AbortSignal }) => Promise<WindowStateValue | undefined>>>;
     // Plan step 11C3: changed, the restore runs in the worker (reconcileInWorker).
     reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean }) => Promise<number>>>;
+    // Plan step 11I (D3; PR #127 review round 1, A L6): the three reads of this fake service are its own fixtures (the
+    // tests of the dialogs of Delete give each list), which its deleteCheckInWorker joins into the one read of the
+    // removable volumes (removableVolumes); EnvironmentService has only removableVolumesOf.
     removableAdditionalVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     removableServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
     possibleServiceDataVolumes: ReturnType<typeof vi.fn<(id: string) => Promise<string[]>>>;
