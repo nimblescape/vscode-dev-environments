@@ -3,8 +3,63 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Git state of a repository folder (implementation notes 10). The scripts run with `sh -c <script> sh <args…>` and
-// `docker exec` in a running dev container. Values arrive as positional parameters.
+// `docker exec` in a running dev container. Values arrive as positional parameters. Plan step 11I (PR B): the scripts of
+// the dev container are entries of the script registry (src/core/worker/containerScripts.ts), which builds their
+// commands; this module only writes them.
 import type { GitSummary } from '../types';
+
+/**
+ * Plan step 11I (PR B): the start of the Git scripts of the dev container (GIT_SUMMARY_SCRIPT, GIT_BRANCH_SCRIPT), once
+ * for both. `$1` is the repository folder; without Git, exit code 127. The function `g` runs Git for the repository of
+ * any owner (`safe.directory`), without hooks, without an fsmonitor, and without optional locks, so that it runs no hook
+ * and never writes to `.git` as another user. It still runs other programs that the repository configuration names (for
+ * example the clean filter of a filter driver in `git status`): it is no trust boundary against the repository. Review
+ * round 5 of PR #84: with `log.showSignature=false` too (with it set in the repository configuration, `git stash list`
+ * ran the program of `gpg.program`). Review round 2 of PR #84: in the C locale (`LC_ALL=C`, `LANG=C`, set in the script
+ * itself), so that Git's messages are never translated; the counts are line counts, and paths pass through as bytes.
+ */
+export const GIT_SCRIPT_PRELUDE = `set -eu
+export LC_ALL=C LANG=C
+cd "$1"
+if ! command -v git >/dev/null 2>&1; then
+  echo 'Git is not installed.' >&2
+  exit 127
+fi
+GIT_OPTIONAL_LOCKS=0
+export GIT_OPTIONAL_LOCKS
+g() {
+  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false "$@"
+}
+`;
+
+/**
+ * Plan step 11I (PR B; section 0 of the plan, one function per fact): the one read of the branch, the shell function
+ * `git_branch` of GIT_SUMMARY_SCRIPT and GIT_BRANCH_SCRIPT (after GIT_SCRIPT_PRELUDE, whose `g` it uses). It sets
+ * `branch` to the branch that HEAD names (also one without commits yet), or to '' for a detached HEAD, and ends with 0;
+ * when Git fails (no repository, a HEAD that cannot be read), `branch` is '' and it ends with the exit code of Git.
+ * `git branch --show-current` needs Git 2.22; an older Git reads `git symbolic-ref --short -q HEAD`, whose exit code 1
+ * (without a message) is a detached HEAD.
+ */
+export const GIT_BRANCH_FUNCTION = `git_branch() {
+  if branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short -q HEAD); then
+    return 0
+  else
+    git_status=$?
+  fi
+  branch=''
+  [ "$git_status" -eq 1 ] || return "$git_status"
+}
+`;
+
+/**
+ * Plan step 11I (PR B): the branch of the repository folder `$1` (GIT_BRANCH_FUNCTION) as one line, empty for a detached
+ * HEAD; exit code 127 without Git, and that of Git when it fails. The script `branch` of the registry, which readBranch
+ * runs (refreshStates.ts: the sidebar, an attached window, the branch after an open) in the running dev container as its
+ * user, with the hardening of GIT_SUMMARY_SCRIPT (GIT_SCRIPT_PRELUDE).
+ */
+export const GIT_BRANCH_SCRIPT = `${GIT_SCRIPT_PRELUDE}${GIT_BRANCH_FUNCTION}git_branch
+printf '%s\\n' "$branch"
+`;
 
 /**
  * Prints 4 lines: the branch (empty for a detached HEAD), the number of `git status --porcelain` lines, the number of
@@ -17,37 +72,22 @@ import type { GitSummary } from '../types';
  * switch (plan step 8, PR C; before, the polls of the local Session Monitor), and after an open or a stop (and, user decision 2026-10-02, before Delete's confirmation when the container runs). Delete runs no
  * Git anywhere else (user decision 2026-10-02: "No git needs delete."): no workspace helper runs this script.
  *
- * Git runs without hooks, without an fsmonitor, and without optional locks, so that it runs no hook and never writes to
- * `.git` as another user. It still runs other programs that the repository configuration names (for example the clean
- * filter of a filter driver in `git status`): it is no trust boundary against the repository. Review round 5 of PR #84:
- * with `log.showSignature=false` too (with it set in the repository configuration, `git stash list` ran the program of
- * `gpg.program`). Review round 2 of PR #84: in the C locale (`LC_ALL=C`, `LANG=C`, set in the script itself), so that
- * Git's messages are never translated; the counts are line counts, and paths pass through as bytes.
+ * Git runs as GIT_SCRIPT_PRELUDE sets it up (no hooks, no fsmonitor, no optional locks, no program for signatures, the C
+ * locale). Plan step 11I (PR B): the branch is read by GIT_BRANCH_FUNCTION, the same function as GIT_BRANCH_SCRIPT; a
+ * failed read of it is an empty branch here, as before, and the counts after it still decide whether the script fails.
  *
  * Review round 4 of PR #84, A-R4-2: a stash that `refs/stash` still names while its reflog is empty (`git reflog expire
  * --expire=now --all`, a packed `refs/stash` without a reflog, or a reftable repository) is listed by no `git stash
  * list`; it counts as 1 stash then.
  */
-export const GIT_SUMMARY_SCRIPT = `set -eu
-export LC_ALL=C LANG=C
-cd "$1"
-if ! command -v git >/dev/null 2>&1; then
-  echo 'Git is not installed.' >&2
-  exit 127
-fi
-GIT_OPTIONAL_LOCKS=0
-export GIT_OPTIONAL_LOCKS
-g() {
-  git -c safe.directory='*' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false "$@"
-}
-count_lines() {
+export const GIT_SUMMARY_SCRIPT = `${GIT_SCRIPT_PRELUDE}count_lines() {
   if [ -z "$1" ]; then
     echo 0
   else
     printf '%s\\n' "$1" | wc -l | tr -d ' '
   fi
 }
-branch=$(g branch --show-current 2>/dev/null) || branch=$(g symbolic-ref --short -q HEAD) || branch=''
+${GIT_BRANCH_FUNCTION}git_branch || branch=''
 status=$(g status --porcelain --untracked-files=normal)
 if g rev-parse -q --verify HEAD >/dev/null 2>&1; then
   unpushed=$(g rev-list --count HEAD --branches --not --remotes 2>/dev/null) || unpushed=0
@@ -404,17 +444,13 @@ export function servicePathArguments(repoFolder: string, folders: ServiceFolders
 
 /**
  * Review round 11 (G3): prints each of the paths `$1`… that exists (also a link that leads nowhere), each followed by a
- * NUL character. Runs as root, so that a folder of a service that others may not read does not hide a path.
+ * NUL character. Runs as root, so that a folder of a service that others may not read does not hide a path. Plan step
+ * 11I (PR B): the script `existingPaths` of the registry (its command is no longer built here).
  */
 export const EXISTING_PATHS_SCRIPT = `for p do
   if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\\0' "$p"; fi
 done
 `;
-
-/** Review round 11 (G3): the command of EXISTING_PATHS_SCRIPT for `docker exec -u root`. */
-export function existingPathsCommand(paths: readonly string[]): string[] {
-  return ['sh', '-c', EXISTING_PATHS_SCRIPT, 'sh', ...paths];
-}
 
 /** Review round 11 (G3): the paths of the output of EXISTING_PATHS_SCRIPT. */
 export function parseExistingPaths(stdout: string): string[] {
@@ -429,7 +465,9 @@ export function parseExistingPaths(stdout: string): string[] {
  * the test (EnvironmentService.withDevMountFolders, devMountFolders). Review round 9 (D9-1): the paths of the test
  * `$3`… (servicePathArguments) and their content are left out; review round 10 (D10-3): except their files and folders
  * of root (SERVICE_OWNER_FIX); review round 12 (P12-2): also their real paths behind links. Works with GNU and BusyBox
- * tools.
+ * tools. Plan step 11I (PR B): the script `ownershipFix` of the registry, run with `docker exec -u root` in the dev
+ * container after its first creation (implementation notes 7 "Ownership": the helper clones as root), with the arguments
+ * `<repository folder> <remote user> <servicePathArguments…>`.
  */
 export const OWNERSHIP_FIX_SCRIPT = `set -eu
 dir="$1"
@@ -542,25 +580,10 @@ export function parseGitSummaryOutput(stdout: string, recordedAt: string): GitSu
   };
 }
 
-/** Command for `docker exec` in a running dev container: `['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', folder]`. */
-export function gitSummaryCommand(repoFolder: string): string[] {
-  return ['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', repoFolder];
-}
-
-/**
- * Command for `docker exec -u root` in the dev container after its first creation (implementation notes 7 "Ownership"):
- * the helper clones as root, so the files get the user and the primary group of `remoteUser`. `gitPaths`: as in
- * serviceFolderPaths (review round 15, K4), for a list that holds the targets of the mounts of the dev container; review
- * round 16 (L2): the set of those targets, when the list holds the paths of the services too.
- */
-export function ownershipFixCommand(repoFolder: string, user: string, serviceFolders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
-  return ['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repoFolder, user, ...servicePathArguments(repoFolder, serviceFolders, gitPaths)];
-}
-
 /**
  * Plan step 11G1: the command of NUMERIC_OWNERSHIP_FIX_SCRIPT for the repository folder `repoFolder`, the numeric IDs
  * `uid` and `gid` (isNumericId; throws for anything else), and the paths of the services `serviceFolders` (the same
- * arguments as ownershipFixCommand, servicePathArguments).
+ * arguments as the script `ownershipFix` of the registry gets, servicePathArguments).
  */
 export function repositoryOwnershipFixCommand(repoFolder: string, uid: string, gid: string, serviceFolders?: ServiceFolders): string[] {
   if (!isNumericId(uid) || !isNumericId(gid)) throw new Error(`Invalid user or group ID: ${JSON.stringify(uid)}:${JSON.stringify(gid)}`);

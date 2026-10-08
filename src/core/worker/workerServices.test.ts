@@ -337,11 +337,13 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     expect(await all.ui.confirmUntrustedRepository('acme/api')).toBe(false);
     expect(await all.ui.recreateContainer('acme/api', { message: 'm', detail: 'd' })).toBe(true);
     expect(calls).toEqual(['windowStatuses', 'confirmUntrustedRepository "acme/api"', 'recreateContainer "acme/api" {"message":"m","detail":"d"}']);
-    // The secret input of an exec must be the token of the operation (EngineDocker over secretOf).
-    await expect(all.docker.exec('c', ['cat'], { secretInput: 'other' })).rejects.toThrow('token secret of the operation');
+    // The secret input of an exec must be the token of the operation (EngineDocker over secretOf). Plan step 11I (PR B):
+    // changed expectation, by its name (before: the value, `secretInput: 'other'` refused and `'ghp_x'` taken): another
+    // secret than the token is refused, the token of the operation is taken.
+    await expect(all.docker.exec('c', ['cat'], { secretInputName: 'registry' as typeof SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
     const execs: unknown[] = [];
     const withExec = deps({ engine: { ...unusedEngine(), exec: async (_c, _command, options) => (execs.push(options), { exitCode: 0, stdout: '', stderr: '', timedOut: false }) } }).all;
-    await withExec.docker.exec('c', ['cat'], { secretInput: 'ghp_x' });
+    await withExec.docker.exec('c', ['cat'], { secretInputName: SECRET_TOKEN });
     expect(execs).toEqual([{ secretInputName: SECRET_TOKEN }]);
     await expect(all.helper.ensureImage()).resolves.toBe('devenv-helper:abc');
   });

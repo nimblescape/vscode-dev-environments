@@ -19,8 +19,9 @@ import {
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
-import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
+import { HOME_GIT_CONFIG_SCRIPT } from '../helper/containerGit';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
+import { scriptCommand } from '../worker/containerScripts';
 import { ANALYSIS_FAILED_ITEM, dockerCheckItem } from '../helper/configurationAnalysis';
 import { Messages } from '../messages';
 import { abortError } from '../ports';
@@ -4517,7 +4518,9 @@ describe('lifecycle token (user decision 2026-09-27): Docker Compose', () => {
     const [run] = h.helper.userCommandContext;
     expect(h.helper.calls.indexOf('prepareGit')).toBeLessThan(h.helper.calls.findIndex((call) => call.startsWith('up')));
     expect(home).toHaveLength(1);
-    expect(h.docker.execs[home[0]]).toMatchObject({ container: dev?.id, user: 'root', command: homeGitConfigCommand('vscode') });
+    // Plan step 11I (PR B): changed expectation, the command of the script `homeGitConfig` of the registry (the builder
+    // homeGitConfigCommand, which built the same command, is removed).
+    expect(h.docker.execs[home[0]]).toMatchObject({ container: dev?.id, user: 'root', command: scriptCommand('homeGitConfig', ['vscode']) });
     expect(token[0]).toBeLessThan(home[0]);
     expect(home[0]).toBeLessThan(run.execsBefore);
     expect(run.token).toBe(TOKEN);

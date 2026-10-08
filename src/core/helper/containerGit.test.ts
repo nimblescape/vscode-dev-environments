@@ -16,12 +16,12 @@ import {
   containerEnvironment,
   containerGitSupport,
   gitIdentity,
-  homeGitConfigCommand,
   isGitHubLogin,
   parseGitVersion,
   remoteEnvironment,
 } from './containerGit';
 import { GITHUB_CLI_ACCOUNT_VARIABLES, hostAccessProblems, isContainerGitVariable, isGitHubCliAccountVariable } from '../policy';
+import { scriptCommand } from '../worker/containerScripts';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';
@@ -398,7 +398,9 @@ describe('HOME_GIT_CONFIG_SCRIPT', () => {
     const log = path.join(dir, 'log');
     fs.writeFileSync(path.join(bin, 'id'), `#!/bin/sh\n[ "$2" = node ] || exit 1\ncase "$1" in -u) echo 1000 ;; -g) echo 1001 ;; esac\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'chown'), `#!/bin/sh\necho "chown $*" >> '${log}'\n`, { mode: 0o755 });
-    const [shell, flag, script, ...args] = homeGitConfigCommand(user);
+    // Plan step 11I (PR B): the command of the script `homeGitConfig` of the registry (the builder homeGitConfigCommand,
+    // which built the same command, is removed).
+    const [shell, flag, script, ...args] = scriptCommand('homeGitConfig', [user]);
     const result = spawnSync(shell, [flag, script.split('/etc/passwd').join(passwd), ...args], {
       encoding: 'utf8',
       env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` },

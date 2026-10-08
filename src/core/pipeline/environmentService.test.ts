@@ -10,9 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
 import { CommandError, UserFacingError } from '../errors';
-import { OWNERSHIP_FIX_SCRIPT, gitSummaryCommand } from '../git/gitSummary';
-import { HOME_GIT_CONFIG_SCRIPT, homeGitConfigCommand } from '../helper/containerGit';
-import { TOKEN_WRITE_SCRIPT, tokenWriteCommand } from '../helper/containerToken';
+import { GIT_BRANCH_SCRIPT, OWNERSHIP_FIX_SCRIPT } from '../git/gitSummary';
+import { HOME_GIT_CONFIG_SCRIPT } from '../helper/containerGit';
+import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
+import { SECRET_TOKEN } from '../helperChannel/protocol';
+import { scriptCommand } from '../worker/containerScripts';
 import { MAX_CONFIG_TEXT_LENGTH } from '../helper/analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import {
@@ -234,8 +236,9 @@ describe('open: first open', () => {
     expect(h.docker.execs.filter((e) => e.command[2] === OWNERSHIP_FIX_SCRIPT).map((e) => e.command[4])).toEqual(['/workspaces/api']);
     expect(h.helper.configOwnershipFixes).toEqual([{ volumeName: env!.volumeName, folder: '/workspaces/.devenv+', uid: '1000', gid: '1000' }]);
     // Before the first attach: the ~/.gitconfig of the remote user, which keeps the Dev Containers extension from copying
-    // the Git configuration of the computer.
-    expect(h.docker.execs.find((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toMatchObject({ user: 'root', command: homeGitConfigCommand('vscode') });
+    // the Git configuration of the computer. Plan step 11I (PR B): changed expectation, the command of the script
+    // `homeGitConfig` of the registry (the builder homeGitConfigCommand, which built the same command, is removed).
+    expect(h.docker.execs.find((e) => e.command[2] === HOME_GIT_CONFIG_SCRIPT)).toMatchObject({ user: 'root', command: scriptCommand('homeGitConfig', ['vscode']) });
     expect(await pendingIds()).toEqual([id]);
     expect(h.progress.steps).toEqual(['downloadingRepository', 'checkingImage', 'downloadingImage', 'preparing', 'starting']);
     expect(h.progress.details).toEqual([]);
@@ -739,7 +742,9 @@ describe('open: first open', () => {
 describe('open: existing environment', () => {
   it('starts a stopped, up-to-date environment with up only', async () => {
     await seedEnvironment(h);
-    h.docker.execHandler = (_c, command) => (command[0] === 'git' ? { stdout: 'feature-y\n' } : {});
+    // Plan step 11I (PR B): changed expectation, the branch is read by the script `branch` of the registry (before: `git
+    // … branch --show-current`, an exec whose program was `git`).
+    h.docker.execHandler = (_c, command) => (command[2] === GIT_BRANCH_SCRIPT ? { stdout: 'feature-y\n' } : {});
     const result = await h.service.open(TARGET, options());
 
     expect(h.checker.calls).toHaveLength(1);
@@ -1417,7 +1422,9 @@ describe('open: existing environment', () => {
     const mark = { operation: 'rebuild' as const, since: new Date(T0).toISOString(), pid: 999, windowId: 'window-2' };
     const exec = h.docker.exec.bind(h.docker);
     h.docker.exec = async (container, command, execOptions) => {
-      if (command.includes('--show-current')) {
+      // Plan step 11I (PR B): changed expectation, the read of the branch is the script `branch` of the registry (before:
+      // `git … branch --show-current`).
+      if (command[2] === GIT_BRANCH_SCRIPT) {
         await h.registry.updateEnvironment(ENV_ID, (e) => {
           e.busy = mark;
         });
@@ -1431,13 +1438,15 @@ describe('open: existing environment', () => {
   it('ends as cancelled when Cancel is pressed during the Git read after the start; the read gets the signal', async () => {
     await seedEnvironment(h);
     const controller = new AbortController();
+    // Plan step 11I (PR B): changed expectation, the read of the branch is the script `branch` of the registry (before:
+    // `git … branch --show-current`).
     h.docker.execHandler = (_container, command) => {
-      if (command.includes('--show-current')) controller.abort();
+      if (command[2] === GIT_BRANCH_SCRIPT) controller.abort();
       return { stdout: 'main\n' };
     };
     const error = await rejection(h.service.open(TARGET, options({ signal: controller.signal })));
     expect(error.code).toBe('cancelled');
-    const read = h.docker.execs.find((call) => call.command.includes('--show-current'));
+    const read = h.docker.execs.find((call) => call.command[2] === GIT_BRANCH_SCRIPT);
     expect(read?.signal).toBe(controller.signal);
     expect(await pendingIds()).toEqual([]);
     expect((await entry())?.lastUsedAt).toBe('2026-09-20T10:00:00.000Z');
@@ -4098,7 +4107,9 @@ describe('safetyCheck', () => {
     const container = h.docker.containersOf(ENV_ID)[0];
     expect(h.docker.execs).toHaveLength(1);
     expect(h.docker.execs[0]).toMatchObject({ container: container.id, user: 'vscode' });
-    expect(h.docker.execs[0].command).toEqual(gitSummaryCommand('/workspaces/api'));
+    // Plan step 11I (PR B): changed expectation, the command of the script `gitSummary` of the registry (the builder
+    // gitSummaryCommand, which built the same command, is removed).
+    expect(h.docker.execs[0].command).toEqual(scriptCommand('gitSummary', ['/workspaces/api']));
     expect((await entry())?.gitSummary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
     // No helper step, and the container keeps running.
     expect(h.helper.calls).toEqual([]);
@@ -4233,7 +4244,9 @@ describe('recordGitState (plan step 8, PR C, Q2)', () => {
     expect(findContainer).toHaveBeenCalledWith(ENV_ID, expect.any(String));
     expect(exec).toHaveBeenCalledTimes(1);
     expect(exec.mock.calls[0][0]).toBe(container.id);
-    expect(exec.mock.calls[0][1]).toEqual(gitSummaryCommand('/workspaces/api'));
+    // Plan step 11I (PR B): changed expectation, the command of the script `gitSummary` of the registry (the builder
+    // gitSummaryCommand, which built the same command, is removed).
+    expect(exec.mock.calls[0][1]).toEqual(scriptCommand('gitSummary', ['/workspaces/api']));
     expect(exec.mock.calls[0][2]).toMatchObject({ user: 'vscode', timeoutMs: 30_000 });
     expect(exec.mock.calls[0][2]?.signal).toBe(controller.signal);
     expect((await entry())?.gitSummary).toMatchObject({ branch: 'feature-z', uncommittedFiles: 5, unpushedCommits: 6, stashes: 2 });
@@ -4659,7 +4672,9 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     const [write] = h.docker.tokenWrites();
     expect(write).toEqual({ container: h.docker.containersOf(ENV_ID)[0].id, user: 'root', remoteUser: 'vscode', login: 'octo', token: TOKEN });
     const exec = h.docker.execs.find((e) => e.command[2] === TOKEN_WRITE_SCRIPT)!;
-    expect(exec.command).toEqual(tokenWriteCommand('vscode', 'octo'));
+    // Plan step 11I (PR B): changed expectation, the command of the script `tokenWrite` of the registry (the builder
+    // tokenWriteCommand, which built the same command, is removed).
+    expect(exec.command).toEqual(scriptCommand('tokenWrite', ['vscode', 'octo']));
     expect(exec.command.some((arg) => arg.includes(TOKEN))).toBe(false);
     // Never in the override configuration, the helper runs, or the log.
     expect(JSON.stringify(h.helper.ups)).not.toContain(TOKEN);
@@ -4685,6 +4700,39 @@ describe('container-only Git (concept section 9 "Git inside the container")', ()
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ login: '', token: TOKEN })]);
     expect(h.logger.warnings.some((line) => line.includes('is no valid GitHub login'))).toBe(true);
+  });
+
+  // Plan step 11I (PR B): the write of the token is the script `tokenWrite` of the registry, run by the pipeline itself
+  // (the tests of the removed writeContainerToken, containerToken.test.ts, moved here).
+  it('plan step 11I (PR B): the exec names the token as the secret of the operation, never its value, and the output is logged without it', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const writes: Array<{ command: readonly string[]; options: unknown }> = [];
+    const exec = h.docker.exec.bind(h.docker);
+    h.docker.exec = async (container, command, execOptions) => {
+      if (command[2] === TOKEN_WRITE_SCRIPT) writes.push({ command, options: execOptions });
+      return exec(container, command, execOptions);
+    };
+    h.docker.execHandler = (_container, command) => (command[2] === TOKEN_WRITE_SCRIPT ? { stdout: `The GitHub token of the environment is in /run/devenv. ${TOKEN}\n` } : {});
+    await h.service.openEnvironment(ENV_ID, options());
+    expect(writes).toHaveLength(1);
+    expect(writes[0].command).toEqual(scriptCommand('tokenWrite', ['vscode', 'octo']));
+    expect(writes[0].options).toMatchObject({ user: 'root', secretInputName: SECRET_TOKEN, timeoutMs: 30_000 });
+    expect(writes[0].options).not.toHaveProperty('input');
+    expect(JSON.stringify(writes[0].options)).not.toContain(TOKEN);
+    // The fake engine gave the script the token of the operation (the token of the session) on its standard input.
+    expect(h.docker.tokenWrites()).toEqual([expect.objectContaining({ user: 'root', token: TOKEN })]);
+    expect(h.logger.infos).toContain('The GitHub token of the environment is in /run/devenv. ***');
+    expect([...h.logger.infos, ...h.logger.warnings, ...h.logger.errors].join('\n')).not.toContain(TOKEN);
+  });
+
+  it('plan step 11I (PR B): a token that the script cannot take is refused before any exec, with a warning', async () => {
+    h.token = 'gho_with space';
+    await seedEnvironment(h, { container: 'running' });
+    const result = await h.service.openEnvironment(ENV_ID, options());
+    expect(result.containerName).toBe(NAME);
+    expect(h.docker.execs.filter((exec) => exec.command[2] === TOKEN_WRITE_SCRIPT)).toEqual([]);
+    expect(h.logger.errors.some((line) => line.includes('The GitHub token could not be written') && line.includes('No valid GitHub token.'))).toBe(true);
+    expect(h.ui.warnings).toEqual([Messages.gitSetupFailed]);
   });
 
   it('writes it before `up`, once per open, and passes the variables of container-only Git', async () => {
@@ -4995,9 +5043,11 @@ describe('the ~/.gitconfig of a new container when root may not write it (concep
     h.docker.execHandler = (_container, command, user) =>
       command[2] === HOME_GIT_CONFIG_SCRIPT && user === 'root' ? { exitCode: 2, stderr: DENIED } : {};
     await h.service.openEnvironment(ENV_ID, options());
+    // Plan step 11I (PR B): changed expectation, the command of the script `homeGitConfig` of the registry (the builder
+    // homeGitConfigCommand, which built the same command, is removed).
     expect(homeRuns().map((exec) => ({ user: exec.user, command: exec.command }))).toEqual([
-      { user: 'root', command: homeGitConfigCommand('vscode') },
-      { user: 'vscode', command: homeGitConfigCommand('vscode') },
+      { user: 'root', command: scriptCommand('homeGitConfig', ['vscode']) },
+      { user: 'vscode', command: scriptCommand('homeGitConfig', ['vscode']) },
     ]);
     expect(h.logger.infos.some((line) => line.includes('could not be prepared as root') && line.includes(DENIED))).toBe(true);
     expect(h.logger.warnings.filter((line) => line.includes('Git configuration'))).toEqual([]);
@@ -6230,8 +6280,9 @@ describe('lifecycle token (user decision 2026-09-27): up --skip-post-create, the
       expect(t.userCommands).toHaveLength(1);
       expect(t.token[0]).toBeLessThan(t.home[0]);
       expect(t.home[0]).toBeLessThan(t.userCommands[0]);
-      // As root, for the remote user of the token write, in the container of `up`.
-      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: homeGitConfigCommand('vscode') });
+      // As root, for the remote user of the token write, in the container of `up`. Plan step 11I (PR B): changed
+      // expectation, the command of the script `homeGitConfig` of the registry (homeGitConfigCommand is removed).
+      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: scriptCommand('homeGitConfig', ['vscode']) });
       // The Git version of the new container is still checked once, after run-user-commands (in finish).
       expect(t.version).toHaveLength(1);
       expect(t.version[0]).toBeGreaterThan(t.userCommands[0]);
@@ -6243,7 +6294,8 @@ describe('lifecycle token (user decision 2026-09-27): up --skip-post-create, the
       await h.service.open(TARGET, options());
       const t = timeline();
       expect(t.home).toHaveLength(1);
-      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: homeGitConfigCommand('vscode') });
+      // Plan step 11I (PR B): changed expectation, the command of the script `homeGitConfig` of the registry.
+      expect(h.docker.execs[t.home[0]]).toMatchObject({ container: container.id, user: 'root', command: scriptCommand('homeGitConfig', ['vscode']) });
       expect(t.token[0]).toBeLessThan(t.home[0]);
       expect(t.home[0]).toBeLessThan(t.userCommands[0]);
       expect(t.version).toEqual([]);

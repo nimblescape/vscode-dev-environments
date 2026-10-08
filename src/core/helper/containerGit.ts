@@ -165,7 +165,8 @@ function shellQuote(text: string): string {
 /**
  * Runs as root in a new dev container, before the first attach (`$1` = the remote user): writes HOME_GIT_CONFIG_CONTENT
  * into ~/.gitconfig when the file does not exist (owned by the user) or is empty (it keeps its owner). A file of the
- * image with content, and a link, stay as they are. Works with GNU and BusyBox tools.
+ * image with content, and a link, stay as they are. Works with GNU and BusyBox tools. Plan step 11I (PR B): the script
+ * `homeGitConfig` of the registry (src/core/worker/containerScripts.ts), which builds its command.
  */
 export const HOME_GIT_CONFIG_SCRIPT = `set -eu
 user="$1"
@@ -188,11 +189,6 @@ elif [ -f "$gitconfig" ] && [ ! -L "$gitconfig" ] && [ ! -s "$gitconfig" ]; then
   printf '%s' "$content" > "$gitconfig"
 fi
 `;
-
-/** Command for `docker exec -u root` in a new dev container: HOME_GIT_CONFIG_SCRIPT for `user`. */
-export function homeGitConfigCommand(user: string): string[] {
-  return ['sh', '-c', HOME_GIT_CONFIG_SCRIPT, 'sh', user];
-}
 
 /** Version of Git from the output of `git --version`, for example `git version 2.39.3 (Apple Git-146)`. */
 export function parseGitVersion(output: string): [major: number, minor: number, patch: number] | undefined {

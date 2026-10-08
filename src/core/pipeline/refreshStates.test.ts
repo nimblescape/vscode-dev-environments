@@ -8,6 +8,7 @@ import type { ContainerInfo } from '../docker/dockerObjects';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { RunResult } from '../ports';
 import type { DockerEngine, EngineExecOptions } from '../worker/dockerEngine';
+import { scriptCommand } from '../worker/containerScripts';
 import { EngineDocker } from '../worker/engineDocker';
 import { BRANCH_EXEC_TIMEOUT_MS, BRANCH_READ_CONCURRENCY, readEnvironmentStates, type StateDocker, type StateEnvironment } from './refreshStates';
 import { ENV_OPS, EXPECTED_STATES, REFRESH_ENVIRONMENTS, fixtureEngine } from './refreshStates.testkit';
@@ -42,11 +43,13 @@ describe('readEnvironmentStates (plan step 5, PR C)', () => {
     // ContainerAdapter, each one that only reads by isReadOnlyDockerCall): the refresh runs over the Engine API, whose
     // fake answers only the reads of the refresh and exec (fixtureEngine over unusedEngine: any other call fails the
     // refresh), and each exec has no standard input, no secret input and no variables (EngineExecOptions has no `env`).
-    for (const { command, options } of execs) {
+    for (const { container, command, options } of execs) {
       expect(options.input).toBeUndefined();
       expect(options.secretInputName).toBeUndefined();
       expect(Object.keys(options).every((key) => ['user', 'timeoutMs', 'signal'].includes(key))).toBe(true);
-      expect(command.slice(0, 4)).toEqual(['git', '-c', 'safe.directory=*', '-C']);
+      // Plan step 11I (PR B): changed expectation, the script `branch` of the registry in the folder of the environment
+      // (before: `git -c safe.directory=* -C <folder> branch --show-current`).
+      expect(command).toEqual(scriptCommand('branch', [REFRESH_ENVIRONMENTS.find((env) => env.containerName === container)!.folder]));
     }
     // No branch of an environment whose branch was not asked for (another account).
     const containers = execs.map((exec) => exec.container);
