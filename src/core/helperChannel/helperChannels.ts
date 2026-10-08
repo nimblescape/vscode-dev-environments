@@ -199,15 +199,17 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   // Review round 4 (M1): channel containers that an earlier open created but never started are removed, in the
   // background (a failure is logged; the channel is open already). Plan step 11I (PR A): its value is checked
   // (parseSweepValue) and the number of removed containers logged. Plan step 11I (PR D): always sent; the worker is this
-  // extension's own bundle (its hash checked by the loader, its protocol at `hello`), which knows `sweep`.
+  // extension's own bundle (its hash checked by the loader, its protocol at `hello`), which knows `sweep`. Plan step 11I
+  // (U5, decision of 2026-10-08): every stopped helper container older than 10 minutes, the channels and the batch helpers
+  // of the worker, never the Session Monitor (SWEEP_FILTERS).
   void channel.operation(OP_SWEEP, parseSweepParams({}), { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).then(
     (value) => {
       const swept = parseSweepValue(value);
-      if (swept === undefined) deps.logger.warn(`The worker on ${name} answered the removal of the stopped helper channel containers with an invalid value.`);
-      else if (swept.removed > 0) deps.logger.info(`Removed ${swept.removed} stopped helper channel ${swept.removed === 1 ? 'container' : 'containers'} on ${name}.`);
+      if (swept === undefined) deps.logger.warn(`The worker on ${name} answered the removal of the stopped helper containers with an invalid value.`);
+      else if (swept.removed > 0) deps.logger.info(`Removed ${swept.removed} stopped helper ${swept.removed === 1 ? 'container' : 'containers'} on ${name}.`);
     },
     (error: unknown) => {
-      deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
+      deps.logger.info(`The stopped helper containers on ${name} could not be removed: ${(error as Error).message}`);
     },
   );
   return channel;

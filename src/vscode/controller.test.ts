@@ -325,9 +325,13 @@ function createHarness(
           summary: () => service.safetyCheck(id, options),
           environment: () => registry.get(id),
           repositoryServiceData: () => service.repositoryServiceData(id),
-          removableAdditionalVolumes: () => service.removableAdditionalVolumes(id),
-          removableServiceDataVolumes: () => service.removableServiceDataVolumes(id),
-          possibleServiceDataVolumes: () => service.possibleServiceDataVolumes(id),
+          // Plan step 11I (D3): the one dep of the removable volumes (removableVolumes), here from the reads of this fake
+          // service, so the tests of the dialogs of Delete below stay as they were.
+          removableVolumes: async () => ({
+            additional: await service.removableAdditionalVolumes(id),
+            serviceData: await service.removableServiceDataVolumes(id),
+            possibly: await service.possibleServiceDataVolumes(id),
+          }),
           ui: new VsCodePipelineUi({} as never, silentLogger, () => {}),
         },
         entry,

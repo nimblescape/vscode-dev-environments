@@ -36,6 +36,7 @@ import {
   parseSweepValue,
 } from '../../src/core/helperChannel/protocol';
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
+import { LABEL_HELPER_RUN } from '../../src/core/names';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartedProcess } from '../../src/core/ports';
@@ -179,9 +180,11 @@ describe('the helper channel with the real Docker engine', () => {
 
     // Plan step 11I (PR A): the sweep prunes over the Engine API with the label and the age of before: a channel container
     // that was created but never started, younger than 10 minutes, is kept (an open that runs now), and the value says
-    // how many it removed (others of this engine older than 10 minutes may go, as at every open).
+    // how many it removed (others of this engine older than 10 minutes may go, as at every open). Plan step 11I (U5,
+    // decision of 2026-10-08): changed input, with the label of every helper container that the sweep prunes now (the
+    // channels carry it, channelRunArgs), so that only its age keeps it.
     const young = `devenv-channel-young-${run.runId}`;
-    cli.ok(['create', '--name', young, '--label', `${LABEL_HELPER_CHANNEL}=${channelLabelValue(script)}`, ...runLabelArgs, helperTag, 'true']);
+    cli.ok(['create', '--name', young, '--label', `${LABEL_HELPER_RUN}=true`, '--label', `${LABEL_HELPER_CHANNEL}=${channelLabelValue(script)}`, ...runLabelArgs, helperTag, 'true']);
     try {
       const swept = parseSweepValue(await timings.measure('sweep through the channel', () => sweepThrough(channel)));
       expect(swept).toBeDefined();

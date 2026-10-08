@@ -6,7 +6,7 @@
 // Plan step 11I2: the tests of this reading that ran through the removed CLI adapter ContainerAdapter (its `docker
 // inspect` of containers, volumes and networks, containerAdapter.test.ts) moved here and read the same JSON directly.
 import { describe, expect, it } from 'vitest';
-import { mapContainerState, preferred, publicInfo, toContainerInfo, toLabels, toNetworkInfo, toVolumeInfo, type InspectedContainer } from './dockerObjects';
+import { mapContainerState, publicInfo, toContainerInfo, toLabels, toNetworkInfo, toVolumeInfo } from './dockerObjects';
 
 const container = (mounts: unknown[], hostMounts: unknown[] = []) => ({
   Id: 'c'.repeat(64),
@@ -177,14 +177,8 @@ describe('the containers of `docker container inspect`', () => {
     expect(read(container)?.volumes).toEqual(['devenv-acme-api-3f2a9c1e', 'api-node_modules']);
   });
 
-  it('prefers a running container, then the newest one', () => {
-    const containers = [
-      containerJson({ id: 'old', name: 'a', status: 'exited', created: '2026-01-01T00:00:00Z' }),
-      containerJson({ id: 'new', name: 'b', status: 'exited', created: '2026-02-01T00:00:00Z' }),
-      containerJson({ id: 'run', name: 'c', status: 'running', created: '2025-01-01T00:00:00Z' }),
-    ].map((value) => toContainerInfo(value) as InspectedContainer);
-    expect([...containers].sort(preferred).map((container) => container.id)).toEqual(['run', 'new', 'old']);
-  });
+  // Plan step 11I (U4, decision of 2026-10-08): 'prefers a running container, then the newest one' is deleted with
+  // `preferred`; the rule of the dev container that replaces it (devContainerOf) is tested in environmentContainers.test.ts.
 
   it('reads the subpaths of volumes that each container mounts (review round 11, G3, G4)', () => {
     const db = {

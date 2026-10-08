@@ -6,7 +6,9 @@
 // sweep over the port of the engine (DockerEngine), no Docker CLI of the worker.
 import { describe, expect, it } from 'vitest';
 import { LABEL_HELPER_CHANNEL, parseProbeValue, parseRefreshValue, parseSweepValue, parseWindowStateValue, type EngineIdentity } from '../core/helperChannel/protocol';
-import { ENV_API, EXPECTED_STATES, REFRESH_ENVIRONMENTS, fixtureEngine } from '../core/pipeline/refreshStates.testkit';
+import { LABEL_HELPER_RUN } from '../core/names';
+import { LABEL_SESSION_MONITOR } from '../core/remoteMonitor/protocol';
+import { ENV_API, EXPECTED_STATES, REFRESH_ENVIRONMENTS, fixtureContainerId, fixtureEngine } from '../core/pipeline/refreshStates.testkit';
 import { EngineError, type DockerEngine, type EngineFilters } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { abortError } from '../core/ports';
@@ -122,13 +124,21 @@ describe('the sweep operation (review round 4, M1; plan step 11I, PR A)', () => 
 
   // Moved from server.test.ts ('sweep prunes only stopped channel containers older than 10 minutes', before: the arguments
   // of `docker container prune -f`): exactly the label and age of before (no wider filter), and the number removed.
-  it('prunes only the stopped channel containers older than 10 minutes, and answers how many it removed', async () => {
+  // Plan step 11I (U5, decision of 2026-10-08): renamed (before: 'prunes only the stopped channel containers older than 10
+  // minutes, and answers how many it removed').
+  it('prunes only the stopped helper containers older than 10 minutes, never the Session Monitor, and answers how many it removed', async () => {
     const { engine, requests } = sweepEngine(async () => ['a'.repeat(64), 'b'.repeat(64)]);
-    const { context: ctx } = context();
+    const { context: ctx, logs } = context();
     const value = await sweepOperation(() => engine)({}, ctx);
     expect(parseSweepValue(value)).toEqual({ removed: 2 });
-    expect(requests).toEqual([{ filters: { label: [LABEL_HELPER_CHANNEL], until: ['10m'] }, signal: ctx.signal }]);
+    // Plan step 11I (U5, decision of 2026-10-08): changed expectation, every stopped helper container (the label of the
+    // helper runs, which the channels carry too; before: the label of the channels), never the Session Monitor.
+    expect(requests).toEqual([{ filters: { label: [LABEL_HELPER_RUN], 'label!': [LABEL_SESSION_MONITOR], until: ['10m'] }, signal: ctx.signal }]);
+    expect(LABEL_HELPER_RUN).toBe('nimblescape.devenv.helper-run');
+    expect(LABEL_SESSION_MONITOR).toBe('nimblescape.devenv.session-monitor');
     expect(LABEL_HELPER_CHANNEL).toBe('nimblescape.devenv.helper-channel');
+    // Plan step 11I (U5): the log line names the helper containers (before: the channel containers).
+    expect(logs).toContain('info The sweep removed 2 stopped helper container(s) older than 10 minutes.');
     const none = sweepEngine(async () => []);
     expect(parseSweepValue(await sweepOperation(() => none.engine)(null, context().context))).toEqual({ removed: 0 });
   });
@@ -183,7 +193,9 @@ describe('the operations windowState and refresh over the port of the engine (pl
     const { engine, execs } = fixtureEngine();
     const { context: ctx } = engineContext();
     expect(parseWindowStateValue(await windowStateOperation(() => engine)(PARAMS, ctx))).toEqual({ state: 'running', outdated: 'version', branch: 'feature/x' });
-    expect(execs).toEqual([{ container: 'devenv-api', user: 'node', signal: ctx.signal }]);
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, the branch is read from the dev container of the
+    // rule by its ID (before: by the name of the request).
+    expect(execs).toEqual([{ container: fixtureContainerId('devenv-api'), user: 'node', signal: ctx.signal }]);
   });
 
   it('windowState: invalid parameters or a secret are invalid, before the engine is asked; the secret is not echoed', async () => {

@@ -116,8 +116,12 @@ describe('the identity and the prune of the port over the Engine API (plan step 
       expect(await engine.pruneContainers(SWEEP_FILTERS)).toEqual(ids);
       expect(calls).toHaveLength(1);
       expect(calls[0]).toMatchObject({ method: 'POST', body: '' });
-      // The filters of the sweep: the label of the channels with any value, and the age, exactly (no other filter).
-      expect(decodeURIComponent(calls[0].url)).toBe('/containers/prune?filters={"label":["nimblescape.devenv.helper-channel"],"until":["10m"]}');
+      // The filters of the sweep: the label of the channels with any value, and the age, exactly (no other filter). Plan
+      // step 11I (U5, decision of 2026-10-08): changed expectation, the label of every helper container and the guard of
+      // the Session Monitor (`label!`), each key as given, in the JSON map that the Engine API takes.
+      expect(decodeURIComponent(calls[0].url)).toBe(
+        '/containers/prune?filters={"label":["nimblescape.devenv.helper-run"],"label!":["nimblescape.devenv.session-monitor"],"until":["10m"]}',
+      );
       const none = await serve(() => ({ status: 200, json: { ContainersDeleted: null, SpaceReclaimed: 0 } }));
       expect(await none.engine.pruneContainers({ label: ['x=y'] })).toEqual([]);
     });

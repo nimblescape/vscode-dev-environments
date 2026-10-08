@@ -96,7 +96,8 @@ describe('an environment of another Docker host is never acted on', () => {
   it('reads nothing of it from Docker', async () => {
     // Plan step 11C1: changed expectation, the reads of the window go through windowStateInWorker (was: currentBranch).
     expect(await h.operations.windowStateInWorker((await h.registry.get(ENV_ID))!, 'devenv-x', { branch: true })).toBeUndefined();
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual([]);
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual([]);
     expect((await h.operations.inspectStates())?.has(ENV_ID)).toBe(false);
   });
@@ -154,6 +155,8 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
     dockerReads = [
       'isRunning',
       'listEnvironmentContainers',
+      // Plan step 11I (U4, decision of 2026-10-08): the containers of one environment are a call of the port now.
+      'environmentContainers',
       'listEnvironmentVolumes',
       'volumeExists',
       'findContainer',
@@ -204,8 +207,9 @@ describe('an endpoint that is neither local nor SSH is never reached (review, D2
     expect(await u.operations.inspectStates()).toEqual(new Map());
     expect(shown()).toHaveLength(1);
     expect(await u.service.reconcileFromVolumes()).toBe(0);
-    expect(await u.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
-    expect(await u.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await u.service.removableVolumesOf(ENV_ID)).additional).toEqual([]);
+    expect((await u.service.removableVolumesOf(ENV_ID)).serviceData).toEqual([]);
     expect(await u.service.repositoryServiceData(ENV_ID)).toEqual([]);
     noDockerCall();
     // Never recorded as the host of a restored entry.

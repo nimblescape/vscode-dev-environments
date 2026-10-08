@@ -12,22 +12,30 @@ import { readBranch } from '../pipeline/refreshStates';
 import type { EngineDocker } from './engineDocker';
 
 export interface WindowStateFlowDeps extends WindowStateParams {
-  docker: Pick<EngineDocker, 'containerState' | 'findContainer' | 'exec'>;
+  docker: Pick<EngineDocker, 'findContainer' | 'exec'>;
   signal?: AbortSignal;
 }
 
-/** The WindowStateValue of the dev container of `environmentId` (see the module comment). */
+/**
+ * The WindowStateValue of the dev container of `environmentId` that the window is attached to (`containerName`, the name
+ * that it sends; see the module comment). Plan step 11I (U4, decision of 2026-10-08): one findContainer, the rule of the
+ * dev container by which the open connects (devContainerOf), for all three reads: its state, whether it is current, and
+ * the branch, read from it by its ID when it runs. A window reads only the container that it is attached to: when the
+ * rule gives another one (the window's container is gone), the state is 'missing' as before, so that the window
+ * reconnects through the open, which connects to the container of the rule. The state of the list maps the engine state
+ * as containerState did (both mapContainerState of the inspect).
+ */
 export async function windowStateFlow(deps: WindowStateFlowDeps): Promise<WindowStateValue> {
-  const state = await deps.docker.containerState(deps.containerName);
-  const value: WindowStateValue = { state };
-  if (state === 'missing') return value;
-  const container = await deps.docker.findContainer(deps.environmentId, deps.containerName);
-  if (container !== undefined && !containerIsCurrent(container.labels, true, deps.checks)) {
+  const found = await deps.docker.findContainer(deps.environmentId, deps.containerName);
+  const container = found?.name === deps.containerName ? found : undefined;
+  if (container === undefined) return { state: 'missing' };
+  const value: WindowStateValue = { state: container.state };
+  if (!containerIsCurrent(container.labels, true, deps.checks)) {
     // A container made while the host access checks were off, when they are on now, else one of an older version.
     value.outdated = containerIsCurrent(container.labels, true, 'off') && isUnrestrictedContainer(container.labels) ? 'hostAccess' : 'version';
   }
-  if (deps.branch !== undefined && state === 'running') {
-    const branch = await readBranch(deps.docker, deps.containerName, deps.branch.user, deps.branch.folder, deps.signal);
+  if (deps.branch !== undefined && container.state === 'running') {
+    const branch = await readBranch(deps.docker, container.id, deps.branch.user, deps.branch.folder, deps.signal);
     if (branch !== undefined) value.branch = branch;
   }
   return value;

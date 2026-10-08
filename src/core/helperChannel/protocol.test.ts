@@ -7,6 +7,10 @@ import { describe, expect, it } from 'vitest';
 import { PIPE_LOADER, encodeBundle } from '../loader/pipeLoader';
 import type { StateEnvironment } from '../pipeline/refreshStates';
 import { ENV_API, ENV_WEB, EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_RUN } from '../names';
+import { LABEL_SESSION_MONITOR } from '../remoteMonitor/protocol';
+import { batchRunSpec } from './batch';
+import { channelRunArgs } from './helperChannels';
 import {
   MIN_SECRET_LENGTH,
   CHANNEL_ENTRY,
@@ -249,13 +253,31 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   });
 
   // Plan step 11I (PR A): the sweep has the label and age filters of `docker container prune -f` before, and no other.
-  it('the sweep prunes by the channel label (any value) and an age of 10 minutes, and answers how many it removed', () => {
-    expect(SWEEP_FILTERS).toEqual({ label: [LABEL_HELPER_CHANNEL], until: ['10m'] });
+  // Plan step 11I (U5, decision of 2026-10-08): renamed (before: 'the sweep prunes by the channel label (any value) and an
+  // age of 10 minutes, and answers how many it removed').
+  it('the sweep prunes by the label of the helper containers (any value), never the Session Monitor, and an age of 10 minutes, and answers how many it removed', () => {
+    // Plan step 11I (U5, decision of 2026-10-08): changed expectation, the label of every helper container (before: of the
+    // channels, LABEL_HELPER_CHANNEL), never one with the label of the Session Monitor; the same age.
+    expect(SWEEP_FILTERS).toEqual({ label: [LABEL_HELPER_RUN], 'label!': [LABEL_SESSION_MONITOR], until: ['10m'] });
     expect(parseSweepValue({ removed: 0 })).toEqual({ removed: 0 });
     expect(parseSweepValue({ removed: 3 })).toEqual({ removed: 3 });
     for (const value of [{ removed: -1 }, { removed: 1.5 }, { removed: '1' }, { removed: Number.MAX_SAFE_INTEGER + 1 }, { removed: 1, output: 'x' }, { output: 'Deleted Containers:' }, null, [], 2]) {
       expect(parseSweepValue(value), JSON.stringify(value)).toBeUndefined();
     }
+  });
+});
+
+describe('the helper containers that the sweep removes when they are stopped (plan step 11I, U5, decision of 2026-10-08)', () => {
+  it('the channels and the batch helpers carry the label of the sweep (any value); the batch helpers also their session label', () => {
+    const run = channelRunArgs({ tag: 't', socketPath: '/var/run/docker.sock', stateVolume: 'devenv-session-monitor', containerName: 'devenv-channel-x', label: 'l', scriptHash: 'h' });
+    const labels = run.flatMap((arg, index) => (run[index - 1] === '--label' ? [arg] : []));
+    expect(labels).toContain(`${LABEL_HELPER_RUN}=true`);
+    expect(labels).toContain(`${LABEL_HELPER_CHANNEL}=l`);
+    const batch = batchRunSpec({ session: 's', volume: 'v', image: `sha256:${'a'.repeat(64)}`, socket: '/var/run/docker.sock', scriptHash: 'h' });
+    expect(batch.labels).toEqual({ [LABEL_HELPER_RUN]: 'true', [LABEL_CHANNEL_STEP]: 's' });
+    // Never the label that guards the Session Monitor.
+    expect(labels.some((label) => label.startsWith(LABEL_SESSION_MONITOR))).toBe(false);
+    expect(Object.keys(batch.labels)).not.toContain(LABEL_SESSION_MONITOR);
   });
 });
 

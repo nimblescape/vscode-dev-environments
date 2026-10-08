@@ -31,6 +31,23 @@ export interface DeleteConfirmation {
 /** The decision of the user: delete with the volumes to remove too, open the environment instead, or nothing. */
 export type DeleteDecision = { decision: 'delete'; additionalVolumesToRemove: string[] } | { decision: 'open' } | { decision: 'cancel' };
 
+/**
+ * Plan step 11I (D3, section 0 of the plan: one computation): the volumes that Delete may remove, for both of its
+ * questions, from one read of the entry, the volumes and the containers (EnvironmentService.removableVolumesOf), so that
+ * the two questions see the same state.
+ */
+export interface RemovableVolumes {
+  /** The additional volumes that Delete may remove (the question deleteAdditionalVolumes). */
+  additional: string[];
+  /** The volumes with the data of the services of Docker Compose that Delete may remove (the question deleteServiceData). */
+  serviceData: string[];
+  /**
+   * Review round 3 (P3-4): of `serviceData`, the volumes that are there only because the entry knows neither the volumes of
+   * its services nor its build: perhaps data of a service, perhaps not (the question names them so).
+   */
+  possibly: string[];
+}
+
 export interface DeleteCheckDeps {
   /** The Git state to name (EnvironmentService.safetyCheck: refreshed in the running dev container and recorded). */
   summary(): Promise<GitSummary | undefined>;
@@ -38,9 +55,12 @@ export interface DeleteCheckDeps {
   environment(): Promise<Environment | undefined>;
   /** The paths of the repository that the containers of the other services mount (repositoryServiceData). */
   repositoryServiceData(): Promise<string[]>;
-  removableAdditionalVolumes(): Promise<string[]>;
-  removableServiceDataVolumes(): Promise<string[]>;
-  possibleServiceDataVolumes(): Promise<string[]>;
+  /**
+   * Plan step 11I (D3): the volumes that Delete may remove, for both questions; asked once per check, after the
+   * confirmation (before: removableAdditionalVolumes, removableServiceDataVolumes and possibleServiceDataVolumes, each of
+   * them read on its own).
+   */
+  removableVolumes(): Promise<RemovableVolumes>;
   ui: {
     confirmDelete(repository: string, confirmation: DeleteConfirmation): Promise<'delete' | 'open' | undefined>;
     deleteAdditionalVolumes(volumes: readonly string[]): Promise<'remove' | 'keep' | undefined>;
@@ -73,8 +93,10 @@ export async function deleteCheck(deps: DeleteCheckDeps, environment: Environmen
   if (answer !== 'delete') return { decision: 'cancel' };
   const confirmed = (await deps.environment()) ?? environment;
   const additional = (confirmed.additionalVolumes ?? []).length > 0;
-  // Only the volumes that Delete would remove (their labels make them the environment's own).
-  const volumes = additional ? await deps.removableAdditionalVolumes() : [];
+  // Only the volumes that Delete would remove (their labels make them the environment's own). Plan step 11I (D3): read
+  // once, here, for both questions.
+  const removable: RemovableVolumes = additional ? await deps.removableVolumes() : { additional: [], serviceData: [], possibly: [] };
+  const volumes = removable.additional;
   let additionalVolumesToRemove: string[] = [];
   if (volumes.length > 0) {
     const choice = await deps.ui.deleteAdditionalVolumes(volumes);
@@ -82,11 +104,10 @@ export async function deleteCheck(deps: DeleteCheckDeps, environment: Environmen
     additionalVolumesToRemove = choice === 'remove' ? [...volumes] : [];
   }
   // D-19: the volumes of a Docker Compose project hold the data of its services; none ticked; Escape cancels.
-  const serviceData = additional ? await deps.removableServiceDataVolumes() : [];
+  const serviceData = removable.serviceData;
   if (serviceData.length > 0) {
     // Review round 3 (P3-4): an environment whose services are not known lists its additional volumes as possible data.
-    const possibly = await deps.possibleServiceDataVolumes();
-    const picked = await deps.ui.deleteServiceData(serviceData, possibly);
+    const picked = await deps.ui.deleteServiceData(serviceData, removable.possibly);
     if (picked === undefined) return { decision: 'cancel' };
     // Only names that the question offered.
     additionalVolumesToRemove = [...additionalVolumesToRemove, ...picked.filter((name) => serviceData.includes(name))];
