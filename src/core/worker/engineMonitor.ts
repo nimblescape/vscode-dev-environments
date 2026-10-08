@@ -10,8 +10,9 @@
 import { errorMessage } from '../errors';
 import { isAbortError } from '../ports';
 import { NO_STORED_SCRIPT, REMOVAL_IN_PROGRESS, parseDockerTime, type MonitorEngine, type MonitorInspected } from '../remoteMonitor/monitorEngine';
-import { LABEL_SESSION_MONITOR, REMOTE_MONITOR_SCRIPT_PATH } from '../remoteMonitor/protocol';
+import { LABEL_SESSION_MONITOR } from '../remoteMonitor/protocol';
 import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, REMOTE_MONITOR_EXEC_TIMEOUT_MS } from '../remoteMonitor/remoteSessionMonitor';
+import { runScript } from './containerScripts';
 import { EngineError, type DockerEngine } from './dockerEngine';
 
 /** `call` within `ms`: past it, an Error "no answer in time"; the cancel of `signal` passes as an AbortError. */
@@ -95,7 +96,8 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
 
     async storedScript(name, signal) {
       try {
-        const result = await engine.exec(name, ['sha256sum', REMOTE_MONITOR_SCRIPT_PATH], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, ...(signal ? { signal } : {}) });
+        // Plan step 11I (PR B): `sha256sum REMOTE_MONITOR_SCRIPT_PATH` as the script `monitorScriptHash` of the registry.
+        const result = await runScript(engine, name, 'monitorScriptHash', [], { timeoutMs: REMOTE_MONITOR_EXEC_TIMEOUT_MS, ...(signal ? { signal } : {}) });
         if (result.timedOut) return 'unknown';
         if (result.exitCode === 0) return { hash: result.stdout };
         // Review round 3 of PR #69 (A-R3-5): the runtime's refusal of an exec in a container that just stopped comes on

@@ -9,6 +9,7 @@
 import { Semaphore } from '../concurrency';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { ContainerState } from '../types';
+import { runScript } from '../worker/containerScripts';
 import { isDevContainer } from '../worker/dockerEngine';
 // Plan step 11I2: a type only (no code of the service in the worker's script).
 import type { EnvironmentDocker } from './environmentService';
@@ -53,9 +54,12 @@ export const BRANCH_READ_CONCURRENCY = 4;
 export const BRANCH_EXEC_TIMEOUT_MS = 15_000;
 
 /**
- * The branch of the repository at `folder` in a running container (`git branch --show-current` through `docker exec`,
- * without `-i` and without variables): `null` for a detached HEAD, `undefined` when Git is missing, fails, or `signal`
- * aborts.
+ * The branch of the repository at `folder` in a running container (through `docker exec`, without `-i` and without
+ * variables): `null` for a detached HEAD, `undefined` when Git is missing, fails, or `signal` aborts. Plan step 11I (PR B,
+ * one function per fact): the script `branch` of the registry (GIT_BRANCH_SCRIPT of gitSummary.ts), which reads the
+ * branch as the Git state does (GIT_BRANCH_FUNCTION: no hooks, the C locale, `safe.directory`, and `git symbolic-ref -q
+ * HEAD`, a branch only below refs/heads/, review round 1 of PR #124); before, `git -c safe.directory=* -C <folder> branch
+ * --show-current`, which Git before 2.22 refused.
  */
 export async function readBranch(
   docker: Pick<EnvironmentDocker, 'exec'>,
@@ -65,7 +69,7 @@ export async function readBranch(
   signal?: AbortSignal,
 ): Promise<string | null | undefined> {
   try {
-    const result = await docker.exec(container, ['git', '-c', 'safe.directory=*', '-C', folder, 'branch', '--show-current'], {
+    const result = await runScript(docker, container, 'branch', [folder], {
       user,
       timeoutMs: BRANCH_EXEC_TIMEOUT_MS,
       signal,

@@ -9,6 +9,9 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   CONFIG_OWNERSHIP_FIX_SCRIPT,
+  GIT_BRANCH_FUNCTION,
+  GIT_BRANCH_SCRIPT,
+  GIT_SCRIPT_PRELUDE,
   GIT_SUMMARY_SCRIPT,
   OWNERSHIP_FIX_SCRIPT,
   MAX_SERVICE_ARGUMENT_CHARACTERS,
@@ -18,19 +21,30 @@ import {
   MAX_SERVICE_REAL_PATHS,
   boundServiceFolders,
   configOwnershipFixCommand,
-  gitSummaryCommand,
   NUMERIC_OWNERSHIP_FIX_SCRIPT,
   RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT,
+  type DevMountPaths,
   type ServiceFolders,
   isNumericId,
-  ownershipFixCommand,
   repositoryOwnershipFixCommand,
   parseGitSummaryOutput,
   serviceFolderPaths,
   servicePathArguments,
   servicePrunePatterns,
 } from './gitSummary';
+import type { EnvironmentDocker } from '../pipeline/environmentService';
 import { devMountFolders, verifiedIdentityTargets, workspaceIdentityMounts } from '../pipeline/pipelineRules';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch } from '../pipeline/refreshStates';
+import { scriptCommand } from '../worker/containerScripts';
+
+/**
+ * Plan step 11I (PR B): the command of the script `ownershipFix` of the registry with the arguments that the pipeline
+ * gives it (EnvironmentService.fixOwnership: the folder, the user, servicePathArguments), in place of the removed builder
+ * ownershipFixCommand, which built the same command.
+ */
+function ownershipFix(repo: string, user: string, folders?: ServiceFolders, gitPaths: DevMountPaths = false): string[] {
+  return scriptCommand('ownershipFix', [repo, user, ...servicePathArguments(repo, folders, gitPaths)]);
+}
 
 const RECORDED_AT = '2026-09-24T17:10:00.000Z';
 
@@ -64,7 +78,8 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 function runSummary(folder: string): { status: number | null; stdout: string; stderr: string } {
-  const [file, ...args] = gitSummaryCommand(folder);
+  // Plan step 11I (PR B): the command of the registry (the builder gitSummaryCommand, which built the same, is removed).
+  const [file, ...args] = scriptCommand('gitSummary', [folder]);
   const result = spawnSync(file, args, {
     encoding: 'utf8',
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
@@ -114,8 +129,10 @@ describe('commands', () => {
   });
 
   it('passes the folder as a positional parameter', () => {
-    expect(gitSummaryCommand('/workspaces/it\'s "api"')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/it\'s "api"']);
-    expect(ownershipFixCommand('/workspaces/api', 'vscode')).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/api', 'vscode']);
+    // Plan step 11I (PR B): changed expectation, the commands of the registry (scriptCommand) in place of the removed
+    // builders gitSummaryCommand and ownershipFixCommand, with the same commands.
+    expect(scriptCommand('gitSummary', ['/workspaces/it\'s "api"'])).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/it\'s "api"']);
+    expect(ownershipFix('/workspaces/api', 'vscode')).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', '/workspaces/api', 'vscode']);
   });
 
   it('never follows a link and never leaves the file system of the folder, on every branch of the fix (review round 3 of PR #81, B-R3-1, B-R3-2)', () => {
@@ -160,7 +177,7 @@ describe('commands', () => {
     fs.writeFileSync(path.join(dir, 'sub', 'file.txt'), 'x');
     fs.symlinkSync('/etc/hosts', path.join(dir, 'link'));
     const user = os.userInfo().username;
-    const [file, ...args] = ownershipFixCommand(dir, user);
+    const [file, ...args] = ownershipFix(dir, user);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -185,7 +202,7 @@ describe('review round 9 (D9-1): the ownership fix leaves out the paths that oth
     // Review round 10 (D10-3): never .git or a path in it (Git writes there as root), also from a recorded list.
     expect(servicePrunePatterns(REPO, [`${REPO}/.git`, `${REPO}/.git/objects`, `${REPO}/sub/.git`, `${REPO}/.github`, `${REPO}/x.git`])).toEqual([`${REPO}/.github`, `${REPO}/x.git`]);
     // Review round 11, G5: the command holds the ready arguments of find (servicePathArguments), not the patterns.
-    expect(ownershipFixCommand(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual([
+    expect(ownershipFix(REPO, 'vscode', [`${REPO}/data/postgres`])).toEqual([
       'sh',
       '-c',
       OWNERSHIP_FIX_SCRIPT,
@@ -228,7 +245,7 @@ describe('review round 9 (D9-1): the ownership fix leaves out the paths that oth
     if (process.getuid?.() === 0) {
       for (const file of ['data/postgres', 'data/postgres/base', 'data/postgres/base/1', '-data/my db', '-data/my db/f']) fs.chownSync(path.join(repo, file), 999, 999);
     }
-    const [file, ...args] = ownershipFixCommand(repo, 'someone', [`${repo}/data/postgres`, `${repo}/-data/my db`]);
+    const [file, ...args] = ownershipFix(repo, 'someone', [`${repo}/data/postgres`, `${repo}/-data/my db`]);
     const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -402,9 +419,215 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
   });
 });
 
+/**
+ * Plan step 11I (PR B): the script `branch` of the registry in `folder`, run by the shell of this computer as `docker exec`
+ * runs it in the dev container; `PATH` decides which Git it finds (oldGit, or a folder without Git).
+ */
+function runBranch(folder: string, searchPath = process.env.PATH ?? '/usr/bin:/bin'): { status: number | null; stdout: string; stderr: string } {
+  const [shell, ...args] = scriptCommand('branch', [folder]);
+  expect(shell).toBe('sh');
+  const result = spawnSync('/bin/sh', args, {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: searchPath, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+/** Plan step 11I (PR B): `PATH` with a Git before 2.22 in front: a stub that refuses `--show-current` as it did, else the real Git. */
+function oldGit(): string {
+  const bin = path.join(tempDir(), 'bin');
+  fs.mkdirSync(bin);
+  const real = spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    `#!/bin/sh\nfor a do\n  if [ "$a" = --show-current ]; then echo "error: unknown option 'show-current'" >&2; exit 129; fi\ndone\nexec '${real}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  return `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`;
+}
+
+/** Plan step 11I (PR B): a repository on `feature/x` with a commit, one without commits on `main`, and one with a detached HEAD. */
+function branchRepos(): { onBranch: string; unborn: string; detached: string } {
+  const root = tempDir();
+  const [onBranch, unborn, detached] = ['on-branch', 'unborn', 'detached'].map((name) => path.join(root, name));
+  git(root, 'init', '-q', '-b', 'feature/x', onBranch);
+  git(root, 'init', '-q', '-b', 'main', unborn);
+  git(root, 'init', '-q', '-b', 'main', detached);
+  for (const repo of [onBranch, detached]) {
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    git(repo, 'add', 'a.txt');
+    git(repo, 'commit', '-q', '-m', 'first');
+  }
+  git(detached, 'checkout', '-q', '--detach');
+  return { onBranch, unborn, detached };
+}
+
+describe('plan step 11I (PR B): GIT_BRANCH_SCRIPT, the one read of the branch (the script `branch` of the registry)', () => {
+  it('starts as GIT_SUMMARY_SCRIPT and reads the branch with the same function, its only read of the branch', () => {
+    // One function per fact (section 0 of the plan): the summary and the branch read share the hardening and the read.
+    for (const script of [GIT_BRANCH_SCRIPT, GIT_SUMMARY_SCRIPT]) {
+      expect(script.startsWith(GIT_SCRIPT_PRELUDE)).toBe(true);
+      expect(script.split(GIT_BRANCH_FUNCTION)).toHaveLength(2);
+      // Review round 1 of PR #124 (A, L-2): changed expectation, HEAD is read once, with `git symbolic-ref -q HEAD`
+      // (before: `git branch --show-current`, with `git symbolic-ref --short` for a Git before 2.22).
+      expect(script).not.toContain('--show-current');
+      expect(script.split('symbolic-ref -q HEAD')).toHaveLength(2);
+    }
+    // The hardening of the summary (review rounds 2, 5 and 6 of PR #84) in the start of both.
+    for (const part of ["safe.directory='*'", 'core.hooksPath=/dev/null', 'core.fsmonitor=false', 'log.showSignature=false', 'command -v git']) {
+      expect(GIT_SCRIPT_PRELUDE).toContain(part);
+    }
+    expect(GIT_SCRIPT_PRELUDE.split('\n').slice(0, 2)).toEqual(['set -eu', 'export LC_ALL=C LANG=C']);
+    expect(GIT_SCRIPT_PRELUDE).toMatch(/^GIT_OPTIONAL_LOCKS=0$/m);
+    expect(GIT_BRANCH_SCRIPT.slice(GIT_SCRIPT_PRELUDE.length + GIT_BRANCH_FUNCTION.length)).toBe('git_branch\nprintf \'%s\\n\' "$branch"\n');
+    expect(scriptCommand('branch', ['/workspaces/api'])).toEqual(['sh', '-c', GIT_BRANCH_SCRIPT, 'sh', '/workspaces/api']);
+  });
+
+  it('has valid sh syntax, and dash syntax where dash exists', () => {
+    for (const shell of hasDash ? ['sh', 'dash'] : ['sh']) {
+      expect(spawnSync(shell, ['-n', '-c', GIT_BRANCH_SCRIPT], { encoding: 'utf8' }).status, shell).toBe(0);
+    }
+  });
+
+  it.skipIf(!hasGit)('reads the branch, also one without commits yet, and an empty line for a detached HEAD', () => {
+    const { onBranch, unborn, detached } = branchRepos();
+    expect(runBranch(onBranch)).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    expect(runBranch(unborn)).toEqual({ status: 0, stdout: 'main\n', stderr: '' });
+    expect(runBranch(detached)).toEqual({ status: 0, stdout: '\n', stderr: '' });
+    // The Git state reads the same branch with the same function.
+    for (const [repo, branch] of [[onBranch, 'feature/x'], [unborn, 'main'], [detached, null]] as const) {
+      expect(parseGitSummaryOutput(runSummary(repo).stdout, RECORDED_AT).branch, repo).toBe(branch);
+    }
+  });
+
+  it.skipIf(!hasGit)('fails for a folder that is no repository (the exit code of Git, with its message) and without Git (127)', () => {
+    const notRepository = runBranch(tempDir());
+    expect(notRepository.status).not.toBe(0);
+    expect(notRepository.stdout).toBe('');
+    expect(notRepository.stderr).toMatch(/not a git repository/i);
+    const missing = runBranch(branchRepos().onBranch, tempDir());
+    expect(missing).toEqual({ status: 127, stdout: '', stderr: 'Git is not installed.\n' });
+    expect(runBranch(path.join(tempDir(), 'missing')).status).not.toBe(0);
+  });
+
+  it.skipIf(!hasGit)('reads the branch with a Git before 2.22 (no `git branch --show-current`) as the summary does: `git symbolic-ref`', () => {
+    const old = oldGit();
+    // The stub refuses `--show-current` as a Git before 2.22 does (so the fallback is what is tested here).
+    expect(spawnSync('git', ['branch', '--show-current'], { encoding: 'utf8', env: { ...process.env, PATH: old } }).status).toBe(129);
+    const { onBranch, unborn, detached } = branchRepos();
+    expect(runBranch(onBranch, old)).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    expect(runBranch(unborn, old)).toEqual({ status: 0, stdout: 'main\n', stderr: '' });
+    expect(runBranch(detached, old)).toEqual({ status: 0, stdout: '\n', stderr: '' });
+    const notRepository = runBranch(tempDir(), old);
+    expect(notRepository.status).not.toBe(0);
+    expect(notRepository.stderr).toMatch(/not a git repository/i);
+    // The summary with the same Git reads the same branch.
+    const summary = spawnSync('/bin/sh', scriptCommand('gitSummary', [onBranch]).slice(1), {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: old, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    });
+    expect(summary.status).toBe(0);
+    expect(parseGitSummaryOutput(summary.stdout, RECORDED_AT).branch).toBe('feature/x');
+  });
+
+  // Review round 1 of PR #124 (A, L-2): only a ref below refs/heads/ is a branch. Before, `git branch --show-current`
+  // failed for a HEAD outside refs/heads/ and the fallback `git symbolic-ref --short` read its short name (the summary
+  // showed `origin/main` or the tag); and a Git before 2.22 read a branch whose name a tag has too as `heads/<name>`.
+  it.skipIf(!hasGit)('takes a HEAD that names a remote-tracking branch or a tag for no branch, and reads a branch whose name a tag has too by its name', async () => {
+    const { onBranch } = branchRepos();
+    git(onBranch, 'tag', 'feature/x');
+    expect(runBranch(onBranch)).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    expect(runBranch(onBranch, oldGit())).toEqual({ status: 0, stdout: 'feature/x\n', stderr: '' });
+    const docker: Pick<EnvironmentDocker, 'exec'> = {
+      exec: async (_container, command) => {
+        const [program, ...args] = command;
+        const result = spawnSync(program === 'sh' ? '/bin/sh' : program, args, {
+          encoding: 'utf8',
+          env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+        });
+        return { exitCode: result.status, stdout: result.stdout, stderr: result.stderr, timedOut: false };
+      },
+    };
+    git(onBranch, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    for (const head of ['refs/remotes/origin/main', 'refs/tags/feature/x']) {
+      fs.writeFileSync(path.join(onBranch, '.git', 'HEAD'), `ref: ${head}\n`);
+      expect(runBranch(onBranch), head).toEqual({ status: 0, stdout: '\n', stderr: '' });
+      expect(await readBranch(docker, 'c', undefined, onBranch), head).toBeNull();
+      const summary = runSummary(onBranch);
+      expect(summary.status, head).toBe(0);
+      expect(parseGitSummaryOutput(summary.stdout, RECORDED_AT).branch, head).toBeNull();
+    }
+  });
+
+  it.skipIf(!hasGit)('runs no hook or fsmonitor of the repository configuration', () => {
+    const repo = tempDir();
+    const marker = path.join(repo, 'marker');
+    git(repo, 'init', '-q', '-b', 'main', '.');
+    const hook = path.join(repo, 'hook.sh');
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    git(repo, 'config', 'core.fsmonitor', hook);
+    fs.writeFileSync(path.join(repo, '.git', 'hooks', 'reference-transaction'), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    expect(runBranch(repo)).toMatchObject({ status: 0, stdout: 'main\n' });
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it.skipIf(!hasGit)('is what readBranch reads (the refresh, an attached window, the branch after an open): null for a detached HEAD, undefined without Git or when Git fails', async () => {
+    const { onBranch, unborn, detached } = branchRepos();
+    // The exec of the pipeline's port, run here as `docker exec` runs the command of the registry in the container.
+    const docker = (searchPath = process.env.PATH ?? '/usr/bin:/bin'): Pick<EnvironmentDocker, 'exec'> => ({
+      exec: async (_container, command, options = {}) => {
+        expect(options).toMatchObject({ timeoutMs: BRANCH_EXEC_TIMEOUT_MS });
+        expect(options).not.toHaveProperty('input');
+        expect(options).not.toHaveProperty('secretInputName');
+        const [program, ...args] = command;
+        const result = spawnSync(program === 'sh' ? '/bin/sh' : program, args, {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: searchPath, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+        });
+        return { exitCode: result.status, stdout: result.stdout, stderr: result.stderr, timedOut: false };
+      },
+    });
+    expect(await readBranch(docker(), 'c', 'vscode', onBranch)).toBe('feature/x');
+    expect(await readBranch(docker(), 'c', undefined, unborn)).toBe('main');
+    expect(await readBranch(docker(), 'c', undefined, detached)).toBeNull();
+    expect(await readBranch(docker(), 'c', undefined, tempDir())).toBeUndefined();
+    expect(await readBranch(docker(), 'c', undefined, path.join(tempDir(), 'missing'))).toBeUndefined();
+    expect(await readBranch(docker(tempDir()), 'c', undefined, onBranch)).toBeUndefined();
+    // A Git before 2.22: the same answers (before plan step 11I, PR B, `git branch --show-current` failed there: undefined).
+    const old = oldGit();
+    expect(await readBranch(docker(old), 'c', undefined, onBranch)).toBe('feature/x');
+    expect(await readBranch(docker(old), 'c', undefined, detached)).toBeNull();
+    expect(await readBranch(docker(old), 'c', undefined, tempDir())).toBeUndefined();
+    // A time limit or a cancel of the exec is no branch either.
+    expect(await readBranch({ exec: async () => ({ exitCode: null, stdout: 'main\n', stderr: '', timedOut: true }) }, 'c', undefined, onBranch)).toBeUndefined();
+    expect(await readBranch({ exec: async () => Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })) }, 'c', undefined, onBranch)).toBeUndefined();
+  });
+
+  it('runs every Git call in the C locale, whatever locale the caller has', () => {
+    const root = tempDir();
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    const log = path.join(root, 'log');
+    // A stub of git that records its locale variables and fails (exit code 1).
+    fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s %s\\n' "\${LC_ALL-unset}" "\${LANG-unset}" >> '${log}'\nexit 1\n`, { mode: 0o755 });
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(repo);
+    const [, ...args] = scriptCommand('branch', [repo]);
+    const result = spawnSync('/bin/sh', args, {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
+    });
+    // Exit code 1 of `git symbolic-ref -q` is a detached HEAD.
+    expect(result).toMatchObject({ status: 0, stdout: '\n' });
+    // Review round 1 of PR #124 (A, L-2): changed expectation, one read of HEAD (before: two, the second for a Git before
+    // 2.22).
+    expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual(['C C']);
+  });
+});
+
 describe.skipIf(process.getuid?.() !== 0)('review round 10 (D10-2, D10-3): the ownership fix in the paths that other services mount, with real tools as root', () => {
   function run(repo: string, user: string, folders: string[]): void {
-    const [file, ...args] = ownershipFixCommand(repo, user, folders);
+    const [file, ...args] = ownershipFix(repo, user, folders);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -499,7 +722,7 @@ describe('review round 11 (G3, G5): the list of the paths of the services, bound
     const repo = path.join(tempDir(), 'api');
     fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
     fs.writeFileSync(path.join(repo, 'src', 'a.ts'), 'x');
-    const [, ...args] = ownershipFixCommand(repo, os.userInfo().username, Array.from({ length: MAX_SERVICE_FOLDERS }, (_, i) => `${repo}/data/host-${i}`));
+    const [, ...args] = ownershipFix(repo, os.userInfo().username, Array.from({ length: MAX_SERVICE_FOLDERS }, (_, i) => `${repo}/data/host-${i}`));
     const started = performance.now();
     const result = spawnSync('dash', args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
@@ -578,7 +801,7 @@ describe('review round 12 (P12-2): the ownership fix resolves the paths of the s
     fs.mkdirSync(bin, { recursive: true });
     fs.writeFileSync(path.join(bin, 'id'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'find'), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o755 });
-    const [file, ...args] = ownershipFixCommand(repo, 'someone', folders);
+    const [file, ...args] = ownershipFix(repo, 'someone', folders);
     const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -656,7 +879,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 12 (D12-2): the ownershi
     for (const file of ['.pgdata', '.pgdata/base', '.pgdata/base/1', '.pgdata/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
     fs.chownSync(path.join(repo, 'node_modules/.other'), 1234, 1234);
     // The paths as withDevMountFolders adds them (devMountFolders of the mounts of the dev container).
-    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.pgdata`, `${repo}/node_modules`]);
+    const [file, ...args] = ownershipFix(repo, 'nobody', [`${repo}/.pgdata`, `${repo}/node_modules`]);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -693,7 +916,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 13 (D13-1, D13-3): the o
   }
 
   function fixAll(repo: string, folders: string[], loop = false): void {
-    const [file, ...args] = ownershipFixCommand(repo, 'nobody', folders);
+    const [file, ...args] = ownershipFix(repo, 'nobody', folders);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     if (!loop) {
       expect(result.stderr).toBe('');
@@ -799,7 +1022,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 11 (G5): over the bound,
     for (const file of ['data/host-7', 'data/host-7/PG_VERSION', 'data/host-7/base', 'data/host-7/base/1']) fs.chownSync(path.join(repo, file), 999, 999);
     fs.chownSync(path.join(repo, 'other/f'), 1234, 1234);
     const folders = Array.from({ length: MAX_SERVICE_FOLDERS + 1 }, (_, i) => `${repo}/data/host-${i + 1000}`);
-    const [file, ...args] = ownershipFixCommand(repo, 'nobody', folders);
+    const [file, ...args] = ownershipFix(repo, 'nobody', folders);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
@@ -809,7 +1032,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 11 (G5): over the bound,
     expect(uidOf(path.join(repo, 'other/f'))).toBe(1234);
     // The same with 'repository' (Environment.serviceFoldersOverflow).
     fs.chownSync(path.join(repo, 'top.txt'), 0, 0);
-    const [again, ...againArgs] = ownershipFixCommand(repo, 'nobody', 'repository');
+    const [again, ...againArgs] = ownershipFix(repo, 'nobody', 'repository');
     expect(spawnSync(again, againArgs, { encoding: 'utf8' }).status).toBe(0);
     expect(uidOf(path.join(repo, 'top.txt'))).toBe(nobody);
     expect(uidOf(path.join(repo, 'data/host-7/PG_VERSION'))).toBe(999);
@@ -829,14 +1052,14 @@ describe.skipIf(process.getuid?.() !== 0)('review round 15 (K4 = D15-2): a mount
     for (const file of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) fs.chownSync(path.join(repo, file), 999, 999);
     fs.chownSync(path.join(repo, '.git/objects/ab/cd'), 1234, 1234);
     // The paths as withDevMountFolders passes them (devMountFolders of the mounts of the dev container), with gitPaths.
-    const [file, ...args] = ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`], true);
+    const [file, ...args] = ownershipFix(repo, 'nobody', [`${repo}/.git/pg`], true);
     const result = spawnSync(file, args, { encoding: 'utf8' });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     for (const name of ['.git/pg', '.git/pg/base', '.git/pg/base/1', '.git/pg/PG_VERSION']) expect(uidOf(path.join(repo, name)), name).toBe(999);
     for (const name of ['.', '.git', '.git/HEAD', '.git/objects', '.git/objects/ab', '.git/objects/ab/cd', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
     // Without gitPaths (the records of the services), the path in .git is dropped as before (review round 10, D10-3).
-    expect(ownershipFixCommand(repo, 'nobody', [`${repo}/.git/pg`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repo, 'nobody']);
+    expect(ownershipFix(repo, 'nobody', [`${repo}/.git/pg`])).toEqual(['sh', '-c', OWNERSHIP_FIX_SCRIPT, 'sh', repo, 'nobody']);
   });
 });
 
@@ -865,7 +1088,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 16 (L2 = D16-2): a mount
   it('keeps the owner of the data behind the link, when the target of the mount names the link (probe of D16-2)', () => {
     const repo = repository();
     // The target of the mount as withDevMountFolders passes it: marked as a mount (before: 999 -> nobody).
-    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`], new Set([`${repo}/data`])));
+    run(ownershipFix(repo, 'nobody', [`${repo}/data`], new Set([`${repo}/data`])));
     for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(999);
     for (const name of ['.git/HEAD', '.git/objects/x', 'src/a.ts']) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
   });
@@ -876,7 +1099,7 @@ describe.skipIf(process.getuid?.() !== 0)('review round 16 (L2 = D16-2): a mount
     fs.writeFileSync(path.join(repo, 'cache/c'), 'x');
     fs.chownSync(path.join(repo, 'cache/c'), 999, 999);
     // `data` is a path of the services (a record), `cache` the target of a mount of the dev container, in one list.
-    run(ownershipFixCommand(repo, 'nobody', [`${repo}/data`, `${repo}/cache`], new Set([`${repo}/cache`])));
+    run(ownershipFix(repo, 'nobody', [`${repo}/data`, `${repo}/cache`], new Set([`${repo}/cache`])));
     expect(uidOf(path.join(repo, 'cache/c'))).toBe(999);
     // The real path of the record lies in .git: not protected (review round 10, D10-3), as before.
     for (const name of PG) expect(uidOf(path.join(repo, name)), name).toBe(nobody);
@@ -1110,7 +1333,8 @@ describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs 
     expect(lines[1]).toBe('export LC_ALL=C LANG=C');
     // Set in the script itself, never as an argument or through `-e`: the command is the script and its parameters.
     // user decision 2026-10-02: Delete runs no Git (the script has one mode, the poll mode; no `complete` argument).
-    expect(gitSummaryCommand('/workspaces/api')).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
+    // Plan step 11I (PR B): changed expectation, the command of the registry (gitSummaryCommand is removed), the same one.
+    expect(scriptCommand('gitSummary', ['/workspaces/api'])).toEqual(['sh', '-c', GIT_SUMMARY_SCRIPT, 'sh', '/workspaces/api']);
   });
 
   it('hardening (LC_ALL): every Git call of the script sees LC_ALL=C and LANG=C, whatever locale the caller has', () => {
@@ -1123,7 +1347,7 @@ describe('hardening (LC_ALL), review round 2 of PR #84: GIT_SUMMARY_SCRIPT runs 
     const repo = path.join(root, 'repo');
     fs.mkdirSync(repo);
     // user decision 2026-10-02: Delete runs no Git (only the poll mode is left; before: also the complete mode).
-    const [file, ...args] = gitSummaryCommand(repo);
+    const [file, ...args] = scriptCommand('gitSummary', [repo]);
     const result = spawnSync(file, args, {
       encoding: 'utf8',
       env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, LC_ALL: 'de_DE.UTF-8', LANG: 'de_DE.UTF-8', LANGUAGE: 'de' },
@@ -1167,7 +1391,7 @@ describe.skipIf(!hasGit || !isRoot || !hasSetpriv)('GIT_SUMMARY_SCRIPT as the re
   }
 
   function runAsOwner(repo: string): { status: number | null; stdout: string; stderr: string } {
-    const [file, ...args] = gitSummaryCommand(repo);
+    const [file, ...args] = scriptCommand('gitSummary', [repo]);
     const result = spawnSync('setpriv', ['--reuid', '1000', '--regid', '1000', '--clear-groups', '--', file, ...args], {
       encoding: 'utf8',
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1' },

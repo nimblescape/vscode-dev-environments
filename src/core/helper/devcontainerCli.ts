@@ -85,7 +85,8 @@ export const SKIP_POST_CREATE_ARG = '--skip-post-create';
  * else comes from the label devcontainer.metadata of the environment image).
  * `--update-remote-user-uid-default never`: the "local" user of the CLI is root in the helper, so a UID update is
  * meaningless, and it would build an additional image `<name>-uid` at each container creation. The files of the
- * volume get their owner through ownershipFixCommand instead.
+ * volume get their owner through the ownership fix instead (the script `ownershipFix` of the script registry; plan step
+ * 11I, PR B).
  * SKIP_POST_CREATE_ARG: the lifecycle commands run with run-user-commands after the token was written.
  */
 export function upArgs(p: {

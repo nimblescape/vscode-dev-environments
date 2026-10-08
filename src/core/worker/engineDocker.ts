@@ -193,17 +193,23 @@ export class EngineDocker implements EnvironmentDocker {
 
   /**
    * `docker exec` over the Engine API (review round 1 of PR #119, A-L1: the CLI adapter refuses a secret input since plan
-   * step 11I1, PR B2; the token is written only here). `secretInput` is a secret that the operation holds (the worker got it through its request,
-   * plan step 11A); it is the standard input of the process, never an argument.
+   * step 11I1, PR B2; the token is written only here). `secretInputName` names a secret that the operation holds (the
+   * worker got it through its request, plan step 11A); it is the standard input of the process, never an argument. Plan
+   * step 11I (PR B): by its name, as the port takes it (before, the value, which had to be the token of the operation).
    */
   async exec(
     container: string,
     command: readonly string[],
-    options: { user?: string; workdir?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number } = {},
+    options: { user?: string; workdir?: string; input?: string; secretInputName?: typeof SECRET_TOKEN; signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<RunResult> {
-    if (options.input !== undefined && options.secretInput !== undefined) throw new Error('A docker exec has either an input or a secret input.');
+    if (options.input !== undefined && options.secretInputName !== undefined) throw new Error('A docker exec has either an input or a secret input.');
     // Review round 1 of 11B3a (A-R1-9): a secret input is the token that the operation holds, passed on by its name.
-    if (options.secretInput !== undefined && this.secretOf(SECRET_TOKEN) !== options.secretInput) {
+    // Plan step 11I (PR B): no other secret of the operation (a registry login) ever goes into a container, and a token
+    // that the operation does not hold is refused before anything is sent. Review round 1 of PR #124 (A, L-1): the token
+    // that is sent is checked here, where it is sent (not only the token of the pipeline's session): a value that is
+    // empty or holds white space is refused too.
+    const token = options.secretInputName !== undefined ? this.secretOf(SECRET_TOKEN) : undefined;
+    if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || !token || /\s/.test(token))) {
       throw new EngineError('A docker exec with a secret input needs it as the token secret of the operation.', 0);
     }
     try {
@@ -211,7 +217,7 @@ export class EngineDocker implements EnvironmentDocker {
         ...(options.user ? { user: options.user } : {}),
         ...(options.workdir ? { workdir: options.workdir } : {}),
         ...(options.input !== undefined ? { input: options.input } : {}),
-        ...(options.secretInput !== undefined ? { secretInputName: SECRET_TOKEN } : {}),
+        ...(options.secretInputName !== undefined ? { secretInputName: SECRET_TOKEN } : {}),
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
       });

@@ -4,21 +4,24 @@
 
 // Unit 15: the token of the owner account only in the memory of the dev container (TOKEN_WRITE_SCRIPT,
 // TOKEN_REMOVE_SCRIPT, writeContainerToken). Plan step 11B1 runs TOKEN_REMOVE_SCRIPT as a flow of the worker
-// (src/core/worker/tokenRemoveFlow.ts), so the removal through `docker exec` and its tests are gone with it.
+// (src/core/worker/tokenRemoveFlow.ts), so the removal through `docker exec` and its tests are gone with it. Plan step 11I
+// (PR B): writeContainerToken is gone too; the pipeline runs the script `tokenWrite` of the registry itself
+// (EnvironmentService.writeGitToken, tested in environmentService.test.ts), and this file keeps the tests of the scripts.
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER, TOKEN_TMPFS } from '../names';
+import { SECRET_TOKEN } from '../helperChannel/protocol';
+import { CONTAINER_SCRIPTS, scriptCommand } from '../worker/containerScripts';
 import {
   TOKEN_REMOVE_SCRIPT,
   TOKEN_TMPFS_SUPER_OPTIONS,
   TOKEN_WRITE_SCRIPT,
-  tokenWriteCommand,
-  writeContainerToken,
-  type ContainerExec,
+  tokenLogin,
+  tokenRunMessage,
 } from './containerToken';
 
 const TOKEN = 'gho_secret_value';
@@ -51,7 +54,10 @@ describe('the names of unit 15', () => {
   });
 
   it('commands: the scripts with their arguments, never the token', () => {
-    expect(tokenWriteCommand('dev', 'octo')).toEqual(['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', 'dev', 'octo']);
+    // Plan step 11I (PR B): changed expectation, the command of the script `tokenWrite` of the registry (the builder
+    // tokenWriteCommand, which built the same command, is removed); the token is the secret that the entry names.
+    expect(scriptCommand('tokenWrite', ['dev', 'octo'])).toEqual(['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', 'dev', 'octo']);
+    expect(CONTAINER_SCRIPTS.tokenWrite.secretInputName).toBe(SECRET_TOKEN);
   });
 });
 
@@ -683,40 +689,22 @@ function execResult(partial: Partial<RunResult> = {}): RunResult {
   return { exitCode: 0, stdout: '', stderr: '', timedOut: false, ...partial };
 }
 
-describe('writeContainerToken', () => {
-  it('runs the script as root with the token on stdin only, and returns its output', async () => {
-    const exec = vi.fn<ContainerExec>(async () => execResult({ stdout: 'The GitHub token of the environment is in /run/devenv.\n' }));
-    const output = await writeContainerToken(exec, { container: 'c1', user: 'dev', token: TOKEN, login: 'scalarion', timeoutMs: 1000 });
-    expect(output).toBe('The GitHub token of the environment is in /run/devenv.');
-    expect(exec).toHaveBeenCalledTimes(1);
-    const [container, command, options] = exec.mock.calls[0];
-    expect(container).toBe('c1');
-    expect(command).toEqual(tokenWriteCommand('dev', 'scalarion'));
-    // Plan step 6, PR C (Q4 of 2026-10-01): changed expectation (before: `input: TOKEN`): the token is the secret input of
-    // the call, which only the worker runs (EngineDocker.exec; plan step 11I1, PR B2), never a plain input.
-    expect(options).toMatchObject({ user: 'root', secretInput: TOKEN, timeoutMs: 1000 });
-    expect(options).not.toHaveProperty('input');
-    expect(command.some((arg) => arg.includes(TOKEN))).toBe(false);
+// Plan step 11I (PR B): the tests of writeContainerToken (removed: the pipeline runs the script `tokenWrite` of the registry
+// itself) moved to environmentService.test.ts (the call, the masked output and failure, the refused token); what it gave
+// the script of the login and how it masked a text stay here, as the pipeline uses them.
+describe('the login and the masked text of the token write', () => {
+  it.each(['', '-octo', '_x', 'octo cat', 'octo"', 'a: b'])('passes no invalid GitHub login (%j): gh is signed in nowhere', (login) => {
+    // Plan step 11I (PR B): changed expectation (before: through writeContainerToken), the login that the pipeline gives
+    // the script `tokenWrite` (tokenLogin), and its command.
+    expect(tokenLogin(login)).toBe('');
+    expect(scriptCommand('tokenWrite', ['dev', tokenLogin(login)])).toEqual(['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', 'dev', '']);
   });
 
-  it.each(['', '-octo', '_x', 'octo cat', 'octo"', 'a: b'])('passes no invalid GitHub login (%j): gh is signed in nowhere', async (login) => {
-    const exec = vi.fn<ContainerExec>(async () => execResult());
-    await writeContainerToken(exec, { container: 'c1', user: 'dev', token: TOKEN, login });
-    expect(exec.mock.calls[0][1]).toEqual(tokenWriteCommand('dev', ''));
-  });
-
-  it('throws the reason without the token when the script fails', async () => {
-    const exec = vi.fn<ContainerExec>(async () => execResult({ exitCode: 3, stderr: `/run/devenv is not a tmpfs mount of the container. ${TOKEN}\n` }));
-    const error = await writeContainerToken(exec, { container: 'c1', user: 'dev', token: TOKEN, login: 'octo' }).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toContain('is not a tmpfs mount');
-    expect((error as Error).message).not.toContain(TOKEN);
-  });
-
-  it('refuses an empty token before any Docker call', async () => {
-    const exec = vi.fn<ContainerExec>(async () => execResult());
-    await expect(writeContainerToken(exec, { container: 'c1', user: 'dev', token: '', login: 'octo' })).rejects.toThrow('No valid GitHub token.');
-    expect(exec).not.toHaveBeenCalled();
+  it('keeps a GitHub login, and masks the token in the text of a run', () => {
+    expect(tokenLogin('scalarion')).toBe('scalarion');
+    expect(tokenRunMessage(execResult({ exitCode: 3, stderr: `/run/devenv is not a tmpfs mount of the container. ${TOKEN}\n` }), TOKEN)).toBe(
+      '/run/devenv is not a tmpfs mount of the container. ***',
+    );
+    expect(tokenRunMessage(execResult({ exitCode: 5 }), TOKEN)).toBe('exit code 5');
   });
 });
-

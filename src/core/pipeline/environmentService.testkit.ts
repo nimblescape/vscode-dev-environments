@@ -39,7 +39,7 @@ import {
 } from '../names';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
-import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, parseStopParams, parseWindowStateParams } from '../helperChannel/protocol';
+import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, SECRET_TOKEN, parseStopParams, parseWindowStateParams } from '../helperChannel/protocol';
 import { EngineDocker } from '../worker/engineDocker';
 import { windowStateFlow } from '../worker/windowStateFlow';
 import { readEnvironmentStates } from './refreshStates';
@@ -337,14 +337,23 @@ export class FakeDocker implements EnvironmentDocker {
     }
   }
 
+  /**
+   * Plan step 11I (PR B): the secrets of the operation by their names, as EngineDocker reads them (`secretOf`); the
+   * harness gives the token of the session (Harness.token).
+   */
+  secretOf: (name: string) => string | undefined = () => undefined;
+
   async exec(
     container: string,
     command: readonly string[],
-    options: { user?: string; signal?: AbortSignal; timeoutMs?: number; input?: string; secretInput?: string } = {},
+    options: { user?: string; signal?: AbortSignal; timeoutMs?: number; input?: string; secretInputName?: typeof SECRET_TOKEN } = {},
   ): Promise<RunResult> {
-    // Plan step 6, PR C (Q4): a secret input (the token) is recorded as the input, marked `secret`.
-    const input = options.secretInput ?? options.input;
-    this.execs.push({ container, command, user: options.user, signal: options.signal, ...(input !== undefined ? { input } : {}), ...(options.secretInput !== undefined ? { secret: true as const } : {}) });
+    // Plan step 6, PR C (Q4): a secret input (the token) is recorded as the input, marked `secret`. Plan step 11I (PR B):
+    // the exec names it (secretInputName), as EngineDocker takes it, which refuses a token that the operation does not hold.
+    const secret = options.secretInputName === undefined ? undefined : this.secretOf(options.secretInputName);
+    if (options.secretInputName !== undefined && secret === undefined) throw new Error('A docker exec with a secret input needs it as the token secret of the operation.');
+    const input = secret ?? options.input;
+    this.execs.push({ container, command, user: options.user, signal: options.signal, ...(input !== undefined ? { input } : {}), ...(options.secretInputName !== undefined ? { secret: true as const } : {}) });
     // Review round 11 (G3): the check of the recorded paths of the services prints those that exist.
     const existing =
       command[2] === EXISTING_PATHS_SCRIPT
@@ -1569,6 +1578,9 @@ export function createHarness(overrides: Partial<EnvironmentServiceDeps & Enviro
     clock,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   } as Omit<Harness, 'service'> as Harness;
+  // Plan step 11I (PR B): the token of the operation is the token of the session (in the worker, both are the secret
+  // `token` of its request), so the token write by its name gets the token that getToken gives.
+  docker.secretOf = (name) => (name === SECRET_TOKEN ? h.token : undefined);
 
   const startDocker: DockerStarter = async ({ onStarting, signal }) => {
     h.dockerStarts++;

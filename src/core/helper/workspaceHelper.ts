@@ -751,8 +751,8 @@ export class WorkspaceHelper {
   /**
    * Writes the Git and Docker configuration of the dev container into the volume (GIT_FILES_SCRIPT, concept section 9
    * "Git inside the container"): the step gitFiles of the batch helper (root). Unit 15: no token; the token
-   * and the sign-in of the GitHub CLI go into the memory of the dev container after its start (writeContainerToken,
-   * ./containerToken.ts). Throws CommandError.
+   * and the sign-in of the GitHub CLI go into the memory of the dev container after its start (the script `tokenWrite`
+   * of the script registry, TOKEN_WRITE_SCRIPT of ./containerToken.ts; plan step 11I, PR B). Throws CommandError.
    */
   async prepareGit(p: {
     volumeName: string;

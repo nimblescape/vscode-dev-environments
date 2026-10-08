@@ -10,9 +10,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { writeContainerToken, type ContainerExec } from '../../src/core/helper/containerToken';
+import { tokenRunMessage } from '../../src/core/helper/containerToken';
+import { SECRET_TOKEN } from '../../src/core/helperChannel/protocol';
 import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS } from '../../src/core/names';
 import type { Environment } from '../../src/core/types';
+import { runScript } from '../../src/core/worker/containerScripts';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
 import { cliEngine } from './cliEngine';
 import { DUMMY_TOKEN, dockerTestContext } from './harness';
@@ -31,14 +33,6 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     for (const name of created.containers) cli.run(['rm', '-f', '-v', name]);
     for (const name of created.volumes) cli.run(['volume', 'rm', name]);
   });
-
-  const exec: ContainerExec = async (container, command, options) => {
-    // Plan step 6, PR C (Q4): the token write passes the token as the secret input of the call; this stand-in for the
-    // worker's `docker exec -i` writes it to standard input as the worker does.
-    const input = options.secretInput ?? options.input;
-    const result = cli.run(['exec', ...(input === undefined ? [] : ['-i']), ...(options.user ? ['-u', options.user] : []), container, ...command], input);
-    return { exitCode: result.code ?? -1, stdout: result.out, stderr: result.err, timedOut: false };
-  };
 
   /** A running container of the base image with the tmpfs of the token and `args`, as the override configuration starts it. */
   function start(args: string[]): string {
@@ -78,9 +72,19 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     return found.out.split('\n').filter((line) => line !== '');
   }
 
-  const write = (container: string) => writeContainerToken(exec, { container, user: USER, token: DUMMY_TOKEN, login: 'devenv-test', timeoutMs: 30_000 });
   // Plan step 11B1: the removal is a flow of the worker; here it runs against the real engine through the port of the tests.
-  const engine = cliEngine(cli);
+  // Plan step 11I (PR B): the port holds the token as the secret of the operation, as the worker does.
+  const engine = cliEngine(cli, { [SECRET_TOKEN]: DUMMY_TOKEN });
+  /**
+   * Plan step 11I (PR B): the write as the pipeline runs it (EnvironmentService.writeGitToken, in place of the removed
+   * writeContainerToken): the script `tokenWrite` of the registry as root, the token as the secret of the operation by its
+   * name (cliEngine writes it to the standard input of `docker exec -i`, as the worker does); a failure throws its reason
+   * without the token.
+   */
+  const write = async (container: string): Promise<void> => {
+    const result = await runScript(engine, container, 'tokenWrite', [USER, 'devenv-test'], { user: 'root', timeoutMs: 30_000 });
+    if (result.exitCode !== 0) throw new Error(tokenRunMessage(result, DUMMY_TOKEN));
+  };
   const remove = (container: string) =>
     removeTokenFlow({
       environmentId: ENVIRONMENT_ID,

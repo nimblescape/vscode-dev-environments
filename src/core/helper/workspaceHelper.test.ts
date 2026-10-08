@@ -1869,8 +1869,9 @@ describe('WorkspaceHelper.clone', () => {
 describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the container")', () => {
   const identity = { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' };
 
-  // unit 15: prepareGit gets no token any more (the token goes into the memory of the dev container after its start,
-  // writeContainerToken, tested in containerToken.test.ts): no stdin, no tmpfs, and no login argument.
+  // unit 15: prepareGit gets no token any more (the token goes into the memory of the dev container after its start;
+  // plan step 11I, PR B: the script `tokenWrite` of the registry, tested in environmentService.test.ts and
+  // containerToken.test.ts): no stdin, no tmpfs, and no login argument.
   it('runs without the token, as the step gitFiles', async () => {
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step gitFiles of the batch helper (root, as before; the
     // per-step mounts and `--network none` are gone, Q2 of 2026-10-01); still no token, no input and no variable.

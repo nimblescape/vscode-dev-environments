@@ -150,15 +150,25 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
   it('exec: the input or the secret input as standard input, never both', async () => {
     const seen: unknown[] = [];
     const engine: DockerEngine = { ...unusedEngine(), exec: async (c, command, options) => (seen.push([c, command, options]), { exitCode: 0, stdout: 'x', stderr: '', timedOut: false }) };
-    const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_TOKEN ? 'ghp_x' : undefined));
-    expect(await docker.exec('c', ['cat'], { user: 'root', secretInput: 'ghp_x', timeoutMs: 5 })).toEqual({ exitCode: 0, stdout: 'x', stderr: '', timedOut: false });
+    const docker = new EngineDocker(engine, silentLogger, (name) => (name === SECRET_TOKEN ? 'ghp_x' : name === SECRET_REGISTRY ? 'registry-password' : undefined));
+    // Plan step 11I (PR B): changed expectation, the secret input comes by its name (`secretInputName`, as the registry's
+    // runScript gives it), no longer as its value (`secretInput: 'ghp_x'`, which had to be the token of the operation).
+    expect(await docker.exec('c', ['cat'], { user: 'root', secretInputName: SECRET_TOKEN, timeoutMs: 5 })).toEqual({ exitCode: 0, stdout: 'x', stderr: '', timedOut: false });
     // Review round 1 of 11B3a (A-R1-9): the secret goes to the port by its name, never as its value.
     expect(seen[0]).toEqual(['c', ['cat'], { user: 'root', secretInputName: SECRET_TOKEN, timeoutMs: 5 }]);
     expect(JSON.stringify(seen[0])).not.toContain('ghp_x');
-    await expect(docker.exec('c', ['cat'], { input: 'a', secretInput: 'b' })).rejects.toThrow('either an input or a secret input');
-    // A secret input that is not the token of the operation is refused before anything is sent.
-    await expect(docker.exec('c', ['cat'], { secretInput: 'other' })).rejects.toThrow('token secret of the operation');
-    await expect(new EngineDocker(engine).exec('c', ['cat'], { secretInput: 'ghp_x' })).rejects.toThrow('token secret of the operation');
+    await expect(docker.exec('c', ['cat'], { input: 'a', secretInputName: SECRET_TOKEN })).rejects.toThrow('either an input or a secret input');
+    // A secret input that is not the token of the operation is refused before anything is sent. Plan step 11I (PR B):
+    // changed expectation, by its name: another secret of the operation (its registry login) never goes into a container,
+    // and the token is refused when the operation holds none.
+    await expect(docker.exec('c', ['cat'], { secretInputName: SECRET_REGISTRY as typeof SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
+    await expect(new EngineDocker(engine).exec('c', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
+    // Review round 1 of PR #124 (A, L-1): the token that the operation holds is checked where it is sent: empty, or with
+    // white space, it is refused before anything is sent.
+    for (const held of ['', 'ghp_a b', 'ghp_x\n']) {
+      await expect(new EngineDocker(engine, silentLogger, (name) => (name === SECRET_TOKEN ? held : undefined)).exec('c', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow('token secret of the operation');
+    }
+    expect(seen).toHaveLength(1);
     await docker.exec('c', ['id'], { input: 'plain', workdir: '/w' });
     expect(seen).toEqual([seen[0], ['c', ['id'], { input: 'plain', workdir: '/w' }]]);
   });

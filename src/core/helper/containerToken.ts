@@ -8,9 +8,12 @@
 // of an open (the container runs then), with the token on standard input only: never on a command line, in a variable
 // of the container, or in a log. They are gone when the container stops; a start without a window of the extension (the
 // Session Monitor, `docker start`) leaves the folder empty until the next open. Plan step 6, PR C (Q4 of 2026-10-01): the
-// token is the secret input of the call (`secretInput`), never a direct `docker exec` of the extension. Plan step 11I1,
-// PR B2: the worker writes it (EngineDocker.exec, the token as the secret of the operation). Plan step 11I2: the extension
-// has no `docker exec` at all (the CLI adapter ContainerAdapter, which refused a secret input, is removed). No vscode import.
+// token is the secret input of the call, never a direct `docker exec` of the extension. Plan step 11I1, PR B2: the worker
+// writes it (EngineDocker.exec, the token as the secret of the operation). Plan step 11I2: the extension has no `docker
+// exec` at all (the CLI adapter ContainerAdapter, which refused a secret input, is removed). Plan step 11I (PR B): the
+// scripts are the entries `tokenWrite` and `tokenRemove` of the script registry (src/core/worker/containerScripts.ts),
+// which builds their commands and gives `tokenWrite` the token as the secret of the operation by its name; the pipeline
+// writes it (EnvironmentService.writeGitToken). No vscode import.
 import type { RunResult } from '../ports';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER } from '../names';
 import { isGitHubLogin } from './containerGit';
@@ -315,46 +318,13 @@ if [ "$status" -eq 0 ]; then echo 'The GitHub token was removed from the contain
 exit "$status"
 `;
 
-/** `sh -c` command of TOKEN_WRITE_SCRIPT for `docker exec -i -u root`. The token goes on stdin. */
-export function tokenWriteCommand(user: string, login: string): string[] {
-  return ['sh', '-c', TOKEN_WRITE_SCRIPT, 'sh', user, login];
-}
-
 /** The login that TOKEN_WRITE_SCRIPT gets: `''` for a login that is no GitHub login (gh is then signed in nowhere). */
 export function tokenLogin(login: string): string {
   return isGitHubLogin(login) ? login : '';
 }
 
-/** `docker exec` as the pipeline and the controller use it (EnvironmentDocker.exec). */
-export type ContainerExec = (
-  container: string,
-  command: readonly string[],
-  options: { user?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number },
-) => Promise<RunResult>;
-
 /** The text of a failed run of the scripts, without the token. */
 export function tokenRunMessage(result: RunResult, token?: string): string {
   const text = (result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`;
   return token !== undefined && token.length >= 4 ? text.split(token).join('***') : text;
-}
-
-/**
- * Writes the token of the owner account and the sign-in of the GitHub CLI as `login` into TOKEN_FOLDER of the running dev
- * container `container`, for `user` (TOKEN_WRITE_SCRIPT, as root, token on stdin). Returns the output (without the
- * token); throws an Error with the reason (without the token) when the script fails.
- */
-export async function writeContainerToken(
-  exec: ContainerExec,
-  p: { container: string; user: string; token: string; login: string; signal?: AbortSignal; timeoutMs?: number },
-): Promise<string> {
-  if (!p.token || /\s/.test(p.token)) throw new Error('No valid GitHub token.');
-  const result = await exec(p.container, tokenWriteCommand(p.user, tokenLogin(p.login)), {
-    user: 'root',
-    // Plan step 6, PR C (Q4): the secret input of the call (in the worker: the secret of the operation).
-    secretInput: p.token,
-    signal: p.signal,
-    timeoutMs: p.timeoutMs,
-  });
-  if (result.exitCode !== 0) throw new Error(tokenRunMessage(result, p.token));
-  return tokenRunMessage({ ...result, stderr: '' }, p.token);
 }

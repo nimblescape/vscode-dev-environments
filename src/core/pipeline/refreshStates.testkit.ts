@@ -9,6 +9,7 @@
 // the branch of a container (execAnswer) stays, for the exec of fixtureEngine.
 import { mapContainerState } from '../docker/dockerObjects';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
+import { scriptCommand } from '../worker/containerScripts';
 import type { DockerEngine } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import type { EnvironmentStates, StateEnvironment } from './refreshStates';
@@ -81,8 +82,6 @@ const LABELLED_VOLUMES: Record<string, Record<string, string>> = {
 /** A volume without the labels, created outside of the extension. */
 const UNLABELLED_VOLUMES = new Set(['devenv-web-vol']);
 
-const BRANCH_COMMAND = ['git', '-c', 'safe.directory=*', '-C'];
-
 interface FixtureAnswer {
   exitCode: number;
   stdout: string;
@@ -91,15 +90,19 @@ interface FixtureAnswer {
 
 /**
  * The answer of the engine of the fixture to a process `command` as `user` in `container` (as `docker exec [-u <user>]
- * <container> <command>` answered it): the branch of a running dev container. Anything else fails (exit code 125).
+ * <container> <command>` answered it): the branch of a running dev container. Anything else fails (exit code 125). Plan
+ * step 11I (PR B): changed expectation, the branch is read by the script `branch` of the registry with the folder as its
+ * argument (before: `git -c safe.directory=* -C <folder> branch --show-current`).
  */
 function execAnswer(container: string, user: string | undefined, command: readonly string[]): FixtureAnswer {
   const ok = (stdout: string): FixtureAnswer => ({ exitCode: 0, stdout, stderr: '' });
-  if (command.slice(0, 4).join(' ') !== BRANCH_COMMAND.join(' ') || command.slice(5).join(' ') !== 'branch --show-current') {
+  const folder = command[4] ?? '';
+  const branchRead = scriptCommand('branch', [folder]);
+  if (command.length !== branchRead.length || command.some((arg, index) => arg !== branchRead[index])) {
     return { exitCode: 125, stdout: '', stderr: 'unexpected exec' };
   }
   if (container === 'devenv-api') {
-    return user === 'node' && command[4] === '/workspaces/api' ? ok('feature/x\n') : { exitCode: 125, stdout: '', stderr: 'wrong user' };
+    return user === 'node' && folder === '/workspaces/api' ? ok('feature/x\n') : { exitCode: 125, stdout: '', stderr: 'wrong user' };
   }
   if (container === 'devenv-detached') return ok('\n');
   if (container === 'devenv-git-fails') return { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository\n' };

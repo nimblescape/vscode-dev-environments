@@ -51,6 +51,7 @@ import {
 import type { DeleteConfirmation } from '../../src/core/pipeline/deleteCheck';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
+import { scriptCommand } from '../../src/core/worker/containerScripts';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
 import { cliEngine } from './cliEngine';
 import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
@@ -610,6 +611,9 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     const after = await registry.get(environmentId);
     expect(after?.buildRecord).toEqual(before?.buildRecord);
     expect(after?.gitSummary).toMatchObject({ branch: 'main', uncommittedFiles: 1 });
+    // Review round 1 of PR #124 (A, T-1): the branch script of the registry, as readBranch runs it, in this container
+    // (Alpine, BusyBox ash): the summary above may still be an earlier record, this read is of now.
+    expect(cli.ok(['exec', '-u', REMOTE_USER, containerName, ...scriptCommand('branch', [FOLDER])]).trim()).toBe('main');
     expect(cli.image(`${imageRepository}:2`)).toBeUndefined();
     expect(untrackedFileKept()).toBe(true);
     expect(result.remoteWorkspaceFolder).toBe(FOLDER);

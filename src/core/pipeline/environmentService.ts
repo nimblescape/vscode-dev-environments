@@ -11,6 +11,8 @@ import { type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import type { ContainerInfo, ImageInfo, ImageInspection, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
+import type { SECRET_TOKEN } from '../helperChannel/protocol';
+import { runScript, scriptCommand } from '../worker/containerScripts';
 import { isDevContainer } from '../worker/dockerEngine';
 import {
   dockerHostField,
@@ -36,13 +38,11 @@ import {
 import {
   MAX_SERVICE_FOLDERS,
   boundServiceFolders,
-  existingPathsCommand,
-  gitSummaryCommand,
-  ownershipFixCommand,
   parseExistingPaths,
   isNumericId,
   parseGitSummaryOutput,
   serviceFolderPaths,
+  servicePathArguments,
   type DevMountPaths,
   type ServiceFolders,
 } from '../git/gitSummary';
@@ -81,12 +81,11 @@ import {
 import {
   containerGitSupport,
   gitIdentity,
-  homeGitConfigCommand,
   isGitHubLogin,
   type GitHubViewer,
   type GitIdentity,
 } from '../helper/containerGit';
-import { writeContainerToken } from '../helper/containerToken';
+import { tokenLogin, tokenRunMessage } from '../helper/containerToken';
 import { currentBatchScope, runWithBatchScope } from '../helper/batchScope';
 import {
   DevcontainerCommandError,
@@ -336,11 +335,16 @@ export interface EnvironmentDocker {
   renameContainer(nameOrId: string, newName: string): Promise<void>;
   /** Removes the container, also a running one. A missing container is not an error. */
   removeContainer(nameOrId: string): Promise<void>;
-  /** `docker exec`; resolves also for a non-zero exit code. `secretInput` is the token that the operation holds. */
+  /**
+   * `docker exec`; resolves also for a non-zero exit code. Plan step 11I (PR B): the pipeline runs only the scripts of
+   * the registry through it (runScript, src/core/worker/containerScripts.ts). `secretInputName` names the secret of the
+   * operation that is the standard input of the process, as DockerEngine.exec takes it (a name, never a value): only the
+   * token (SECRET_TOKEN), which the operation must hold.
+   */
   exec(
     container: string,
     command: readonly string[],
-    options?: { user?: string; workdir?: string; input?: string; secretInput?: string; signal?: AbortSignal; timeoutMs?: number },
+    options?: { user?: string; workdir?: string; input?: string; secretInputName?: typeof SECRET_TOKEN; signal?: AbortSignal; timeoutMs?: number },
   ): Promise<RunResult>;
   /** Plan step 10A: starts the container with the full ID `id`. */
   startContainer(id: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<void>;
@@ -594,12 +598,6 @@ const IMAGE_INSPECT_TIMEOUT_MS = 60_000;
 const GIT_EXEC_TIMEOUT_MS = 30_000;
 const OWNERSHIP_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_START_TIMEOUT_MS = 60_000;
-/**
- * Recreate offer: the check of a running container as the remote user (runningContainerFault). `docker exec -u` fails
- * when /etc/passwd lacks the user, and the shell (which the Dev Container CLI and the Dev Containers extension need) must
- * start.
- */
-const CONTAINER_CHECK_COMMAND: readonly string[] = ['/bin/sh', '-c', 'exit 0'];
 // A helper container that a cancel removes can hold the volume for a moment.
 const VOLUME_REMOVE_ATTEMPTS = 3;
 const VOLUME_REMOVE_DELAY_MS = 1_000;
@@ -3274,8 +3272,9 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * Recreate offer: `docker exec` of a shell as the remote user in the running container (the Dev Containers extension
-   * attaches as that user). The text of the failure when it names a damaged container (isDamagedContainer), otherwise
-   * `undefined`, also when the remote user is not known or the check itself fails (the open goes on as before).
+   * attaches as that user; plan step 11I (PR B): the script `check` of the registry). The text of the failure when it
+   * names a damaged container (isDamagedContainer), otherwise `undefined`, also when the remote user is not known or the
+   * check itself fails (the open goes on as before).
    */
   private async runningContainerFault(ctx: PipelineContext, container: ContainerInfo, loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
     // Review round 3 (F1): the user of the container itself (its label devcontainer.metadata, by which the Dev Containers
@@ -3286,7 +3285,7 @@ export class EnvironmentService extends OperationBase {
     if (user === undefined || ctx.helperUnavailable) return undefined;
     let text: string;
     try {
-      const result = await this.deps.docker.exec(container.id, CONTAINER_CHECK_COMMAND, { user, timeoutMs: BRANCH_EXEC_TIMEOUT_MS, signal: ctx.signal });
+      const result = await runScript(this.deps.docker, container.id, 'check', [], { user, timeoutMs: BRANCH_EXEC_TIMEOUT_MS, signal: ctx.signal });
       if (result.exitCode === 0 || result.timedOut) return undefined;
       text = `${result.stderr}\n${result.stdout}`.trim();
     } catch (error) {
@@ -4564,8 +4563,9 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * Review round 11 (G3): of `folders`, those that exist in the volume (EXISTING_PATHS_SCRIPT with `docker exec -u root`
-   * in the running dev container `container`); `undefined` when that fails (the caller keeps them all).
+   * Review round 11 (G3): of `folders`, those that exist in the volume (the script `existingPaths` of the registry,
+   * EXISTING_PATHS_SCRIPT, with `docker exec -u root` in the running dev container `container`); `undefined` when that
+   * fails (the caller keeps them all).
    */
   private async existingServiceFolders(ctx: PipelineContext, container: string, folders: readonly string[]): Promise<Set<string> | undefined> {
     const found = new Set<string>();
@@ -4582,7 +4582,7 @@ export class EnvironmentService extends OperationBase {
     }
     try {
       for (const batch of batches) {
-        const result = await this.deps.docker.exec(container, existingPathsCommand(batch), { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+        const result = await runScript(this.deps.docker, container, 'existingPaths', batch, { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
         if (result.exitCode !== 0) {
           this.logger.warn(`The recorded paths of the services of ${ctx.env.repository} could not be checked: ${(result.stderr || result.stdout).trim()}`);
           return undefined;
@@ -5058,10 +5058,13 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * Unit 15 (concept section 9 "Git inside the container"): the token of the owner account and the sign-in of the GitHub
-   * CLI as that account go into the tmpfs TOKEN_FOLDER of the running dev container (writeContainerToken: `docker exec
-   * -i -u root`, the token on stdin only), owned by `user`. They stay there while the container runs, also without a
-   * window, and are gone when it stops. A failure is a warning: the environment opens, but Git and the GitHub CLI in it
-   * cannot reach GitHub as the owner account.
+   * CLI as that account go into the tmpfs TOKEN_FOLDER of the running dev container (the script `tokenWrite` of the
+   * registry, TOKEN_WRITE_SCRIPT: `docker exec -i -u root`, the token on stdin only), owned by `user`. They stay there
+   * while the container runs, also without a window, and are gone when it stops. A failure is a warning: the environment
+   * opens, but Git and the GitHub CLI in it cannot reach GitHub as the owner account. Plan step 11I (PR B, the former
+   * writeContainerToken): the exec gets the token as the secret of the operation by its name (the entry's
+   * `secretInputName`), never as an argument or a value of the call; the token of the session is checked first, and is
+   * masked in the output and in the reason of a failure.
    */
   private async writeGitToken(ctx: PipelineContext, container: string, user: string): Promise<void> {
     const { token, account } = ctx.session;
@@ -5070,14 +5073,14 @@ export class EnvironmentService extends OperationBase {
       this.logger.warn(`The GitHub login ${JSON.stringify(account.login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
     }
     try {
-      const output = await writeContainerToken((c, command, options) => this.deps.docker.exec(c, command, options), {
-        container,
-        user,
-        token,
-        login: account.login,
+      if (!token || /\s/.test(token)) throw new Error('No valid GitHub token.');
+      const result = await runScript(this.deps.docker, container, 'tokenWrite', [user, tokenLogin(account.login)], {
+        user: 'root',
         signal: ctx.signal,
         timeoutMs: GIT_EXEC_TIMEOUT_MS,
       });
+      if (result.exitCode !== 0) throw new Error(tokenRunMessage(result, token));
+      const output = tokenRunMessage({ ...result, stderr: '' }, token);
       if (output !== '') this.logger.info(output);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;
@@ -5141,10 +5144,13 @@ export class EnvironmentService extends OperationBase {
     if (failure !== undefined) this.logger.warn(`The Git configuration of ${user} in the container could not be prepared: ${failure}`);
   }
 
-  /** HOME_GIT_CONFIG_SCRIPT for `user`, run as `runAs`. The reason of a failure, or `undefined`. */
+  /**
+   * HOME_GIT_CONFIG_SCRIPT (the script `homeGitConfig` of the registry) for `user`, run as `runAs`. The reason of a
+   * failure, or `undefined`.
+   */
   private async runHomeGitConfig(ctx: PipelineContext, container: string, user: string, runAs: string): Promise<string | undefined> {
     try {
-      const result = await this.deps.docker.exec(container, homeGitConfigCommand(user), {
+      const result = await runScript(this.deps.docker, container, 'homeGitConfig', [user], {
         user: runAs,
         signal: ctx.signal,
         timeoutMs: GIT_EXEC_TIMEOUT_MS,
@@ -5160,12 +5166,13 @@ export class EnvironmentService extends OperationBase {
    * Concept section 9: what Git of a new container supports of container-only Git (containerGitSupport). Git before 2.9
    * may use the forwarding credential helper of the Dev Containers extension (forwardingHelperReachesGit), so the user
    * gets a warning; Git 2.9 to 2.31 ignores GIT_CONFIG_GLOBAL and gets the configuration of the volume only through
-   * ~/.gitconfig, which is logged. A container without Git needs nothing. Never fails the open.
+   * ~/.gitconfig, which is logged. A container without Git needs nothing. Never fails the open. Plan step 11I (PR B): the
+   * script `gitVersion` of the registry (`git --version`).
    */
   private async checkGitVersion(ctx: PipelineContext, container: string, user: string): Promise<void> {
     let output: string;
     try {
-      const result = await this.deps.docker.exec(container, ['git', '--version'], {
+      const result = await runScript(this.deps.docker, container, 'gitVersion', [], {
         user,
         signal: ctx.signal,
         timeoutMs: BRANCH_EXEC_TIMEOUT_MS,
@@ -5357,14 +5364,15 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * Review round 14 (P14-1): the targets of the mounts of the workspace volume in the dev container that show their folder
-   * at its own canonical path (workspaceIdentityMounts), checked with `/proc/self/mountinfo` of the container
-   * (verifiedIdentityTargets). When it cannot be read, none: the mounts stay protected.
+   * at its own canonical path (workspaceIdentityMounts), checked with `/proc/self/mountinfo` of the container (the script
+   * `mountInfo` of the registry, as root; verifiedIdentityTargets). When it cannot be read, none: the mounts stay
+   * protected.
    */
   private async workspaceIdentities(ctx: PipelineContext, container: ContainerInfo | undefined): Promise<Set<string>> {
     const candidates = workspaceIdentityMounts(container, ctx.env);
     if (container === undefined || candidates.length === 0) return new Set();
     try {
-      const result = await this.deps.docker.exec(container.id, ['cat', '/proc/self/mountinfo'], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+      const result = await runScript(this.deps.docker, container.id, 'mountInfo', [], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
       if (result.exitCode === 0) return verifiedIdentityTargets(candidates, result.stdout);
       this.logger.info(`The mounts of the container of ${ctx.env.repository} could not be read: ${(result.stderr || result.stdout).trim()}`);
     } catch (error) {
@@ -5384,18 +5392,19 @@ export class EnvironmentService extends OperationBase {
    * of a service that mounts there, or a tmpfs; the fix walked it in full and gave its files (for example the data of a
    * database, uid 999) to the remote user. The helper sees only the folder of the volume. Such a mount can still hide the
    * token and the Git configuration in the dev container, which breaks only the Git authentication of the owner. IDs that
-   * are not decimal numbers skip the fix. A failure is logged, it does not fail the pipeline (as fixOwnership).
+   * are not decimal numbers skip the fix. A failure is logged, it does not fail the pipeline (as fixOwnership). Plan step
+   * 11I (PR B): the IDs by the scripts `userId` and `groupId` of the registry.
    */
   private async fixConfigOwnership(ctx: PipelineContext, container: string, user: string): Promise<void> {
     const folder = CONFIG_FOLDER;
     try {
       const ids: string[] = [];
-      for (const flag of ['-u', '-g']) {
-        const result = await this.deps.docker.exec(container, ['id', flag, user], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
+      for (const script of ['userId', 'groupId'] as const) {
+        const result = await runScript(this.deps.docker, container, script, [user], { user: 'root', signal: ctx.signal, timeoutMs: OWNERSHIP_TIMEOUT_MS });
         const id = result.stdout.trim();
         if (result.exitCode !== 0 || !isNumericId(id)) {
           this.logger.warn(
-            `The owner of the files in ${folder} could not be changed: \`id ${flag} ${user}\` in the container gave no user or group ID (${JSON.stringify((result.stderr || result.stdout).trim().slice(0, 200))}).`,
+            `The owner of the files in ${folder} could not be changed: \`${scriptCommand(script, [user]).join(' ')}\` in the container gave no user or group ID (${JSON.stringify((result.stderr || result.stdout).trim().slice(0, 200))}).`,
           );
           return;
         }
@@ -5423,7 +5432,12 @@ export class EnvironmentService extends OperationBase {
     }
   }
 
-  /** Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline. */
+  /**
+   * Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline.
+   * Plan step 11I (PR B): the script `ownershipFix` of the registry, as root, with the repository folder, the user, and
+   * the arguments of the paths of the services (servicePathArguments; `gitPaths` as in serviceFolderPaths, review round
+   * 15, K4, and round 16, L2).
+   */
   private async fixOwnership(
     ctx: PipelineContext,
     container: string,
@@ -5440,7 +5454,7 @@ export class EnvironmentService extends OperationBase {
           : '';
     this.logger.info(`Giving the files in ${folder} to ${user}${except}.`);
     try {
-      const result = await this.deps.docker.exec(container, ownershipFixCommand(folder, user, serviceFolders, gitPaths), {
+      const result = await runScript(this.deps.docker, container, 'ownershipFix', [folder, user, ...servicePathArguments(folder, serviceFolders, gitPaths)], {
         user: 'root',
         signal: ctx.signal,
         timeoutMs: OWNERSHIP_TIMEOUT_MS,
@@ -6548,7 +6562,10 @@ export class EnvironmentService extends OperationBase {
     return true;
   }
 
-  /** The Git summary from the running container, or `undefined` when Git is missing, fails, or `signal` aborts. */
+  /**
+   * The Git summary from the running container (the script `gitSummary` of the registry), or `undefined` when Git is
+   * missing, fails, or `signal` aborts.
+   */
   private async gitSummaryInContainer(
     container: string,
     user: string | undefined,
@@ -6556,7 +6573,7 @@ export class EnvironmentService extends OperationBase {
     signal?: AbortSignal,
   ): Promise<GitSummary | undefined> {
     try {
-      const result = await this.deps.docker.exec(container, gitSummaryCommand(folder), { user, timeoutMs: GIT_EXEC_TIMEOUT_MS, signal });
+      const result = await runScript(this.deps.docker, container, 'gitSummary', [folder], { user, timeoutMs: GIT_EXEC_TIMEOUT_MS, signal });
       if (result.exitCode !== 0) {
         this.logger.info(`The Git state in ${container} could not be read: ${(result.stderr || result.stdout).trim()}`);
         return undefined;
@@ -6568,7 +6585,10 @@ export class EnvironmentService extends OperationBase {
     }
   }
 
-  /** The branch (`null` for a detached HEAD), or `undefined` when Git is missing, fails, or `signal` aborts. */
+  /**
+   * The branch (`null` for a detached HEAD), or `undefined` when Git is missing, fails, or `signal` aborts. Plan step 11I
+   * (PR B): the one read of the branch (readBranch, the script `branch` of the registry), as the refresh reads it.
+   */
   private branchInContainer(container: string, user: string | undefined, folder: string, signal?: AbortSignal): Promise<string | null | undefined> {
     return readBranch(this.deps.docker, container, user, folder, signal);
   }
