@@ -121,6 +121,16 @@ function texts(value: unknown): string[] {
 }
 
 /**
+ * PR #126 review round 2 (A, L1): the name of a container in the list of the engine (`Names`, each with a leading `/`):
+ * its own name, not an alias of a legacy `--link` (`/<other>/<alias>`, which the engine may sort first), as `docker ps`
+ * shows it; the first one when all have a further `/`; '' when the list gives none.
+ */
+export function containerName(names: readonly string[]): string {
+  const plain = names.map((name) => name.replace(/^\//, ''));
+  return plain.find((name) => !name.includes('/')) ?? plain[0] ?? '';
+}
+
+/**
  * Plan step 11B1: the port over the Engine API of the worker's engine. `secretOf` gives the value of a secret that the
  * operation holds (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName) and
  * the login of a pull; the port of an operation is built with its own secrets (review round 1 of plan step 11B1, A-R1-3).
@@ -188,7 +198,7 @@ export function dockerEngine(
         if (typeof entry !== 'object' || entry === null || typeof entry.Id !== 'string' || entry.Id === '') continue;
         summaries.push({
           id: entry.Id,
-          name: (texts(entry.Names)[0] ?? '').replace(/^\//, ''),
+          name: containerName(texts(entry.Names)),
           state: typeof entry.State === 'string' ? entry.State : '',
           labels: toLabels(entry.Labels),
         });

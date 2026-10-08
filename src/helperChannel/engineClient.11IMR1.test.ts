@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { EngineError } from '../core/worker/dockerEngine';
 import { MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
-import { dockerEngine } from './engineClient';
+import { containerName, dockerEngine } from './engineClient';
 
 const ok = (value: unknown, status = 200): EngineAnswer => ({ status, body: typeof value === 'string' ? value : JSON.stringify(value), truncated: false });
 
@@ -72,5 +72,16 @@ describe('the bound of the answers of the lists (review round 1 of PR #126, F2)'
       ['/containers/json', undefined],
       ['/images/x%3A1/json', undefined],
     ]);
+  });
+});
+
+// PR #126 review round 2 (A, L1): the name of a container in the list is its own name, never an alias of a legacy
+// `--link` that the engine sorts first (the name goes into the log lines of the stops of the Session Monitor).
+describe('the name of a container in the list of the engine (PR #126 review round 2, A L1)', () => {
+  it('takes its own name before an alias of a legacy link, else the first one, else none', () => {
+    expect(containerName(['/aaa/db', '/devenv-api-db-1'])).toBe('devenv-api-db-1');
+    expect(containerName(['/devenv-api'])).toBe('devenv-api');
+    expect(containerName(['/aaa/db'])).toBe('aaa/db');
+    expect(containerName([])).toBe('');
   });
 });
