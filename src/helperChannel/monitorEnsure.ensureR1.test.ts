@@ -23,9 +23,6 @@ function contextOf() {
     progress: () => {},
     log: (text) => lines.push(text),
     output: () => {},
-    docker: async () => {
-      throw new Error('No Docker CLI call.');
-    },
   };
   return { context, controller, lines };
 }

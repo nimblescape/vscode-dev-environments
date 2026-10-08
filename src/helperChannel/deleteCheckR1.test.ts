@@ -59,9 +59,6 @@ function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
     progress: (...args: unknown[]) => void progress.push(args),
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('no Docker CLI');
-    },
   } as unknown as OperationContext;
   const engine: DockerEngine = {
     ...unusedEngine(),

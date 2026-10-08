@@ -20,6 +20,9 @@ export function unusedEngine(): DockerEngine {
     stop: unused('stop'),
     start: unused('start'),
     version: unused('version'),
+    // Plan step 11I (PR A): the identity of the engine and the prune of the probe and the sweep.
+    identity: unused('identity'),
+    pruneContainers: unused('pruneContainers'),
     inspect: unused('inspect'),
     containerIds: unused('containerIds'),
     images: unused('images'),

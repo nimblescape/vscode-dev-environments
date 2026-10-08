@@ -24,9 +24,6 @@ function run(options: { secrets?: Record<string, string>; ownHelper?: (abort: ()
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('no Docker CLI');
-    },
   };
   const engine: DockerEngine = {
     ...unusedEngine(),

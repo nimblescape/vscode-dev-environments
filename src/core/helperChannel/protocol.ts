@@ -21,9 +21,10 @@
 //      to sleep): it exits. The extension sends a ping every CHANNEL_PING_INTERVAL_MS while the channel is open.
 //   3. No operation for CHANNEL_SERVER_IDLE_EXIT_MS and none runs (the extension did not close it): it exits.
 //   4. `--rm` removes the container when the script ended; tini (the entry point of the image) passes signals on.
-// Before it exits, it cancels the operations that still run: their Docker calls end (SIGTERM, then SIGKILL), and the
-// batch helpers of their flows are removed by their session label (review round 1, S1: never by a name, so no container
-// that the operation did not start can be removed; src/helperChannel/batch.ts).
+// Before it exits, it cancels the operations that still run: their requests to the engine end (plan step 11I, PR A: the
+// script runs no Docker CLI of its own), and the batch helpers of their flows are stopped and removed by their session
+// label (review round 1, S1: never by a name, so no container that the operation did not start can be removed;
+// src/helperChannel/batch.ts).
 import { createHash, randomBytes } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
@@ -61,7 +62,11 @@ export const CHANNEL_PONG_TIMEOUT_MS = 30_000;
 export const CHANNEL_IDLE_CLOSE_MS = 10 * 60_000;
 /** The script exits when no operation came for this long and none runs (a backstop to CHANNEL_IDLE_CLOSE_MS). */
 export const CHANNEL_SERVER_IDLE_EXIT_MS = 15 * 60_000;
-/** The script ends a Docker call with SIGTERM, then after this time with SIGKILL. */
+/**
+ * A process of an operation ends with SIGTERM, then after this time with SIGKILL: a step of the batch helper, and the
+ * batch helper itself (its stop time). Plan step 11I (PR A): the script itself starts no process (before: its Docker
+ * calls too).
+ */
 export const CHANNEL_KILL_GRACE_MS = 5_000;
 /** Time limit of the removal of the containers of an operation by their label (the batch helper of a flow). */
 export const CHANNEL_CLEANUP_TIMEOUT_MS = 30_000;
@@ -174,7 +179,8 @@ export interface ProgressAnswer {
 
 /**
  * A line of the log of the operation `id` (user request 2026-09-28: the local log is as detailed as the work of the
- * helper): each Docker call that it runs with its exit code and duration, and what the operation reports.
+ * helper): what the operation reports. Plan step 11I (PR A): the script runs no Docker CLI call of its own, so it logs
+ * none (before: each one with its exit code and duration).
  */
 export interface LogAnswer {
   t: 'log';
@@ -590,66 +596,148 @@ export function channelLabelValue(script: string): string {
 // ---- The operations of step 1 ----
 
 // Plan step 11I1, PR B1: the operation `docker` (one Docker call relayed for the extension) is gone.
-/** `probe`: whether the Docker CLI of the container reaches its engine; the value is ProbeValue. */
+/**
+ * `probe`: whether the worker reaches the engine behind its socket, and which engine it is (plan step 5, PR A). Plan step
+ * 11I (PR A): over the port of the engine (the version and the identity that the Engine API answers), no Docker CLI of
+ * the worker. No parameters (parseProbeParams); the value is ProbeValue.
+ */
 export const OP_PROBE = 'probe';
 /**
  * Review round 4 (M1): `sweep` removes the channel containers of the engine that were created but never started (a
  * connection that broke between the create and the start of `docker run -i --rm`, which then never ends and is never
- * removed): `docker container prune` of the stopped containers with LABEL_HELPER_CHANNEL older than SWEEP_MIN_AGE (so
- * never one of an open that runs now); running channels are never touched. The value is the prune output.
+ * removed): the prune of the stopped containers with LABEL_HELPER_CHANNEL older than SWEEP_MIN_AGE (so never one of an
+ * open that runs now); running channels are never touched. Plan step 11I (PR A): the prune of the port of the engine
+ * (`POST /containers/prune` with SWEEP_FILTERS; before: `docker container prune -f` of the worker's Docker CLI with the
+ * same two filters). No parameters (parseSweepParams); the value is SweepValue.
  */
 export const OP_SWEEP = 'sweep';
 export const SWEEP_MIN_AGE = '10m';
 
-/** The arguments of the sweep (the `-f` of prune only skips its question; it removes stopped containers only). */
-export function sweepArgs(): string[] {
-  return ['container', 'prune', '-f', '--filter', `label=${LABEL_HELPER_CHANNEL}`, '--filter', `until=${SWEEP_MIN_AGE}`];
+/**
+ * Plan step 11I (PR A): the filters of the prune of the sweep, the two of `docker container prune -f` before: the label
+ * LABEL_HELPER_CHANNEL with any value, and created more than SWEEP_MIN_AGE ago (by the clock of the engine). A prune
+ * removes stopped containers only.
+ */
+export const SWEEP_FILTERS: Readonly<Record<'label' | 'until', readonly string[]>> = { label: [LABEL_HELPER_CHANNEL], until: [SWEEP_MIN_AGE] };
+
+/**
+ * Plan step 11I (PR A): the parameters of an operation that takes none (`probe`, `sweep`): `{}`, or null (a missing
+ * `params` travels as null). Anything else is refused.
+ */
+export type NoParams = Record<string, never>;
+
+function parseNoParams(value: unknown): NoParams | undefined {
+  return value === null || value === undefined || (isRecord(value) && Object.keys(value).length === 0) ? {} : undefined;
+}
+
+/** Plan step 11I (PR A): the strict check of the parameters of `probe` (both sides): none. */
+export function parseProbeParams(value: unknown): NoParams | undefined {
+  return parseNoParams(value);
+}
+
+/** Plan step 11I (PR A): the strict check of the parameters of `sweep` (both sides): none. */
+export function parseSweepParams(value: unknown): NoParams | undefined {
+  return parseNoParams(value);
+}
+
+/**
+ * Plan step 5, PR A: the identity of a Docker engine, its ID (never empty) and its root folder, as `GET /info` of the
+ * Engine API names them (`ID`, `DockerRootDir`). Plan step 11I (PR A): two identities are compared as these values
+ * (sameEngine), never as text: the Docker CLI of the extension prints them as JSON in Go's form (`{{json}}` escapes `<`,
+ * `>` and `&`, JSON.stringify does not), while the worker reads them over the Engine API.
+ */
+export interface EngineIdentity {
+  id: string;
+  rootDir: string;
 }
 
 export interface ProbeValue {
-  /** The server version of the engine, or undefined when `docker version` failed. */
+  /**
+   * The version of the engine (`Version` of `GET /version`, as `docker version --format '{{.Server.Version}}'` prints
+   * it), or undefined when it could not be read.
+   */
   serverVersion?: string;
   detail: string;
   /**
-   * Plan step 5, PR A: the identity of the engine behind the socket of the container, the output of ENGINE_IDENTITY_ARGS
-   * (trimmed), or undefined when that call failed. The extension compares it with the same call without the worker.
+   * Plan step 5, PR A: the identity of the engine behind the socket of the worker, or undefined when it could not be
+   * read. The extension compares it with the identity that its own Docker CLI reads without the worker
+   * (ENGINE_IDENTITY_ARGS). Plan step 11I (PR A): the values of `GET /info` (before: the text of ENGINE_IDENTITY_ARGS of
+   * the worker's own Docker CLI).
    */
-  engine?: string;
+  engine?: EngineIdentity;
 }
 
-/** Plan step 5, PR A: `docker info` with the ID and the root folder of the engine (the engine identity of ProbeValue). */
+/**
+ * Plan step 5, PR A: `docker info` with the ID and the root folder of the engine: the identity of the engine as the
+ * Docker CLI of the extension reads it without the worker (engineIdentity).
+ */
 export const ENGINE_IDENTITY_ARGS: readonly string[] = ['info', '--format', '{{json .ID}} {{json .DockerRootDir}}'];
-/** The longest engine identity. */
+/** The longest output of ENGINE_IDENTITY_ARGS, and the longest ID and root folder of an EngineIdentity. */
 export const MAX_ENGINE_IDENTITY_LENGTH = 1_024;
 
 /**
- * An engine identity as ENGINE_IDENTITY_ARGS prints it: two JSON strings on one line, the ID not empty, at most
- * MAX_ENGINE_IDENTITY_LENGTH characters. Undefined for anything else (also a warning line of the CLI).
+ * The engine identity in the output of ENGINE_IDENTITY_ARGS: two JSON strings on one line, the ID not empty, at most
+ * MAX_ENGINE_IDENTITY_LENGTH characters. Undefined for anything else (also a warning line of the CLI). Plan step 11I
+ * (PR A): its values (before: the text, which the extension compared with the text of the worker's call).
  */
-export function engineIdentity(stdout: string): string | undefined {
+export function engineIdentity(stdout: string): EngineIdentity | undefined {
   const text = stdout.trim();
   if (text.length > MAX_ENGINE_IDENTITY_LENGTH) return undefined;
   const match = /^("(?:[^"\\\n]|\\.)*") ("(?:[^"\\\n]|\\.)*")$/.exec(text);
   if (!match) return undefined;
   try {
-    const id: unknown = JSON.parse(match[1]);
-    const root: unknown = JSON.parse(match[2]);
-    return typeof id === 'string' && id !== '' && typeof root === 'string' ? text : undefined;
+    return parseEngineIdentity({ id: JSON.parse(match[1]) as unknown, rootDir: JSON.parse(match[2]) as unknown });
   } catch {
     return undefined;
   }
 }
 
+/**
+ * Plan step 11I (PR A): the check of an EngineIdentity (the identity that the worker answers, and the one of the port):
+ * the ID a string of 1 to MAX_ENGINE_IDENTITY_LENGTH characters, the root folder a string of at most
+ * MAX_ENGINE_IDENTITY_LENGTH characters, nothing else.
+ */
+export function parseEngineIdentity(value: unknown): EngineIdentity | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'rootDir'])) return undefined;
+  const { id, rootDir } = value;
+  if (typeof id !== 'string' || id === '' || id.length > MAX_ENGINE_IDENTITY_LENGTH) return undefined;
+  if (typeof rootDir !== 'string' || rootDir.length > MAX_ENGINE_IDENTITY_LENGTH) return undefined;
+  return { id, rootDir };
+}
+
+/** Plan step 11I (PR A): whether two identities name the same engine: the same ID and the same root folder. */
+export function sameEngine(a: EngineIdentity, b: EngineIdentity): boolean {
+  return a.id === b.id && a.rootDir === b.rootDir;
+}
+
+/** The longest detail of a probe that did not reach the engine (the worker keeps the end of the reason). */
+export const MAX_PROBE_DETAIL_LENGTH = 2_000;
+
 /** The check of ProbeValue (the extension). */
 export function parseProbeValue(value: unknown): ProbeValue | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['detail'], ['serverVersion', 'engine']) || typeof value.detail !== 'string') return undefined;
+  // Review round 1 of PR #122 (B, L2): the extension puts the detail into a message; the worker cuts it to this length.
+  if (value.detail.length > MAX_PROBE_DETAIL_LENGTH) return undefined;
   if (value.serverVersion !== undefined && typeof value.serverVersion !== 'string') return undefined;
-  // Plan step 5, PR A: an engine identity is one that engineIdentity accepts, unchanged.
-  if (value.engine !== undefined && (typeof value.engine !== 'string' || engineIdentity(value.engine) !== value.engine)) return undefined;
+  // Plan step 5, PR A; plan step 11I (PR A): the identity of the engine as its checked values (parseEngineIdentity).
+  const engine = value.engine === undefined ? undefined : parseEngineIdentity(value.engine);
+  if (value.engine !== undefined && engine === undefined) return undefined;
   const probe: ProbeValue = { detail: value.detail };
   if (value.serverVersion !== undefined) probe.serverVersion = value.serverVersion as string;
-  if (value.engine !== undefined) probe.engine = value.engine as string;
+  if (engine !== undefined) probe.engine = engine;
   return probe;
+}
+
+/** Plan step 11I (PR A): the value of `sweep`: how many stopped channel containers it removed. */
+export interface SweepValue {
+  removed: number;
+}
+
+/** Plan step 11I (PR A): the check of SweepValue (the extension): a whole number from 0, nothing else. */
+export function parseSweepValue(value: unknown): SweepValue | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['removed'])) return undefined;
+  const { removed } = value;
+  return typeof removed === 'number' && Number.isSafeInteger(removed) && removed >= 0 ? { removed } : undefined;
 }
 
 // ---- Plan step 5, PR C: the batched refresh ----

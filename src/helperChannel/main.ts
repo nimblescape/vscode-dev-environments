@@ -6,59 +6,19 @@
 // dist/helperChannel.js. The pipe loader of the container (src/core/loader/pipeLoader.ts, plan step 3) checks its hash,
 // stores it at CHANNEL_SCRIPT_PATH, and calls startChannel (CHANNEL_ENTRY) with the input that it read after the script;
 // the rest of the standard input comes as text (the loader set its encoding and paused it). Only Node.js built-ins and small modules of src/core.
-import { spawn } from 'child_process';
+// Plan step 11I (PR A): the worker starts no `docker` process (spawnDockerProcess is gone): its operations act on the
+// engine through the port over the Engine API (section 0 of the plan).
 import * as fs from 'fs';
 import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_KILL_GRACE_MS, CHANNEL_SILENCE_EXIT_MS } from '../core/helperChannel/protocol';
 
-/** Review round 2 (A2): the output of the calls pauses while more than this many characters wait to be written. */
+/**
+ * Review round 2 (A2): the output that the operations read from the engine (OperationContext.pausable) pauses while more
+ * than this many characters wait to be written.
+ */
 export const CHANNEL_OUTPUT_HIGH_WATER = 1024 * 1024;
 import { batchHelperOperations, prepareBatchHelper, runQuietProcess, spawnStepProcess } from './batchHelper';
 import { OPERATIONS } from './operations';
-import { ChannelServer, type OperationHandler, type ServerChild } from './server';
-
-/** SpawnDocker with child_process.spawn: the Docker CLI of the image, its socket; no shell. */
-export function spawnDockerProcess(args: readonly string[], onStdout: (text: string) => void, onStderr: (text: string) => void): ServerChild {
-  const child = spawn('docker', [...args], { shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
-  const stdoutDecoder = new TextDecoder('utf-8');
-  const stderrDecoder = new TextDecoder('utf-8');
-  child.stdout.on('data', (chunk: Buffer) => onStdout(stdoutDecoder.decode(chunk, { stream: true })));
-  child.stderr.on('data', (chunk: Buffer) => onStderr(stderrDecoder.decode(chunk, { stream: true })));
-  // EPIPE when the process ends before it reads its input.
-  child.stdin.on('error', () => {});
-  const exited = new Promise<{ exitCode: number | null; error?: string }>((resolve) => {
-    let done = false;
-    child.on('error', (error) => {
-      if (done) return;
-      done = true;
-      resolve({ exitCode: null, error: error.message });
-    });
-    child.on('close', (code) => {
-      if (done) return;
-      done = true;
-      const restOut = stdoutDecoder.decode();
-      const restErr = stderrDecoder.decode();
-      if (restOut !== '') onStdout(restOut);
-      if (restErr !== '') onStderr(restErr);
-      resolve({ exitCode: code });
-    });
-  });
-  return {
-    end: (input) => (input === undefined ? child.stdin.end() : child.stdin.end(input)),
-    // Review round 2 (A2): with the reading paused, the pipe fills and the Docker CLI waits.
-    pause: () => {
-      child.stdout.pause();
-      child.stderr.pause();
-    },
-    resume: () => {
-      child.stdout.resume();
-      child.stderr.resume();
-    },
-    kill: (signal) => {
-      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-    },
-    exited,
-  };
-}
+import { ChannelServer, type OperationHandler } from './server';
 
 /**
  * The shorter times of the Docker tests: DEVENV_CHANNEL_SILENCE_MS (500..60000 ms) for the silence; the idle time is
@@ -108,7 +68,6 @@ function serve(initial: string, operations: Readonly<Record<string, OperationHan
       process.stdout.write(text);
       return true;
     },
-    spawnDocker: spawnDockerProcess,
     operations,
     // Review round 2 (A2): `process.stdout.write` to a pipe does not wait; the answers that wait are bounded here.
     congested: () => process.stdout.writableLength > CHANNEL_OUTPUT_HIGH_WATER,

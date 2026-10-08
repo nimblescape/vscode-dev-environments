@@ -45,9 +45,6 @@ function contextOf(ask: OperationContext['ask'] = async () => undefined, secrets
     progress: () => {},
     log: (text, level) => lines.push({ text, level }),
     output: () => {},
-    docker: async () => {
-      throw new Error('No Docker CLI call.');
-    },
   };
   return { context, controller, lines };
 }

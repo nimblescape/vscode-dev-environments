@@ -52,9 +52,6 @@ function run() {
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('No Docker CLI call.');
-    },
   };
   const operation = openOperation(
     () => unusedEngine(),

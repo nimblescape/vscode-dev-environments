@@ -30,9 +30,14 @@ import {
   OP_SWEEP,
   channelLabelValue,
   engineIdentity,
+  parseProbeParams,
   parseProbeValue,
   parseRefreshParams,
   parseRefreshValue,
+  parseSweepParams,
+  parseSweepValue,
+  sameEngine,
+  type EngineIdentity,
 } from './protocol';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 
@@ -127,12 +132,19 @@ function engineName(target: DockerTarget): string {
   return target.kind === 'local' ? 'the local Docker' : target.host;
 }
 
+/** Plan step 11I (PR A): an engine identity in a message: its ID and root folder as JSON strings (control characters escaped). */
+function identityText(identity: EngineIdentity): string {
+  return `${JSON.stringify(identity.id)} ${JSON.stringify(identity.rootDir)}`;
+}
+
 /**
  * Opens a channel to the engine of `target`: starts the container with the Docker context of `target`, then checks
- * with the operation `probe` that the Docker CLI in it reaches its engine, and (plan step 5, PR A) that it is the engine
- * of `target`: the engine identity of the probe (ENGINE_IDENTITY_ARGS in the container) must be the one of the same call
- * without the worker (a socket mount of another engine, for example with DOCKER_HOST set to a TCP endpoint of this
- * computer, is refused). Throws HelperChannelError('open').
+ * with the operation `probe` that the worker reaches its engine, and (plan step 5, PR A) that it is the engine of
+ * `target`: the engine identity of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a
+ * socket mount of another engine, for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused).
+ * Plan step 11I (PR A): the worker reads its identity over the Engine API (`GET /info`), so both are compared as their
+ * values (sameEngine; the Docker CLI prints them as JSON in Go's form, which escapes `<`, `>` and `&`), and the value of
+ * the worker is checked (parseProbeValue) as everything that it answers. Throws HelperChannelError('open').
  */
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const [script, tag, socketPath] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target)]);
@@ -154,17 +166,18 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
     deps.logger.warn(`The Docker engine ${name} has no default bridge network, so the worker runs without outbound network there: image checks and downloads in the worker cannot reach the network.`);
     channel = await start('none');
   }
-  let engine: string | undefined;
+  let engine: EngineIdentity | undefined;
   try {
-    const probe = parseProbeValue(await channel.operation(OP_PROBE, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
+    // Plan step 11I (PR A): the parameters of the schema of both sides (none).
+    const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
     if (probe?.serverVersion === undefined) throw new Error(probe?.detail ?? 'an invalid answer');
     engine = probe.engine;
   } catch (error) {
     channel.close();
     throw new HelperChannelError('open', `The helper channel to ${name} does not reach Docker: ${(error as Error).message}`);
   }
-  // Plan step 5, PR A: the engine identity, compared with one call without the worker.
-  let direct: string | undefined;
+  // Plan step 5, PR A: the engine identity, compared with one call without the worker; plan step 11I (PR A): as values.
+  let direct: EngineIdentity | undefined;
   let directDetail = '';
   try {
     const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
@@ -173,22 +186,30 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   } catch (error) {
     directDetail = (error as Error).message;
   }
-  if (engine === undefined || direct === undefined || engine !== direct) {
+  if (engine === undefined || direct === undefined || !sameEngine(engine, direct)) {
     channel.close();
     const why =
       engine === undefined
         ? 'the helper did not name its Docker engine'
         : direct === undefined
           ? `the Docker engine could not be identified without it${directDetail ? ` (${directDetail})` : ''}`
-          : `it reaches another Docker engine (${engine}) than the Docker calls without it (${direct})`;
+          : `it reaches another Docker engine (${identityText(engine)}) than the Docker calls without it (${identityText(direct)})`;
     throw new HelperChannelError('open', `The helper channel to ${name} was closed: ${why}.`);
   }
   // Review round 4 (M1): channel containers that an earlier open created but never started are removed, in the
-  // background (a failure is logged; the channel is open already).
+  // background (a failure is logged; the channel is open already). Plan step 11I (PR A): its value is checked
+  // (parseSweepValue) and the number of removed containers logged.
   if (channel.operations.includes(OP_SWEEP)) {
-    void channel.operation(OP_SWEEP, {}, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).catch((error: unknown) => {
-      deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
-    });
+    void channel.operation(OP_SWEEP, parseSweepParams({}), { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }).then(
+      (value) => {
+        const swept = parseSweepValue(value);
+        if (swept === undefined) deps.logger.warn(`The worker on ${name} answered the removal of the stopped helper channel containers with an invalid value.`);
+        else if (swept.removed > 0) deps.logger.info(`Removed ${swept.removed} stopped helper channel ${swept.removed === 1 ? 'container' : 'containers'} on ${name}.`);
+      },
+      (error: unknown) => {
+        deps.logger.info(`The stopped helper channel containers on ${name} could not be removed: ${(error as Error).message}`);
+      },
+    );
   }
   return channel;
 }

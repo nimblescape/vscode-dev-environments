@@ -31,6 +31,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HelperChannel } from '../core/helperChannel/helperChannel';
 import { CHANNEL_ENTRY } from '../core/helperChannel/protocol';
 import { HELD_STEP, OP_HOLD_BATCH, type HoldBatchParams, type HoldBatchValue } from './batchE2eWorker.testkit';
+// Plan step 11I (PR A): the plugin of the engine socket of the test, shared with channel.e2e.test.ts (before: defined here).
+import { engineSocketPlugin } from './engineSocket.testkit';
 import { bundleHash, loaderCommand } from '../core/loader/pipeLoader';
 import { silentLogger, type Logger, type StartedProcess } from '../core/ports';
 import { NodeProcessRunner } from '../core/process';
@@ -161,25 +163,6 @@ function fakeEngine(dir: string) {
     }),
   };
   return engine;
-}
-
-/**
- * Plan step 11G3: the Engine API of the worker's bundle on `socketPath` instead of /var/run/docker.sock (only in the
- * build of this test; the worker itself has no way to choose another engine).
- */
-function engineSocketPlugin(socketPath: string): esbuild.Plugin {
-  return {
-    name: 'engine-socket-of-the-test',
-    setup(build) {
-      build.onLoad({ filter: /[\\/]helperChannel[\\/]engineApi\.ts$/ }, async (args) => {
-        const text = await fs.promises.readFile(args.path, 'utf8');
-        const parts = text.split('socketPath: string = HELPER_DOCKER_SOCKET');
-        // The API and the hijack: a change of either must change this test too.
-        if (parts.length !== 3) throw new Error('The default socket of engineApi.ts changed; the e2e test of the batch helper cannot replace it.');
-        return { contents: parts.join(`socketPath: string = ${JSON.stringify(socketPath)}`), loader: 'ts' };
-      });
-    },
-  };
 }
 
 const VOLUME = 'devenv-e2e-volume';

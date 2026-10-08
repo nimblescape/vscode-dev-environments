@@ -200,9 +200,6 @@ describe('the start of the batch helper of a flow when it fails (review round 1 
       progress: (step: string, detail?: string) => progress.push(`${step} ${detail ?? ''}`),
       log: (text: string, level?: string) => logs.push(`${level ?? 'info'} ${text}`),
       output: () => {},
-      docker: async () => {
-        throw new Error('Plan step 11G3: the batch helper runs no Docker call of the worker.');
-      },
     } as unknown as OperationContext;
     return { ctx, engine, calls, logs, kills, specs, controller, order, progress };
   }

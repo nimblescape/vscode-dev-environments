@@ -23,9 +23,6 @@ function contextOf(pausable?: OperationContext['pausable']): OperationContext {
     progress: () => {},
     log: () => {},
     output: () => {},
-    docker: async () => {
-      throw new Error('Plan step 11G3: the batch helper runs no Docker call of the worker.');
-    },
     ...(pausable === undefined ? {} : { pausable }),
   };
 }

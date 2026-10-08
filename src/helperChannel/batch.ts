@@ -124,8 +124,8 @@ async function startBatchHelper(deps: BatchDeps, context: OperationContext, p: B
     }
     try {
       createSent = true;
-      // Plan step 11G3: the cancel of the operation stops and removes it (SIGTERM, then SIGKILL after the kill grace of
-      // the server, as its Docker calls end).
+      // Plan step 11G3: the cancel of the operation stops and removes it (SIGTERM, then SIGKILL after CHANNEL_KILL_GRACE_MS;
+      // plan step 11I, PR A: before, also the kill grace of the Docker calls of the server, which are gone).
       run = await engine.runAttached(batchRunSpec({ ...p, scriptHash: bundleHash(script) }), { signal: context.signal, stopSeconds: CHANNEL_KILL_GRACE_MS / 1000 });
     } catch (error) {
       if (context.signal.aborted || isAbortError(error)) throw cancelled();

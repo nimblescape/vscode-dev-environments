@@ -81,9 +81,6 @@ function run(volumes: Volume[], options: { containers?: EngineContainer[]; param
     progress: () => {},
     log: (text) => lines.push(text),
     output: () => {},
-    docker: async () => {
-      throw new Error('The rebuild of the registry runs no Docker CLI call.');
-    },
   };
   const containers = options.containers ?? [];
   const engine: DockerEngine = {

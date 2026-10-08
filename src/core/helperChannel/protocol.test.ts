@@ -31,7 +31,15 @@ import {
   encodeMessage,
   parseClientMessage,
   engineIdentity,
+  parseEngineIdentity,
+  parseProbeParams,
   parseProbeValue,
+  MAX_PROBE_DETAIL_LENGTH,
+  parseSweepParams,
+  parseSweepValue,
+  sameEngine,
+  LABEL_HELPER_CHANNEL,
+  SWEEP_FILTERS,
   parseServerMessage,
   refusedOperationId,
   StreamRedactor,
@@ -178,20 +186,76 @@ describe('the protocol of the helper channel (user request 2026-09-28)', () => {
   it('checks the value of probe', () => {
     expect(parseProbeValue({ serverVersion: '27', detail: 'd' })).toEqual({ serverVersion: '27', detail: 'd' });
     expect(parseProbeValue({ detail: 3 })).toBeUndefined();
+    // Review round 1 of PR #122 (B, L2): a detail longer than the worker sends is refused.
+    expect(parseProbeValue({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH) })).toEqual({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH) });
+    expect(parseProbeValue({ detail: 'x'.repeat(MAX_PROBE_DETAIL_LENGTH + 1) })).toBeUndefined();
   });
 
-  // Plan step 5, PR A: the engine identity of the probe is checked strictly.
+  // Plan step 5, PR A: the engine identity of the probe is checked strictly. Plan step 11I (PR A): changed expectations:
+  // engineIdentity answers the values of the output of the Docker CLI (before: its text), and the engine of ProbeValue is
+  // those values (before: the text of the worker's own Docker CLI call), checked by parseEngineIdentity.
   it('engineIdentity and the engine of ProbeValue', () => {
-    const engine = '"7b1c:ABCD" "/var/lib/docker"';
-    expect(engineIdentity(`${engine}\n`)).toBe(engine);
+    const engine = { id: '7b1c:ABCD', rootDir: '/var/lib/docker' };
+    expect(engineIdentity('"7b1c:ABCD" "/var/lib/docker"\n')).toEqual(engine);
     expect(engineIdentity('"" "/var/lib/docker"')).toBeUndefined();
     expect(engineIdentity('"id"')).toBeUndefined();
     expect(engineIdentity('WARNING: x\n"id" "/r"')).toBeUndefined();
     expect(engineIdentity(`"${'a'.repeat(2_000)}" "/r"`)).toBeUndefined();
+    expect(engineIdentity('"id" ""')).toEqual({ id: 'id', rootDir: '' });
     expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine })).toEqual({ serverVersion: '27', detail: 'd', engine });
     expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: 3 })).toBeUndefined();
-    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: ` ${engine}` })).toBeUndefined();
-    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: '"id" "/r"', other: 1 })).toBeUndefined();
+    // Plan step 11I (PR A): the text of before is no engine any more; nor is an identity with another key or without a value.
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: '"7b1c:ABCD" "/var/lib/docker"' })).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: { ...engine, other: 1 } })).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine: { id: '7b1c:ABCD' } })).toBeUndefined();
+    expect(parseProbeValue({ serverVersion: '27', detail: 'd', engine, other: 1 })).toBeUndefined();
+  });
+
+  // Plan step 11I (PR A): the identity is compared as its values, so the escapes of Go's `{{json}}` (`<`, `>` and `&` as
+  // \u003c, \u003e and \u0026, which JSON.stringify leaves as they are) never make the same engine another one.
+  it('compares the identity of the Docker CLI and of the Engine API as values', () => {
+    const cli = engineIdentity('"id-1" "/srv/docker\\u0026\\u003cdata\\u003e"');
+    expect(cli).toEqual({ id: 'id-1', rootDir: '/srv/docker&<data>' });
+    const api = parseEngineIdentity({ id: 'id-1', rootDir: '/srv/docker&<data>' });
+    expect(sameEngine(cli!, api!)).toBe(true);
+    expect(sameEngine(cli!, { id: 'id-2', rootDir: '/srv/docker&<data>' })).toBe(false);
+    expect(sameEngine(cli!, { id: 'id-1', rootDir: '/var/lib/docker' })).toBe(false);
+  });
+
+  it('parseEngineIdentity takes an ID of 1 to 1024 characters and a root folder of at most 1024, nothing else', () => {
+    expect(parseEngineIdentity({ id: 'a'.repeat(1_024), rootDir: 'r'.repeat(1_024) })).toEqual({ id: 'a'.repeat(1_024), rootDir: 'r'.repeat(1_024) });
+    for (const value of [
+      { id: '', rootDir: '/r' },
+      { id: 'a'.repeat(1_025), rootDir: '/r' },
+      { id: 'a', rootDir: 'r'.repeat(1_025) },
+      { id: 1, rootDir: '/r' },
+      { id: 'a', rootDir: null },
+      { id: 'a' },
+      { id: 'a', rootDir: '/r', extra: true },
+      ['a', '/r'],
+      null,
+      '"a" "/r"',
+    ]) {
+      expect(parseEngineIdentity(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+
+  // Plan step 11I (PR A, O1): the probe and the sweep take no parameters, by one schema on both sides.
+  it('parseProbeParams and parseSweepParams take no parameters', () => {
+    for (const parse of [parseProbeParams, parseSweepParams]) {
+      for (const value of [{}, null, undefined]) expect(parse(value)).toEqual({});
+      for (const value of [{ x: 1 }, [], 'x', 0, false, { undefined: undefined }]) expect(parse(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+
+  // Plan step 11I (PR A): the sweep has the label and age filters of `docker container prune -f` before, and no other.
+  it('the sweep prunes by the channel label (any value) and an age of 10 minutes, and answers how many it removed', () => {
+    expect(SWEEP_FILTERS).toEqual({ label: [LABEL_HELPER_CHANNEL], until: ['10m'] });
+    expect(parseSweepValue({ removed: 0 })).toEqual({ removed: 0 });
+    expect(parseSweepValue({ removed: 3 })).toEqual({ removed: 3 });
+    for (const value of [{ removed: -1 }, { removed: 1.5 }, { removed: '1' }, { removed: Number.MAX_SAFE_INTEGER + 1 }, { removed: 1, output: 'x' }, { output: 'Deleted Containers:' }, null, [], 2]) {
+      expect(parseSweepValue(value), JSON.stringify(value)).toBeUndefined();
+    }
   });
 });
 

@@ -2,13 +2,13 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The operations of the helper channel (src/core/helperChannel/protocol.ts): `probe` (whether the Docker CLI of the
-// container reaches its engine, and which engine: plan step 5, PR A), `sweep`, `refresh` (the states and branches of the
-// environments: plan step 5, PR C), and the flows that run whole operations here, next to the engine (flowOperations.ts).
-// Plan step 11I1, PR B1: the relay operations (`docker`, `lock`, `batch`, `batchStep`, `batchChunk`, `pull`,
-// `startContainers`) are gone; the worker runs the whole pipeline itself, under its own locks and batch helpers.
+// The operations of the helper channel (src/core/helperChannel/protocol.ts): `probe` (whether the worker reaches its
+// engine, and which engine: plan step 5, PR A), `sweep`, `refresh` (the states and branches of the environments: plan
+// step 5, PR C), and the flows that run whole operations here, next to the engine (flowOperations.ts). Plan step 11I1,
+// PR B1: the relay operations (`docker`, `lock`, `batch`, `batchStep`, `batchChunk`, `pull`, `startContainers`) are gone;
+// the worker runs the whole pipeline itself, under its own locks and batch helpers. Plan step 11I (PR A): every operation
+// acts on the engine through its port (DockerEngine, section 0 of the plan); the worker runs no Docker CLI of its own.
 import {
-  ENGINE_IDENTITY_ARGS,
   OP_PROBE,
   OP_DELETE,
   OP_DELETE_CHECK,
@@ -22,14 +22,18 @@ import {
   OP_STOP,
   OP_TOKEN_REMOVE,
   OP_REFRESH,
+  MAX_PROBE_DETAIL_LENGTH,
   OP_SWEEP,
-  engineIdentity,
+  SWEEP_FILTERS,
+  parseProbeParams,
   parseRefreshParams,
+  parseSweepParams,
   refreshValue,
-  sweepArgs,
   type ProbeValue,
   type RefreshValue,
+  type SweepValue,
 } from '../core/helperChannel/protocol';
+import { errorMessage } from '../core/errors';
 import { readEnvironmentStates } from '../core/pipeline/refreshStates';
 import { EngineDocker } from '../core/worker/engineDocker';
 import { batchDeps, workerBatchSession } from './batch';
@@ -40,37 +44,69 @@ import * as os from 'os';
 import { OperationError, type OperationHandler } from './server';
 import monitorScript from 'devenv:monitor-script';
 
-/** `docker version`: the server version of the engine behind the socket of the container. */
-export const probeOperation: OperationHandler = async (params, context) => {
-  if (params !== null && params !== undefined && !(typeof params === 'object' && Object.keys(params).length === 0)) {
-    throw new OperationError('invalid', 'The probe operation takes no parameters.');
-  }
-  context.progress('probe');
-  // The time limit is the one of the request (the extension sets it).
-  const result = await context.docker(['version', '--format', '{{.Server.Version}}']);
-  const version = result.stdout.trim();
-  if (result.exitCode !== 0 || version === '') {
-    const failed: ProbeValue = { detail: ((result.error ?? result.stderr.trim()) || `exit code ${result.exitCode}`).slice(-2_000) };
-    return failed;
-  }
-  const value: ProbeValue = { serverVersion: version, detail: `Docker ${version}` };
-  // Plan step 5, PR A: the identity of the engine behind the socket, which the extension compares with its own call.
-  const identity = await context.docker(ENGINE_IDENTITY_ARGS);
-  const engine = identity.exitCode === 0 ? engineIdentity(identity.stdout) : undefined;
-  if (engine !== undefined) value.engine = engine;
-  return value;
-};
+// Review round 1 of PR #122 (B, L2): MAX_PROBE_DETAIL_LENGTH moved to the protocol, whose parseProbeValue checks it.
+export { MAX_PROBE_DETAIL_LENGTH };
 
-/** Review round 4 (M1): removes the channel containers that were created but never started (protocol.ts, OP_SWEEP). */
-export const sweepOperation: OperationHandler = async (params, context) => {
-  if (params !== null && params !== undefined && !(typeof params === 'object' && Object.keys(params).length === 0)) {
-    throw new OperationError('invalid', 'The sweep operation takes no parameters.');
-  }
-  const result = await context.docker(sweepArgs());
-  if (result.error !== undefined) throw new OperationError('failed', result.error);
-  if (result.exitCode !== 0) throw new OperationError('failed', result.stderr.trim() || `exit code ${result.exitCode}`);
-  return { output: result.stdout.trim().slice(-2_000) };
-};
+/**
+ * `probe` (plan step 5, PR A): the version of the engine behind the socket of the worker, and the identity of that
+ * engine, which the extension compares with the identity that its own Docker CLI reads without the worker. Plan step
+ * 11I (PR A): over the port of the engine (`GET /version`, `GET /info`), no Docker CLI of the worker. A version that
+ * cannot be read is the answer (its reason as the detail: the extension closes the worker, "does not reach Docker"); an
+ * identity that cannot be read is left out (the extension closes the worker too). The time limit is the one of the
+ * request (the extension sets it).
+ */
+export function probeOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    if (parseProbeParams(params) === undefined) throw new OperationError('invalid', 'The probe operation takes no parameters.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The probe operation takes no secret.');
+    context.progress('probe');
+    const engine = engineOf(context);
+    let version: string;
+    try {
+      version = (await engine.version(context.signal)).version;
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The probe operation was cancelled.');
+      const failed: ProbeValue = { detail: errorMessage(error).slice(-MAX_PROBE_DETAIL_LENGTH) };
+      return failed;
+    }
+    if (version === '') {
+      const failed: ProbeValue = { detail: 'The Docker engine did not name its version.' };
+      return failed;
+    }
+    const value: ProbeValue = { serverVersion: version, detail: `Docker ${version}` };
+    try {
+      value.engine = await engine.identity(context.signal);
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The probe operation was cancelled.');
+      // Plan step 5, PR A: no identity, so the extension refuses this worker; the log says why.
+      context.log(`The identity of the Docker engine could not be read: ${errorMessage(error)}`, 'warn');
+    }
+    return value;
+  };
+}
+
+/**
+ * Review round 4 (M1): `sweep` removes the channel containers that were created but never started (protocol.ts,
+ * OP_SWEEP). Plan step 11I (PR A): the prune of the port of the engine with SWEEP_FILTERS (`POST /containers/prune`;
+ * before: `docker container prune -f` of the worker's Docker CLI, with the same filters); its value is how many it
+ * removed.
+ */
+export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
+  return async (params, context) => {
+    if (parseSweepParams(params) === undefined) throw new OperationError('invalid', 'The sweep operation takes no parameters.');
+    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The sweep operation takes no secret.');
+    try {
+      const removed = await engineOf(context).pruneContainers(SWEEP_FILTERS, context.signal);
+      const value: SweepValue = { removed: removed.length };
+      // Review round 1 of PR #122 (A, L4): what the sweep did, in the log of the worker (before: the line of the CLI call).
+      context.log(`The sweep removed ${removed.length} stopped helper channel container(s) older than 10 minutes.`);
+      return value;
+    } catch (error) {
+      if (context.signal.aborted) throw new OperationError('cancelled', 'The sweep operation was cancelled.');
+      throw new OperationError('failed', errorMessage(error));
+    }
+  };
+}
 
 /**
  * Plan step 5, PR C: `refresh`: readEnvironmentStates of the worker, the same code as in the pipeline. Plan step 11C1:
@@ -106,8 +142,9 @@ const BATCH = batchDeps(ENGINE_OF);
 const OWN_HELPER_OF: OwnHelperOf = ownHelperOfEngine(ENGINE_OF, () => os.hostname());
 
 export const OPERATIONS: Readonly<Record<string, OperationHandler>> = {
-  [OP_PROBE]: probeOperation,
-  [OP_SWEEP]: sweepOperation,
+  // Plan step 11I (PR A): over the port of the engine too.
+  [OP_PROBE]: probeOperation(ENGINE_OF),
+  [OP_SWEEP]: sweepOperation(ENGINE_OF),
   [OP_REFRESH]: refreshOperation(ENGINE_OF),
   // Plan step 11B1: the flows that run in the worker (flowOperations.ts).
   [OP_TOKEN_REMOVE]: tokenRemoveOperation(ENGINE_OF),

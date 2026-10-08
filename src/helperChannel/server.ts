@@ -5,9 +5,11 @@
 // The logic of the script of the helper channel (src/core/helperChannel/protocol.ts): it reads the messages of the
 // extension, runs each operation (operations.ts) with an OperationContext, and answers with progress, output, and one
 // result per operation. It ends by itself when the connection is lost (the four ways in protocol.ts); before it exits,
-// it cancels every operation that runs: their Docker calls end (SIGTERM, then SIGKILL), and it waits for their results.
-// It never writes the secret or the parameters of an operation anywhere. Plan step 11I1, PR B1: the removal of the
-// containers of a cleanup label after a cancel (only the removed `docker` operation used it) is gone.
+// it cancels every operation that runs (their signals abort) and waits for their results. It never writes the secret or
+// the parameters of an operation anywhere. Plan step 11I1, PR B1: the removal of the containers of a cleanup label after
+// a cancel (only the removed `docker` operation used it) is gone. Plan step 11I (PR A): so are the Docker calls of the
+// script (OperationContext.docker, the last ones were the probe and the sweep): an operation acts on the engine only
+// through its port (DockerEngine, section 0 of the plan), and the script starts no process of its own.
 import {
   CHANNEL_CLEANUP_TIMEOUT_MS,
   CHANNEL_KILL_GRACE_MS,
@@ -38,53 +40,14 @@ import { abortError } from '../core/ports';
 // Plan step 6, PR B: moved to protocol.ts (the extension masks the output of a batch step too).
 export { StreamRedactor, redact };
 
-/** A started Docker call of the script. */
-export interface ServerChild {
-  /** Writes the input (if any) and closes the standard input. */
-  end(input?: string): void;
-  kill(signal: 'SIGTERM' | 'SIGKILL'): void;
-  /** Review round 2 (A2): stops and resumes the reading of its output (the pipe fills, so the call waits). */
-  pause?(): void;
-  resume?(): void;
-  /** Resolves when the process ended: its exit code, or null after a signal; `error` when it could not be started. */
-  readonly exited: Promise<{ exitCode: number | null; error?: string }>;
-}
-
-/** Starts `docker <args>` without a shell; its output goes to the two callbacks. */
-export type SpawnDocker = (args: readonly string[], onStdout: (text: string) => void, onStderr: (text: string) => void) => ServerChild;
-
-/** The result of OperationContext.docker. */
-export interface ContextDockerResult {
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  /** Set when the call could not be started, or its output was too large (it was ended then). */
-  error?: string;
-}
-
-/**
- * Review round 1 (S5): the script keeps at most this much standard output of a call (beyond, the call is ended and
- * fails), and the last MAX_CONTEXT_STDERR_CHARACTERS of its error output, so that a long call cannot fill the memory of
- * the host.
- */
-export const MAX_CONTEXT_STDOUT_CHARACTERS = 64 * 1024 * 1024;
-export const MAX_CONTEXT_STDERR_CHARACTERS = 1024 * 1024;
-
 /** Review round 2 (C1): the longest text of a log or progress message (a longer one is cut, with `…`). */
 export const MAX_LOG_TEXT = 16 * 1024;
 
-export interface ContextDockerOptions {
-  input?: string;
-  /** Output as it comes (in addition to the result). */
-  onStdout?: (text: string) => void;
-  onStderr?: (text: string) => void;
-  /** Pipe its output to the log of the extension as it comes (the tools of a step; not data that it parses). */
-  stream?: boolean;
-  /** Plan step 5, PR C: ends this call alone (SIGTERM, then SIGKILL), for example after its own time limit. */
-  signal?: AbortSignal;
-}
-
-/** What an operation can do. Every Docker call ends when the operation is cancelled. */
+/**
+ * What an operation can do. Its signal aborts when it is cancelled (by the extension, at its time limit, or at the end of
+ * the script). Plan step 11I (PR A): no Docker call (`docker`, removed): the engine only through the port of the
+ * operation (DockerEngine).
+ */
 export interface OperationContext {
   readonly signal: AbortSignal;
   /**
@@ -115,12 +78,10 @@ export interface OperationContext {
   /** A line of the log of the extension. */
   log(text: string, level?: 'info' | 'warn'): void;
   output(stream: 'stdout' | 'stderr', text: string): void;
-  docker(args: readonly string[], options?: ContextDockerOptions): Promise<ContextDockerResult>;
   /**
-   * Plan step 11G3: output that the operation reads from the engine itself (the attached batch helper, no Docker call of
-   * the script) is paused and resumed with the output of the Docker calls while the connection of the extension is
-   * congested (review round 2, A2), until the returned function removes it or the operation ends. Optional, for the
-   * fake contexts of the tests.
+   * Plan step 11G3: output that the operation reads from the engine itself (the attached batch helper) is paused and
+   * resumed while the connection of the extension is congested (review round 2, A2), until the returned function removes
+   * it or the operation ends. Optional, for the fake contexts of the tests.
    */
   pausable?(target: Pausable): () => void;
 }
@@ -148,11 +109,11 @@ export type OperationHandler = (params: unknown, context: OperationContext) => P
 export interface ServerDeps {
   /** Writes a line to the standard output. False when it cannot be written anymore (the connection is gone). */
   write(text: string): boolean;
-  spawnDocker: SpawnDocker;
   operations: Readonly<Record<string, OperationHandler>>;
   /**
    * Review round 2 (A2): true while more than CHANNEL_OUTPUT_HIGH_WATER characters wait to be written (the connection is
-   * slower than the output), and `listener` once they are written. While congested, the output of every call is paused.
+   * slower than the output), and `listener` once they are written. While congested, the output that the operations read
+   * themselves (OperationContext.pausable) is paused.
    */
   congested?(): boolean;
   onDrain?(listener: () => void): void;
@@ -161,13 +122,18 @@ export interface ServerDeps {
   /** Only for the tests: shorter times (main.ts: DEVENV_CHANNEL_SILENCE_MS). */
   silenceMs?: number;
   idleMs?: number;
-  killGraceMs?: number;
 }
+
+/**
+ * The hard deadline of the exit after the shutdown began: the grace of the processes of the operations (a step of the
+ * batch helper, the batch helper itself: SIGTERM, then SIGKILL after CHANNEL_KILL_GRACE_MS) and the removal of the batch
+ * helpers by their label (CHANNEL_CLEANUP_TIMEOUT_MS), with a margin.
+ */
+export const SHUTDOWN_DEADLINE_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS + 5_000;
 
 interface Running {
   request: OperationRequest;
   controller: AbortController;
-  children: Set<ServerChild>;
   /** Plan step 11G3: the output that the operation reads from the engine itself (OperationContext.pausable). */
   pausables: Set<Pausable>;
   cancelled: boolean;
@@ -194,7 +160,7 @@ interface Running {
 /** The logic of the script: one instance per process. */
 export class ChannelServer {
   private readonly running = new Map<number, Running>();
-  /** Review round 2 (A2): the output of the calls is paused until the waiting answers are written. */
+  /** Review round 2 (A2): the output that the operations read is paused until the waiting answers are written. */
   private outputPaused = false;
   private readonly splitter: LineSplitter;
   private silenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -202,12 +168,10 @@ export class ChannelServer {
   private stopping = false;
   private readonly silenceMs: number;
   private readonly idleMs: number;
-  private readonly killGraceMs: number;
 
   constructor(private readonly deps: ServerDeps) {
     this.silenceMs = deps.silenceMs ?? CHANNEL_SILENCE_EXIT_MS;
     this.idleMs = deps.idleMs ?? CHANNEL_SERVER_IDLE_EXIT_MS;
-    this.killGraceMs = deps.killGraceMs ?? CHANNEL_KILL_GRACE_MS;
     this.splitter = new LineSplitter(MAX_CLIENT_LINE, (line) => this.onLine(line), () => this.shutdown());
   }
 
@@ -268,24 +232,25 @@ export class ChannelServer {
     if (!this.outputPaused && this.deps.congested?.() === true) this.pauseOutput();
   }
 
-  /** Review round 2 (A2): pauses the output of every call until the waiting answers are written. */
+  /**
+   * Review round 2 (A2): pauses the output that the operations read from the engine themselves (plan step 11G3:
+   * OperationContext.pausable) until the waiting answers are written. Plan step 11I (PR A): the only output that it
+   * pauses (before: also the output of the Docker calls of the script, removed).
+   */
   private pauseOutput(): void {
     this.outputPaused = true;
     for (const run of this.running.values()) {
-      for (const child of run.children) child.pause?.();
-      // Plan step 11G3: and the output that an operation reads from the engine itself.
       for (const target of run.pausables) target.pause();
     }
     this.deps.onDrain?.(() => {
       this.outputPaused = false;
       for (const run of this.running.values()) {
-        for (const child of run.children) child.resume?.();
         for (const target of run.pausables) target.resume();
       }
     });
   }
 
-  /** The output of a call as `out` messages, in pieces of at most OUTPUT_CHUNK_CHARACTERS. */
+  /** The output of an operation as `out` messages, in pieces of at most OUTPUT_CHUNK_CHARACTERS. */
   private sendOutput(id: number, stream: 'stdout' | 'stderr'): (text: string) => void {
     return (text) => {
       for (let start = 0; start < text.length; start += OUTPUT_CHUNK_CHARACTERS) {
@@ -422,7 +387,6 @@ export class ChannelServer {
     const run: Running = {
       request,
       controller: new AbortController(),
-      children: new Set(),
       pausables: new Set(),
       cancelled: false,
       timedOut: false,
@@ -454,8 +418,6 @@ export class ChannelServer {
       }
       if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
       this.endAsks(run);
-      // Its Docker calls may still run when the handler did not wait for them: end them.
-      await this.endChildren(run);
       // Plan step 11G3: the output that it read from the engine itself is no longer paused with the others.
       for (const target of run.pausables) if (this.outputPaused) target.resume();
       run.pausables.clear();
@@ -503,7 +465,6 @@ export class ChannelServer {
         ),
       log: (text, level = 'info') => this.send({ t: 'log', id, level, text: clip(mask(text)) }),
       output: (stream, text) => run.redactors[stream].push(text),
-      docker: (args, options = {}) => this.docker(run, args, options),
       pausable: (target) => {
         if (this.running.get(id) !== run) return () => {};
         run.pausables.add(target);
@@ -516,86 +477,10 @@ export class ChannelServer {
     };
   }
 
-  private async docker(run: Running, args: readonly string[], options: ContextDockerOptions): Promise<ContextDockerResult> {
-    if (run.controller.signal.aborted) return { exitCode: null, stdout: '', stderr: '', error: 'The operation was cancelled.' };
-    let stdout = '';
-    let stderr = '';
-    let tooLarge = false;
-    let child: ServerChild;
-    const id = run.request.id;
-    const secret = () => run.masked;
-    const log = (text: string, level: 'info' | 'warn' = 'info') => this.send({ t: 'log', id, level, text: clip(redact(text, secret())) });
-    // Review round 2 (B1): each streamed call has its own redactors, so its end flushes only its own held-back text.
-    const streamed = options.stream === true
-      ? { stdout: new StreamRedactor(secret, this.sendOutput(id, 'stdout')), stderr: new StreamRedactor(secret, this.sendOutput(id, 'stderr')) }
-      : undefined;
-    // Review round 2 (B2): the kept error output is masked before it is cut, so a cut cannot leave a part of the secret.
-    const stderrKept = new StreamRedactor(secret, (text) => {
-      stderr += text;
-      // Cut only once it is twice as long: linear time, however small the pieces are.
-      if (stderr.length > 2 * MAX_CONTEXT_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CONTEXT_STDERR_CHARACTERS);
-    });
-    const command = commandLine(args);
-    const startedAt = Date.now();
-    log(`$ ${command}`);
-    try {
-      child = this.deps.spawnDocker(
-        args,
-        (text) => {
-          if (tooLarge) return;
-          stdout += text;
-          if (stdout.length > MAX_CONTEXT_STDOUT_CHARACTERS) {
-            tooLarge = true;
-            stdout = '';
-            this.terminate(child);
-            return;
-          }
-          streamed?.stdout.push(text);
-          options.onStdout?.(text);
-        },
-        (text) => {
-          stderrKept.push(text);
-          streamed?.stderr.push(text);
-          options.onStderr?.(text);
-        },
-      );
-    } catch (error) {
-      const message = `docker could not be started: ${messageOf(error)}`;
-      log(message, 'warn');
-      return { exitCode: null, stdout: '', stderr: '', error: message };
-    }
-    run.children.add(child);
-    if (this.outputPaused) child.pause?.();
-    try {
-      child.end(options.input);
-    } catch {
-      // The process ended before it read its input; its exit is reported below.
-    }
-    // Cancelled while the call started.
-    if (run.controller.signal.aborted) this.terminate(child);
-    const endCall = () => this.terminate(child);
-    if (options.signal?.aborted) endCall();
-    else options.signal?.addEventListener('abort', endCall, { once: true });
-    const { exitCode, error } = await child.exited;
-    options.signal?.removeEventListener('abort', endCall);
-    run.children.delete(child);
-    streamed?.stdout.flush();
-    streamed?.stderr.flush();
-    stderrKept.flush();
-    if (stderr.length > MAX_CONTEXT_STDERR_CHARACTERS) stderr = stderr.slice(-MAX_CONTEXT_STDERR_CHARACTERS);
-    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-    if (tooLarge) {
-      const message = `The output of docker is larger than ${MAX_CONTEXT_STDOUT_CHARACTERS / (1024 * 1024)} M characters. It was stopped.`;
-      log(message, 'warn');
-      return { exitCode, stdout: '', stderr, error: message };
-    }
-    if (error !== undefined) log(`docker could not be started: ${error}`, 'warn');
-    // Review round 1 (S2): masked before the line is cut, so that a cut cannot leave a part of the secret.
-    else log(`${exitCode === null ? 'ended by a signal' : `exit code ${exitCode}`} after ${seconds} s${exitCode === 0 ? '' : `: ${lastLine(stderr)}`}`);
-    return error === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, error: `docker could not be started: ${error}` };
-  }
-
-  /** Cancels an operation: its signal aborts and its Docker calls end. Its result follows when its handler ended. */
+  /**
+   * Cancels an operation: its signal aborts and its open requests to the extension end. Its result follows when its
+   * handler ended (plan step 11I, PR A: the script has no Docker call of its own to end; before: SIGTERM, then SIGKILL).
+   */
   private cancel(run: Running, timedOut: boolean): void {
     if (run.cancelled || run.timedOut) return;
     if (timedOut) run.timedOut = true;
@@ -603,44 +488,19 @@ export class ChannelServer {
     if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
     run.controller.abort();
     this.endAsks(run);
-    for (const child of run.children) this.terminate(child);
-  }
-
-  /** SIGTERM, then SIGKILL after the grace time (only while it still runs). */
-  private terminate(child: ServerChild): void {
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      // It ended already.
-    }
-    let ended = false;
-    void child.exited.then(() => (ended = true));
-    const timer = setTimeout(() => {
-      if (ended) return;
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // It ended already.
-      }
-    }, this.killGraceMs);
-    void child.exited.then(() => clearTimeout(timer));
-  }
-
-  private async endChildren(run: Running): Promise<void> {
-    const children = [...run.children];
-    for (const child of children) this.terminate(child);
-    await Promise.all(children.map((child) => child.exited));
   }
 
   /**
-   * Ends the script: no more messages are read; every operation is cancelled (its Docker calls end); then exit. A hard deadline makes sure that it exits even when a call or a handler does not end.
+   * Ends the script: no more messages are read; every operation is cancelled (its signal aborts); then exit, once every
+   * cancelled operation sent its result. A hard deadline (SHUTDOWN_DEADLINE_MS) makes sure that it exits even when a
+   * handler does not end.
    */
   shutdown(): void {
     if (this.stopping) return;
     this.stopping = true;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    const deadline = setTimeout(() => this.deps.exit(0), this.killGraceMs + CHANNEL_CLEANUP_TIMEOUT_MS + 5_000);
+    const deadline = setTimeout(() => this.deps.exit(0), SHUTDOWN_DEADLINE_MS);
     const runs = [...this.running.values()];
     for (const run of runs) this.cancel(run, false);
     void Promise.all(runs.map((run) => run.finished)).then(() => {
@@ -654,35 +514,7 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** A command for the log: `docker` and its arguments, an argument with a space or a quote as JSON. */
-export function commandLine(args: readonly string[]): string {
-  return ['docker', ...args.map((arg, i) => (isLongScript(args, i) ? '<script>' : arg === '' || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(' ');
-}
-
-/** Live check of 2026-10-03: the log line of a call shows a script that is longer than this (or has more than one line) as `<script>`. */
-export const MAX_LOGGED_SCRIPT_LENGTH = 200;
-
-/**
- * Live check of 2026-10-03: whether `args[i]` is the script of `sh -c <script>` or `node -e <script>` with more than one
- * line or more than MAX_LOGGED_SCRIPT_LENGTH characters (the token write, the pipe loader), which the log line shows as
- * `<script>`, as the batch helper does. Only the log line; the call gets the script.
- */
-function isLongScript(args: readonly string[], i: number): boolean {
-  if (i < 2) return false;
-  const program = args[i - 2];
-  const flag = args[i - 1];
-  const script = (flag === '-c' && /(^|\/)sh$/.test(program)) || (flag === '-e' && /(^|\/)node$/.test(program));
-  return script && (args[i].includes('\n') || args[i].length > MAX_LOGGED_SCRIPT_LENGTH);
-}
-
 /** Review round 2 (C1): a text of a log or progress message, cut to MAX_LOG_TEXT characters. */
 export function clip(text: string): string {
   return text.length > MAX_LOG_TEXT ? `${text.slice(0, MAX_LOG_TEXT)}…` : text;
-}
-
-/** The last non-empty line of an output, at most 500 characters. */
-function lastLine(text: string): string {
-  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '');
-  const last = lines[lines.length - 1] ?? '';
-  return last.length > 500 ? `${last.slice(0, 500)}…` : last;
 }

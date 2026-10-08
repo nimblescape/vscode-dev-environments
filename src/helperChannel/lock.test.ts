@@ -41,9 +41,6 @@ function harness(secret?: string): Harness {
       progress: (step) => progress.push(step),
       log: () => {},
       output: () => {},
-      docker: async () => {
-        throw new Error('The lock operation runs no Docker call.');
-      },
     },
   };
 }
