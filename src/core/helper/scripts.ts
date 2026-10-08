@@ -450,7 +450,10 @@ const readInRepository = (file, limit) => {
     const opened = fs.fstatSync(fd);
     if (opened.isDirectory()) return undefined;
     if (!opened.isFile()) return null;
-    const real = realPath(file);
+    // Review round 2 of PR #121 (B-R2-1): the real path of the opened descriptor, as the kernel names the file it opened
+    // (/proc/self/fd of the helper), not a second walk of \`file\`, whose links a writer of the repository may change
+    // between the open, that walk, and the stat below.
+    const real = realPath(fs.existsSync('/proc/self/fd') ? '/proc/self/fd/' + fd : file);
     if (!realInRepository(real)) return null;
     // Review round 2 of PR #121 (A-1): a file that is gone or changed since is refused, never a failure of the script.
     let named;
