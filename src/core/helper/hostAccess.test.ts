@@ -1142,6 +1142,13 @@ describe('isHelperPath', () => {
     ['/var/run/devenv-docker/docker.sock', true],
     ['/var/run/devenv-secrets', true],
     ['/run', true],
+    // Review round 1 of the follow-up of plan step 11I (A-F5): a `..` segment, which the helper resolves after the links
+    // of its image (/var/run → /run, /var/lock → /run/lock, /usr/lib/ssl/certs → /etc/ssl/certs), not as the text says.
+    ['/var/run/../devenv-cache', true],
+    ['/var/lock/../devenv-secrets', true],
+    ['/usr/lib/ssl/certs/../../../run/devenv-secrets', true],
+    ['/opt/tools/../other', true],
+    ['/opt/..tools', false],
     ['/run/devenv-dockerx', false],
     ['/run/devenv', false],
     ['/device', false],

@@ -444,7 +444,8 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
     // its command has the `-e` of `node -e`; still no `-e` (a variable) among the arguments of the run before it.
     const command = commandOf(run.args);
     expect(run.args.slice(0, run.args.length - command.length)).not.toContain('-e');
-    expect(command).toEqual(['node', '-e', GIT_FILES_SCRIPT, 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
+    // Review round 1 of that follow-up (B-L1): changed expectation, `--` before the arguments of the script.
+    expect(command).toEqual(['node', '-e', GIT_FILES_SCRIPT, '--', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
   });
 
   it('throws a CommandError when the script fails', async () => {

@@ -68,8 +68,19 @@ export const BATCH_HELPER_FOLDERS: readonly string[] = [BATCH_SOCKET_FOLDER, SEC
  * folders of the kernel (KERNEL_FOLDERS, review round 3, S3-1); and every path below WORKSPACES_ROOT that is not in the
  * repository folder (the internal folder, other folders of the volume). A folder that contains one of them counts too
  * (for example `/var` with the socket, `/run` with the folders of the batch helper). `file` is absolute.
+ *
+ * Review round 1 of the follow-up of plan step 11I (A-F5): a path with a `..` segment counts too. The check reads the path
+ * as text, but the helper resolves `..` after the links of its image: `/var/run/../devenv-cache` is /devenv-cache there
+ * (/var/run → /run), `/var/lock/../devenv-secrets` is /run/devenv-secrets (/var/lock → /run/lock), while the text says
+ * /var/devenv-cache and /var/devenv-secrets; any link of the image to a folder elsewhere does the same (Debian's
+ * /usr/lib/ssl/certs → /etc/ssl/certs). Chosen over a map of the links of the image, which would have to list every such
+ * link of every version of the image; without `..`, the text and the helper differ only at a link into a protected
+ * folder, which the list names (BATCH_HELPER_FOLDERS by /var/run). The callers resolve relative paths before (no `..`
+ * left); only a path that a configuration writes absolute with `..` (an option of `build.options`, a Compose path) is
+ * refused, which it can write without.
  */
 export function isHelperPath(file: string, repositoryFolder: string): boolean {
+  if (file.split('/').includes('..')) return true;
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
   if (normal === '/') return true;
   if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET, ...BATCH_HELPER_FOLDERS, ...KERNEL_FOLDERS].some((helperPath) => overlaps(normal, helperPath))) return true;

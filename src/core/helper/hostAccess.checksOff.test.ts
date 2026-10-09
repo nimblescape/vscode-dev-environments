@@ -203,6 +203,10 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['a Dockerfile in the token tmpfs of the batch helper', input({ build: { dockerfile: '/run/devenv-secrets/github-token' } }, HELPER_PATHS), 'Dockerfile /run/devenv-secrets/github-token (a folder of the workspace helper)', 'protected'],
   ['the folder of the Docker socket by /var/run as build context', input({ build: { dockerfile: 'Dockerfile', context: '/var/run/devenv-docker' } }, HELPER_PATHS), 'build context /var/run/devenv-docker (a folder of the workspace helper)', 'protected'],
   ['the token tmpfs by /var/run as build context', input({ build: { dockerfile: 'Dockerfile', context: '/var/run/devenv-secrets' } }, HELPER_PATHS), 'build context /var/run/devenv-secrets (a folder of the workspace helper)', 'protected'],
+  // Review round 1 of the follow-up of plan step 11I (A-F5): a `..` after a link of the helper image, which the check reads
+  // as text (/var/devenv-secrets, /var/devenv-cache/token) and the helper resolves into its folders.
+  ['the token tmpfs by `..` after /var/lock in --build-context', input(build('--build-context', 'x=/var/lock/../devenv-secrets')), 'build option --build-context=x=/var/lock/../devenv-secrets', 'protected'],
+  ['the cache volume by `..` after /var/run in a build secret', input(build('--secret', 'id=s,src=/var/run/../devenv-cache/token')), 'build option --secret id=s,src=/var/run/../devenv-cache/token', 'protected'],
   // U2: a Dockerfile that is a link out of the repository (for example to the token) or could not be read.
   ['a Dockerfile that is a link out of the repository', input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileUnreadable: 'Dockerfile' }), 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)', 'protected'],
   // U1: a size limit, not a check of the content.

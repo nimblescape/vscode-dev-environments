@@ -31,6 +31,9 @@
 // folders, and `.devenv+` itself while /workspaces is 1777 for the clone). So the helper changes the mode and the owner
 // of CONFIG_FOLDER only through a descriptor that it opened without following a link (openConfigFolder), for the close
 // and for the restore after the step; /workspaces and the secrets tmpfs are mount points, which no link can replace.
+// Review round 1 of that follow-up (A-F1): the files of the Git user get root through chown runs in the folder that find
+// holds open (and the walk of `chown -R`, which follows no link), never through a whole path that chown would resolve
+// again (gitUserFilesToRootCommands).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
@@ -128,13 +131,42 @@ function clearSecrets(deps: BatchHelperDeps): void {
 const CLONE_WORK_NAME = '.devenv-clone.*';
 
 /**
+ * Review round 1 of the follow-up of plan step 11I (A-F1): the commands (GNU findutils and coreutils, as in the helper
+ * image) that give the files of the user `uid` in the folder `root` (WORKSPACES_ROOT) to root, never through a link. A
+ * process of the dev container can replace a folder of the volume by a link at any moment (root of the dev container
+ * every folder), and `find … -exec chown -h 0:0 {} +` hands chown whole paths, which it resolves again: through such a
+ * link, root would give a file outside the volume to root (the folder of the socket, the shared cache volume). So:
+ * - first, each entry of that user at the top of the volume (the new clone) goes to root with its content in one
+ *   `chown -R -h --from=<uid>`, run in the folder that find has open (`-execdir`); GNU chown walks with fts, opening each
+ *   folder without following a link (O_NOFOLLOW|O_DIRECTORY, relative to the folder above) and changing each entry
+ *   relative to its folder (fchownat, AT_SYMLINK_NOFOLLOW), and changes only what belongs to that user (`--from`, as
+ *   `-user`); chown has no `-xdev`, and needs none: nothing is mounted below /workspaces in the batch helper
+ *   (batchRunSpec), and a process of the dev container cannot mount into it;
+ * - then every other file of that user with `-execdir chown -h 0:0 {} +`, which runs chown in the folder that find has
+ *   open with `./<name>` (as HELPER_SERVICE_OWNER_FIX of src/core/git/gitSummary.ts, review round 1 of PR #114, A-M1).
+ * The first command keeps the walk after a clone fast: `-execdir … +` runs one chown per folder (about 10 s for 3000
+ * folders; review round 2 of PR #114, A2-M1), and after the first command it finds nothing of that user in the clone.
+ */
+export function gitUserFilesToRootCommands(root: string, uid: string): string[][] {
+  return [
+    ['find', root, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'],
+    ['find', root, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'],
+  ];
+}
+
+/** The files of the Git user in the volume get root (gitUserFilesToRootCommands). */
+async function giveGitUserFilesToRoot(deps: BatchHelperDeps, uid: string): Promise<void> {
+  for (const command of gitUserFilesToRootCommands(WORKSPACES_ROOT, uid)) await deps.runQuiet(command);
+}
+
+/**
  * Review round 1 of PR #80 (A-R1-1, A-R1-2): what a Git step left when its cleanup was cut off (the whole helper killed
  * on a cancel of the batch, `docker rm -f`) is repaired before the next Git step, as root: the files of the Git user in
  * the volume get root, and the temporary folders of killed clones go after 60 minutes (as the clone of the per-step
  * helper removed them, which ran as root; the Git user cannot remove a folder of root in the sticky /workspaces).
  */
 async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<void> {
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await giveGitUserFilesToRoot(deps, uid);
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
@@ -220,11 +252,19 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
     // of its clone (A-R1-2: a clone whose own cleanup was cut off by its kill), and its files outside the volume; in the
     // volume its files get root, as the clone of the per-step helper (which ran as root) left them.
     await deps.runQuiet(killAllCommand(gitPrivilegeArgs()));
-    try {
-      for (const restore of restores.reverse()) restore();
-    } finally {
-      await removeGitUserLeftovers(deps, uid);
+    // Review round 1 of the follow-up of plan step 11I (A-F6): each restore runs, also when one before it throws (as in
+    // asRepositoryOwner, review round 5 of PR #82, A-R5-3), so that a failed restore of the secrets tmpfs neither leaves
+    // CONFIG_FOLDER closed nor its descriptor open; then the walks; then the first error is rethrown.
+    let failure: { error: unknown } | undefined;
+    for (const restore of restores.reverse()) {
+      try {
+        restore();
+      } catch (error) {
+        failure ??= { error };
+      }
     }
+    await removeGitUserLeftovers(deps, uid);
+    if (failure !== undefined) throw failure.error;
   }
 }
 
@@ -234,7 +274,7 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
  */
 async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string): Promise<void> {
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await giveGitUserFilesToRoot(deps, uid);
   await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
