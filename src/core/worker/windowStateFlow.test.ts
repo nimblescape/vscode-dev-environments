@@ -39,7 +39,9 @@ describe('the reads of an attached window in the worker (plan step 11C1)', () =>
     expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker })).toEqual({ state: 'running' });
     expect(execs).toEqual([]);
     expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api', user: 'vscode' }, docker })).toEqual({ state: 'running', branch: 'main' });
-    expect(execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, the branch is read from the dev container of the
+    // rule by its ID (before: by the name of the request).
+    expect(execs[0]).toMatchObject({ container: 'a'.repeat(64), user: 'vscode' });
     expect(execs[0].command).toContain('/workspaces/api');
   });
 
@@ -96,8 +98,11 @@ describe('the reads of an attached window in the worker (plan step 11C1)', () =>
 // Review round 1 of plan step 11C1 (B-R1-4, B-R1-8, B-R1-9, B-R1-10).
 describe('the reads of an attached window in the worker: review round 1 of 11C1', () => {
   it('rejects when the engine fails: never a state that it did not read', async () => {
-    const port: DockerEngine = { ...unusedEngine(), container: async () => Promise.reject(new Error('socket closed')), containers: async () => [] };
-    await expect(windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).rejects.toThrow();
+    // Plan step 11I (U4, decision of 2026-10-08): changed input, the list of the containers of the environment fails too:
+    // the flow reads the state from it (one findContainer, the rule of the dev container), no longer by an inspect of the
+    // name (`container`, which fails here as before).
+    const port: DockerEngine = { ...unusedEngine(), container: async () => Promise.reject(new Error('socket closed')), containers: async () => Promise.reject(new Error('socket closed')) };
+    await expect(windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', docker: new EngineDocker(port, silentLogger) })).rejects.toThrow('socket closed');
   });
 
   it('a container of an older version that was made while the checks were off is `version`', async () => {
@@ -133,5 +138,50 @@ describe('the reads of an attached window in the worker: review round 1 of 11C1'
     const signal = new AbortController().signal;
     await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker, signal });
     expect(execs[0].signal).toBe(signal);
+  });
+});
+
+describe('the reads of an attached window by the rule of the dev container (plan step 11I, U4, decision of 2026-10-08)', () => {
+  // The window is attached to the container of its name: when that one is gone, its state is missing (it reconnects
+  // through the open, which connects to the container of the rule), never the state of another container.
+  it('the named container is missing and another dev container runs: missing, and no read of the other one', async () => {
+    const other: EngineContainer = { ...container({ [LABEL_CONTAINER_VERSION]: '0' }), id: 'c'.repeat(64), name: 'devenv-acme-api-other' };
+    const execs: string[] = [];
+    const port: DockerEngine = {
+      ...unusedEngine(),
+      container: async (reference) => [other].find((each) => each.name === reference || each.id === reference),
+      containers: async () => [other],
+      exec: async (name) => (execs.push(name), { exitCode: 0, stdout: 'main\n', stderr: '', timedOut: false }),
+    };
+    const read = windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker: new EngineDocker(port, silentLogger) });
+    expect(await read).toEqual({ state: 'missing' });
+    expect(execs).toEqual([]);
+  });
+
+  it('the named container is stopped while another dev container runs: the named one, and no branch', async () => {
+    const own = container(CURRENT, 'stopped');
+    const other: EngineContainer = { ...container(CURRENT), id: 'c'.repeat(64), name: 'devenv-acme-api-other', created: '2026-10-08T09:00:00Z' };
+    const execs: string[] = [];
+    const port: DockerEngine = {
+      ...unusedEngine(),
+      container: async (reference) => [own, other].find((each) => each.name === reference || each.id === reference),
+      containers: async () => [other, own],
+      exec: async (name) => (execs.push(name), { exitCode: 0, stdout: 'main\n', stderr: '', timedOut: false }),
+    };
+    expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker: new EngineDocker(port, silentLogger) })).toEqual({ state: 'stopped' });
+    expect(execs).toEqual([]);
+  });
+});
+
+// PR #127 review round 1 (A, L1): the window state reads the container of its name from the list of the environment; it
+// never logs the line of the rule about another container (which it does not read), at each of its reads.
+describe('the window state and the log of the rule (PR #127 review round 1, A L1)', () => {
+  it('logs nothing when the container of the window is gone and another dev container runs', async () => {
+    const other: EngineContainer = { ...container(CURRENT), id: 'c'.repeat(64), name: 'devenv-acme-api-other' };
+    const lines: string[] = [];
+    const logger = { ...silentLogger, info: (line: string) => lines.push(line), warn: (line: string) => lines.push(line) };
+    const port: DockerEngine = { ...unusedEngine(), containers: async () => [other], exec: async () => ({ exitCode: 0, stdout: 'main\n', stderr: '', timedOut: false }) };
+    expect(await windowStateFlow({ environmentId: ID, containerName: NAME, checks: 'on', branch: { folder: '/workspaces/api' }, docker: new EngineDocker(port, logger) })).toEqual({ state: 'missing' });
+    expect(lines).toEqual([]);
   });
 });

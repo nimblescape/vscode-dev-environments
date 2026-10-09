@@ -3929,8 +3929,9 @@ describe('delete', () => {
     h.docker.volumes.set('own', additionalVolumeLabels());
     h.docker.volumes.set('legacy', {});
     h.docker.volumes.set('shared', additionalVolumeLabels());
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['own']);
-    expect(await h.service.removableAdditionalVolumes('f0000001-0000-4000-8000-000000000001')).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual(['own']);
+    expect((await h.service.removableVolumesOf('f0000001-0000-4000-8000-000000000001')).additional).toEqual([]);
   });
 
   it('removes the tag of an unused base image that the removal by digest keeps (classic image store)', async () => {
@@ -4254,7 +4255,9 @@ describe('inspectStates and currentBranch', () => {
     const env = await seedEnvironment(h, { container: 'running' });
     h.docker.execHandler = () => ({ stdout: 'feature-q\n' });
     expect((await h.operations.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBe('feature-q');
-    expect(h.docker.execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, read from the dev container of the rule by its ID
+    // (before: by the name of the request).
+    expect(h.docker.execs[0]).toMatchObject({ container: h.docker.containersOf(ENV_ID)[0].id, user: 'vscode' });
     h.docker.execHandler = () => ({ exitCode: 1, stderr: 'container is not running' });
     expect((await h.operations.windowStateInWorker(env, NAME, { branch: true }))?.branch).toBeUndefined();
     h.docker.execHandler = () => ({ stdout: '\n' });
@@ -4283,7 +4286,9 @@ describe('refreshStates (plan step 5, PR C)', () => {
     await seedTwo(h);
     expect(await h.operations.refreshStates(new Set([ENV_ID, OTHER_ID]))).toEqual(direct);
     expect(h.docker.execs).toHaveLength(1);
-    expect(h.docker.execs[0]).toMatchObject({ container: NAME, user: 'vscode' });
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, read from the dev container of the rule by its ID
+    // (before: by the recorded name).
+    expect(h.docker.execs[0]).toMatchObject({ container: h.docker.containersOf(ENV_ID)[0].id, user: 'vscode' });
     // No branch read for an environment whose branch was not asked for.
     expect(await h.operations.refreshStates(new Set())).toEqual({ ...direct, branches: new Map() });
     expect(h.docker.execs).toHaveLength(1);
@@ -4416,7 +4421,8 @@ describe('reconcileFromVolumes', () => {
     expect((await h.registry.get(B))?.additionalVolumes).toEqual(['web-node_modules']);
     expect((await h.registry.get(C))?.additionalVolumes).toBeUndefined();
     // The Delete of A keeps it while B records it, and the question does not offer it.
-    expect(await h.service.removableAdditionalVolumes(A)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(A)).additional).toEqual([]);
     await h.service.delete(A, options({ additionalVolumesToRemove: ['web-node_modules'] }));
     expect(h.docker.volumes.has('web-node_modules')).toBe(true);
     expect(h.logger.infos).toContain('The volume web-node_modules is kept, because another environment uses it too.');

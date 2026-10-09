@@ -12,7 +12,7 @@ import * as path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { tokenRunMessage } from '../../src/core/helper/containerToken';
 import { SECRET_TOKEN } from '../../src/core/helperChannel/protocol';
-import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS } from '../../src/core/names';
+import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
 import type { Environment } from '../../src/core/types';
 import { runScript } from '../../src/core/worker/containerScripts';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
@@ -22,8 +22,6 @@ import { TEST_BASE_IMAGE, TEST_RUN_LABEL } from './dockerRun';
 
 /** The remote user of the containers: a numeric user without an entry in /etc/passwd (the scripts take it as it is). */
 const USER = '1000';
-/** The environment that the containers of this file belong to (the flow of the removal finds them by its label). */
-const ENVIRONMENT_ID = 'devenv-test-token-environment';
 
 describe('the token in the memory of a real container (review of unit 15)', () => {
   const { run, cli } = dockerTestContext('containerToken');
@@ -34,10 +32,18 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     for (const name of created.volumes) cli.run(['volume', 'rm', name]);
   });
 
+  /**
+   * The environment of each container (the flow of the removal finds the containers by its label). PR #127 review round 1
+   * (A, L4): one environment per container, so that the removal in one test (which empties every running dev container of
+   * its environment, plan step 11I, U4) never reaches the containers of another test.
+   */
+  const environmentOf = new Map<string, string>();
+
   /** A running container of the base image with the tmpfs of the token and `args`, as the override configuration starts it. */
   function start(args: string[]): string {
     const name = `devenv-test-token-${crypto.randomBytes(4).toString('hex')}`;
     created.containers.push(name);
+    environmentOf.set(name, newEnvironmentId());
     cli.ok([
       'run',
       '-d',
@@ -48,7 +54,7 @@ describe('the token in the memory of a real container (review of unit 15)', () =
       '--label',
       `${TEST_RUN_LABEL}=${run.runId}`,
       '--label',
-      `${LABEL_ENVIRONMENT_ID}=${ENVIRONMENT_ID}`,
+      `${LABEL_ENVIRONMENT_ID}=${environmentOf.get(name)}`,
       ...args,
       '--tmpfs',
       TOKEN_TMPFS,
@@ -87,10 +93,10 @@ describe('the token in the memory of a real container (review of unit 15)', () =
   };
   const remove = (container: string) =>
     removeTokenFlow({
-      environmentId: ENVIRONMENT_ID,
+      environmentId: environmentOf.get(container)!,
       containerName: container,
       engine,
-      records: { get: async () => ({ id: ENVIRONMENT_ID, remoteUser: USER }) as Environment },
+      records: { get: async () => ({ id: environmentOf.get(container)!, remoteUser: USER }) as Environment },
     });
 
   it.each<[string, string[]]>([

@@ -147,6 +147,16 @@ export interface InspectedContainer extends ContainerInfo {
   created: string;
 }
 
+/**
+ * Plan step 11I (U4, decision of 2026-10-08): a container of the lists of the pipeline's Docker (EnvironmentDocker), with
+ * the time of its create, by which the rule of the dev container (devContainerOf, src/core/worker/environmentContainers.ts)
+ * takes the newest one.
+ */
+export interface ListedContainer extends ContainerInfo {
+  /** When the daemon created it (`Created` of the inspect, RFC 3339); absent when it is not known. */
+  created?: string;
+}
+
 export function toContainerInfo(value: unknown): InspectedContainer | undefined {
   if (!isRecord(value)) return undefined;
   const id = value.Id;
@@ -264,8 +274,5 @@ export function publicInfo(container: InspectedContainer): ContainerInfo {
   };
 }
 
-/** Newest first; a running container before a stopped one. */
-export function preferred(a: InspectedContainer, b: InspectedContainer): number {
-  if (a.state !== b.state) return a.state === 'running' ? -1 : 1;
-  return b.created.localeCompare(a.created);
-}
+// Plan step 11I (U4, decision of 2026-10-08): `preferred` (a running container first, then the newest by the text of its
+// time) is removed; the one rule of the dev container is devContainerOf (src/core/worker/environmentContainers.ts).

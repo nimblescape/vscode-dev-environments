@@ -444,9 +444,10 @@ export const StateTexts = {
   kept: 'kept',
   /**
    * Review round 7, P7-2: the suffix of the state text of an environment whose dev container does not run while another
-   * service of Docker Compose runs, for example `Stopped · services running` (Stop stays offered).
+   * service of Docker Compose runs (plan step 11I, U4, decision of 2026-10-08: or another dev container of the
+   * environment), for example `Stopped · containers running` (Stop stays offered).
    */
-  servicesRunning: 'services running',
+  servicesRunning: 'containers running',
 } as const;
 
 /** The most names that one message lists (review round 9, S9-1). */
