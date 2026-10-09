@@ -5397,7 +5397,9 @@ describe('the shared VS Code server store in Docker Compose (plan step 11H1)', (
     useCompose(h);
     await h.service.open(TARGET, options());
     const m = upModel();
-    expect(m.services.app.volumes).toContainEqual({ type: 'volume', source: 'devenv-vscode', target: '/opt/devenv/vscode', read_only: true });
+    // Review round 1 of 11H1 (A-M1): changed expectation, `volume: { nocopy: true }` (before: without it), so that Docker
+    // never copies the image's /opt/devenv/vscode into an empty store.
+    expect(m.services.app.volumes).toContainEqual({ type: 'volume', source: 'devenv-vscode', target: '/opt/devenv/vscode', read_only: true, volume: { nocopy: true } });
     expect(m.volumes?.['devenv-vscode']).toEqual({ name: 'devenv-vscode', external: true });
     expect(JSON.stringify(m.services.db)).not.toContain('devenv-vscode');
     expect(h.docker.log.filter((line) => line.includes('devenv-vscode'))).toEqual([]);

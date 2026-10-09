@@ -159,6 +159,27 @@ function tunnel(proxy: URL, host: string, port: number, signal: AbortSignal | un
   });
 }
 
+/** Waits for `promise`; rejects when `signal` aborts first (review round 1 of 11H1, A-L1). */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  const ended = (): Error => new Error('The request ended before the proxy settings of the Docker engine were read.');
+  if (signal.aborted) return Promise.reject(ended());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(ended());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * The worker's HTTPS transport: through the proxy of `settings()` (read once, when the first request needs it), else
  * directly. Only `https:` URLs (a registry never gets credentials without TLS); the TLS of the host is checked as without a
@@ -171,7 +192,10 @@ export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): H
     const url = new URL(target);
     if (url.protocol !== 'https:') throw new Error(`The worker sends no request without TLS (${url.protocol}//${url.host}).`);
     read ??= settings();
-    const proxy = proxyFor(url, await read);
+    // Review round 1 of 11H1 (A-L1): the read of the proxy settings (`docker info`) ends with the request's signal too,
+    // so a daemon that does not answer never holds a request beyond its signal (the fetch of the shared VS Code server
+    // and its time limit). The read itself stays shared by the later requests.
+    const proxy = proxyFor(url, await untilAborted(read, signal));
     if (proxy === undefined) return {};
     const host = url.hostname.replace(/^\[|\]$/g, '');
     const socket = await tunnel(proxy, host, url.port === '' ? 443 : Number(url.port), signal);

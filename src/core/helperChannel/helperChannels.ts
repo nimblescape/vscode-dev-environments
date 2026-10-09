@@ -112,9 +112,10 @@ export function channelRunArgs(p: {
     `type=volume,source=${p.stateVolume},target=${LOCK_STATE_DIR}`,
     // Plan step 11H1 (decision of 2026-10-03, "The VS Code caches are worker operations"): the shared VS Code server store
     // of the engine, read-write (only the worker writes it; the dev containers get it read-only). The worker reads its
-    // name from the inspect of its own container (readOwnHelper).
+    // name from the inspect of its own container (readOwnHelper). Review round 1 of 11H1 (A-M1): `volume-nocopy`, as the
+    // mount of the dev containers (vscodeStoreMount): the store's content comes only from ensureServer, never from an image.
     '--mount',
-    `type=volume,source=${p.vscodeVolume},target=${VSCODE_STORE_DIR}`,
+    `type=volume,source=${p.vscodeVolume},target=${VSCODE_STORE_DIR},volume-nocopy`,
     p.tag,
     ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: CHANNEL_ENTRY }),
   ];

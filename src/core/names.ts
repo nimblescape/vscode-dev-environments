@@ -236,10 +236,13 @@ export const VSCODE_STORE_TARGET = '/opt/devenv/vscode';
 /**
  * Plan step 11H1: the `--mount` value of the store in the override configuration of a single container (and the volume
  * mount of the dev service of Docker Compose): the store `volume` read-only at VSCODE_STORE_TARGET. The host access
- * policy exempts exactly this text in the override configuration (runArgsFindings).
+ * policy exempts exactly this text in the override configuration (runArgsFindings). Review round 1 of 11H1 (A-M1):
+ * `volume-nocopy`, so that Docker never copies the image's VSCODE_STORE_TARGET into an empty store (Docker fills an
+ * empty volume from the image at container create unless `nocopy`, read-only or not; a repository's image could plant a
+ * server there that every dev container of the engine would then link).
  */
 export function vscodeStoreMount(volume: string): string {
-  return `type=volume,source=${volume},target=${VSCODE_STORE_TARGET},readonly`;
+  return `type=volume,source=${volume},target=${VSCODE_STORE_TARGET},readonly,volume-nocopy`;
 }
 
 export function newEnvironmentId(): string {

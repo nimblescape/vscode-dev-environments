@@ -27,7 +27,9 @@ describe('the name and the target of the shared VS Code server store (plan step 
   it('are fixed: devenv-vscode, read-only at /opt/devenv/vscode', () => {
     expect(VSCODE_STORE_VOLUME).toBe('devenv-vscode');
     expect(VSCODE_STORE_TARGET).toBe('/opt/devenv/vscode');
-    expect(OUR_MOUNT).toBe('type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly');
+    // Review round 1 of 11H1 (A-M1): changed expectation, `volume-nocopy` (before: without it), so that Docker never
+    // copies the image's /opt/devenv/vscode into an empty store.
+    expect(OUR_MOUNT).toBe('type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly,volume-nocopy');
     expect(foreignVolumeName('devenv-vscode')).toBe('the shared VS Code server store');
     // Only the exact name.
     expect(foreignVolumeName('devenv-vscode2')).toBeUndefined();
@@ -107,6 +109,12 @@ describe('the override configuration mounts the store, exactly so (plan step 11H
     ['ro=true', 'type=volume,source=devenv-vscode,target=/opt/devenv/vscode,ro=true'],
     ['another target', 'type=volume,source=devenv-vscode,target=/opt/vscode,readonly'],
     ['with a subpath', 'type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly,volume-subpath=server'],
+    // Review round 1 of 11H1 (A-M1): the exemption follows the text with `volume-nocopy`; the text of 11H1 without it (a
+    // copy-up of the image into an empty store), and every other spelling of nocopy, stay refused.
+    ['the text without volume-nocopy', 'type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly'],
+    ['volume-nocopy=true', 'type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly,volume-nocopy=true'],
+    ['volume-nocopy first', 'volume-nocopy,type=volume,source=devenv-vscode,target=/opt/devenv/vscode,readonly'],
+    ['volume-nocopy twice', `${OUR_MOUNT},volume-nocopy`],
   ])('refuses any other text in the override configuration (%s)', (_name, value) => {
     const report = checkContainer('finalRunArgs', { ...input({ runArgs: ['--mount', value] }), checks: 'off' });
     expect(report.hostAccess.length + report.unsupported.length).toBeGreaterThan(0);

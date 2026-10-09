@@ -375,8 +375,9 @@ describe('channelRunArgs and openHelperChannel', () => {
       // Plan step 5, PR B: changed expectation: the volume of the Session Monitor at /state, for the lock files.
       '--mount', 'type=volume,source=devenv-session-monitor,target=/state',
       // Plan step 11H1 (decision of 2026-10-03, "The VS Code caches are worker operations"): changed expectation, the
-      // shared VS Code server store of the engine, read-write at /vscode (before: no such mount).
-      '--mount', 'type=volume,source=devenv-vscode,target=/vscode',
+      // shared VS Code server store of the engine, read-write at /vscode (before: no such mount). Review round 1 of 11H1
+      // (A-M1): changed expectation, `volume-nocopy` (before: without it), the store's content never comes from an image.
+      '--mount', 'type=volume,source=devenv-vscode,target=/vscode,volume-nocopy',
       // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: 'node', '-e', CHANNEL_LOADER).
       'devenv-helper:abc', 'node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', hash, 'startChannel',
     ]);

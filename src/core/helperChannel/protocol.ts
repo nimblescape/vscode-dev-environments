@@ -1476,9 +1476,9 @@ export type VscodePlatform = 'linux-x64' | 'linux-arm64';
 
 /**
  * Plan step 11H1: what the link of the shared VS Code server did in the dev container of an open: `linked` (a new link),
- * `present` (the container has that server already), `missing` (the store lacks the server for the container: its
- * download failed, or the container has another platform), `skipped` (anything else: a container without the store, a
- * container of musl, a planted link, a failure; the open's log says why). In each case but `linked` and `present`, the
+ * `present` (the container has that server already), `missing` (the store lacks the server: its download failed),
+ * `skipped` (anything else: a container without the store, a container of another platform than the engine or of musl, a
+ * planted link, a failure; the open's log says why; review round 1 of 11H1, A-L4: another platform is `skipped`). In each case but `linked` and `present`, the
  * Dev Containers extension installs the server into the container, as before.
  */
 export interface VscodeServerLink {

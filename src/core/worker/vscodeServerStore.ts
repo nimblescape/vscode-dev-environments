@@ -39,6 +39,8 @@ export const SERVER_FETCH_TIMEOUT_MS = 10 * 60_000;
 export const MAX_SERVER_ARCHIVE_BYTES = 256 * 1024 * 1024;
 /** Plan step 11H1: the most redirects of the download (each to an `https:` URL). */
 export const MAX_SERVER_REDIRECTS = 5;
+/** Review round 1 of 11H1 (reviewer B): the largest answer of the update service (its JSON is a few hundred bytes). */
+export const MAX_UPDATE_SERVICE_BYTES = 64 * 1024;
 /** Plan step 11H1: the longest unpack of the archive by `tar`. */
 export const SERVER_UNPACK_TIMEOUT_MS = 5 * 60_000;
 
@@ -118,8 +120,23 @@ export function serverVersionName(server: VscodeServerRef, platform: VscodePlatf
  * after one line in the log (also for a cancel by `signal` and the time limit of the whole fetch); never rejects.
  */
 export async function ensureServer(deps: VscodeStoreDeps, server: VscodeServerRef, platform: VscodePlatform, signal: AbortSignal): Promise<boolean> {
+  return ensureServerWithin(deps, server, platform, signal, fetchLimit(deps));
+}
+
+/** The time limit of one fetch (deps.timeoutMs, default SERVER_FETCH_TIMEOUT_MS): its length and its signal. */
+function fetchLimit(deps: VscodeStoreDeps): { timeoutMs: number; limit: AbortSignal } {
   const timeoutMs = deps.timeoutMs ?? SERVER_FETCH_TIMEOUT_MS;
-  const limit = AbortSignal.timeout(timeoutMs);
+  return { timeoutMs, limit: AbortSignal.timeout(timeoutMs) };
+}
+
+/** ensureServer within the time limit `limit` (started by the caller: ensureEngineServer counts its /info in it). */
+async function ensureServerWithin(
+  deps: VscodeStoreDeps,
+  server: VscodeServerRef,
+  platform: VscodePlatform,
+  signal: AbortSignal,
+  { timeoutMs, limit }: { timeoutMs: number; limit: AbortSignal },
+): Promise<boolean> {
   const both = AbortSignal.any([signal, limit]);
   const name = `${server.commit} (${server.quality})`;
   try {
@@ -154,15 +171,26 @@ export async function ensureServer(deps: VscodeStoreDeps, server: VscodeServerRe
 /**
  * Plan step 11H1: ensureServer for the platform of the engine's architecture (serverPlatform of deps.architecture); an
  * architecture without a server in the store, or an engine that does not say it, is one line and `undefined`. Resolves
- * with the platform when its server is ready, else `undefined`; never rejects.
+ * with the platform when its server is ready, else `undefined`; never rejects. Review round 1 of 11H1 (A-L1): the read of
+ * the architecture counts in the time limit of the fetch (one limit for both), so an engine that does not answer
+ * `GET /info` never holds the open beyond it.
  */
 export async function ensureEngineServer(deps: VscodeStoreDeps, server: VscodeServerRef, signal: AbortSignal): Promise<VscodePlatform | undefined> {
   const name = `${server.commit} (${server.quality})`;
+  const limit = fetchLimit(deps);
+  const both = AbortSignal.any([signal, limit.limit]);
   let architecture: string;
   try {
-    architecture = await deps.architecture(signal);
+    architecture = await untilAborted(deps.architecture(both), both);
   } catch (error) {
-    deps.logger.warn(`The VS Code server ${name} is not fetched into the shared store: the architecture of the engine could not be read (${signal.aborted ? 'the open was cancelled' : error instanceof Error ? error.message : String(error)}).`);
+    const why = signal.aborted
+      ? 'the open was cancelled'
+      : limit.limit.aborted
+        ? `no answer within ${Math.round(limit.timeoutMs / 1000)} s`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    deps.logger.warn(`The VS Code server ${name} is not fetched into the shared store: the architecture of the engine could not be read (${why}).`);
     return undefined;
   }
   const platform = serverPlatform(architecture);
@@ -170,7 +198,26 @@ export async function ensureEngineServer(deps: VscodeStoreDeps, server: VscodeSe
     deps.logger.info(`The VS Code server ${name} is not fetched into the shared store: the engine's architecture ${JSON.stringify(architecture)} has no server there.`);
     return undefined;
   }
-  return (await ensureServer(deps, server, platform, signal)) ? platform : undefined;
+  return (await ensureServerWithin(deps, server, platform, signal, limit)) ? platform : undefined;
+}
+
+/** Waits for `promise`; rejects when `signal` aborts first (a call that ignores its signal ends at the limit too). */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new FetchError('ended'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new FetchError('ended'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Plan step 11H1: the folder of the temporary folders of the downloads in the store. */
@@ -223,8 +270,14 @@ async function fetchServer(deps: VscodeStoreDeps, server: VscodeServerRef, platf
 
 /** The URL and the SHA-256 of the archive of the server, from the update service (VSCODE_UPDATE_SERVICE). */
 async function serverDownload(transport: HttpTransport, server: VscodeServerRef, platform: VscodePlatform, signal: AbortSignal): Promise<{ url: string; sha256: string }> {
-  const response = await transport.request({ method: 'GET', url: serverVersionUrl(server, platform), headers: { Accept: 'application/json' } }, signal);
+  const response = await transport.request(
+    { method: 'GET', url: serverVersionUrl(server, platform), headers: { Accept: 'application/json' }, maxBodyBytes: MAX_UPDATE_SERVICE_BYTES },
+    signal,
+  );
   if (response.status !== 200) throw new FetchError(`the update service answered HTTP ${response.status}`);
+  // Review round 1 of 11H1 (reviewer B): at most MAX_UPDATE_SERVICE_BYTES (httpsRequest stops reading there; checked
+  // here too, whatever the transport).
+  if (Buffer.byteLength(response.body, 'utf8') > MAX_UPDATE_SERVICE_BYTES) throw new FetchError(`the update service answered more than ${MAX_UPDATE_SERVICE_BYTES} bytes`);
   let value: unknown;
   try {
     value = JSON.parse(response.body);
@@ -298,7 +351,8 @@ export async function downloadToFile(transport: HttpStreamTransport, url: string
 /**
  * Plan step 11H1: everything in `folder` readable for all: folders 0755, files their mode plus read for all, and execute
  * for all where any execute bit is set (so the remote user of a dev container runs `node` and `bin/code-server`); links
- * stay as they are.
+ * stay as they are. Review round 1 of 11H1 (A-L2): the setuid, setgid and sticky bits of the archive are dropped (a
+ * setuid file in the store would run as its owner, root, in every dev container of the engine).
  */
 export async function readableForAll(folder: string): Promise<void> {
   const stat = await fs.promises.lstat(folder);
@@ -308,9 +362,9 @@ export async function readableForAll(folder: string): Promise<void> {
     for (const entry of await fs.promises.readdir(folder)) await readableForAll(path.join(folder, entry));
     return;
   }
-  const mode = stat.mode & 0o7777;
+  const mode = stat.mode & 0o777;
   const wanted = mode | 0o444 | ((mode & 0o111) !== 0 ? 0o111 : 0);
-  if (wanted !== mode) await fs.promises.chmod(folder, wanted);
+  if (wanted !== (stat.mode & 0o7777)) await fs.promises.chmod(folder, wanted);
 }
 
 /** Plan step 11H1: the folder of the lock files of the server versions in the store. */

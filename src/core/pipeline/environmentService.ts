@@ -5270,7 +5270,8 @@ export class EnvironmentService extends OperationBase {
       await this.writeGitToken(ctx, containerRef, remoteUser ?? 'root');
     }
     // Plan step 11H1: the shared VS Code server, linked at every open before the window connects (the commit changes with
-    // each update of VS Code) when the store has it; nothing is waited for, and a failure never fails the open.
+    // each update of VS Code) when the store has it; the open waits for the fetch that it started (linkVscodeServer; review
+    // round 1 of 11H1, A-L4), and a failure never fails the open.
     const vscodeServer = await this.linkVscodeServer(ctx, containerRef, containerName, remoteUser ?? 'root');
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.

@@ -827,9 +827,13 @@ export function composeUpModel(
   dev.tmpfs = [...tmpfsEntries(dev.tmpfs), TOKEN_TMPFS];
   // Plan step 11H1: the shared VS Code server store, read-only, only in the dev container. The check refused every mount
   // of the repository at or below its target (configFolderTarget) and the key (topLevelVolumeProblems), so this one is the
-  // only one.
+  // only one. Review round 1 of 11H1 (A-M1): `nocopy`, so that Docker never copies the image's VSCODE_STORE_TARGET into
+  // an empty store (as vscodeStoreMount for a single container).
   if (p.vscodeStoreVolume !== undefined) {
-    dev.volumes = [...(Array.isArray(dev.volumes) ? dev.volumes : []), { type: 'volume', source: VSCODE_STORE_KEY, target: VSCODE_STORE_TARGET, read_only: true }];
+    dev.volumes = [
+      ...(Array.isArray(dev.volumes) ? dev.volumes : []),
+      { type: 'volume', source: VSCODE_STORE_KEY, target: VSCODE_STORE_TARGET, read_only: true, volume: { nocopy: true } },
+    ];
     result.volumes = { ...(result.volumes ?? {}), [VSCODE_STORE_KEY]: { name: p.vscodeStoreVolume, external: true } };
   }
   // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.

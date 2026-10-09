@@ -23,7 +23,8 @@ import { VSCODE_STORE_TARGET } from '../names';
  * - `~/.vscode-server` (`~/.vscode-server-insiders` for the quality `insider`) and its `bin` are each missing (then
  *   created) or a plain folder of the user; a link, another kind of file, or a folder of another user is refused;
  * - `bin/<commit>` does not exist yet (a file, a folder or a link there is never replaced).
- * Then it creates the link `bin/<commit>` → the server in the store. Its output is one line: `linked`, `present`,
+ * Then it creates the link `bin/<commit>` → the server in the store (review round 1 of 11H1: working in each checked
+ * folder, entered after its check, with `ln -sn`, so nothing is written through a link planted after a check). Its output is one line: `linked`, `present`,
  * `skipped: <why>` or `refused: <why>`; it exits 0 for each of them, and non-zero only when a command failed. Works with
  * GNU and BusyBox tools.
  */
@@ -60,21 +61,31 @@ if [ ! -f "$server/bin/code-server" ] || [ ! -f "$server/node" ]; then echo 'ski
 uid=$(id -u) || exit 1
 home=$(awk -F: -v u="$uid" '$3 == u { print $6; exit }' /etc/passwd)
 if [ -z "$home" ] || [ ! -d "$home" ]; then echo 'skipped: the user has no home folder'; exit 0; fi
-folder() {
-  if [ -L "$1" ]; then echo "refused: $1 is a link"; exit 0; fi
+# Review round 1 of 11H1 (reviewer B): each step after a check works in the folder that it checked. The script enters
+# each folder after its check, makes sure there that it is the folder it checked (its real path, and the user's), and
+# creates the link relative to it with \`ln -n\`, so a link planted after a check is never followed by a later step. What
+# remains: the remote user (or root) of the container can still move a checked folder while the script runs; the link
+# then lands in that same folder at its new place, in the container's own file system, which they can write anyway.
+cd -P -- "$home" || exit 1
+enter() {
+  if [ -L "$1" ]; then echo "refused: $2 is a link"; exit 0; fi
   if [ -e "$1" ]; then
-    if [ ! -d "$1" ]; then echo "refused: $1 is not a folder"; exit 0; fi
+    if [ ! -d "$1" ]; then echo "refused: $2 is not a folder"; exit 0; fi
     owner=$(ls -ldn "$1" | awk '{ print $3 }')
-    if [ "$owner" != "$uid" ]; then echo "refused: $1 is not the user's"; exit 0; fi
+    if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
   else
     mkdir "$1" || exit 1
   fi
+  here=$(pwd -P) || exit 1
+  cd -P "$1" || exit 1
+  if [ "$(pwd -P)" != "\${here%/}/$1" ]; then echo "refused: $2 was replaced while it was checked"; exit 0; fi
+  owner=$(ls -ldn . | awk '{ print $3 }')
+  if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
 }
-folder "$home/$data"
-folder "$home/$data/bin"
-link="$home/$data/bin/$commit"
-if [ -e "$link" ] || [ -L "$link" ]; then echo 'present'; exit 0; fi
-ln -s "$server" "$link" || exit 1
+enter "$data" "$home/$data"
+enter bin "$home/$data/bin"
+if [ -e "$commit" ] || [ -L "$commit" ]; then echo 'present'; exit 0; fi
+ln -sn "$server" "$commit" || exit 1
 echo 'linked'
 `;
 

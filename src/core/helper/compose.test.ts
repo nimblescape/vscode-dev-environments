@@ -459,7 +459,9 @@ describe('composeUpModel', () => {
     const { model } = up(templateModel(), { vscodeStoreVolume: 'devenv-vscode' });
     expect(model.services.app.volumes).toEqual([
       { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' },
-      { type: 'volume', source: VSCODE_STORE_KEY, target: '/opt/devenv/vscode', read_only: true },
+      // Review round 1 of 11H1 (A-M1): changed expectation, `volume: { nocopy: true }` (before: without it), so that
+      // Docker never copies the image's /opt/devenv/vscode into an empty store.
+      { type: 'volume', source: VSCODE_STORE_KEY, target: '/opt/devenv/vscode', read_only: true, volume: { nocopy: true } },
     ]);
     expect(model.services.db.volumes).toEqual(plain.services.db.volumes);
     expect(model.volumes).toEqual({ ...plain.volumes, [VSCODE_STORE_KEY]: { name: 'devenv-vscode', external: true } });

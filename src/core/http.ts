@@ -10,6 +10,11 @@ export interface HttpRequest {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  /**
+   * Review round 1 of 11H1 (reviewer B): the largest body that httpsRequest reads for this request (lower than
+   * MAX_BODY_BYTES; never higher); a larger one fails as "too large".
+   */
+  maxBodyBytes?: number;
 }
 
 export interface HttpResponse {
@@ -33,9 +38,10 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 /**
  * One request with the Node.js `https` module; `options` adds to the request (plan step 11E3a: the connection through a
- * proxy). The body is read up to MAX_BODY_BYTES.
+ * proxy). The body is read up to MAX_BODY_BYTES (or the lower `request.maxBodyBytes`).
  */
 export function httpsRequest(request: HttpRequest, signal: AbortSignal | undefined, options: https.RequestOptions = {}): Promise<HttpResponse> {
+  const maxBytes = Math.min(MAX_BODY_BYTES, request.maxBodyBytes ?? MAX_BODY_BYTES);
   return new Promise((resolve, reject) => {
     const req = https.request(
       request.url,
@@ -45,8 +51,12 @@ export function httpsRequest(request: HttpRequest, signal: AbortSignal | undefin
         let size = 0;
         res.on('data', (chunk: Buffer) => {
           size += chunk.length;
-          if (size > MAX_BODY_BYTES) {
-            req.destroy(new Error(`Response of ${request.url} is too large.`));
+          if (size > maxBytes) {
+            // Review round 1 of 11H1: rejected here, not by the destroy alone (a body that came in one chunk would end
+            // first and resolve without its content).
+            const error = new Error(`Response of ${request.url} is too large.`);
+            reject(error);
+            req.destroy(error);
             return;
           }
           chunks.push(chunk);
