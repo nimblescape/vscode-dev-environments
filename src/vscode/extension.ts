@@ -47,6 +47,8 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment';
 import { workerMonitor } from './workerMonitor';
+import { windowVscodeServer } from './vscodeServer';
+import { VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings } from '../core/types';
@@ -268,6 +270,9 @@ async function activateExtension(
           socketPath: engineSocket,
           // Plan step 5, PR B: the lock files of the environments, in the volume of the Session Monitor of the engine.
           stateVolume: REMOTE_MONITOR_VOLUME,
+          // Plan step 11H1 (decision of 2026-10-03, "The VS Code caches are worker operations"): the shared VS Code server
+          // store of the engine, which the worker mounts read-write.
+          vscodeVolume: VSCODE_STORE_VOLUME,
         },
         target,
       ),
@@ -482,6 +487,9 @@ async function activateExtension(
     // Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list that an open carries for the
     // Session Monitor of its engine (the worker makes sure that the monitor runs, and sends its first heartbeat).
     openMonitor: (dockerHost) => ({ images: imageMaintenance(), ...imageListFor(dockerHost) }),
+    // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the commit and quality of this VS Code
+    // (product.json under vscode.env.appRoot, read once), which an open sends when the build qualifies.
+    vscodeServerOfWindow: windowVscodeServer(vscode.env.appRoot, (file) => fs.promises.readFile(file, 'utf8'), (message) => logger.info(message)),
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
       startDockerFor(

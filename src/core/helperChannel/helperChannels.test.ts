@@ -353,8 +353,17 @@ describe('HelperChannels (user request 2026-09-28: the helper channel)', () => {
 describe('channelRunArgs and openHelperChannel', () => {
   it('runs the helper image with --rm -i, never a pull, outbound network only, no capability, only the socket, and the loader', () => {
     const hash = bundleHash('SCRIPT');
-    // Plan step 5, PR B: changed call: the state volume with the lock files is mounted too.
-    const args = channelRunArgs({ tag: 'devenv-helper:abc', socketPath: '/run/user/1000/docker.sock', stateVolume: 'devenv-session-monitor', containerName: 'devenv-channel-1', label: '1-x', scriptHash: hash });
+    // Plan step 5, PR B: changed call: the state volume with the lock files is mounted too. Plan step 11H1 (decision of
+    // 2026-10-03, "The VS Code caches are worker operations"): changed call, and the shared VS Code server store.
+    const args = channelRunArgs({
+      tag: 'devenv-helper:abc',
+      socketPath: '/run/user/1000/docker.sock',
+      stateVolume: 'devenv-session-monitor',
+      vscodeVolume: 'devenv-vscode',
+      containerName: 'devenv-channel-1',
+      label: '1-x',
+      scriptHash: hash,
+    });
     expect(args).toEqual([
       'run', '--rm', '-i', '--pull', 'never', '--name', 'devenv-channel-1',
       '--label', 'nimblescape.devenv.helper-run=true',
@@ -365,16 +374,21 @@ describe('channelRunArgs and openHelperChannel', () => {
       '--mount', 'type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock',
       // Plan step 5, PR B: changed expectation: the volume of the Session Monitor at /state, for the lock files.
       '--mount', 'type=volume,source=devenv-session-monitor,target=/state',
+      // Plan step 11H1 (decision of 2026-10-03, "The VS Code caches are worker operations"): changed expectation, the
+      // shared VS Code server store of the engine, read-write at /vscode (before: no such mount).
+      '--mount', 'type=volume,source=devenv-vscode,target=/vscode',
       // Plan step 3 (pipe loading, user decision 2026-09-29): changed expectation (before: 'node', '-e', CHANNEL_LOADER).
       'devenv-helper:abc', 'node', '-e', PIPE_LOADER, '/opt/devenv/channel.js', hash, 'startChannel',
     ]);
     // Neither a restart policy nor -d: the container lives only as long as its connection.
     expect(args).not.toContain('--restart');
     expect(args).not.toContain('-d');
-    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', stateVolume: 'v', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+    expect(() => channelRunArgs({ tag: 't', socketPath: '/a,b', stateVolume: 'v', vscodeVolume: 'w', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
     // Plan step 5, PR B: a volume name that could change the mount (CSV) or be an option is refused.
     for (const stateVolume of ['a,b', '-v', 'a"b', '', 'a=b']) {
-      expect(() => channelRunArgs({ tag: 't', socketPath: '/s', stateVolume, containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+      expect(() => channelRunArgs({ tag: 't', socketPath: '/s', stateVolume, vscodeVolume: 'w', containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
+      // Plan step 11H1: the same for the volume of the shared VS Code server store.
+      expect(() => channelRunArgs({ tag: 't', socketPath: '/s', stateVolume: 'v', vscodeVolume: stateVolume, containerName: 'n', label: 'l', scriptHash: hash })).toThrow(HelperChannelError);
     }
   });
 
@@ -417,6 +431,7 @@ describe('channelRunArgs and openHelperChannel', () => {
         helperTag: async () => 'devenv-helper:abc',
         socketPath: async () => '/var/run/docker.sock',
         stateVolume: 'devenv-session-monitor',
+        vscodeVolume: 'devenv-vscode',
       },
       REMOTE,
     );
@@ -486,6 +501,7 @@ describe('channelRunArgs and openHelperChannel', () => {
           helperTag: async () => 'devenv-helper:abc',
           socketPath: async () => '/var/run/docker.sock',
           stateVolume: 'devenv-session-monitor',
+          vscodeVolume: 'devenv-vscode',
         },
         REMOTE,
       );
@@ -542,6 +558,7 @@ describe('channelRunArgs and openHelperChannel', () => {
         helperTag: async () => 'devenv-helper:abc',
         socketPath: async () => '/var/run/docker.sock',
         stateVolume: 'devenv-session-monitor',
+        vscodeVolume: 'devenv-vscode',
       },
       REMOTE,
     );
@@ -577,7 +594,7 @@ describe('channelRunArgs and openHelperChannel', () => {
     };
     await expect(
       openHelperChannel(
-        { start: () => process, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
+        { start: () => process, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor', vscodeVolume: 'devenv-vscode' },
         REMOTE,
       ),
     ).rejects.toThrow('The helper channel to build-box does not reach Docker: permission denied while trying to connect to the Docker daemon socket');
@@ -587,7 +604,7 @@ describe('channelRunArgs and openHelperChannel', () => {
   it('fails to open without a Docker CLI', async () => {
     await expect(
       openHelperChannel(
-        { start: () => undefined, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
+        { start: () => undefined, runDirect: directEngine, logger: silentLogger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor', vscodeVolume: 'devenv-vscode' },
         REMOTE,
       ),
     ).rejects.toMatchObject({ code: 'open' });
@@ -643,6 +660,7 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
         helperTag: async () => 't',
         socketPath: async () => '/run/user/1000/docker.sock',
         stateVolume: 'devenv-session-monitor',
+        vscodeVolume: 'devenv-vscode',
       },
       target,
     );
@@ -677,6 +695,7 @@ describe('the engine identity at the open (plan step 5, PR A)', () => {
               helperTag: async () => 't',
               socketPath: async () => '/var/run/docker.sock',
               stateVolume: 'devenv-session-monitor',
+              vscodeVolume: 'devenv-vscode',
             },
             target,
           ),
@@ -736,6 +755,7 @@ describe('the engine identity as values (plan step 11I, PR A)', () => {
     helperTag: async () => 't',
     socketPath: async () => '/var/run/docker.sock',
     stateVolume: 'devenv-session-monitor',
+    vscodeVolume: 'devenv-vscode',
   });
 
   // Go's `{{json}}` escapes `&`, `<` and `>` (\u0026, \u003c, \u003e); the Engine API answers the plain value.
@@ -809,7 +829,7 @@ describe('the sweep at the open (review round 4, M1; plan step 11I, PR A)', () =
       const lines: string[] = [];
       const logger: Logger = { ...silentLogger, info: (text) => lines.push(`info ${text}`), warn: (text) => lines.push(`warn ${text}`) };
       const channel = await openHelperChannel(
-        { start: () => worker.process, runDirect: directEngine, logger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor' },
+        { start: () => worker.process, runDirect: directEngine, logger, script: async () => 'S', helperTag: async () => 't', socketPath: async () => '/s', stateVolume: 'devenv-session-monitor', vscodeVolume: 'devenv-vscode' },
         REMOTE,
       );
       for (let i = 0; i < 20 && worker.sent.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 0));

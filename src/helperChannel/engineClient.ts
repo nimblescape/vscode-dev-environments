@@ -413,6 +413,12 @@ export function dockerEngine(
       const noProxy = field(value?.NoProxy);
       return { ...(httpProxy ? { httpProxy } : {}), ...(httpsProxy ? { httpsProxy } : {}), ...(noProxy ? { noProxy } : {}) };
     },
+    // Plan step 11H1: the platform of the shared VS Code server comes from it.
+    architecture: async (signal) => {
+      const value = (await list('/info', signal)) as { Architecture?: unknown } | null;
+      if (typeof value?.Architecture !== 'string' || value.Architecture === '') throw new EngineError('The engine answered /info without its architecture.', 200);
+      return value.Architecture;
+    },
     createAttached: (spec, options) => createAttached(api, hijack, spec, options),
     runAttached: (spec, options) => runAttached(api, hijack, spec, options),
   };

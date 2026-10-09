@@ -14,6 +14,7 @@ import {
   LABEL_OWNER_ID,
   LABEL_VOLUME,
   VOLUME_KIND_ADDITIONAL,
+  VSCODE_STORE_VOLUME,
 } from '../names';
 import { DEV_CONTAINERS_VOLUMES, hasDevContainersVolumeLabel, isDevContainersCloneVolumeName } from '../devContainers';
 import { REMOTE_MONITOR_VOLUME } from '../remoteMonitor/protocol';
@@ -109,8 +110,8 @@ export function isAnonymousVolumeName(name: string): boolean {
 }
 
 /**
- * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, the Session Monitor
- * on a remote Docker host (its heartbeat records; review round 1 of PR #39, R1: a mount could forge or delete them), another environment
+ * What a volume belongs to by its name alone, `undefined` for any other name: the workspace helper, the shared VS Code
+ * server store (plan step 11H1), the Session Monitor on a remote Docker host (its heartbeat records; review round 1 of PR #39, R1: a mount could forge or delete them), another environment
  * (named like a workspace volume), another container (an anonymous volume; older Docker versions do not label it), or
  * the Dev Containers extension (DEV_CONTAINERS_VOLUMES). Only for the host access policy: whether a volume
  * is an environment's own is decided by its labels (isOwnVolume).
@@ -118,6 +119,8 @@ export function isAnonymousVolumeName(name: string): boolean {
 export function foreignVolumeName(name: string): string | undefined {
   if (name === HELPER_CACHE_VOLUME) return 'the workspace helper';
   if (name === REMOTE_MONITOR_VOLUME) return 'the Session Monitor';
+  // Plan step 11H1: the shared VS Code server store (only the override configuration mounts it, read-only).
+  if (name === VSCODE_STORE_VOLUME) return 'the shared VS Code server store';
   if (isEnvironmentResourceName(name)) return 'another environment';
   if (ANONYMOUS_VOLUME_NAME.test(name)) return 'another container';
   if (DEV_CONTAINERS_VOLUMES.includes(name)) return 'the Dev Containers extension';
@@ -203,7 +206,9 @@ export function volumeNameProblems(name: string, volumes: VolumeContext): Proble
   const byName = foreignVolumeName(name);
   if (byName !== undefined) {
     const item = `volume ${name} of ${byName}`;
-    const protectedName = name === HELPER_CACHE_VOLUME || name === REMOTE_MONITOR_VOLUME || isEnvironmentResourceName(name);
+    // Plan step 11H1: the shared VS Code server store too (a write would change the server of every environment; read-only
+    // or not, only the override configuration mounts it).
+    const protectedName = name === HELPER_CACHE_VOLUME || name === REMOTE_MONITOR_VOLUME || name === VSCODE_STORE_VOLUME || isEnvironmentResourceName(name);
     return [protectedName ? guarded(item) : access(item)];
   }
   const labels = volumes.labels[name];

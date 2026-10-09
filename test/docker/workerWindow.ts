@@ -27,6 +27,7 @@ import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import type { DockerTarget } from '../../src/core/docker/dockerHost';
+import type { VscodeServerRef } from '../../src/core/helperChannel/protocol';
 import { extensionFlow, extensionHostSide } from '../../src/vscode/hostSide';
 import { readBaseline } from './dockerRun';
 import { FakeUi, HELPER_DOCKERFILE, fakeAuth, type DockerTestContext } from './harness';
@@ -105,6 +106,11 @@ export interface WorkerWindowOptions {
   network?: 'none';
   /** The start of Docker before an open (default: nothing, the engine of the tests runs). */
   startDocker?: EnvironmentOperationsDeps['startDocker'];
+  /**
+   * Plan step 11H1: the VS Code server that the opens of this window carry (as the product.json of a window would give
+   * it); default none (the opens run without the shared server, as before).
+   */
+  vscodeServer?: VscodeServerRef;
 }
 
 /** A window of the extension for a Docker test file (see the module comment). */
@@ -167,6 +173,7 @@ export function workerWindow(context: DockerTestContext, docker: BootstrapDocker
     startDocker: options.startDocker ?? (async () => {}),
     monitorSource: () => '0123456789abcdef0123456789abcdef',
     openMonitor: () => ({ images: { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, listSent: () => {} }),
+    ...(options.vscodeServer !== undefined ? { vscodeServerOfWindow: async () => options.vscodeServer } : {}),
   });
   return {
     ...computer,

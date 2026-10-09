@@ -151,6 +151,17 @@ export function testStateVolume(context: Pick<DockerTestContext, 'run' | 'cli'>,
   return volume;
 }
 
+/**
+ * Plan step 11H1: a volume of its own for the shared VS Code server store of the workers of a test file
+ * (ChannelOpenDeps.vscodeVolume), so that the store of the engine (VSCODE_STORE_VOLUME) is never created or touched; with
+ * the label of the run, so that removeRunObjects removes it. Created now when it is missing; returns its name.
+ */
+export function testVscodeVolume(context: Pick<DockerTestContext, 'run' | 'cli'>, name: string): string {
+  const volume = `devenv-test-vscode-${name}-${context.run.runId}`;
+  if (context.cli.volume(volume) === undefined) context.cli.ok(['volume', 'create', '--label', `${TEST_RUN_LABEL}=${context.run.runId}`, volume]);
+  return volume;
+}
+
 /** Logger of the core modules. Messages and the output of the tools go to one file per test file. */
 export class TestLog implements Logger {
   private readonly started = Date.now();

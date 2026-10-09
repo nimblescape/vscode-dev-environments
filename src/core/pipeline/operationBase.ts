@@ -8,6 +8,7 @@
 // (one operation per repository at a time, the sign-in, the Docker host of the operation, the busy marks of the other
 // windows, the cleanup of the session files). It imports nothing of the pipeline, so the extension's bundle holds none
 // of it. No `vscode`.
+import type { VscodeServerLink } from '../helperChannel/protocol';
 import { type BusyMarkView, type EnvironmentBusyMarks } from './busyMarks';
 import { dockerHostOf, isOnDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { dockerEndpointUnsupported } from '../docker/remoteDocker';
@@ -46,6 +47,12 @@ export const PipelineTexts = {
     `${repository} is being changed in another window. Try again when this is finished.`,
   preparingHelper: 'The workspace helper is being prepared. This happens once and can take a few minutes.',
   updatingHelper: 'The workspace helper is being updated. This can take a few minutes.',
+  /**
+   * Plan step 11H1 (decision of 2026-10-09): the detail of the open while it waits for the download of the VS Code server
+   * of the window into the shared store (the very first open of a VS Code version on the engine, or a download that runs
+   * in another window).
+   */
+  downloadingVscodeServer: 'Downloading the VS Code server.',
   lifecycleCommandFailed: (command: string | undefined) =>
     `The ${command ?? 'lifecycle command'} of the environment failed. The environment is opened anyway.`,
   /** Plan step 5, PR B, user decision D3: the lock of the environment stayed held elsewhere for ENVIRONMENT_LOCK_WAIT_SECONDS. */
@@ -153,6 +160,8 @@ export interface OpenResult {
   containerName: string;
   /** From `devcontainer up`, fallback `/workspaces/<name>`. */
   remoteWorkspaceFolder: string;
+  /** Plan step 11H1: what the link of the shared VS Code server did (an open with a server only; the worker's pipeline). */
+  vscodeServer?: VscodeServerLink;
 }
 
 export const BUSY_POLL_MS = 500;

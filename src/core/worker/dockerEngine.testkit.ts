@@ -42,6 +42,7 @@ export function unusedEngine(): DockerEngine {
     imageFile: unused('imageFile'),
     systemTime: unused('systemTime'),
     proxy: unused('proxy'),
+    architecture: unused('architecture'),
     createAttached: unused('createAttached'),
     runAttached: unused('runAttached'),
   };

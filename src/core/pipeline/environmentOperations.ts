@@ -38,6 +38,7 @@ import {
   parseWindowStateParams,
   parseWindowStateValue,
   type OpenParams,
+  type VscodeServerRef,
   type WindowStateValue,
 } from '../helperChannel/protocol';
 import type { HelperMaintenance } from '../helper/helperImages';
@@ -129,6 +130,12 @@ export interface EnvironmentOperationsDeps extends OperationBaseDeps {
   monitorSource?: () => string;
   /** Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list of an open. */
   openMonitor?: (dockerHost: string) => { images: ImageSettings; repositories?: string[]; listSent: () => void };
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the VS Code server of this window (the commit
+   * and quality of its product.json, only for a build of the Microsoft update service), which the open carries; none: the
+   * open runs without the shared server.
+   */
+  vscodeServerOfWindow?: () => Promise<VscodeServerRef | undefined>;
 }
 
 /** Plan step 11F1: the operations of a window, sent to the worker (see the module comment). */
@@ -206,6 +213,8 @@ export class EnvironmentOperations extends OperationBase {
     const dockerHost = await this.currentDockerHost();
     const monitor = this.deps.openMonitor?.(dockerHost);
     const settings = this.deps.settings();
+    // Plan step 11H1: the server of this window's VS Code, when its build qualifies (never rejects).
+    const vscodeServer = await this.deps.vscodeServerOfWindow?.();
     const params = parseOpenParams({
       dockerHost,
       owner: this.deps.owner,
@@ -224,6 +233,7 @@ export class EnvironmentOperations extends OperationBase {
       ...what,
       ...(options.forceRebuild === true ? { forceRebuild: true } : {}),
       ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
+      ...(vscodeServer !== undefined ? { vscodeServer } : {}),
     });
     if (params === undefined) throw new Error(`The open of ${repository} cannot be sent to the worker.`);
     // PR H (decision of 2026-10-09): the preparation of the worker of this open (when no worker of the engine is open)

@@ -147,7 +147,8 @@ export interface ContainerDetails {
   RestartCount?: number;
   Config: { Image: string; Hostname?: string; Labels: Record<string, string> | null; Env?: string[] | null; Tty?: boolean; OpenStdin?: boolean; Cmd?: string[] | null };
   HostConfig: { AutoRemove?: boolean; CapDrop?: string[] | null; Privileged?: boolean; RestartPolicy?: { Name?: string; MaximumRetryCount?: number }; Tmpfs?: Record<string, string> | null };
-  Mounts: Array<{ Type: string; Name?: string; Destination: string }>;
+  /** Plan step 11H1: and `RW` (the read-only mount of the shared VS Code server store). */
+  Mounts: Array<{ Type: string; Name?: string; Destination: string; RW?: boolean }>;
 }
 
 /** The fields of `docker image inspect` that the tests read. */

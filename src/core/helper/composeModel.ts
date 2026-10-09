@@ -23,6 +23,12 @@ export interface ComposeModel {
 export const WORKSPACE_VOLUME_KEY = 'devenv-workspace';
 
 /**
+ * Plan step 11H1: key of the shared VS Code server store (VSCODE_STORE_VOLUME, or the store of the worker) in the
+ * top-level `volumes` of our up model. The check refuses it in a repository.
+ */
+export const VSCODE_STORE_KEY = 'devenv-vscode';
+
+/**
  * The oldest Compose plugin with the YAML tags `!reset` (2.24.0) and `!override` (2.24.4): the fallback of the
  * implementation notes (the repository's files plus one file of ours) needs them. The helper installs the current plugin.
  */

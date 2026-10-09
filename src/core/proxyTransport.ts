@@ -12,7 +12,7 @@ import * as https from 'https';
 import * as net from 'net';
 import type { Duplex } from 'stream';
 import * as tls from 'tls';
-import { httpsRequest, type HttpTransport } from './http';
+import { httpsRequest, httpsStream, type HttpStreamTransport, type HttpTransport } from './http';
 
 /** The proxy settings that the transport follows (the daemon's, EngineProxy). */
 export interface ProxySettings {
@@ -164,24 +164,32 @@ function tunnel(proxy: URL, host: string, port: number, signal: AbortSignal | un
  * directly. Only `https:` URLs (a registry never gets credentials without TLS); the TLS of the host is checked as without a
  * proxy (its name, SNI).
  */
-export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): HttpTransport {
+export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): HttpTransport & HttpStreamTransport {
   let read: Promise<ProxySettings> | undefined;
+  // The options of the connection to `target`: none for a direct one, else the tunnel through the proxy.
+  const connection = async (target: string, signal: AbortSignal | undefined): Promise<https.RequestOptions> => {
+    const url = new URL(target);
+    if (url.protocol !== 'https:') throw new Error(`The worker sends no request without TLS (${url.protocol}//${url.host}).`);
+    read ??= settings();
+    const proxy = proxyFor(url, await read);
+    if (proxy === undefined) return {};
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    const socket = await tunnel(proxy, host, url.port === '' ? 443 : Number(url.port), signal);
+    // No agent: Node then uses createConnection (with `agent: false` it would make an agent of its own, which connects
+    // directly).
+    return {
+      // Review round 1 of PR #109 (A-M1): checked for the host of the URL, also an IP address (Node would take the name
+      // of the proxy from the socket).
+      createConnection: () => tls.connect({ socket, ...tlsNameOf(host) }),
+    };
+  };
   return {
     async request(request, signal) {
-      const url = new URL(request.url);
-      if (url.protocol !== 'https:') throw new Error(`The worker sends no request without TLS (${url.protocol}//${url.host}).`);
-      read ??= settings();
-      const proxy = proxyFor(url, await read);
-      if (proxy === undefined) return httpsRequest(request, signal);
-      const host = url.hostname.replace(/^\[|\]$/g, '');
-      const socket = await tunnel(proxy, host, url.port === '' ? 443 : Number(url.port), signal);
-      // No agent: Node then uses createConnection (with `agent: false` it would make an agent of its own, which connects
-      // directly).
-      return httpsRequest(request, signal, {
-        // Review round 1 of PR #109 (A-M1): checked for the host of the URL, also an IP address (Node would take the name
-        // of the proxy from the socket).
-        createConnection: () => tls.connect({ socket, ...tlsNameOf(host) }),
-      });
+      return httpsRequest(request, signal, await connection(request.url, signal));
+    },
+    // Plan step 11H1: the download of the shared VS Code server, streamed to a file (the same connection rules).
+    async stream(url, signal) {
+      return httpsStream(url, signal, await connection(url, signal));
     },
   };
 }

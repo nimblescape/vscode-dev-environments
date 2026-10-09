@@ -18,6 +18,7 @@ import { SECRET_REGISTRY, SECRET_TOKEN } from '../helperChannel/protocol';
 import { silentLogger } from '../ports';
 import { REMOTE_MONITOR_SCRIPT_PATH, isUnderRecordsLock } from '../remoteMonitor/protocol';
 import { CONTAINER_SCRIPTS, runScript, scriptCommand, type ContainerScript, type ScriptEntry, type ScriptExec } from './containerScripts';
+import { VSCODE_SERVER_LINK_SCRIPT } from './vscodeServerLink';
 import type { DockerEngine, EngineExecOptions } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { EngineDocker } from './engineDocker';
@@ -55,6 +56,8 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
     // changed expectation, every command of the pipeline in a container is an entry now (branch, check, gitVersion,
     // groupId, mountInfo, monitorScriptHash, userId). Plan step 11I (U2, decision of 2026-10-08): changed expectation, the
     // commands of the Session Monitor are entries too (monitorForget, monitorHeartbeat, monitorImages, monitorSettings).
+    // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): changed expectation, the link of the shared
+    // VS Code server in the dev container (vscodeServerLink).
     expect(Object.keys(CONTAINER_SCRIPTS).sort()).toEqual([
       'branch',
       'check',
@@ -73,8 +76,12 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
       'tokenRemove',
       'tokenWrite',
       'userId',
+      'vscodeServerLink',
     ]);
     expect(CONTAINER_SCRIPTS.tokenWrite.script).toBe(TOKEN_WRITE_SCRIPT);
+    // Plan step 11H1: the text of its module, without a secret.
+    expect(CONTAINER_SCRIPTS.vscodeServerLink.script).toBe(VSCODE_SERVER_LINK_SCRIPT);
+    expect('secretInputName' in CONTAINER_SCRIPTS.vscodeServerLink).toBe(false);
     expect(CONTAINER_SCRIPTS.tokenRemove.script).toBe(TOKEN_REMOVE_SCRIPT);
     expect(CONTAINER_SCRIPTS.gitSummary.script).toBe(GIT_SUMMARY_SCRIPT);
     // Plan step 11I (PR B): the scripts of the pipeline, each the text of its module.

@@ -57,6 +57,8 @@ export interface MountTarget {
    * with the same volume and target; the top-level `Mounts` do not have it). Missing: the whole volume, or not known.
    */
   subpath?: string;
+  /** Plan step 11H1: the mount is read-only (`RW` false); missing: read-write, or not known. */
+  readOnly?: true;
 }
 
 /** Review round 11 (G3, G4): a mount of a subpath of a named volume (ContainerInfo.volumeSubpaths). */
@@ -215,7 +217,14 @@ function mountTargets(mounts: unknown, tmpfs: unknown, hostMounts: unknown): Mou
     if (!isRecord(mount) || typeof mount.Destination !== 'string' || mount.Destination === '' || typeof mount.Type !== 'string') continue;
     const volume = mount.Type === 'volume' && typeof mount.Name === 'string' && mount.Name !== '' ? mount.Name : undefined;
     const subpath = volume !== undefined && mount.Destination.startsWith('/') ? subpaths.get(`${volume}\0${cleanTarget(mount.Destination)}`) : undefined;
-    result.push({ type: mount.Type, ...(volume !== undefined ? { volume } : {}), target: mount.Destination, ...(typeof subpath === 'string' ? { subpath } : {}) });
+    result.push({
+      type: mount.Type,
+      ...(volume !== undefined ? { volume } : {}),
+      target: mount.Destination,
+      ...(typeof subpath === 'string' ? { subpath } : {}),
+      // Plan step 11H1: the link of the shared VS Code server needs the store read-only.
+      ...(mount.RW === false ? { readOnly: true as const } : {}),
+    });
   }
   if (isRecord(tmpfs)) for (const target of Object.keys(tmpfs)) if (target !== '') result.push({ type: 'tmpfs', target });
   return result;

@@ -217,9 +217,27 @@ describe('the containers of `docker container inspect`', () => {
     expect(read(dev)?.mountTargets).toEqual([
       { type: 'volume', volume: 'acme-api-3f2a9c1e', target: '/workspaces' },
       { type: 'volume', volume: 'devenv-3f2a9c1e_pgdata', target: '/workspaces/api/.pgdata' },
-      { type: 'bind', target: '/home/vscode/.ssh' },
+      // Plan step 11H1: changed expectation, a read-only mount says so (RW false; the link of the shared VS Code server
+      // needs the store read-only).
+      { type: 'bind', target: '/home/vscode/.ssh', readOnly: true },
       { type: 'tmpfs', target: '/run/x' },
       { type: 'tmpfs', target: '/workspaces/api/tmp' },
+    ]);
+  });
+
+  it('reads the read-only mount of the shared VS Code server store (plan step 11H1)', () => {
+    const dev = {
+      ...containerJson({ id: 'dev1', name: 'acme-api-3f2a9c1e', status: 'running' }),
+      Mounts: [
+        { Type: 'volume', Name: 'devenv-vscode', Source: '/var/lib/docker/volumes/devenv-vscode/_data', Destination: '/opt/devenv/vscode', RW: false },
+        { Type: 'volume', Name: 'devenv-vscode', Source: '/var/lib/docker/volumes/devenv-vscode/_data', Destination: '/opt/rw', RW: true },
+        { Type: 'volume', Name: 'devenv-vscode', Source: '/var/lib/docker/volumes/devenv-vscode/_data', Destination: '/opt/unknown' },
+      ],
+    };
+    expect(read(dev)?.mountTargets).toEqual([
+      { type: 'volume', volume: 'devenv-vscode', target: '/opt/devenv/vscode', readOnly: true },
+      { type: 'volume', volume: 'devenv-vscode', target: '/opt/rw' },
+      { type: 'volume', volume: 'devenv-vscode', target: '/opt/unknown' },
     ]);
   });
 

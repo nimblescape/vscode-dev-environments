@@ -259,4 +259,14 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     const failing = await serve(() => ({ status: 500, json: { message: 'daemon busy' } }));
     await expect(failing.engine.proxy()).rejects.toThrow('daemon busy');
   });
+
+  it('reads the architecture of the engine (plan step 11H1: the platform of the shared VS Code server); none is a failure', async () => {
+    const good = await serve(() => ({ status: 200, json: { Architecture: 'aarch64', Containers: 3 } }));
+    expect(await good.engine.architecture()).toBe('aarch64');
+    expect(good.calls[0]).toMatchObject({ method: 'GET', url: '/info' });
+    for (const json of [{ Containers: 3 }, { Architecture: '' }, { Architecture: 64 }]) {
+      const bad = await serve(() => ({ status: 200, json }));
+      await expect(bad.engine.architecture()).rejects.toThrow('without its architecture');
+    }
+  });
 });

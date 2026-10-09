@@ -42,11 +42,19 @@ export function openLockFile(stateDir: string, environmentId: string): number {
   const folderStat = fs.lstatSync(folder);
   if (!folderStat.isDirectory()) throw new Error(`${folder} is not a folder.`);
   if ((folderStat.mode & 0o777) !== 0o700) fs.chmodSync(folder, 0o700);
+  return openPlainLockFile(lockFilePath(environmentId, stateDir), `The lock file of ${environmentId}`);
+}
+
+/**
+ * Opens (creates) the lock file `file` as openLockFile does it (O_NOFOLLOW, O_NONBLOCK, 0600, a plain file only; `what`
+ * names it in the refusal). Plan step 11H1: also the lock file of the shared VS Code server store (vscodeServerStore.ts).
+ */
+export function openPlainLockFile(file: string, what: string): number {
   const { O_RDWR, O_CREAT, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-  const fd = fs.openSync(lockFilePath(environmentId, stateDir), O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
+  const fd = fs.openSync(file, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`The lock file of ${environmentId} is not a plain file.`);
+    if (!stat.isFile()) throw new Error(`${what} is not a plain file.`);
     if ((stat.mode & 0o777) !== 0o600) fs.fchmodSync(fd, 0o600);
   } catch (error) {
     fs.closeSync(fd);

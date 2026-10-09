@@ -5,7 +5,7 @@
 // Plan step 11B3b (section 3b of the plan: the helper image of an open is the worker's own image): what the worker reads
 // of its own container, so that the batch helpers of its flows run from its image (by ID) with the same socket of the
 // engine. Read from the engine (the inspect of the worker's container), never from a parameter. Pure; no I/O, no `vscode`.
-import { HELPER_DOCKER_SOCKET } from '../names';
+import { HELPER_DOCKER_SOCKET, VSCODE_STORE_DIR } from '../names';
 import type { HelperImageUse } from '../helper/helperImage';
 import type { DockerEngine } from './dockerEngine';
 
@@ -13,11 +13,18 @@ import type { DockerEngine } from './dockerEngine';
 export interface OwnHelper {
   image: HelperImageUse;
   socket: string;
+  /**
+   * Plan step 11H1: the name of the volume that the worker mounts read-write at VSCODE_STORE_DIR, the shared VS Code
+   * server store of its engine (channelRunArgs; VSCODE_STORE_VOLUME, a volume of their own in the Docker tests). Missing:
+   * the worker has no store, and its opens run without the shared server.
+   */
+  vscodeStore?: string;
 }
 
 /**
  * The OwnHelper of the inspect JSON of the worker's container: its image ID (`Image`), the reference it was started from
  * (`Config.Image`), and the source of the bind mount at HELPER_DOCKER_SOCKET. `undefined` when one of them is missing.
+ * Plan step 11H1: and the name of the read-write volume at VSCODE_STORE_DIR, when there is one.
  */
 export function ownHelperOf(inspect: unknown): OwnHelper | undefined {
   if (typeof inspect !== 'object' || inspect === null) return undefined;
@@ -30,7 +37,11 @@ export function ownHelperOf(inspect: unknown): OwnHelper | undefined {
     .map((mount) => mount as { Type?: unknown; Source?: unknown; Destination?: unknown })
     .find((mount) => mount.Type === 'bind' && mount.Destination === HELPER_DOCKER_SOCKET && typeof mount.Source === 'string' && mount.Source !== '')?.Source;
   if (typeof socket !== 'string') return undefined;
-  return { image: { tag, id }, socket };
+  // Plan step 11H1: a named volume, read-write, at VSCODE_STORE_DIR.
+  const store = mounts
+    .map((mount) => mount as { Type?: unknown; Name?: unknown; Destination?: unknown; RW?: unknown })
+    .find((mount) => mount.Type === 'volume' && mount.Destination === VSCODE_STORE_DIR && mount.RW === true && typeof mount.Name === 'string' && mount.Name !== '')?.Name;
+  return { image: { tag, id }, socket, ...(typeof store === 'string' ? { vscodeStore: store } : {}) };
 }
 
 /**

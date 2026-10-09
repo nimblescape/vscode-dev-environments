@@ -18,6 +18,7 @@ import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToke
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { REMOTE_MONITOR_SCRIPT_PATH, underRecordsLock } from '../remoteMonitor/protocol';
 import type { EngineExecOptions, EngineExecResult } from './dockerEngine';
+import { VSCODE_SERVER_LINK_SCRIPT } from './vscodeServerLink';
 
 /**
  * How a script runs. A script for a program of the container: its text, whether it takes the token on its standard
@@ -99,6 +100,11 @@ export const CONTAINER_SCRIPTS = {
   monitorSettings: { command: ['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'], plainInput: true },
   /** Plan step 11I (U2): stores the image list of its plain standard input (JSON), as imagesCommand built it. */
   monitorImages: { command: ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'], plainInput: true },
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): links the server of the shared store into the
+   * home folder of the remote user (its arguments: the commit and the quality), as that user, when the store has it.
+   */
+  vscodeServerLink: { program: 'sh', script: VSCODE_SERVER_LINK_SCRIPT },
 } as const satisfies Record<string, ScriptEntry>;
 
 /** The name of a script of the registry. */

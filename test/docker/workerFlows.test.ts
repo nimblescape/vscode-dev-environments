@@ -23,7 +23,7 @@ import type { Environment } from '../../src/core/types';
 import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';
 import { hostSideHandler } from '../../src/core/worker/hostSideHandler';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, dockerTestContext, testHelperImage, testStateVolume } from './harness';
+import { DUMMY_TOKEN, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 import { holdLockInContainer } from './workerLocks';
 
 async function bundleScript(): Promise<string> {
@@ -96,6 +96,8 @@ describe('the flows through a real worker (plan step 11B1)', () => {
             helperTag: async () => helperTag,
             socketPath: async () => helperDockerSocket(env, process.platform, target.endpoint),
             stateVolume: testStateVolume({ run, cli }, 'workerFlows'),
+            // Plan step 11H1: the shared VS Code server store, a volume of the test.
+            vscodeVolume: testVscodeVolume({ run, cli }, 'workerFlows'),
           },
           target,
         ),

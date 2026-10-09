@@ -52,6 +52,7 @@ function open(worker: ReturnType<typeof workerProcess>, directStdout = ENGINE) {
       helperTag: async () => 't',
       socketPath: async () => '/s',
       stateVolume: 'devenv-session-monitor',
+      vscodeVolume: 'devenv-vscode',
     },
     REMOTE,
   );
