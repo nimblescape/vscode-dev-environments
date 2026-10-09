@@ -26,6 +26,45 @@ export function mountsVscodeStore(mounts: readonly MountTarget[] | undefined, st
 }
 
 /**
+ * Plan step 11H3: the part of a script of the container setup that finds the home folder of the user that runs it (by
+ * the user ID in /etc/passwd), and ends with `skipped: the user has no home folder` without one. Shared by the link of
+ * the server and the seed of the extension cache (VSCODE_EXTENSION_SEED_SCRIPT).
+ */
+export const SCRIPT_HOME_OF_USER = `uid=$(id -u) || exit 1
+home=$(awk -F: -v u="$uid" '$3 == u { print $6; exit }' /etc/passwd)
+if [ -z "$home" ] || [ ! -d "$home" ]; then echo 'skipped: the user has no home folder'; exit 0; fi
+`;
+
+/**
+ * Plan step 11H3: the part of a script of the container setup that enters the home folder and defines `enter <folder>
+ * <name>`: it enters a folder of the user below the working folder after its checks (never a link, a folder of the user,
+ * created when missing; refused otherwise), and checks there that it is that folder (review round 1 of 11H1, reviewer
+ * B). Shared by the link of the server and the seed of the extension cache.
+ */
+export const SCRIPT_ENTER_FOLDER = `# Review round 1 of 11H1 (reviewer B): each step after a check works in the folder that it checked. The script enters
+# each folder after its check, makes sure there that it is the folder it checked (its real path, and the user's), and
+# creates the link relative to it with \`ln -n\`, so a link planted after a check is never followed by a later step. What
+# remains: the remote user (or root) of the container can still move a checked folder while the script runs; the link
+# then lands in that same folder at its new place, in the container's own file system, which they can write anyway.
+cd -P -- "$home" || exit 1
+enter() {
+  if [ -L "$1" ]; then echo "refused: $2 is a link"; exit 0; fi
+  if [ -e "$1" ]; then
+    if [ ! -d "$1" ]; then echo "refused: $2 is not a folder"; exit 0; fi
+    owner=$(ls -ldn "$1" | awk '{ print $3 }')
+    if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
+  else
+    mkdir "$1" || exit 1
+  fi
+  here=$(pwd -P) || exit 1
+  cd -P "$1" || exit 1
+  if [ "$(pwd -P)" != "\${here%/}/$1" ]; then echo "refused: $2 was replaced while it was checked"; exit 0; fi
+  owner=$(ls -ldn . | awk '{ print $3 }')
+  if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
+}
+`;
+
+/**
  * Plan step 11H1: runs as the remote user in the dev container, with the commit (`$1`), the quality (`$2`), and the
  * platform whose server the open made present in the store (`$3`, the platform of the engine). It links only when
  * everything fits:
@@ -73,31 +112,7 @@ fi
 if [ "$platform" != "$stored" ]; then echo "skipped: the container is $platform, the server in the store is for $stored"; exit 0; fi
 server="${VSCODE_STORE_TARGET}/server/$quality/$platform/$commit"
 if [ ! -f "$server/bin/code-server" ] || [ ! -f "$server/node" ]; then echo 'skipped: the store does not have the server'; exit 0; fi
-uid=$(id -u) || exit 1
-home=$(awk -F: -v u="$uid" '$3 == u { print $6; exit }' /etc/passwd)
-if [ -z "$home" ] || [ ! -d "$home" ]; then echo 'skipped: the user has no home folder'; exit 0; fi
-# Review round 1 of 11H1 (reviewer B): each step after a check works in the folder that it checked. The script enters
-# each folder after its check, makes sure there that it is the folder it checked (its real path, and the user's), and
-# creates the link relative to it with \`ln -n\`, so a link planted after a check is never followed by a later step. What
-# remains: the remote user (or root) of the container can still move a checked folder while the script runs; the link
-# then lands in that same folder at its new place, in the container's own file system, which they can write anyway.
-cd -P -- "$home" || exit 1
-enter() {
-  if [ -L "$1" ]; then echo "refused: $2 is a link"; exit 0; fi
-  if [ -e "$1" ]; then
-    if [ ! -d "$1" ]; then echo "refused: $2 is not a folder"; exit 0; fi
-    owner=$(ls -ldn "$1" | awk '{ print $3 }')
-    if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
-  else
-    mkdir "$1" || exit 1
-  fi
-  here=$(pwd -P) || exit 1
-  cd -P "$1" || exit 1
-  if [ "$(pwd -P)" != "\${here%/}/$1" ]; then echo "refused: $2 was replaced while it was checked"; exit 0; fi
-  owner=$(ls -ldn . | awk '{ print $3 }')
-  if [ "$owner" != "$uid" ]; then echo "refused: $2 is not the user's"; exit 0; fi
-}
-enter "$data" "$home/$data"
+${SCRIPT_HOME_OF_USER}${SCRIPT_ENTER_FOLDER}enter "$data" "$home/$data"
 enter bin "$home/$data/bin"
 if [ -e "$commit" ] || [ -L "$commit" ]; then echo 'present'; exit 0; fi
 ln -sn "$server" "$commit" || exit 1

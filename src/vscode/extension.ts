@@ -48,7 +48,7 @@ import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment';
 import { workerMonitor } from './workerMonitor';
-import { windowVscodeServer } from './vscodeServer';
+import { defaultExtensionEntries, windowVscodeServer } from './vscodeServer';
 import { VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
@@ -497,6 +497,9 @@ async function activateExtension(
     // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the commit and quality of this VS Code
     // (product.json under vscode.env.appRoot, read once), which an open sends when the build qualifies.
     vscodeServerOfWindow: windowVscodeServer(vscode.env.appRoot, (file) => fs.promises.readFile(file, 'utf8'), (message) => logger.info(message)),
+    // Plan step 11H3 (decision of 2026-10-09): the user's default extensions of the Dev Containers extension, which an open
+    // with a VS Code server carries for the shared extension cache (read at each open).
+    defaultExtensionsOfWindow: () => defaultExtensionEntries(vscode.workspace.getConfiguration('dev.containers').get<unknown>('defaultExtensions'), (message) => logger.info(message)),
     // Unit 7: the local Docker is started as before; a remote host is only checked (never a Docker Desktop start).
     startDocker: async ({ onStarting, signal }) =>
       startDockerFor(

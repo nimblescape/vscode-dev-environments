@@ -9,6 +9,9 @@
 // it present. The new dev container mounts the store read-only at /opt/devenv/vscode, and the open links the server as
 // the remote user into ~/.vscode-server/bin/<commit>. The dev image is of glibc (the helper image's base, which the
 // engine has): a container of musl is never linked. Skipped where the engine had a Session Monitor before the tests.
+// Plan step 11H3 (decision of 2026-10-09): the store also holds a fake `.vsix` of an extension that devcontainer.json
+// names (no network: the open never downloads extensions); the open records the list in the store and copies the file
+// into ~/.vscode-server/extensionsCache of the remote user.
 import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
@@ -47,7 +50,15 @@ mkdir -p "$folder/bin"
 printf '#!/bin/sh\\necho fake server\\n' > "$folder/bin/code-server"
 printf '#!/bin/sh\\necho fake node\\n' > "$folder/node"
 chmod 755 /workspaces/server /workspaces/server/stable "/workspaces/server/stable/$1" "$folder" "$folder/bin" "$folder/bin/code-server" "$folder/node"
+mkdir -p /workspaces/extensions/universal
+printf 'PK\\003\\004fake vsix\\n' > "/workspaces/extensions/universal/$3"
+chmod 755 /workspaces/extensions /workspaces/extensions/universal
+chmod 644 "/workspaces/extensions/universal/$3"
 `;
+
+/** Plan step 11H3: the extension that devcontainer.json names, and its cache name in the store. */
+const EXTENSION = 'devenv-test.fake-extension';
+const EXTENSION_FILE = `${EXTENSION}-1.0.0`;
 
 describe('the shared VS Code server of an open through a real worker (plan step 11H1)', () => {
   const { run, env, cli, log } = dockerTestContext(NAME);
@@ -79,10 +90,16 @@ describe('the shared VS Code server of an open through a real worker (plan step 
     // download the newest server into the store of this file and link it into its container).
     await seedTestMonitorRun(docker, { run });
     paths.ensureDirectoriesSync();
-    const seededStore = await runInVolume(docker, store, ['sh', '-c', STORE_SEED_SCRIPT, 'sh', platform!, COMMIT]);
+    const seededStore = await runInVolume(docker, store, ['sh', '-c', STORE_SEED_SCRIPT, 'sh', platform!, COMMIT, EXTENSION_FILE]);
     expect(seededStore.exitCode, seededStore.stderr).toBe(0);
     const devcontainerJson = JSON.stringify(
-      { name: 'VS Code server', build: { dockerfile: 'Dockerfile' }, remoteUser: REMOTE_USER, runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`] },
+      {
+        name: 'VS Code server',
+        build: { dockerfile: 'Dockerfile' },
+        remoteUser: REMOTE_USER,
+        runArgs: ['--label', `${TEST_RUN_LABEL}=${run.runId}`],
+        customizations: { vscode: { extensions: [EXTENSION] } },
+      },
       null,
       2,
     );
@@ -121,6 +138,9 @@ describe('the shared VS Code server of an open through a real worker (plan step 
     expect(execIn(REMOTE_USER, `"/home/${REMOTE_USER}/.vscode-server/bin/${COMMIT}/bin/code-server"`).out).toBe('fake server');
     // The store is read-only in the dev container, also for root.
     expect(execIn('root', `touch ${VSCODE_STORE_TARGET}/x`).code).not.toBe(0);
+    // Plan step 11H3: the list is recorded in the store, and the cached `.vsix` is in the extension cache of the user.
+    expect(JSON.parse(execIn('root', `cat ${VSCODE_STORE_TARGET}/extensions/wanted/${environmentId}.json`).out)).toMatchObject({ configuration: [EXTENSION] });
+    expect(execIn(REMOTE_USER, `test -O "/home/${REMOTE_USER}/.vscode-server/extensionsCache" && test -f "/home/${REMOTE_USER}/.vscode-server/extensionsCache/${EXTENSION_FILE}" && tail -c +5 "/home/${REMOTE_USER}/.vscode-server/extensionsCache/${EXTENSION_FILE}"`).out).toBe('fake vsix');
     // Never a volume of the environment: no label of it, not recorded.
     expect(cli.volume(store)?.Labels?.[LABEL_ENVIRONMENT_ID]).toBeUndefined();
     expect((await registry.get(environmentId))?.additionalVolumes ?? []).not.toContain(store);

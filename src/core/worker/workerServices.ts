@@ -24,7 +24,7 @@ import { proxiedHttpsTransport } from '../proxyTransport';
 import { SECRET_REGISTRY, type VscodeServerRef } from '../helperChannel/protocol';
 import { VSCODE_STORE_DIR } from '../names';
 import { Messages } from '../messages';
-import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionMonitor } from '../pipeline/environmentService';
+import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionMonitor, type VscodeExtensionCache } from '../pipeline/environmentService';
 import type { EnvironmentSessionFiles, EnvironmentStore } from '../pipeline/operationBase';
 import type { EnvironmentBusyMarks } from '../pipeline/busyMarks';
 import type { OpenRecords } from '../pipeline/openRecords';
@@ -39,6 +39,8 @@ import { EngineDocker } from './engineDocker';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
 import { ensureEngineServer, storeLock, unpackServer, type VscodeStoreDeps } from './vscodeServerStore';
+import { cachedExtensionFiles, recordExtensions } from './vscodeExtensionStore';
+import { parseExtensionEntry, seedSelection, type ExtensionRef } from '../vscodeExtensions';
 
 /**
  * Plan step 11I (PR D): what a part of the pipeline throws when its operation did not give the worker what it needs (fail
@@ -352,6 +354,23 @@ export interface WorkerServicesDeps {
    * the server is linked into the container; without either, the open runs as before.
    */
   vscodeServer?: VscodeServerRef;
+  /**
+   * Plan step 11H3 (decision of 2026-10-09): the user's default extensions of the open (OpenParams.defaultExtensions),
+   * recorded with the configuration's extensions in the shared extension cache of the store.
+   */
+  defaultExtensions?: string[];
+}
+
+/**
+ * Plan step 11H3 (decision of 2026-10-09; live check 3): the shared extension cache of the store at VSCODE_STORE_DIR for
+ * an open: its record of the extension list (with the user's `defaults`, at the time of the open) and the files to seed.
+ */
+export function workerExtensionCache(defaults: readonly string[] | undefined, root = VSCODE_STORE_DIR, now: () => number = Date.now): VscodeExtensionCache {
+  const refs = (defaults ?? []).map(parseExtensionEntry).filter((ref): ref is ExtensionRef => ref !== undefined);
+  return {
+    record: (environmentId, configuration) => recordExtensions(root, environmentId, configuration, refs, now()),
+    seedFiles: async (list, platform) => seedSelection(list, await cachedExtensionFiles(root), platform),
+  };
 }
 
 /**
@@ -402,7 +421,14 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     ...(store !== undefined ? { vscodeStoreVolume: store } : {}),
     // The fetch of the server into the store, for the platform of the engine (ensureEngineServer; never rejects).
     ...(server !== undefined && store !== undefined
-      ? { vscodeServer: { server, fetch: (signal: AbortSignal) => ensureEngineServer(workerVscodeStore(deps), server, signal) } }
+      ? {
+          vscodeServer: {
+            server,
+            fetch: (signal: AbortSignal) => ensureEngineServer(workerVscodeStore(deps), server, signal),
+            // Plan step 11H3: the record of the extension list and the seed of the cached `.vsix` files.
+            extensions: workerExtensionCache(deps.defaultExtensions),
+          },
+        }
       : {}),
     docker,
     // Docker runs where the worker runs; the engine must answer.

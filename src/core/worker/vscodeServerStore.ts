@@ -507,7 +507,8 @@ export function serverLockFile(root: string, name: string): string {
  * Plan step 11H1: the lock of one server version in the store (serverLockFile), taken as the environment lock is taken
  * (lockFile.ts: the lock file opened without following a link, `flock` on its descriptor with a bounded wait), so it holds
  * across the workers of all windows and the Session Monitor of the engine; resolves with its release. Rejects when the
- * lock stayed held for the whole wait, when `flock` fails, or when `signal` aborts (flock is ended then).
+ * lock stayed held for the whole wait, when `flock` fails, or when `signal` aborts (flock is ended then). Plan step 11H3:
+ * `lockFile` names the lock file of another entry of the store (the lock of one extension file, extensionLockFile).
  */
 export async function storeLock(
   root: string,
@@ -515,11 +516,12 @@ export async function storeLock(
   waitSeconds: number,
   signal: AbortSignal,
   startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
+  lockFile: string = serverLockFile(root, name),
 ): Promise<() => void> {
   const folder = path.posix.join(root, STORE_LOCK_FOLDER);
   fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
   if (!fs.lstatSync(folder).isDirectory()) throw new FetchError(`${folder} is not a folder`);
-  const fd = openPlainLockFile(serverLockFile(root, name), 'The lock file of the shared VS Code server store');
+  const fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
   const release = () => {
     try {
       fs.closeSync(fd);
@@ -557,19 +559,20 @@ export type StoreLockAttempt = { kind: 'locked'; release(): void } | { kind: 'bu
  * Plan step 11H2 (the plan's 11H2 row: `flock -n`): the lock of one server version in the store (serverLockFile), taken
  * without a wait, for the cleanup of the Session Monitor: `busy` while a download of that version (an open, another
  * window, the monitor) holds it, so the cleanup never touches a version that is being fetched. Never rejects; the lock
- * file stays (lock files are never removed).
+ * file stays (lock files are never removed). Plan step 11H3: `lockFile` as for storeLock.
  */
 export async function storeTryLock(
   root: string,
   name: string,
   startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
+  lockFile: string = serverLockFile(root, name),
 ): Promise<StoreLockAttempt> {
   let fd: number;
   try {
     const folder = path.posix.join(root, STORE_LOCK_FOLDER);
     fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
     if (!fs.lstatSync(folder).isDirectory()) return { kind: 'failed', detail: `${folder} is not a folder` };
-    fd = openPlainLockFile(serverLockFile(root, name), 'The lock file of the shared VS Code server store');
+    fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
   } catch (error) {
     return { kind: 'failed', detail: `the lock file could not be opened: ${error instanceof Error ? error.message : String(error)}` };
   }

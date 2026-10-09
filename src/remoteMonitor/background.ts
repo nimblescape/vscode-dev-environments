@@ -21,6 +21,8 @@
 //      quality and platform, and that no running container that mounts the store runs (its processes; review round 1,
 //      A-M2), each under its lock taken without a wait (`flock -n`), and the temporary folders
 //      of a version only while its lock can be taken at once; lock files are never removed.
+// Plan step 11H3: after b and c, the part "extensions" (extensionDownloads.ts: the newest compatible releases of the
+// extensions that the opens recorded, downloaded into the store), and in d the cleanup of the extension cache.
 // The pure rules are in backgroundRules.ts. No `vscode`.
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
@@ -58,6 +60,7 @@ import {
   type StoredServer,
 } from './backgroundRules';
 import { engineFailure, type VscodeEngine } from './engine';
+import { cleanupExtensions, downloadExtensions, type ExtensionRunDeps } from './extensionDownloads';
 
 /** Plan step 11H2: the time limit of a request to the engine of the VS Code part (the architecture, a list, an inspect). */
 export const BACKGROUND_ENGINE_TIMEOUT_MS = 60_000;
@@ -84,6 +87,20 @@ export interface VscodeBackgroundDeps {
   tryLock: (name: string) => Promise<StoreLockAttempt>;
   /** The fetch of a server into the store: ensureServer of the open (the default; the tests give their own). */
   ensure?: typeof ensureServer;
+  /** Plan step 11H3: the locks of the files of the extension cache (default: storeLock and storeTryLock; the tests give their own). */
+  extensionLocks?: Pick<ExtensionRunDeps, 'lock' | 'tryLock'>;
+}
+
+/** Plan step 11H3: what the part "extensions" and its cleanup use, from the VS Code part of the run. */
+export function extensionRunDeps(vscode: VscodeBackgroundDeps, deps: Pick<BackgroundRunDeps, 'log' | 'now'>): ExtensionRunDeps {
+  return {
+    root: vscode.store.root,
+    transport: vscode.store.transport,
+    architecture: (signal) => vscode.engine.architecture(signal),
+    ...vscode.extensionLocks,
+    log: deps.log,
+    now: deps.now,
+  };
 }
 
 export interface BackgroundRunDeps {
@@ -129,6 +146,8 @@ export class BackgroundRun {
       await this.part('the VS Code server', async () => {
         found = await this.newestServers(vscode);
       });
+      // Plan step 11H3 (decision of 2026-10-09): the part "extensions", after the part of the server.
+      await this.part('the VS Code extensions', () => downloadExtensions(extensionRunDeps(vscode, this.deps)));
       await this.part('the cleanup of the VS Code server store', () => this.cleanupWhenDue(vscode, found));
     }
     log('The background run ended.');
@@ -295,6 +314,8 @@ export class BackgroundRun {
       await this.removeOldServers(vscode, found);
     }
     await this.removeTemporaryFolders(vscode);
+    // Plan step 11H3: the shared extension cache too (never throws).
+    await cleanupExtensions(extensionRunDeps(vscode, this.deps));
     await this.deps.state.update({ lastCleanupAt: now });
   }
 

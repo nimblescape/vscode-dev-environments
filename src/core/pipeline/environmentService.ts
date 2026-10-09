@@ -14,6 +14,8 @@ import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, Networ
 import type { SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
 import { mountsVscodeStore, vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
+import { vscodeExtensionSeedOutcome } from '../worker/vscodeExtensionSeed';
+import { configurationExtensions, type ExtensionRef } from '../vscodeExtensions';
 import type { VscodePlatform, VscodeServerLink, VscodeServerRef } from '../helperChannel/protocol';
 import { isDevContainer } from '../worker/dockerEngine';
 import {
@@ -523,7 +525,22 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
    * window is waited for through its lock; a missing one is downloaded by the very first open) and waits for it before the
    * link.
    */
-  vscodeServer?: { server: VscodeServerRef; fetch: (signal: AbortSignal) => Promise<VscodePlatform | undefined> };
+  vscodeServer?: { server: VscodeServerRef; fetch: (signal: AbortSignal) => Promise<VscodePlatform | undefined>; extensions?: VscodeExtensionCache };
+}
+
+/**
+ * Plan step 11H3 (decision of 2026-10-09; live check 3): the shared extension cache of the store for an open with a VS
+ * Code server (the worker's: recordExtensions, cachedExtensionFiles and seedSelection at VSCODE_STORE_DIR).
+ */
+export interface VscodeExtensionCache {
+  /**
+   * Records the extension list of the open of `environmentId` (the configuration's extensions, undefined when the open
+   * could not read its configuration: the recorded ones stay; and the user's defaults) with the time of the open;
+   * resolves with the list of the open. Rejects with the cause.
+   */
+  record(environmentId: string, configuration: ExtensionRef[] | undefined): Promise<ExtensionRef[]>;
+  /** The cached files of the store to seed for `list` (`<folder>/<cache name>`), for the engine's platform when known. */
+  seedFiles(list: ExtensionRef[], platform: VscodePlatform | undefined): Promise<string[]>;
 }
 
 
@@ -576,6 +593,11 @@ interface LoadedConfiguration {
   mountedVolumes: string[];
   /** A Docker Compose configuration. */
   compose?: LoadedCompose;
+  /**
+   * Plan step 11H3 (decision of 2026-10-09): the extensions of the configuration (configurationExtensions: of the merged
+   * configuration when the open has it, else of devcontainer.json), for the shared extension cache.
+   */
+  extensions: ExtensionRef[];
 }
 
 /**
@@ -1835,6 +1857,8 @@ export class EnvironmentService extends OperationBase {
       dockerfileText: dockerfile.text,
       references: analysis.references,
       mountedVolumes: mountedVolumeNames(checked),
+      // Plan step 11H3: the extensions of the merged configuration that the checks used (else of devcontainer.json).
+      extensions: configurationExtensions(config, merged),
     };
   }
 
@@ -2042,6 +2066,8 @@ export class EnvironmentService extends OperationBase {
       references,
       mountedVolumes: [...new Set([...volumes, ...this.composeMountVolumes(env, compose, compose.mounts).names])],
       compose,
+      // Plan step 11H3: the extensions of the merged configuration (else of devcontainer.json).
+      extensions: configurationExtensions(config, merged),
     };
   }
 
@@ -5118,6 +5144,51 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
+   * Plan step 11H3 (decision of 2026-10-09: "the open never downloads extensions and never waits for them"; live check
+   * 3): with a VS Code server of the open and the extension cache of the worker (EnvironmentServiceDeps.vscodeServer
+   * .extensions), records the extension list of the open (the configuration's extensions of `loaded`, else the recorded
+   * ones, and the user's defaults; recordExtensions), and, when the dev container mounts the store read-only at
+   * VSCODE_STORE_TARGET (mountsVscodeStore), runs the script `vscodeExtensionSeed` as the remote user once with the
+   * cached files of the store for that list (seedSelection: the newest of each entry for the engine's platform, which the
+   * fetch of the server found, or universal), which copies them into its extension cache without replacing a file. No
+   * files: no script. Every failure is one line in the log and never fails the open; only a cancel of the open ends it.
+   */
+  private async seedVscodeExtensions(ctx: PipelineContext, container: string, containerName: string, user: string, loaded: LoadedConfiguration | undefined): Promise<void> {
+    const vscode = this.deps.vscodeServer;
+    const cache = vscode?.extensions;
+    if (vscode === undefined || cache === undefined) return;
+    try {
+      const list = await cache.record(ctx.env.id, loaded?.extensions);
+      if (list.length === 0) return;
+      const found = await this.deps.docker.findContainer(ctx.env.id, containerName);
+      if (found === undefined || !(sameContainer(found.id, container) || found.name === container) || !mountsVscodeStore(found.mountTargets, this.vscodeStoreVolume())) return;
+      // The fetch of the server settled before the link (linkVscodeServer): its platform is the engine's, or unknown.
+      const platform = ctx.vscodeServer !== undefined && ctx.vscodeServer.settled ? await ctx.vscodeServer.ready : undefined;
+      const files = await cache.seedFiles(list, platform);
+      if (files.length === 0) {
+        this.logger.info(`The shared extension cache has none of the ${list.length} extension(s) of ${ctx.env.repository} yet; the Session Monitor downloads them in the background.`);
+        return;
+      }
+      const result = await runScript(this.deps.docker, container, 'vscodeExtensionSeed', [vscode.server.quality, platform ?? 'none', ...files], {
+        user,
+        signal: ctx.signal,
+        timeoutMs: GIT_EXEC_TIMEOUT_MS,
+      });
+      const outcome = vscodeExtensionSeedOutcome(result);
+      if (outcome.kind === 'seeded') {
+        this.logger.info(
+          `The shared extension cache seeded the container of ${ctx.env.repository}: ${outcome.copied} copied, ${outcome.present} present, ${outcome.skipped} skipped, ${outcome.failed} failed (of ${list.length} extension(s)).`,
+        );
+      } else {
+        this.logger.info(`The shared extension cache did not seed the container of ${ctx.env.repository} (${outcome.kind}: ${outcome.reason}).`);
+      }
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The shared extension cache could not seed the container of ${ctx.env.repository}: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
    * user.name and user.email of a new Git configuration: the profile of the account on GitHub, or, when GitHub does not
    * answer within 5 seconds, the login and the ID of the session. The opens of this window share one question per
    * account: its answer counts for the window; after a failed question, the fallback counts for 10 minutes, so an open
@@ -5268,6 +5339,9 @@ export class EnvironmentService extends OperationBase {
     // each update of VS Code) when the store has it; the open waits for the fetch that it started (linkVscodeServer; review
     // round 1 of 11H1, A-L4), and a failure never fails the open.
     const vscodeServer = await this.linkVscodeServer(ctx, containerRef, containerName, remoteUser ?? 'root');
+    // Plan step 11H3 (decision of 2026-10-09): the extension list of the open is recorded, and the cached `.vsix` files of
+    // the store are copied into the container's extension cache, right after the link (no network, no wait).
+    await this.seedVscodeExtensions(ctx, containerRef, containerName, remoteUser ?? 'root', loaded);
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.
     this.throwIfCancelled(ctx.signal);

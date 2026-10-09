@@ -18,6 +18,7 @@ import { TOKEN_REMOVE_SCRIPT, TOKEN_WRITE_SCRIPT } from '../helper/containerToke
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { REMOTE_MONITOR_SCRIPT_PATH, underRecordsLock } from '../remoteMonitor/protocol';
 import type { EngineExecOptions, EngineExecResult } from './dockerEngine';
+import { VSCODE_EXTENSION_SEED_SCRIPT } from './vscodeExtensionSeed';
 import { VSCODE_SERVER_LINK_SCRIPT } from './vscodeServerLink';
 
 /**
@@ -105,6 +106,12 @@ export const CONTAINER_SCRIPTS = {
    * home folder of the remote user (its arguments: the commit and the quality), as that user, when the store has it.
    */
   vscodeServerLink: { program: 'sh', script: VSCODE_SERVER_LINK_SCRIPT },
+  /**
+   * Plan step 11H3 (decision of 2026-10-09; live check 3): copies the cached `.vsix` files of the shared store into the
+   * extension cache of the remote user's VS Code server (its arguments: the quality, the engine's platform, the files), as
+   * that user, never replacing a file.
+   */
+  vscodeExtensionSeed: { program: 'sh', script: VSCODE_EXTENSION_SEED_SCRIPT },
 } as const satisfies Record<string, ScriptEntry>;
 
 /** The name of a script of the registry. */

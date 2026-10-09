@@ -139,6 +139,11 @@ export interface EnvironmentOperationsDeps extends OperationBaseDeps {
    * open runs without the shared server.
    */
   vscodeServerOfWindow?: () => Promise<VscodeServerRef | undefined>;
+  /**
+   * Plan step 11H3 (decision of 2026-10-09; live check 3): the user's `dev.containers.defaultExtensions`, as the entries
+   * that the protocol takes (defaultExtensionsOf); the open carries them only with a VS Code server of the window.
+   */
+  defaultExtensionsOfWindow?: () => string[];
 }
 
 /** Plan step 11F1: the operations of a window, sent to the worker (see the module comment). */
@@ -218,6 +223,8 @@ export class EnvironmentOperations extends OperationBase {
     const settings = this.deps.settings();
     // Plan step 11H1: the server of this window's VS Code, when its build qualifies (never rejects).
     const vscodeServer = await this.deps.vscodeServerOfWindow?.();
+    // Plan step 11H3: the user's default extensions, only with the server of the official VS Code.
+    const defaultExtensions = vscodeServer !== undefined ? this.deps.defaultExtensionsOfWindow?.() : undefined;
     const params = parseOpenParams({
       dockerHost,
       owner: this.deps.owner,
@@ -237,6 +244,7 @@ export class EnvironmentOperations extends OperationBase {
       ...(options.forceRebuild === true ? { forceRebuild: true } : {}),
       ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
       ...(vscodeServer !== undefined ? { vscodeServer } : {}),
+      ...(defaultExtensions !== undefined && defaultExtensions.length > 0 ? { defaultExtensions } : {}),
     });
     if (params === undefined) throw new Error(`The open of ${repository} cannot be sent to the worker.`);
     // PR H (decision of 2026-10-09): the preparation of the worker of this open (when no worker of the engine is open)
