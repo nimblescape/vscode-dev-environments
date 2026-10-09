@@ -40,6 +40,20 @@ export const COMPOSE_REMOTE_OFF: Readonly<Record<string, string>> = {
   COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false',
 };
 
+/**
+ * User decision of 2026-10-09 (option a): Buildx 0.37.2 (advisory GHSA-gwr2-q96m-6682) refuses a Docker Compose build
+ * through bake whose Dockerfile lies outside the build context (`additional privileges requested:
+ * --allow=fs.read=…`), and the Dev Container CLI always writes its Dockerfile with the Features into a folder of its own
+ * outside the context; Docker Compose grants only the contexts (docker/compose#14285). So the steps of the CLI that
+ * build with Docker Compose (`build`, `up`) run with the file-system entitlement check of bake off, as every build ran
+ * before Buildx 0.37.2. In the checked mode the host access policy keeps the contexts and Dockerfiles of a Compose build
+ * in the repository (policy/compose.ts buildProblems); with the checks off, the user allowed access to the computer.
+ * Set after the variables of the request (which cannot name `BUILDX_*` anyway: isPassableEnvName).
+ */
+export const BAKE_FS_ENTITLEMENTS_OFF: Readonly<Record<string, string>> = {
+  BUILDX_BAKE_ENTITLEMENTS_FS: '0',
+};
+
 /** A step as the batch helper runs it: always built here, never sent. */
 export interface BatchStepCommand {
   command: string[];
@@ -241,7 +255,8 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
       const configFile = `${folder}/${checked(kind, () => checkConfigPath(text(kind, p.configPath)))}`;
       const imageName = text(kind, p.imageName, 255);
       if (!/^[a-z0-9][^\s]*$/i.test(imageName)) fail(kind);
-      const env = stepEnv(kind, p.env);
+      // User decision of 2026-10-09: the entitlement check of bake off (BAKE_FS_ENTITLEMENTS_OFF).
+      const env = { ...stepEnv(kind, p.env), ...BAKE_FS_ENTITLEMENTS_OFF };
       // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule.
       const override = p.override === undefined ? undefined : jsonObject(kind, p.override);
       const files = helperFiles(kind, p.files);
@@ -291,7 +306,8 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
         removeExistingContainer: p.removeExistingContainer,
       });
       const input = checked(kind, () => overrideInput(files, jsonObject(kind, p.override)));
-      return { command: overrideCommand(args, files), input, env: stepEnv(kind, p.env), git: false, secret: 'mask' };
+      // User decision of 2026-10-09: `up` builds a missing image of a Docker Compose configuration too.
+      return { command: overrideCommand(args, files), input, env: { ...stepEnv(kind, p.env), ...BAKE_FS_ENTITLEMENTS_OFF }, git: false, secret: 'mask' };
     }
     case 'runUserCommands': {
       const p = fields(kind, params, ['repository', 'override', 'environmentId', 'containerId'], ['files', 'env']);
