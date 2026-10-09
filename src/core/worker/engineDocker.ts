@@ -8,7 +8,7 @@
 // implementation of EnvironmentDocker now), so that EnvironmentService runs in the worker (plan steps 11B3 and 11E); the
 // inspect JSON is read by the same functions as `docker inspect` (dockerObjects.ts). Pure over the port; no I/O, no
 // `vscode`.
-import { mapContainerState, preferred, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type ImageInspection, type ImageNames, type InspectedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
+import { mapContainerState, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, type ContainerInfo, type ImageInfo, type ImageInspection, type ImageNames, type InspectedContainer, type ListedContainer, type NetworkInfo, type VolumeInfo } from '../docker/dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/dockerTimeouts';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
@@ -20,6 +20,7 @@ import type { ContainerState } from '../types';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { EngineError, isDevContainer, isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
+import { devContainerOf, environmentContainers } from './environmentContainers';
 
 /**
  * Registry credentials for one pull (pullImage). Plan step 11I (PR D): moved here from pipeline/pullCredentials.ts, whose
@@ -40,6 +41,14 @@ function sortedTags(repository: string, tags: Iterable<string>): string[] {
 
 function inspected(container: EngineContainer): InspectedContainer {
   return { ...container, created: container.created ?? '' };
+}
+
+/**
+ * Plan step 11I (U4, decision of 2026-10-08): a container of a list of the pipeline: its public shape (publicInfo) and the
+ * time of its create, by which the rule of the dev container (devContainerOf) takes the newest one.
+ */
+function listed(container: EngineContainer): ListedContainer {
+  return { ...publicInfo(inspected(container)), ...(container.created !== undefined ? { created: container.created } : {}) };
 }
 
 /**
@@ -130,19 +139,32 @@ export class EngineDocker implements EnvironmentDocker {
     return this.call(`the inspect of ${reference}`, signal, (limited) => this.engine.inspect(kind, reference, limited));
   }
 
-  /** EnvironmentDocker.findContainer: the dev container (isDevContainer), the named one first, else running, else newest. */
+  /**
+   * EnvironmentDocker.findContainer: the dev container of the environment by the one rule (devContainerOf, plan step 11I,
+   * U4, decision of 2026-10-08: the named one whatever its state, else the newest running one, else the newest one, by the
+   * time of the create; before: `preferred`, which compared the text of the time); warns about several.
+   */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
-    const containers = (await this.containersWithLabel(`${LABEL_ENVIRONMENT_ID}=${environmentId}`)).filter((container) => isDevContainer(container, containerName));
-    if (containers.length === 0) return undefined;
+    const containers = (await this.environmentContainers(environmentId)).filter((container) => isDevContainer(container, containerName));
     if (containers.length > 1) {
       this.logger.warn(`${containers.length} containers have the label ${LABEL_ENVIRONMENT_ID}=${environmentId}: ${containers.map((c) => c.name).join(', ')}`);
     }
-    const named = containers.find((container) => container.name === containerName);
-    return publicInfo(named !== undefined ? inspected(named) : [...containers.map(inspected)].sort(preferred)[0]);
+    const found = devContainerOf(containers, containerName, (line) => this.logger.info(line));
+    return found === undefined ? undefined : publicInfo(inspected(found));
   }
 
-  async listEnvironmentContainers(): Promise<ContainerInfo[]> {
-    return (await this.containersWithLabel(LABEL_ENVIRONMENT_ID)).map((container) => publicInfo(inspected(container)));
+  /** EnvironmentDocker.listEnvironmentContainers; plan step 11I (U4): each with the time of its create (ListedContainer). */
+  async listEnvironmentContainers(): Promise<ListedContainer[]> {
+    return (await this.containersWithLabel(LABEL_ENVIRONMENT_ID)).map(listed);
+  }
+
+  /**
+   * Plan step 11I (U4, decision of 2026-10-08): EnvironmentDocker.environmentContainers, the containers of one
+   * environment by the worker's one function for them (environmentContainers: the engine filters by the label), each with
+   * the time of its create.
+   */
+  async environmentContainers(environmentId: string): Promise<ListedContainer[]> {
+    return (await this.call('the list of the containers', undefined, (limited) => environmentContainers(this.engine, environmentId, limited))).map(listed);
   }
 
   async listProjectContainers(project: string): Promise<ContainerInfo[]> {

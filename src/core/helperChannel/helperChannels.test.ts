@@ -790,16 +790,18 @@ describe('the sweep at the open (review round 4, M1; plan step 11I, PR A)', () =
     return { process, sent };
   }
 
+  // Plan step 11I (U5, decision of 2026-10-08): changed expectations, the lines name the stopped helper containers (the
+  // sweep removes the batch helpers too; before: the helper channel containers).
   for (const [what, sweep, expected] of [
-    ['logs how many it removed', { ok: true, value: { removed: 2 } }, ['info Removed 2 stopped helper channel containers on build-box.']],
-    ['logs one removed container', { ok: true, value: { removed: 1 } }, ['info Removed 1 stopped helper channel container on build-box.']],
+    ['logs how many it removed', { ok: true, value: { removed: 2 } }, ['info Removed 2 stopped helper containers on build-box.']],
+    ['logs one removed container', { ok: true, value: { removed: 1 } }, ['info Removed 1 stopped helper container on build-box.']],
     ['logs nothing when it removed none', { ok: true, value: { removed: 0 } }, []],
     // The value of before (the output of `docker container prune`) is no value any more.
-    ['warns about a value that is not one', { ok: true, value: { output: 'Deleted Containers:' } }, ['warn The worker on build-box answered the removal of the stopped helper channel containers with an invalid value.']],
+    ['warns about a value that is not one', { ok: true, value: { output: 'Deleted Containers:' } }, ['warn The worker on build-box answered the removal of the stopped helper containers with an invalid value.']],
     [
       'logs a failure',
       { ok: false, error: { code: 'failed', message: 'a prune operation is already running' }, cancelled: false, timedOut: false },
-      ['info The stopped helper channel containers on build-box could not be removed: a prune operation is already running'],
+      ['info The stopped helper containers on build-box could not be removed: a prune operation is already running'],
     ],
   ] as const) {
     it(`sends the probe and the sweep without parameters, and ${what}`, async () => {
@@ -816,7 +818,8 @@ describe('the sweep at the open (review round 4, M1; plan step 11I, PR A)', () =
         { op: 'probe', params: {} },
         { op: 'sweep', params: {} },
       ]);
-      expect(lines.filter((line) => line.includes('stopped helper channel container'))).toEqual(expected);
+      // Plan step 11I (U5): changed filter, the words of the lines above (before: `stopped helper channel container`).
+      expect(lines.filter((line) => line.includes('stopped helper container'))).toEqual(expected);
       channel.close();
     });
   }

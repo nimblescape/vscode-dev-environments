@@ -9,7 +9,6 @@ import { describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperOperationError } from '../helperChannel/helperChannel';
 import type { BusyMark } from '../types';
-import type { EnvironmentServiceDeps } from './environmentService';
 import { ENV_ID, OTHER_ACCOUNT, PID, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 
 const OPENED = { environmentId: ENV_ID, containerName: 'devenv-acme-api-c', remoteWorkspaceFolder: '/workspaces/api' };

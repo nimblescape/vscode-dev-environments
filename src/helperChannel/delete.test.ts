@@ -10,7 +10,8 @@ import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID } from '../core/names';
 import { silentLogger } from '../core/ports';
 import { FLOW_REQUESTS } from '../core/worker/hostSide';
 import { hostSideHandler } from '../core/worker/hostSideHandler';
-import { REMOTE_MONITOR_CONTAINER, forgetCommand } from '../core/remoteMonitor/protocol';
+import { REMOTE_MONITOR_CONTAINER } from '../core/remoteMonitor/protocol';
+import { scriptCommand } from '../core/worker/containerScripts';
 import type { BusyMark, Environment } from '../core/types';
 import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
@@ -20,7 +21,7 @@ import type { FlockProcess } from '../core/helperChannel/lockFile';
 import type { LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import type { HostSide } from '../core/worker/hostSide';
-import { OperationError, type OperationContext } from './server';
+import type { OperationContext } from './server';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const NAME = 'devenv-acme-api-brave-noether';
@@ -168,7 +169,8 @@ describe('delete in the worker (plan step 11C2a)', () => {
     expect(events.at(-1)).toBe('unlock');
     expect(engineCalls).toContain(`stop ${'c'.repeat(64)}`);
     expect(engineCalls).toContain(`removeVolume ${NAME}`);
-    expect(engineCalls.at(-1)).toBe(`exec ${REMOTE_MONITOR_CONTAINER} ${forgetCommand(SOURCE, ID).join(' ')}`);
+    // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorForget (forgetCommand before).
+    expect(engineCalls.at(-1)).toBe(`exec ${REMOTE_MONITOR_CONTAINER} ${scriptCommand('monitorForget', [SOURCE, ID]).join(' ')}`);
   });
 
   it('waits while another window holds a live mark, and refuses when it keeps it; nothing is removed then', async () => {

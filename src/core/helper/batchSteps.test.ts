@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_DEPTH, MAX_SERVICE_PATH_LENGTH, configOwnershipFixCommand, repositoryOwnershipFixCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, environmentIdLabel } from '../names';
-import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand } from './batchSteps';
+import { BAKE_FS_ENTITLEMENTS_OFF, BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepKind } from './batchSteps';
 import { isBatchStepKind } from './batchStepKinds';
 import { COMPOSE_MODEL_PATH } from './compose';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
@@ -141,23 +141,25 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
     const configFile = `${FOLDER}/.devcontainer/devcontainer.json`;
     // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: buildCommand, with
     // no input).
+    // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: build and up run with the entitlement check of
+    // bake off (BAKE_FS_ENTITLEMENTS_OFF).
     expect(batchStepCommand('build', { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1' })).toEqual({
       command: writeAndRunCommand({ repositoryConfig: configFile }, buildArgs({ workspaceFolder: FOLDER, configPath: configFile, imageName: 'devenv-x:1' })),
       input: writeAndRunInput(undefined, undefined),
-      env: {},
+      env: { BUILDX_BAKE_ENTITLEMENTS_FS: '0' },
       git: false,
     });
     expect(batchStepCommand('build', { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', override, files })).toEqual({
       command: writeAndRunCommand({ repositoryConfig: configFile, config: OVERRIDE_CONFIG_PATH }, buildArgs({ workspaceFolder: FOLDER, configPath: OVERRIDE_CONFIG_PATH, imageName: 'devenv-x:1' })),
       input: writeAndRunInput(files, override),
-      env: {},
+      env: { BUILDX_BAKE_ENTITLEMENTS_FS: '0' },
       git: false,
     });
     const up = upArgs({ workspaceFolder: FOLDER, overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel, removeExistingContainer: true });
     expect(batchStepCommand('up', { repository: REPO, override, environmentId: ID, removeExistingContainer: true })).toEqual({
       command: overrideCommand(up, undefined),
       input: overrideInput(undefined, override),
-      env: {},
+      env: { BUILDX_BAKE_ENTITLEMENTS_FS: '0' },
       git: false,
       secret: 'mask',
     });
@@ -299,9 +301,12 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
   });
 
   it('passes only the variables that isPassableEnvName accepts, on the step', () => {
+    // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: build and up run with the entitlement check of
+    // bake off (BAKE_FS_ENTITLEMENTS_OFF).
     expect(batchStepCommand('up', { repository: REPO, override: {}, environmentId: ID, removeExistingContainer: false, env: { COMPOSE_PROJECT_NAME: 'p', http_proxy: 'x' } }).env).toEqual({
       COMPOSE_PROJECT_NAME: 'p',
       http_proxy: 'x',
+      BUILDX_BAKE_ENTITLEMENTS_FS: '0',
     });
     for (const name of ['DOCKER_HOST', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS', 'VSCODE_IPC_HOOK_CLI', 'vscode_git_askpass_node', 'SSH_AUTH_SOCK', 'BROWSER', 'PATH', 'LD_PRELOAD', 'NODE_OPTIONS', 'A-B', '1A']) {
       expect(() => batchStepCommand('build', { repository: REPO, configPath: 'a.json', imageName: 'x', env: { [name]: 'v' } }), name).toThrow(BatchStepError);
@@ -318,7 +323,9 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
     const refused = ['NODE_OPTIONS', 'LD_PRELOAD', 'DOCKER_HOST', 'SSH_AUTH_SOCK', 'BROWSER', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_x', 'REMOTE_CONTAINERS_IPC', 'REMOTE_CONTAINERS_x', 'PATH'];
     for (const [kind, params] of withEnv) {
       // The allowed name passes, so a refusal below comes from the name alone.
-      expect(batchStepCommand(kind, { ...params, env: { COMPOSE_PROJECT_NAME: 'p' } }).env, kind).toEqual({ COMPOSE_PROJECT_NAME: 'p' });
+      // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: build and up add BAKE_FS_ENTITLEMENTS_OFF.
+      const own = kind === 'build' || kind === 'up' ? BAKE_FS_ENTITLEMENTS_OFF : {};
+      expect(batchStepCommand(kind, { ...params, env: { COMPOSE_PROJECT_NAME: 'p' } }).env, kind).toEqual({ COMPOSE_PROJECT_NAME: 'p', ...own });
       for (const name of refused) {
         expect(() => batchStepCommand(kind, { ...params, env: { COMPOSE_PROJECT_NAME: 'p', [name]: 'v' } }), `${kind} ${name}`).toThrow(BatchStepError);
       }
@@ -357,5 +364,37 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
 
   it('switches the remote includes of Docker Compose off', () => {
     expect(COMPOSE_REMOTE_OFF).toEqual({ COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' });
+  });
+
+  // User decision of 2026-10-09 (Buildx 0.37.2, GHSA-gwr2-q96m-6682): Buildx refuses the Compose build of the Dev Container
+  // CLI (its Dockerfile with the Features lies outside the build context); only the two steps that build with Compose run
+  // with the entitlement check of bake off, and a request can neither set it on another step nor change it.
+  it('turns the entitlement checks of bake that the variable covers off for build and up only (user decision of 2026-10-09)', () => {
+    expect(BAKE_FS_ENTITLEMENTS_OFF).toEqual({ BUILDX_BAKE_ENTITLEMENTS_FS: '0' });
+    // Review round 1 of PR #130 (A-F4): every kind of step, so a new kind is decided here too.
+    const params: Record<BatchStepKind, Record<string, unknown>> = {
+      clone: { repository: 'acme/api' },
+      readFiles: { repository: REPO, configPath: '.devcontainer/devcontainer.json' },
+      listConfigs: { repository: REPO },
+      readConfiguration: { repository: REPO, configPath: 'a.json', environmentId: ID, merged: true },
+      build: { repository: REPO, configPath: 'a.json', imageName: 'x' },
+      composeModel: { repository: REPO, files: [`${FOLDER}/compose.yml`], project: 'p' },
+      composeHash: { repository: REPO, model: '{}', project: 'p' },
+      createFolders: { repository: REPO, folders: [`${FOLDER}/a`] },
+      up: { repository: REPO, override: {}, environmentId: ID, removeExistingContainer: false },
+      runUserCommands: { repository: REPO, override: {}, environmentId: ID, containerId: 'abcdef012345' },
+      gitFiles: { repository: REPO, identity: { name: 'A', email: 'a@b' } },
+      ownershipFix: { folder: CONFIG_FOLDER, uid: '1000', gid: '1000' },
+      repositoryOwnershipFix: { repository: REPO, uid: '1000', gid: '1000' },
+    };
+    expect(Object.keys(params).sort()).toEqual([...BATCH_STEP_KINDS].sort());
+    for (const [kind, p] of Object.entries(params)) {
+      const env = batchStepCommand(kind, p).env;
+      expect(env.BUILDX_BAKE_ENTITLEMENTS_FS, kind).toBe(kind === 'build' || kind === 'up' ? '0' : undefined);
+    }
+    // A request cannot name the variable (BUILDX_* is refused), so it can neither turn the check on again nor off elsewhere.
+    for (const kind of ['readConfiguration', 'build', 'up', 'runUserCommands'] as const) {
+      expect(() => batchStepCommand(kind, { ...params[kind], env: { BUILDX_BAKE_ENTITLEMENTS_FS: '1' } }), kind).toThrow(BatchStepError);
+    }
   });
 });

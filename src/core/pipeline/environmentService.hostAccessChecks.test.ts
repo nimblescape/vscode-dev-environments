@@ -32,7 +32,6 @@ import {
   FEATURE_DIGEST,
   OTHER_ID,
   REPO,
-  checked,
   createHarness,
   imageConfigWithUser,
   seedEnvironment,

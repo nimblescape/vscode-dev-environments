@@ -22,7 +22,7 @@ import {
   WORKSPACE_VOLUME_KEY,
   type ComposeModel,
 } from '../helper/composeModel';
-import { localContextPath } from './dockerFlags';
+import { csvFields, imageContext, isUrlContext, localContextPath } from './dockerFlags';
 import { imageReferenceFinding, type NamedImageReference } from './images';
 import { access, guarded, unsupported, type HostAccessFinding, type HostAccessReport, type Problem } from './report';
 import { decideServiceMount, decideServicePort, type ComposeMountContext } from './rewrites';
@@ -629,6 +629,65 @@ const BUILD_ALLOWED = new Set([
 ]);
 
 /**
+ * Review round 1 of PR #130 (A-F1): an entry of `cache_from` as Buildx reads it (util/buildflags/cache.go): without `=`
+ * the reference of a registry image; else CSV fields `key=value` whose keys Buildx compares in lower case, the last
+ * `type` counting. Only a registry import is allowed: exactly one `type` field, with the value `registry`. Every other
+ * entry (a local or another cache import, a second `type`, a field without `=`, a quote that does not close) is not
+ * supported. Before the user decision of 2026-10-09 the file-system entitlement check of bake refused a local import
+ * outside the repository; since then this check alone keeps it out.
+ */
+export function cacheFromIsRegistry(text: string): boolean {
+  if (!text.includes('=')) return text !== '';
+  const fields = csvFields(text);
+  if (fields === undefined) return false;
+  let types = 0;
+  for (const field of fields) {
+    const index = field.indexOf('=');
+    if (index < 0) return false;
+    if (field.slice(0, index).trim().toLowerCase() !== 'type') continue;
+    types += 1;
+    if (field.slice(index + 1) !== 'registry') return false;
+  }
+  return types === 1;
+}
+
+/**
+ * Review round 2 of PR #130 (R2A-1): the values of a build that bake evaluates as an HCL template. Docker Compose writes
+ * its build definition as JSON to `buildx bake --file -`, and bake reads it as HCL, so it evaluates `${…}` and `%{…}`
+ * in a string; Compose escapes `${` only in the build arguments and `dockerfile_inline`, and passes the context, the
+ * Dockerfile, the additional contexts and the cache imports on as written. The checks of this file see the text, not
+ * what bake makes of it (a path of the repository can become one of the workspace helper, a registry import a local
+ * one), and these builds run without the file-system entitlement check of bake (BAKE_FS_ENTITLEMENTS_OFF), so such a
+ * value is not supported whatever the switch says. An escape (`$${`, `%%{`) holds the same characters and is refused
+ * too. The build arguments and the text of `dockerfile_inline` do not choose what the build client reads. Review round
+ * 3 of PR #130 (R3A-2): the key files of `build.ssh` and the files of the build secrets, too.
+ */
+function bakeTemplateProblems(value: Record<string, unknown>, ctx: ServiceContext): Problem[] {
+  const secrets = isRecord(ctx.input.model.secrets) ? ctx.input.model.secrets : {};
+  const texts: Array<[string, unknown]> = [
+    ['build context', value.context],
+    ['build dockerfile', value.dockerfile],
+    ...listOf(value.cache_from).map((entry): [string, unknown] => ['build cache_from', entry]),
+    ...Object.entries(isRecord(value.additional_contexts) ? value.additional_contexts : {}).map(
+      ([name, source]): [string, unknown] => [`build additional_contexts ${name}`, source],
+    ),
+    // Review round 3 of PR #130 (R3A-2): the key files of `build.ssh` and the files of the secrets that `build.secrets`
+    // names, which the build client reads too (buildSshProblems, buildSecretProblems).
+    ...(isRecord(value.ssh) ? Object.values(value.ssh) : listOf(value.ssh).map((entry) => (isRecord(entry) ? entry.path : entry))).map(
+      (entry): [string, unknown] => ['build ssh', entry],
+    ),
+    ...listOf(value.secrets).flatMap((entry): Array<[string, unknown]> => {
+      const name = typeof entry === 'string' ? entry : isRecord(entry) && typeof entry.source === 'string' ? entry.source : undefined;
+      const secret = name === undefined ? undefined : secrets[name];
+      return isRecord(secret) ? [[`build secret ${name} file`, secret.file]] : [];
+    }),
+  ];
+  return texts
+    .filter(([, text]) => typeof text === 'string' && (text.includes('${') || text.includes('%{')))
+    .map(([what, text]) => unsupported(`${what} ${String(text)} (Buildx evaluates \`\${\` and \`%{\` in it as a template)`));
+}
+
+/**
  * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it);
  * a remote context is not supported yet (review round 5, S5-4); the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
  * access to the computer; tags and exported caches could overwrite images or write files.
@@ -636,7 +695,7 @@ const BUILD_ALLOWED = new Set([
 function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   if (isUnset(value)) return [];
   if (!isRecord(value)) return [unsupported(`build ${JSON.stringify(value)}`)];
-  const problems: Problem[] = [];
+  const problems: Problem[] = bakeTemplateProblems(value, ctx);
   const context = typeof value.context === 'string' ? value.context : undefined;
   const remote = context !== undefined && isRemoteContext(context);
   // Review round 3 (P3-1): a missing context or Dockerfile of the repository is left to composeMissingBuildPaths.
@@ -690,16 +749,19 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   problems.push(...buildSshProblems(value.ssh, ctx), ...buildSecretProblems(value.secrets, ctx));
   for (const entry of listOf(value.cache_from)) {
     const text = String(entry).trim();
-    if (text.includes('=') ? !/^type=registry(,|$)/.test(text) : text === '') problems.push(unsupported(`build cache_from ${text}`));
+    if (!cacheFromIsRegistry(text)) problems.push(unsupported(`build cache_from ${text}`));
   }
   if (isRecord(value.additional_contexts)) {
     for (const [name, source] of Object.entries(value.additional_contexts)) {
-      const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
-      if (image) problems.push(...imageProblems(image[1], `build additional_contexts ${name} image`));
-      else if (!/^https?:\/\//i.test(String(source))) {
+      // Review round 1 of PR #130 (A-F2): Buildx takes a context for an image or a URL only by its exact lower-case
+      // prefix (no trimming); every other value, `HTTPS://…` too, is a path that the build client reads.
+      const image = imageContext(String(source));
+      if (image !== undefined) problems.push(...imageProblems(image, `build additional_contexts ${name} image`));
+      else if (!isUrlContext(String(source))) {
         const item = `build additional_contexts ${name}=${String(source)}`;
         // Review round 2 (S2-03): a folder (also of `oci-layout://`) is read by the build client in the workspace helper.
-        const folder = localContextPath(String(source));
+        // Review round 3 of PR #130 (R3A-4): Docker Compose makes `service:<name>` the target of that service.
+        const folder = String(source).startsWith('service:') ? undefined : localContextPath(String(source));
         problems.push(access(item), ...(folder === undefined ? [] : helperInputProblems(item, folder, ctx)));
       }
     }
@@ -1144,8 +1206,8 @@ export function composeImageReferences(model: ComposeModel): NamedImageReference
     }
     if (isRecord(build.additional_contexts)) {
       for (const [key, source] of Object.entries(build.additional_contexts)) {
-        const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
-        if (image) references.push({ reference: image[1].trim(), what: `${at}build additional_contexts ${key} image` });
+        const image = imageContext(String(source));
+        if (image !== undefined) references.push({ reference: image.trim(), what: `${at}build additional_contexts ${key} image` });
       }
     }
   }

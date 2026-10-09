@@ -7,10 +7,9 @@
 // Plan step 11C2a (decisions of 2026-10-03 and 2026-10-04): `delete`, run by the worker's own pipeline (workerServices)
 // with a small engine in memory, a fake extension (its requests), and a fake flock.
 import { describe, expect, it } from 'vitest';
-import { LOCK_BUSY_EXIT, LOCK_UNAVAILABLE_CODE, parseDeleteValue, type AskKind } from '../core/helperChannel/protocol';
+import { LOCK_UNAVAILABLE_CODE, type AskKind } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
-import { REMOTE_MONITOR_CONTAINER, forgetCommand } from '../core/remoteMonitor/protocol';
-import type { BusyMark, Environment } from '../core/types';
+import type { Environment } from '../core/types';
 import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import type { OwnHelper } from '../core/worker/ownHelper';
@@ -37,7 +36,6 @@ const ENVIRONMENT = {
 } as unknown as Environment;
 const OWN: OwnHelper = { image: { tag: 'devenv-helper:abc', id: `sha256:${'a'.repeat(64)}` }, socket: '/run/user/1000/docker.sock' };
 const PARAMS = { environmentId: ID, dockerHost: '', owner: { windowId: 'window-1', pid: 4242 }, additionalVolumesToRemove: [] as string[], monitorSource: SOURCE };
-const OTHER_MARK: BusyMark = { operation: 'update', since: '2026-10-04T10:00:00.000Z', pid: 7, windowId: 'window-2' };
 
 interface Setup {
   /** The record that `record get` answers (null: none). */

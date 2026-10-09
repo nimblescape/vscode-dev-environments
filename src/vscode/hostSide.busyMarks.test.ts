@@ -7,12 +7,9 @@
 // Plan step 11B1 (review round 1, missing test 6): the HostSide of this computer, which answers the requests of a flow
 // in the worker: where the registry logins come from, how a record changes, and what is refused.
 import { describe, expect, it, vi } from 'vitest';
-import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
-import { OP_DELETE, OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
-import type { OperationOptions } from '../core/helperChannel/helperChannel';
-import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
+import { extensionHostSide, type HostSideDeps } from './hostSide';
 
 function deps(overrides: Partial<HostSideDeps> = {}) {
   const environment = { id: 'e1', repository: 'acme/app', lastUsedAt: 'old' } as unknown as Environment;

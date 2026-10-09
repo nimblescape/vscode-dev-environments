@@ -17,7 +17,7 @@ import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunResult } from '../ports';
-import { batchStepCommand, type BatchStepKind } from './batchSteps';
+import { BAKE_FS_ENTITLEMENTS_OFF, batchStepCommand, type BatchStepKind } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
@@ -672,7 +672,9 @@ describe('the batch scope of an open (plan step 6, PR C)', () => {
       expect([...new Set(lock.steps.map((step) => step.kind))], kind).toEqual([kind]);
       const command = batchStepCommand(kind, lock.steps[0].params);
       expect(command.command, kind).toEqual(expected);
-      expect(command.env, kind).toEqual(built[0].env);
+      // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: the helper adds BAKE_FS_ENTITLEMENTS_OFF to the
+      // variables of build and up (the request never carries it).
+      expect(command.env, kind).toEqual(kind === 'build' || kind === 'up' ? { ...built[0].env, ...BAKE_FS_ENTITLEMENTS_OFF } : built[0].env);
       // The clone takes the token as its secret, not as an input of the step.
       if (kind !== 'clone') expect(command.input, kind).toBe(input);
       else expect(lock.steps[0].options.secrets?.token, kind).toBe(TOKEN);

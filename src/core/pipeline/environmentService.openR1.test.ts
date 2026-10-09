@@ -8,7 +8,6 @@
 // operation (B1-34), each with all other terms fitting; the default of stopOnClose is on (B1-52).
 import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
-import type { EnvironmentServiceDeps } from './environmentService';
 import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, REPO, createHarness, seedEnvironment } from './environmentService.testkit';
 
 const OPENED = { environmentId: ENV_ID, containerName: 'devenv-acme-api-c', remoteWorkspaceFolder: '/workspaces/api' };

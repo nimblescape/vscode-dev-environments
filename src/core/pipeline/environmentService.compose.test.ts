@@ -42,7 +42,6 @@ import {
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
   composeProjectName,
-  configurationName,
   environmentImageName,
   resourceName,
 } from '../names';
@@ -1468,8 +1467,31 @@ describe('Delete of a Docker Compose environment', () => {
 
   it('lists the volumes of the project apart from the other additional volumes', async () => {
     await seedForDelete();
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual([`${PROJECT}_pgdata`, `${PROJECT}_cache`]);
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['shared-tools']);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual([`${PROJECT}_pgdata`, `${PROJECT}_cache`]);
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual(['shared-tools']);
+  });
+
+  // Plan step 11I (D3, section 0 of the plan: one computation): the check of Delete reads the removable volumes once for
+  // both of its questions (before: once for each question, and once more for the possible data of services).
+  it('plan step 11I (D3): the check of Delete reads the removable volumes once for both questions', async () => {
+    await seedForDelete();
+    const asked: unknown[] = [];
+    h.ui.deleteAdditionalVolumes = async (...args: unknown[]) => (asked.push(['additional', ...args]), 'keep');
+    h.ui.deleteServiceData = async (...args: unknown[]) => (asked.push(['serviceData', ...args]), []);
+    let lists = 0;
+    const list = h.docker.environmentContainers.bind(h.docker);
+    h.docker.environmentContainers = async (environmentId) => (lists++, list(environmentId));
+    const inspections = h.docker.volumeInspections.length;
+    expect(await h.service.deleteCheck(ENV_ID, { progress: h.progress, repository: REPO, otherWindow: false })).toEqual({ decision: 'delete', additionalVolumesToRemove: [] });
+    expect(asked).toEqual([
+      ['additional', ['shared-tools']],
+      ['serviceData', [`${PROJECT}_pgdata`, `${PROJECT}_cache`], []],
+    ]);
+    // One inspect of the volumes, and two lists of the containers: one for the data folders of the confirmation
+    // (repositoryServiceData), one for the volumes of both questions.
+    expect(h.docker.volumeInspections.length - inspections).toBe(1);
+    expect(lists).toBe(2);
   });
 
   it('lists a volume with a name of its own that a side service mounts as data of the services (review round 1, D1)', async () => {
@@ -1485,15 +1507,17 @@ describe('Delete of a Docker Compose environment', () => {
     // Review round 2 (D2-3): and the label of the data of a service.
     expect(h.docker.volumes.get('myapp-db')?.['nimblescape.devenv.service-data']).toBe('true');
     expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toContain('myapp-db');
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).not.toContain('myapp-db');
     // Also without the record: the container of the service mounts it.
     await h.registry.updateEnvironment(ENV_ID, (entry) => {
       delete entry.serviceVolumes;
     });
     dbContainer()!.volumes = ['myapp-db'];
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toContain('myapp-db');
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).not.toContain('myapp-db');
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toContain('myapp-db');
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).not.toContain('myapp-db');
   });
 
   it('removes all containers, the networks, and the images of the project, and keeps the data of the services by default', async () => {
@@ -1906,26 +1930,31 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     expect((await h.registry.get(ENV_ID))?.serviceVolumes).toEqual(['myapp-db']);
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db']);
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['shared-tools']);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual(['myapp-db']);
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual(['shared-tools']);
     // Review round 3 (P3-4): known by its label, so no "possibly".
-    expect(await h.service.possibleServiceDataVolumes(ENV_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).possibly).toEqual([]);
   });
 
   it('asks about every volume of a restored entry whose volumes have no label of the data of a service (review round 2, D2-3)', async () => {
     // Created without the label (for example by Docker at `up`): whether a service used it is not known.
     seedVolumes({ 'myapp-db': volumeLabelsOf(VOLUME_KIND_ADDITIONAL), 'shared-tools': volumeLabelsOf(VOLUME_KIND_ADDITIONAL) });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual(['myapp-db', 'shared-tools']);
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual([]);
     // Review round 3 (P3-4): the question names them as additional volumes that may hold data of services.
-    expect(await h.service.possibleServiceDataVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).possibly).toEqual(['myapp-db', 'shared-tools']);
     // Once the entry has a build record (its next open), the volumes are known by their use again.
     await h.registry.updateEnvironment(ENV_ID, (entry) => {
       entry.buildRecord = { builtAt: '2026-09-24T15:40:00.000Z', environmentImage: IMAGE_1, buildNumber: 1, configPath: DEFAULT_CONFIG_PATH, configHash: HASH, images: {}, features: {} };
     });
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual([]);
-    expect(await h.service.removableAdditionalVolumes(ENV_ID)).toEqual(['myapp-db', 'shared-tools']);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual([]);
+    expect((await h.service.removableVolumesOf(ENV_ID)).additional).toEqual(['myapp-db', 'shared-tools']);
   });
 
   it('restores the entry with the volumes of the project, finds both containers, and asks about the data at Delete', async () => {
@@ -1950,7 +1979,8 @@ describe('restore of a Docker Compose environment after a lost registry', () => 
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     const restored = await h.registry.get(ENV_ID);
     expect(restored?.additionalVolumes).toEqual([`${PROJECT}_pgdata`]);
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual([`${PROJECT}_pgdata`]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual([`${PROJECT}_pgdata`]);
     expect((await h.operations.inspectStates())?.get(ENV_ID)).toEqual({ container: 'stopped', volume: true });
 
     // Without a build record, the next open builds, and `up` creates the dev container again in the same project.
@@ -3791,7 +3821,8 @@ describe('review round 17 of unit 6 (D17-1): volumes of `mounts` with variables 
     expect(h.docker.volumes.get(`${PROJECT}_${DIND}`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
     expect(h.docker.volumes.get(`${PROJECT}_api-node_modules`)).toEqual({ ...labels, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
     expect((await h.registry.get(ENV_ID))?.additionalVolumes).toEqual(expect.arrayContaining([`${PROJECT}_${DIND}`, `${PROJECT}_api-node_modules`]));
-    expect(await h.service.removableServiceDataVolumes(ENV_ID)).toEqual(expect.arrayContaining([`${PROJECT}_${DIND}`, `${PROJECT}_api-node_modules`]));
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(ENV_ID)).serviceData).toEqual(expect.arrayContaining([`${PROJECT}_${DIND}`, `${PROJECT}_api-node_modules`]));
     await h.service.delete(ENV_ID, { ...options(), additionalVolumesToRemove: [`${PROJECT}_${DIND}`] });
     expect(h.docker.volumes.has(`${PROJECT}_${DIND}`)).toBe(false);
     expect(h.docker.volumes.has(`${PROJECT}_api-node_modules`)).toBe(true);
@@ -3816,7 +3847,6 @@ describe('review round 17 of unit 6 (D17-1): volumes of `mounts` with variables 
 describe('review round 17 of unit 6 (P17-1, P17-2, P17-3): the build of the dev service and the size of a refusal', () => {
   const DEV_IMAGE = 'mcr.microsoft.com/devcontainers/python:3.12';
   const PRIVATE_IMAGE = 'registry.corp.example/prod/base:1';
-  const INJECTION = 'root\n      ssh:\n        - default=/workspaces/.devenv+/github-token';
 
   /** The dev service builds `dockerfile` with `build` (target, args) from .devcontainer. */
   function useDevBuild(dockerfile: string, build: Record<string, unknown> = {}): void {

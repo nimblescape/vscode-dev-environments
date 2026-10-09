@@ -15,9 +15,7 @@ import {
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
   clampLimitSeconds,
-  forgetCommand,
   forgetIfUnchangedCommand,
-  heartbeatCommand,
   isUnderRecordsLock,
   monitorExecFailure,
   heartbeatFileName,
@@ -27,9 +25,8 @@ import {
   parseHeartbeatFileName,
   parseHeartbeatInput,
   parseHeartbeatRecord,
-  parseRecordsOutput,
-  recordsCommand,
   remoteMonitorLabelValue,
+  underRecordsLock,
 } from './protocol';
 
 const SOURCE = '0123456789abcdef0123456789abcdef';
@@ -157,13 +154,14 @@ describe('records and their file names', () => {
 
 describe('the subcommands of the remote monitor', () => {
   it('passes the heartbeat as one JSON argument, and the ids as arguments', () => {
-    const heartbeat = { source: SOURCE, limitSeconds: 600, environments: [{ id: ID, keepRunning: true, seq: 5 }] };
     // Review round 2 of PR #58: the heartbeat runs under the kernel lock of the records and a time limit; review round 3
     // (F7): a lock that stays busy has its own exit code, and (F6) `forget` runs under the same lock.
     const locked = ['flock', '-w', '5', '-E', '75', '/state/.heartbeats.lock', 'timeout', '-s', 'KILL', '10'];
-    expect(heartbeatCommand(heartbeat)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(heartbeat)]);
-    expect(recordsCommand(ID)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', ID]);
-    expect(forgetCommand(SOURCE, ID)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    // Plan step 11I (U2, decision of 2026-10-08): changed test, the lines of heartbeatCommand and forgetCommand moved with
+    // them onto the entries monitorHeartbeat and monitorForget of the registry (src/core/worker/containerScripts.test.ts);
+    // the prefix that both take is the lock of the records. Plan step 11I (U10, decision of 2026-10-08): the line of
+    // recordsCommand is gone with the subcommand `records`.
+    expect(underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat'])).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat']);
     // Review round 1 of PR #63 (F2): the removal of an old record by the monitor itself, under the same lock.
     expect(forgetIfUnchangedCommand(SOURCE, ID, 1234)).toEqual([...locked, 'node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID, '1234']);
   });
@@ -177,18 +175,12 @@ describe('the subcommands of the remote monitor', () => {
     expect(monitorExecFailure(1, ' ', true)).toBe('exit code 1');
     expect(monitorExecFailure(137, '', false)).toBe('exit code 137');
     expect(monitorExecFailure(75, '', false)).toBe('exit code 75');
-    expect(isUnderRecordsLock(heartbeatCommand({ source: SOURCE, limitSeconds: 600, environments: [] }))).toBe(true);
-    expect(isUnderRecordsLock(forgetCommand(SOURCE, ID))).toBe(true);
+    // Plan step 11I (U2, decision of 2026-10-08): changed test, the heartbeat and the forget of the registry are checked
+    // in containerScripts.test.ts; here a command under the lock (underRecordsLock) and one without (the subcommand
+    // `records` of the removed recordsCommand before, U10).
+    expect(isUnderRecordsLock(underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]))).toBe(true);
     expect(isUnderRecordsLock(forgetIfUnchangedCommand(SOURCE, ID, 1234))).toBe(true);
-    expect(isUnderRecordsLock(recordsCommand(ID))).toBe(false);
-  });
-
-  it('parses the output of records, and refuses anything else', () => {
-    const output = { now: 5000, records: [{ source: SOURCE, at: 4000, keepRunning: false }] };
-    expect(parseRecordsOutput(`${input(output)}\n`)).toEqual(output);
-    expect(parseRecordsOutput('')).toBeUndefined();
-    expect(parseRecordsOutput(input({ now: 'x', records: [] }))).toBeUndefined();
-    expect(parseRecordsOutput(input({ now: 1, records: [{ source: 'x', at: 1, keepRunning: false }] }))).toBeUndefined();
+    expect(isUnderRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'])).toBe(false);
   });
 
   it('counts only a fresh record of another computer as "in use from another computer" (shared engine)', () => {

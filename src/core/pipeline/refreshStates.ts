@@ -7,22 +7,27 @@
 // directly in the extension). It only reads. Pure: no `vscode`, and nothing of the
 // service, so that the script of the worker stays small.
 import { Semaphore } from '../concurrency';
+import type { ListedContainer } from '../docker/dockerObjects';
 import { LABEL_ENVIRONMENT_ID } from '../names';
 import type { ContainerState } from '../types';
 import { runScript } from '../worker/containerScripts';
-import { isDevContainer } from '../worker/dockerEngine';
+import { devContainerOf } from '../worker/environmentContainers';
 // Plan step 11I2: a type only (no code of the service in the worker's script).
 import type { EnvironmentDocker } from './environmentService';
 
 /** State of the container and the volume of an environment. */
 export interface EnvironmentRuntimeState {
-  /** Review round 7, P7-2: the state of the dev container only (isDevContainer), not of the other services. */
+  /**
+   * Review round 7, P7-2: the state of the dev container only (isDevContainer), not of the other services. Plan step 11I
+   * (U4, decision of 2026-10-08): of the dev container by the rule (devContainerOf), as the open connects to it.
+   */
   container: ContainerState;
   volume: boolean;
   /**
    * Review round 7, P7-2: `true` when a container of another service of Docker Compose (label
    * nimblescape.devenv.compose-service) runs; not set otherwise. Stop stays offered while it runs, also when the dev
-   * container is stopped.
+   * container is stopped. Plan step 11I (U4): when any other container of the environment runs, a service or another dev
+   * container (Stop stops them all). The name of the field stays (the protocol).
    */
   servicesRunning?: boolean;
 }
@@ -89,36 +94,42 @@ export async function readBranch(
 export async function readEnvironmentStates(docker: StateDocker, environments: readonly StateEnvironment[]): Promise<EnvironmentStates> {
   const [containers, volumes] = await Promise.all([docker.listEnvironmentContainers(), docker.listEnvironmentVolumes()]);
   // Review round 7, P7-2: the state of the environment is the one of its dev container; a running container of another
-  // service of Docker Compose only sets servicesRunning (before: any running container made it "running").
-  const containerNames = new Map(environments.map((env) => [env.id, env.containerName]));
-  const containerStates = new Map<string, ContainerState>();
-  const servicesRunning = new Set<string>();
+  // service of Docker Compose only sets servicesRunning (before: any running container made it "running"). Plan step 11I
+  // (U4, decision of 2026-10-08): the dev container by the rule (devContainerOf), the one that the open connects to
+  // (before: "running" when any dev container ran); any other running container of the environment, a service or another
+  // dev container, sets servicesRunning, so that the sidebar offers Stop, which stops them all.
+  const byEnvironment = new Map<string, ListedContainer[]>();
   for (const container of containers) {
     const id = container.labels[LABEL_ENVIRONMENT_ID];
-    const containerName = id === undefined ? undefined : containerNames.get(id);
-    if (!id || containerName === undefined) continue;
-    if (!isDevContainer(container, containerName)) {
-      if (container.state === 'running') servicesRunning.add(id);
-    } else if (containerStates.get(id) !== 'running') {
-      containerStates.set(id, container.state);
-    }
+    if (!id) continue;
+    const own = byEnvironment.get(id);
+    if (own === undefined) byEnvironment.set(id, [container]);
+    else own.push(container);
   }
   const volumeNames = new Set(volumes.map((volume) => volume.name));
   const runtime = new Map<string, EnvironmentRuntimeState>();
+  const devContainers = new Map<string, ListedContainer>();
   for (const env of environments) {
+    const own = byEnvironment.get(env.id) ?? [];
+    const dev = devContainerOf(own, env.containerName);
+    if (dev !== undefined) devContainers.set(env.id, dev);
     // A volume without the labels (created outside of this extension) is found by its name.
     const volume = volumeNames.has(env.volumeName) || (await docker.volumeExists(env.volumeName));
-    const state: EnvironmentRuntimeState = { container: containerStates.get(env.id) ?? 'missing', volume };
-    if (servicesRunning.has(env.id)) state.servicesRunning = true;
+    const state: EnvironmentRuntimeState = { container: dev?.state ?? 'missing', volume };
+    if (own.some((other) => other.state === 'running' && other.id !== dev?.id)) state.servicesRunning = true;
     runtime.set(env.id, state);
   }
   const branches = new Map<string, string>();
   const limit = new Semaphore(BRANCH_READ_CONCURRENCY);
-  const running = environments.filter((env) => env.branch && runtime.get(env.id)?.container === 'running');
+  const running = environments.flatMap((env) => {
+    const dev = devContainers.get(env.id);
+    return env.branch && dev?.state === 'running' ? [{ env, dev }] : [];
+  });
   await Promise.all(
-    running.map((env) =>
+    running.map(({ env, dev }) =>
       limit.run(async () => {
-        const branch = await readBranch(docker, env.containerName, env.user, env.folder);
+        // Plan step 11I (U4): from the dev container of the rule, by its ID (before: by the recorded name).
+        const branch = await readBranch(docker, dev.id, env.user, env.folder);
         if (branch) branches.set(env.id, branch);
       }),
     ),

@@ -4,7 +4,9 @@
 
 // Review round 2 of PR #58: the heartbeats of the remote Session Monitor run under the kernel lock `flock` of
 // heartbeatCommand. These tests run that command line with real processes: `flock` and `timeout` as in the helper image,
-// and the monitor script built with esbuild (its state folder passed by a small entry instead of /state).
+// and the monitor script built with esbuild (its state folder passed by a small entry instead of /state). Plan step 11I
+// (U2, decision of 2026-10-08): the command lines are those of the entries monitorHeartbeat and monitorForget of the
+// registry of the container scripts (scriptCommand), which replace heartbeatCommand and forgetCommand with the same lines.
 import { execFile, execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -15,13 +17,17 @@ import {
   HEARTBEAT_LOCK_PATH,
   RECORDS_LOCK_BUSY_EXIT,
   REMOTE_MONITOR_SCRIPT_PATH,
-  forgetCommand,
   forgetIfUnchangedCommand,
-  heartbeatCommand,
   heartbeatFileName,
   type HeartbeatInput,
 } from '../core/remoteMonitor/protocol';
+import { scriptCommand } from '../core/worker/containerScripts';
 import { recordRemover } from './main';
+
+/** Plan step 11I (U2, decision of 2026-10-08): the command line of a heartbeat, of the registry (heartbeatCommand before). */
+function heartbeatCommand(input: HeartbeatInput): string[] {
+  return scriptCommand('monitorHeartbeat', [JSON.stringify(input)]);
+}
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const SOURCE = '0123456789abcdef0123456789abcdef';
@@ -65,7 +71,7 @@ afterEach(() => {
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
-/** heartbeatCommand with the lock in the test folder and the test build of the script with its state folder. */
+/** The command line of a heartbeat with the lock in the test folder and the test build of the script with its state folder. */
 function command(input: HeartbeatInput): string[] {
   return heartbeatCommand(input).flatMap((part) => {
     if (part === HEARTBEAT_LOCK_PATH) return [lockPath()];
@@ -196,7 +202,8 @@ describe.skipIf(process.platform !== 'linux')('the lock of the heartbeat records
     expect(await exited(start(command(heartbeat(1, true))))).toBe(0);
     const holder = await holdLock();
     const forget = start(
-      forgetCommand(SOURCE, A).flatMap((part) => (part === HEARTBEAT_LOCK_PATH ? [lockPath()] : part === REMOTE_MONITOR_SCRIPT_PATH ? [script, stateDir] : [part])),
+      // Plan step 11I (U2, decision of 2026-10-08): the command line of the entry monitorForget (forgetCommand before).
+      scriptCommand('monitorForget', [SOURCE, A]).flatMap((part) => (part === HEARTBEAT_LOCK_PATH ? [lockPath()] : part === REMOTE_MONITOR_SCRIPT_PATH ? [script, stateDir] : [part])),
     );
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(forget.exitCode).toBeNull();

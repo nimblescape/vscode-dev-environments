@@ -8,9 +8,9 @@
 // pipeline can run again at any time.
 import * as path from 'path';
 import { type EnvironmentBusyMarks } from './busyMarks';
-import { deleteCheck, type DeleteDecision } from './deleteCheck';
+import { deleteCheck, type DeleteDecision, type RemovableVolumes } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
-import type { ContainerInfo, ImageInfo, ImageInspection, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
+import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import type { SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
 import { isDevContainer } from '../worker/dockerEngine';
@@ -297,12 +297,21 @@ export interface EnvironmentDocker {
    */
   imageUserIds(image: string, user: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<UserIds | undefined>;
   /**
-   * The dev container of the environment (label nimblescape.devenv.environment-id, isDevContainer): the container named
-   * `containerName` first, else a running one, else the newest.
+   * The dev container of the environment (label nimblescape.devenv.environment-id, isDevContainer) by the one rule of
+   * plan step 11I (U4, decision of 2026-10-08; devContainerOf): the container named `containerName` whatever its state,
+   * else the newest running one, else the newest one.
    */
   findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined>;
-  /** All containers with the label nimblescape.devenv.environment-id, running or not. */
-  listEnvironmentContainers(): Promise<ContainerInfo[]>;
+  /**
+   * All containers with the label nimblescape.devenv.environment-id, running or not (the refresh reads all environments
+   * at once). Plan step 11I (U4): each with the time of its create, for the rule of the dev container.
+   */
+  listEnvironmentContainers(): Promise<ListedContainer[]>;
+  /**
+   * Plan step 11I (U4, decision of 2026-10-08): the containers with the label nimblescape.devenv.environment-id of
+   * `environmentId`, running or not: its dev container and the other services; each with the time of its create.
+   */
+  environmentContainers(environmentId: string): Promise<ListedContainer[]>;
   /** All containers of the Docker Compose project `project` (label com.docker.compose.project), running or not. */
   listProjectContainers(project: string): Promise<ContainerInfo[]>;
   /** The names of the networks of the Docker Compose project `project`. */
@@ -3450,7 +3459,7 @@ export class EnvironmentService extends OperationBase {
 
   /** A container of another Docker Compose service of the environment that was created while the host access checks were off. */
   private async unrestrictedServiceContainer(ctx: PipelineContext): Promise<ContainerInfo | undefined> {
-    return (await this.environmentContainers(ctx.env.id)).find(
+    return (await this.deps.docker.environmentContainers(ctx.env.id)).find(
       (other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined && isUnrestrictedContainer(other.labels),
     );
   }
@@ -3484,7 +3493,7 @@ export class EnvironmentService extends OperationBase {
    * `docker start` (the dev container runs). A failure is a warning: the dev container runs, and the user can see why.
    */
   private async startStoppedServices(ctx: PipelineContext): Promise<void> {
-    const stopped = (await this.environmentContainers(ctx.env.id)).filter(
+    const stopped = (await this.deps.docker.environmentContainers(ctx.env.id)).filter(
       (container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined && container.state !== 'running',
     );
     for (const container of stopped) {
@@ -3499,13 +3508,9 @@ export class EnvironmentService extends OperationBase {
     }
   }
 
-  /**
-   * The containers with the label nimblescape.devenv.environment-id of `environmentId`: the dev container and the other
-   * services.
-   */
-  private async environmentContainers(environmentId: string): Promise<ContainerInfo[]> {
-    return (await this.deps.docker.listEnvironmentContainers()).filter((container) => container.labels[LABEL_ENVIRONMENT_ID] === environmentId);
-  }
+  // Plan step 11I (U4, decision of 2026-10-08): the private environmentContainers (the list of all environments, filtered
+  // here) is gone: the containers of one environment are EnvironmentDocker.environmentContainers, the worker's one
+  // function for them (src/core/worker/environmentContainers.ts).
 
   /**
    * `devcontainer up` with the override configuration (concept 7.6). `createsContainer`: `up` creates a container from
@@ -3584,7 +3589,7 @@ export class EnvironmentService extends OperationBase {
     // The environment was a Docker Compose environment: `up` finds the container by the ID label, which the containers
     // of the other services have too, so they go first. Review round 3 (D3-1): also the containers of other services that
     // exist without a Docker Compose dev container or record (for example after a failed switch to Docker Compose).
-    let services = (await this.environmentContainers(env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
+    let services = (await this.deps.docker.environmentContainers(env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
     if (!createsContainer && services.length > 0) {
       // `up` without a new container would take one of them for the dev container. Review round 4 (P4-3): next to a single
       // dev container (no container of Docker Compose), they are strays (for example of a failed switch to Docker
@@ -3871,7 +3876,7 @@ export class EnvironmentService extends OperationBase {
 
   /** The containers with the ID label of the environment and, with `compose`, those of its Docker Compose project, once each. */
   private async upContainers(env: Environment, compose: boolean): Promise<ContainerInfo[]> {
-    const all = [...(await this.environmentContainers(env.id)), ...(compose ? await this.deps.docker.listProjectContainers(composeProjectName(env.repository, env.id)) : [])];
+    const all = [...(await this.deps.docker.environmentContainers(env.id)), ...(compose ? await this.deps.docker.listProjectContainers(composeProjectName(env.repository, env.id)) : [])];
     const seen = new Set<string>();
     return all.filter((container) => {
       if (seen.has(container.id)) return false;
@@ -4574,7 +4579,7 @@ export class EnvironmentService extends OperationBase {
    * `all`: the volumes of every container of the environment (the services of a Docker Compose configuration).
    */
   private async recordContainerVolumes(ctx: PipelineContext, all = false): Promise<void> {
-    const containers = all ? await this.environmentContainers(ctx.env.id) : [await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName)];
+    const containers = all ? await this.deps.docker.environmentContainers(ctx.env.id) : [await this.deps.docker.findContainer(ctx.env.id, ctx.env.containerName)];
     const volumes = await this.recordedVolumes(
       containers.flatMap((container) => container?.volumes ?? []),
       ctx.env,
@@ -5356,7 +5361,7 @@ export class EnvironmentService extends OperationBase {
    * volumes stay.
    */
   private async removeComposeServices(ctx: PipelineContext): Promise<void> {
-    const services = (await this.environmentContainers(ctx.env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
+    const services = (await this.deps.docker.environmentContainers(ctx.env.id)).filter((container) => container.labels[LABEL_COMPOSE_SERVICE] !== undefined);
     for (const container of services) {
       this.logger.info(
         `The configuration of ${ctx.env.repository} no longer uses Docker Compose: the container ${container.name} of the service ${container.labels[LABEL_COMPOSE_SERVICE]} is removed. Its volumes are kept.`,
@@ -5411,7 +5416,7 @@ export class EnvironmentService extends OperationBase {
    */
   private async composeContainers(env: Environment): Promise<ContainerInfo[]> {
     const project = composeProjectName(env.repository, env.id);
-    const containers = [...(await this.environmentContainers(env.id)), ...(await this.deps.docker.listProjectContainers(project))];
+    const containers = [...(await this.deps.docker.environmentContainers(env.id)), ...(await this.deps.docker.listProjectContainers(project))];
     const seen = new Set<string>();
     const result: ContainerInfo[] = [];
     for (const container of containers) {
@@ -5570,9 +5575,8 @@ export class EnvironmentService extends OperationBase {
         summary: () => this.safetyCheck(environmentId, options),
         environment: () => this.deps.registry.get(environmentId),
         repositoryServiceData: () => this.repositoryServiceData(environmentId),
-        removableAdditionalVolumes: () => this.removableAdditionalVolumes(environmentId),
-        removableServiceDataVolumes: () => this.removableServiceDataVolumes(environmentId),
-        possibleServiceDataVolumes: () => this.possibleServiceDataVolumes(environmentId),
+        // Plan step 11I (D3): one read of the removable volumes for both questions.
+        removableVolumes: () => this.removableVolumesOf(environmentId),
         ui: this.deps.ui,
       },
       environment,
@@ -5632,7 +5636,7 @@ export class EnvironmentService extends OperationBase {
         if (ownership === 'unreadable') throw new Error(`The labels of the volume ${env.volumeName} could not be read; nothing was removed.`);
         const byName = ownership !== 'foreign';
         // Step 3: container, environment image, unused base images.
-        const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
+        const containers = await docker.environmentContainers(env.id);
         for (const container of containers) {
           await this.stopServiceBeforeRemoval(container, env);
           await docker.removeContainer(container.id);
@@ -5680,7 +5684,7 @@ export class EnvironmentService extends OperationBase {
    */
   private async containersUseCompose(env: Environment, container: ContainerInfo | undefined): Promise<boolean | undefined> {
     if (container !== undefined) return isComposeContainer(container.labels, composeProjectName(env.repository, env.id));
-    return (await this.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
+    return (await this.deps.docker.environmentContainers(env.id)).some((other) => other.labels[LABEL_COMPOSE_SERVICE] !== undefined) ? true : undefined;
   }
 
   /**
@@ -6191,32 +6195,27 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * The additional volumes that Delete of `environmentId` would remove (removableVolumes), for the question of Delete:
-   * it lists only these, and keeps the others. Empty when the environment or Docker does not answer. Without the
-   * volumes of a Docker Compose project (nimblescape.devenv.volume=compose), which removableServiceDataVolumes lists
-   * for a question of their own.
+   * The volumes of `environmentId` that Delete would remove, for the two questions of Delete, from one read
+   * (removableVolumesByKind; plan step 11I, D3: before, removableAdditionalVolumes, removableServiceDataVolumes and
+   * possibleServiceDataVolumes read them each on their own, so the two questions could see different states). Empty
+   * lists when the environment or Docker does not answer.
+   * - `additional`: the additional volumes that Delete would remove (removableVolumes), for the question of Delete: it
+   *   lists only these, and keeps the others; without the volumes of a Docker Compose project
+   *   (nimblescape.devenv.volume=compose), which `serviceData` has for a question of their own.
+   * - `serviceData`: the volumes of the Docker Compose project that Delete would remove (D-19): the data of its services,
+   *   for example of a database. The question of Delete lists them apart, none ticked: they are removed only when the
+   *   user ticks them.
+   * - `possibly` (review round 3, P3-4): of `serviceData`, the volumes that are there only because the entry knows neither
+   *   the volumes of its services nor its build (review round 2, D2-3): additional volumes that may hold data of services,
+   *   or not (for example of a single container restored from its volumes). The question names them so.
    */
-  async removableAdditionalVolumes(environmentId: string): Promise<string[]> {
-    return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.kind !== VOLUME_KIND_COMPOSE).map((volume) => volume.name);
-  }
-
-  /**
-   * The volumes of the Docker Compose project of `environmentId` that Delete would remove
-   * (nimblescape.devenv.volume=compose, D-19): the data of its services, for example of a database. The question of
-   * Delete lists them apart, none ticked: they are removed only when the user ticks them. Empty when the environment or
-   * Docker does not answer.
-   */
-  async removableServiceDataVolumes(environmentId: string): Promise<string[]> {
-    return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.kind === VOLUME_KIND_COMPOSE).map((volume) => volume.name);
-  }
-
-  /**
-   * Review round 3 (P3-4): of removableServiceDataVolumes, the volumes that are listed there only because the entry
-   * knows neither the volumes of its services nor its build (review round 2, D2-3): additional volumes that may hold data
-   * of services, or not (for example of a single container restored from its volumes). The question names them so.
-   */
-  async possibleServiceDataVolumes(environmentId: string): Promise<string[]> {
-    return (await this.removableVolumesByKind(environmentId)).filter((volume) => volume.possibly === true).map((volume) => volume.name);
+  async removableVolumesOf(environmentId: string): Promise<RemovableVolumes> {
+    const volumes = await this.removableVolumesByKind(environmentId);
+    return {
+      additional: volumes.filter((volume) => volume.kind !== VOLUME_KIND_COMPOSE).map((volume) => volume.name),
+      serviceData: volumes.filter((volume) => volume.kind === VOLUME_KIND_COMPOSE).map((volume) => volume.name),
+      possibly: volumes.filter((volume) => volume.possibly === true).map((volume) => volume.name),
+    };
   }
 
   /**
@@ -6232,7 +6231,7 @@ export class EnvironmentService extends OperationBase {
     try {
       const { removable, labels } = await this.removableVolumes(env, env.additionalVolumes ?? []);
       const services = new Set(env.serviceVolumes ?? []);
-      const containers = await this.environmentContainers(env.id);
+      const containers = await this.deps.docker.environmentContainers(env.id);
       for (const container of containers) {
         if (!isDevContainer(container, env.containerName)) for (const name of container.volumes ?? []) services.add(name);
       }
@@ -6385,7 +6384,7 @@ export class EnvironmentService extends OperationBase {
     const foreignName = ownership === 'foreign' || ownership === 'unreadable';
     if (foreignName) this.logger.warn(`Nothing of the name ${env.volumeName} is removed: the volume is not the environment's own (${ownership}).`);
     await this.quietly('remove the container', async () => {
-      const containers = (await docker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === env.id);
+      const containers = await docker.environmentContainers(env.id);
       for (const container of containers) {
         // Review round 8 (P8-3): a running side service is stopped first, as at Delete (D7-1).
         await this.stopServiceBeforeRemoval(container, env);

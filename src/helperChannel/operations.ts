@@ -89,7 +89,8 @@ export function probeOperation(engineOf: EngineOfOperation): OperationHandler {
  * Review round 4 (M1): `sweep` removes the channel containers that were created but never started (protocol.ts,
  * OP_SWEEP). Plan step 11I (PR A): the prune of the port of the engine with SWEEP_FILTERS (`POST /containers/prune`;
  * before: `docker container prune -f` of the worker's Docker CLI, with the same filters); its value is how many it
- * removed.
+ * removed. Plan step 11I (U5, decision of 2026-10-08): every stopped helper container (the channels and the batch
+ * helpers), never the Session Monitor.
  */
 export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
   return async (params, context) => {
@@ -99,7 +100,8 @@ export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
       const removed = await engineOf(context).pruneContainers(SWEEP_FILTERS, context.signal);
       const value: SweepValue = { removed: removed.length };
       // Review round 1 of PR #122 (A, L4): what the sweep did, in the log of the worker (before: the line of the CLI call).
-      context.log(`The sweep removed ${removed.length} stopped helper channel container(s) older than 10 minutes.`);
+      // Plan step 11I (U5, decision of 2026-10-08): the helper containers, the channels and the batch helpers alike.
+      context.log(`The sweep removed ${removed.length} stopped helper container(s) older than 10 minutes.`);
       return value;
     } catch (error) {
       if (context.signal.aborted) throw new OperationError('cancelled', 'The sweep operation was cancelled.');

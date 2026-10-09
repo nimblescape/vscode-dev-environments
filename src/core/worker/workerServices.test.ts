@@ -15,7 +15,8 @@ import { hostRegistryCredentials, registryLogins, workerImageChecker, hostAuth, 
 import { EngineError, type DockerEngine } from './dockerEngine';
 // Plan step 11D1: the time limit of a monitor command is in monitorFlow.ts (the commands of the monitor in the worker).
 import { MONITOR_EXEC_TIMEOUT_MS } from './monitorFlow';
-import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH, forgetCommand, heartbeatCommand } from '../remoteMonitor/protocol';
+import { RECORDS_RUN_LIMIT_EXIT, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_SCRIPT_PATH } from '../remoteMonitor/protocol';
+import { scriptCommand } from './containerScripts';
 import { stopAfterSeconds } from '../session/sessionRules';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
@@ -384,8 +385,10 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
     const { lines, logger } = log();
     await workerSessionMonitor(engine, SOURCE, logger).forget!(TARGET, ID);
-    expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: forgetCommand(SOURCE, ID), timeoutMs: MONITOR_EXEC_TIMEOUT_MS }]);
-    expect(forgetCommand(SOURCE, ID).slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorForget (forgetCommand before), the same line.
+    expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: scriptCommand('monitorForget', [SOURCE, ID]), timeoutMs: MONITOR_EXEC_TIMEOUT_MS }]);
+    expect(execs[0].command.slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
+    expect(execs[0].command[0]).toBe('flock');
     expect(lines).toEqual([]);
   });
 
@@ -428,8 +431,13 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
       const monitor = workerSessionMonitor(engine, COMPUTER, silentLogger, { limitSeconds: () => 900 });
       expect(await monitor.heartbeat(TARGET, ID, true, 7)).toEqual({ ok: true });
+      // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
       expect(execs).toEqual([
-        { container: REMOTE_MONITOR_CONTAINER, command: heartbeatCommand({ source: COMPUTER, limitSeconds: 900, environments: [{ id: ID, keepRunning: true, seq: 7 }] }), timeoutMs: MONITOR_EXEC_TIMEOUT_MS },
+        {
+          container: REMOTE_MONITOR_CONTAINER,
+          command: scriptCommand('monitorHeartbeat', [JSON.stringify({ source: COMPUTER, limitSeconds: 900, environments: [{ id: ID, keepRunning: true, seq: 7 }] })]),
+          timeoutMs: MONITOR_EXEC_TIMEOUT_MS,
+        },
       ]);
     });
 
@@ -493,7 +501,10 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       await all.sessionMonitor!.ensure(TARGET, 'tag', run, undefined);
       expect(ensured).toEqual([undefined, run]);
       expect(await all.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toEqual({ ok: true });
-      expect(execs.map((exec) => exec.command)).toEqual([heartbeatCommand({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]);
+      // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
+      expect(execs.map((exec) => exec.command)).toEqual([
+        scriptCommand('monitorHeartbeat', [JSON.stringify({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]),
+      ]);
       // Without them, the ensure fails closed and no heartbeat is sent.
       const bare = deps({});
       // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E6").

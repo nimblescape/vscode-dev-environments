@@ -96,7 +96,9 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     const stopped = container({ id: 'd'.repeat(64), state: 'stopped', rawState: 'exited' });
     const named = fakeEngine([service, container({ id: 'a'.repeat(64), name: 'older', created: '2026-10-03T19:00:00Z' }), container()]);
     expect(await flow(named.engine)).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
-    expect(named.execs.map((exec) => exec.container)).toEqual([ID]);
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, every running dev container is emptied, the named
+    // one first (before: only the named one).
+    expect(named.execs.map((exec) => exec.container)).toEqual([ID, 'a'.repeat(64)]);
     // The recorded name is gone (the container was created again under another one): the newest running one.
     const lines: string[] = [];
     const renamed = fakeEngine([
@@ -106,8 +108,14 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
       container({ id: 'e'.repeat(64), name: 'newer', created: '2026-10-03T20:00:00Z' }),
     ]);
     expect(await flow(renamed.engine, { log: (line) => lines.push(line) })).toEqual({ outcome: 'removed', container: 'e'.repeat(12) });
-    expect(renamed.execs.map((exec) => exec.container)).toEqual(['e'.repeat(64)]);
-    expect(lines).toEqual([`The container ${CONTAINER} does not run; the running container newer of the environment is used.`]);
+    // Plan step 11I (U4): changed expectation, the newest running one first, then the others (before: only the newest),
+    // and the log names each one that was emptied.
+    expect(renamed.execs.map((exec) => exec.container)).toEqual(['e'.repeat(64), 'a'.repeat(64)]);
+    expect(lines).toEqual([
+      `The container ${CONTAINER} does not run; the running container newer of the environment is used.`,
+      'The GitHub token was removed from the container newer.',
+      'The GitHub token was removed from the container older.',
+    ]);
   });
 
   it('runs it as the remote user of the environment when root may not (for example --cap-drop ALL), and logs the first try', async () => {
@@ -204,7 +212,8 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     await expect(flow(engine)).rejects.toThrow(/^said on stdout$/);
     const exact = fakeEngine([container()], () => ok(1, 'y'.repeat(1000)));
     expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
-    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts).
+    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts). PR #127
+    // review round 1 (A, L3): for the container of the request, which the flow tries first (plan step 11I, U4).
     expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(60_000);
   });
 
@@ -246,5 +255,112 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
       throw new EngineError(`Container ${ID} is not running`, 409);
     };
     expect(await flow(engine, { records: records({ remoteUser: 'vscode' }) })).toEqual({ outcome: 'notRunning' });
+  });
+});
+
+describe('the token removal in every running dev container (plan step 11I, U4, decision of 2026-10-08)', () => {
+  const other = container({ id: 'b'.repeat(64), name: 'other', created: '2026-10-08T09:00:00Z' });
+
+  it('empties each running dev container, the named one first, each with its two tries; the result names the first', async () => {
+    const lines: string[] = [];
+    const { engine } = fakeEngine([other, container(), container({ id: 'd'.repeat(64), name: 'stopped', state: 'stopped', rawState: 'exited' })]);
+    const tried: string[] = [];
+    engine.exec = async (name, _command, options = {}) => {
+      tried.push(`${name.slice(0, 2)} ${options.user}`);
+      return name === other.id && options.user === 'root' ? ok(1, 'Operation not permitted') : ok();
+    };
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }), log: (line) => lines.push(line) })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
+    expect(tried).toEqual(['c0 root', 'bb root', 'bb vscode']);
+    expect(lines).toEqual([
+      `The GitHub token was removed from the container ${CONTAINER}.`,
+      'The removal as root failed in the container other: Operation not permitted',
+      'The GitHub token was removed from the container other.',
+    ]);
+  });
+
+  it('a stopped named container never keeps a running other dev container from being emptied', async () => {
+    const { engine, execs } = fakeEngine([container({ state: 'stopped', rawState: 'exited' }), other]);
+    expect(await flow(engine)).toEqual({ outcome: 'removed', container: 'b'.repeat(12) });
+    expect(execs.map((exec) => exec.container)).toEqual([other.id]);
+  });
+
+  it('throws after it tried each one when the token could still be in one, and names it', async () => {
+    const keeps = (failing: string[]) => {
+      const { engine, execs } = fakeEngine([other, container()]);
+      engine.exec = async (name, command, options = {}) => {
+        execs.push({ container: name, command, options });
+        return failing.includes(name) ? ok(1, 'root may not') : ok();
+      };
+      return { engine, execs };
+    };
+    // The other keeps it: the named one is emptied all the same, and the message names the other.
+    const otherKeeps = keeps([other.id]);
+    expect(((await flow(otherKeeps.engine).catch((e: unknown) => e)) as Error).message).toBe('In the container other: root may not');
+    expect(otherKeeps.execs.map((exec) => exec.container)).toEqual([ID, other.id]);
+    // The named one keeps it (the extension names the container of the request): its reason as before, and the other is
+    // tried all the same.
+    const namedKeeps = keeps([ID]);
+    expect(((await flow(namedKeeps.engine).catch((e: unknown) => e)) as Error).message).toBe('root may not');
+    expect(namedKeeps.execs.map((exec) => exec.container)).toEqual([ID, other.id]);
+    // Both keep it: both reasons.
+    expect(((await flow(keeps([ID, other.id]).engine).catch((e: unknown) => e)) as Error).message).toBe('root may not In the container other: root may not');
+  });
+
+  it('is notRunning when each turned out not running, and removed when one was emptied and the other stopped since the list', async () => {
+    const { engine } = fakeEngine([other, container()]);
+    engine.exec = async (name) => {
+      throw new EngineError(`Container ${name} is not running`, 409);
+    };
+    expect(await flow(engine)).toEqual({ outcome: 'notRunning' });
+    engine.exec = async (name) => {
+      if (name === ID) throw new EngineError(`Container ${name} is not running`, 409);
+      return ok();
+    };
+    expect(await flow(engine)).toEqual({ outcome: 'removed', container: 'b'.repeat(12) });
+  });
+
+  it('reads the record of the remote user once for all containers', async () => {
+    let reads = 0;
+    const counted = {
+      get: async () => {
+        reads++;
+        return { id: ENVIRONMENT_ID, remoteUser: 'vscode' } as Environment;
+      },
+    };
+    const { engine, execs } = fakeEngine([other, container()], (user) => (user === 'root' ? ok(1, 'no') : ok()));
+    expect(await flow(engine, { records: counted })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
+    expect(execs.map((exec) => `${exec.container.slice(0, 2)} ${exec.options.user}`)).toEqual(['c0 root', 'c0 vscode', 'bb root', 'bb vscode']);
+    expect(reads).toBe(1);
+  });
+});
+
+// PR #127 review round 1 (A, L2): a running dev container other than the one of the request whose folder is not the tmpfs
+// of the extension (for example one that the user started from the environment image) holds no token of the scripts:
+// nothing to remove there, no failure; for the container of the request the exit code 3 stays a failure, as before.
+describe('the token removal and a dev container without the tmpfs of the extension (PR #127 review round 1, A L2)', () => {
+  const other = container({ id: 'b'.repeat(64), name: 'other', created: '2026-10-08T09:00:00Z' });
+  const notOurs = ok(3, 'is not the tmpfs of the container');
+
+  it('another container whose folder is not the tmpfs of the extension: nothing to remove there, logged, no second try', async () => {
+    const lines: string[] = [];
+    const { engine, execs } = fakeEngine([other, container()], () => ok());
+    engine.exec = async (name, command, options = {}) => (execs.push({ container: name, command, options }), name === other.id ? notOurs : ok());
+    expect(await flow(engine, { records: records({ remoteUser: 'vscode' }), log: (line) => lines.push(line) })).toEqual({ outcome: 'removed', container: ID.slice(0, 12) });
+    expect(execs.map((exec) => `${exec.container.slice(0, 2)} ${exec.options.user}`)).toEqual(['c0 root', 'bb root']);
+    expect(lines).toContain('The container other has no token folder of the extension; nothing to remove there.');
+    // Only that one: notRunning, as no container could hold a token of the scripts.
+    const alone = fakeEngine([other], () => notOurs);
+    expect(await flow(alone.engine, { records: records({ remoteUser: 'vscode' }) })).toEqual({ outcome: 'notRunning' });
+  });
+
+  it('the container of the request whose folder is not the tmpfs of the extension still fails, with its reason', async () => {
+    const { engine } = fakeEngine([container()], () => notOurs);
+    await expect(flow(engine)).rejects.toThrow(/^is not the tmpfs of the container$/);
+  });
+
+  it('another exit code of another container stays a failure that names it', async () => {
+    const { engine } = fakeEngine([other, container()]);
+    engine.exec = async (name) => (name === other.id ? ok(1, 'cannot be read') : ok());
+    expect(((await flow(engine).catch((e: unknown) => e)) as Error).message).toBe('In the container other: cannot be read');
   });
 });

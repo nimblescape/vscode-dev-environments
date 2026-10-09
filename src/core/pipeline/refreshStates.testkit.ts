@@ -73,6 +73,11 @@ const CONTAINERS: Container[] = [
   { id: '2'.repeat(64), name: 'devenv-unknown', status: 'running', labels: { [LABEL_ENVIRONMENT_ID]: ENV_UNKNOWN } },
 ];
 
+/** Plan step 11I (U4, decision of 2026-10-08): the ID of the container of the fixture with the name `name`, if there is one. */
+export function fixtureContainerId(name: string): string | undefined {
+  return CONTAINERS.find((container) => container.name === name)?.id;
+}
+
 const LABELLED_VOLUMES: Record<string, Record<string, string>> = {
   'devenv-api-vol': { [LABEL_ENVIRONMENT_ID]: ENV_API },
   'devenv-ops-vol': { [LABEL_ENVIRONMENT_ID]: ENV_OPS },
@@ -92,9 +97,12 @@ interface FixtureAnswer {
  * The answer of the engine of the fixture to a process `command` as `user` in `container` (as `docker exec [-u <user>]
  * <container> <command>` answered it): the branch of a running dev container. Anything else fails (exit code 125). Plan
  * step 11I (PR B): changed expectation, the branch is read by the script `branch` of the registry with the folder as its
- * argument (before: `git -c safe.directory=* -C <folder> branch --show-current`).
+ * argument (before: `git -c safe.directory=* -C <folder> branch --show-current`). Plan step 11I (U4, decision of
+ * 2026-10-08): `container` is a name or an ID, as the engine takes it (the refresh reads the branch by the ID of the dev
+ * container of the rule, before by the recorded name).
  */
-function execAnswer(container: string, user: string | undefined, command: readonly string[]): FixtureAnswer {
+function execAnswer(reference: string, user: string | undefined, command: readonly string[]): FixtureAnswer {
+  const container = CONTAINERS.find((each) => each.name === reference || each.id === reference)?.name ?? reference;
   const ok = (stdout: string): FixtureAnswer => ({ exitCode: 0, stdout, stderr: '' });
   const folder = command[4] ?? '';
   const branchRead = scriptCommand('branch', [folder]);

@@ -269,7 +269,8 @@ describe('additional volumes that a Delete kept (concept 7.14 step 4, section 9)
     // same owner, concept section 9), does not take it for its own or relabel it, and its Delete keeps it.
     expect(result.environment.additionalVolumes).toEqual([DATA]);
     expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
-    expect(await h.service.removableAdditionalVolumes(result.environment.id)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(result.environment.id)).additional).toEqual([]);
     await h.service.delete(result.environment.id, { progress: h.progress, additionalVolumesToRemove: [DATA] });
     expect(h.docker.volumes.get(DATA)).toEqual(additionalVolumeLabels(ENV_ID, OTHER_ACCOUNT));
     expect(h.docker.log.filter((line) => line === `volume rm ${DATA}`)).toEqual([]);
@@ -403,7 +404,8 @@ describe('a lost registry: the named volumes without labels that the container o
     lostRegistry([PGDATA]);
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     signIn(OTHER_ACCOUNT, OTHER_TOKEN);
-    expect(await h.service.removableAdditionalVolumes(OTHER_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(OTHER_ID)).additional).toEqual([]);
     // Even a confirmation of the name does not remove it: its labels do not make it the environment's own.
     await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [PGDATA] });
     expect(await h.registry.get(OTHER_ID)).toBeUndefined();
@@ -553,7 +555,8 @@ describe('a named volume that the environments of one account share (concept sec
 
   it('keeps the volume at the Delete of the first environment while the second records it, and does not offer it', async () => {
     await openBoth();
-    expect(await h.service.removableAdditionalVolumes(OTHER_ID)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(OTHER_ID)).additional).toEqual([]);
     await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
     expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
     expect(h.logger.infos).toContain(kept('another environment uses it too'));
@@ -562,7 +565,8 @@ describe('a named volume that the environments of one account share (concept sec
 
   it('keeps the volume at the Delete of the second environment: it is not its own', async () => {
     const { b } = await openBoth();
-    expect(await h.service.removableAdditionalVolumes(b.id)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(b.id)).additional).toEqual([]);
     await h.service.delete(b.id, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
     expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
     expect(h.logger.infos).toContain(kept('another environment uses it too'));
@@ -573,7 +577,8 @@ describe('a named volume that the environments of one account share (concept sec
   it('keeps the volume at the Delete of the second environment after the Delete of the first kept it', async () => {
     const { b } = await openBoth();
     await h.service.delete(OTHER_ID, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
-    expect(await h.service.removableAdditionalVolumes(b.id)).toEqual([]);
+    // Plan step 11I (D3): changed call, the one read of the removable volumes (removableVolumesOf), same expectation.
+    expect((await h.service.removableVolumesOf(b.id)).additional).toEqual([]);
     await h.service.delete(b.id, { progress: h.progress, additionalVolumesToRemove: [SHARED] });
     expect(h.docker.volumes.get(SHARED)).toEqual(FORK_LABELS);
     expect(h.logger.infos).toContain(kept('another environment created it'));

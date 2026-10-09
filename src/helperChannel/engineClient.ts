@@ -13,6 +13,7 @@ import {
   type EngineAttachedRun,
   type EngineAttachedSpec,
   type EngineContainer,
+  type EngineContainerSummary,
   type EngineExecOptions,
   type EngineExecResult,
   type EngineFilters,
@@ -29,7 +30,16 @@ import * as crypto from 'crypto';
 import { hasTagOrDigest, parseEngineIdentity, StreamRedactor } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';
 import { firstTarFile } from '../core/docker/tarFile';
-import { engineApi, engineErrorMessage, engineHijack, type EngineAnswer, type EngineApi, type EngineHijackRequest, type EngineStream } from './engineApi';
+import {
+  MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+  engineApi,
+  engineErrorMessage,
+  engineHijack,
+  type EngineAnswer,
+  type EngineApi,
+  type EngineHijackRequest,
+  type EngineStream,
+} from './engineApi';
 
 /**
  * The container of an inspect answer, read as the pipeline reads `docker inspect` (toContainerInfo of dockerObjects.ts,
@@ -111,6 +121,16 @@ function texts(value: unknown): string[] {
 }
 
 /**
+ * PR #126 review round 2 (A, L1): the name of a container in the list of the engine (`Names`, each with a leading `/`):
+ * its own name, not an alias of a legacy `--link` (`/<other>/<alias>`, which the engine may sort first), as `docker ps`
+ * shows it; the first one when all have a further `/`; '' when the list gives none.
+ */
+export function containerName(names: readonly string[]): string {
+  const plain = names.map((name) => name.replace(/^\//, ''));
+  return plain.find((name) => !name.includes('/')) ?? plain[0] ?? '';
+}
+
+/**
  * Plan step 11B1: the port over the Engine API of the worker's engine. `secretOf` gives the value of a secret that the
  * operation holds (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName) and
  * the login of a pull; the port of an operation is built with its own secrets (review round 1 of plan step 11B1, A-R1-3).
@@ -133,8 +153,10 @@ export function dockerEngine(
     if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new EngineError(`The engine answered the inspect of the ${kind} ${reference} with an invalid value.`, answer.status);
     return value;
   };
-  const list = async (path: string, signal?: AbortSignal): Promise<unknown> => {
-    const answer = await api({ method: 'GET', path, signal });
+  // Plan step 11I (review round 1 of PR #126, F2): `maxCharacters`, the bound of the answer of a list of every container
+  // or image (MAX_ENGINE_LIST_ANSWER_CHARACTERS); the engineApi's default for every other request.
+  const list = async (path: string, signal?: AbortSignal, maxCharacters?: number): Promise<unknown> => {
+    const answer = await api({ method: 'GET', path, signal, ...(maxCharacters !== undefined ? { maxCharacters } : {}) });
     if (answer.status !== 200) fail(answer);
     if (answer.truncated) throw new EngineError(`The engine answered ${path.split('?')[0]} with more than can be read.`, answer.status);
     const value = json(answer.body);
@@ -164,6 +186,24 @@ export function dockerEngine(
         if (container !== undefined) found.push(container);
       }
       return found;
+    },
+    // Plan step 11I (review round 1 of PR #126, F1): the list of the engine as it is, without an inspect (`docker ps -a
+    // --filter label=…` sends `all=1`), within the bound of a list (F2). An entry without an ID is left out; its state,
+    // first name and labels are read as the list gives them ('' and none when it gives none).
+    containerSummaries: async (label, signal) => {
+      const value = await list(`/containers/json?all=1&${filtersQuery({ label: [label] })}`, signal, MAX_ENGINE_LIST_ANSWER_CHARACTERS);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the containers with an invalid value.', 200);
+      const summaries: EngineContainerSummary[] = [];
+      for (const entry of value as Record<string, unknown>[]) {
+        if (typeof entry !== 'object' || entry === null || typeof entry.Id !== 'string' || entry.Id === '') continue;
+        summaries.push({
+          id: entry.Id,
+          name: containerName(texts(entry.Names)),
+          state: typeof entry.State === 'string' ? entry.State : '',
+          labels: toLabels(entry.Labels),
+        });
+      }
+      return summaries;
     },
     exec: (container, command, options = {}) => execInContainer(api, hijack, secretOf, secrets, container, command, options),
     stop: async (container, timeoutSeconds, signal) => {
@@ -200,7 +240,8 @@ export function dockerEngine(
     inspect,
     containerIds,
     images: async (filters, signal) => {
-      const value = await list(`/images/json?${filtersQuery(filters)}`, signal);
+      // Plan step 11I (review round 1 of PR #126, F2): within the bound of a list (the Session Monitor lists every image).
+      const value = await list(`/images/json?${filtersQuery(filters)}`, signal, MAX_ENGINE_LIST_ANSWER_CHARACTERS);
       if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the images with an invalid value.', 200);
       const images: EngineImage[] = [];
       for (const entry of value as Record<string, unknown>[]) {

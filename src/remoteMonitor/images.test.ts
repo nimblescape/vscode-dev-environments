@@ -3,14 +3,22 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import * as http from 'http';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { abortError } from '../core/ports';
+import { EngineError, type EngineFilters, type EngineImage } from '../core/worker/dockerEngine';
+import { MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineApi, type EngineAnswer, type EngineRequest } from '../helperChannel/engineApi';
+import { dockerEngine } from '../helperChannel/engineClient';
+import type { ImageEngine } from './engine';
 import {
+  IMAGE_LIST_TIMEOUT_MS,
+  IMAGE_PULL_TIMEOUT_MS,
+  IMAGE_REMOVE_TIMEOUT_MS,
   ImageMaintenance,
   highestMajorTag,
   httpGetWith,
   imagePrefixesOf,
+  localImagesOf,
   parseBearerChallenge,
-  parseImageList,
   parseReplacedImages,
   prefixesFromEnv,
   pruneReplacedImages,
@@ -20,20 +28,30 @@ import {
   type LocalImage,
   type ReplacedImages,
 } from './images';
-import type { DockerResult } from './main';
 
 const DEV = 'ghcr.io/majikmate/devcontainer-dev';
 const WEB = 'ghcr.io/majikmate/devcontainer-classroom-web';
 const PREFIXES = ['ghcr.io/majikmate/devcontainer-classroom', 'ghcr.io/majikmate/devcontainer-dev'];
 
-function image(repository: string, tag: string, id: string, createdAt: string): string {
-  return JSON.stringify({ Repository: repository, Tag: tag, ID: id, CreatedAt: createdAt });
+/**
+ * One row of `docker image ls` (a repository and a tag of an image; `<none>`: the image has only a digest of the
+ * repository). Plan step 11I (U1, decision of 2026-10-08): an object instead of the JSON line of the CLI; the fake engine
+ * lists the rows of an ID as one image with its references.
+ */
+function image(repository: string, tag: string, id: string, createdAt: string): LocalImage {
+  return { repository, tag, id, createdAt };
 }
 
-/** A Docker CLI of the engine of the test: its images, the containers per image, and the calls. */
-// Review round 1 of PR #57 (G): `layers` of an image ID (default: one layer of its own, no image built on another).
+/**
+ * The engine of the test over the port (plan step 11I, U1, decision of 2026-10-08; before: the Docker CLI with its
+ * arguments): its images, the containers per image, and the calls, each as the name of the method and its argument.
+ * Review round 1 of PR #57 (G): `layers` of an image ID (default: one layer of its own, no image built on another).
+ * `failInspect`: every inspect answers that the image does not exist (an image removed meanwhile; the stderr of the CLI
+ * before). `failRemove`: references whose removal the engine refuses as in use (409; an exit code of `docker image rm`
+ * with the conflict before, which removed none of its references).
+ */
 function fakeEngine(options: {
-  images: string[];
+  images: LocalImage[];
   usedBy?: Record<string, string>;
   failRemove?: string[];
   layers?: Record<string, string[]>;
@@ -42,67 +60,77 @@ function fakeEngine(options: {
   dangling?: Record<string, string>;
 }) {
   const calls: string[][] = [];
+  /** The arguments of each call of removeImage (the reference and the signal: no force). */
+  const removals: unknown[][] = [];
+  /** The options of each pull (no login). */
+  const pulls: unknown[] = [];
   let images = [...options.images];
-  const idOf = (line: string) => (JSON.parse(line) as { ID: string }).ID;
-  const docker = async (args: readonly string[]): Promise<DockerResult> => {
-    calls.push([...args]);
-    if (args[0] === 'image' && args[1] === 'ls' && args[2] === '-a' && args[3] === '-q') {
-      return { code: 0, stdout: [...new Set([...images.map(idOf), ...Object.keys(options.layers ?? {}), ...Object.keys(options.dangling ?? {})])].join('\n'), stderr: '' };
+  /** The images of the list of the engine: one per ID, a row with a tag as `repository:tag`, one without as a digest. */
+  const listed = (): EngineImage[] => {
+    const byId = new Map<string, EngineImage>();
+    for (const row of images) {
+      const entry = byId.get(row.id) ?? { id: row.id, repoTags: [], repoDigests: [], labels: {}, created: row.createdAt };
+      byId.set(row.id, entry);
+      if (row.tag === '<none>') entry.repoDigests.push(`${row.repository}@sha256:${'d'.repeat(64)}`);
+      else entry.repoTags.push(`${row.repository}:${row.tag}`);
     }
+    // The IDs of other images of the engine (built on one of the repositories), and of images that it lists without
+    // a reference (the containerd image store after a pull replaced them).
+    for (const id of [...Object.keys(options.layers ?? {}), ...Object.keys(options.dangling ?? {})]) {
+      if (!byId.has(id)) byId.set(id, { id, repoTags: [], repoDigests: [], labels: {}, created: options.dangling?.[id] ?? '2026-01-01T00:00:00Z' });
+    }
+    return [...byId.values()];
+  };
+  const engine: ImageEngine = {
+    images: async (filters: EngineFilters) => {
+      calls.push(['images', JSON.stringify(filters)]);
+      return listed();
+    },
     // Review round 6 of PR #57 (F1): the ID of a reference, and the tags and time of an ID (`pulled`: what a pull of a
     // reference makes it point to; `dangling`: images that Docker lists without their repository, as the containerd
-    // image store does after a pull replaced them).
-    if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
-      const line = images.find((entry) => {
-        const item = JSON.parse(entry) as { Repository: string; Tag: string };
-        return `${item.Repository}:${item.Tag}` === args[4];
-      });
-      return line ? { code: 0, stdout: `${idOf(line)}\n`, stderr: '' } : { code: 1, stdout: '', stderr: 'Error: No such image' };
-    }
-    if (args[0] === 'image' && args[1] === 'inspect' && args[3].startsWith('{{json .RepoTags}}')) {
-      const id = args[4];
-      const tags = images.filter((entry) => idOf(entry) === id).map((entry) => JSON.parse(entry) as { Repository: string; Tag: string }).filter((item) => item.Tag !== '<none>');
+    // image store does after a pull replaced them), and the layers of an ID: the inspect JSON of the engine.
+    inspect: async (kind, reference) => {
+      calls.push(['inspect', reference]);
+      if (kind !== 'image') throw new Error(`unexpected inspect of a ${kind}`);
+      if (options.failInspect) return undefined;
+      const id = images.find((row) => row.tag !== '<none>' && `${row.repository}:${row.tag}` === reference)?.id ?? reference;
+      const rows = images.filter((row) => row.id === id);
       const dangling = options.dangling?.[id];
-      if (tags.length === 0 && dangling === undefined) return { code: 1, stdout: '', stderr: 'Error: No such image' };
-      return { code: 0, stdout: `${JSON.stringify(tags.map((item) => `${item.Repository}:${item.Tag}`))}\t${dangling ?? '2026-01-01T00:00:00Z'}\n`, stderr: '' };
-    }
-    if (args[0] === 'image' && args[1] === 'inspect') {
-      if (options.failInspect) return { code: 1, stdout: '', stderr: 'Error: No such image' };
-      return { code: 0, stdout: args.slice(4).map((id) => `${id} ${JSON.stringify(options.layers?.[id] ?? [`${id}/layer`])}`).join('\n'), stderr: '' };
-    }
-    if (args[0] === 'image' && args[1] === 'ls') return { code: 0, stdout: images.join('\n'), stderr: '' };
-    if (args[0] === 'pull') {
+      if (rows.length === 0 && dangling === undefined && options.layers?.[id] === undefined) return undefined;
+      const tags = rows.filter((row) => row.tag !== '<none>').map((row) => `${row.repository}:${row.tag}`);
+      return { Id: id, RepoTags: tags, Created: dangling ?? rows[0]?.createdAt ?? '2026-01-01T00:00:00Z', RootFS: { Type: 'layers', Layers: options.layers?.[id] ?? [`${id}/layer`] } };
+    },
+    pull: async (reference, pullOptions) => {
+      calls.push(['pull', reference]);
+      pulls.push(pullOptions);
       // A pull that moves the reference to a new image: the old one loses it (containerd: listed without repository).
-      const target = options.pulled?.[args[2]];
+      const target = options.pulled?.[reference];
       if (target !== undefined) {
-        const [repository, tag] = [args[2].slice(0, args[2].lastIndexOf(':')), args[2].slice(args[2].lastIndexOf(':') + 1)];
-        images = images.filter((entry) => {
-          const item = JSON.parse(entry) as { Repository: string; Tag: string };
-          return !(item.Repository === repository && item.Tag === tag);
-        });
+        const [repository, tag] = [reference.slice(0, reference.lastIndexOf(':')), reference.slice(reference.lastIndexOf(':') + 1)];
+        images = images.filter((row) => !(row.repository === repository && row.tag === tag));
         images.push(image(repository, tag, target, '2026-09-28'));
       }
-      return { code: 0, stdout: '', stderr: '' };
-    }
-    if (args[0] === 'ps') {
-      const id = /ancestor=(.*)$/.exec(args[args.length - 1])?.[1] ?? '';
-      return { code: 0, stdout: options.usedBy?.[id] ?? '', stderr: '' };
-    }
-    if (args[0] === 'image' && args[1] === 'rm') {
-      const references = args.slice(2);
-      if (references.some((reference) => options.failRemove?.includes(reference))) {
-        return { code: 1, stdout: '', stderr: 'Error response from daemon: conflict: image has dependent child images' };
-      }
-      images = images.filter((line) => {
-        const item = JSON.parse(line) as { Repository: string; Tag: string; ID: string };
-        return !references.includes(`${item.Repository}:${item.Tag}`) && !references.includes(item.ID);
-      });
-      return { code: 0, stdout: '', stderr: '' };
-    }
-    return { code: 1, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+    },
+    containerIds: async (filters) => {
+      calls.push(['containerIds', JSON.stringify(filters)]);
+      const id = filters.ancestor?.[0] ?? '';
+      return options.usedBy?.[id] === undefined ? [] : [options.usedBy[id]];
+    },
+    removeImage: async (...args) => {
+      const [reference] = args;
+      calls.push(['removeImage', reference]);
+      removals.push(args);
+      if (options.failRemove?.includes(reference)) return 'inUse';
+      const before = images.length;
+      images = images.filter((row) => `${row.repository}:${row.tag}` !== reference && row.id !== reference);
+      return images.length < before ? 'removed' : 'missing';
+    },
   };
-  return { docker, calls };
+  return { engine, calls, removals, pulls };
 }
+
+/** Plan step 11I (U1): the calls of removeImage of a fake engine (`docker image rm` before). */
+const removed = (calls: string[][]): string[][] => calls.filter((call) => call[0] === 'removeImage');
 
 /** A registry that wants a token from its challenge, then lists `tags` per repository path. */
 function fakeRegistry(tags: Record<string, string[]>) {
@@ -154,16 +182,16 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
   });
 
   it('orders the versions of a repository newest first: version tags, then the creation time', () => {
-    const images: LocalImage[] = parseImageList(
-      [
-        image(DEV, '2.0.13', 'sha256:b', '2026-09-01 10:00:00 +0000 UTC'),
-        image(DEV, '2', 'sha256:c', '2026-09-20 10:00:00 +0000 UTC'),
-        image(DEV, '2.0.14', 'sha256:c', '2026-09-20 10:00:00 +0000 UTC'),
-        image(DEV, '1.9.0', 'sha256:a', '2026-10-01 10:00:00 +0000 UTC'),
-        image(DEV, '<none>', 'sha256:d', '2026-09-25 10:00:00 +0000 UTC'),
-        'not json',
-      ].join('\n'),
-    );
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, the images of the list of the engine (localImagesOf;
+    // was the lines of `docker image ls --format '{{json .}}'` with the times of the CLI, parseImageList, and a line that
+    // was no JSON, which a list of the engine has no counterpart of: an entry without an ID is left out by the port,
+    // engineClient.test.ts). The same images and times, so the same order.
+    const images: LocalImage[] = localImagesOf([
+      { id: 'sha256:b', repoTags: [`${DEV}:2.0.13`], repoDigests: [], labels: {}, created: '2026-09-01T10:00:00.000Z' },
+      { id: 'sha256:c', repoTags: [`${DEV}:2`, `${DEV}:2.0.14`], repoDigests: [`${DEV}@sha256:${'c'.repeat(64)}`], labels: {}, created: '2026-09-20T10:00:00.000Z' },
+      { id: 'sha256:a', repoTags: [`${DEV}:1.9.0`], repoDigests: [], labels: {}, created: '2026-10-01T10:00:00.000Z' },
+      { id: 'sha256:d', repoTags: [], repoDigests: [`${DEV}@sha256:${'d'.repeat(64)}`], labels: {}, created: '2026-09-25T10:00:00.000Z' },
+    ]);
     expect(versionsOf(images).map((version) => [version.id, version.tags])).toEqual([
       ['sha256:c', ['2', '2.0.14']],
       ['sha256:b', ['2.0.13']],
@@ -192,17 +220,20 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['latest', '2', '2.0.14'], 'majikmate/devcontainer-classroom-web': ['1', '2', '3'] });
     const log: string[] = [];
     await new ImageMaintenance({
-      docker: engine.docker,
+      engine: engine.engine,
       httpGet: registry.httpGet,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       // A repository that the host has no image of yet, and one of no prefix (left out).
       knownRepositories: async () => [WEB, 'ghcr.io/other/base'],
     }).pass();
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the pulls of the engine (was `docker pull --quiet
+    // <reference>`), without a login (the CLI of the monitor had none) and with their time limit only.
     expect(engine.calls.filter((call) => call[0] === 'pull')).toEqual([
-      ['pull', '--quiet', `${DEV}:2`],
-      ['pull', '--quiet', `${WEB}:3`],
+      ['pull', `${DEV}:2`],
+      ['pull', `${WEB}:3`],
     ]);
+    expect(engine.pulls.map((options) => Object.keys(options as object))).toEqual([['signal'], ['signal']]);
     // The anonymous token of the challenge; the other repository is never asked.
     expect(registry.requests.some((request) => request.url.includes('other'))).toBe(false);
     expect(registry.requests.filter((request) => request.url.startsWith('https://ghcr.io/token?'))[0].url).toContain('scope=repository%3Amajikmate%2Fdevcontainer-dev%3Apull');
@@ -225,18 +256,21 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] });
     const log: string[] = [];
-    await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
-    const removals = engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm');
-    expect(removals).toEqual([
-      ['image', 'rm', `${DEV}:2.0.11`],
-      ['image', 'rm', `${DEV}:2.0.10`],
-      ['image', 'rm', 'sha256:dangling'],
+    await new ImageMaintenance({ engine: engine.engine, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, one removal of the engine per reference (was
+    // `docker image rm <references…>`), each with the reference and its time limit only: never with force (was: no `-f`
+    // or `--force` among the arguments).
+    expect(removed(engine.calls)).toEqual([
+      ['removeImage', `${DEV}:2.0.11`],
+      ['removeImage', `${DEV}:2.0.10`],
+      ['removeImage', 'sha256:dangling'],
     ]);
-    expect(engine.calls.flat()).not.toContain('-f');
-    expect(engine.calls.flat()).not.toContain('--force');
+    expect(engine.removals.every((args) => args.length === 2 && args[1] instanceof AbortSignal)).toBe(true);
+    // Plan step 11I (U1): changed expectation, the engine answers 409 for an image in use (was the stderr of the CLI,
+    // "Error response from daemon: conflict: image has dependent child images"); the image stays and the log says why.
     expect(log).toEqual([
       `Removed the older image ${DEV} (2.0.11).`,
-      `The older image ${DEV} (2.0.10) stays: Error response from daemon: conflict: image has dependent child images`,
+      `The older image ${DEV} (2.0.10) stays: ${DEV}:2.0.10 is in use (a container, or an image built on it); the engine answered 409.`,
       `Removed the older image ${DEV} (sha256:dangling).`,
     ]);
   });
@@ -259,12 +293,14 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2', '2.0.15'], 'majikmate/devcontainer-classroom-web': ['1'] });
     const log: string[] = [];
-    await new ImageMaintenance({ docker: engine.docker, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
-    expect(engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm')).toEqual([
-      ['image', 'rm', `${DEV}:2.0.13`],
-      ['image', 'rm', `${WEB}:0.9.0`],
+    await new ImageMaintenance({ engine: engine.engine, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removals of the engine (was `docker image rm`).
+    expect(removed(engine.calls)).toEqual([
+      ['removeImage', `${DEV}:2.0.13`],
+      ['removeImage', `${WEB}:0.9.0`],
     ]);
-    expect(versionsOf(parseImageList([image(DEV, '2.0', 'sha256:a', '1'), image(DEV, '2.0.14', 'sha256:b', '2'), image(DEV, '3.0.0', 'sha256:c', '0')].join('\n'))).map((version) => version.id)).toEqual([
+    // Plan step 11I (U1): the rows as objects (were the lines of the CLI read by parseImageList).
+    expect(versionsOf([image(DEV, '2.0', 'sha256:a', '1'), image(DEV, '2.0.14', 'sha256:b', '2'), image(DEV, '3.0.0', 'sha256:c', '0')]).map((version) => version.id)).toEqual([
       'sha256:c',
       'sha256:a',
       'sha256:b',
@@ -284,13 +320,14 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const log: string[] = [];
     await new ImageMaintenance({
-      docker: engine.docker,
+      engine: engine.engine,
       httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
     }).pass();
-    expect(engine.calls.filter((call) => call[0] === 'image' && call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:older']]);
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removal of the engine (was `docker image rm`).
+    expect(removed(engine.calls)).toEqual([['removeImage', 'sha256:older']]);
   });
 
   // Review round 2 of PR #57 (R5): the idle time limit of the socket alone let a registry that sends a byte now and then,
@@ -343,32 +380,33 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const replaced = { read: async () => stored, write: async (value: ReplacedImages) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) };
     const run = () =>
       new ImageMaintenance({
-        docker: engine.docker,
+        engine: engine.engine,
         httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
         log: () => {},
         prefixes: () => PREFIXES,
         knownRepositories: async () => [],
         replaced,
       }).pass();
-    // v1 is replaced by v2 and listed as <none> <none> (not in `docker image ls` of the repository): two versions stay.
+    // v1 is replaced by v2 and listed as <none> <none> (not in the list of the repository): two versions stay.
     dangling['sha256:v1'] = '2026-09-01T00:00:00Z';
     await run();
     // Review round 7 of PR #57: the store keeps every ID seen with a tag of the repository, so also the current v2.
     expect(Object.keys(stored)).toEqual([DEV]);
     expect([...stored[DEV]].sort()).toEqual(['sha256:v1', 'sha256:v2']);
-    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+    // Plan step 11I (U1, decision of 2026-10-08): the removals of the engine (`docker image rm` before), here and below.
+    expect(removed(engine.calls)).toEqual([]);
     // The next update: v1 is now the third version and is removed by its ID.
     const second = fakeEngine({ images: [image(DEV, '2', 'sha256:v2', '2026-09-28')], pulled: { [`${DEV}:2`]: 'sha256:v3' }, dangling });
     dangling['sha256:v2'] = '2026-09-28T00:00:00Z';
     await new ImageMaintenance({
-      docker: second.docker,
+      engine: second.engine,
       httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
       replaced,
     }).pass();
-    expect(second.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:v1']]);
+    expect(removed(second.calls)).toEqual([['removeImage', 'sha256:v1']]);
     expect(stored[DEV]).toContain('sha256:v2');
     expect(parseReplacedImages('{"ghcr.io/a/b":["sha256:x",3],"ubuntu":["sha256:y"]}')).toEqual({ 'ghcr.io/a/b': ['sha256:x'] });
     expect(parseReplacedImages('not json')).toEqual({});
@@ -384,7 +422,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const pass = async (current: string, created: string) => {
       const engine = fakeEngine({ images: [image(DEV, '2', current, created)], dangling });
       await new ImageMaintenance({
-        docker: engine.docker,
+        engine: engine.engine,
         httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
         log: () => {},
         prefixes: () => PREFIXES,
@@ -398,7 +436,8 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     await pass('sha256:v2', '2026-09-10');
     dangling['sha256:v2'] = '2026-09-10T00:00:00Z';
     const engine = await pass('sha256:v3', '2026-09-20');
-    expect(engine.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', 'sha256:v1']]);
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removal of the engine (was `docker image rm`).
+    expect(removed(engine.calls)).toEqual([['removeImage', 'sha256:v1']]);
   });
 
   // Review round 8 of PR #57 (S1): an ID stored for two repositories was removed by one while the other kept it.
@@ -410,14 +449,15 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const stored: ReplacedImages = { [DEV]: ['sha256:x'], [MINE]: ['sha256:x'] };
     await new ImageMaintenance({
-      docker: engine.docker,
+      engine: engine.engine,
       httpGet: fakeRegistry({}).httpGet,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
       replaced: { read: async () => stored, write: async () => {} },
     }).pass();
-    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+    // Plan step 11I (U1, decision of 2026-10-08): no removal of the engine (`docker image rm` before).
+    expect(removed(engine.calls)).toEqual([]);
   });
 
   // Review round 8 of PR #57 (S2): beyond the limit, the IDs that are tagged now go first, not the untagged ones.
@@ -426,7 +466,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const tagged = Array.from({ length: 210 }, (_, index) => image(DEV, `2.0.${index}`, `sha256:t${index}`, '2026-09-01'));
     let stored: ReplacedImages = { [DEV]: ['sha256:old1', 'sha256:old2'] };
     const maintenance = new ImageMaintenance({
-      docker: fakeEngine({ images: tagged }).docker,
+      engine: fakeEngine({ images: tagged }).engine,
       httpGet: fakeRegistry({}).httpGet,
       log: () => {},
       prefixes: () => PREFIXES,
@@ -454,7 +494,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const OLD = 'ghcr.io/someone/else';
     let stored: ReplacedImages = { [DEV]: ['sha256:v1'], [WEB]: [], [OLD]: ['sha256:gone'] };
     await new ImageMaintenance({
-      docker: fakeEngine({ images: [image(DEV, '2', 'sha256:v1', '2026-09-01')] }).docker,
+      engine: fakeEngine({ images: [image(DEV, '2', 'sha256:v1', '2026-09-01')] }).engine,
       httpGet: fakeRegistry({}).httpGet,
       log: () => {},
       prefixes: () => PREFIXES,
@@ -475,15 +515,21 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     ];
     const engine = fakeEngine({ images, layers: { 'sha256:base': ['l1', 'l2'], 'sha256:environment': ['l1', 'l2', 'l3'] } });
     const log: string[] = [];
-    const run = (docker: typeof engine.docker) =>
-      new ImageMaintenance({ docker, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
-    await run(engine.docker);
-    expect(engine.calls.some((call) => call[1] === 'rm')).toBe(false);
+    const run = (target: ImageEngine) =>
+      new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await run(engine.engine);
+    // Plan step 11I (U1, decision of 2026-10-08): no removal of the engine (`docker image rm` before), here and below.
+    expect(removed(engine.calls)).toEqual([]);
     expect(log).toContain(`The older image ${DEV} (2.0.12) stays: another image is built on it.`);
     const failing = fakeEngine({ images, failInspect: true });
-    await run(failing.docker);
-    expect(failing.calls.some((call) => call[1] === 'rm')).toBe(false);
+    await run(failing.engine);
+    expect(removed(failing.calls)).toEqual([]);
     expect(log).toContain(`The older image ${DEV} (2.0.12) stays: its layers could not be read.`);
+    // Plan step 11I (U1): an engine whose inspect fails (it does not answer) removes nothing either.
+    const broken: ImageEngine = { ...fakeEngine({ images }).engine, inspect: async () => Promise.reject(new EngineError('the daemon is busy', 500)) };
+    const before = log.length;
+    await run(broken);
+    expect(log.slice(before)).toContain(`The older image ${DEV} (2.0.12) stays: its layers could not be read.`);
   });
 
   it('does not update a repository whose tags cannot be read, and still cleans it', async () => {
@@ -492,26 +538,233 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const log: string[] = [];
     const httpGet: HttpGet = async () => ({ status: 500, headers: {}, body: '' });
-    await new ImageMaintenance({ docker: engine.docker, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine: engine.engine, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(engine.calls.some((call) => call[0] === 'pull')).toBe(false);
     expect(log[0]).toBe(`The tags of ${DEV} could not be read; it is not updated: HTTP 500`);
-    expect(engine.calls.filter((call) => call[1] === 'rm')).toEqual([['image', 'rm', `${DEV}:2.0.12`]]);
+    // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removal of the engine (was `docker image rm`).
+    expect(removed(engine.calls)).toEqual([['removeImage', `${DEV}:2.0.12`]]);
   });
 
   // User request 2026-09-28 ("in a guided cron style manner"): the tests of the daily time (06:07 in Europe/Vienna,
   // daylight saving time) and of the time zone moved, with the same expectations, to src/core/remoteMonitor/cron.test.ts.
 
   it('does nothing without prefixes, and never throws when Docker does not answer', async () => {
-    const calls: string[][] = [];
-    const docker = async (args: readonly string[]): Promise<DockerResult> => {
-      calls.push([...args]);
-      return { code: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' };
+    const calls: string[] = [];
+    // Plan step 11I (U1, decision of 2026-10-08): changed fixture, an engine whose every call fails (a CLI that could not
+    // connect before).
+    const failing = (name: string) => async (): Promise<never> => {
+      calls.push(name);
+      throw new Error('connect ECONNREFUSED /var/run/docker.sock');
     };
+    const engine: ImageEngine = { images: failing('images'), inspect: failing('inspect'), pull: failing('pull'), containerIds: failing('containerIds'), removeImage: failing('removeImage') };
     const httpGet: HttpGet = async () => ({ status: 200, headers: {}, body: '{}' });
-    await new ImageMaintenance({ docker, httpGet, log: () => {}, prefixes: () => [], knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine, httpGet, log: () => {}, prefixes: () => [], knownRepositories: async () => [] }).pass();
     expect(calls).toEqual([]);
     const log: string[] = [];
-    await new ImageMaintenance({ docker, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
-    expect(log).toEqual(['The images could not be maintained: docker image ls failed: Cannot connect to the Docker daemon']);
+    await new ImageMaintenance({ engine, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    // Plan step 11I (U1): changed expectation, the failure of the list of the engine (was "docker image ls failed: Cannot
+    // connect to the Docker daemon").
+    expect(log).toEqual(['The images could not be maintained: the list of the images failed: connect ECONNREFUSED /var/run/docker.sock']);
+    expect(calls).toEqual(['images']);
+  });
+});
+
+// Plan step 11I (U1, decision of 2026-10-08): the image maintenance over the Engine API; the answers of the engine that the
+// Docker CLI hid (an error in the stream of a pull, an image in use, a reference that is gone, an engine that does not
+// answer), the time limit of each call, and the requests of the real port.
+describe('the image maintenance over the Engine API (plan step 11I, U1)', () => {
+  const VERSIONS = [image(DEV, '2', 'sha256:new', '2026-09-20'), image(DEV, '2.0.14', 'sha256:new', '2026-09-20'), image(DEV, '2.0.13', 'sha256:prev', '2026-09-10')];
+
+  it('logs a pull whose stream reports an error, records no replaced image for it, and still cleans', async () => {
+    const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')], pulled: { [`${DEV}:2`]: 'sha256:newer' } });
+    let stored: ReplacedImages = {};
+    const log: string[] = [];
+    await new ImageMaintenance({
+      // The engine answers 200, and its stream carries the error (the port rejects with its message).
+      engine: { ...engine.engine, pull: async (reference) => (engine.calls.push(['pull', reference]), Promise.reject(new EngineError('manifest unknown', 200))) },
+      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      log: (message) => log.push(message),
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced: { read: async () => stored, write: async (value) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) },
+    }).pass();
+    expect(log).toEqual([`${DEV}:2 could not be pulled: manifest unknown`, `Removed the older image ${DEV} (2.0.12).`]);
+    // The pull did not move the reference: no ID is recorded as replaced by it (the store has the tagged IDs only).
+    expect([...stored[DEV]].sort()).toEqual(['sha256:new', 'sha256:old', 'sha256:prev']);
+    expect(removed(engine.calls)).toEqual([['removeImage', `${DEV}:2.0.12`]]);
+  });
+
+  it('tries every reference of a version; one in use (409) keeps it, and the log names the first refusal', async () => {
+    const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '1.0.0', 'sha256:old', '2026-08-01'), image(DEV, '1.0', 'sha256:old', '2026-08-01')], failRemove: [`${DEV}:1.0.0`] });
+    const log: string[] = [];
+    await new ImageMaintenance({ engine: engine.engine, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    // As `docker image rm a b`: each reference in turn, also after a refusal.
+    expect(removed(engine.calls)).toEqual([
+      ['removeImage', `${DEV}:1.0.0`],
+      ['removeImage', `${DEV}:1.0`],
+    ]);
+    expect(log).toContain(`The older image ${DEV} (1.0.0, 1.0) stays: ${DEV}:1.0.0 is in use (a container, or an image built on it); the engine answered 409.`);
+    // The refusals of all of a version's references share one time limit.
+    expect(engine.removals[0][1]).toBe(engine.removals[1][1]);
+  });
+
+  it('a reference that is gone (404) keeps the version in the log as "No such image", as the CLI said; another failure names its message', async () => {
+    const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')] });
+    const log: string[] = [];
+    const run = (target: ImageEngine) =>
+      new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await run({ ...engine.engine, removeImage: async () => 'missing' });
+    // (The registry of this test lists no tags: each pass logs that first.)
+    expect(log.filter((line) => line.startsWith('The older image'))).toEqual([`The older image ${DEV} (2.0.12) stays: No such image: ${DEV}:2.0.12`]);
+    await run({ ...engine.engine, removeImage: async () => Promise.reject(new EngineError('the daemon is busy', 500)) });
+    expect(log.at(-1)).toBe(`The older image ${DEV} (2.0.12) stays: the daemon is busy`);
+    // A removal that does not answer within its time limit.
+    await run({ ...engine.engine, removeImage: async () => Promise.reject(abortError()) });
+    expect(log.at(-1)).toBe(`The older image ${DEV} (2.0.12) stays: Docker did not answer within 120 seconds.`);
+  });
+
+  // As a failed `docker image inspect` of a chunk of IDs before: the layers of one image that cannot be read (removed
+  // meanwhile: 404; or the engine fails for it) keep every older version in that pass, as that image may be built on one.
+  it('removes nothing in a pass in which the layers of one image cannot be read', async () => {
+    const images = [image(DEV, '2.0.14', 'sha256:a', '2026-09-20'), image(DEV, '2.0.13', 'sha256:b', '2026-09-10'), image(DEV, '2.0.12', 'sha256:base', '2026-09-01')];
+    const layers = { 'sha256:base': ['l1', 'l2'], 'sha256:environment': ['l1', 'l2', 'l3'] };
+    for (const answer of [async () => undefined, async () => Promise.reject(new EngineError('the daemon is busy', 500))]) {
+      const engine = fakeEngine({ images, layers });
+      const log: string[] = [];
+      const target: ImageEngine = { ...engine.engine, inspect: async (kind, reference, signal) => (reference === 'sha256:environment' ? answer() : engine.engine.inspect(kind, reference, signal)) };
+      await new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      expect(removed(engine.calls)).toEqual([]);
+      expect(log).toContain(`The older image ${DEV} (2.0.12) stays: its layers could not be read.`);
+    }
+  });
+
+  // As a failed `docker image inspect --format '{{json .RepoTags}}…'` before: a stored replaced ID whose inspect fails is
+  // forgotten (not kept for a later pass), and nothing is removed by it.
+  it('forgets a stored replaced ID whose inspect fails, as before, and removes nothing by it', async () => {
+    const engine = fakeEngine({ images: VERSIONS, dangling: { 'sha256:x': '2026-09-01T00:00:00Z' } });
+    let stored: ReplacedImages = { [DEV]: ['sha256:x'] };
+    const target: ImageEngine = { ...engine.engine, inspect: async (kind, reference, signal) => (reference === 'sha256:x' ? Promise.reject(new Error('connect ECONNREFUSED /var/run/docker.sock')) : engine.engine.inspect(kind, reference, signal)) };
+    await new ImageMaintenance({
+      engine: target,
+      httpGet: fakeRegistry({}).httpGet,
+      log: () => {},
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+      replaced: { read: async () => stored, write: async (value) => void (stored = JSON.parse(JSON.stringify(value)) as ReplacedImages) },
+    }).pass();
+    expect(removed(engine.calls)).toEqual([]);
+    expect(stored[DEV]).not.toContain('sha256:x');
+  });
+
+  it('removes no version whose containers cannot be listed (the ancestor check fails), and logs nothing for it', async () => {
+    const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')], usedBy: {} });
+    const log: string[] = [];
+    await new ImageMaintenance({
+      engine: { ...engine.engine, containerIds: async () => Promise.reject(new Error('connect ECONNREFUSED /var/run/docker.sock')) },
+      httpGet: fakeRegistry({}).httpGet,
+      log: (message) => log.push(message),
+      prefixes: () => PREFIXES,
+      knownRepositories: async () => [],
+    }).pass();
+    expect(removed(engine.calls)).toEqual([]);
+    // (The registry of this test lists no tags: the pass logs only that.)
+    expect(log).toEqual([`The tags of ${DEV} could not be read; it is not updated: HTTP 404`]);
+    // One used by a container (the ancestor check of the engine): kept too.
+    const used = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')], usedBy: { 'sha256:old': 'c'.repeat(64) } });
+    await new ImageMaintenance({ engine: used.engine, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    expect(used.calls).toContainEqual(['containerIds', JSON.stringify({ ancestor: ['sha256:old'] })]);
+    expect(removed(used.calls)).toEqual([]);
+  });
+
+  // Each call of the engine keeps the time limit of its CLI command, as an AbortSignal (AbortSignal.timeout, read here
+  // through a spy): a list or an inspect IMAGE_LIST_TIMEOUT_MS, a pull IMAGE_PULL_TIMEOUT_MS, the removal of a version
+  // IMAGE_REMOVE_TIMEOUT_MS.
+  it('gives each call of the engine its time limit', async () => {
+    const limits = new Map<AbortSignal, number>();
+    const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+      const signal = new AbortController().signal;
+      limits.set(signal, ms);
+      return signal;
+    });
+    try {
+      const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')], pulled: { [`${DEV}:2`]: 'sha256:newer' } });
+      const timed: Array<[string, number | undefined]> = [];
+      const limit = (signal: AbortSignal | undefined) => (signal === undefined ? undefined : limits.get(signal));
+      const target: ImageEngine = {
+        images: async (filters, signal) => (timed.push(['images', limit(signal)]), engine.engine.images(filters)),
+        inspect: async (kind, reference, signal) => (timed.push(['inspect', limit(signal)]), engine.engine.inspect(kind, reference)),
+        pull: async (reference, options) => (timed.push(['pull', limit(options?.signal)]), engine.engine.pull(reference)),
+        containerIds: async (filters, signal) => (timed.push(['containerIds', limit(signal)]), engine.engine.containerIds(filters)),
+        removeImage: async (reference, signal) => (timed.push(['removeImage', limit(signal)]), engine.engine.removeImage(reference)),
+      };
+      await new ImageMaintenance({ engine: target, httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet, log: () => {}, prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      const byCall = new Map<string, Set<number | undefined>>();
+      for (const [call, ms] of timed) byCall.set(call, new Set([...(byCall.get(call) ?? []), ms]));
+      expect(Object.fromEntries([...byCall].map(([call, values]) => [call, [...values]]))).toEqual({
+        images: [IMAGE_LIST_TIMEOUT_MS],
+        inspect: [IMAGE_LIST_TIMEOUT_MS],
+        pull: [IMAGE_PULL_TIMEOUT_MS],
+        containerIds: [IMAGE_LIST_TIMEOUT_MS],
+        removeImage: [IMAGE_REMOVE_TIMEOUT_MS],
+      });
+      expect([IMAGE_LIST_TIMEOUT_MS, IMAGE_PULL_TIMEOUT_MS, IMAGE_REMOVE_TIMEOUT_MS]).toEqual([60_000, 3_600_000, 120_000]);
+      expect(removed(engine.calls).length).toBeGreaterThan(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // The requests of the real port (src/helperChannel/engineClient.ts) over an Engine API in memory, with the answers as the
+  // engine gives them: `Created` of the list in Unix seconds, `RepoTags` and `RepoDigests`, the inspect JSON, the pull
+  // stream, and 409 for an image in use.
+  it('runs a pass over the real port: the list as rows of `docker image ls -a`, the pull without a login, the ancestor list, and the removal without force', async () => {
+    const requests: EngineRequest[] = [];
+    const ok = (value: unknown, status = 200): EngineAnswer => ({ status, body: JSON.stringify(value), truncated: false });
+    const seconds = (date: string) => Date.parse(date) / 1000;
+    const listed = [
+      { Id: 'sha256:new', RepoTags: [`${DEV}:2`, `${DEV}:2.0.14`], RepoDigests: [`${DEV}@sha256:${'a'.repeat(64)}`], Created: seconds('2026-09-20T00:00:00Z') },
+      { Id: 'sha256:prev', RepoTags: [`${DEV}:2.0.13`], RepoDigests: [], Created: seconds('2026-09-10T00:00:00Z') },
+      // An image that a pull replaced on the classic store: only a digest of the repository (a `<none>` row of it).
+      { Id: 'sha256:old', RepoTags: [], RepoDigests: [`${DEV}@sha256:${'b'.repeat(64)}`], Created: seconds('2026-09-01T00:00:00Z') },
+      { Id: 'sha256:used', RepoTags: [`${DEV}:2.0.11`], RepoDigests: [], Created: seconds('2026-08-01T00:00:00Z') },
+      { Id: 'sha256:other', RepoTags: ['ghcr.io/someone/else:1'], RepoDigests: [], Created: seconds('2026-07-01T00:00:00Z') },
+    ];
+    const api: EngineApi = async (request) => {
+      requests.push(request);
+      const path = decodeURIComponent(request.path);
+      if (request.method === 'GET' && path.startsWith('/images/json')) return ok(listed);
+      if (request.method === 'GET' && path.startsWith('/images/')) {
+        const id = path === `/images/${DEV}:2/json` ? 'sha256:new' : path.slice('/images/'.length, -'/json'.length);
+        return ok({ Id: id, RepoTags: [], Created: '2026-01-01T00:00:00Z', RootFS: { Type: 'layers', Layers: [`${id}/layer`] } });
+      }
+      if (request.method === 'POST' && path.startsWith('/images/create')) {
+        request.onChunk?.('{"status":"Status: Image is up to date for ghcr.io/majikmate/devcontainer-dev:2"}\n');
+        return ok('');
+      }
+      if (request.method === 'GET' && path.startsWith('/containers/json')) return ok(path.includes('sha256:used') ? [{ Id: 'c'.repeat(64) }] : []);
+      if (request.method === 'DELETE' && path.startsWith('/images/')) return path === '/images/sha256:old' ? ok({ message: 'conflict: unable to delete sha256:old (cannot be forced) - image has dependent child images' }, 409) : ok([]);
+      return ok({ message: 'not routed' }, 500);
+    };
+    const engine = dockerEngine(api, async () => Promise.reject(new Error('no exec in this test')));
+    const log: string[] = [];
+    await new ImageMaintenance({ engine, httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    const paths = requests.map((request) => `${request.method} ${decodeURIComponent(request.path)}`);
+    // The list without `all` (no intermediate images; none of a repository), with no filter. Review round 1 of PR #126
+    // (F2): within the bound of a list of every image, not the 1 MiB of the other requests.
+    expect(paths).toContain('GET /images/json?filters={}');
+    expect(requests.filter((request) => request.path.startsWith('/images/json')).map((request) => request.maxCharacters)).toEqual([
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+      MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+    ]);
+    // The pull of the major tag, anonymous: no header of a login.
+    const pull = requests.find((request) => request.path.startsWith('/images/create'))!;
+    expect(decodeURIComponent(pull.path)).toBe(`/images/create?fromImage=${DEV}:2`);
+    expect(pull.headers).toEqual({});
+    // The two newest versions stay; the older ones: the one a container uses stays (ancestor), the one the engine refuses
+    // (409) stays, without force: DELETE without a query.
+    expect(paths).toContain('GET /containers/json?all=true&filters={"ancestor":["sha256:used"]}');
+    expect(paths.filter((entry) => entry.startsWith('DELETE'))).toEqual(['DELETE /images/sha256:old']);
+    expect(log).toEqual([`The older image ${DEV} (sha256:old) stays: sha256:old is in use (a container, or an image built on it); the engine answered 409.`]);
   });
 });
