@@ -584,6 +584,9 @@ describe('host access policy: build options', () => {
     ['the SSH agent', ['--ssh=default'], ['build option --ssh']],
     ['entitlements', ['--allow', 'network.host'], ['build option --allow']],
     ['a build context of a folder', ['--build-context', 'src=/Users/x/src'], ['build option --build-context=src=/Users/x/src']],
+    // Review round 1 of PR #130 (A-F2): only the exact lower-case prefixes are an image or a URL for Buildx.
+    ['a build context of HTTPS:// (a path for Buildx)', ['--build-context', 'src=HTTPS://example.com/x'], ['build option --build-context=src=HTTPS://example.com/x']],
+    ['a build context of DOCKER-IMAGE:// (a path for Buildx)', ['--build-context', 'src=DOCKER-IMAGE://alpine'], ['build option --build-context=src=DOCKER-IMAGE://alpine']],
     ['a build context of an OCI layout (a folder)', ['--build-context=x=oci-layout:///Users/x'], ['build option --build-context=x=oci-layout:///Users/x']],
     // Review round 3, S3-6: changed expectation, `-o out` writes to a relative path.
     ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o', 'build option -o out (a relative path)']],
