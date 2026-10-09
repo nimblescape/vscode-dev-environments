@@ -15,7 +15,7 @@ import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperMaintenance } from '../helper/helperImages';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
-import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
+import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN, VSCODE_STORE_DIR } from '../names';
 import { errorMessage, isUserFacingError } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError } from './helperChannel';
@@ -62,14 +62,26 @@ export const CHANNEL_PASSIVE_OPEN_WAIT_MS = 30_000;
 /**
  * `docker run` arguments of a channel container: `--rm -i`, never a pull (the helper image is built by the open
  * pipeline, or made ready by HelperChannelsOptions.prepare; without it the start fails), the labels, outbound network only (plan step 11E3a), no
- * capability, no new privileges, only the Docker socket of the engine. The command is the pipe loader (plan step 3) with
+ * capability, no new privileges, only the Docker socket of the engine, the volume of the lock files (`stateVolume`), and
+ * (plan step 11H1) the shared VS Code server store (`vscodeVolume`) at VSCODE_STORE_DIR. The command is the pipe loader (plan step 3) with
  * CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`, bundleHash), and CHANNEL_ENTRY; the script itself comes as
  * the first line of the input (HelperChannel.open), never on the command line.
  */
-export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume: string; containerName: string; label: string; scriptHash: string; network?: 'bridge' | 'none' }): string[] {
+export function channelRunArgs(p: {
+  tag: string;
+  socketPath: string;
+  stateVolume: string;
+  vscodeVolume: string;
+  containerName: string;
+  label: string;
+  scriptHash: string;
+  network?: 'bridge' | 'none';
+}): string[] {
   // --mount is CSV: a path with a comma or a quote would change the mount.
   if (/[",]/.test(p.socketPath)) throw new HelperChannelError('open', `The Docker socket path ${p.socketPath} cannot be mounted.`);
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(p.stateVolume)) throw new HelperChannelError('open', `The volume ${p.stateVolume} cannot be mounted.`);
+  for (const volume of [p.stateVolume, p.vscodeVolume]) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(volume)) throw new HelperChannelError('open', `The volume ${volume} cannot be mounted.`);
+  }
   return [
     'run',
     '--rm',
@@ -98,6 +110,12 @@ export function channelRunArgs(p: { tag: string; socketPath: string; stateVolume
     // Plan step 5, PR B: the volume of the Session Monitor, for the lock files of the environments (lock.ts of the worker).
     '--mount',
     `type=volume,source=${p.stateVolume},target=${LOCK_STATE_DIR}`,
+    // Plan step 11H1 (decision of 2026-10-03, "The VS Code caches are worker operations"): the shared VS Code server store
+    // of the engine, read-write (only the worker writes it; the dev containers get it read-only). The worker reads its
+    // name from the inspect of its own container (readOwnHelper). Review round 1 of 11H1 (A-M1): `volume-nocopy`, as the
+    // mount of the dev containers (vscodeStoreMount): the store's content comes only from ensureServer, never from an image.
+    '--mount',
+    `type=volume,source=${p.vscodeVolume},target=${VSCODE_STORE_DIR},volume-nocopy`,
     p.tag,
     ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: CHANNEL_ENTRY }),
   ];
@@ -123,6 +141,11 @@ export interface ChannelOpenDeps {
    * (REMOTE_MONITOR_VOLUME), the same for every engine, local and remote (the Docker tests: a volume of their own).
    */
   stateVolume: string;
+  /**
+   * Plan step 11H1: the shared VS Code server store of the engine (VSCODE_STORE_VOLUME, the same for every engine; the
+   * Docker tests: a volume of their own, so that the store of the engine is never created or touched).
+   */
+  vscodeVolume: string;
 }
 
 /** Review round 1 of PR #109 (A-L3): Docker's refusal of `--network bridge` on a daemon without it. */
@@ -152,7 +175,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   const name = engineName(target);
   const start = async (network: 'bridge' | 'none'): Promise<HelperChannel> => {
     const containerName = `devenv-channel-${crypto.randomBytes(6).toString('hex')}`;
-    const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script), network });
+    const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, vscodeVolume: deps.vscodeVolume, containerName, label: channelLabelValue(script), scriptHash: bundleHash(script), network });
     const process = await runWithDockerTarget(target, async () => deps.start(args));
     if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
     return HelperChannel.open(process, script, { logger: deps.logger, name });

@@ -21,7 +21,8 @@ import { ImageChecker } from '../imageCheck/imageCheck';
 import { RegistryClient, type CredentialsProvider } from '../imageCheck/registryClient';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { proxiedHttpsTransport } from '../proxyTransport';
-import { SECRET_REGISTRY } from '../helperChannel/protocol';
+import { SECRET_REGISTRY, type VscodeServerRef } from '../helperChannel/protocol';
+import { VSCODE_STORE_DIR } from '../names';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionMonitor } from '../pipeline/environmentService';
 import type { EnvironmentSessionFiles, EnvironmentStore } from '../pipeline/operationBase';
@@ -37,6 +38,7 @@ import { stopAfterSeconds } from '../session/sessionRules';
 import { EngineDocker } from './engineDocker';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
+import { ensureEngineServer, storeLock, unpackServer, type VscodeStoreDeps } from './vscodeServerStore';
 
 /**
  * Plan step 11I (PR D): what a part of the pipeline throws when its operation did not give the worker what it needs (fail
@@ -343,6 +345,29 @@ export interface WorkerServicesDeps {
    * with its limits); without it, an analysis fails closed.
    */
   analyzer?: ConfigurationAnalyzer;
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the VS Code server of an open
+   * (OpenParams.vscodeServer). With the store of the worker (OwnHelper.vscodeStore), a container that the open creates
+   * mounts the store, the open makes sure that the store has the server (ensureEngineServer, started at its start), and
+   * the server is linked into the container; without either, the open runs as before.
+   */
+  vscodeServer?: VscodeServerRef;
+}
+
+/**
+ * Plan step 11H1: what ensureServer uses in the worker: the store at VSCODE_STORE_DIR, HTTPS through the proxy of the
+ * daemon (proxiedHttpsTransport, decision C1 of 2026-10-05), the architecture of the engine, the lock of a server version
+ * (storeLock), `tar` (unpackServer), and the log of the operation.
+ */
+export function workerVscodeStore(deps: Pick<WorkerServicesDeps, 'engine' | 'logger'>): VscodeStoreDeps {
+  return {
+    root: VSCODE_STORE_DIR,
+    transport: proxiedHttpsTransport(() => deps.engine.proxy()),
+    architecture: (signal) => deps.engine.architecture(signal),
+    lock: (root, name, waitSeconds, signal) => storeLock(root, name, waitSeconds, signal),
+    unpack: (archive, folder, signal) => unpackServer(archive, folder, signal),
+    logger: deps.logger,
+  };
 }
 
 /** The core services of one operation in the worker (see the module comment). */
@@ -369,7 +394,16 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
     // Review round 1 of PR #129 (B-L4): with the signal of the step, so a cancel does not wait for the inspect.
     containerRuns: async (containerId, signal) => (await docker.containerState(containerId, signal)) === 'running',
   });
+  // Plan step 11H1: the shared VS Code server store of the worker (the volume at VSCODE_STORE_DIR of its own container).
+  const store = deps.ownHelper.vscodeStore;
+  const server = deps.vscodeServer;
+  if (server !== undefined && store === undefined) deps.logger.info('The worker mounts no shared VS Code server store, so the open runs without it.');
   return {
+    ...(store !== undefined ? { vscodeStoreVolume: store } : {}),
+    // The fetch of the server into the store, for the platform of the engine (ensureEngineServer; never rejects).
+    ...(server !== undefined && store !== undefined
+      ? { vscodeServer: { server, fetch: (signal: AbortSignal) => ensureEngineServer(workerVscodeStore(deps), server, signal) } }
+      : {}),
     docker,
     // Docker runs where the worker runs; the engine must answer.
     startDocker: async ({ signal }) => {

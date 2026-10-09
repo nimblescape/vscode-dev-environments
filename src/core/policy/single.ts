@@ -16,8 +16,10 @@ import {
   COMPOSE_CLEARED_LABELS,
   LABEL_CONFIG_PATH,
   TOKEN_TMPFS,
+  VSCODE_STORE_VOLUME,
   WORKSPACES_ROOT,
   isConfigPathLabelValue,
+  vscodeStoreMount,
 } from '../names';
 import { exposingLocalPortHostValues, LOCAL_PORT_HOST_SETTING } from '../devContainers';
 import {
@@ -120,6 +122,14 @@ export interface HostAccessInput extends VolumeInput {
    * too.
    */
   composeMounts?: boolean;
+  /**
+   * Plan step 11H1: the name of the shared VS Code server store of the engine (the volume that the worker mounts at
+   * VSCODE_STORE_DIR; default VSCODE_STORE_VOLUME, a volume of their own in the Docker tests). The `--mount` of the store
+   * that the override configuration adds (vscodeStoreMount of this name) is allowed in the runArgs of the override
+   * configuration and of the merged configuration (which holds them for an existing container), exactly as written there;
+   * the name VSCODE_STORE_VOLUME stays protected everywhere else (foreignVolumeName).
+   */
+  vscodeStoreVolume?: string;
   /**
    * The variables of the Dev Container CLI at `up` (helperCliVariables in ./cliVariables.ts): the image metadata is
    * checked as the CLI substitutes it before it passes it to Docker, with the repository folder for
@@ -237,9 +247,11 @@ function hostAccessFindings(original: HostAccessInput, checksOn: boolean): Probl
         // The labels of Docker Compose with empty values: only those that the override configuration adds (D2-1), which
         // the merged configuration of an existing container holds too.
         const cleared = source === input.merged || input.overrideConfiguration === true;
-        add(runArgsFindings(source.runArgs, volumes, cleared));
+        // Plan step 11H1: and the mount of the shared VS Code server store that the override configuration adds.
+        const store = cleared ? vscodeStoreMount(input.vscodeStoreVolume ?? VSCODE_STORE_VOLUME) : undefined;
+        add(runArgsFindings(source.runArgs, volumes, cleared, store));
         // What Docker gets: the same list without the removed flags, and (checks on) with 127.0.0.1 for published ports.
-        add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared));
+        add(runArgsFindings(overrideRunArgs(source.runArgs, checksOn), volumes, cleared, store));
       }
     }
     if (source.appPort !== undefined) {
@@ -844,9 +856,11 @@ function isOwnConfigPathLabel(value: string): boolean {
  * `cleared`: the labels of Docker Compose with empty values that the override configuration adds
  * (COMPOSE_CLEARED_LABELS, review round 2, D2-1) are allowed, exactly as written there, the label
  * nimblescape.devenv.config-path of the override configuration (review round 4, D4-2), and (unit 15) its `--tmpfs
- * TOKEN_TMPFS`.
+ * TOKEN_TMPFS`. Plan step 11H1: `storeMount`, the value of the `--mount` of the shared VS Code server store that the
+ * override configuration adds (vscodeStoreMount), allowed exactly as written there (the caller gives it only where it
+ * gives `cleared`: the override and the merged configuration).
  */
-function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false): Problem[] {
+function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cleared = false, storeMount?: string): Problem[] {
   const problems: Problem[] = [];
   for (const flag of parseFlags(runArgs, RUN_FLAGS)) {
     const rule = flag.rule;
@@ -861,6 +875,10 @@ function runArgsFindings(runArgs: readonly unknown[], volumes: VolumeContext, cl
       continue;
     } else if (cleared && flag.name === '--tmpfs' && flag.value === TOKEN_TMPFS) {
       // Unit 15: the tmpfs of the token that the override configuration adds, exactly as written there.
+      continue;
+    } else if (storeMount !== undefined && flag.name === '--mount' && flag.value === storeMount) {
+      // Plan step 11H1: the read-only mount of the shared VS Code server store that the override configuration adds,
+      // exactly as written there (the repository's runArgs are checked without it, so a copy there stays refused).
       continue;
     } else if (flag.name === '-v' || flag.name === '--volume') {
       problems.push(...volumeFlagProblems(flag.value ?? '', volumes));

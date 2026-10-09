@@ -5387,3 +5387,31 @@ describe('review round 2 of PR #88 (B-R2-7): a rebuild keeps the images of the p
     expect(h.docker.images.has(IMAGE_1)).toBe(false);
   });
 });
+
+describe('the shared VS Code server store in Docker Compose (plan step 11H1)', () => {
+  const SERVER = { commit: '0123456789abcdef0123456789abcdef01234567', quality: 'stable' as const };
+
+  it('the up model mounts the store read-only into the dev service; it is never created or recorded as a volume of the environment', async () => {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID, vscodeStoreVolume: 'devenv-vscode', vscodeServer: { server: SERVER, fetch: async () => 'linux-x64' } });
+    useCompose(h);
+    await h.service.open(TARGET, options());
+    const m = upModel();
+    // Review round 1 of 11H1 (A-M1): changed expectation, `volume: { nocopy: true }` (before: without it), so that Docker
+    // never copies the image's /opt/devenv/vscode into an empty store.
+    expect(m.services.app.volumes).toContainEqual({ type: 'volume', source: 'devenv-vscode', target: '/opt/devenv/vscode', read_only: true, volume: { nocopy: true } });
+    expect(m.volumes?.['devenv-vscode']).toEqual({ name: 'devenv-vscode', external: true });
+    expect(JSON.stringify(m.services.db)).not.toContain('devenv-vscode');
+    expect(h.docker.log.filter((line) => line.includes('devenv-vscode'))).toEqual([]);
+    expect(h.docker.volumes.has('devenv-vscode')).toBe(false);
+    expect(JSON.stringify(await h.registry.get(ENV_ID))).not.toContain('devenv-vscode');
+  });
+
+  it('without a server: the up model as before', async () => {
+    h.cleanup();
+    h = createHarness({ newEnvironmentId: () => ENV_ID, vscodeStoreVolume: 'devenv-vscode' });
+    useCompose(h);
+    await h.service.open(TARGET, options());
+    expect(JSON.stringify(upModel())).not.toContain('devenv-vscode');
+  });
+});

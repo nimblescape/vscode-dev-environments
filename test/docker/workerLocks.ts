@@ -31,7 +31,7 @@ import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { contextSecrets } from '../../src/helperChannel/operationContext.testkit';
 import type { OperationContext } from '../../src/helperChannel/server';
 import { TEST_RUN_LABEL, readBaseline } from './dockerRun';
-import { HELPER_DOCKERFILE, testStateVolume, type DockerTestContext } from './harness';
+import { HELPER_DOCKERFILE, testStateVolume, testVscodeVolume, type DockerTestContext } from './harness';
 
 let bundled: Promise<string> | undefined;
 
@@ -104,6 +104,8 @@ export function workerLocks(
           helperTag: async () => helperTag,
           socketPath: async () => socketPath(target),
           stateVolume: testStateVolume(context, name),
+          // Plan step 11H1: the shared VS Code server store, a volume of the test file.
+          vscodeVolume: testVscodeVolume(context, name),
         },
         target,
       ),

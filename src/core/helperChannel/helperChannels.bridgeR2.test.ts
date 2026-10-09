@@ -76,6 +76,7 @@ async function open(first: () => StartedProcess) {
       helperTag: async () => 'devenv-helper:abc',
       socketPath: async () => '/var/run/docker.sock',
       stateVolume: 'devenv-session-monitor',
+      vscodeVolume: 'devenv-vscode',
     },
     REMOTE,
   ).catch((error: unknown) => {

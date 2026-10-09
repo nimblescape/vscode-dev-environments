@@ -13,6 +13,8 @@ import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfW
 import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import type { SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
+import { vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
+import type { VscodePlatform, VscodeServerLink, VscodeServerRef } from '../helperChannel/protocol';
 import { isDevContainer } from '../worker/dockerEngine';
 import {
   dockerHostField,
@@ -118,6 +120,8 @@ import {
   SERVICE_DATA,
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
+  VSCODE_STORE_TARGET,
+  VSCODE_STORE_VOLUME,
   composeProjectName,
   configurationFolder,
   configurationName,
@@ -505,6 +509,22 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
    * AbortError. Stop and Delete take it (user decision D2). Required (D1: there is no path without the lock).
    */
   environmentLock: (environmentId: string, waitSeconds: number, signal: AbortSignal | undefined) => Promise<HeldEnvironmentLock>;
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the name of the shared VS Code server store of
+   * the engine (the volume that the worker mounts read-write, OwnHelper.vscodeStore; default VSCODE_STORE_VOLUME). The host
+   * access policy allows its mount in the override configuration (HostAccessInput.vscodeStoreVolume), the creation of the
+   * additional volumes never creates or records it, and the link checks that the dev container mounts it.
+   */
+  vscodeStoreVolume?: string;
+  /**
+   * Plan step 11H1: the VS Code server of an open that carries one (OpenParams.vscodeServer) on a worker with a store, and
+   * `fetch`, which makes sure that the store has it for the platform of the engine (ensureEngineServer; resolves with that
+   * platform when it is ready, else `undefined`; never rejects). Without it the open runs as before: no mount of the store, no fetch, no link. The decision
+   * of 2026-10-09: the open starts the fetch at its start (a present server costs nothing; a download that runs in another
+   * window is waited for through its lock; a missing one is downloaded by the very first open) and waits for it before the
+   * link.
+   */
+  vscodeServer?: { server: VscodeServerRef; fetch: (signal: AbortSignal) => Promise<VscodePlatform | undefined> };
 }
 
 
@@ -583,6 +603,15 @@ interface LoadedCompose {
   hostAccessChecks: HostAccessChecks;
   /** composeInputsHash of the files as written (review round 1, P-4). */
   inputsHash: string;
+}
+
+/**
+ * Plan step 11H1: the fetch of the shared VS Code server of an open (startVscodeServer): `ready` resolves with the
+ * platform whose server the store has, or `undefined` (never rejects); `settled` once it resolved.
+ */
+interface VscodeServerFetch {
+  ready: Promise<VscodePlatform | undefined>;
+  settled: boolean;
 }
 
 /** State of one pipeline run. */
@@ -668,6 +697,12 @@ interface PipelineContext {
    * runs while Docker starts and the image check runs. Never rejects.
    */
   identity: Promise<GitIdentity>;
+  /**
+   * Plan step 11H1 (decision of 2026-10-09): the fetch of the shared VS Code server of the open (startVscodeServer), started
+   * at the start of the open like `identity`, and awaited before the link in `finish`; `settled` once it resolved. Missing
+   * without EnvironmentServiceDeps.vscodeServer. Never rejects.
+   */
+  vscodeServer?: VscodeServerFetch;
   /**
    * The switch of the host access checks for the repository, read from the settings at the start of this open
    * (hostAccessChecks, concept section 9 "Host access"). `off` lifts the refusals of access to the computer.
@@ -1115,6 +1150,8 @@ export class EnvironmentService extends OperationBase {
    * question, `retryAfter` is the time from which GitHub is asked again.
    */
   private readonly identities = new Map<string, { identity: Promise<GitIdentity>; retryAfter?: number }>();
+  /** Plan step 11H1: the fetch of the shared VS Code server of each open (startVscodeServer), by the options of the open. */
+  private readonly vscodeServerFetches = new WeakMap<OpenOptions, VscodeServerFetch>();
   private readonly pendingRefreshMs: number;
   private readonly output = (text: string): void => this.deps.logger.output(text);
 
@@ -1182,6 +1219,9 @@ export class EnvironmentService extends OperationBase {
     }
     // Asked now, so the question to GitHub runs while Docker starts and the repository is cloned.
     const identity = this.identityOf(session);
+    // Plan step 11H1: started now too, so a download of the VS Code server runs while the repository is cloned and the
+    // image is built.
+    const vscodeServer = this.startVscodeServer(options);
     await this.startDocker(steps, signal);
     // Concept 7.5 "registry lost", D-3: a labeled volume of this repository and account that the registry lacks holds the
     // work of the user. It becomes the environment again; a second environment would hide it. Docker runs now, so the
@@ -1239,6 +1279,7 @@ export class EnvironmentService extends OperationBase {
       session,
       gitPrepared: false,
       identity,
+      ...(vscodeServer !== undefined ? { vscodeServer } : {}),
       hostAccessChecks: this.hostAccessChecksFor(environment.repository),
     };
     // Plan step 6, PR A (user decision D2): the first open runs under the lock of the environment on the Docker host,
@@ -1307,6 +1348,8 @@ export class EnvironmentService extends OperationBase {
     const owned = await this.requireOwner(environment, session);
     // Asked now, so the question to GitHub runs while Docker starts and the image check runs (NFR-08).
     const identity = this.identityOf(session);
+    // Plan step 11H1: started now too (the same fetch when openFirst started it already for these options).
+    const vscodeServer = this.startVscodeServer(options);
     // The Session Monitor must not stop a running container while the pipeline runs (concept 7.9). The file is written
     // again while the pipeline runs, because it counts only for 2 minutes and not every step holds a busy mark.
     await this.deps.sessionFiles.writePending(owned.id, this.deps.owner.windowId);
@@ -1350,6 +1393,7 @@ export class EnvironmentService extends OperationBase {
           session,
           gitPrepared: false,
           identity,
+          ...(vscodeServer !== undefined ? { vscodeServer } : {}),
           hostAccessChecks: this.hostAccessChecksFor(env.repository),
           // Plan step 11E4d: what the window remembers, read under the lock (no other open of the environment runs now).
           unrecordedLifecycle: await this.lifecycleMemory.get(env.id),
@@ -3551,6 +3595,9 @@ export class EnvironmentService extends OperationBase {
       hostAccessChecks: ctx.hostAccessChecks,
       // Review round 4 (D4-2): reconcileFromVolumes restores the configuration path from it.
       configPath: env.configPath,
+      // Plan step 11H1: the shared VS Code server store, read-only, for an open that carries a server (only a container
+      // that `up` creates gets it; an existing one is started as it is).
+      ...(this.deps.vscodeServer !== undefined ? { vscodeStoreVolume: this.vscodeStoreVolume() } : {}),
     });
     // Concept section 9 "Host access": the arguments and published ports that Docker gets, after the changes of the
     // override configuration, pass the policy too (the check of the configuration covers them as read-configuration
@@ -3733,6 +3780,9 @@ export class EnvironmentService extends OperationBase {
       ...this.composeParams(env, compose, mounts.sources),
       image,
       configPath: env.configPath,
+      // Plan step 11H1: the shared VS Code server store, read-only in the dev service, for an open that carries a server
+      // (Docker Compose creates the dev container with it; `up` keeps an existing one, --no-recreate of the CLI).
+      ...(this.deps.vscodeServer !== undefined ? { vscodeStoreVolume: this.vscodeStoreVolume() } : {}),
     });
     // Review round 10 (D10-1): before `up` (also before the first build record, so that a failed `up` leaves them
     // recorded). Review round 11 (G3, G4): with the paths that the existing containers mount; the list never shrinks
@@ -4599,7 +4649,8 @@ export class EnvironmentService extends OperationBase {
    * another program or account, a volume that Docker created at `up`) is never recorded, so Delete never removes it.
    */
   private async recordedVolumes(names: readonly string[], env: Pick<Environment, 'id' | 'volumeName' | 'owner'>): Promise<string[]> {
-    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
+    // Plan step 11H1: never the shared VS Code server store.
+    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName && !this.isVscodeStore(name));
     if (candidates.length === 0) return [];
     const volumes = await this.deps.docker.inspectVolumes(candidates);
     const recorded = new Set(
@@ -4624,7 +4675,9 @@ export class EnvironmentService extends OperationBase {
    */
   private async createAdditionalVolumes(ctx: PipelineContext, names: readonly string[], labelsOf?: (name: string) => Record<string, string>): Promise<void> {
     const env = ctx.env;
-    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName);
+    // Plan step 11H1 (hazard 1 of the survey): the shared VS Code server store, which the override configuration mounts,
+    // is never created with the labels of the environment, nor recorded (it is no environment's volume).
+    const candidates = [...new Set(names)].filter((name) => name !== env.volumeName && !this.isVscodeStore(name));
     if (candidates.length === 0) return;
     const inspected = await this.deps.docker.inspectVolumes(candidates);
     const existing = new Set(inspected.map((volume) => volume.name));
@@ -4766,7 +4819,13 @@ export class EnvironmentService extends OperationBase {
     // Checked as the Dev Container CLI resolves the variables at `up` (helperCliVariables). Review round 18 (D18-1): the
     // runs of Docker Compose (composeMounts) get COMPOSE_PROJECT_NAME with the project name of the environment.
     const composeEnv: Record<string, string> = input.composeMounts === true ? { COMPOSE_PROJECT_NAME: composeProjectName(env.repository, env.id) } : {};
-    const checked: HostAccessInput = { ...input, ownVolume: env.volumeName, variables: helperCliVariables(env.repository, composeEnv) };
+    const checked: HostAccessInput = {
+      ...input,
+      ownVolume: env.volumeName,
+      variables: helperCliVariables(env.repository, composeEnv),
+      // Plan step 11H1: the store of the worker, whose mount the override configuration adds (default VSCODE_STORE_VOLUME).
+      ...(this.deps.vscodeStoreVolume !== undefined ? { vscodeStoreVolume: this.deps.vscodeStoreVolume } : {}),
+    };
     const file = await this.deps.registry.read();
     const otherOwner = (owner: GitHubAccount) => owner.id !== env.owner.id;
     const others = file.environments.filter((other) => other.id !== env.id && otherOwner(other.owner));
@@ -4961,6 +5020,108 @@ export class EnvironmentService extends OperationBase {
     }
   }
 
+  /** Plan step 11H1: the shared VS Code server store of the engine (EnvironmentServiceDeps.vscodeStoreVolume). */
+  private vscodeStoreVolume(): string {
+    return this.deps.vscodeStoreVolume ?? VSCODE_STORE_VOLUME;
+  }
+
+  /** Plan step 11H1: `name` is the shared VS Code server store: its fixed name, or the store of the worker. */
+  private isVscodeStore(name: string): boolean {
+    return name === VSCODE_STORE_VOLUME || name === this.vscodeStoreVolume();
+  }
+
+  /**
+   * Plan step 11H1 (decision of 2026-10-09, "11H: the shared VS Code server and the Session Monitor's daily run"): starts
+   * the fetch of the shared VS Code server of the open (EnvironmentServiceDeps.vscodeServer) with the signal of the open,
+   * once per open (`options`: openFirst and the openExisting that it may hand over to share it); `undefined` without a
+   * server. Never rejects.
+   */
+  private startVscodeServer(options: OpenOptions): VscodeServerFetch | undefined {
+    const server = this.deps.vscodeServer;
+    if (server === undefined) return undefined;
+    const started = this.vscodeServerFetches.get(options);
+    if (started !== undefined) return started;
+    const fetch: VscodeServerFetch = { ready: Promise.resolve(undefined), settled: false };
+    const signal = options.signal ?? new AbortController().signal;
+    fetch.ready = server
+      .fetch(signal)
+      .catch(() => undefined)
+      .finally(() => {
+        fetch.settled = true;
+      });
+    this.vscodeServerFetches.set(options, fetch);
+    return fetch;
+  }
+
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"; the live checks of 2026-10-09; the decision of
+   * 2026-10-09: "open means we need the vscode server that is the same commit as our vscode window"): before the window
+   * connects, the server of the store is linked into the dev container. Only when the dev container mounts the store
+   * read-only at VSCODE_STORE_TARGET (its inspect): the open waits for its fetch (ctx.vscodeServer; with the detail
+   * "Downloading the VS Code server." while it still runs; a cancel of the open ends the wait), and when the store has
+   * the server, the script `vscodeServerLink` runs as the remote user (it decides the platform of the container, and
+   * whether a link is made; one line in the log). A failure is a line in the log and `skipped` or `missing`: the Dev
+   * Containers extension then installs the server into the container as before; only a cancel of the open ends the open.
+   * `undefined` without a server of the open.
+   */
+  private async linkVscodeServer(ctx: PipelineContext, container: string, containerName: string, user: string): Promise<VscodeServerLink | undefined> {
+    const vscode = this.deps.vscodeServer;
+    if (vscode === undefined) return undefined;
+    const { commit, quality } = vscode.server;
+    const store = this.vscodeStoreVolume();
+    try {
+      const found = await this.deps.docker.findContainer(ctx.env.id, containerName);
+      const mounted =
+        found !== undefined &&
+        (sameContainer(found.id, container) || found.name === container) &&
+        (found.mountTargets ?? []).some(
+          (mount) => mount.type === 'volume' && mount.volume === store && mount.subpath === undefined && mount.readOnly === true && path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') === VSCODE_STORE_TARGET,
+        );
+      if (!mounted) {
+        this.logger.info(`The VS Code server ${commit} is not linked: the container of ${ctx.env.repository} does not mount the shared store (it was created before; a rebuild adds it).`);
+        return { outcome: 'skipped' };
+      }
+      const fetch: VscodeServerFetch = ctx.vscodeServer ?? { ready: Promise.resolve(undefined), settled: true };
+      // The detail only while the fetch still runs (a present server: no wait, no detail).
+      const shown = !fetch.settled;
+      if (shown) ctx.steps.detail(PipelineTexts.downloadingVscodeServer);
+      let platform: VscodePlatform | undefined;
+      try {
+        platform = await waitUnlessAborted(fetch.ready, ctx.signal);
+      } finally {
+        if (shown) ctx.steps.clearDetail();
+      }
+      if (platform === undefined) {
+        this.logger.info(`The shared store does not have the VS Code server ${commit}; the Dev Containers extension installs it into the container of ${ctx.env.repository}.`);
+        return { outcome: 'missing' };
+      }
+      const result = await runScript(this.deps.docker, container, 'vscodeServerLink', [commit, quality, platform], {
+        user,
+        signal: ctx.signal,
+        timeoutMs: GIT_EXEC_TIMEOUT_MS,
+      });
+      const outcome = vscodeServerLinkOutcome(result);
+      switch (outcome.kind) {
+        case 'linked':
+          this.logger.info(`The VS Code server ${commit} is linked from the shared store into the container of ${ctx.env.repository}.`);
+          return { outcome: 'linked' };
+        case 'present':
+          this.logger.info(`The VS Code server ${commit} is in the container of ${ctx.env.repository} already; it is left as it is.`);
+          return { outcome: 'present' };
+        case 'failed':
+          this.logger.warn(`The VS Code server ${commit} could not be linked into the container of ${ctx.env.repository} (${outcome.reason}); the Dev Containers extension installs it.`);
+          return { outcome: 'skipped' };
+        default:
+          this.logger.info(`The VS Code server ${commit} is not linked into the container of ${ctx.env.repository} (${outcome.kind}: ${outcome.reason}); the Dev Containers extension installs it.`);
+          return { outcome: 'skipped' };
+      }
+    } catch (error) {
+      if (this.isCancellation(error, ctx.signal)) throw error;
+      this.logger.warn(`The VS Code server ${commit} could not be linked into the container of ${ctx.env.repository} (${errorMessage(error)}); the Dev Containers extension installs it.`);
+      return { outcome: 'skipped' };
+    }
+  }
+
   /**
    * user.name and user.email of a new Git configuration: the profile of the account on GitHub, or, when GitHub does not
    * answer within 5 seconds, the login and the ID of the session. The opens of this window share one question per
@@ -5108,6 +5269,10 @@ export class EnvironmentService extends OperationBase {
     if (ctx.tokenWrittenTo === undefined || !sameContainerId(ctx.tokenWrittenTo, containerRef)) {
       await this.writeGitToken(ctx, containerRef, remoteUser ?? 'root');
     }
+    // Plan step 11H1: the shared VS Code server, linked at every open before the window connects (the commit changes with
+    // each update of VS Code) when the store has it; the open waits for the fetch that it started (linkVscodeServer; review
+    // round 1 of 11H1, A-L4), and a failure never fails the open.
+    const vscodeServer = await this.linkVscodeServer(ctx, containerRef, containerName, remoteUser ?? 'root');
     const gitSummary = await this.gitSummaryAfterOpen(ctx, containerRef, remoteUser, folder);
     // A Cancel during the Git read ends the open here, before the window would connect.
     this.throwIfCancelled(ctx.signal);
@@ -5132,7 +5297,7 @@ export class EnvironmentService extends OperationBase {
     // container ran.
     if (ctx.lifecycleRanFor !== undefined) await this.forgetUnrecordedLifecycle(ctx, ctx.lifecycleRanFor);
     this.logger.info(`${env.repository} is ready in the container ${containerName}.`);
-    return { environment: ctx.env, containerName, remoteWorkspaceFolder };
+    return { environment: ctx.env, containerName, remoteWorkspaceFolder, ...(vscodeServer !== undefined ? { vscodeServer } : {}) };
   }
 
   /**
@@ -5848,7 +6013,8 @@ export class EnvironmentService extends OperationBase {
    * and not a volume that does not exist.
    */
   private async protectedMountedVolumes(names: readonly string[], workspaceVolume: string): Promise<string[]> {
-    const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined);
+    // Plan step 11H1: never the shared VS Code server store (by its name, or the store of the worker).
+    const candidates = [...new Set(names)].filter((name) => name !== workspaceVolume && foreignVolumeName(name) === undefined && !this.isVscodeStore(name));
     if (candidates.length === 0) return [];
     const labels = new Map((await this.deps.docker.inspectVolumes(candidates)).map((volume) => [volume.name, volume.labels]));
     return candidates.filter((name) => {

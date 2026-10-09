@@ -32,6 +32,7 @@ import {
   supportsVolumeSubpath,
   type ComposeModel,
   type ComposeRewriteParams,
+  VSCODE_STORE_KEY,
 } from './compose';
 import { OVERRIDE_FOLDER } from './scripts';
 import {
@@ -451,6 +452,24 @@ describe('composeUpModel', () => {
       { item: 'service db: restart unless-stopped', reason: 'Dev Environments starts the containers itself (no)' },
       { item: 'service app: build', reason: `the environment image ${PROJECT}:7 is used` },
     ]);
+  });
+
+  it('mounts the shared VS Code server store read-only into the dev service only, as an external volume (plan step 11H1)', () => {
+    const plain = up(templateModel()).model;
+    const { model } = up(templateModel(), { vscodeStoreVolume: 'devenv-vscode' });
+    expect(model.services.app.volumes).toEqual([
+      { type: 'volume', source: WORKSPACE_VOLUME_KEY, target: '/workspaces' },
+      // Review round 1 of 11H1 (A-M1): changed expectation, `volume: { nocopy: true }` (before: without it), so that
+      // Docker never copies the image's /opt/devenv/vscode into an empty store.
+      { type: 'volume', source: VSCODE_STORE_KEY, target: '/opt/devenv/vscode', read_only: true, volume: { nocopy: true } },
+    ]);
+    expect(model.services.db.volumes).toEqual(plain.services.db.volumes);
+    expect(model.volumes).toEqual({ ...plain.volumes, [VSCODE_STORE_KEY]: { name: 'devenv-vscode', external: true } });
+    // The store of the worker by its name (a volume of the Docker tests).
+    expect(up(templateModel(), { vscodeStoreVolume: 'devenv-test-vscode-x' }).model.volumes?.[VSCODE_STORE_KEY]).toEqual({ name: 'devenv-test-vscode-x', external: true });
+    // Without it: neither (the open of a window without a server).
+    expect(plain.volumes).not.toHaveProperty(VSCODE_STORE_KEY);
+    expect(JSON.stringify(plain)).not.toContain('/opt/devenv/vscode');
   });
 
   // Review round 7, P7-1: the templates (Python & PostgreSQL, …) set `restart: unless-stopped` on the database.

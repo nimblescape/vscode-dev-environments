@@ -652,6 +652,8 @@ export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelpe
       monitorSource: checked.monitorSource,
       monitorEnsure: monitor.monitorEnsure,
       monitorImages: monitor.monitorImages,
+      // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the server of the window's VS Code.
+      ...(checked.vscodeServer !== undefined ? { vscodeServer: checked.vscodeServer } : {}),
     });
     const sent = (): { imageListSent?: true } => (monitor.imageListSent() ? { imageListSent: true } : {});
     const options = {
@@ -667,6 +669,8 @@ export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelpe
           : await service.open({ repository: checked.repository, ...checked.target!, defaultBranch: checked.target!.defaultBranch ?? null }, options);
       return {
         opened: { environmentId: result.environment.id, containerName: result.containerName, remoteWorkspaceFolder: result.remoteWorkspaceFolder },
+        // Plan step 11H1: what the link of the shared VS Code server did (one value; the log of the open says why).
+        ...(result.vscodeServer !== undefined ? { vscodeServer: result.vscodeServer } : {}),
         ...sent(),
       } satisfies OpenValue;
     } catch (error) {

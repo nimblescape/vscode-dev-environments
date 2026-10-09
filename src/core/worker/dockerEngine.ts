@@ -244,6 +244,11 @@ export interface DockerEngine {
    */
   proxy(signal?: AbortSignal): Promise<EngineProxy>;
   /**
+   * Plan step 11H1: the architecture of the engine's host (`GET /info`, its `Architecture` as the daemon writes it, for
+   * example `x86_64` or `aarch64`); rejects with an EngineError when the answer has none.
+   */
+  architecture(signal?: AbortSignal): Promise<string>;
+  /**
    * Plan step 11D2 (the Session Monitor container, plan step 3 pipe loading): creates the container of `spec` with an open
    * input, attaches to it, starts it, writes `input`, and waits for `readyText` on its output, its end, `timeoutMs`, or
    * the cancellation; then its input is closed (the container goes on alone). A create that the engine refuses is

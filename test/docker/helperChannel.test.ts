@@ -41,7 +41,7 @@ import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { Timings, dockerTestContext, testHelperImage, testStateVolume } from './harness';
+import { Timings, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -125,6 +125,8 @@ describe('the helper channel with the real Docker engine', () => {
         socketPath: async () => socket,
         // Plan step 5, PR B: the lock files in a volume of the test, never the one of the Session Monitor.
         stateVolume: testStateVolume({ run, cli }, 'helperChannel'),
+        // Plan step 11H1: the shared VS Code server store, a volume of the test.
+        vscodeVolume: testVscodeVolume({ run, cli }, 'helperChannel'),
       },
       target,
     );
@@ -218,6 +220,8 @@ describe('the helper channel with the real Docker engine', () => {
       tag: helperTag,
       socketPath: socket,
       stateVolume: testStateVolume({ run, cli }, 'helperChannel'),
+      // Plan step 11H1: changed call, the shared VS Code server store (a volume of the test).
+      vscodeVolume: testVscodeVolume({ run, cli }, 'helperChannel'),
       containerName,
       label: channelLabelValue(script),
       scriptHash: bundleHash(script),

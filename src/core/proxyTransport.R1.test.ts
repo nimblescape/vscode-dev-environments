@@ -145,8 +145,14 @@ describe('proxiedHttpsTransport and httpsRequest, review round 1 (B)', () => {
       proxyRequests.length = 0;
       const controller = new AbortController();
       const request = proxiedHttpsTransport(async () => ({ httpsProxy })).request({ method: 'GET', url: 'https://ghcr.io/v2/' }, controller.signal);
+      // Review round 1 of 11H1 (A-L1): changed timing, the abort comes after the proxy settings were read (before: at
+      // once). The read of the settings now ends with the request's signal, so an abort before it ended no longer reaches
+      // the tunnel whose port this test checks. The expectation is attached first: the connection to the proxy may fail
+      // (nothing listens there) before the abort.
+      const rejected = expect(request).rejects.toThrow();
+      await new Promise((resolve) => setImmediate(resolve));
       controller.abort();
-      await expect(request).rejects.toThrow();
+      await rejected;
       if (httpsProxy.startsWith('http:')) expect(proxyRequests).toEqual([{ host: '127.0.0.1', port }]);
       else expect(proxyRequests).toEqual([]);
     }

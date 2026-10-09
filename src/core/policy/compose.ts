@@ -19,6 +19,7 @@ import {
   composeNetworkNames,
   composeVolumeNames,
   durationSeconds,
+  VSCODE_STORE_KEY,
   WORKSPACE_VOLUME_KEY,
   type ComposeModel,
 } from '../helper/composeModel';
@@ -998,7 +999,8 @@ function topLevelVolumeProblems(input: ComposeAccessInput): Problem[] {
   const names = new Map(composeVolumeNames(input.model, input.project).map((volume) => [volume.key, volume.name]));
   for (const [key, volume] of Object.entries(volumes)) {
     const at = `volume ${key}: `;
-    if (key === WORKSPACE_VOLUME_KEY) problems.push(unsupported(`volume key ${key} (Dev Environments uses it)`));
+    // Plan step 11H1: and the key of the shared VS Code server store of the up model.
+    if (key === WORKSPACE_VOLUME_KEY || key === VSCODE_STORE_KEY) problems.push(unsupported(`volume key ${key} (Dev Environments uses it)`));
     const name = names.get(key) ?? key;
     if (isOtherEnvironmentProjectName(name, input.project)) problems.push(guarded(`volume ${name} of another environment`));
     else problems.push(...volumeNameFindings(name, input));

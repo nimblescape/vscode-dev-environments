@@ -33,6 +33,7 @@ import {
   LABEL_PREFIX,
   SECRETS_FOLDER,
   TOKEN_FOLDER,
+  VSCODE_STORE_TARGET,
   WORKSPACES_ROOT,
 } from '../names';
 import { containerEnvironment } from '../helper/containerGit';
@@ -94,8 +95,11 @@ export function isHelperPath(file: string, repositoryFolder: string): boolean {
  */
 export const TOKEN_FOLDER_ALIAS = `/var${TOKEN_FOLDER}`;
 
-/** The folders of configFolderTarget. */
-const INTERNAL_FOLDERS: readonly string[] = [CONFIG_FOLDER, TOKEN_FOLDER, TOKEN_FOLDER_ALIAS];
+/**
+ * The folders of configFolderTarget. Plan step 11H1: and the mount point of the shared VS Code server store in the dev
+ * container (VSCODE_STORE_TARGET), so that no mount of a repository shadows the store or a server in it.
+ */
+const INTERNAL_FOLDERS: readonly string[] = [CONFIG_FOLDER, TOKEN_FOLDER, TOKEN_FOLDER_ALIAS, VSCODE_STORE_TARGET];
 
 /** Review round 14 (S14-1): the reason of configFolderMountItem. */
 export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal folder are not supported";
@@ -107,7 +111,9 @@ export const CONFIG_FOLDER_MOUNT_REASON = "mounts into the extension's internal 
  * configuration adds: a mount there would shadow the token or move it out of the memory of the container, for example
  * into a volume; `/run/devenvx` and the parent `/run` are not), also by its other name TOKEN_FOLDER_ALIAS
  * (`/var/run/devenv`, review of unit 15, T2; a clearer message only: the write of the token checks the mount that it
- * finds in the container, whatever path led there); `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
+ * finds in the container, whatever path led there); plan step 11H1: or VSCODE_STORE_TARGET or a path below it
+ * (`/opt/devenv/vscode`, the read-only mount of the shared VS Code server store, which only the override configuration
+ * adds; `/opt/devenv` and `/opt` are not); `undefined` otherwise. The extension writes the token and the Git configuration there, and its ownership fix gives
  * every file there the remote user (`find -xdev`, no paths left out): a mount there would shadow them, and would give
  * the files of the mounted folder (for example the data of another service, or the whole repository through an alias)
  * to the remote user. Other paths of WORKSPACES_ROOT outside the repository (for example a cache volume at

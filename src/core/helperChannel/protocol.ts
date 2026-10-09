@@ -1449,10 +1449,63 @@ export interface OpenParams {
   forceRebuild?: true;
   /** Select configuration (OpenOptions.configPath). */
   configPath?: string;
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"; decision of 2026-10-09, "11H: the shared VS
+   * Code server and the Session Monitor's daily run"): the VS Code of the window that sends the open (its
+   * `product.json`), only for a build of the Microsoft update service (vscodeServerOf of src/vscode). A dev container that
+   * the open creates gets the store read-only; the worker makes sure that the store has the server of this commit (a
+   * download under the lock of the version when it lacks it) and links it into the container before the open returns;
+   * the value says how (OpenValue.vscodeServer). Never a URL: the host of the download is fixed in the worker. Missing:
+   * the open runs without the shared server.
+   */
+  vscodeServer?: VscodeServerRef;
 }
 
-/** What the window needs to connect (decision A1), or the refusal of the pipeline; `imageListSent`: the list was given. */
-export type OpenValue = ({ opened: OpenedEnvironment } | { refused: FlowRefusal }) & { imageListSent?: true };
+/** Plan step 11H1: the qualities of VS Code whose server the store holds (`quality` of `product.json`). */
+export const VSCODE_QUALITIES = ['stable', 'insider'] as const;
+export type VscodeQuality = (typeof VSCODE_QUALITIES)[number];
+
+/** Plan step 11H1: a VS Code server: the commit of the build (40 lower-case hexadecimal characters) and its quality. */
+export interface VscodeServerRef {
+  commit: string;
+  quality: VscodeQuality;
+}
+
+/** Plan step 11H1: the platforms whose server the store holds (`server-<platform>` of the update service; glibc). */
+export type VscodePlatform = 'linux-x64' | 'linux-arm64';
+
+/**
+ * Plan step 11H1: what the link of the shared VS Code server did in the dev container of an open: `linked` (a new link),
+ * `present` (the container has that server already), `missing` (the store lacks the server: its download failed),
+ * `skipped` (anything else: a container without the store, a container of another platform than the engine or of musl, a
+ * planted link, a failure; the open's log says why; review round 1 of 11H1, A-L4: another platform is `skipped`). In each case but `linked` and `present`, the
+ * Dev Containers extension installs the server into the container, as before.
+ */
+export interface VscodeServerLink {
+  outcome: 'linked' | 'present' | 'missing' | 'skipped';
+}
+
+/** Plan step 11H1: the check of a VscodeServerLink (the extension). */
+export function parseVscodeServerLink(value: unknown): VscodeServerLink | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['outcome'])) return undefined;
+  const { outcome } = value;
+  return outcome === 'linked' || outcome === 'present' || outcome === 'missing' || outcome === 'skipped' ? { outcome } : undefined;
+}
+
+/** Plan step 11H1: the strict check of a VscodeServerRef (both sides): exactly its two keys, each of its shape. */
+export function parseVscodeServerRef(value: unknown): VscodeServerRef | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['commit', 'quality'])) return undefined;
+  const { commit, quality } = value;
+  if (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)) return undefined;
+  if (typeof quality !== 'string' || !(VSCODE_QUALITIES as readonly string[]).includes(quality)) return undefined;
+  return { commit, quality: quality as VscodeQuality };
+}
+
+/**
+ * What the window needs to connect (decision A1), or the refusal of the pipeline; `imageListSent`: the list was given.
+ * Plan step 11H1: an open with OpenParams.vscodeServer also says what the link of the server did (`vscodeServer`).
+ */
+export type OpenValue = ({ opened: OpenedEnvironment; vscodeServer?: VscodeServerLink } | { refused: FlowRefusal }) & { imageListSent?: true };
 
 export interface OpenedEnvironment {
   environmentId: string;
@@ -1496,7 +1549,7 @@ function parseOpenSettings(value: unknown): OpenSettings | undefined {
 export function parseOpenParams(value: unknown): OpenParams | undefined {
   if (
     !isRecord(value) ||
-    !hasOnlyKeys(value, ['dockerHost', 'owner', 'monitorSource', 'settings', 'images', 'repository'], ['repositories', 'environmentId', 'target', 'forceRebuild', 'configPath'])
+    !hasOnlyKeys(value, ['dockerHost', 'owner', 'monitorSource', 'settings', 'images', 'repository'], ['repositories', 'environmentId', 'target', 'forceRebuild', 'configPath', 'vscodeServer'])
   ) {
     return undefined;
   }
@@ -1528,6 +1581,12 @@ export function parseOpenParams(value: unknown): OpenParams | undefined {
   }
   if (forceRebuild !== undefined && forceRebuild !== true) return undefined;
   if (configPath !== undefined && !plainOpenText(configPath, MAX_CONFIGURATION_PATH_LENGTH)) return undefined;
+  // Plan step 11H1: exactly a VscodeServerRef when it is given.
+  let vscodeServer: VscodeServerRef | undefined;
+  if (value.vscodeServer !== undefined) {
+    vscodeServer = parseVscodeServerRef(value.vscodeServer);
+    if (vscodeServer === undefined) return undefined;
+  }
   return {
     ...operationTarget,
     monitorSource,
@@ -1539,6 +1598,7 @@ export function parseOpenParams(value: unknown): OpenParams | undefined {
     ...(checkedTarget !== undefined ? { target: checkedTarget } : {}),
     ...(forceRebuild === true ? { forceRebuild } : {}),
     ...(configPath !== undefined ? { configPath } : {}),
+    ...(vscodeServer !== undefined ? { vscodeServer } : {}),
   };
 }
 
@@ -1552,9 +1612,15 @@ export function parseOpenValue(value: unknown): OpenValue | undefined {
     const refused = parseFlowRefusal(value.refused);
     return refused === undefined ? undefined : { refused, ...sent };
   }
-  if (!hasOnlyKeys(value, ['opened'], ['imageListSent']) || !isRecord(value.opened) || !hasOnlyKeys(value.opened, ['environmentId', 'containerName', 'remoteWorkspaceFolder'])) return undefined;
+  if (!hasOnlyKeys(value, ['opened'], ['imageListSent', 'vscodeServer']) || !isRecord(value.opened) || !hasOnlyKeys(value.opened, ['environmentId', 'containerName', 'remoteWorkspaceFolder'])) return undefined;
   const { environmentId, containerName, remoteWorkspaceFolder } = value.opened;
   if (!isStorageId(environmentId) || typeof containerName !== 'string' || !DOCKER_NAME.test(containerName)) return undefined;
   if (!plainOpenText(remoteWorkspaceFolder, MAX_REMOTE_FOLDER_LENGTH) || !remoteWorkspaceFolder.startsWith('/')) return undefined;
-  return { opened: { environmentId, containerName, remoteWorkspaceFolder }, ...sent };
+  // Plan step 11H1: the link of the shared VS Code server, when the open carried a server.
+  let link: VscodeServerLink | undefined;
+  if (value.vscodeServer !== undefined) {
+    link = parseVscodeServerLink(value.vscodeServer);
+    if (link === undefined) return undefined;
+  }
+  return { opened: { environmentId, containerName, remoteWorkspaceFolder }, ...(link !== undefined ? { vscodeServer: link } : {}), ...sent };
 }

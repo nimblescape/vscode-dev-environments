@@ -24,6 +24,7 @@ import {
   LABEL_CONFIG_PATH,
   LABEL_HOST_ACCESS,
   TOKEN_TMPFS,
+  VSCODE_STORE_TARGET,
   WORKSPACES_ROOT,
   containerHostname,
   isConfigPathLabelValue,
@@ -41,6 +42,7 @@ import {
 } from '../policy';
 import { MAX_ANALYSIS_JOB_CHARACTERS, MAX_COMPOSE_MOUNTS, MAX_COMPOSE_SERVICES, MAX_COMPOSE_TOP_LEVEL_ENTRIES } from './analysisLimits';
 import {
+  VSCODE_STORE_KEY,
   WORKSPACE_VOLUME_KEY,
   composeNetworkNames,
   composeVolumeNames,
@@ -55,6 +57,7 @@ export {
   MIN_COMPOSE_VERSION,
   MIN_SUBPATH_API_VERSION,
   MIN_SUBPATH_ENGINE,
+  VSCODE_STORE_KEY,
   WORKSPACE_VOLUME_KEY,
   composeNetworkNames,
   composeVolumeNames,
@@ -492,6 +495,12 @@ export interface ComposeRewriteParams {
    * isConfigPathLabelValue takes it (D5-2). Only the up model gets it.
    */
   configPath?: string;
+  /**
+   * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the volume of the shared VS Code server store,
+   * mounted read-only into the dev service at VSCODE_STORE_TARGET (an external top-level volume under VSCODE_STORE_KEY).
+   * Only the up model gets it; without it, no store.
+   */
+  vscodeStoreVolume?: string;
 }
 
 /** A change of the rewrite, for the log: what, and why. */
@@ -789,9 +798,10 @@ function finish(model: ComposeModel): ComposeModel {
  * - the dev service: the environment image (`image`, no `build`, `pull_policy: never`), the name of the environment
  *   (`container_name`), the label nimblescape.devenv.container-version, the workspace volume at WORKSPACES_ROOT (the
  *   templates' bind mount there is dropped), the host name of the repository (containerHostname) unless the service
- *   decides it (serviceDecidesHostname), and (unit 15) the tmpfs of the token, TOKEN_TMPFS, added to its `tmpfs`;
- * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY) and the
- *   volumes of `mountVolumeSources`;
+ *   decides it (serviceDecidesHostname), and (unit 15) the tmpfs of the token, TOKEN_TMPFS, added to its `tmpfs`; plan
+ *   step 11H1: with `vscodeStoreVolume`, the store read-only at VSCODE_STORE_TARGET;
+ * - top-level `volumes`: each external, with its Docker name, plus the workspace volume (WORKSPACE_VOLUME_KEY), the
+ *   volumes of `mountVolumeSources`, and (plan step 11H1) the store (VSCODE_STORE_KEY);
  * - the label nimblescape.devenv.host-access on every service: `checked`, or with the host access checks off
  *   (`hostAccessChecks`) `unrestricted` (review round 2, D2-2); with the checks off also the published ports as the
  *   model has them, and the mounts that only the class `computer` refuses unchanged;
@@ -815,6 +825,17 @@ export function composeUpModel(
   // Unit 15: the tmpfs of the token (TOKEN_FOLDER), only in the dev container. The check refused every entry of the
   // repository there (configFolderTarget), so this one is the only one.
   dev.tmpfs = [...tmpfsEntries(dev.tmpfs), TOKEN_TMPFS];
+  // Plan step 11H1: the shared VS Code server store, read-only, only in the dev container. The check refused every mount
+  // of the repository at or below its target (configFolderTarget) and the key (topLevelVolumeProblems), so this one is the
+  // only one. Review round 1 of 11H1 (A-M1): `nocopy`, so that Docker never copies the image's VSCODE_STORE_TARGET into
+  // an empty store (as vscodeStoreMount for a single container).
+  if (p.vscodeStoreVolume !== undefined) {
+    dev.volumes = [
+      ...(Array.isArray(dev.volumes) ? dev.volumes : []),
+      { type: 'volume', source: VSCODE_STORE_KEY, target: VSCODE_STORE_TARGET, read_only: true, volume: { nocopy: true } },
+    ];
+    result.volumes = { ...(result.volumes ?? {}), [VSCODE_STORE_KEY]: { name: p.vscodeStoreVolume, external: true } };
+  }
   // Review round 8 (P8-2): the folders of the repository that the pipeline creates before `up`.
   // Review round 9 (D9-1): the paths of the repository that the other services mount (serviceRepositoryPath).
   return {

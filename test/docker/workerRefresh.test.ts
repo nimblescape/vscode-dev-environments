@@ -21,7 +21,7 @@ import { LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
 import type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment } from '../../src/core/pipeline/refreshStates';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { dockerTestContext, testHelperImage, testStateVolume } from './harness';
+import { dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -92,6 +92,8 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
             socketPath: async () => helperDockerSocket(env, process.platform, target.endpoint),
             // Plan step 5, PR B: the lock files in a volume of the test, never the one of the Session Monitor.
             stateVolume: testStateVolume({ run, cli }, 'workerRefresh'),
+            // Plan step 11H1: the shared VS Code server store, a volume of the test.
+            vscodeVolume: testVscodeVolume({ run, cli }, 'workerRefresh'),
           },
           target,
         ),

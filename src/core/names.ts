@@ -221,6 +221,30 @@ export const GH_VOLUME_FOLDER = `${CONFIG_FOLDER}/gh`;
 /** gh's config.yml in the volume; GH_CONFIG_FOLDER/config.yml is a link to it. */
 export const GH_VOLUME_CONFIG_FILE = `${GH_VOLUME_FOLDER}/config.yml`;
 
+/**
+ * Plan step 11H1 (decisions of 2026-10-03, "Shared VS Code server store" and "The VS Code caches are worker operations"):
+ * the volume of the shared VS Code servers of an engine, one per engine. Only the worker writes it (mounted read-write at
+ * VSCODE_STORE_DIR); a dev container that an open creates gets it read-only at VSCODE_STORE_TARGET. The host access
+ * policy protects the name (a repository never mounts it) and reserves the target. It is never an environment's volume:
+ * never created with the labels of an environment, never recorded, never offered at Delete.
+ */
+export const VSCODE_STORE_VOLUME = 'devenv-vscode';
+/** Plan step 11H1: the mount point of the store in the worker (read-write). */
+export const VSCODE_STORE_DIR = '/vscode';
+/** Plan step 11H1: the mount point of the store in a dev container (read-only); no configuration may mount at or below it. */
+export const VSCODE_STORE_TARGET = '/opt/devenv/vscode';
+/**
+ * Plan step 11H1: the `--mount` value of the store in the override configuration of a single container (and the volume
+ * mount of the dev service of Docker Compose): the store `volume` read-only at VSCODE_STORE_TARGET. The host access
+ * policy exempts exactly this text in the override configuration (runArgsFindings). Review round 1 of 11H1 (A-M1):
+ * `volume-nocopy`, so that Docker never copies the image's VSCODE_STORE_TARGET into an empty store (Docker fills an
+ * empty volume from the image at container create unless `nocopy`, read-only or not; a repository's image could plant a
+ * server there that every dev container of the engine would then link).
+ */
+export function vscodeStoreMount(volume: string): string {
+  return `type=volume,source=${volume},target=${VSCODE_STORE_TARGET},readonly,volume-nocopy`;
+}
+
 export function newEnvironmentId(): string {
   return crypto.randomUUID();
 }
