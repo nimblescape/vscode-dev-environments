@@ -26,9 +26,11 @@ import { VSCODE_STORE_TARGET } from '../names';
  * Then it creates the link `bin/<commit>` → the server in the store (review round 1 of 11H1: working in each checked
  * folder, entered after its check, with `ln -sn`, so nothing is written through a link planted after a check). Its output is one line: `linked`, `present`,
  * `skipped: <why>` or `refused: <why>`; it exits 0 for each of them, and non-zero only when a command failed. Works with
- * GNU and BusyBox tools.
+ * GNU and BusyBox tools. Review round 2 of 11H1 (reviewers A and B): it unsets CDPATH first (the environment of the image
+ * may set it), so `cd` enters the folder relative to the working folder, never one of CDPATH, and prints nothing.
  */
 export const VSCODE_SERVER_LINK_SCRIPT = `set -u
+unset CDPATH
 commit="$1"
 quality="$2"
 stored="$3"

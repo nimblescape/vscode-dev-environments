@@ -257,6 +257,9 @@ async function fetchServer(deps: VscodeStoreDeps, server: VscodeServerRef, platf
       if (!stat.isDirectory()) throw new FetchError(`${parent} is not a folder`);
       if ((stat.mode & 0o777) !== 0o755) await fs.promises.chmod(parent, 0o755);
     }
+    // Review round 2 of 11H1: a folder of the commit that is ready is never moved away or removed (a dev container may run
+    // the server from it): it stays, and this download goes with the temporary folder.
+    if (await isServerReady(folder)) return;
     // A folder of the commit that is not ready (no download of the worker leaves one; it is not used anyway) goes first.
     const old = await fs.promises.lstat(folder).catch(() => undefined);
     if (old !== undefined) await fs.promises.rename(folder, path.posix.join(own, 'old'));
