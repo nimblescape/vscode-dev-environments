@@ -12,7 +12,7 @@
 // PR B1: the operations `batch`, `batchStep` and `batchChunk` (the batch helper relayed for the extension) are gone.
 // Pure functions and constants. No `vscode`.
 import { loaderCommand } from '../loader/pipeLoader';
-import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
+import { BATCH_SOCKET_FOLDER, HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
 import { isBatchStepKind, type BatchStepKind } from '../helper/batchStepKinds';
 import type { EngineAttachedSpec } from '../worker/dockerEngine';
 import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
@@ -30,12 +30,9 @@ export const BATCH_ENTRY = 'startBatchHelper';
 export const BATCH_HOLD_LIMIT_MS = LOCK_HOLD_LIMIT_MS;
 /** The longest input (JSON of the parameters of a step) that one step of a session can carry. */
 export const MAX_BATCH_INPUT_CHARACTERS = 3 * 1024 * 1024;
-/**
- * Q2 of 2026-10-01: the socket is mounted in a folder that only root can enter (the image creates it 0700; the helper
- * checks it), so the Git user of the helper cannot reach it. The helper links /var/run/docker.sock to it for its root
- * steps (the default of the Docker CLI and the Dev Container CLI; DOCKER_HOST is never set).
- */
-export const BATCH_SOCKET_FOLDER = '/run/devenv-docker';
+// Follow-up of plan step 11I (the links of the owner): BATCH_SOCKET_FOLDER moved to ../names (the host access policy names
+// it too).
+export { BATCH_SOCKET_FOLDER };
 export const BATCH_DOCKER_SOCKET = `${BATCH_SOCKET_FOLDER}/docker.sock`;
 /** Q2: the unprivileged user of the Git steps (resources/helper/Dockerfile: devenv-git, no home, no login). */
 export const BATCH_GIT_UID = 52741;

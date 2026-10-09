@@ -12,9 +12,10 @@
 //                namespaces of the computer, ports on other addresses than localhost, volumes of other programs.
 // - protected:   refused whatever the switch says: account separation (volumes, networks, and images of other
 //                environments, the cache volume of the workspace helper), the protected paths below (the internal
-//                folder, the token folder /run/devenv and /var/run/devenv, the Docker socket, the kernel folders), the
-//                identity of the owner account (the variables of container-only Git and of the GitHub CLI),
-//                `initializeCommand`, and items whose class is not clear.
+//                folder, the token folder /run/devenv and /var/run/devenv, the Docker socket and the folders of the batch
+//                helper with the socket and the token, the kernel folders), the identity of the owner account (the
+//                variables of container-only Git and of the GitHub CLI), `initializeCommand`, and items whose class is
+//                not clear.
 // - unsupported: options that the policy does not know or does not support (unknown flags and keys, texts that cannot
 //                be checked, a Dockerfile longer than MAX_DOCKERFILE_LENGTH); refused whatever the switch says.
 // Where the rules are applied: ./flags.ts (the flags of `docker run` and `docker build`), ./single.ts (a single
@@ -22,6 +23,7 @@
 // ./images.ts (image references), ./rewrites.ts (what the policy changes in the final configuration). Pure, no I/O.
 import * as path from 'path';
 import {
+  BATCH_SOCKET_FOLDER,
   CONFIG_FOLDER,
   CONTAINER_CONFIG_UNKNOWN_LABEL,
   CONTAINER_VERSION_LABEL,
@@ -29,6 +31,7 @@ import {
   HELPER_DOCKER_SOCKET,
   HOST_ACCESS_UNRESTRICTED_LABEL,
   LABEL_PREFIX,
+  SECRETS_FOLDER,
   TOKEN_FOLDER,
   WORKSPACES_ROOT,
 } from '../names';
@@ -50,17 +53,26 @@ function overlaps(file: string, folder: string): boolean {
 export const KERNEL_FOLDERS: readonly string[] = ['/proc', '/sys', '/dev'];
 
 /**
+ * Follow-up of plan step 11I (the links of the owner): the folders of the batch helper that only root can enter, the
+ * folder of the Docker socket (BATCH_SOCKET_FOLDER) and the tmpfs of the token of a step (SECRETS_FOLDER), also by the
+ * link `/var/run` → `/run` of the helper image (as TOKEN_FOLDER_ALIAS in the dev container): a path there is checked as
+ * written, without its links.
+ */
+export const BATCH_HELPER_FOLDERS: readonly string[] = [BATCH_SOCKET_FOLDER, SECRETS_FOLDER, `/var${BATCH_SOCKET_FOLDER}`, `/var${SECRETS_FOLDER}`];
+
+/**
  * A path of the workspace helper that no build context, Dockerfile, or bind mount may name, whatever the switch of the
  * host access checks says (HostAccessClass `protected`): the root `/`; the cache volume that all environments share
  * (HELPER_CACHE_FOLDER); the internal folder (CONFIG_FOLDER: the Git and Docker configuration of the dev container);
- * the Docker socket; the folders of the kernel (KERNEL_FOLDERS, review round 3, S3-1); and every path below
- * WORKSPACES_ROOT that is not in the repository folder (the internal folder, other folders of the volume). A folder
- * that contains one of them counts too (for example `/var` with the socket). `file` is absolute.
+ * the Docker socket, and the folders of the batch helper with the socket and the token (BATCH_HELPER_FOLDERS); the
+ * folders of the kernel (KERNEL_FOLDERS, review round 3, S3-1); and every path below WORKSPACES_ROOT that is not in the
+ * repository folder (the internal folder, other folders of the volume). A folder that contains one of them counts too
+ * (for example `/var` with the socket, `/run` with the folders of the batch helper). `file` is absolute.
  */
 export function isHelperPath(file: string, repositoryFolder: string): boolean {
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
   if (normal === '/') return true;
-  if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET, ...KERNEL_FOLDERS].some((helperPath) => overlaps(normal, helperPath))) return true;
+  if ([HELPER_CACHE_FOLDER, CONFIG_FOLDER, HELPER_DOCKER_SOCKET, ...BATCH_HELPER_FOLDERS, ...KERNEL_FOLDERS].some((helperPath) => overlaps(normal, helperPath))) return true;
   const inRepository = normal === repositoryFolder || normal.startsWith(`${repositoryFolder}/`);
   return !inRepository && overlaps(normal, WORKSPACES_ROOT);
 }

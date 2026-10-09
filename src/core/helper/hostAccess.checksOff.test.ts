@@ -197,6 +197,12 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['the root as build context', input({ build: { dockerfile: 'Dockerfile', context: '/' } }, HELPER_PATHS), 'build context / (a folder of the workspace helper)', 'protected'],
   ['the older property context', input({ dockerFile: 'Dockerfile', context: '/workspaces' }, HELPER_PATHS), 'build context /workspaces (a folder of the workspace helper)', 'protected'],
   ['a Dockerfile in the cache volume', input({ build: { dockerfile: '/devenv-cache/Dockerfile' } }, HELPER_PATHS), 'Dockerfile /devenv-cache/Dockerfile (a folder of the workspace helper)', 'protected'],
+  // Follow-up of plan step 11I (the links of the owner): the folders of the batch helper with the Docker socket and the
+  // token of a step, also by /var/run.
+  ['the folder of the Docker socket of the batch helper as build context', input({ build: { dockerfile: 'Dockerfile', context: '/run/devenv-docker' } }, HELPER_PATHS), 'build context /run/devenv-docker (a folder of the workspace helper)', 'protected'],
+  ['a Dockerfile in the token tmpfs of the batch helper', input({ build: { dockerfile: '/run/devenv-secrets/github-token' } }, HELPER_PATHS), 'Dockerfile /run/devenv-secrets/github-token (a folder of the workspace helper)', 'protected'],
+  ['the folder of the Docker socket by /var/run as build context', input({ build: { dockerfile: 'Dockerfile', context: '/var/run/devenv-docker' } }, HELPER_PATHS), 'build context /var/run/devenv-docker (a folder of the workspace helper)', 'protected'],
+  ['the token tmpfs by /var/run as build context', input({ build: { dockerfile: 'Dockerfile', context: '/var/run/devenv-secrets' } }, HELPER_PATHS), 'build context /var/run/devenv-secrets (a folder of the workspace helper)', 'protected'],
   // U2: a Dockerfile that is a link out of the repository (for example to the token) or could not be read.
   ['a Dockerfile that is a link out of the repository', input({ build: { dockerfile: 'Dockerfile' } }, { ...HELPER_PATHS, dockerfileUnreadable: 'Dockerfile' }), 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)', 'protected'],
   // U1: a size limit, not a check of the content.

@@ -1641,3 +1641,53 @@ describe('review round 3 of PR #114 (A3-M1): the fix of a resumed clone', () => 
     for (const line of finds) expect(line).toMatch(/ -execdir chown -h -- "\$fix_owner" \{\} \+$/);
   });
 });
+
+// Follow-up of plan step 11I (the links of the owner): the fixes of the batch helper give no owner to a file with a second
+// hard link (its other name may be a file of another user elsewhere in the volume). A fake `chown` on PATH records the
+// inode of each path that it gets (with `-execdir`, relative to the folder that find has open). The files belong to the
+// test user, so all of them lack the user 4321: the branch without paths of services gives each one the owner.
+const gnuFindForLinks = process.platform === 'linux' && /GNU findutils/.test(spawnSync('find', ['--version'], { encoding: 'utf8' }).stdout ?? '');
+describe.runIf(gnuFindForLinks)('the ownership fixes of the batch helper and hard links (follow-up of plan step 11I)', () => {
+  it.each([
+    ['CONFIG_OWNERSHIP_FIX_SCRIPT', (folder: string) => configOwnershipFixCommand(folder, '4321', '4321')],
+    ['NUMERIC_OWNERSHIP_FIX_SCRIPT', (folder: string) => repositoryOwnershipFixCommand(folder, '4321', '4321')],
+    ['RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT', (folder: string) => repositoryOwnershipFixCommand(folder, '4321', '4321', [])],
+  ] as const)('%s gives no owner to a file that has a second link', (_name, command) => {
+    const base = tempDir();
+    const folder = path.join(base, 'folder');
+    const elsewhere = path.join(base, 'elsewhere');
+    fs.mkdirSync(path.join(folder, 'sub'), { recursive: true });
+    fs.mkdirSync(elsewhere);
+    fs.writeFileSync(path.join(folder, 'single'), 'x');
+    fs.writeFileSync(path.join(folder, 'sub', 'deep'), 'x');
+    fs.writeFileSync(path.join(elsewhere, 'data'), 'x');
+    fs.linkSync(path.join(elsewhere, 'data'), path.join(folder, 'sub', 'linked'));
+    const bin = path.join(base, 'bin');
+    const log = path.join(base, 'chowned');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(log, '');
+    fs.writeFileSync(
+      path.join(bin, 'chown'),
+      ['#!/bin/sh', "owner=''", 'for arg do', '  case "$arg" in', '    -h|--) ;;', '    *) if [ -z "$owner" ]; then owner=$arg; else stat -c %i -- "$arg" >> "$DEVENV_TEST_LOG"; fi ;;', '  esac', 'done', ''].join('\n'),
+      { mode: 0o755 },
+    );
+    const [file, ...args] = command(folder);
+    const result = spawnSync(file, args, { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/local/bin:/usr/bin:/bin`, DEVENV_TEST_LOG: log } });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const chowned = fs.readFileSync(log, 'utf8').split('\n').filter((line) => line !== '').map(Number);
+    const ino = (file: string) => fs.lstatSync(file).ino;
+    expect(chowned).not.toContain(ino(path.join(elsewhere, 'data')));
+    for (const entry of [folder, path.join(folder, 'sub'), path.join(folder, 'single'), path.join(folder, 'sub', 'deep')]) expect(chowned, entry).toContain(ino(entry));
+  });
+
+  it('has the test of the links in every find of the fixes of the batch helper, and not in the fix of the dev container', () => {
+    for (const script of [CONFIG_OWNERSHIP_FIX_SCRIPT, NUMERIC_OWNERSHIP_FIX_SCRIPT, RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT]) {
+      const finds = script.split('\n').filter((line) => /^\s*find "\$folder"/.test(line));
+      expect(finds).toHaveLength(3);
+      for (const line of finds) expect(line).toMatch(/ \\\( -type d -o -links 1 \\\) -exec(dir)? chown -h /);
+    }
+    // The fix in the dev container keeps its test: a BusyBox find may lack -links.
+    expect(OWNERSHIP_FIX_SCRIPT).not.toContain('-links');
+  });
+});

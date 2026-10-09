@@ -40,7 +40,7 @@ import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './c
 import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
-import { composeAccessReport, type ComposeAccessInput } from '../policy';
+import { BATCH_HELPER_FOLDERS, composeAccessReport, type ComposeAccessInput } from '../policy';
 import { WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
 
 /** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
@@ -89,7 +89,7 @@ function runSh(command: string[], input = ''): { status: number | null; stdout: 
 const SHELL_SCRIPTS: Array<[string, string]> = [
   ['CLONE_SCRIPT', CLONE_SCRIPT],
   // 2026-10-01: the Switch branch command was dropped (user decision). SWITCH_BRANCH_SCRIPT is gone.
-  ['GIT_FILES_SCRIPT', GIT_FILES_SCRIPT],
+  // Follow-up of plan step 11I (the links of the owner): GIT_FILES_SCRIPT is a Node.js script now; its suite below runs it.
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
   // Follow-up of PR #121: BUILD_SCRIPT is gone (every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule).
@@ -113,7 +113,9 @@ describe('shell scripts', () => {
     expect(cloneCommand('acme/api', 'api')).toEqual(['sh', '-c', CLONE_SCRIPT, 'sh', 'acme/api', 'api', '']);
     // 2026-10-01: the Switch branch command was dropped (user decision). switchBranchCommand is gone.
     // unit 15: no login argument (the sign-in of the GitHub CLI is written into the memory of the dev container).
-    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', 'Me', 'me@x', 'helper']);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, a Node.js script (was `sh -c … sh`); the
+    // values are still arguments only.
+    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual(['node', '-e', GIT_FILES_SCRIPT, 'api', 'Me', 'me@x', 'helper']);
     expect(upCommand(OVERRIDE_CONFIG_PATH, ['up', '--x'])).toEqual(['sh', '-c', UP_SCRIPT, 'sh', OVERRIDE_CONFIG_PATH, 'up', '--x']);
     // Follow-up of PR #121: buildCommand is gone (every build runs through writeAndRunCommand, whose test names it).
   });
@@ -641,6 +643,27 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.dockerfiles).toEqual({});
   });
 
+  it.each(BATCH_HELPER_FOLDERS)('does not read a Dockerfile in %s, a folder of the batch helper (follow-up of plan step 11I)', (folder) => {
+    // The test cannot write the folder of the helper: in the list of the script, a temporary folder with a Dockerfile
+    // stands for it. The script as it is reads that Dockerfile (outside the repository, no path of the helper).
+    const { dir, repo, env } = setup();
+    const standIn = path.join(dir, 'helper-folder');
+    write(path.join(standIn, 'Dockerfile'), 'FROM secret\n');
+    const script = COMPOSE_MODEL_SCRIPT.split(`'${folder}'`).join(JSON.stringify(standIn));
+    expect(script).not.toBe(COMPOSE_MODEL_SCRIPT);
+    const model = { name: PROJECT, services: { app: { build: { context: standIn } } } };
+    const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+    const dockerfiles = (text: string): unknown => {
+      const result = spawnSync(process.execPath, ['-e', text, ...command.slice(3)], { encoding: 'utf8', env: { ...env, FAKE_MODEL: JSON.stringify(model) } });
+      expect(result.status, result.stderr).toBe(0);
+      const parsed = parseComposeModelOutput(result.stdout.trim());
+      if ('error' in parsed) throw new Error(parsed.error);
+      return parsed.dockerfiles;
+    };
+    expect(dockerfiles(COMPOSE_MODEL_SCRIPT)).toEqual({ app: 'FROM secret\n' });
+    expect(dockerfiles(script)).toEqual({});
+  });
+
   it('lists the build contexts and Dockerfiles that are missing in the repository, not links that lead out or nowhere (review round 3, P3-1)', () => {
     const { dir, repo, env } = setup();
     fs.mkdirSync(path.join(repo, 'ctx'));
@@ -1100,40 +1123,204 @@ describe('LIST_CONFIGS_SCRIPT', () => {
   });
 });
 
-describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
-  // The script needs Linux (GNU stat and mv). Fake tools on PATH stand in for them; Git is real.
+// Follow-up of plan step 11I (the links of the owner): the script needs Linux (/proc/self/fd, as in the helper), so the suite
+// runs on Linux only (before, fakes of GNU stat and mv let it run elsewhere too).
+describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with fake tools', () => {
+  // The script needs Linux (/proc/self/fd, GNU rm). Git is real. Fake tools stand in for what a test cannot do as a user:
+  // a module that Node loads before the script (`--require`) records the owner changes of the script (fchown, lchown)
+  // instead of making them, by the inode they reach, and gives the repository folder the owner 1000:1001. A fake `git` on
+  // PATH records the file that Git edits and runs the real Git; for the races, it first plays the owner of the repository
+  // once (`race`, a shell command with that file as $1).
   // unit 15: the script gets no token any more; the token and the sign-in of the GitHub CLI go into the memory of the
   // dev container (TOKEN_WRITE_SCRIPT, containerToken.test.ts).
+  // Follow-up of plan step 11I (the links of the owner): GIT_FILES_SCRIPT is a Node.js script (was sh, with a fake stat,
+  // chown and mv).
+  const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
 
-  function setup(): { ws: string; bin: string; log: string } {
+  interface GitFilesEnv {
+    dir: string;
+    ws: string;
+    bin: string;
+    log: string;
+    gitFiles: string;
+    preload: string;
+  }
+
+  function setup(): GitFilesEnv {
     const dir = tempDir();
     const ws = path.join(dir, 'workspaces');
     const bin = path.join(dir, 'bin');
     const log = path.join(dir, 'log');
+    const gitFiles = path.join(dir, 'git-files');
+    const preload = path.join(dir, 'preload.js');
     fs.mkdirSync(path.join(ws, 'api'), { recursive: true });
-    const tool = (name: string, body: string) => {
-      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
-      fs.chmodSync(path.join(bin, name), 0o755);
-    };
-    tool('stat', 'echo 1000:1001');
-    tool('chown', `echo "chown $*" >> '${log}'`);
-    tool('mv', 'if [ "$1" = -fT ]; then shift; exec /bin/mv -f "$1" "$2"; fi\nexec /bin/mv "$@"');
-    return { ws, bin, log };
+    fs.writeFileSync(log, '');
+    fs.writeFileSync(gitFiles, '');
+    write(
+      preload,
+      [
+        "'use strict';",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        'const { DEVENV_TEST_LOG: log, DEVENV_TEST_REPO: repo, DEVENV_TEST_MKDIR_RACE: race } = process.env;',
+        "const record = (stat, uid, gid) => fs.appendFileSync(log, stat.ino + ' ' + uid + ':' + gid + '\\n');",
+        'fs.fchownSync = (fd, uid, gid) => record(fs.fstatSync(fd), uid, gid);',
+        'fs.lchownSync = (file, uid, gid) => record(fs.lstatSync(file), uid, gid);',
+        'fs.chownSync = (file, uid, gid) => record(fs.statSync(file), uid, gid);',
+        "for (const name of ['lstatSync', 'statSync']) {",
+        '  const real = fs[name];',
+        '  fs[name] = (file, ...rest) => {',
+        '    const stat = real.call(fs, file, ...rest);',
+        '    return file === repo && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
+        '  };',
+        '}',
+        // The race of the owner between the creation of a folder and its mode: right after the script made the folder
+        // `entry`, the owner renames it away and puts a link to `target` in its place.
+        'if (race) {',
+        '  const [entry, target] = JSON.parse(race);',
+        '  const mkdirSync = fs.mkdirSync;',
+        '  fs.mkdirSync = (file, ...rest) => {',
+        '    const result = mkdirSync.call(fs, file, ...rest);',
+        '    if (path.basename(String(file)) === entry) {',
+        "      fs.renameSync(file, file + '.moved');",
+        '      fs.symlinkSync(target, file);',
+        '    }',
+        '    return result;',
+        '  };',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    write(
+      path.join(bin, 'git'),
+      [
+        '#!/bin/sh',
+        "file=''",
+        "previous=''",
+        'for arg do',
+        '  if [ "$previous" = --file ]; then file=$arg; fi',
+        '  previous=$arg',
+        'done',
+        'printf \'%s %s\\n\' "$(stat -c %a "$(dirname "$file")")" "$file" >> "$DEVENV_TEST_GIT_FILES"',
+        'if [ -n "${DEVENV_TEST_RACE-}" ] && [ ! -e "$DEVENV_TEST_GIT_FILES.raced" ]; then',
+        '  : > "$DEVENV_TEST_GIT_FILES.raced"',
+        '  sh -c "$DEVENV_TEST_RACE" sh "$file"',
+        'fi',
+        'case " $* " in *" ${DEVENV_TEST_GIT_FAIL-none} "*) exit 1 ;; esac',
+        'exec "$DEVENV_TEST_REAL_GIT" "$@"',
+        '',
+      ].join('\n'),
+    );
+    fs.chmodSync(path.join(bin, 'git'), 0o755);
+    return { dir, ws, bin, log, gitFiles, preload };
   }
 
-  function run(env: { ws: string; bin: string }, folder = 'api') {
+  interface RunOptions {
+    folder?: string;
+    /** A shell command that the fake git runs once, at its first call, as the owner of the repository. */
+    race?: string;
+    /** [entry, target]: the folder `entry` is replaced by a link to `target` right after the script created it. */
+    mkdirRace?: [string, string];
+    /** The fake git fails when its arguments contain this one. */
+    gitFails?: string;
+  }
+
+  function run(env: GitFilesEnv, options: RunOptions = {}) {
     const script = GIT_FILES_SCRIPT.split('/workspaces').join(env.ws);
-    const command = gitFilesCommand(folder, { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
-    const result = spawnSync('sh', ['-c', script, ...command.slice(3)], {
+    const command = gitFilesCommand(options.folder ?? 'api', { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
+    expect(command.slice(0, 3)).toEqual(['node', '-e', GIT_FILES_SCRIPT]);
+    const result = spawnSync(process.execPath, ['--require', env.preload, '-e', script, ...command.slice(3)], {
       encoding: 'utf8',
       input: '',
-      env: { ...process.env, PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`, GIT_CONFIG_NOSYSTEM: '1' },
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`,
+        GIT_CONFIG_NOSYSTEM: '1',
+        DEVENV_TEST_LOG: env.log,
+        DEVENV_TEST_REPO: path.join(env.ws, options.folder ?? 'api'),
+        DEVENV_TEST_GIT_FILES: env.gitFiles,
+        DEVENV_TEST_REAL_GIT: realGit,
+        ...(options.race !== undefined ? { DEVENV_TEST_RACE: options.race } : {}),
+        ...(options.mkdirRace !== undefined ? { DEVENV_TEST_MKDIR_RACE: JSON.stringify(options.mkdirRace) } : {}),
+        ...(options.gitFails !== undefined ? { DEVENV_TEST_GIT_FAIL: options.gitFails } : {}),
+      },
     });
-    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr, error: result.error };
   }
 
   function gitConfig(file: string, ...args: string[]): string {
     return spawnSync('git', ['config', '--file', file, ...args], { encoding: 'utf8' }).stdout;
+  }
+
+  /** The owners that the script gave, by inode (the records of the fake chown). */
+  function owners(env: GitFilesEnv): Map<number, string[]> {
+    const result = new Map<number, string[]>();
+    for (const line of fs.readFileSync(env.log, 'utf8').split('\n').filter((entry) => entry !== '')) {
+      const [ino, owner] = line.split(' ');
+      result.set(Number(ino), [...(result.get(Number(ino)) ?? []), owner]);
+    }
+    return result;
+  }
+
+  const ino = (file: string): number => fs.lstatSync(file).ino;
+
+  /**
+   * Follow-up of plan step 11I (the links of the owner): a folder outside the volume (in the helper, the cache volume or
+   * its own files), with files named as those of CONFIG_FOLDER, at which the owner points links; `state` is all that the
+   * script must not change (names, kinds, modes, inodes, contents), `inodes` what it must give no owner.
+   */
+  function outside(env: GitFilesEnv): { folder: string; file: string; state: () => string[]; inodes: () => number[] } {
+    const folder = path.join(env.dir, 'outside');
+    fs.mkdirSync(path.join(folder, 'docker'), { recursive: true });
+    for (const name of ['file', 'gitconfig', 'credentials.gitconfig']) write(path.join(folder, name), `[outside]\n\tname = ${name}\n`);
+    for (const name of ['file', 'gitconfig', 'credentials.gitconfig']) fs.chmodSync(path.join(folder, name), 0o640);
+    fs.chmodSync(path.join(folder, 'docker'), 0o751);
+    fs.chmodSync(folder, 0o751);
+    const entries = (): Array<[string, fs.Stats]> => {
+      const list: Array<[string, fs.Stats]> = [['.', fs.lstatSync(folder)]];
+      const walk = (at: string) => {
+        for (const name of fs.readdirSync(at).sort()) {
+          const file = path.join(at, name);
+          const stat = fs.lstatSync(file);
+          list.push([path.relative(folder, file), stat]);
+          if (stat.isDirectory()) walk(file);
+        }
+      };
+      walk(folder);
+      return list;
+    };
+    return {
+      folder,
+      file: path.join(folder, 'file'),
+      state: () =>
+        entries().map(([name, stat]) => {
+          const kind = stat.isDirectory() ? 'folder' : stat.isSymbolicLink() ? `link ${fs.readlinkSync(path.join(folder, name))}` : JSON.stringify(fs.readFileSync(path.join(folder, name), 'utf8'));
+          return `${name} ${(stat.mode & 0o7777).toString(8)} ${stat.ino} ${kind}`;
+        }),
+      inodes: () => entries().map(([, stat]) => stat.ino),
+    };
+  }
+
+  /** A gitconfig of the user whose credential section the script has to repair, in a new CONFIG_FOLDER. */
+  function userGitConfig(env: GitFilesEnv): string {
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, '[user]\n\tname = Changed Name\n[credential "https://github.com"]\n\thelper = store\n[alias]\n\tst = status\n');
+    return cfg;
+  }
+
+  /** CONFIG_FOLDER `dir` as the script leaves it: the four entries, their modes, the owner 1000:1001 of each. */
+  function expectConfigFolder(env: GitFilesEnv, dir: string): void {
+    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
+    expect(fs.lstatSync(dir).mode & 0o777).toBe(0o755);
+    for (const name of ['docker', 'gh']) {
+      expect(fs.lstatSync(path.join(dir, name)).isDirectory()).toBe(true);
+      expect(fs.lstatSync(path.join(dir, name)).mode & 0o777).toBe(0o700);
+    }
+    for (const name of ['gitconfig', 'credentials.gitconfig']) expect(fs.lstatSync(path.join(dir, name)).isFile()).toBe(true);
+    expect(gitConfig(path.join(dir, 'gitconfig'), '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    const given = owners(env);
+    for (const name of ['.', 'docker', 'gh', 'gitconfig', 'credentials.gitconfig']) expect(given.get(ino(path.join(dir, name))), name).toEqual(['1000:1001']);
   }
 
   it('writes the Git configuration and the Docker folder, owned by the repository owner, and no token', () => {
@@ -1149,21 +1336,24 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
     expect(CONTAINER_CREDENTIAL_HELPER).toContain('/run/devenv/github-token');
     expect(fs.statSync(path.join(dir, 'docker')).mode & 0o777).toBe(0o700);
-    const chowned = fs.readFileSync(env.log, 'utf8');
-    expect(chowned).toContain(`chown -h 1000:1001 ${dir} ${dir}/docker ${dir}/gitconfig`);
-    expect(chowned).toContain(cfg);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, the owner changes are recorded by the inode
+    // that the script gives the owner through its descriptor (fchown), not as a chown command line; the same five entries
+    // (the folder, docker, gitconfig, credentials.gitconfig, gh) get 1000:1001, and nothing else gets an owner.
+    const given = owners(env);
+    const credentials = path.join(dir, 'credentials.gitconfig');
+    const gh = path.join(dir, 'gh');
+    expect([...given.keys()].sort()).toEqual([dir, path.join(dir, 'docker'), cfg, credentials, gh].map(ino).sort());
+    for (const file of [dir, path.join(dir, 'docker'), cfg, credentials, gh]) expect(given.get(ino(file)), file).toEqual(['1000:1001']);
     // No GnuPG folder: the extension does not change where GnuPG works (user decision 2026-09-25). unit 15: no token file.
     expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
     // The file for the credential helpers of the user: only comments, readable by every user of the container.
-    const credentials = path.join(dir, 'credentials.gitconfig');
     expect(fs.readFileSync(credentials, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
     expect(fs.statSync(credentials).mode & 0o777).toBe(0o644);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o644);
     expect(spawnSync('git', ['config', '--file', credentials, '--list'], { encoding: 'utf8' })).toMatchObject({ status: 0, stdout: '' });
     // unit 15: the gh folder of the volume (for config.yml), 0700 and empty, owned by the repository owner.
-    const gh = path.join(dir, 'gh');
     expect(fs.statSync(gh).mode & 0o777).toBe(0o700);
     expect(fs.readdirSync(gh)).toEqual([]);
-    expect(chowned).toContain(`${cfg} ${credentials} ${gh}`);
     // No temporary folder is left.
     expect(fs.readdirSync(dir).filter((name) => name.startsWith('.work'))).toEqual([]);
   });
@@ -1237,15 +1427,152 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
 
   it('writes nothing without the repository folder', () => {
     const env = setup();
-    const missing = run(env, 'other');
+    const missing = run(env, { folder: 'other' });
     expect(missing.status).toBe(4);
     expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
   });
 
   it('rejects an invalid folder name', () => {
-    const result = run(setup(), '../etc');
+    const result = run(setup(), { folder: '../etc' });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Invalid folder name');
+  });
+
+  // Follow-up of plan step 11I (the links of the owner): root never follows a link that the owner of the repository
+  // planted, before the run or while it runs, and never resolves a path through an entry of the volume.
+
+  it.each([
+    ['gitconfig', 'file'],
+    ['credentials.gitconfig', 'file'],
+    ['docker', 'folder'],
+    ['gh', 'folder'],
+  ] as const)('leaves the target of a link planted at %s before the run unchanged, and writes a correct configuration', (entry, target) => {
+    const env = setup();
+    const out = outside(env);
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    fs.symlinkSync(target === 'file' ? out.file : out.folder, path.join(dir, entry));
+    const before = out.state();
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expectConfigFolder(env, dir);
+  });
+
+  it('edits no gitconfig that the owner replaces by a link while Git runs', () => {
+    const env = setup();
+    const out = outside(env);
+    const cfg = userGitConfig(env);
+    const before = out.state();
+    // The owner renames gitconfig away and puts a link to a file outside the volume in its place when Git starts.
+    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'` });
+    expect(fs.readFileSync(`${cfg}.moved`, 'utf8')).toContain('helper = store');
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // The rename of the new file replaced the link itself: gitconfig is the repaired configuration of the user.
+    expect(fs.lstatSync(cfg).isFile()).toBe(true);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  it('writes only into the configuration folder that it opened, also when it is replaced by a link while Git runs', () => {
+    // Root of the dev container (also a remote user with sudo) can rename the entries of /workspaces too.
+    const env = setup();
+    const out = outside(env);
+    userGitConfig(env);
+    const dir = path.join(env.ws, '.devenv+');
+    const before = out.state();
+    const result = run(env, { race: `mv '${dir}' '${dir}.moved' && ln -s '${out.folder}' '${dir}'` });
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Everything went into the folder that the script opened, wherever the owner moved it.
+    expectConfigFolder(env, `${dir}.moved`);
+    expect(gitConfig(path.join(`${dir}.moved`, 'gitconfig'), 'alias.st')).toBe('status\n');
+  });
+
+  it.each(['.devenv+', 'docker', 'gh'])('changes no mode through a link that replaces %s between its creation and its mode', (entry) => {
+    const env = setup();
+    const out = outside(env);
+    const before = out.state();
+    const result = run(env, { mkdirRace: [entry, out.folder] });
+    // The script finds a link where it created the folder: it stops (a warning of the open), and follows nothing.
+    const moved = entry === '.devenv+' ? path.join(env.ws, '.devenv+.moved') : path.join(env.ws, '.devenv+', `${entry}.moved`);
+    expect(fs.lstatSync(moved).isDirectory()).toBe(true);
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.status).toBe(1);
+  });
+
+  it('lets Git edit only a copy in a folder of root outside the volume, which it removes at the end, also after a failure', () => {
+    const env = setup();
+    userGitConfig(env);
+    expect(run(env).status).toBe(0);
+    const edited = fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((line) => line !== '');
+    expect(edited.length).toBeGreaterThan(0);
+    const folders = new Set(edited.map((line) => path.dirname(line.slice(line.indexOf(' ') + 1))));
+    expect(folders.size).toBe(1);
+    const [work] = [...folders];
+    // Root's folder (0700), outside the workspace volume, gone after the run.
+    expect(edited.every((line) => line.startsWith('700 '))).toBe(true);
+    expect(path.relative(env.ws, work).startsWith('..')).toBe(true);
+    expect(fs.existsSync(work)).toBe(false);
+
+    // A failure of Git: the step fails, and neither the folder nor a new file of the script is left.
+    const failing = setup();
+    const cfg = userGitConfig(failing);
+    const original = fs.readFileSync(cfg, 'utf8');
+    const result = run(failing, { gitFails: '--add' });
+    expect(result.status).not.toBe(0);
+    const failedWork = path.dirname(fs.readFileSync(failing.gitFiles, 'utf8').split('\n')[0].split(' ')[1]);
+    expect(path.relative(failing.ws, failedWork).startsWith('..')).toBe(true);
+    expect(fs.existsSync(failedWork)).toBe(false);
+    expect(fs.readdirSync(path.join(failing.ws, '.devenv+')).sort()).toEqual(['docker', 'gh', 'gitconfig']);
+    expect(fs.readFileSync(cfg, 'utf8')).toBe(original);
+  });
+
+  it('gives no owner to a file that has another link, and writes such a gitconfig again as a new file', () => {
+    // A hard link could name a file of another user elsewhere in the volume.
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const sharedCredentials = path.join(env.ws, 'api', 'credentials');
+    const sharedConfig = path.join(env.ws, 'api', 'config');
+    write(sharedCredentials, 'credentials of another file\n');
+    const correct = `[credential "https://github.com"]\n\thelper = \n\thelper = ${JSON.stringify(CONTAINER_CREDENTIAL_HELPER)}\n`;
+    write(sharedConfig, correct);
+    fs.linkSync(sharedCredentials, path.join(dir, 'credentials.gitconfig'));
+    fs.linkSync(sharedConfig, path.join(dir, 'gitconfig'));
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(owners(env).has(ino(sharedCredentials))).toBe(false);
+    expect(owners(env).has(ino(sharedConfig))).toBe(false);
+    expect(fs.readFileSync(sharedConfig, 'utf8')).toBe(correct);
+    expect(fs.readFileSync(sharedCredentials, 'utf8')).toBe('credentials of another file\n');
+    // gitconfig: a new file of the owner with the same text; credentials.gitconfig stays as it is.
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(sharedConfig));
+    expect(fs.readFileSync(cfg, 'utf8')).toBe(correct);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+    expect(ino(path.join(dir, 'credentials.gitconfig'))).toBe(ino(sharedCredentials));
+  });
+
+  it('never waits on a FIFO in place of gitconfig', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    expect(spawnSync('mkfifo', [path.join(dir, 'gitconfig')]).status).toBe(0);
+    const result = run(env);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${dir}/gitconfig is not a file.`);
   });
 });
 
@@ -1694,6 +2021,116 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     expect(created.status).toBe(2);
     expect(created.stderr).toContain('leads out of the repository');
     expect(fs.existsSync(path.join(outside, 'new'))).toBe(false);
+  });
+});
+
+// Follow-up of plan step 11I (the links of the owner): CREATE_FOLDERS_SCRIPT runs as root when root owns the repository,
+// and root of the dev container can replace a folder of the repository by a link between a check and a use. A module
+// that Node loads before the script (`--require`) plays it once: right after the script resolved the real path of
+// DEVENV_TEST_RACE_REAL (its last check of the nearest folder), or right before it creates a folder named
+// DEVENV_TEST_RACE_MKDIR, or right before it changes into a folder named DEVENV_TEST_RACE_CHDIR, the folder
+// DEVENV_TEST_RACE_SWAP is renamed away and a link to DEVENV_TEST_RACE_TARGET takes its place. The script never creates a
+// folder out of the repository.
+describe('CREATE_FOLDERS_SCRIPT and the links of the owner (follow-up of plan step 11I)', () => {
+  function setup(): { dir: string; repo: string; outside: string; preload: string } {
+    const dir = fs.realpathSync.native(tempDir());
+    const repo = path.join(dir, 'repo');
+    const outside = path.join(dir, 'outside');
+    fs.mkdirSync(path.join(repo, 'data'), { recursive: true });
+    fs.mkdirSync(outside);
+    const preload = path.join(dir, 'race.js');
+    write(
+      preload,
+      [
+        "'use strict';",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        'const { DEVENV_TEST_RACE_REAL: real, DEVENV_TEST_RACE_MKDIR: made, DEVENV_TEST_RACE_CHDIR: entered, DEVENV_TEST_RACE_SWAP: swap, DEVENV_TEST_RACE_TARGET: target } = process.env;',
+        'let done = false;',
+        'const act = () => {',
+        '  if (done) return;',
+        '  done = true;',
+        "  fs.renameSync(swap, swap + '.moved');",
+        '  fs.symlinkSync(target, swap);',
+        '};',
+        'const realpath = fs.realpathSync.native;',
+        'fs.realpathSync.native = (file, ...rest) => {',
+        '  const result = realpath(file, ...rest);',
+        '  if (file === real) act();',
+        '  return result;',
+        '};',
+        'const mkdirSync = fs.mkdirSync;',
+        'fs.mkdirSync = (file, ...rest) => {',
+        '  if (made !== undefined && path.basename(String(file)) === made) act();',
+        '  return mkdirSync.call(fs, file, ...rest);',
+        '};',
+        'const chdir = process.chdir;',
+        'process.chdir = (folder) => {',
+        '  if (entered !== undefined && path.basename(String(folder)) === entered) act();',
+        '  return chdir.call(process, folder);',
+        '};',
+        '',
+      ].join('\n'),
+    );
+    return { dir, repo, outside, preload };
+  }
+
+  function run(preload: string, repo: string, folders: string[], env: Record<string, string>) {
+    const command = createFoldersCommand(repo, folders);
+    const result = spawnSync(process.execPath, ['--require', preload, ...command.slice(1)], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ...env } });
+    expect(result.error).toBeUndefined();
+    return result;
+  }
+
+  it('creates nothing out of the repository when its nearest folder is replaced by a link after the checks', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new/sub`], {
+      DEVENV_TEST_RACE_REAL: `${repo}/data`,
+      DEVENV_TEST_RACE_SWAP: `${repo}/data`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${repo}/data is no folder of the repository.`);
+  });
+
+  it('creates each part in the folder that it made before, also when that folder is replaced by a link', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new/sub`], {
+      DEVENV_TEST_RACE_MKDIR: 'sub',
+      DEVENV_TEST_RACE_SWAP: `${repo}/data/new`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data/new`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    // `sub` is in the folder `new` that the script made (the owner moved it to new.moved).
+    expect(fs.lstatSync(`${repo}/data/new.moved/sub`).isDirectory()).toBe(true);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  });
+
+  it('stops when a folder is replaced by a link between its open and the change into it (the folder entered must be the folder opened)', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new`], {
+      DEVENV_TEST_RACE_CHDIR: 'data',
+      DEVENV_TEST_RACE_SWAP: `${repo}/data`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${repo}/data is no folder of the repository.`);
+  });
+
+  it('refuses a link in place of the repository folder, and creates nothing where it leads', () => {
+    const { dir, outside } = setup();
+    const link = path.join(dir, 'linked-repo');
+    fs.symlinkSync(outside, link);
+    const result = runNode(createFoldersCommand(link, [`${link}/x`]));
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`The repository folder ${link} is no folder of its own`);
   });
 });
 

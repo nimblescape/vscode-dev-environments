@@ -440,8 +440,11 @@ describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the containe
     const run = docker.runs[0];
     expect(bridge.kinds).toEqual(['gitFiles']);
     expect(run.options.input).toBeUndefined();
-    expect(run.args).not.toContain('-e');
-    expect(commandOf(run.args)).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, GIT_FILES_SCRIPT is a Node.js script, so
+    // its command has the `-e` of `node -e`; still no `-e` (a variable) among the arguments of the run before it.
+    const command = commandOf(run.args);
+    expect(run.args.slice(0, run.args.length - command.length)).not.toContain('-e');
+    expect(command).toEqual(['node', '-e', GIT_FILES_SCRIPT, 'api', identity.name, identity.email, CONTAINER_CREDENTIAL_HELPER]);
   });
 
   it('throws a CommandError when the script fails', async () => {

@@ -1133,6 +1133,17 @@ describe('isHelperPath', () => {
     ['/proc', true],
     ['/sys/fs/cgroup', true],
     ['/dev/fd/3', true],
+    // Follow-up of plan step 11I (the links of the owner): the folders of the batch helper with the Docker socket and the
+    // token, also by /var/run, and the folder that contains them; not a folder that only starts with their names.
+    ['/run/devenv-docker', true],
+    ['/run/devenv-docker/docker.sock', true],
+    ['/run/devenv-secrets', true],
+    ['/run/devenv-secrets/github-token', true],
+    ['/var/run/devenv-docker/docker.sock', true],
+    ['/var/run/devenv-secrets', true],
+    ['/run', true],
+    ['/run/devenv-dockerx', false],
+    ['/run/devenv', false],
     ['/device', false],
     ['/workspaces/api', false],
     ['/workspaces/api/.devcontainer', false],
