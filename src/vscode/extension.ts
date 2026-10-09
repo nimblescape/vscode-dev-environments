@@ -188,8 +188,11 @@ async function activateExtension(
     docker,
     logger,
     dockerfilePath: helperDockerfile,
-    // Implementation notes 7: the weekly check of the base image uses the registry client (and the credentials) of the
-    // image check, with its own time limit of 5 seconds, in the background of the open.
+    // Implementation notes 7: the digest of the base image is read with this registry client and the credentials of
+    // this computer (for ghcr.io also the GitHub sign-in), with its own time limit of 5 seconds: at the build of a
+    // missing tag, and by the weekly check of ensureImage, which has no caller in this version (the decision of
+    // 2026-10-09, docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the
+    // worker for an open and in the background prebuild, with a follow-up PR).
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
     // Unit 7: the engine of the operation (its key: '' for the local Docker, else the host). Review round 1 of PR #129
@@ -674,11 +677,12 @@ async function activateExtension(
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
   // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
-  // The build is shared with the open pipeline of this window (HelperImages.prebuildImage) and cancelled when the
-  // extension is deactivated. Plan step 6, PR D: on the Docker engine of the current Docker context, local or remote
-  // alike, as an operation on it (the state file and engine key of an open there); a remote host gets our own SSH check
-  // without questions before its `docker info` (dockerEngineAnswers). A host switch starts no new prebuild: the next
-  // activation, or the first open on that host, builds its tag.
+  // The build (HelperImages.prebuildImage) is shared with the preparation of a worker in this window
+  // (HelperImages.ensureImagePresent) and cancelled when the extension is deactivated. Plan step 6, PR D: on the Docker
+  // engine of the current Docker context, local or remote alike, as an operation on it (the state file and engine key
+  // of an open there); a remote host gets our own SSH check without questions before its `docker info`
+  // (dockerEngineAnswers). A host switch starts no new prebuild: the next activation, or the first open on that host,
+  // builds its tag.
   const helperPrebuild = new HelperPrebuild({
     helper,
     dockerRunning: (target, signal) =>

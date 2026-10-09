@@ -409,7 +409,7 @@ function volumesFromEntry(entry: unknown): { container: boolean; name: string } 
  * dev service (the workspace volume, with the repository and the Git configuration of the environment); a container (`container:…`, perhaps of another
  * environment) stays refused whatever the switch says. When the dev service takes the volumes of other services (also
  * through their own `volumes_from`), their mounts land in the dev container: the rules of its mounts apply to their
- * targets (not at WORKSPACES_ROOT, not in the internal folder with the token).
+ * targets (not at WORKSPACES_ROOT, not in the internal folder CONFIG_FOLDER).
  */
 function volumesFromProblems(value: unknown, ctx: ServiceContext): Problem[] {
   const services = isRecord(ctx.input.model.services) ? ctx.input.model.services : {};
@@ -941,8 +941,8 @@ function buildSecretProblems(value: unknown, ctx: ServiceContext): Problem[] {
 
 /**
  * A local path of a build (its context or its Dockerfile, absolute as `docker compose config` prints it), which the
- * builder reads in the workspace helper, where the cache volume, the folder with the token, and the Docker socket are
- * mounted (S1):
+ * builder reads in the workspace helper, where the cache volume, the workspace volume with the internal folder
+ * (CONFIG_FOLDER), and the Docker socket are mounted (S1):
  * - in the repository folder (lexically): allowed, unless its real path (ComposeModelOutput.realPaths) does not exist or
  *   is outside the repository (a link out): refused whatever the switch says, because BuildKit follows the link;
  * - outside the repository: a path of the workspace helper (isHelperPath, also after links) stays refused whatever the

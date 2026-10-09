@@ -126,9 +126,10 @@ export type Secrets = Readonly<Record<string, string>>;
 /**
  * An operation: the script runs all its steps and answers with one `result`. `params`: checked by the operation.
  * `secrets` (for example the GitHub token as SECRET_TOKEN): kept apart from `params`, so that no log of the parameters
- * can contain them; a secret never becomes an argument or a variable of a process in the script, only input of one or
- * the header of a request to the engine, and every one is masked in all that the script sends back. `timeoutMs`: the
- * operation is cancelled after it.
+ * can contain them; a secret never becomes an argument or a variable of a process in the script, only input of one or a
+ * header of a request (`X-Registry-Auth` of a pull to the engine, and the Basic `Authorization` of the image check's
+ * HTTPS requests to that registry and to the token service that it names), and every one is masked in all that the
+ * script sends back. `timeoutMs`: the operation is cancelled after it.
  */
 export interface OperationRequest {
   t: 'op';
@@ -210,8 +211,9 @@ export type ResultAnswer =
 
 /**
  * Review round 4 (M2): the script received the cancel of the operation `id`, which had ended already (its result may
- * have crossed the cancel): the containers of its cleanup labels are removed (the exit waits for that). A cancel of an
- * operation that still runs is answered by its result instead.
+ * have crossed the cancel). A cancel of an operation that still runs is answered by its result instead. Plan step 11I1,
+ * PR B1: before, the containers of the cleanup labels of the operation were removed first (only the removed operation
+ * `docker` had such labels); the batch helper of a flow is removed by its session label when its operation ends.
  */
 export interface CancelledAnswer {
   t: 'cancelled';
@@ -758,7 +760,7 @@ export function parseSweepValue(value: unknown): SweepValue | undefined {
  * secret. Parameters RefreshParams, value RefreshValue.
  */
 export const OP_REFRESH = 'refresh';
-/** The most environments of one refresh (more: the refresh runs without the worker). */
+/** The most environments of one refresh (more: it is refused as `unsendable`, never read without the worker). */
 export const MAX_REFRESH_ENVIRONMENTS = 200;
 /** The longest branch name of a RefreshValue. */
 export const MAX_REFRESH_BRANCH_LENGTH = 1_024;
@@ -792,8 +794,9 @@ function parseStateEnvironment(value: unknown): StateEnvironment | undefined {
 }
 
 /**
- * The strict check of RefreshParams (both sides: the extension checks what it sends, so a list beyond the check is read
- * without the worker): at most MAX_REFRESH_ENVIRONMENTS environments with distinct IDs.
+ * The strict check of RefreshParams (both sides: the extension checks what it sends, so a list beyond the check is
+ * refused before it is sent, never read without the worker): at most MAX_REFRESH_ENVIRONMENTS environments with
+ * distinct IDs.
  */
 export function parseRefreshParams(value: unknown): RefreshParams | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['environments']) || !Array.isArray(value.environments)) return undefined;

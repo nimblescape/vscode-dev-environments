@@ -265,12 +265,12 @@ function withExecdir(script: string, inLine: (line: string) => boolean): string 
 export const MAX_SERVICE_FOLDERS = 1000;
 
 /**
- * Review round 11 (G5): the most characters of the arguments of servicePathArguments. The command line of `docker exec`
- * and `docker run` on this computer holds them, together with the script (a few KiB), and so does the `execve` in the
- * container: on Windows a command line has at most 32767 characters, so 24 KiB there (about 300 paths of 30
- * characters); on Linux and macOS ARG_MAX (2 MiB on Linux, one argument at most 128 KiB; 1 MiB on macOS; both with the
- * environment) is far above 256 KiB (1000 paths of up to about 120 characters). Over it, as over MAX_SERVICE_FOLDERS,
- * the whole repository counts as a path of the services.
+ * Review round 11 (G5): the most characters of the arguments of servicePathArguments. The `execve` in the container
+ * holds them, together with the script (a few KiB). The pipeline runs in the worker, on Linux, where ARG_MAX (2 MiB, one
+ * argument at most 128 KiB, both with the environment) is far above 256 KiB (1000 paths of up to about 120 characters).
+ * The 24 KiB on Windows (a command line of at most 32767 characters there, about 300 paths of 30 characters) are from
+ * the time when the command line of the Docker CLI of the computer held them (before plan steps 11E and 11I2). Over it,
+ * as over MAX_SERVICE_FOLDERS, the whole repository counts as a path of the services.
  */
 export const MAX_SERVICE_ARGUMENT_CHARACTERS = process.platform === 'win32' ? 24 * 1024 : 256 * 1024;
 

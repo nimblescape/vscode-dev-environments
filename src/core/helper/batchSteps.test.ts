@@ -93,7 +93,7 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
       owner: FOLDER,
     });
-    // User decision of 2026-10-01 (agreed extension): only the steps without the Docker socket run as the owner; the
+    // User decision of 2026-10-01 (agreed extension): only steps that need no Docker socket run as the owner; the
     // clone stays Git's, and the steps that need the socket, gitFiles and ownershipFix stay root.
     const owners = BATCH_STEP_KINDS.filter((kind) => {
       const samples: Record<string, unknown> = {

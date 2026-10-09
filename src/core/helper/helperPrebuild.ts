@@ -102,11 +102,14 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * Docker nothing when it is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor
  * connect to a remote host. Plan step 6, PR D: on the Docker engine of the target that `start` gets, local or remote
  * alike (it runs as an operation on it, so the engine key, the state file and every Docker call are those of an open on
- * that engine), and only when that engine answers (Docker is never started for this). The build is the one of HelperImages.prebuildImage, shared with ensureImage, so an open of the
- * same window that starts meanwhile never builds a second time. Review round 6 of PR #64 (R6-1): there is no lock across
- * windows (a lock left behind by a window that closed during the prebuild would block the prebuild of every window).
- * Windows that start at the same time may each build the tag once (BuildKit shares the layer cache; the extra images
- * are dangling and the daily cleanup removes them); windows that start later find the record and do nothing.
+ * that engine), and only when that engine answers (Docker is never started for this). The build is the one of
+ * HelperImages.prebuildImage, shared with ensureImagePresent, so the preparation of a worker in the same window that
+ * starts meanwhile never builds a second time. Review round 6 of PR #64 (R6-1): there is no lock across windows (a lock
+ * left behind by a window that closed during the prebuild would block the prebuild of every window). Windows that start
+ * at the same time may each build the tag once (BuildKit shares the layer cache; the extra images are dangling, and the
+ * daily cleanup that removes them has no caller in this version; the decision of 2026-10-09, docs/plan-remote-worker.md
+ * section 2, restores it in the extension's preparation of the worker for an open and in the background prebuild, with
+ * a follow-up PR); windows that start later find the record and do nothing.
  */
 export class HelperPrebuild {
   private readonly controller = new AbortController();

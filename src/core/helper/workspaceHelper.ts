@@ -7,8 +7,9 @@
 // the batch helper of an operation (batchScope.ts, batchSteps.ts, src/helperChannel/batchHelper.ts), never as a container
 // of its own; a step outside the batch scope of an operation is an internal error. In the batch helper the runs of the
 // Dev Container CLI get the Docker socket, so the CLI builds and starts dev containers with the Docker engine; the clone
-// runs as an unprivileged Git user and the read steps as the owner of the repository, without the socket: Git runs
-// programs that the repository configuration names (for example filter drivers). Plan step 11I (U7, decision of
+// runs as an unprivileged Git user, which cannot reach the socket (Git runs programs that the repository configuration
+// names, for example filter drivers), and the read steps run as the owner of the repository, which reaches it only when
+// root owns the repository (implementation notes §17, Known limitation). Plan step 11I (U7, decision of
 // 2026-10-08): only the worker builds a WorkspaceHelper (workerServices.ts), and every step runs from the worker's own
 // helper image (section 3b of the plan); the helper image of the extension (its build, check, maintenance and record)
 // is HelperImages' (helperImages.ts), of which this module imports only types, so the worker's bundle holds none of it.
@@ -451,9 +452,11 @@ export class WorkspaceHelper {
 
   /**
    * The merged model of a Docker Compose configuration (COMPOSE_MODEL_SCRIPT: `docker compose config --format json` of
-   * `files`, all profiles, with COMPOSE_PROJECT_NAME=`project`): the step composeModel, as the owner of the repository,
-   * without the Docker socket and with the configuration folder of the volume closed (implementation notes §17). `files`
-   * are absolute paths in the repository folder (resolveComposeFiles). `{ error }` carries the message of Docker Compose. Throws CommandError when the helper fails.
+   * `files`, all profiles, with COMPOSE_PROJECT_NAME=`project`): the step composeModel, as the owner of the repository:
+   * without the Docker socket (it lies in a folder that only root can enter, batchHelper.ts) and with the configuration
+   * folder of the volume closed to it, both unless root owns the repository (implementation notes §17, Known
+   * limitation). `files` are absolute paths in the repository folder (resolveComposeFiles). `{ error }` carries the
+   * message of Docker Compose. Throws CommandError when the helper fails.
    */
   async composeModel(p: {
     volumeName: string;
@@ -485,8 +488,9 @@ export class WorkspaceHelper {
   /**
    * Recreate offer, review round 2: the configuration hash of each service of the up model `model` (its text, as `up`
    * gets it at COMPOSE_MODEL_PATH) with the project name `project`, computed by the Docker Compose of this helper, the
-   * one that runs `up` (COMPOSE_HASH_SCRIPT): the step composeHash, as the owner of the repository, without the Docker
-   * socket and with the configuration folder of the volume closed. Throws CommandError when Compose fails.
+   * one that runs `up` (COMPOSE_HASH_SCRIPT): the step composeHash, as the owner of the repository: without the Docker
+   * socket and with the configuration folder of the volume closed to it, unless root owns the repository. Throws
+   * CommandError when Compose fails.
    */
   async composeServiceHashes(p: {
     volumeName: string;
@@ -514,8 +518,9 @@ export class WorkspaceHelper {
    * Review round 8 (P8-2): creates the folders of the repository that the bind mounts of a Docker Compose configuration
    * name and that do not exist yet (composeUpModel's `createFolders`, absolute paths below the repository folder), as
    * Docker would create them on the computer (CREATE_FOLDERS_SCRIPT: no part through a link out of the repository).
-   * The step createFolders, as the owner of the repository, without the Docker socket and with the configuration folder of
-   * the volume closed. Throws CommandError when a folder cannot be created.
+   * The step createFolders, as the owner of the repository: without the Docker socket unless root owns the repository;
+   * the configuration folder of the volume stays open (batchSteps.ts, closeConfigFolder). Throws CommandError when a
+   * folder cannot be created.
    */
   async createRepositoryFolders(p: {
     volumeName: string;

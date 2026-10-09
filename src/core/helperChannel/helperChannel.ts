@@ -91,7 +91,8 @@ export class HelperOperationError extends Error {
 export interface OperationOptions {
   /**
    * Plan step 11A: the named secrets of the operation (SECRET_TOKEN, SECRET_REGISTRY; protocol.ts: never logged, only
-   * input of a process or the header of a request to the engine, masked in everything that comes back).
+   * input of a process or a header of a request, `X-Registry-Auth` of a pull or the Basic `Authorization` of the image
+   * check, masked in everything that comes back).
    */
   secrets?: Secrets;
   /**

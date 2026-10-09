@@ -161,8 +161,12 @@ export interface EnsureHelperImageOptions {
   /** Time limit of `baseDigest`; after it, the registry counts as unreachable. Default IMAGE_CHECK_TIMEOUT_MS. */
   baseDigestTimeoutMs?: number;
   /**
-   * `false` for the helper runs (default `true`): only a missing tag is built and the use is recorded; the check of the
-   * base image, a rebuild that a check asked for, and the cleanup are left to the open pipeline.
+   * `false` for the calls without the maintenance (ensureImagePresent, prebuildImage; default `true`): only a missing
+   * tag is built and the use is recorded; the check of the base image, a rebuild that a check asked for, and the
+   * cleanup are left to HelperImages.ensureImage, which the open pipeline called until the open moved into the worker
+   * and which has no caller in this version (the decision of 2026-10-09, docs/plan-remote-worker.md section 2, restores
+   * the maintenance in the extension's preparation of the worker for an open and in the background prebuild, with a
+   * follow-up PR).
    */
   maintain?: boolean;
   /**
