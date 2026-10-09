@@ -15,12 +15,12 @@
 import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, VSCODE_STORE_TARGET, newEnvironmentId, resourceName } from '../../src/core/names';
+import { LABEL_ENVIRONMENT_ID, LABEL_REPOSITORY, VSCODE_STORE_TARGET, WORKSPACES_ROOT, newEnvironmentId, resourceName } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { serverPlatform } from '../../src/core/worker/vscodeServerStore';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { RecordingProgress, TEST_ACCOUNT, createVolume, dockerTestContext, runInVolume, testHelperImage, testVscodeVolume } from './harness';
+import { RecordingProgress, TEST_ACCOUNT, createVolume, dockerTestContext, runInVolume, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 import { monitorOfUser as engineHadMonitor, removeTestMonitor, seedTestMonitorRun, workerWindow } from './workerWindow';
 
 const NAME = 'vscodeServer';
@@ -138,8 +138,13 @@ describe('the shared VS Code server of an open through a real worker (plan step 
     expect(execIn(REMOTE_USER, `"/home/${REMOTE_USER}/.vscode-server/bin/${COMMIT}/bin/code-server"`).out).toBe('fake server');
     // The store is read-only in the dev container, also for root.
     expect(execIn('root', `touch ${VSCODE_STORE_TARGET}/x`).code).not.toBe(0);
-    // Plan step 11H3: the list is recorded in the store, and the cached `.vsix` is in the extension cache of the user.
-    expect(JSON.parse(execIn('root', `cat ${VSCODE_STORE_TARGET}/extensions/wanted/${environmentId}.json`).out)).toMatchObject({ configuration: [EXTENSION] });
+    // Plan step 11H3: the list is recorded, and the cached `.vsix` is in the extension cache of the user. Review round 1
+    // of 11H3 (A-L5): the record lives in the state volume of the workers (testStateVolume of this file, at /state in the
+    // worker), not in the store that every dev container mounts (CI of #136: the test still read it from the store).
+    const record = await runInVolume(docker, testStateVolume({ run, cli }, NAME), ['cat', `${WORKSPACES_ROOT}/extensions/wanted/${environmentId}.json`]);
+    expect(record.exitCode, record.stderr).toBe(0);
+    expect(JSON.parse(record.stdout)).toMatchObject({ configuration: [EXTENSION] });
+    expect(execIn('root', `test -e ${VSCODE_STORE_TARGET}/extensions/wanted`).code).not.toBe(0);
     expect(execIn(REMOTE_USER, `test -O "/home/${REMOTE_USER}/.vscode-server/extensionsCache" && test -f "/home/${REMOTE_USER}/.vscode-server/extensionsCache/${EXTENSION_FILE}" && tail -c +5 "/home/${REMOTE_USER}/.vscode-server/extensionsCache/${EXTENSION_FILE}"`).out).toBe('fake vsix');
     // Never a volume of the environment: no label of it, not recorded.
     expect(cli.volume(store)?.Labels?.[LABEL_ENVIRONMENT_ID]).toBeUndefined();
