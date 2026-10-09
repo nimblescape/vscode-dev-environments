@@ -21,7 +21,7 @@ import type { FlockProcess } from '../core/helperChannel/lockFile';
 import type { LockDeps } from './lock';
 import { contextSecrets } from './operationContext.testkit';
 import type { HostSide } from '../core/worker/hostSide';
-import { OperationError, type OperationContext } from './server';
+import type { OperationContext } from './server';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const NAME = 'devenv-acme-api-brave-noether';

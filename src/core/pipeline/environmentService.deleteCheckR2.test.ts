@@ -6,7 +6,6 @@
 import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
 import { ENV_ID, createHarness, seedEnvironment } from './environmentService.testkit';
-import type { EnvironmentServiceDeps } from './environmentService';
 
 type FlowOptions = Parameters<OperationFlow>[2];
 const rejection = (p: Promise<unknown>) => p.then((value) => ({ resolved: value }), (error: unknown) => error);

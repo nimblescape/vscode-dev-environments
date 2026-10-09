@@ -9,7 +9,6 @@ import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperOperationError } from '../helperChannel/helperChannel';
-import type { EnvironmentServiceDeps } from './environmentService';
 import { ENV_ID, PID, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 
 function harness(answer: (signal: AbortSignal | undefined) => Promise<unknown>) {

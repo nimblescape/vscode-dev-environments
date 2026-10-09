@@ -140,13 +140,6 @@ class FakeDocker implements HelperDocker {
   }
 }
 
-/** The command after the image reference `image` in docker run arguments. */
-function commandOfImage(args: string[], image: string): string[] {
-  const index = args.indexOf(image);
-  expect(index).toBeGreaterThan(0);
-  return args.slice(index + 1);
-}
-
 /**
  * The command after the image in docker run arguments. Plan step 7 (user decision of 2026-10-01): the per-step path is
  * removed; a step of the batch helper runs with the image ID of its session (was: the helper tag of a per-step run).

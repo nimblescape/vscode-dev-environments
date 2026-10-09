@@ -8,9 +8,8 @@
 // clock and view of the windows under the registry lock (registryBusyMarks), for its own pipeline and for the requests
 // of the worker alike.
 import { describe, expect, it } from 'vitest';
-import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { silentLogger } from '../ports';
-import type { BusyMark, Environment, WindowStatus } from '../types';
+import type { BusyMark, Environment } from '../types';
 import { registryBusyMarks, type BusyMarkView } from './busyMarks';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
