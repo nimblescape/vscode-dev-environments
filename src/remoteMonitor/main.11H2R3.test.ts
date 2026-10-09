@@ -50,6 +50,9 @@ describe('the idle exit after the removals of old records (review round 3 of 11H
     const vscode = {
       store: { root: store },
       storeVolume: 'devenv-vscode',
+      // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is the temporary
+      // state folder of the test, as main gives its own to vscodeBackgroundDeps; never the real /state.
+      extensionStateDir: stateDir,
       engine: {
         ...unusedEngine(),
         architecture: async () => {

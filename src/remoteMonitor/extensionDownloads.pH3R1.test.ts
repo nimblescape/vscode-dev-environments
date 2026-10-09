@@ -287,6 +287,8 @@ describe('the wiring into the background run (review round 1 of 11H3, reviewer B
       tryLock: async () => ({ kind: 'busy' }) as StoreLockAttempt,
       ensure: async () => true,
       extensionLocks: { lock: f.deps.lock, tryLock: f.deps.tryLock },
+      // Integration of 11H3 with the final 11H2 (#135): the lists in the folder of the fake (its stateDir), never the real /state.
+      extensionStateDir: f.deps.stateDir,
     } as unknown as VscodeBackgroundDeps;
   }
 

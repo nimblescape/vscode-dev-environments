@@ -229,6 +229,9 @@ describe('the idle exit during a background run (review round 1 of 11H2, A-L8)',
     const vscode = {
       store: { root: store },
       storeVolume: 'devenv-vscode',
+      // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is the temporary
+      // state folder of the test, as main gives its own to vscodeBackgroundDeps; never the real /state.
+      extensionStateDir: stateDir,
       engine: {
         ...unusedEngine(),
         architecture: async () => {
@@ -283,6 +286,9 @@ describe('the idle exit during a background run (review round 1 of 11H2, A-L8)',
     const vscode = {
       store: { root: store },
       storeVolume: 'devenv-vscode',
+      // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is the temporary
+      // state folder of the test, as main gives its own to vscodeBackgroundDeps; never the real /state.
+      extensionStateDir: stateDir,
       engine: {
         ...unusedEngine(),
         architecture: async () => {

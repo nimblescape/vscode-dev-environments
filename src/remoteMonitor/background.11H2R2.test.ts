@@ -40,6 +40,8 @@ function unmarkedServer(root: string, server: VscodeServerRef, folderAt: number,
 function harness(options: { commits: Partial<Record<'stable' | 'insider', string[]>>; ensure: boolean; onLock?: (name: string) => void; failWrite?: keyof CacheRunState }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-11h2r2-'));
   temps.push(root);
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-11h2r2-state-'));
+  temps.push(stateDir);
   const log: string[] = [];
   const locks: string[] = [];
   let state: CacheRunState = {};
@@ -64,6 +66,9 @@ function harness(options: { commits: Partial<Record<'stable' | 'insider', string
   const vscode: VscodeBackgroundDeps = {
     store,
     storeVolume: 'devenv-vscode',
+    // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is a temporary folder,
+    // never the real /state (as background.test.ts since review round 2 of 11H3, A-L4).
+    extensionStateDir: stateDir,
     engine: { ...unusedEngine(), architecture: async () => 'x86_64', containerSummaries: async () => [], containerIds: async () => [], processes: async () => [] } as unknown as VscodeBackgroundDeps['engine'],
     tryLock: async (name): Promise<StoreLockAttempt> => {
       locks.push(name);

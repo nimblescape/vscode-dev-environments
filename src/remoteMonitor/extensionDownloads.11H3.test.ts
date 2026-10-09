@@ -257,6 +257,8 @@ describe('the part "extensions" of the background run (plan step 11H3)', () => {
       tryLock: async () => ({ kind: 'busy' }) as StoreLockAttempt,
       ensure: async () => true,
       extensionLocks: { lock: f.deps.lock, tryLock: f.deps.tryLock },
+      // Integration of 11H3 with the final 11H2 (#135): the lists in the folder of the fake (its stateDir), never the real /state.
+      extensionStateDir: f.deps.stateDir,
     } as unknown as VscodeBackgroundDeps;
     const run = new BackgroundRun({ log: (message) => logs.push(message), now: () => NOW, images: async () => undefined, vscode: () => vscode, state: { read: async () => ({ lastCleanupAt: NOW }), update: async () => undefined } });
     await run.run();
@@ -309,6 +311,8 @@ describe('the cleanup of the extension cache (plan step 11H3)', () => {
       tryLock: async () => ({ kind: 'busy' }) as StoreLockAttempt,
       ensure: async () => true,
       extensionLocks: { lock: f.deps.lock, tryLock: f.deps.tryLock },
+      // Integration of 11H3 with the final 11H2 (#135): the lists in the folder of the fake (its stateDir), never the real /state.
+      extensionStateDir: f.deps.stateDir,
     } as unknown as VscodeBackgroundDeps;
     const transport = vscode.store.transport as { request: unknown };
     transport.request = async () => ({ status: 503, headers: {}, body: '' });
