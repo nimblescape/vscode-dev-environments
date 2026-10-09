@@ -17,7 +17,7 @@ import { runWithDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS, checkSshLogin, type SshCheckDeps } from '../docker/remoteDocker';
 import { errorMessage } from '../errors';
 import { isAbortError, type Logger } from '../ports';
-import { helperImageTag } from './helperImage';
+import { helperImageTag, helperTimeLimit } from './helperImage';
 import { readHelperState } from './helperState';
 import { helperStatePathFor, type HelperImages } from './helperImages';
 
@@ -33,8 +33,12 @@ export type HelperPrebuildOutcome = 'notDue' | 'unsupported' | 'dockerNotRunning
 /**
  * PR #77 review round 1 (A-R1-1): the time limit of a prebuild, on every engine. Nobody can cancel the background prebuild, and an open that
  * joins its build can end only its own wait (R5-1); a build that stalls (a half-open SSH connection after a sleep) would
- * otherwise block every open and worker preparation on that engine until a reload. At the limit the build is ended, and
- * a caller that waited for it builds for itself (BuildKit keeps the finished layers).
+ * otherwise block every open and worker preparation on that engine until a reload. At the limit the build is ended. The
+ * build of a missing tag fails, and a caller that waited for it builds for itself (with the layers that BuildKit
+ * finished in its cache). Review round 1 of PR H (A-L3): a rebuild that a check asked for (`--pull --no-cache`, which
+ * reuses no layer) counts as a failed rebuild instead, as the limit aborts with a time limit (helperTimeLimit): the
+ * existing image is used, also by a caller that waited for it, and the next check is in a week, so the next start does
+ * not repeat it.
  */
 export const HELPER_PREBUILD_TIMEOUT_MS = 15 * 60_000;
 
@@ -110,7 +114,8 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * It runs when the helper state file of the engine has no record of the current helper tag (after an update that
  * changed the tag, a first installation, or a tag that the cleanup removed), or (PR H, decision of 2026-10-09,
  * docs/plan-remote-worker.md section 2), with the setting updateImagesOnConnect on, when the refresh of that tag is due
- * by the state file (HelperImages.refreshDue: the rebuild that a check asked for, the weekly check of the base image).
+ * by the state file (HelperImages.refreshDue: the rebuild that a check asked for, the weekly check of the base image,
+ * which an attempt that the registry did not answer puts off by a week here: review round 1 of PR H, A-L2).
  * The daily cleanup alone never makes it due: it is housekeeping, and runs when the prebuild runs anyway and in the
  * preparation of the worker for an open. Review round 5 of PR #64 (R5-2): the state file alone decides, so a window that
  * starts after the prebuild of another one finds the record (and no refresh due) and does nothing. It asks Docker
@@ -157,7 +162,11 @@ export class HelperPrebuild {
 
   private async prebuild(target: DockerTarget): Promise<HelperPrebuildOutcome> {
     const { deps } = this;
-    const timer = setTimeout(() => this.limit.abort(), deps.timeoutMs ?? HELPER_PREBUILD_TIMEOUT_MS);
+    // Review round 1 of PR H: a time limit, not a cancel, so a rebuild that it ends counts as a failed one.
+    const timer = setTimeout(
+      () => this.limit.abort(helperTimeLimit('The time limit of the background preparation of the workspace helper image ended.')),
+      deps.timeoutMs ?? HELPER_PREBUILD_TIMEOUT_MS,
+    );
     try {
       return await this.prebuildWithin(target, AbortSignal.any([this.controller.signal, this.limit.signal]));
     } finally {

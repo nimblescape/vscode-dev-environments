@@ -305,8 +305,10 @@ export class HelperImages {
    * when they are due. It shares the cached promise of this instance with the preparation of a worker
    * (ensureImagePresent; ensureImageUse before an open), so a preparation that needs the missing tag meanwhile waits for
    * this build instead of building a second time (one before an open also for the rebuild, with its progress); when
-   * `signal` aborts, the build is cancelled, and a preparation that waited for it builds again for itself. Plan step 6,
-   * PR D: on every engine, local or remote (it no longer returns `undefined` for a remote one). Throws like ensureImage.
+   * `signal` aborts, the build is cancelled, and a preparation that waited for it builds again for itself (review round 1
+   * of PR H: a rebuild that the time limit of `signal` ends, helperTimeLimit, counts as a failed rebuild instead, so
+   * that preparation gets the existing image). Plan step 6, PR D: on every engine, local or remote (it no longer returns
+   * `undefined` for a remote one). Throws like ensureImage.
    */
   async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void; checkBaseImage?: boolean }): Promise<HelperImageUse> {
     return this.image({ signal: options.signal, onBuild: options.onBuild, checkBaseImage: options.checkBaseImage }, true);
@@ -315,9 +317,10 @@ export class HelperImages {
   /**
    * PR H (decision of 2026-10-09): whether the refresh of the current tag is due on the engine of the operation, by its
    * state file alone (helperRefreshDue: no Docker call): with `checkBaseImage` (the setting updateImagesOnConnect), the
-   * rebuild that a check asked for, or the weekly check of the base image (with a lookup of its digest). Never for the
-   * daily cleanup alone. `false` without a state file. The background prebuild asks Docker only then, or when the state
-   * file has no record of the current tag.
+   * rebuild that a check asked for, or the weekly check of the base image (with a lookup of its digest; a week also after
+   * an attempt that the registry did not answer: review round 1 of PR H, A-L2). Never for the daily cleanup alone.
+   * `false` without a state file. The background prebuild asks Docker only then, or when the state file has no record
+   * of the current tag.
    */
   async refreshDue(options: { checkBaseImage: boolean }): Promise<boolean> {
     const statePath = this.statePathFor(await this.currentEngine());

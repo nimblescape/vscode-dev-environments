@@ -15,9 +15,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { ImageInfo } from '../docker/dockerObjects';
 import { CommandError } from '../errors';
-import type { Logger } from '../ports';
-import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, type HelperPrebuildDeps } from './helperPrebuild';
-import { helperImageTag, helperRefreshDue, type BaseDigestLookup } from './helperImage';
+import { abortError, type Logger } from '../ports';
+import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, type HelperPrebuildDeps, type HelperPrebuildOutcome } from './helperPrebuild';
+import { HELPER_REBUILD_TIMEOUT_MS, ensureHelperImageUse, helperImageTag, helperRefreshDue, type BaseDigestLookup } from './helperImage';
 import { HelperImages, helperStatePathFor, type HelperImageDocker, type HelperImagesDeps, type HelperMaintenance } from './helperImages';
 import { readHelperState, type HelperState } from './helperState';
 import { heartbeatHelperImage } from '../session/heartbeatHelperImage';
@@ -30,6 +30,9 @@ const NOW = Date.parse('2026-10-09T12:00:00.000Z');
 const OLD = '2026-09-01T12:00:00.000Z';
 /** Within the day before NOW. */
 const TODAY = '2026-10-09T06:00:00.000Z';
+/** Two days before NOW. */
+const TWO_DAYS_AGO = '2026-10-07T12:00:00.000Z';
+const DAY = 24 * 60 * 60 * 1000;
 const ID1 = `sha256:${'1'.repeat(64)}`;
 const ID2 = `sha256:${'2'.repeat(64)}`;
 const DIGEST_A = `sha256:${'a'.repeat(64)}`;
@@ -146,13 +149,17 @@ describe('helperRefreshDue (PR H, decision of 2026-10-09)', () => {
     expect(due({ images: { [TAG]: rebuildAsked } }, true, false)).toBe(true);
   });
 
-  it('the weekly check is due only with the setting on and a lookup of the base digest, a day after an attempt', () => {
+  // Review round 1 of PR H (A-L2): changed expectation (and name; it was "…, a day after an attempt"): for the prebuild,
+  // an attempt that the registry did not answer puts the check off by a week, not a day (two days ago: not due).
+  it('the weekly check is due only with the setting on and a lookup of the base digest, a week after an unanswered attempt', () => {
     const at = (record: object): Omit<HelperState, 'version'> => ({ images: { [TAG]: record } });
     expect(due(at({ checkedAt: OLD }), true)).toBe(true);
     expect(due(at({ checkedAt: OLD }), false)).toBe(false);
     expect(due(at({ checkedAt: OLD }), true, false)).toBe(false);
     expect(due(at({ checkedAt: TODAY }), true)).toBe(false);
     expect(due(at({ checkedAt: OLD, attemptedAt: TODAY }), true)).toBe(false);
+    expect(due(at({ checkedAt: OLD, attemptedAt: TWO_DAYS_AGO }), true)).toBe(false);
+    expect(due(at({ attemptedAt: TWO_DAYS_AGO }), true)).toBe(false);
     expect(due(at({ checkedAt: OLD, attemptedAt: OLD }), true)).toBe(true);
     // A record of the tag of another Dockerfile does not count.
     expect(due({ images: { 'devenv-helper:0123456789ab': { checkedAt: TODAY } } }, true)).toBe(true);
@@ -255,6 +262,60 @@ describe('HelperPrebuild: due for a refresh, never for the cleanup alone, and th
     expect(await prebuild(window(), { checkBaseImage: () => false }).start()).toBe('present');
     expect(lookup).not.toHaveBeenCalled();
     expect(checks).toEqual([]);
+    expect(docker.builds).toHaveLength(1);
+  });
+
+  it('a registry that does not answer makes it contact Docker once a week, not every day (review round 1 of PR H, A-L2)', async () => {
+    docker.tags.set(TAG, ID1);
+    writeState({ images: { [TAG]: { baseImage: 'node:22-bookworm-slim', baseDigest: DIGEST_A, builtAt: OLD, checkedAt: OLD } }, lastCleanupAt: TODAY });
+    const unreachable: BaseDigestLookup = async () => 'unreachable';
+    const outcomes: HelperPrebuildOutcome[] = [];
+    let asked = 0;
+    // The first window start of four days: today, the next two days, and a week later.
+    for (const day of [0, 1, 2, 8]) {
+      const now = NOW + day * DAY + 60_000;
+      const checks: Promise<void>[] = [];
+      const helper = images({ baseDigest: unreachable, clock: { now: () => now }, onBaseImageCheck: (check) => checks.push(check) });
+      const dockerRunning = async (): Promise<boolean> => {
+        asked++;
+        return true;
+      };
+      outcomes.push(await prebuild(helper, { dockerRunning }).start());
+      await Promise.all(checks);
+    }
+    expect(outcomes).toEqual(['present', 'notDue', 'notDue', 'present']);
+    expect(asked).toBe(2);
+    expect((await readState()).images[TAG]?.attemptedAt).toBe(new Date(NOW + 8 * DAY + 60_000).toISOString());
+  });
+
+  it('a rebuild that its time limit ends counts as failed: the existing image, and the next start does not repeat it (review round 1 of PR H)', async () => {
+    docker.tags.set(TAG, ID1);
+    writeState({ images: { [TAG]: rebuildAsked }, lastCleanupAt: TODAY });
+    // A rebuild that stalls without failing: it ends only when its signal aborts (docker build is ended).
+    docker.buildHandler = (options) =>
+      new Promise<void>((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => reject(new Error('docker build was ended')), { once: true });
+      });
+    const helper = images();
+    // The prebuild's own wait ends at its time limit, as before ('failed', logged); the shared ensure ends the stalled
+    // rebuild (its docker build) and counts it as a failed rebuild: the next check is in a week.
+    expect(await prebuild(helper, { timeoutMs: 50 }).start()).toBe('failed');
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+    await vi.waitFor(async () => {
+      const record = (await readState()).images[TAG];
+      expect(record?.latestBaseDigest).toBeUndefined();
+      expect(record?.checkedAt).toBe(new Date(NOW).toISOString());
+    });
+    expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} was not built again within its time limit, so its build was stopped. The existing image is used.`);
+    // An open of this window gets the existing image, without a rebuild of its own.
+    expect(await helper.ensureImageUse({ checkBaseImage: true })).toEqual({ tag: TAG, id: ID1 });
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.tags.get(TAG)).toBe(ID1);
+    // The next window start finds no rebuild asked: nothing is due, Docker is not asked.
+    const running = vi.fn(async () => true);
+    expect(await prebuild(images(), { dockerRunning: running }).start()).toBe('notDue');
+    expect(running).not.toHaveBeenCalled();
     expect(docker.builds).toHaveLength(1);
   });
 
@@ -390,5 +451,64 @@ describe('the preparation of the worker for an open runs the maintaining ensure 
     expect(events).toEqual(['build refresh', 'end']);
     expect(docker.builds).toHaveLength(1);
     preparation.dispose();
+  });
+});
+
+describe('the time limit of a rebuild that a check asked for (review round 1 of PR H)', () => {
+  /** A rebuild that stalls without failing: it ends only when its signal aborts (then docker build is ended). */
+  const stalled = (options: BuildOptions): Promise<void> =>
+    new Promise<void>((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(abortError()), { once: true });
+    });
+
+  it('a rebuild that never ends is stopped after HELPER_REBUILD_TIMEOUT_MS and counts as failed: the existing image, the warning, the next check in a week', async () => {
+    docker.tags.set(TAG, ID1);
+    writeState({ images: { [TAG]: rebuildAsked }, lastCleanupAt: TODAY });
+    docker.buildHandler = stalled;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const ensure = ensureHelperImageUse(docker, path.join(dir, 'Dockerfile'), { statePath: statePath(), clock: { now: () => NOW }, logger, checkBaseImage: true });
+      // Not vi.waitFor (it would advance the fake clock): wait by the real clock until the build runs.
+      const deadline = Date.now() + 10_000;
+      while (docker.builds.length === 0 && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+      expect(docker.builds).toHaveLength(1);
+      expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true, noCache: true });
+      await vi.advanceTimersByTimeAsync(HELPER_REBUILD_TIMEOUT_MS - 1_000);
+      expect(docker.builds[0].signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await ensure).toEqual({ tag: TAG, id: ID1 });
+      // The signal of the build ended it (BootstrapDocker ends the docker build process with it).
+      expect(docker.builds[0].signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(docker.tags.get(TAG)).toBe(ID1);
+    expect(logger.lines).toContain(`warn The workspace helper image ${TAG} was not built again within its time limit, so its build was stopped. The existing image is used.`);
+    const record = (await readState()).images[TAG];
+    expect(record?.latestBaseDigest).toBeUndefined();
+    expect(record?.checkedAt).toBe(new Date(NOW).toISOString());
+  });
+
+  it('a cancel of the caller during the rebuild still rejects with an AbortError and changes nothing', async () => {
+    docker.tags.set(TAG, ID1);
+    writeState({ images: { [TAG]: rebuildAsked }, lastCleanupAt: TODAY });
+    docker.buildHandler = stalled;
+    const controller = new AbortController();
+    const ensure = ensureHelperImageUse(docker, path.join(dir, 'Dockerfile'), {
+      statePath: statePath(),
+      clock: { now: () => NOW },
+      logger,
+      checkBaseImage: true,
+      signal: controller.signal,
+    }).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
+    controller.abort();
+    expect(await ensure).toMatchObject({ name: 'AbortError' });
+    expect(docker.builds[0].signal?.aborted).toBe(true);
+    expect(docker.tags.get(TAG)).toBe(ID1);
+    // The rebuild that the check asked for is still asked for: the next ensure builds again.
+    expect((await readState()).images[TAG]).toMatchObject({ latestBaseDigest: DIGEST_B, checkedAt: TODAY });
+    expect(logger.lines.join('\n')).not.toContain('could not be built again');
+    expect(logger.lines.join('\n')).not.toContain('within its time limit');
   });
 });

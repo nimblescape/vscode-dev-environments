@@ -46,6 +46,38 @@ describe('HelperChannels and the helper image maintenance of an open (PR H)', ()
     channels.dispose();
   });
 
+  // Review round 1 of PR H (A-L1): reviewer A's probe, inverted.
+  it('an open whose worker another call is opening gets the preparation without the maintenance, and joins that worker', async () => {
+    const worker = openChannel();
+    let opened: (channel: HelperChannel) => void = () => {};
+    const open = vi.fn(() => new Promise<HelperChannel>((resolve) => (opened = resolve)));
+    const prepare = vi.fn(async (_target: DockerTarget, _signal: AbortSignal | undefined, maintenance?: HelperMaintenance) => {
+      // The maintaining ensure of an open would report its rebuild here; the others find the tag present.
+      maintenance?.onBuild?.('refresh');
+      maintenance?.onBuildEnd?.();
+    });
+    const channels = new HelperChannels({ open, prepare, logger: silentLogger });
+    // Another call (a Stop; a heartbeat or the passive refresh likewise) prepares at once and starts the worker.
+    const stop = channels.flow(REMOTE, 'stop', {});
+    await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+    // The open arrives while that worker is being opened: no maintenance, as it joins the worker that is being opened.
+    const events: string[] = [];
+    const maintenance: HelperMaintenance = { checkBaseImage: true, onBuild: (kind) => events.push(`build ${kind}`), onBuildEnd: () => events.push('end') };
+    const openFlow = channels.flow(REMOTE, 'open', { repository: 'acme/api' }, { helperMaintenance: maintenance });
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(2));
+    opened(worker as unknown as HelperChannel);
+    expect(await stop).toEqual({ ok: true });
+    expect(await openFlow).toEqual({ ok: true });
+    expect(events).toEqual([]);
+    expect(prepare.mock.calls).toEqual([
+      [REMOTE, undefined],
+      [REMOTE, undefined],
+    ]);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(worker.flow.mock.calls.map((call) => call[0])).toEqual(['stop', 'open']);
+    channels.dispose();
+  });
+
   it('a flow without it prepares the worker without a maintenance, and a passive read never gets one', async () => {
     const prepare = vi.fn(async (_target: DockerTarget, _signal: AbortSignal | undefined, _maintenance?: HelperMaintenance) => {});
     const checkPresent = vi.fn(async (_target: DockerTarget, _signal: AbortSignal | undefined, _maintenance?: HelperMaintenance) => {});

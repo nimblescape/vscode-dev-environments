@@ -231,8 +231,9 @@ export interface HelperChannelsOptions {
    * opened for a call (a flow, the refresh): the helper image, built when its tag is missing (HelperImages.ensureImagePresent).
    * PR H (decision of 2026-10-09): `maintenance` when the call is an operation `open` (its flow option
    * `helperMaintenance`): the maintaining ensure instead (HelperImages.ensureImageUse: the rebuild that a check asked
-   * for, the weekly check of the base image, the daily cleanup), before the worker of the open starts. Rejects when it
-   * cannot; the call is then refused. An AbortError when `signal` aborts.
+   * for, the weekly check of the base image, the daily cleanup), before the worker of the open starts (review round 1 of
+   * PR H, A-L1: not while another call opens the worker of the engine). Rejects when it cannot; the call is then
+   * refused. An AbortError when `signal` aborts.
    */
   prepare?(target: DockerTarget, signal: AbortSignal | undefined, maintenance?: HelperMaintenance): Promise<void>;
   /**
@@ -356,7 +357,8 @@ export class HelperChannels {
    * Throws
    * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts. PR H
    * (decision of 2026-10-09): `maintenance` (the flow of an operation `open`) goes to `prepare`; a worker that is open
-   * already is used as it is, without a preparation.
+   * already is used as it is, without a preparation, and (review round 1 of PR H, A-L1) one that another call is opening
+   * gets the preparation without the maintenance.
    */
   private async ready(target: DockerTarget, signal: AbortSignal | undefined, passive = false, maintenance?: HelperMaintenance): Promise<HelperChannel> {
     if (signal?.aborted) throw abortError();
@@ -368,8 +370,11 @@ export class HelperChannels {
     if (prepare !== undefined) {
       try {
         // PR H (decision of 2026-10-09): the maintenance of the flow of an operation `open` goes to `prepare`; the
-        // check of a passive read (checkPresent) never gets one.
-        if (!passive && maintenance !== undefined) await this.options.prepare?.(target, signal, maintenance);
+        // check of a passive read (checkPresent) never gets one. Review round 1 of PR H (A-L1): nor does the preparation
+        // while another call opens the worker of the engine: the open joins that worker, which starts from the image
+        // that the tag has before a rebuild, so it would wait for a rebuild that it does not use.
+        const opening = this.entries.get(keyOf(target))?.opening !== undefined;
+        if (!passive && maintenance !== undefined && !opening) await this.options.prepare?.(target, signal, maintenance);
         else await prepare(target, signal);
       } catch (error) {
         if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError();
