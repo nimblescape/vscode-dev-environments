@@ -36,6 +36,18 @@ describe('the monitor settings of an open and of monitorEnsure (plan step 11H2)'
     expect(parseMonitorSettings('{}')).toBeUndefined();
   });
 
+  // Review round 1 of 11H2 (A-L2): why the monitor is permanent: `remote`, a boolean, only with `permanent: true`.
+  it('takes `remote` as a boolean only for a permanent monitor', () => {
+    expect(parseMonitorSettings({ ...IMAGES, permanent: true, remote: true })).toEqual({ ...IMAGES, permanent: true, remote: true });
+    expect(parseMonitorSettings({ ...IMAGES, permanent: true, remote: false })).toEqual({ ...IMAGES, permanent: true, remote: false });
+    expect(parseMonitorSettings({ ...IMAGES, remote: false })).toEqual({ ...IMAGES, remote: false });
+    for (const images of [{ ...IMAGES, remote: true }, { ...IMAGES, permanent: false, remote: true }, { ...IMAGES, permanent: true, remote: 'yes' }, { ...IMAGES, permanent: true, remote: null }]) {
+      expect(parseMonitorSettings(images), JSON.stringify(images)).toBeUndefined();
+    }
+    expect(parseMonitorEnsureParams({ images: { ...IMAGES, permanent: true, remote: true } })).toEqual({ images: { ...IMAGES, permanent: true, remote: true } });
+    expect(imageSettingsOf({ ...IMAGES, permanent: true, remote: true } as typeof IMAGES)).toEqual(IMAGES);
+  });
+
   it('carries the mode in monitorEnsure and in the open', () => {
     expect(parseMonitorEnsureParams({ images: { ...IMAGES, permanent: true } })).toEqual({ images: { ...IMAGES, permanent: true } });
     expect(parseMonitorEnsureParams({ images: { ...IMAGES, permanent: 'yes' } })).toBeUndefined();

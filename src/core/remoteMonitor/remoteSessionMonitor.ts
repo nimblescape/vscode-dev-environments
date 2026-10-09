@@ -28,8 +28,12 @@ import {
   REMOTE_MONITOR_SCRIPT_PATH,
   REMOTE_MONITOR_STATE_DIR,
   REMOTE_MONITOR_VOLUME,
-  PERMANENT_MONITOR_LABEL_PART,
+  PERMANENT_LOCAL_LABEL_PART,
+  PERMANENT_REMOTE_LABEL_PART,
+  monitorModeOf,
   remoteMonitorLabelValue,
+  vscodeStoreLabelPart,
+  type MonitorMode,
   type MonitorSettings,
 } from './protocol';
 
@@ -91,6 +95,8 @@ export interface ImageMaintenanceSettings {
   timeZone: string;
   /** Plan step 11H2 (D1): the monitor runs permanently (MonitorSettings.permanent); missing: it ends when idle. */
   permanent?: MonitorSettings['permanent'];
+  /** Review round 1 of 11H2 (A-L2): permanent because the engine is remote for this computer (MonitorSettings.remote). */
+  remote?: MonitorSettings['remote'];
 }
 
 /** Plan step 11H2 (D1): the environment variable that tells the monitor that it runs permanently (`1`). */
@@ -239,11 +245,17 @@ export class RemoteSessionMonitor {
     // so computers with other settings or another time zone on the same engine do not replace it at each open. Plan step
     // 11H2 (D1 of 2026-10-09): the label holds the mode (permanent or not: its restart policy and its exit when idle) in
     // place of whether it maintains images (its network, which it now always has).
-    const permanent = images?.permanent === true;
-    const label = monitorLabel(script, helperTag, permanent);
-    // Plan step 11H2 (D1): one engine can be local for one computer and remote for another, so an ensure that wants a
-    // monitor that ends when idle takes a running permanent one of the same version as current (acceptedLabels).
-    const accepted = permanent ? { label } : { label, running: monitorLabel(script, helperTag, true) };
+    // Review round 1 of 11H2 (A-L2, A-L6): the label holds why it is permanent, and the store that it mounts.
+    const mode = monitorModeOf(images);
+    const store = this.options.vscodeStoreVolume;
+    const label = monitorLabel(script, helperTag, mode, store);
+    // Plan step 11H2 (D1): one engine can be local for one computer and remote for another, so an ensure takes a running
+    // monitor of the same version that another computer runs permanently as current (acceptedLabels). Review round 1 of
+    // 11H2 (A-L2): an ensure that sees the engine as local (permanent or not) takes a running `permanent-remote` one; one
+    // that sees it as remote takes a running `permanent-local` one. So turning stopLocalMonitorWhenIdle on again replaces
+    // this computer's own permanent monitor (`permanent-local`) at its next ensure.
+    const other: MonitorMode = mode === PERMANENT_REMOTE_LABEL_PART ? PERMANENT_LOCAL_LABEL_PART : PERMANENT_REMOTE_LABEL_PART;
+    const accepted = { label, running: monitorLabel(script, helperTag, other, store) };
     // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
     const createId = randomUUID();
     const spec = this.runSpec(helperImage ?? helperTag, socketPath, label, script, images, createId, imageId);
@@ -599,11 +611,12 @@ export class RemoteSessionMonitor {
 }
 
 /**
- * Plan step 11H2 (D1 of 2026-10-09): the label of the monitor container (remoteMonitorLabelValue) for its mode: the part
- * PERMANENT_MONITOR_LABEL_PART for a permanent one, none for one that ends when idle.
+ * Plan step 11H2 (D1 of 2026-10-09): the label of the monitor container (remoteMonitorLabelValue) for its mode: none for
+ * one that ends when idle. Review round 1 of 11H2 (A-L2): `permanent-remote` or `permanent-local` for a permanent one
+ * (PERMANENT_REMOTE_LABEL_PART, PERMANENT_LOCAL_LABEL_PART); (A-L6) and the store that it mounts (vscodeStoreLabelPart).
  */
-export function monitorLabel(script: string, helperTag: string, permanent: boolean): string {
-  return remoteMonitorLabelValue(script, helperTag, permanent ? [PERMANENT_MONITOR_LABEL_PART] : []);
+export function monitorLabel(script: string, helperTag: string, mode: MonitorMode, store?: string): string {
+  return remoteMonitorLabelValue(script, helperTag, [...(mode === 'idle' ? [] : [mode]), ...(store !== undefined ? [vscodeStoreLabelPart(store)] : [])]);
 }
 
 /**

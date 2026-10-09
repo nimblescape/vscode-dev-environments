@@ -10,6 +10,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import type { ExtensionSettings } from '../core/types';
 import { Messages } from '../core/messages';
+import { parseCacheSchedule } from '../core/remoteMonitor/cacheSettings';
 import {
   DEFAULT_SETTINGS,
   MAX_REFRESH_INTERVAL_MINUTES,
@@ -111,6 +112,12 @@ describe('settings (concept section 8)', () => {
     const pattern = new RegExp(schedule.pattern ?? '');
     for (const text of ['17', ' 60 ', '7 6 * * *', '7 */6 * * 1-5']) expect(pattern.test(text), text).toBe(true);
     for (const text of ['17 minutes', '7 6 * *', 'soon', '']) expect(pattern.test(text), text).toBe(false);
+    // Review round 1 of 11H2 (A-L1): the pattern takes exactly the minutes that the parse takes (5 to 1440, leading zeros
+    // allowed), so the settings editor shows its error for `4`, `0` or `1441` instead of a silent default.
+    for (const text of ['4', '0', '1441', '525601', '12345678', '00004']) expect(pattern.test(text), text).toBe(false);
+    for (let minutes = 0; minutes <= 2000; minutes++) {
+      for (const text of [String(minutes), `00${minutes}`]) expect(pattern.test(text), text).toBe(parseCacheSchedule(text)?.kind === 'interval');
+    }
   });
 
   // Plan step 11H2 (D1, decision of 2026-10-09): stopLocalMonitorWhenIdle, a boolean, true by default.

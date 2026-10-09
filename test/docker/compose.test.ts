@@ -55,7 +55,7 @@ import {
   expectLabelledEnvironmentImage,
   runInVolume,
   testHelperImage } from './harness';
-import { monitorOfUser, removeTestMonitor, workerWindow } from './workerWindow';
+import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, workerWindow } from './workerWindow';
 
 const CONFIG_PATH = '.devcontainer/devcontainer.json';
 const INIT_SQL = 'select 1;';
@@ -245,6 +245,8 @@ ${extra}volumes:
     // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
     // WorkspaceHelper).
     await testHelperImage(docker, log, env);
+    // Review round 1 of 11H2 (A-L5): the real monitor of the opens runs no background run during the tests.
+    await seedTestMonitorRun(docker, { run });
     apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
     log.info(`Docker Engine API ${apiVersion}`);
     // Review round 17 (D17-1): with a volume named with `${devcontainerId}`, which read-configuration leaves as written.

@@ -672,7 +672,8 @@ describe('the Session Monitor container: the environment lock of its stops and i
   // Plan step 11H2 (decision of 2026-10-09, D1 and "unless-stopped"): a permanent monitor (a remote engine, or
   // stopLocalMonitorWhenIdle off) has the restart policy `unless-stopped`, mounts the store of the worker read-write with
   // `nocopy` at /vscode (a volume of this run), and never exits when idle; an ensure of one that ends when idle keeps it.
-  // Its first background run is a day away (DEVENV_IMAGE_FIRST_MS), so nothing is downloaded here.
+  // Its first background run is a day away (DEVENV_IMAGE_FIRST_MS), so nothing is downloaded here (review round 1 of 11H2,
+  // A-L5: the one Docker test of the monitor with the store; it downloads nothing).
   it('a permanent monitor: unless-stopped, the store at /vscode, no exit when idle; an ensure of one that ends when idle keeps it (plan step 11H2)', async () => {
     cli.run(['rm', '-f', containerName]);
     const store = testVscodeVolume({ run, cli }, 'remoteMonitor');
@@ -686,7 +687,9 @@ describe('the Session Monitor container: the environment lock of its stops and i
       containerEnv: { DEVENV_MONITOR_TICK_MS: String(TICK_MS), DEVENV_MONITOR_IDLE_MS: '3000', DEVENV_IMAGE_FIRST_MS: '86400000' },
       vscodeStoreVolume: store,
     };
-    const permanent = new RemoteSessionMonitor({ ...options, imageMaintenance: () => ({ prefixes: [], schedule: '17', timeZone: 'UTC', permanent: true }) });
+    // Review round 1 of 11H2 (A-L2): changed expectation, a monitor of a computer that reaches the engine as a remote one
+    // (`remote`), which a window that sees the engine as local keeps (a local one with the setting off would be replaced).
+    const permanent = new RemoteSessionMonitor({ ...options, imageMaintenance: () => ({ prefixes: [], schedule: '17', timeZone: 'UTC', permanent: true, remote: true }) });
     expect(await permanent.ensure(helperTag, socket)).toBe('created');
     const details = cli.container(containerName) as unknown as {
       HostConfig: { RestartPolicy: { Name: string }; Mounts?: Array<{ Type: string; Source: string; Target: string; VolumeOptions?: { NoCopy?: boolean } }> };

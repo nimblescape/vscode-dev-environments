@@ -641,8 +641,9 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
 /**
  * Monitor cleanup, user decision 2026-09-29 (R4): the temporary files of writeStateFile
  * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
+ * Review round 1 of 11H2 (reviewer B, D2): and of cache-run.json (written at the end of every background run).
  */
-export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
+export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images|cache-run)\.json\.\d+\.\d+\.tmp$/;
 /**
  * Such a file whose modification time is more than this from now is removed at the start of `run` (only then: a younger
  * one stays until the next start; review round 9 of PR #63, A2).
@@ -795,6 +796,8 @@ export class CacheSchedule {
   private checking = false;
   /** The observe of a check that runs now; a pass waits for it (review round 9, T1). */
   private observing: Promise<void> | undefined;
+  /** Review round 1 of 11H2 (A-L8): the run that runs now (its end stored), for the idle exit. */
+  private current: Promise<void> | undefined;
 
   constructor(
     private readonly deps: {
@@ -848,13 +851,32 @@ export class CacheSchedule {
     if (missed !== undefined && missed <= this.deps.now()) this.deps.log('A background run was still running; the times of the schedule during it are left out.');
   }
 
+  /** Review round 1 of 11H2 (A-L8): whether a run runs now. */
+  get busy(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Review round 1 of 11H2 (A-L8): resolves when no run runs (the one that runs now ended and its end is stored). The run
+   * is bounded by the time limits of its own parts (a request to the engine, the update service, a fetch, a pull).
+   */
+  async settled(): Promise<void> {
+    await this.current;
+  }
+
   /** One run now, unless one runs; then its end is kept (in the volume too). Never throws. */
-  async run(): Promise<void> {
+  run(): Promise<void> {
     if (this.running) {
       this.deps.log('A background run is still running; this time of the schedule is left out.');
-      return;
+      return Promise.resolve();
     }
     this.running = true;
+    const current = this.runOnce();
+    this.current = current;
+    return current;
+  }
+
+  private async runOnce(): Promise<void> {
     try {
       // Review round 9 of PR #57 (T1): not together with the observe of a check (both keep the store of IDs).
       await this.observing?.catch(() => undefined);
@@ -1022,6 +1044,13 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         // step 11H2 (D1 of 2026-10-09): a permanent monitor (a remote engine, or stopLocalMonitorWhenIdle off) never exits
         // when idle; one that ends when idle does so also with image updates (before, they kept it).
         if (!permanent && loop.idleMs() >= idleExitMs) {
+          // Review round 1 of 11H2 (A-L8): not during a background run (a download would be cut, and its end not stored):
+          // the exit waits for its end (bounded by the limits of its parts), then the loop looks again.
+          if (schedule.busy) {
+            log('No environment container runs, but a background run is running; the Session Monitor exits after its end.');
+            await schedule.settled();
+            continue;
+          }
           await loop.removals;
           // Review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats too.
           log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and it does not run permanently; the Session Monitor exits. The next open starts it again.`);

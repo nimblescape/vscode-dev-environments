@@ -419,6 +419,21 @@ export function dockerEngine(
       if (typeof value?.Architecture !== 'string' || value.Architecture === '') throw new EngineError('The engine answered /info without its architecture.', 200);
       return value.Architecture;
     },
+    // Review round 1 of 11H2 (A-M2): the server versions that running dev containers run, for the cleanup of the store.
+    processes: async (container, signal) => {
+      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/top`, signal });
+      if (answer.status === 404 || answer.status === 409) return undefined;
+      if (answer.status !== 200) fail(answer);
+      if (answer.truncated) throw new EngineError('The engine answered the processes of a container with more than can be read.', answer.status);
+      const value = json(answer.body) as { Processes?: unknown } | undefined;
+      const rows = value?.Processes;
+      // An empty list may come as null.
+      if (rows === null) return [];
+      if (!Array.isArray(rows) || !rows.every((row) => Array.isArray(row) && row.every((field) => typeof field === 'string'))) {
+        throw new EngineError('The engine answered the processes of a container with an invalid value.', answer.status);
+      }
+      return rows as string[][];
+    },
     createAttached: (spec, options) => createAttached(api, hijack, spec, options),
     runAttached: (spec, options) => runAttached(api, hijack, spec, options),
   };

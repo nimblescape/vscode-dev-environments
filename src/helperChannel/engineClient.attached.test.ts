@@ -281,6 +281,26 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     await expect(failing.engine.proxy()).rejects.toThrow('daemon busy');
   });
 
+  // Review round 1 of 11H2 (A-M2): the processes of a container (`GET /containers/<id>/top`), for the cleanup of the store.
+  it('reads the processes of a container; a missing or stopped one has none; another answer is a failure (review round 1 of 11H2)', async () => {
+    const rows = [['root', '1', '0', '0', '10:00', '?', '00:00:00', 'sleep infinity']];
+    const good = await serve(() => ({ status: 200, json: { Titles: ['UID', 'PID', 'PPID', 'C', 'STIME', 'TTY', 'TIME', 'CMD'], Processes: rows } }));
+    expect(await good.engine.processes('dev a')).toEqual(rows);
+    expect(good.calls[0]).toMatchObject({ method: 'GET', url: '/containers/dev%20a/top' });
+    const empty = await serve(() => ({ status: 200, json: { Titles: ['PID'], Processes: null } }));
+    expect(await empty.engine.processes('a')).toEqual([]);
+    for (const status of [404, 409]) {
+      const gone = await serve(() => ({ status, json: { message: 'is not running' } }));
+      expect(await gone.engine.processes('a'), String(status)).toBeUndefined();
+    }
+    const failing = await serve(() => ({ status: 500, json: { message: 'daemon busy' } }));
+    await expect(failing.engine.processes('a')).rejects.toThrow('daemon busy');
+    for (const json of [{ Titles: [] }, { Processes: [['1', 2]] }, { Processes: 'x' }, [1]]) {
+      const bad = await serve(() => ({ status: 200, json }));
+      await expect(bad.engine.processes('a'), JSON.stringify(json)).rejects.toThrow('an invalid value');
+    }
+  });
+
   it('reads the architecture of the engine (plan step 11H1: the platform of the shared VS Code server); none is a failure', async () => {
     const good = await serve(() => ({ status: 200, json: { Architecture: 'aarch64', Containers: 3 } }));
     expect(await good.engine.architecture()).toBe('aarch64');

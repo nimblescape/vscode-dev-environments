@@ -32,9 +32,10 @@ export type ImageEngine = Pick<DockerEngine, 'images' | 'inspect' | 'pull' | 'co
  * Plan step 11H2 (decision of 2026-10-09): what the VS Code part of the background run asks of its engine: the proxy of
  * the daemon (its HTTPS, decision C1 of 2026-10-05) and its architecture (the platform of the server), the running dev
  * containers (their list and the inspect of each: their mounts and their label devcontainer.metadata), and the exec of the
- * link script of the registry of the container scripts in each.
+ * link script of the registry of the container scripts in each. Review round 1 of 11H2 (A-M2): and, for the cleanup, the
+ * running containers that mount the store (containerIds) and their processes (`GET /containers/<id>/top`).
  */
-export type VscodeEngine = Pick<DockerEngine, 'proxy' | 'architecture' | 'containerSummaries' | 'container' | 'exec'>;
+export type VscodeEngine = Pick<DockerEngine, 'proxy' | 'architecture' | 'containerSummaries' | 'container' | 'exec' | 'containerIds' | 'processes'>;
 
 /** The engine of `run`: the loop's, the image maintenance's and (plan step 11H2) the VS Code part's of the background run. */
 export type MonitorEngineParts = LoopEngine & ImageEngine & VscodeEngine;

@@ -5,7 +5,7 @@
 // Plan step 11H2 (decision of 2026-10-09, D3 and the plan's 11H2 row): what the Session Monitor's background run uses of the
 // store: the released commits of the update service (the host fixed, the answer capped and strictly parsed), the version
 // of a temporary folder, the lock of a version without a wait (`flock -n`), and the marker of the last use of a version
-// (the modification time of its folder), which the open sets too.
+// by an open (review round 1 of 11H2, A-M1: a file of its own in `used/`, which only the open sets).
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -17,12 +17,14 @@ import { silentLogger } from '../ports';
 import {
   MAX_SERVER_COMMITS_BYTES,
   ensureEngineServer,
-  markServerUsed,
+  markServerOpened,
   parseServerCommits,
   serverCommits,
   serverCommitsUrl,
   serverFolder,
   serverLockFile,
+  serverOpenedAt,
+  serverUseMarker,
   storeTryLock,
   temporaryFolderVersion,
   type VscodeStoreDeps,
@@ -147,26 +149,47 @@ describe('the lock of a version without a wait (plan step 11H2, flock -n)', () =
   });
 });
 
-describe('the marker of the last use of a version (plan step 11H2)', () => {
-  it('sets the modification time of the folder, without following a link', async () => {
+// Review round 1 of 11H2 (A-M1): changed expectation, the marker of the last use is a file of its own per version in
+// `used/`, set only by the open (markServerUsed, the modification time of the version's folder that the monitor's link
+// set too, is removed with this change).
+describe('the marker of the last use of a version by an open (plan step 11H2, review round 1: A-M1)', () => {
+  const NAME = `stable-linux-x64-${COMMIT}`;
+
+  it('creates or touches the file used/<version>, never following a link; a missing store is no failure and is not made', async () => {
     const root = tempDir();
-    const folder = readyServer(root);
-    const past = new Date(Date.parse('2026-01-01T00:00:00Z'));
-    fs.utimesSync(folder, past, past);
     const at = new Date(Date.parse('2026-10-09T12:00:00Z'));
-    await markServerUsed(folder, at);
-    expect(fs.lstatSync(folder).mtimeMs).toBe(at.getTime());
-    const target = tempDir();
+    expect(await serverOpenedAt(root, NAME)).toBeUndefined();
+    await markServerOpened(root, { commit: COMMIT, quality: 'stable' }, 'linux-x64', at);
+    expect(await serverOpenedAt(root, NAME)).toBe(at.getTime());
+    expect(fs.statSync(path.join(root, 'used')).mode & 0o077).toBe(0);
+    const later = new Date(at.getTime() + 60_000);
+    await markServerOpened(root, { commit: COMMIT, quality: 'stable' }, 'linux-x64', later);
+    expect(await serverOpenedAt(root, NAME)).toBe(later.getTime());
+    // A link in the place of the marker is neither followed nor taken as a use.
+    const target = path.join(tempDir(), 'target');
+    fs.writeFileSync(target, '');
+    const past = new Date(Date.parse('2026-01-01T00:00:00Z'));
     fs.utimesSync(target, past, past);
-    const link = path.join(root, 'link');
-    fs.symlinkSync(target, link);
-    await markServerUsed(link, at);
+    const other = `stable-linux-x64-${'f'.repeat(40)}`;
+    fs.symlinkSync(target, serverUseMarker(root, other));
+    await markServerOpened(root, { commit: 'f'.repeat(40), quality: 'stable' }, 'linux-x64', at);
     expect(fs.statSync(target).mtimeMs).toBe(past.getTime());
-    // A missing folder is no failure.
-    await markServerUsed(path.join(root, 'missing'), at);
+    expect(await serverOpenedAt(root, other)).toBeUndefined();
+    // The store is the mount of the volume: a missing one is not made.
+    const missing = path.join(tempDir(), 'missing');
+    await markServerOpened(missing, { commit: COMMIT, quality: 'stable' }, 'linux-x64', at);
+    expect(fs.existsSync(missing)).toBe(false);
   });
 
-  it('the open marks the version that it needs as used (ensureEngineServer)', async () => {
+  it('a link in the place of the folder used/ is not followed', async () => {
+    const root = tempDir();
+    const elsewhere = tempDir();
+    fs.symlinkSync(elsewhere, path.join(root, 'used'));
+    await markServerOpened(root, { commit: COMMIT, quality: 'stable' }, 'linux-x64');
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+  });
+
+  it('the open marks the version that it needs (ensureEngineServer), also when its fetch fails; the folder keeps its time', async () => {
     const root = tempDir();
     const folder = readyServer(root);
     const past = new Date(Date.parse('2026-01-01T00:00:00Z'));
@@ -184,6 +207,11 @@ describe('the marker of the last use of a version (plan step 11H2)', () => {
     };
     const before = Date.now();
     expect(await ensureEngineServer(deps, { commit: COMMIT, quality: 'stable' }, new AbortController().signal)).toBe('linux-x64');
-    expect(fs.lstatSync(folder).mtimeMs).toBeGreaterThanOrEqual(before - 1000);
+    expect((await serverOpenedAt(root, NAME))!).toBeGreaterThanOrEqual(before - 1000);
+    expect(fs.lstatSync(folder).mtimeMs).toBe(past.getTime());
+    // A version that is not in the store and cannot be fetched (the lock fails): marked all the same (an open wants it).
+    const missing = { commit: 'e'.repeat(40), quality: 'insider' as const };
+    expect(await ensureEngineServer({ ...deps, lock: async () => Promise.reject(new Error('no lock')) }, missing, new AbortController().signal)).toBeUndefined();
+    expect(await serverOpenedAt(root, `insider-linux-x64-${'e'.repeat(40)}`)).toBeGreaterThanOrEqual(before - 1000);
   });
 });

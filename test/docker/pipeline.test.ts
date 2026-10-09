@@ -71,7 +71,7 @@ import {
   runInVolume,
   testHelperImage,
 } from './harness';
-import { monitorOfUser, removeTestMonitor, workerWindow, type WorkerWindow } from './workerWindow';
+import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, workerWindow, type WorkerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/tiny';
 const FOLDER = '/workspaces/tiny';
@@ -284,6 +284,8 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
     // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
     // WorkspaceHelper).
     await timings.measure('workspace helper image ready', () => testHelperImage(docker, log, env));
+    // Review round 1 of 11H2 (A-L5): the real monitor of the opens runs no background run during the tests.
+    await seedTestMonitorRun(docker, { run });
     paths.ensureDirectoriesSync();
     hostPort = await freePort();
     const devcontainerJson = JSON.stringify(

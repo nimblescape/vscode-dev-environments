@@ -378,8 +378,10 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     // Plan step 11D2: changed, the operation `monitorEnsure` of the worker of the repair's engine (before:
     // monitorEnsure(remoteMonitor, engineSocket), removed with its test).
     // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, with the mode of the monitor of the repair's engine
-    // (a remote target runs it permanently; was imageMaintenance() without it).
-    expect(source).toContain("const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(target.kind === 'remote'), signal));");
+    // (a remote target runs it permanently; was imageMaintenance() without it). Review round 1 of 11H2 (A-L7): changed
+    // expectation, the settings of the target come from monitorSettings.forTarget (src/vscode/monitorSettings.ts, tested by
+    // its result in extension.monitorMode.11H2.test.ts; was imageMaintenance(target.kind === 'remote')).
+    expect(source).toContain('const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, monitorSettings.forTarget(target), signal));');
     expect(source).not.toContain('ensureOrThrow(image.tag');
     expect(source).toMatch(/onImageBuilt: \(\) => \{\s*helperChannels\?\.clearFailures\(\);\s*heartbeats\.imageBuilt\(\);\s*\}/);
   });

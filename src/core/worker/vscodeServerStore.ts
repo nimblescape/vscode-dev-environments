@@ -12,10 +12,13 @@
 //                                                          monitor of the engine: one download of a version at a time)
 //   <store>/tmp/<quality>-<platform>-<commit>-<random>/  the archive and the unpacked folder of one download, removed on
 //                                                          every outcome
-// Plan step 11H2: the modification time of the folder of a server version is the time of its last use (markServerUsed:
-// the open and the Session Monitor's link set it), and the cleanup of the monitor takes the lock of a version without a
-// wait (storeTryLock) and reads the released commits of the update service (serverCommits); lock files are never removed.
-// A present server costs two `lstat` calls: no lock, no network (plan step 11H2: and the open sets the time of its use). The host of the update service is fixed here
+//   <store>/used/<quality>-<platform>-<commit>             review round 1 of 11H2 (A-M1): the marker of the last use of
+//                                                          a version by an open (markServerOpened; its modification time)
+// Plan step 11H2: the cleanup of the monitor takes the lock of a version without a wait (storeTryLock) and reads the
+// released commits of the update service (serverCommits); lock files are never removed. Review round 1 of 11H2 (A-M1):
+// only an open marks a version as used (never the monitor's own fetch or link), so the monitor's fetches never keep
+// themselves (or the fetch of Insiders) going. A present server costs two `lstat` calls: no lock, no network (and the open
+// touches its marker). The host of the update service is fixed here
 // (VSCODE_UPDATE_SERVICE): the extension sends only the commit and the quality, never a URL. The download goes over the
 // worker's HTTPS transport (the proxy of the daemon, decision C1 of 2026-10-05), streamed to a file, its SHA-256 checked
 // against the update service, unpacked with `tar` and renamed into place. Every failure is one line in the log and means
@@ -210,22 +213,57 @@ export async function ensureEngineServer(deps: VscodeStoreDeps, server: VscodeSe
     deps.logger.info(`The VS Code server ${name} is not fetched into the shared store: the engine's architecture ${JSON.stringify(architecture)} has no server there.`);
     return undefined;
   }
+  // Plan step 11H2, review round 1 (A-M1): the open uses this version now (markServerOpened). Before the check of the
+  // store, so that a cleanup that takes the lock of this version after it sees the use (it checks the marker again under
+  // the lock).
+  await markServerOpened(deps.root, server, platform);
   if (!(await ensureServerWithin(deps, server, platform, signal, limit))) return undefined;
-  // Plan step 11H2: the open uses this version now (the marker of the cleanup of the store, markServerUsed).
-  await markServerUsed(serverFolder(deps.root, server, platform));
   return platform;
 }
 
+/** Review round 1 of 11H2 (A-M1): the folder of the markers of the use of a server version by an open. */
+export const STORE_USED_FOLDER = 'used';
+
+/** Review round 1 of 11H2 (A-M1): the marker of the use of the server version `version` (serverVersionName) by an open. */
+export function serverUseMarker(root: string, version: string): string {
+  return path.posix.join(root, STORE_USED_FOLDER, version);
+}
+
 /**
- * Plan step 11H2 (the brief: "used", a cheap marker): the modification time of the folder of a server version in the
- * store is the time of its last use: the open that needs it (ensureEngineServer) and the link of the Session Monitor into
- * a running dev container set it to now (without following a link). The cleanup of the store removes a version whose
- * folder was not touched for SERVER_UNUSED_MS (src/remoteMonitor/backgroundRules.ts). The dev containers mount the store
- * read-only, so only the workers and the monitor set it. Best effort: a failure is ignored (the version then counts as
- * used when it was last touched).
+ * Plan step 11H2 (the brief: "used", a cheap marker), review round 1 (A-M1): the open that needs a server version
+ * (ensureEngineServer, the worker of the open, before its link) sets the modification time of its marker
+ * (`<store>/used/<version>`, an empty file, created when missing) to now; nothing else does: the Session Monitor's own
+ * fetch and link never count as a use. The marker decides whether the monitor keeps the newest Insiders server present
+ * (an insider version used by an open within 14 days) and which versions its cleanup may remove (not used by an open for
+ * 14 days). The file is opened without following a link, in a `used` folder that is no link; the dev containers mount
+ * the store read-only, so only the workers set it. Best effort: a failure is ignored.
  */
-export async function markServerUsed(folder: string, at: Date = new Date()): Promise<void> {
-  await fs.promises.lutimes(folder, at, at).catch(() => undefined);
+export async function markServerOpened(root: string, server: VscodeServerRef, platform: VscodePlatform, at: Date = new Date()): Promise<void> {
+  try {
+    const folder = path.posix.join(root, STORE_USED_FOLDER);
+    // Never the store itself (it is the mount of the volume): only its folder `used`, which must be a plain folder.
+    await fs.promises.mkdir(folder, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    if (!(await fs.promises.lstat(folder)).isDirectory()) return;
+    const handle = await fs.promises.open(serverUseMarker(root, serverVersionName(server, platform)), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+    try {
+      await handle.utimes(at, at);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Best effort: the version then counts as used when it was last marked.
+  }
+}
+
+/**
+ * Review round 1 of 11H2 (A-M1): when an open last used the server version `version` (the modification time of its
+ * marker, a regular file), or undefined when no open marked it.
+ */
+export async function serverOpenedAt(root: string, version: string): Promise<number | undefined> {
+  const stat = await fs.promises.lstat(serverUseMarker(root, version)).catch(() => undefined);
+  return stat?.isFile() === true ? stat.mtimeMs : undefined;
 }
 
 /** Waits for `promise`; rejects when `signal` aborts first (a call that ignores its signal ends at the limit too). */

@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { LABEL_ENVIRONMENT_ID } from '../core/names';
 import { CACHE_RUN_FILE, IMAGE_SETTINGS_FILE } from '../core/remoteMonitor/protocol';
 import type { EngineContainerSummary } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
@@ -205,5 +206,128 @@ describe('the VS Code part of the container (plan step 11H2)', () => {
     expect(deps?.storeVolume).toBe('devenv-vscode');
     expect(deps?.store.root).toBe('/vscode');
     expect(deps?.store.background).toBe(true);
+  });
+});
+
+// Review round 1 of 11H2 (reviewer A, A-L8): the idle exit of a monitor that ends when idle waits for a background run
+// that runs (it is not cut, and its end is stored), and exits after it.
+describe('the idle exit during a background run (review round 1 of 11H2, A-L8)', () => {
+  it('waits for the run to end, stores its end, then exits', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    let started!: () => void;
+    const runStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const gate = new Promise<string>((_resolve, reject) => (finish = () => reject(new Error('ended by the test'))));
+    const store = path.join(stateDir, 'store');
+    fs.mkdirSync(store);
+    const vscode = {
+      store: { root: store },
+      storeVolume: 'devenv-vscode',
+      engine: {
+        ...unusedEngine(),
+        architecture: async () => {
+          started();
+          return gate;
+        },
+      },
+      tryLock: async () => ({ kind: 'busy' as const }),
+    } as unknown as NonNullable<ReturnType<typeof vscodeBackgroundDeps>>;
+    let mono = 0;
+    let ticks = 0;
+    let out = '';
+    const result = main(['run'], {
+      env: { DEVENV_IMAGE_FIRST_MS: '1000' },
+      stateDir,
+      engine: { ...unusedEngine(), containerSummaries: async (): Promise<EngineContainerSummary[]> => [] },
+      vscodeBackground: () => vscode,
+      lockEnvironment: async () => ({ kind: 'locked', release: () => {} }),
+      exec: (_file, _args, _options, callback) => callback(null, 'removed\n', ''),
+      monotonic: () => mono,
+      now: () => T0 + mono,
+      sleep: async (ms) => {
+        ticks += 1;
+        mono += ms;
+        if (ticks === 1) await runStarted;
+      },
+      out: (text) => (out += text),
+    });
+    let exited: number | undefined;
+    void result.then((code) => (exited = code));
+    await vi.waitFor(() => expect(out).toContain('first check in 1 s'));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(out).toContain('a background run is running; the Session Monitor exits after its end.'));
+    expect(exited).toBeUndefined();
+    expect(out).not.toContain('The background run ended.');
+    expect(fs.existsSync(path.join(stateDir, CACHE_RUN_FILE))).toBe(false);
+    finish();
+    expect(await result).toBe(0);
+    expect(out.indexOf('The background run ended.')).toBeGreaterThan(-1);
+    expect(out.indexOf('the Session Monitor exits. The next open starts it again.')).toBeGreaterThan(out.indexOf('The background run ended.'));
+    expect(JSON.parse(fs.readFileSync(path.join(stateDir, CACHE_RUN_FILE), 'utf8')).lastEndAt).toBeGreaterThanOrEqual(T0);
+  });
+
+  it('looks again after the run: an environment that started meanwhile keeps it running', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
+    let started!: () => void;
+    const runStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const gate = new Promise<string>((_resolve, reject) => (finish = () => reject(new Error('ended by the test'))));
+    const store = path.join(stateDir, 'store');
+    fs.mkdirSync(store);
+    const vscode = {
+      store: { root: store },
+      storeVolume: 'devenv-vscode',
+      engine: {
+        ...unusedEngine(),
+        architecture: async () => {
+          started();
+          return gate;
+        },
+      },
+      tryLock: async () => ({ kind: 'busy' as const }),
+    } as unknown as NonNullable<ReturnType<typeof vscodeBackgroundDeps>>;
+    let environmentRuns = false;
+    let mono = 0;
+    let ticks = 0;
+    let afterRun = 0;
+    let out = '';
+    let reachedBlock = false;
+    const result = main(['run'], {
+      env: { DEVENV_IMAGE_FIRST_MS: '1000' },
+      stateDir,
+      engine: {
+        ...unusedEngine(),
+        containerSummaries: async (): Promise<EngineContainerSummary[]> =>
+          environmentRuns ? [{ id: 'e'.repeat(64), name: 'dev', state: 'running', labels: { [LABEL_ENVIRONMENT_ID]: '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d' } }] : [],
+      },
+      vscodeBackground: () => vscode,
+      lockEnvironment: async () => ({ kind: 'locked', release: () => {} }),
+      exec: (_file, _args, _options, callback) => callback(null, 'removed\n', ''),
+      monotonic: () => mono,
+      now: () => T0 + mono,
+      sleep: async (ms) => {
+        ticks += 1;
+        mono += ms;
+        if (ticks === 1) await runStarted;
+        if (environmentRuns && ++afterRun >= 5) {
+          reachedBlock = true;
+          await new Promise(() => {});
+        }
+      },
+      out: (text) => (out += text),
+    });
+    let exited = false;
+    void result.then(() => (exited = true));
+    await vi.waitFor(() => expect(out).toContain('first check in 1 s'));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(out).toContain('the Session Monitor exits after its end.'));
+    environmentRuns = true;
+    finish();
+    // The end of the run is real I/O; the ticks after it may wait on timers of their own (fake here, which vi.waitFor
+    // advances).
+    await vi.waitFor(() => expect(reachedBlock || exited).toBe(true), { timeout: 4_000 });
+    expect(out).toContain('The background run ended.');
+    expect(exited, out).toBe(false);
+    expect(out).not.toContain('the Session Monitor exits. The next open starts it again.');
   });
 });

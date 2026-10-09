@@ -383,10 +383,12 @@ export interface ImageSettings {
  * Plan step 11H2 (D1, decision of 2026-10-09): the settings of the Session Monitor that an open and `monitorEnsure`
  * carry: the image settings (ImageSettings, which the monitor gets with `settings -`), and whether it runs permanently
  * (monitorRunsPermanently: on a remote engine, or on a local one with stopLocalMonitorWhenIdle off). The mode is part of
- * its label (PERMANENT_MONITOR_LABEL_PART), never of `settings -`; missing means false.
+ * its label (monitorModeLabelPart), never of `settings -`; missing means false. Review round 1 of 11H2 (A-L2): and why it
+ * is permanent: `remote` when the computer reaches the engine as a remote one (only with `permanent`).
  */
 export interface MonitorSettings extends ImageSettings {
   permanent?: boolean;
+  remote?: boolean;
 }
 
 /** Plan step 11H2: the image settings of MonitorSettings, as `settings -` takes them (without the mode). */
@@ -400,11 +402,13 @@ export function imageSettingsOf(settings: ImageSettings): ImageSettings {
  */
 export function parseMonitorSettings(value: unknown): MonitorSettings | undefined {
   if (!isRecord(value)) return undefined;
-  const { permanent, ...rest } = value;
+  const { permanent, remote, ...rest } = value;
   if ('permanent' in value && typeof permanent !== 'boolean') return undefined;
+  // Review round 1 of 11H2 (A-L2): `remote`, a boolean, only for a permanent monitor (a remote engine always has one).
+  if ('remote' in value && (typeof remote !== 'boolean' || (remote && permanent !== true))) return undefined;
   const images = parseImageSettingsInput(JSON.stringify(rest));
   if (images === undefined) return undefined;
-  return typeof permanent === 'boolean' ? { ...images, permanent } : images;
+  return { ...images, ...(typeof permanent === 'boolean' ? { permanent } : {}), ...(typeof remote === 'boolean' ? { remote } : {}) };
 }
 
 /**
@@ -446,12 +450,34 @@ export function inUseByOtherComputer(output: { now: number; records: ReadonlyArr
 /**
  * Plan step 11H2 (D1 and the user's decision "unless-stopped" of 2026-10-09): the part of the label of a monitor that runs
  * permanently (restart policy `unless-stopped`, never an exit when idle), so a change of the mode replaces it at the next
- * ensure (RemoteSessionMonitor: a running permanent monitor still counts as current for an ensure that wants one that
- * ends when idle). It replaces the part `image-maintenance` of the user requests of 2026-09-28: the monitor always has
- * its outbound network now (the VS Code server of its background run), so the image maintenance no longer changes its
- * container. Review round 1 of PR #57 (C): the settings of the run are not part of the label.
+ * ensure. It replaces the part `image-maintenance` of the user requests of 2026-09-28: the monitor always has its outbound
+ * network now (the VS Code server of its background run), so the image maintenance no longer changes its container.
+ * Review round 1 of PR #57 (C): the settings of the run are not part of the label. Review round 1 of 11H2 (A-L2): the part
+ * says why it is permanent (before: `permanent` alone): a computer reaches the engine as a remote one
+ * (`permanent-remote`), or as the local one with stopLocalMonitorWhenIdle off (`permanent-local`). An ensure that sees the
+ * engine as local takes a running `permanent-remote` monitor of the same version as current, and one that sees it as
+ * remote a running `permanent-local` one (RemoteSessionMonitor), so a computer that turns the setting on again replaces
+ * its own permanent monitor, but never one that another computer runs as remote.
  */
-export const PERMANENT_MONITOR_LABEL_PART = 'permanent';
+export const PERMANENT_REMOTE_LABEL_PART = 'permanent-remote';
+export const PERMANENT_LOCAL_LABEL_PART = 'permanent-local';
+
+/** Review round 1 of 11H2 (A-L2): the mode of a monitor: it ends when idle, or it is permanent for one of two reasons. */
+export type MonitorMode = 'idle' | typeof PERMANENT_LOCAL_LABEL_PART | typeof PERMANENT_REMOTE_LABEL_PART;
+
+/** Review round 1 of 11H2 (A-L2): the mode of the monitor that MonitorSettings ask for. */
+export function monitorModeOf(settings: Pick<MonitorSettings, 'permanent' | 'remote'> | undefined): MonitorMode {
+  if (settings?.permanent !== true) return 'idle';
+  return settings.remote === true ? PERMANENT_REMOTE_LABEL_PART : PERMANENT_LOCAL_LABEL_PART;
+}
+
+/**
+ * Review round 1 of 11H2 (A-L6): the part of the label of a monitor that mounts the shared VS Code server store `volume`,
+ * so that a monitor created without the store (or with another one) is replaced by an ensure that has it.
+ */
+export function vscodeStoreLabelPart(volume: string): string {
+  return `vscode-store:${volume}`;
+}
 
 /** Plan step 11H2: the file of the background run in the volume of the monitor (the end of its last run, its last cleanup). */
 export const CACHE_RUN_FILE = 'cache-run.json';

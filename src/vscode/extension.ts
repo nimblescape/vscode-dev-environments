@@ -31,9 +31,9 @@ import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/image
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { systemClock } from '../core/ports';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
-import { DEFAULT_CACHE_UPDATE_SCHEDULE, monitorRunsPermanently } from '../core/remoteMonitor/cacheSettings';
 import { PACKAGES_TIMEOUT_MS, ghcrRepositories } from '../core/remoteMonitor/imageRepositories';
 import { imageLists } from './imageLists';
+import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME, imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import { EnvironmentOperations } from '../core/pipeline/environmentOperations';
 import { windowLifecycleMemory } from '../core/pipeline/lifecycleMemory';
@@ -315,13 +315,13 @@ async function activateExtension(
   };
   // Plan step 11H2 (D1 and D2, decision of 2026-10-09): the schedule of the monitor's whole background run
   // (cacheUpdateSchedule), and its mode for an engine that is remote (`ssh://`, classifyDockerEndpoint) or local
-  // (monitorRunsPermanently with stopLocalMonitorWhenIdle).
-  const imageMaintenance = (remote: boolean) => ({
-    prefixes: usedImagePrefixes(),
-    schedule: getSettings().cacheUpdateSchedule ?? DEFAULT_CACHE_UPDATE_SCHEDULE,
+  // (monitorRunsPermanently with stopLocalMonitorWhenIdle). Review round 1 of 11H2 (A-L7): in monitorSettings.ts, tested
+  // by its behaviour.
+  const monitorSettings = monitorSettingsOf({
+    settings: getSettings,
+    prefixes: usedImagePrefixes,
     // Review round 5 of PR #57 (P2): an unknown zone of Node.js (`Etc/Unknown`) is UTC.
-    timeZone: usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
-    permanent: monitorRunsPermanently(remote, getSettings().stopLocalMonitorWhenIdle),
+    timeZone: () => usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone),
   });
   const imageListFor = imageLists({
     prefixes: usedImagePrefixes,
@@ -344,7 +344,7 @@ async function activateExtension(
   // A-R3-1: the same wait after a failed build on this engine as for the worker of a heartbeat; A-R4-1: within it, the
   // repair goes on with the tag when it is present (heartbeatWiring.repair).
   // Plan step 11D2: the operation `monitorEnsure` of the worker of that engine.
-  const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(target.kind === 'remote'), signal));
+  const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, monitorSettings.forTarget(target), signal));
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
   const windowHeartbeats = new WindowHeartbeats({
@@ -493,7 +493,7 @@ async function activateExtension(
     // Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list that an open carries for the
     // Session Monitor of its engine (the worker makes sure that the monitor runs, and sends its first heartbeat).
     // Plan step 11H2 (D1): the Docker host of the open is empty for the local Docker and names the SSH host otherwise.
-    openMonitor: (dockerHost) => ({ images: imageMaintenance(dockerHost !== ''), ...imageListFor(dockerHost) }),
+    openMonitor: (dockerHost) => ({ images: monitorSettings.forOpen(dockerHost), ...imageListFor(dockerHost) }),
     // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the commit and quality of this VS Code
     // (product.json under vscode.env.appRoot, read once), which an open sends when the build qualifies.
     vscodeServerOfWindow: windowVscodeServer(vscode.env.appRoot, (file) => fs.promises.readFile(file, 'utf8'), (message) => logger.info(message)),

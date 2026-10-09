@@ -46,11 +46,15 @@ describe('the cleanup of the store, at most once a day (plan step 11H2, D2)', ()
 });
 
 describe('the qualities of the newest server (plan step 11H2, D3)', () => {
-  it('stable always, insider only when the store has an insider server', () => {
-    expect(qualitiesToFetch(new Set())).toEqual(['stable']);
-    expect(qualitiesToFetch(new Set(['stable'] as const))).toEqual(['stable']);
-    expect(qualitiesToFetch(new Set(['insider'] as const))).toEqual(['stable', 'insider']);
-    expect(qualitiesToFetch(new Set(['stable', 'insider'] as const))).toEqual(['stable', 'insider']);
+  // Review round 1 of 11H2 (A-M1): changed expectation, insider only while an open used an insider version within 14 days
+  // (before: whenever the store had a ready insider server, which the monitor's own fetches kept true for ever).
+  it('stable always, insider only while an open used an insider version within 14 days', () => {
+    expect(qualitiesToFetch([], NOW)).toEqual(['stable']);
+    expect(qualitiesToFetch([{ quality: 'stable', at: NOW }], NOW)).toEqual(['stable']);
+    expect(qualitiesToFetch([{ quality: 'insider', at: NOW - 14 * DAY + 1 }], NOW)).toEqual(['stable', 'insider']);
+    expect(qualitiesToFetch([{ quality: 'stable', at: NOW }, { quality: 'insider', at: NOW + DAY }], NOW)).toEqual(['stable', 'insider']);
+    expect(qualitiesToFetch([{ quality: 'insider', at: NOW - 14 * DAY }], NOW)).toEqual(['stable']);
+    expect(qualitiesToFetch([{ quality: 'insider', at: NOW - 100 * DAY }, { quality: 'stable', at: NOW }], NOW)).toEqual(['stable']);
   });
 });
 

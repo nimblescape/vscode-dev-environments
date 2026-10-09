@@ -13,28 +13,43 @@ import { nextCronTime, parseCronSchedule, type CronSchedule } from './cron';
 export const DEFAULT_CACHE_UPDATE_SCHEDULE = '17';
 /** Plan step 11H2 (D2): the shortest interval in minutes (the brief: a whole number, at least 5). */
 export const MIN_CACHE_INTERVAL_MINUTES = 5;
-/** Plan step 11H2: the longest interval in minutes (a year; a longer number is no valid setting). */
-export const MAX_CACHE_INTERVAL_MINUTES = 525_600;
+/**
+ * Plan step 11H2: the longest interval in minutes. Review round 1 of 11H2 (A-L1): a day (1440), as the pattern of the
+ * setting in package.json, so that every number that the settings editor takes is one that the monitor takes (before: a
+ * year, and the pattern took any number, so `4` or `0` became the default silently).
+ */
+export const MAX_CACHE_INTERVAL_MINUTES = 1440;
 
 /** Plan step 11H2 (D2): the schedule of the background run: an interval in minutes, or a cron schedule. */
 export type CacheSchedule = { kind: 'interval'; minutes: number; text: string } | { kind: 'cron'; cron: CronSchedule; text: string };
 
 /**
  * Plan step 11H2 (D2): the setting devEnvLauncher.cacheUpdateSchedule: a whole number of minutes from
- * MIN_CACHE_INTERVAL_MINUTES to MAX_CACHE_INTERVAL_MINUTES (a JSON number or its digits, spaces around it allowed) is an
- * interval, five fields that parseCronSchedule takes are a cron schedule (its text with single spaces); `undefined` for
- * anything else (fewer minutes, a fraction, other text, another type).
+ * MIN_CACHE_INTERVAL_MINUTES to MAX_CACHE_INTERVAL_MINUTES (a JSON number or its digits, leading zeros and spaces around
+ * it allowed, as the pattern of package.json) is an interval, five fields that parseCronSchedule takes are a cron schedule
+ * (its text with single spaces); `undefined` for anything else (fewer minutes, a fraction, other text, another type).
+ * Review round 1 of 11H2 (reviewer B, D3): also a cron schedule that has no time (`0 0 30 2 *`, no 30 February): it would
+ * never run once a run is known, so it means the default.
  */
 export function parseCacheSchedule(value: unknown): CacheSchedule | undefined {
   const text = typeof value === 'number' ? (Number.isInteger(value) ? String(value) : '') : typeof value === 'string' ? value.trim() : '';
-  if (/^\d{1,7}$/.test(text)) {
-    const minutes = Number(text);
+  const digits = /^0*(\d{1,4})$/.exec(text);
+  if (digits !== null) {
+    const minutes = Number(digits[1]);
     if (minutes < MIN_CACHE_INTERVAL_MINUTES || minutes > MAX_CACHE_INTERVAL_MINUTES) return undefined;
     return { kind: 'interval', minutes, text: String(minutes) };
   }
+  if (/^\d+$/.test(text)) return undefined;
   const cron = parseCronSchedule(text);
-  return cron === undefined ? undefined : { kind: 'cron', cron, text: text.split(/\s+/).join(' ') };
+  if (cron === undefined || nextCronTime(CRON_CHECK_FROM, cron, 'UTC') === undefined) return undefined;
+  return { kind: 'cron', cron, text: text.split(/\s+/).join(' ') };
 }
+
+/**
+ * Review round 1 of 11H2 (reviewer B, D3): the time from which parseCacheSchedule looks for a time of a cron schedule
+ * (nextCronTime looks five years ahead, so 29 February is found): fixed, so that the parse stays pure.
+ */
+const CRON_CHECK_FROM = Date.UTC(2027, 0, 1);
 
 /** Plan step 11H2 (D2): the setting as the monitor gets it: the text of parseCacheSchedule, or the default. */
 export function normalizeCacheSchedule(value: unknown): string {

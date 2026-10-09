@@ -25,7 +25,13 @@ describe('cacheUpdateSchedule (plan step 11H2, D2)', () => {
     expect(parseCacheSchedule(String(MAX_CACHE_INTERVAL_MINUTES))).toMatchObject({ kind: 'interval', minutes: MAX_CACHE_INTERVAL_MINUTES });
   });
 
-  it('refuses fewer than 5 minutes, more than a year, fractions and signs', () => {
+  // Review round 1 of 11H2 (A-L1): changed expectation, at most a day (1440 minutes; before: a year), as the pattern of the
+  // setting in package.json.
+  it('refuses fewer than 5 minutes, more than a day, fractions and signs', () => {
+    expect(MAX_CACHE_INTERVAL_MINUTES).toBe(1440);
+    expect(parseCacheSchedule('1440')).toEqual({ kind: 'interval', minutes: 1440, text: '1440' });
+    expect(parseCacheSchedule('001440')).toEqual({ kind: 'interval', minutes: 1440, text: '1440' });
+    for (const value of ['1441', 1441, '525600', '00000', '000004']) expect(parseCacheSchedule(value), JSON.stringify(value)).toBeUndefined();
     for (const value of ['4', 4, '0', 0, '-5', -5, '5.0', 5.5, '+5', String(MAX_CACHE_INTERVAL_MINUTES + 1), '1e3', '12345678']) {
       expect(parseCacheSchedule(value), JSON.stringify(value)).toBeUndefined();
     }
@@ -36,6 +42,14 @@ describe('cacheUpdateSchedule (plan step 11H2, D2)', () => {
     expect(parsed?.kind).toBe('cron');
     expect(parsed?.text).toBe('7 6 * * 1-5');
     expect(parsed?.kind === 'cron' ? parsed.cron.weekdays : undefined).toEqual(new Set([1, 2, 3, 4, 5]));
+  });
+
+  // Review round 1 of 11H2 (reviewer B, D3): a cron schedule without any time would stop the background run for good.
+  it('refuses a cron schedule that has no time; one with a time every four years stays', () => {
+    for (const value of ['0 0 30 2 *', '0 0 31 4 *', '0 0 31 2,4,6,9,11 *']) expect(parseCacheSchedule(value), value).toBeUndefined();
+    expect(parseCacheSchedule('0 0 29 2 *')?.kind).toBe('cron');
+    expect(parseCacheSchedule('0 0 30 2 1')?.kind).toBe('cron');
+    expect(normalizeCacheSchedule('0 0 30 2 *')).toBe(DEFAULT_CACHE_UPDATE_SCHEDULE);
   });
 
   it('refuses junk: other text, four or six fields, an invalid field, other types', () => {
