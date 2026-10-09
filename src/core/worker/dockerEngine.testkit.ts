@@ -16,6 +16,8 @@ export function unusedEngine(): DockerEngine {
   return {
     container: unused('container'),
     containers: unused('containers'),
+    // Plan step 11I (review round 1 of PR #126, F1): the list of the containers without an inspect.
+    containerSummaries: unused('containerSummaries'),
     exec: unused('exec'),
     stop: unused('stop'),
     start: unused('start'),

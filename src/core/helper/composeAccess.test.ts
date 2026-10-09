@@ -75,6 +75,8 @@ describe('network_mode and the Compose project label of a network (review round 
   });
 });
 const U = (...items: string[]): HostAccessReport => ({ hostAccess: [], unsupported: items });
+/** Review round 2 of PR #130 (R2A-1): the reason of a value that bake evaluates as a template. */
+const TEMPLATE = '(Buildx evaluates `${` and `%{` in it as a template)';
 
 describe('composeAccessReport: the allowed model', () => {
   it('allows the template model', () => {
@@ -151,9 +153,44 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['an unknown build key', 'db', { build: { context: REPO, future: 1 } }, U('service db: build future')],
     ['cache_from of an image and a registry', 'db', { build: { context: REPO, cache_from: ['acme/cache:1', 'type=registry,ref=acme/cache'] } }, NONE],
     ['cache_from of a local folder', 'db', { build: { context: REPO, cache_from: ['type=local,src=/x'] } }, U('service db: build cache_from type=local,src=/x')],
+    // Review round 1 of PR #130 (A-F1): Buildx reads the CSV fields with keys in any case, and its last `type` counts, so a
+    // registry entry with a second `type` (or a quoted one) is a local cache import; a field without `=` is not read.
+    ['cache_from with a second type', 'db', { build: { context: REPO, cache_from: ['type=registry,type=local,src=/tmp/c'] } }, U('service db: build cache_from type=registry,type=local,src=/tmp/c')],
+    ['cache_from with a second TYPE', 'db', { build: { context: REPO, cache_from: ['type=registry,TYPE=local,src=/tmp/c'] } }, U('service db: build cache_from type=registry,TYPE=local,src=/tmp/c')],
+    ['cache_from with a quoted second type', 'db', { build: { context: REPO, cache_from: ['type=registry,"type=local",src=/tmp/c'] } }, U('service db: build cache_from type=registry,"type=local",src=/tmp/c')],
+    ['cache_from of a registry in another case', 'db', { build: { context: REPO, cache_from: ['TYPE=registry,ref=acme/cache'] } }, NONE],
+    ['cache_from with a field without a value', 'db', { build: { context: REPO, cache_from: ['type=registry,ref'] } }, U('service db: build cache_from type=registry,ref')],
     ['additional contexts of images and URLs', 'db', { build: { context: REPO, additional_contexts: { base: 'docker-image://alpine', src: 'https://x/y.git' } } }, NONE],
     ['an additional context of a folder', 'db', { build: { context: REPO, additional_contexts: { home: '/root' } } }, A('service db: build additional_contexts home=/root')],
     ['an additional context of a service', 'db', { build: { context: REPO, additional_contexts: { base: 'service:app' } } }, A('service db: build additional_contexts base=service:app')],
+    // Review round 1 of PR #130 (A-F2): Buildx takes an image or a URL only by the exact lower-case prefix; any other
+    // spelling is a path that the build client reads, so it is refused like a folder.
+    // Review round 2 of PR #130 (D1): Buildx reads it as a path relative to its working folder, so it is also refused whatever the switch says.
+    ['an additional context of HTTPS:// (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: 'HTTPS://example.com/dir' } } }, A('service db: build additional_contexts x=HTTPS://example.com/dir', 'service db: build additional_contexts x=HTTPS://example.com/dir (a relative path)')],
+    ['an additional context of DOCKER-IMAGE:// (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: 'DOCKER-IMAGE://alpine' } } }, A('service db: build additional_contexts x=DOCKER-IMAGE://alpine', 'service db: build additional_contexts x=DOCKER-IMAGE://alpine (a relative path)')],
+    ['an additional context of an image after a space (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: ' docker-image://alpine' } } }, A('service db: build additional_contexts x= docker-image://alpine', 'service db: build additional_contexts x= docker-image://alpine (a relative path)')],
+    // Review round 2 of PR #130 (D1): bake reads `cwd://<path>` as `<path>`, Buildx another scheme or a Git reference that it
+    // cannot parse as a path relative to its working folder; only an image, a URL and a target are no path.
+    ['an additional context of cwd:// (a path for bake)', 'db', { build: { context: REPO, additional_contexts: { x: 'cwd:///devenv-cache' } } }, A('service db: build additional_contexts x=cwd:///devenv-cache', 'service db: build additional_contexts x=cwd:///devenv-cache (a relative path)')],
+    // Review round 3 of PR #130 (R3A-3): a Git reference by SSH is fetched by Buildx when it can parse it, else read as a
+    // folder; refused as a relative folder either way (a Git context only by https://).
+    ['an additional context of ssh:// (refused as a relative folder; a Git context only by https://)', 'db', { build: { context: REPO, additional_contexts: { x: 'ssh://h/../../../devenv-cache' } } }, A('service db: build additional_contexts x=ssh://h/../../../devenv-cache', 'service db: build additional_contexts x=ssh://h/../../../devenv-cache (a relative path)')],
+    ['an additional context of a target', 'db', { build: { context: REPO, additional_contexts: { x: 'target:base' } } }, A('service db: build additional_contexts x=target:base')],
+    // Review round 3 of PR #130 (R3A-2): bake evaluates the key files of build.ssh and the files of the build secrets as
+    // templates too.
+    ['a key file of build.ssh with a template of bake', 'db', { build: { context: REPO, ssh: ['deploy=%{if true}/devenv-cache/key%{endif}'] } }, {
+      hostAccess: ['service db: build ssh', 'service db: build ssh deploy=%{if true}/devenv-cache/key%{endif} (a relative path)'],
+      unsupported: [`service db: build ssh deploy=%{if true}/devenv-cache/key%{endif} ${TEMPLATE}`],
+    }],
+    // Review round 2 of PR #130 (R2A-1): bake reads the build definition of Docker Compose as HCL and evaluates `${…}` and
+    // `%{…}` in the values that Compose passes on as written, so such a value is not supported, whatever its text says
+    // (here a folder of the repository that bake makes /workspaces/x, or a registry import that it makes a local one).
+    ['a build context with a template of bake', 'db', { build: { context: `${REPO}/%{if true}..%{endif}/x` } }, U(`service db: build context ${REPO}/%{if true}..%{endif}/x ${TEMPLATE}`)],
+    ['a build context with an interpolation of bake', 'db', { build: { context: `${REPO}/\${".."}/x` } }, U(`service db: build context ${REPO}/\${".."}/x ${TEMPLATE}`)],
+    ['a build context with an escaped template', 'db', { build: { context: `${REPO}/$\${x}/%%{y}` } }, U(`service db: build context ${REPO}/$\${x}/%%{y} ${TEMPLATE}`)],
+    ['a Dockerfile with a template of bake', 'db', { build: { context: REPO, dockerfile: '%{if true}../..%{endif}/etc/passwd' } }, U(`service db: build dockerfile %{if true}../..%{endif}/etc/passwd ${TEMPLATE}`)],
+    ['cache_from with a template of bake', 'db', { build: { context: REPO, cache_from: ['type=registry,%{if true}type%{endif}=local,src=/devenv-cache'] } }, U(`service db: build cache_from type=registry,%{if true}type%{endif}=local,src=/devenv-cache ${TEMPLATE}`)],
+    ['an additional context of an image with a template of bake', 'db', { build: { context: REPO, additional_contexts: { x: 'docker-image://%{if true}alpine%{endif}' } } }, U(`service db: build additional_contexts x docker-image://%{if true}alpine%{endif} ${TEMPLATE}`)],
     // container_name (rewritten, D-12)
     ['a container_name', 'db', { container_name: 'db1' }, NONE],
     // labels

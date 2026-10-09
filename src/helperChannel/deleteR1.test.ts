@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import { LOCK_BUSY_EXIT, LOCK_UNAVAILABLE_CODE, parseDeleteValue, type AskKind } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
-import { REMOTE_MONITOR_CONTAINER, forgetCommand } from '../core/remoteMonitor/protocol';
+import { REMOTE_MONITOR_CONTAINER } from '../core/remoteMonitor/protocol';
 import type { BusyMark, Environment } from '../core/types';
 import { EngineError, type DockerEngine, type EngineContainer } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';

@@ -4,7 +4,8 @@
 
 // Review B, round 1 of plan step 11D1 (mutation probes): monitorCommand and its senders.
 import { describe, expect, it } from 'vitest';
-import { REMOTE_MONITOR_CONTAINER, forgetCommand } from '../remoteMonitor/protocol';
+import { REMOTE_MONITOR_CONTAINER } from '../remoteMonitor/protocol';
+import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { forgetRecord, monitorCommand, sendHeartbeat, sendMonitorSettings } from './monitorFlow';
@@ -34,7 +35,9 @@ describe('monitorCommand (review B-R1 probes, plan step 11D1)', () => {
   });
 
   it('a command without the lock of the records gets the bare exit code for 75 and 137 (MF11)', async () => {
-    const bare = async (code: number) => monitorCommand(engineWith(async () => result(code)).engine, ['node', 'x']);
+    // Plan step 11I (U2, decision of 2026-10-08): changed test, the command is an entry of the registry without the lock
+    // (monitorImages; `['node', 'x']` before, which no caller may build any more).
+    const bare = async (code: number) => monitorCommand(engineWith(async () => result(code)).engine, 'monitorImages', [], { input: '{"repositories":[]}' });
     expect(await bare(75)).toEqual({ ok: false, missing: false, detail: 'exit code 75' });
     expect(await bare(137)).toEqual({ ok: false, missing: false, detail: 'exit code 137' });
   });
@@ -59,7 +62,8 @@ describe('monitorCommand (review B-R1 probes, plan step 11D1)', () => {
     await sendMonitorSettings(engine, { repositories: ['ghcr.io/majikmate/devcontainer-dev'] }, signal);
     expect(calls.map((call) => call.options?.signal)).toEqual([signal, signal]);
     await forgetRecord(engine, SOURCE, ID, 'devenv-test-monitor');
-    expect(calls[2]).toMatchObject({ container: 'devenv-test-monitor', command: forgetCommand(SOURCE, ID) });
+    // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorForget (forgetCommand before).
+    expect(calls[2]).toMatchObject({ container: 'devenv-test-monitor', command: scriptCommand('monitorForget', [SOURCE, ID]) });
     expect(calls[2].container).not.toBe(REMOTE_MONITOR_CONTAINER);
   });
 });
