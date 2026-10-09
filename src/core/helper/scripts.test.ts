@@ -1202,7 +1202,7 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         "'use strict';",
         "const fs = require('fs');",
         "const path = require('path');",
-        'const { DEVENV_TEST_LOG: log, DEVENV_TEST_REPO: repo, DEVENV_TEST_MKDIR_RACE: race, DEVENV_TEST_GROW: grow } = process.env;',
+        'const { DEVENV_TEST_LOG: log, DEVENV_TEST_REPO: repo, DEVENV_TEST_MKDIR_RACE: race, DEVENV_TEST_GROW: grow, DEVENV_TEST_ROOT_LOCK: rootLock } = process.env;',
         "const record = (stat, uid, gid) => fs.appendFileSync(log, stat.ino + ' ' + uid + ':' + gid + '\\n');",
         'fs.fchownSync = (fd, uid, gid) => record(fs.fstatSync(fd), uid, gid);',
         'fs.lchownSync = (file, uid, gid) => record(fs.lstatSync(file), uid, gid);',
@@ -1211,6 +1211,8 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         '  const real = fs[name];',
         '  fs[name] = (file, ...rest) => {',
         '    const stat = real.call(fs, file, ...rest);',
+        // Review round 2 of the follow-up (A-L1): with DEVENV_TEST_ROOT_LOCK, gitconfig.lock is root's.
+        "    if (rootLock && stat && path.basename(String(file)) === 'gitconfig.lock') return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 0, gid: 0 });",
         '    return file === repo && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
         '  };',
         '}',
@@ -1261,9 +1263,15 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         '  previous=$arg',
         'done',
         'printf \'%s %s\\n\' "$(stat -c %a "$(dirname "$file")")" "$file" >> "$DEVENV_TEST_GIT_FILES"',
-        'if [ -n "${DEVENV_TEST_RACE-}" ] && [ ! -e "$DEVENV_TEST_GIT_FILES.raced" ]; then',
-        '  : > "$DEVENV_TEST_GIT_FILES.raced"',
+        // Review round 2 of the follow-up (A-L1): the number of this call of Git, for the race and the signal at a call.
+        'calls=$(($(wc -l < "$DEVENV_TEST_GIT_FILES")))',
+        'if [ -n "${DEVENV_TEST_RACE-}" ] && [ "$calls" -eq "${DEVENV_TEST_RACE_AT:-1}" ]; then',
         '  sh -c "$DEVENV_TEST_RACE" sh "$file"',
+        'fi',
+        // A Cancel: the signal to the script and to its Git (the batch helper signals the whole process group of the step).
+        'if [ "$calls" -eq "${DEVENV_TEST_SIGNAL_AT:-0}" ]; then',
+        '  kill -s "$DEVENV_TEST_SIGNAL" "$PPID"',
+        '  kill -s "$DEVENV_TEST_SIGNAL" "$$"',
         'fi',
         'case " $* " in *" ${DEVENV_TEST_GIT_FAIL-none} "*) exit 1 ;; esac',
         'exec "$DEVENV_TEST_REAL_GIT" "$@"',
@@ -1276,8 +1284,14 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
 
   interface RunOptions {
     folder?: string;
-    /** A shell command that the fake git runs once, at its first call, as the owner of the repository. */
+    /** A shell command that the fake git runs once, at its first call (or at the call raceAt), as the owner of the repository. */
     race?: string;
+    /** Review round 2 of the follow-up (A-L1): the call of Git at which `race` runs (1 when not given). */
+    raceAt?: number;
+    /** Review round 2 of the follow-up (A-L1): at this call of Git, the signal goes to the script and to that Git. */
+    signalAt?: { call: number; signal: 'TERM' | 'INT' | 'HUP' };
+    /** Review round 2 of the follow-up (A-L1): lstat reports gitconfig.lock as root's (as the test may not run as root). */
+    rootLock?: boolean;
     /** [entry, target]: the folder `entry` is replaced by a link to `target` right after the script created it. */
     mkdirRace?: [string, string];
     /** The fake git fails when its arguments contain this one. */
@@ -1307,6 +1321,9 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         DEVENV_TEST_GIT_FILES: env.gitFiles,
         DEVENV_TEST_REAL_GIT: realGit,
         ...(options.race !== undefined ? { DEVENV_TEST_RACE: options.race } : {}),
+        ...(options.raceAt !== undefined ? { DEVENV_TEST_RACE_AT: String(options.raceAt) } : {}),
+        ...(options.signalAt !== undefined ? { DEVENV_TEST_SIGNAL_AT: String(options.signalAt.call), DEVENV_TEST_SIGNAL: options.signalAt.signal } : {}),
+        ...(options.rootLock === true ? { DEVENV_TEST_ROOT_LOCK: '1' } : {}),
         ...(options.mkdirRace !== undefined ? { DEVENV_TEST_MKDIR_RACE: JSON.stringify(options.mkdirRace) } : {}),
         ...(options.gitFails !== undefined ? { DEVENV_TEST_GIT_FAIL: options.gitFails } : {}),
         ...(options.grow !== undefined ? { DEVENV_TEST_GROW: String(options.grow) } : {}),
@@ -1533,7 +1550,9 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     const cfg = userGitConfig(env);
     const before = out.state();
     // The owner renames gitconfig away and puts a link to a file outside the volume in its place when Git starts.
-    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'` });
+    // Review round 2 of the follow-up (A-L1): changed test, at the second call of Git (the first under Git's lock, on the
+    // copy that it writes; the first call is now the check without the lock, the next test).
+    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'`, raceAt: 2 });
     expect(fs.readFileSync(`${cfg}.moved`, 'utf8')).toContain('helper = store');
     expect(out.state()).toEqual(before);
     expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
@@ -1542,6 +1561,26 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     // The rename of the new file replaced the link itself: gitconfig is the repaired configuration of the user.
     expect(fs.lstatSync(cfg).isFile()).toBe(true);
     expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a link that the owner puts in place of gitconfig during the
+  // check without the lock is removed under the lock, and a new gitconfig takes its place (the file of the owner is where
+  // it moved it).
+  it('edits no gitconfig that the owner replaces by a link during its check without the lock', () => {
+    const env = setup();
+    const out = outside(env);
+    const cfg = userGitConfig(env);
+    const before = out.state();
+    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'` });
+    expect(fs.readFileSync(`${cfg}.moved`, 'utf8')).toContain('helper = store');
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.lstatSync(cfg).isFile()).toBe(true);
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
     expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
     expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
   });
@@ -1651,8 +1690,10 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     const cfg = userGitConfig(env);
     const status = path.join(env.dir, 'concurrent-status');
     const stderr = path.join(env.dir, 'concurrent-stderr');
-    // When the script's Git starts (after the copy), Git in the dev container sets user.name in gitconfig.
-    const result = run(env, { race: `"$DEVENV_TEST_REAL_GIT" config --file '${cfg}' user.name 'Concurrent Name' 2> '${stderr}'; echo $? > '${status}'` });
+    // When the script's Git starts (after the copy), Git in the dev container sets user.name in gitconfig. Review round 2
+    // of the follow-up (A-L1): changed test, at the second call of Git, the first under the lock (the first call is now
+    // the check without the lock, the next test).
+    const result = run(env, { race: `"$DEVENV_TEST_REAL_GIT" config --file '${cfg}' user.name 'Concurrent Name' 2> '${stderr}'; echo $? > '${status}'`, raceAt: 2 });
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     // Git finds the lock and fails, as for another Git: the user sees it (never a change that is silently lost).
@@ -1665,6 +1706,21 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     expect(fs.readdirSync(path.dirname(cfg)).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
   });
 
+  // Review round 2 of the follow-up of plan step 11I (A-L1): during the check without the lock, a change of Git in the dev
+  // container succeeds; the script reads gitconfig again under the lock, so the change is kept.
+  it('keeps a change that Git in the dev container makes during the check without the lock', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const status = path.join(env.dir, 'concurrent-status');
+    const result = run(env, { race: `"$DEVENV_TEST_REAL_GIT" config --file '${cfg}' user.name 'Concurrent Name'; echo $? > '${status}'` });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.readFileSync(status, 'utf8').trim()).toBe('0');
+    expect(gitConfig(cfg, 'user.name')).toBe('Concurrent Name\n');
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
   it('fails and changes nothing when gitconfig.lock exists (a Git of the dev container holds it), as Git does', () => {
     const env = setup();
     const cfg = userGitConfig(env);
@@ -1675,21 +1731,119 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`${lock} exists`);
     expect(result.stderr).not.toContain('/proc/self/fd');
-    // gitconfig and the lock of the other Git stay as they are; Git did not run.
+    // gitconfig and the lock of the other Git stay as they are; Git did not run. Review round 2 of the follow-up (A-L1):
+    // changed expectation, Git ran once, on the copy of the check without the lock (was: never), and never on a copy to
+    // write.
     expect({ text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) }).toEqual(before);
     expect(fs.readFileSync(lock, 'utf8')).toBe('the lock of another Git\n');
-    expect(fs.readFileSync(env.gitFiles, 'utf8')).toBe('');
+    expect(fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((line) => line !== '').map((line) => path.basename(line))).toEqual(['check']);
   });
 
   it('removes only its own lock when it fails: an entry that the owner put in its place stays', () => {
     const env = setup();
     const cfg = userGitConfig(env);
     const lock = `${cfg}.lock`;
-    // When Git starts, the owner moves the lock of the script away and puts a file of its own at gitconfig.lock; then Git
-    // fails.
-    const result = run(env, { race: `mv '${lock}' '${lock}.moved' && printf 'other\\n' > '${lock}'`, gitFails: '--add' });
+    // When Git starts under the lock (its second call; review round 2 of the follow-up, A-L1: the first is the check
+    // without the lock), the owner moves the lock of the script away and puts a file of its own at gitconfig.lock; then
+    // Git fails.
+    const result = run(env, { race: `mv '${lock}' '${lock}.moved' && printf 'other\\n' > '${lock}'`, raceAt: 2, gitFails: '--add' });
     expect(result.status).toBe(1);
     expect(fs.readFileSync(lock, 'utf8')).toBe('other\n');
+    expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): the script took Git's lock at every run, also when nothing
+  // changed (every open, also of a running dev container); a run killed then (a Cancel) left it, and it stopped every
+  // later run and every `git config --global` in the dev container. A run that changes nothing takes no lock now.
+  it.each(['file', 'folder'])('takes no lock when nothing changes: a gitconfig.lock (a %s) does not stop the run, and stays', (kind) => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, `[credential "https://github.com"]\n\thelper = \n\thelper = ${JSON.stringify(CONTAINER_CREDENTIAL_HELPER)}\n`);
+    const lock = `${cfg}.lock`;
+    if (kind === 'folder') fs.mkdirSync(lock);
+    else write(lock, 'the lock of another Git\n');
+    const before = { text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) };
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect({ text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) }).toEqual(before);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a Cancel sends SIGTERM to the process group of the step (the
+  // script and its Git); the script died with it, and a run killed while it held the lock left it. Now it ignores the
+  // signal and ends at once with its cleanup: at the second call of Git (under the lock) its Git dies, it takes the
+  // section for changed and writes it; at the fourth (the first `--add`) the step fails and changes nothing.
+  it.each([
+    [2, 'TERM'],
+    [4, 'TERM'],
+    [2, 'INT'],
+    [2, 'HUP'],
+  ] as const)('leaves no lock and ends at once at the call %s of Git (under the lock) when it gets SIG%s', (call, signal) => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const started = Date.now();
+    const result = run(env, { signalAt: { call, signal } });
+    // Before the SIGKILL of the batch helper (CHANNEL_KILL_GRACE_MS, 5 seconds).
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.signal).toBeNull();
+    expect(fs.existsSync(`${cfg}.lock`)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    if (call === 2) {
+      expect(result.status).toBe(0);
+      expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    } else {
+      expect(result.status).toBe(1);
+      expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+    }
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a lock that a killed run left (root's, a plain file of one
+  // link, unchanged for more than 10 minutes) is removed, with a line in the log; any other lock stays and stops the step.
+  const staleLock = (lock: string, minutes: number) => {
+    const time = (Date.now() - minutes * 60 * 1000) / 1000;
+    if (fs.lstatSync(lock).isSymbolicLink()) fs.lutimesSync(lock, time, time);
+    else fs.utimesSync(lock, time, time);
+  };
+
+  it('removes a lock of root that is unchanged for more than 10 minutes (a run that was killed), says so, and repairs gitconfig', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  it.each([
+    ['younger than 10 minutes', 9, 'file'],
+    ['of another owner', 11, 'other'],
+    ['a folder', 11, 'folder'],
+    ['a file with a second link', 11, 'linked'],
+    ['a link', 11, 'link'],
+  ] as const)('keeps a lock that is %s, and fails as for a Git that runs', (_what, minutes, kind) => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    if (kind === 'folder') fs.mkdirSync(lock);
+    else if (kind === 'link') fs.symlinkSync(path.join(env.dir, 'nowhere'), lock);
+    else write(lock, 'the lock of another Git\n');
+    if (kind === 'linked') fs.linkSync(lock, path.join(env.dir, 'second'));
+    // Not root's: as root, another owner; as a user, the lock is the user's already (no fake owner below).
+    if (kind === 'other' && process.getuid?.() === 0) fs.chownSync(lock, 4321, 4321);
+    staleLock(lock, minutes);
+    const before = fs.lstatSync(lock).ino;
+    const result = run(env, { rootLock: kind !== 'other' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${lock} exists`);
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.lstatSync(lock).ino).toBe(before);
     expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
   });
 

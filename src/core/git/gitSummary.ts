@@ -264,6 +264,12 @@ function withExecdir(script: string, inLine: (line: string) => boolean): string 
  * into the folder (root of the dev container always; the owner where fs.protected_hardlinks is off). A folder cannot have
  * a hard link. Only for the fixes of the batch helper (GNU find); the fix in the dev container (OWNERSHIP_FIX_SCRIPT) keeps
  * its test, because a BusyBox find may lack `-links`. Throws when no line changed.
+ *
+ * Review round 2 of that follow-up (A-L2), a known residual: the test holds when find looks at the entry; chown runs
+ * later (`-exec … +` and `-execdir … +` collect names), by the name. A process of the dev container that can make a hard
+ * link (root of the dev container always; the owner only where fs.protected_hardlinks is off) can rename one over an entry
+ * that find already chose, and that file then gets the owner. Closing it needs a walk that opens each file and changes
+ * its owner through the descriptor after it checked the link count there (not done).
  */
 function withSingleLinks(script: string): string {
   const result = script

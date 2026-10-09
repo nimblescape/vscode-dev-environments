@@ -186,7 +186,10 @@ function gitFilesEntries(): { config: string; docker: string; gh: string; gitcon
  * name of its own, then renames it over its entry (a rename replaces the entry itself, also a link, and never follows
  * it): credentials.gitconfig under a random name, gitconfig as Git's lock gitconfig.lock, which the script holds from
  * before its read of gitconfig to the rename, as `git config` does (review round 1 of the follow-up, A-F4: a change of Git
- * in the dev container meanwhile is never lost; when the lock exists, the step fails, as Git does). Git edits a copy in a
+ * in the dev container meanwhile is never lost; when the lock exists, the step fails, as Git does). Review round 2 (A-L1):
+ * only when it changes gitconfig (a first check reads it without the lock); it ignores SIGTERM, SIGINT and SIGHUP, so that
+ * a Cancel cannot end it while it holds the lock; and a lock of root that is a plain file unchanged for more than 10
+ * minutes is one of a killed run, which it removes (and says so). Git edits a copy in a
  * folder of root in the helper's /tmp (`git config --file`, from `/`), outside the volume, which no process of the dev
  * container can reach; a gitconfig of more than 1 MiB is not copied (A-F2: the step fails). Whatever the owner renames
  * or replaces in between, root writes, reads and changes only what lies in the volume, and every folder it writes into
@@ -200,6 +203,12 @@ const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_NOCTTY } = fs.constants;
 const [folder, name, email, credentialHelper] = process.argv.slice(1);
+// Review round 2 of the follow-up of plan step 11I (A-L1): a Cancel sends SIGTERM to the process group of the step, and
+// SIGKILL 5 seconds later (runStep of the batch helper). The script is synchronous and ends within a fraction of a second,
+// so it ignores SIGTERM, SIGINT and SIGHUP and ends with its cleanup (Git's lock, the work folder): a kill while it holds
+// the lock would leave it there, where it stops Git in the dev container. Its children (Git, rm) end with the signal, and
+// the script fails or goes on as it would after such a failure. SIGKILL still ends it.
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
 const root = ${JSON.stringify(WORKSPACES_ROOT)};
 const configFolder = ${JSON.stringify(CONFIG_FOLDER)};
 // The entries of CONFIG_FOLDER in /workspaces, and its own entries.
@@ -305,25 +314,99 @@ const place = (parent, entry, owner, mode, write) => {
     fs.closeSync(descriptor);
   }
 };
-// gitconfig is the file of GIT_CONFIG_GLOBAL in the dev container. Review round 1 of the follow-up of plan step 11I (A-F4):
-// the script holds the lock of Git on it while it reads and replaces it, as \`git config\` does: gitconfig.lock, made with
-// O_CREAT|O_EXCL (never through a link) in the open folder before the read; the new text is written into it and it is
-// renamed over gitconfig. So a change that Git makes in the dev container meanwhile is never lost: Git finds the lock
-// and fails ("could not lock config file"), as it does for another Git. When gitconfig.lock exists (a Git of the dev
-// container, or a run that was killed), the step fails and changes nothing, as Git does. The script removes only its own
-// lock (the same file), on every way out but the rename.
-const gitconfig = (config, owner, work) => {
-  const copy = work + '/gitconfig';
-  const git = (...args) => execFileSync('git', ['config', '--file', copy, ...args], { cwd: '/', encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-  const file = paths.get(config) + '/' + names.gitconfig;
-  const lockEntry = names.gitconfig + '.lock';
-  let lock;
+// The section of gitconfig that the script ensures: an empty helper (which removes the helpers before it), then ours.
+const KEY = 'credential.https://github.com.helper';
+// Git on a copy of gitconfig in the work folder (never on a file of the volume).
+const gitOn = (copy) => (...args) => execFileSync('git', ['config', '--file', copy, ...args], { cwd: '/', encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+// Whether the section of the copy that git edits is not as the script wants it.
+const sectionChanged = (git) => {
+  let current = '';
   try {
-    lock = fs.openSync(at(config, lockEntry), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
-  } catch (error) {
-    if (error.code === 'EEXIST') throw new Error(file + '.lock exists: a Git in the dev container is changing ' + file + ', which stays as it is (when no Git runs there, remove ' + file + '.lock).');
-    throw error;
+    current = git('--get-all', KEY);
+  } catch {}
+  return current.replace(/\n+$/, '') !== ('\n' + credentialHelper).replace(/\n+$/, '');
+};
+// The file existing (openFile) copied into the new file copy of the work folder, at most MAX_GITCONFIG bytes (A-F2).
+const copyFor = (existing, copy, tooLarge) => {
+  if (existing !== undefined && existing.stat.size > MAX_GITCONFIG) throw new Error(tooLarge);
+  const target = fs.openSync(copy, O_WRONLY | O_CREAT | O_EXCL, 0o600);
+  try {
+    if (existing !== undefined) copyAtMost(existing.descriptor, target, MAX_GITCONFIG, tooLarge);
+  } finally {
+    fs.closeSync(target);
   }
+};
+// Review round 2 of the follow-up of plan step 11I (A-L1): a lock that is root's, a plain file of one link, and unchanged
+// for more than 10 minutes is the lock of a run that was killed (this script's, which stays root's until right before its
+// rename, or that of a Git of root in the dev container): Git holds its lock for the moment of one change and leaves it
+// only when it is killed. Such a lock would stop this step and every \`git config --global\` in the dev container until the
+// user found it, so the script removes it (and says so) and takes the lock. Any other lock stays (the lock of a Git of the
+// owner: the owner removes it, as Git tells it).
+const STALE_LOCK_MS = 10 * 60 * 1000;
+// Git's lock on gitconfig in the open folder config, made with O_CREAT|O_EXCL (never through a link); its descriptor.
+const takeLock = (config, file) => {
+  const entry = names.gitconfig + '.lock';
+  const create = () => {
+    try {
+      return fs.openSync(at(config, entry), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (error) {
+      if (error.code === 'EEXIST') return undefined;
+      throw error;
+    }
+  };
+  let lock = create();
+  if (lock === undefined) {
+    let seen;
+    try {
+      seen = fs.lstatSync(at(config, entry));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    const age = seen === undefined ? 0 : Date.now() - seen.mtimeMs;
+    const stale = seen !== undefined && seen.isFile() && seen.nlink === 1 && seen.uid === 0 && age > STALE_LOCK_MS;
+    if (stale) {
+      fs.unlinkSync(at(config, entry));
+      process.stdout.write('Removed ' + file + '.lock, the lock of a run that was killed (unchanged for ' + Math.floor(age / 60000) + ' minutes).\n');
+    }
+    // Gone meanwhile (a Git of the dev container ended), or removed: once more.
+    if (seen === undefined || stale) lock = create();
+  }
+  if (lock === undefined) throw new Error(file + '.lock exists: a Git in the dev container is changing ' + file + ', which stays as it is (when no Git runs there, remove ' + file + '.lock).');
+  return lock;
+};
+// gitconfig is the file of GIT_CONFIG_GLOBAL in the dev container. Review round 1 of the follow-up of plan step 11I (A-F4):
+// to change it, the script holds the lock of Git on it while it reads and replaces it, as \`git config\` does:
+// gitconfig.lock (takeLock), made before the read; the new text is written into it and it is renamed over gitconfig. So a
+// change that Git makes in the dev container meanwhile is never lost: Git finds the lock and fails ("could not lock
+// config file"), as it does for another Git. When gitconfig.lock exists (a Git of the dev container, or a run that was
+// killed), the step fails and changes nothing, as Git does. The script removes only its own lock (the same file), on
+// every way out but the rename. Review round 2 (A-L1): a run that changes nothing takes no lock, as the shell script
+// before it (whose Git took the lock only in its writes): gitconfig is first read without it (a change of Git meanwhile
+// replaces the file whole, by a rename); when its section is as it must be and it has one link (every open after the
+// first), it only gets the owner. Otherwise all is done again under the lock.
+const gitconfig = (config, owner, work) => {
+  const file = paths.get(config) + '/' + names.gitconfig;
+  const tooLarge = file + ' is larger than 1 MiB: it stays as it is.';
+  const kind = kindOf(config, names.gitconfig);
+  if (kind !== 'link' && kind !== 'missing') {
+    const existing = openFile(config, names.gitconfig);
+    if (existing !== undefined) {
+      try {
+        const check = work + '/check';
+        copyFor(existing, check, tooLarge);
+        if (existing.stat.nlink === 1 && !sectionChanged(gitOn(check))) {
+          fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
+          return;
+        }
+      } finally {
+        fs.closeSync(existing.descriptor);
+      }
+    }
+  }
+  const copy = work + '/gitconfig';
+  const git = gitOn(copy);
+  const lockEntry = names.gitconfig + '.lock';
+  const lock = takeLock(config, file);
   let held = true;
   const unlock = () => {
     const own = fs.fstatSync(lock);
@@ -341,30 +424,18 @@ const gitconfig = (config, owner, work) => {
       if (kindOf(config, names.gitconfig) === 'link') fs.unlinkSync(at(config, names.gitconfig));
       const existing = openFile(config, names.gitconfig);
       try {
-        const tooLarge = file + ' is larger than 1 MiB: it stays as it is.';
-        if (existing !== undefined && existing.stat.size > MAX_GITCONFIG) throw new Error(tooLarge);
-        const target = fs.openSync(copy, O_WRONLY | O_CREAT | O_EXCL, 0o600);
-        try {
-          if (existing !== undefined) copyAtMost(existing.descriptor, target, MAX_GITCONFIG, tooLarge);
-        } finally {
-          fs.closeSync(target);
-        }
+        copyFor(existing, copy, tooLarge);
         if (existing === undefined) {
           if (name !== '') git('user.name', name);
           if (email !== '') git('user.email', email);
         }
-        const key = 'credential.https://github.com.helper';
-        let current = '';
-        try {
-          current = git('--get-all', key);
-        } catch {}
-        const changed = current.replace(/\n+$/, '') !== ('\n' + credentialHelper).replace(/\n+$/, '');
+        const changed = sectionChanged(git);
         if (changed) {
           try {
-            git('--unset-all', key);
+            git('--unset-all', KEY);
           } catch {}
-          git('--add', key, '');
-          git('--add', key, credentialHelper);
+          git('--add', KEY, '');
+          git('--add', KEY, credentialHelper);
         }
         if (existing === undefined || changed || existing.stat.nlink !== 1) {
           // The new text in the lock, with the owner and the mode through its descriptor, then renamed over gitconfig
@@ -380,6 +451,7 @@ const gitconfig = (config, owner, work) => {
           fs.renameSync(at(config, lockEntry), at(config, names.gitconfig));
           held = false;
         } else {
+          // As it must be meanwhile (a Git of the dev container repaired it).
           fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
         }
       } finally {

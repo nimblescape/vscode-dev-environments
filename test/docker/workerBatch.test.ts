@@ -115,6 +115,21 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     expect(batchLeftovers).toEqual([]);
   });
 
+  // Review round 2 of the follow-up of plan step 11I (A-L3): the root steps of the batch helper rely on the walks of GNU
+  // coreutils and findutils, which follow no link: `chown -R` and `find -execdir` give the files of the Git user to root
+  // (gitUserFilesToRootCommands of src/helperChannel/batchHelper.ts), GNU `rm -rf` removes for GIT_FILES_SCRIPT, and the
+  // ownership fixes of the batch helper use `-execdir` and `-links`. A BusyBox or uutils chown walks by the paths.
+  it('has the chown, rm and find of GNU in the helper image', () => {
+    for (const [tool, project] of [
+      ['chown', 'GNU coreutils'],
+      ['rm', 'GNU coreutils'],
+      ['find', 'GNU findutils'],
+    ] as const) {
+      const version = cli.ok(['run', '--rm', '--pull', 'never', '--network', 'none', '--label', `${TEST_RUN_LABEL}=${run.runId}`, helperTag, tool, '--version']);
+      expect(version.split('\n')[0], tool).toMatch(new RegExp(`^${tool} \\(${project}\\) \\d`));
+    }
+  });
+
   it('refuses a missing volume and does not create it', async () => {
     // Plan step 11I1, PR A1: opened from the test process (was: through the lock of a worker).
     const target = await targets.current();
