@@ -1049,6 +1049,9 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
             continue;
           }
           await loop.removals;
+          // Review round 3 of 11H2 (reviewer A, A3-L1; reviewer B, D1): the timer of the schedule can start a run while the
+          // removals end, so the exit looks again; the next idle tick waits for that run as above.
+          if (schedule.busy) continue;
           // Review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats too.
           log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and it does not run permanently; the Session Monitor exits. The next open starts it again.`);
           return 0;
