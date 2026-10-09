@@ -25,6 +25,11 @@ const realMv = ['/usr/bin/mv', '/bin/mv'].find((file) => fs.existsSync(file)) ??
 // `setpriv` (util-linux) runs the shell without capabilities, so that a root user of the tests gets the permission checks
 // of a plain user (a home folder it cannot enter).
 const setpriv = ['/usr/bin/setpriv', '/bin/setpriv'].find((file) => fs.existsSync(file));
+// CI of #134 (the runner is not root): a plain user gets those permission checks without `setpriv`, and `setpriv
+// --bounding-set` needs a capability it does not have. So `setpriv` only for a root user of the tests; a root user
+// without it skips the test, and only a root user can give a folder another owner (the swap test).
+const isRoot = process.getuid?.() === 0;
+const asPlainUser: string[] = isRoot && setpriv !== undefined ? [setpriv, '--bounding-set', '-all', '--inh-caps', '-all', '--'] : [];
 
 const temps: string[] = [];
 afterEach(() => {
@@ -91,18 +96,19 @@ function sandbox() {
 describe('the folder checks of the link script, probes (review round 2 of 11H1, reviewer B)', () => {
   const rootServer = fs.existsSync('/root/.vscode-server');
 
-  it.skipIf(setpriv === undefined)('a home folder that the user cannot enter: the script fails and writes nothing into its working folder', () => {
+  it.skipIf(isRoot && setpriv === undefined)('a home folder that the user cannot enter: the script fails and writes nothing into its working folder', () => {
     const s = sandbox();
     fs.chmodSync(s.home, 0o000);
     // Without capabilities the root user of the tests cannot enter a folder of mode 000 either; `[ -d ]` still holds.
-    expect(spawnSync(setpriv as string, ['--bounding-set', '-all', '--inh-caps', '-all', '--', shell, '-c', `[ -d '${s.home}' ] && ! cd '${s.home}' 2>/dev/null`], { stdio: 'ignore' }).status).toBe(0);
-    const result = s.run({}, [setpriv as string, '--bounding-set', '-all', '--inh-caps', '-all', '--']);
+    const check = [...asPlainUser, shell, '-c', `[ -d '${s.home}' ] && ! cd '${s.home}' 2>/dev/null`];
+    expect(spawnSync(check[0], check.slice(1), { stdio: 'ignore' }).status).toBe(0);
+    const result = s.run({}, asPlainUser);
     expect(result.status).not.toBe(0);
     expect(result.stdout).not.toContain('linked');
     expect(fs.readdirSync(s.work)).toEqual([]);
   });
 
-  it("~/.vscode-server swapped for another user's folder after its first check: refused, nothing created in it", () => {
+  it.skipIf(!isRoot)("~/.vscode-server swapped for another user's folder after its first check: refused, nothing created in it", () => {
     const s = sandbox();
     fs.mkdirSync(path.join(s.home, '.vscode-server'));
     // The folder of another user, swapped in at the same path (the `pwd -P` check sees the expected path).
