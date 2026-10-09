@@ -4,9 +4,9 @@
 
 // Plan step 11F2 (decision 1 of 2026-10-03: no bypass of the worker, by construction): the Docker CLI of the extension,
 // only for the bootstrap: whether the CLI is installed and the engine answers (`docker info`), the helper image (its
-// check and build; its rebuild and its cleanup, the maintenance, have no caller in this version, and the decision of
-// 2026-10-09, docs/plan-remote-worker.md section 2, restores them in the extension's preparation of the worker for an
-// open and in the background prebuild, with a follow-up PR), the start of the worker (`docker run -i`), the Docker
+// check and build, and its maintenance, the rebuild and the cleanup: PR H, decision of 2026-10-09,
+// docs/plan-remote-worker.md section 2, in the extension's preparation of the worker for an operation `open` and in the
+// background prebuild), the start of the worker (`docker run -i`), the Docker
 // contexts, the test of a new remote host, and the attach diagnostics (what the Dev Containers extension sees through
 // the local CLI). Every other Docker action runs in the worker. A call that does not only read is logged with its
 // command (directCommandName), never its arguments. Output is read as JSON, never as a table. No `vscode`.

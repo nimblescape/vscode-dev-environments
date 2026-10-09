@@ -4,7 +4,8 @@
 
 // Image of the workspace helper (implementation notes 7): built locally from resources/helper/Dockerfile. With a state
 // file, the base image is checked once a week in the background (a changed base image rebuilds the same tag at the next
-// ensure), and helper images that no window uses anymore are removed once a day. User decision 2026-09-29: there is no
+// maintaining ensure: PR H, the preparation of a worker for an open and the background prebuild), and helper images that
+// no window uses anymore are removed once a day. User decision 2026-09-29: there is no
 // previous helper image. When the current tag is missing and cannot be built, the ensure fails (the open then fails with
 // helperFailed); the background prebuild after an extension update (HelperPrebuild) builds the new tag early.
 import * as crypto from 'crypto';
@@ -58,6 +59,29 @@ export const HELPER_RETRY_INTERVAL_MS = DAY_MS;
  * this long after the removal. Then the tombstone expires: the tag gets a new grace period, and an unlisted tag is forgotten.
  */
 export const HELPER_TOMBSTONE_MS = 90 * DAY_MS;
+
+/**
+ * Review round 1 of PR H: the longest rebuild that a check asked for (`--pull --no-cache`), as long as the time limit of
+ * the background prebuild. A rebuild that takes longer (a pull or a download that stalls without failing) is ended and
+ * counts as a failed rebuild: the existing image stays, and the next check is in a week.
+ */
+export const HELPER_REBUILD_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * Review round 1 of PR H: the abort reason of a time limit of a caller (the background prebuild), a TimeoutError as
+ * AbortSignal.timeout gives one: a rebuild that it ends counts as a failed rebuild, not as a cancel.
+ */
+export function helperTimeLimit(message: string): Error {
+  const reason = new Error(message);
+  reason.name = 'TimeoutError';
+  return reason;
+}
+
+/** Review round 1 of PR H: `signal` was ended by a time limit (helperTimeLimit, AbortSignal.timeout), not by a cancel. */
+function endedByTimeLimit(signal: AbortSignal | undefined): boolean {
+  const reason: unknown = signal?.aborted === true ? signal.reason : undefined;
+  return typeof reason === 'object' && reason !== null && (reason as { name?: unknown }).name === 'TimeoutError';
+}
 
 /** The part of BootstrapDocker that the helper image needs. */
 export type HelperImageDocker = Pick<
@@ -161,12 +185,11 @@ export interface EnsureHelperImageOptions {
   /** Time limit of `baseDigest`; after it, the registry counts as unreachable. Default IMAGE_CHECK_TIMEOUT_MS. */
   baseDigestTimeoutMs?: number;
   /**
-   * `false` for the calls without the maintenance (ensureImagePresent, prebuildImage; default `true`): only a missing
-   * tag is built and the use is recorded; the check of the base image, a rebuild that a check asked for, and the
-   * cleanup are left to HelperImages.ensureImage, which the open pipeline called until the open moved into the worker
-   * and which has no caller in this version (the decision of 2026-10-09, docs/plan-remote-worker.md section 2, restores
-   * the maintenance in the extension's preparation of the worker for an open and in the background prebuild, with a
-   * follow-up PR).
+   * `false` for the calls without the maintenance (ensureImagePresent, the preparation of a worker for any operation but
+   * an open and for a heartbeat; default `true`): only a missing tag is built and the use is recorded; the check of the
+   * base image, a rebuild that a check asked for, and the cleanup are left to the maintaining ensure of HelperImages
+   * (ensureImageUse, prebuildImage), which PR H (decision of 2026-10-09, docs/plan-remote-worker.md section 2) calls in
+   * the extension's preparation of the worker for an operation `open` and in the background prebuild.
    */
   maintain?: boolean;
   /**
@@ -185,7 +208,8 @@ export interface EnsureHelperImageOptions {
   logger?: Logger;
 }
 
-type BuildFlags = { pull?: boolean; noCache?: boolean };
+/** `signal`: instead of the caller's (review round 1 of PR H: the rebuild bounds it, HELPER_REBUILD_TIMEOUT_MS). */
+type BuildFlags = { pull?: boolean; noCache?: boolean; signal?: AbortSignal };
 
 /** How a build or a check changes the record of the tag: a function of the current record. */
 type RecordChange = (record: HelperImageRecord | undefined) => HelperImageRecord;
@@ -214,10 +238,12 @@ interface Maintenance {
  *   local base image and the build cache may still build it, and the next check that reaches the registry asks for a
  *   rebuild from the current base image.
  * - `maintain` (not for the helper runs): a rebuild that an earlier check asked for runs now, with `--pull --no-cache`;
- *   the previous image is then removed if it has no tag anymore. A failed rebuild keeps the existing image. When the
- *   check of the base image is due (7 days after the last answer of the registry, a day after an attempt without an
- *   answer), it starts in the background, under its own time limit: this function does not wait for it. It compares the
- *   registry digest of the base image with the recorded one; a change asks the next ensure for a rebuild.
+ *   the previous image is then removed if it has no tag anymore. A failed rebuild keeps the existing image (review round
+ *   1 of PR H: so does one that takes longer than HELPER_REBUILD_TIMEOUT_MS, or that a time limit of the caller ends;
+ *   a cancel of the caller is an abort). When the check of the base image is due (7 days after the last answer of the
+ *   registry, a day after an attempt without an answer), it starts in the background, under its own time limit: this
+ *   function does not wait for it. It compares the registry digest of the base image with the recorded one; a change
+ *   asks the next ensure for a rebuild.
  * - `lastUsedAt` of the tag is written (at most once per hour); with `maintain`, the cleanup runs (at most once per day).
  * - User decision 2026-09-29: when the missing tag cannot be built, the error of the build is thrown; no other helper
  *   image is used in its place.
@@ -244,7 +270,7 @@ export async function ensureHelperImageUse(
   const content = await fs.promises.readFile(dockerfilePath, 'utf8');
   const tag = helperImageTag(content);
   const logger = options.logger ?? silentLogger;
-  const build = (flags: BuildFlags): Promise<string | undefined> =>
+  const build = ({ signal, ...flags }: BuildFlags): Promise<string | undefined> =>
     docker.buildImage({
       tag,
       dockerfile: dockerfilePath,
@@ -253,7 +279,7 @@ export async function ensureHelperImageUse(
       buildArgs: { DEVCONTAINER_CLI_VERSION },
       ...flags,
       onOutput: options.onOutput,
-      signal: options.signal,
+      signal: signal ?? options.signal,
     });
   if (options.statePath === undefined) {
     if (await docker.imageExists(tag)) return withId(tag, await imageIdOf(docker, tag, logger));
@@ -331,6 +357,46 @@ function isDue(time: string | undefined, now: number, intervalMs: number): boole
   return age === undefined || age < 0 || age >= intervalMs;
 }
 
+/** A check of the base image asked the next maintaining ensure for a rebuild of the tag (its new digest is recorded). */
+function isRebuildAsked(record: HelperImageRecord | undefined): record is HelperImageRecord & { latestBaseDigest: string } {
+  return record?.latestBaseDigest !== undefined;
+}
+
+/**
+ * The time of the weekly check of the base image has come: 7 days after the last answer of the registry, a day after an
+ * attempt.
+ */
+function isBaseCheckTime(record: HelperImageRecord | undefined, now: number): boolean {
+  return isDue(record?.checkedAt, now, HELPER_CHECK_INTERVAL_MS) && isDue(record?.attemptedAt, now, HELPER_RETRY_INTERVAL_MS);
+}
+
+/** The daily cleanup of other helper images is due. */
+function isCleanupDue(state: HelperState, now: number): boolean {
+  return isDue(state.lastCleanupAt, now, HELPER_CLEANUP_INTERVAL_MS);
+}
+
+/**
+ * PR H (decision of 2026-10-09): whether the refresh of the helper tag of `dockerfileContent` is due, by the state file
+ * alone (no Docker call): with `checkBaseImage` (the setting updateImagesOnConnect) and a base image in the Dockerfile,
+ * the rebuild that a check asked for, or, with a lookup of the base digest (`baseDigest`), the weekly check of the base
+ * image. The rules of ensureWithState, but for one: an attempt of the check that the registry did not answer puts the
+ * next one off by a week here, not by a day as in ensureWithState (isBaseCheckTime; review round 1 of PR H, A-L2), so
+ * that a registry that does not answer does not make the prebuild contact Docker every day for a check that needs no
+ * Docker; the preparation of the worker for an open still tries it again after a day. The daily cleanup is not part of
+ * it (isCleanupDue): the background prebuild asks Docker only when this, or the build of a tag without a record, is due
+ * (HelperPrebuild), never for the cleanup alone, which then runs with it when it is due too.
+ */
+export function helperRefreshDue(
+  state: HelperState,
+  dockerfileContent: string,
+  options: { now: number; checkBaseImage: boolean; baseDigest: boolean },
+): boolean {
+  if (!options.checkBaseImage || baseImageOf(dockerfileContent) === undefined) return false;
+  const record = state.images[helperImageTag(dockerfileContent)];
+  const checkDue = isDue(record?.checkedAt, options.now, HELPER_CHECK_INTERVAL_MS) && isDue(record?.attemptedAt, options.now, HELPER_CHECK_INTERVAL_MS);
+  return isRebuildAsked(record) || (options.baseDigest && checkDue);
+}
+
 /** True if the record marks the tag as one of another installation, or as removed. */
 function isForeign(record: HelperImageRecord | undefined): boolean {
   return record?.foreignSince !== undefined || record?.removedAt !== undefined;
@@ -359,7 +425,7 @@ async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
     const builtId = created.id;
     currentId = builtId ?? (await imageIdQuietly(m));
     change = builtId === undefined ? created.change : (record) => ({ ...created.change(record), imageId: builtId });
-  } else if (maintain && checkBaseImage && m.baseImage !== undefined && recorded?.latestBaseDigest !== undefined) {
+  } else if (maintain && checkBaseImage && m.baseImage !== undefined && isRebuildAsked(recorded)) {
     const rebuilt = await rebuild(m, m.baseImage, recorded, recorded.latestBaseDigest, currentId);
     change = rebuilt.change;
     currentId = rebuilt.currentId;
@@ -395,8 +461,7 @@ async function ensureWithState(m: Maintenance): Promise<HelperImageUse> {
 /** The weekly check of the base image is due: 7 days after the last answer of the registry, a day after an attempt. */
 function isCheckDue(m: Maintenance, record: HelperImageRecord | undefined): boolean {
   if (!m.options.baseDigest || m.baseImage === undefined) return false;
-  const now = m.clock.now();
-  return isDue(record?.checkedAt, now, HELPER_CHECK_INTERVAL_MS) && isDue(record?.attemptedAt, now, HELPER_RETRY_INTERVAL_MS);
+  return isBaseCheckTime(record, m.clock.now());
 }
 
 /**
@@ -446,7 +511,9 @@ async function buildMissing(m: Maintenance, pull: boolean): Promise<{ pulled: bo
 /**
  * Step 3 (implementation notes 7), the rebuild that a check asked for: the same tag with `--pull --no-cache`, then the
  * removal of the previous image if it has no tag anymore. A failed rebuild keeps the existing image, and the next check
- * is in a week. An abort passes through and changes nothing, so the next ensure builds again.
+ * is in a week. Review round 1 of PR H: so does a rebuild that takes longer than HELPER_REBUILD_TIMEOUT_MS, or that a
+ * time limit of the caller ends (helperTimeLimit: the background prebuild); its `docker build` is ended. A cancel of the
+ * caller passes through as an abort and changes nothing, so the next ensure builds again.
  */
 async function rebuild(
   m: Maintenance,
@@ -462,14 +529,26 @@ async function rebuild(
       : `The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again.`,
   );
   m.options.onBuild?.('refresh');
+  // Review round 1 of PR H: the rebuild has a time limit; its end aborts the signal of the build, which ends `docker build`.
+  const limit = new AbortController();
+  const timer = setTimeout(() => limit.abort(), HELPER_REBUILD_TIMEOUT_MS);
+  (timer as { unref?: () => void }).unref?.();
+  const signal = m.options.signal === undefined ? limit.signal : AbortSignal.any([m.options.signal, limit.signal]);
   let builtId: string | undefined;
   try {
     // A fresh base image, and no cache: the Debian packages and the Docker CLI are installed again, too.
-    builtId = await m.build({ pull: true, noCache: true });
+    builtId = await m.build({ pull: true, noCache: true, signal });
   } catch (error) {
-    if (isAbortError(error) || m.options.signal?.aborted) throw error;
+    // Review round 1 of PR H: a time limit (this one, or the caller's) ends a stalled rebuild like a failed one; a cancel
+    // of the caller stays an abort.
+    const timedOut = limit.signal.aborted || endedByTimeLimit(m.options.signal);
+    if (!timedOut && (isAbortError(error) || m.options.signal?.aborted)) throw error;
     // Docker moves the tag only after a successful build: the existing image stays. The next check is in a week.
-    logger.warn(`The workspace helper image ${tag} could not be built again. The existing image is used: ${errorMessage(error)}`);
+    logger.warn(
+      timedOut
+        ? `The workspace helper image ${tag} was not built again within its time limit, so its build was stopped. The existing image is used.`
+        : `The workspace helper image ${tag} could not be built again. The existing image is used: ${errorMessage(error)}`,
+    );
     const checkedAt = isoTime(m.clock);
     return {
       change: (record) => {
@@ -478,6 +557,8 @@ async function rebuild(
       },
       currentId,
     };
+  } finally {
+    clearTimeout(timer);
   }
   const builtAt = isoTime(m.clock);
   // Review round 3 of PR #64 (P4): the ID of the rebuilt image comes from the build (its build label); the tag is read only
@@ -541,10 +622,12 @@ async function recordCheck(m: Maintenance, baseImage: string, digest: string | '
     else if (known === undefined) state.images[tag] = { ...record, baseImage, baseDigest: digest, checkedAt: now };
     else state.images[tag] = { ...record, checkedAt: now };
   });
+  // PR H (decision of 2026-10-09): the next maintaining ensure rebuilds it: the background prebuild when a window starts
+  // (with the setting updateImagesOnConnect on), or the preparation of a new worker for an open.
   if (rebuildReason === 'changed') {
-    logger.info(`The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again at the next open.`);
+    logger.info(`The base image ${baseImage} of the workspace helper has changed. The image ${tag} is built again when a window starts or a worker is set up for an open.`);
   } else if (rebuildReason === 'unpulled') {
-    logger.info(`The workspace helper image ${tag} was built from the local base image. It is built again from the current base image at the next open.`);
+    logger.info(`The workspace helper image ${tag} was built from the local base image. It is built again from the current base image when a window starts or a worker is set up for an open.`);
   }
 }
 
@@ -654,7 +737,7 @@ async function removeHelperImage(m: Maintenance, image: ImageInfo, reference: st
 async function cleanUpIfDue(m: Maintenance, currentId: string): Promise<void> {
   const nowMs = m.clock.now();
   const state = await readHelperState(m.statePath);
-  if (!isDue(state.lastCleanupAt, nowMs, HELPER_CLEANUP_INTERVAL_MS)) return;
+  if (!isCleanupDue(state, nowMs)) return;
   const images = await listHelperImages(m);
   if (!images) return;
 

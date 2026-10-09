@@ -190,9 +190,8 @@ async function activateExtension(
     dockerfilePath: helperDockerfile,
     // Implementation notes 7: the digest of the base image is read with this registry client and the credentials of
     // this computer (for ghcr.io also the GitHub sign-in), with its own time limit of 5 seconds: at the build of a
-    // missing tag, and by the weekly check of ensureImage, which has no caller in this version (the decision of
-    // 2026-10-09, docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the
-    // worker for an open and in the background prebuild, with a follow-up PR).
+    // missing tag, and by the weekly check of the maintaining ensure (PR H, decision of 2026-10-09: the preparation of
+    // the worker for an operation `open`, and the background prebuild).
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
     // Unit 7: the engine of the operation (its key: '' for the local Docker, else the host). Review round 1 of PR #129
@@ -242,11 +241,12 @@ async function activateExtension(
   const channels = new HelperChannels({
     logger,
     // Plan step 5, PR D (rule D1 of 2026-09-30): the helper image on the engine of the operation, as withEnvironmentLock
-    // ensures it before the lock (only a missing tag is built). A-R2-2: for a heartbeat, with the long signal.
-    prepare: async (target, signal) => {
+    // ensures it before the lock (only a missing tag is built). A-R2-2: for a heartbeat, with the long signal. PR H
+    // (decision of 2026-10-09): for an operation `open`, the maintaining ensure with its `maintenance` (heartbeatWiring).
+    prepare: async (target, signal, maintenance) => {
       // Review round 3 of PR #85 (A-R3-1): for a heartbeat, no new build on this engine within the wait after a failed one;
       // review round 4 of PR #85 (A-R4-1): within it, the heartbeat goes on when the tag is present (heartbeatWiring).
-      await heartbeats.prepareWorker(target, signal);
+      await heartbeats.prepareWorker(target, signal, maintenance);
     },
     // PR #76 review round 1 (A-R1-1, A-R1-2): the refresh of the sidebar only checks that the helper image is present.
     checkPresent: async (target, signal) => {
@@ -678,17 +678,21 @@ async function activateExtension(
   // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
   // The build (HelperImages.prebuildImage) is shared with the preparation of a worker in this window
-  // (HelperImages.ensureImagePresent) and cancelled when the extension is deactivated. Plan step 6, PR D: on the Docker
-  // engine of the current Docker context, local or remote alike, as an operation on it (the state file and engine key
-  // of an open there); a remote host gets our own SSH check without questions before its `docker info`
-  // (dockerEngineAnswers). A host switch starts no new prebuild: the next activation, or the first open on that host,
-  // builds its tag.
+  // (HelperImages.ensureImagePresent, ensureImageUse before an open) and cancelled when the extension is deactivated.
+  // PR H (decision of 2026-10-09): with updateImagesOnConnect on, it also runs when helper.json says that the refresh of
+  // the helper image is due (the rebuild that a check asked for, the weekly check), never for the daily cleanup alone; its
+  // maintaining ensure then also runs the cleanup when that is due. Plan step 6, PR D: on the Docker engine of the current
+  // Docker context, local or remote alike, as an operation on it (the state file and engine key of an open there); a
+  // remote host gets our own SSH check without questions before its `docker info` (dockerEngineAnswers). A host switch
+  // starts no new prebuild: the next activation, or the first open on that host, builds its tag.
   const helperPrebuild = new HelperPrebuild({
     helper,
     dockerRunning: (target, signal) =>
       dockerEngineAnswers(target, { daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger }, signal),
     dockerfilePath: context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile')),
     statePath: paths.helperState,
+    // PR H (decision of 2026-10-09): the setting decides the check of the base image and the rebuild, not the cleanup.
+    checkBaseImage: () => getSettings().updateImagesOnConnect,
     logger,
   });
   context.subscriptions.push(helperPrebuild);

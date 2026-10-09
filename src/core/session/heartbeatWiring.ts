@@ -10,6 +10,7 @@
 // is tested.
 // No `vscode`.
 import type { DockerTarget } from '../docker/dockerHost';
+import type { HelperMaintenance } from '../helper/helperImages';
 import { heartbeatHelperImage, type HeartbeatHelperImageDeps } from './heartbeatHelperImage';
 import { HeartbeatPreparation } from './heartbeatPreparation';
 
@@ -33,8 +34,12 @@ export interface HeartbeatWiring {
   readonly preparation: HeartbeatPreparation;
   /** HelperImages' onImageBuilt: a build succeeded, so the wait of its engine ends (every wait when not known). */
   imageBuilt(): void;
-  /** HelperChannels' `prepare`: the helper image for the worker of `target`, through the preparation (its wait). */
-  prepareWorker(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
+  /**
+   * HelperChannels' `prepare`: the helper image for the worker of `target`, through the preparation (its wait). PR H
+   * (decision of 2026-10-09): with `maintenance` (the preparation for an operation `open`), the maintaining ensure
+   * (heartbeatHelperImage).
+   */
+  prepareWorker(target: DockerTarget, signal: AbortSignal | undefined, maintenance?: HelperMaintenance): Promise<void>;
   /**
    * The repair of the Session Monitor container of a heartbeat: in the scope of a heartbeat, `ensureMonitor` on
    * `target` (plan step 11D2: the worker's operation; its preparation is the helper image through the preparation and
@@ -55,7 +60,7 @@ export function heartbeatWiring(deps: HeartbeatWiringDeps): HeartbeatWiring {
       if (built !== undefined) preparation.clear(built);
       else preparation.clearAll();
     },
-    prepareWorker: (target, signal) => image.prepareWorker(target, signal),
+    prepareWorker: (target, signal, maintenance) => image.prepareWorker(target, signal, maintenance),
     repair: (ensureMonitor) => (target, signal) => preparation.scope(() => ensureMonitor(target, signal)),
   };
 }

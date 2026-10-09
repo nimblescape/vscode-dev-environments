@@ -40,6 +40,7 @@ import {
   type OpenParams,
   type WindowStateValue,
 } from '../helperChannel/protocol';
+import type { HelperMaintenance } from '../helper/helperImages';
 import type { ImageSettings } from '../remoteMonitor/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { Steps, type ProgressStep } from '../messages';
@@ -99,6 +100,9 @@ export type OperationFlow = (
     onQuestion?: (state: 'asked' | 'settled') => void;
     // Plan step 11E6: a step of the flow began (the progress of the open).
     onProgress?: (step: string, detail?: string) => void;
+    // PR H (decision of 2026-10-09): only the operation `open`: the helper image maintenance of the preparation of its
+    // worker (HelperChannelsOptions.prepare), when no worker of the engine is open yet.
+    helperMaintenance?: HelperMaintenance;
   },
 ) => Promise<unknown>;
 
@@ -178,7 +182,10 @@ export class EnvironmentOperations extends OperationBase {
    * dialog when needed: the worker asks for the token without one) and the start of the local Docker (concept 7.6). The
    * steps of the worker are the progress of the open. Decision D1: the open carries the image maintenance of this
    * computer and the image list. The answer names an environment of the signed-in account on the Docker host of the
-   * operation (and of the repository of the open), which the window takes from its own registry.
+   * operation (and of the repository of the open), which the window takes from its own registry. PR H (decision of
+   * 2026-10-09): the flow carries the helper image maintenance (HelperMaintenance, with the setting
+   * updateImagesOnConnect) for the preparation of its worker, and a build of the helper image there is a detail of the
+   * progress until that preparation ended.
    */
   private async openThroughWorker(
     repository: string,
@@ -193,7 +200,8 @@ export class EnvironmentOperations extends OperationBase {
       if (!entry) throw environmentMissing(repository);
       this.availableEntry(entry, session.account);
     }
-    await this.startDocker(new StepReporter(options.progress, this.logger), signal);
+    const steps = new StepReporter(options.progress, this.logger);
+    await this.startDocker(steps, signal);
     this.throwIfCancelled(signal);
     const dockerHost = await this.currentDockerHost();
     const monitor = this.deps.openMonitor?.(dockerHost);
@@ -218,6 +226,15 @@ export class EnvironmentOperations extends OperationBase {
       ...(options.configPath !== undefined ? { configPath: options.configPath } : {}),
     });
     if (params === undefined) throw new Error(`The open of ${repository} cannot be sent to the worker.`);
+    // PR H (decision of 2026-10-09): the preparation of the worker of this open (when no worker of the engine is open)
+    // runs the helper image maintenance with the setting updateImagesOnConnect; its build (a missing tag, or the rebuild
+    // that a check asked for) is shown as the detail of the progress until the preparation ended, as the open pipeline
+    // showed it before it moved into the worker.
+    const helperMaintenance: HelperMaintenance = {
+      checkBaseImage: settings.updateImagesOnConnect,
+      onBuild: (kind) => steps.detail(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
+      onBuildEnd: () => steps.clearDetail(),
+    };
     // The steps of the worker's pipeline (it logs them itself); `starting`: its `up` may run from here on.
     let started = false;
     const onProgress = (step: string, detail?: string) => {
@@ -231,7 +248,7 @@ export class EnvironmentOperations extends OperationBase {
     };
     let answer: unknown;
     try {
-      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress);
+      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress, helperMaintenance);
     } catch (error) {
       // Review round 1 of PR #111 (A-M1): the user cancelled a question of the open in the worker (the worker cleaned up
       // through its requests, which were answered): a cancel, as before the move.
@@ -368,9 +385,18 @@ export class EnvironmentOperations extends OperationBase {
     onQuestion?: (state: 'asked' | 'settled') => void,
     // Plan step 11E6: the progress of the flow (the open).
     onProgress?: (step: string, detail?: string) => void,
+    // PR H (decision of 2026-10-09): the helper image maintenance of the preparation of the worker (the open).
+    helperMaintenance?: HelperMaintenance,
   ): Promise<unknown> {
     try {
-      return await this.deps.flow(op, params, { signal, timeoutMs, ...(onAnswer ? { onAnswer } : {}), ...(onQuestion ? { onQuestion } : {}), ...(onProgress ? { onProgress } : {}) });
+      return await this.deps.flow(op, params, {
+        signal,
+        timeoutMs,
+        ...(onAnswer ? { onAnswer } : {}),
+        ...(onQuestion ? { onQuestion } : {}),
+        ...(onProgress ? { onProgress } : {}),
+        ...(helperMaintenance ? { helperMaintenance } : {}),
+      });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
       if (error instanceof HelperOperationError && error.code === LOCK_BUSY_CODE) {
