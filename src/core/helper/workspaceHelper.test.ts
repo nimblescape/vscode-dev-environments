@@ -2235,7 +2235,9 @@ describe('WorkspaceHelper Dev Container CLI calls', () => {
     expect(result).toMatchObject({ outcome: 'success', containerId: 'c1', remoteWorkspaceFolder: '/workspaces/api' });
     const run = docker.runs[0];
     expect(JSON.parse(run.options.input ?? '')).toEqual(override);
-    expect(run.args).not.toContain('-e');
+    // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: the only variable of up is the entitlement check of
+    // bake turned off (was: no variable).
+    expect(run.args.filter((_arg, index) => run.args[index - 1] === '-e')).toEqual(['BUILDX_BAKE_ENTITLEMENTS_FS=0']);
     expect(commandOf(run.args)).toEqual([
       'sh',
       '-c',

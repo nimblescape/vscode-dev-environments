@@ -162,12 +162,23 @@ describe('the variables and the log line of a step (plan step 6, PR B)', () => {
     const base = { PATH: '/usr/bin', HOME: '/root', DOCKER_HOST: 'tcp://x:2375', XDG_CONFIG_HOME: '/root/.config' };
     const up = batchStepCommand('up', { repository: 'o/r', override: {}, environmentId: 'e', removeExistingContainer: false, env: { COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'true', A: 'b' } });
     const env = stepEnvironment(base, up);
-    expect(env).toEqual({ PATH: '/usr/bin', HOME: '/root', XDG_CONFIG_HOME: '/root/.config', A: 'b', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' });
+    // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: up runs with the entitlement check of bake off.
+    expect(env).toEqual({ PATH: '/usr/bin', HOME: '/root', XDG_CONFIG_HOME: '/root/.config', A: 'b', BUILDX_BAKE_ENTITLEMENTS_FS: '0', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' });
     const clone = stepEnvironment(base, batchStepCommand('clone', { repository: 'o/r' }));
     expect(clone.HOME).toBe(BATCH_GIT_HOME);
     expect(clone.XDG_CONFIG_HOME).toBeUndefined();
     expect(clone.DOCKER_HOST).toBeUndefined();
     expect(base.DOCKER_HOST).toBe('tcp://x:2375');
+  });
+
+  // Review round 1 of PR #130 (A-F4): a value of the variable in the helper's own environment (for example one that a
+  // future image set) does not turn the check of bake on again for build and up.
+  it('gives build and up the entitlement check of bake off, also over a value of the helper (user decision of 2026-10-09)', () => {
+    const base = { PATH: '/usr/bin', HOME: '/root', BUILDX_BAKE_ENTITLEMENTS_FS: '1' };
+    const up = batchStepCommand('up', { repository: 'o/r', override: {}, environmentId: 'e', removeExistingContainer: false });
+    const build = batchStepCommand('build', { repository: 'o/r', configPath: 'a.json', imageName: 'x' });
+    expect(stepEnvironment(base, up).BUILDX_BAKE_ENTITLEMENTS_FS).toBe('0');
+    expect(stepEnvironment(base, build).BUILDX_BAKE_ENTITLEMENTS_FS).toBe('0');
   });
 
   it('logs the command without its script, and the Git user', () => {

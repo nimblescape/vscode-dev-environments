@@ -37,6 +37,7 @@ import {
 import {
   checksValue,
   cliList,
+  imageContext,
   isPathSource,
   mountType,
   takesValue,
@@ -348,8 +349,8 @@ export function singleImageReferences(config: Readonly<Record<string, unknown>>)
   if (Array.isArray(build.options)) {
     for (const flag of parseFlags(build.options, BUILD_FLAGS)) {
       if (flag.name !== '--build-context' || flag.value === undefined) continue;
-      const image = /^docker-image:\/\/(.*)$/i.exec(flag.value.slice(flag.value.indexOf('=') + 1).trim());
-      if (image) references.push({ reference: image[1].trim(), what: 'build option --build-context image' });
+      const image = imageContext(flag.value.slice(flag.value.indexOf('=') + 1));
+      if (image !== undefined) references.push({ reference: image.trim(), what: 'build option --build-context image' });
     }
   }
   return references;
