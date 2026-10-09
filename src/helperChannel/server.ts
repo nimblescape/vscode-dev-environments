@@ -49,8 +49,9 @@ export interface OperationContext {
   readonly signal: AbortSignal;
   /**
    * Plan step 11A: the named secrets of the request (SECRET_TOKEN, SECRET_REGISTRY, …), with those that the answers of its
-   * requests added. Only ever input of a process or the header of a request to the engine; each is masked in all that
-   * the operation sends back.
+   * requests added. Only ever input of a process or a header of a request (`X-Registry-Auth` of a pull to the engine,
+   * the Basic `Authorization` of the image check's HTTPS requests to the registry and to its token service); each is
+   * masked in all that the operation sends back.
    */
   readonly secrets: Secrets;
   /** Plan step 11A: true when the operation has no secret at all. */

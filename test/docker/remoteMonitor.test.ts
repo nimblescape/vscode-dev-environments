@@ -4,7 +4,8 @@
 
 // Unit 7, PR 2: the Session Monitor container of a remote Docker host, against the real Docker engine of the runner
 // (the same code path as on a remote host: RemoteSessionMonitor.ensure with the workspace helper image and the socket
-// of the engine). The script is bundled from src/remoteMonitor/main.ts like dist/remoteMonitor.js. The container, its
+// of the engine). The script is bundled from src/remoteMonitor/main.ts as the worker's bundle carries it (the module
+// `devenv:monitor-script` of scripts/workerScripts.mjs; dist/remoteMonitor.js until plan step 11D2). The container, its
 // volume, and the test containers have names of this run; the test containers carry the label
 // nimblescape.devenv.environment-id with new ids, so the monitor acts on them. The tick of the monitor is shortened
 // with DEVENV_MONITOR_TICK_MS (read only by main.ts). Checked: a labeled container with a stale record is stopped; one
@@ -74,7 +75,7 @@ const RELEASE_LIMIT_MS = releaseLimitSeconds(RELEASE_WAITING_TIME_SECONDS) * 100
 /** The wait for the stop: the limit, then some ticks of the monitor, the stop itself, and slack for a loaded runner. */
 const RELEASE_STOP_WAIT_MS = RELEASE_LIMIT_MS + 60_000;
 
-/** Bundles the script of the remote monitor as esbuild.mjs does (minified, one file). */
+/** Bundles the script of the remote monitor as the worker's bundle carries it (workerScriptsPlugin: minified, one file). */
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
     entryPoints: [path.resolve(__dirname, '../../src/remoteMonitor/main.ts')],

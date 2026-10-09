@@ -134,7 +134,7 @@ export interface HostSecrets {
   /** The GitHub token of the signed-in account (SECRET_TOKEN). */
   token(): Promise<string | undefined>;
   /**
-   * The login of a registry: the GitHub sign-in for ghcr.io, else what Docker stored on this computer. The password (or
+   * The login of a registry: what Docker stored on this computer, else for ghcr.io the GitHub sign-in. The password (or
    * the identity token) travels as the secret SECRET_REGISTRY, never in the value of the answer.
    */
   registry(registry: string): Promise<{ username?: string; identityToken?: boolean; serveraddress: string; password: string } | undefined>;

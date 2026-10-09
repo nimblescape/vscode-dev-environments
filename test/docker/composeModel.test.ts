@@ -2,15 +2,17 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The model run of a Docker Compose configuration (implementation notes, section "Docker Compose") in the real workspace
-// helper: `docker compose config` without the Docker socket and without network (L-12), all profiles, the `.env` of the
-// project, the `$` probe, the configuration folder with the token hidden, and whether Compose reads our rewrite of its
-// own output again with the same values (L-6, D-1). The open, stop, and delete of a Compose environment are tested with
-// the pipeline (compose.test.ts). Plan step 7 (user decision of 2026-10-01): the per-step path is removed, so the model
-// runs in the batch helper of the real worker under a lock, as an operation runs it, as the owner of the repository (user
-// decision of 2026-10-01; Q2: without `--network none`); the seeds and the checks run in a plain container of the helper
-// image (runInVolume). Plan step 11I1, PR A1: the batch helper is started from the test process as the worker's own flow
-// starts it (inProcessBatches), without the relay of the worker.
+// The model run of a Docker Compose configuration (implementation notes, section "Docker Compose") in the real
+// workspace helper: `docker compose config` as the step composeModel of the batch helper (as the owner of the
+// repository, so without the Docker socket and with the internal folder `/workspaces/.devenv+` closed to it unless root
+// owns the repository; with the network of the helper; Compose fetches no remote resource), all profiles, the `.env` of
+// the project, the `$` probe, a Dockerfile behind a link into the internal folder (not read), and whether Compose reads
+// our rewrite of its own output again with the same values (L-6, D-1). The open, stop, and delete of a Compose
+// environment are tested with the pipeline (compose.test.ts). Plan step 7 (user decision of 2026-10-01): the per-step
+// path is removed, so the model runs in the batch helper of the real worker under a lock, as an operation runs it, as
+// the owner of the repository (user decision of 2026-10-01; Q2: without `--network none`); the seeds and the checks run
+// in a plain container of the helper image (runInVolume). Plan step 11I1, PR A1: the batch helper is started from the
+// test process as the worker's own flow starts it (inProcessBatches), without the relay of the worker.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
@@ -163,7 +165,8 @@ describe('model run of a Docker Compose configuration', () => {
     const output = await model(['compose.yml', 'linked.yml']);
     if ('error' in output) throw new Error(output.error);
     expect(output.realPaths[`${REPO}/ctx`]).toBe('/workspaces/.devenv+');
-    // The Dockerfile behind the link is not read (the folder with the token is hidden in the model run anyway).
+    // The Dockerfile behind the link is not read (the internal folder is a path of the workspace helper, isHelperPath;
+    // the model run also closes it to the owner of the repository).
     expect(output.dockerfiles.linked).toBeUndefined();
     expect(output.inputsHash).toMatch(/^[0-9a-f]{64}$/);
     const input = {

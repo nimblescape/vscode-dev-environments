@@ -52,10 +52,10 @@ export const KERNEL_FOLDERS: readonly string[] = ['/proc', '/sys', '/dev'];
 /**
  * A path of the workspace helper that no build context, Dockerfile, or bind mount may name, whatever the switch of the
  * host access checks says (HostAccessClass `protected`): the root `/`; the cache volume that all environments share
- * (HELPER_CACHE_FOLDER); the folder with the token (CONFIG_FOLDER); the Docker socket; the folders of the kernel
- * (KERNEL_FOLDERS, review round 3, S3-1); and every path below WORKSPACES_ROOT that is not in the repository folder (the
- * folder with the token, other folders of the volume). A folder that contains one of them counts too (for example `/var`
- * with the socket). `file` is absolute.
+ * (HELPER_CACHE_FOLDER); the internal folder (CONFIG_FOLDER: the Git and Docker configuration of the dev container);
+ * the Docker socket; the folders of the kernel (KERNEL_FOLDERS, review round 3, S3-1); and every path below
+ * WORKSPACES_ROOT that is not in the repository folder (the internal folder, other folders of the volume). A folder
+ * that contains one of them counts too (for example `/var` with the socket). `file` is absolute.
  */
 export function isHelperPath(file: string, repositoryFolder: string): boolean {
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');

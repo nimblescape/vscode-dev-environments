@@ -905,8 +905,10 @@ describe('WorkspaceHelper Docker Compose runs', () => {
   });
 
   it('createRepositoryFolders runs its script as the owner of the repository (review round 8, P8-2)', async () => {
-    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step createFolders of the batch helper runs as the owner of the
-    // repository, with CONFIG_FOLDER closed (was: a per-step run without the socket and network, with a tmpfs over it).
+    // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; changed expectation: the step
+    // createFolders of the batch helper runs as the owner of the repository; CONFIG_FOLDER stays open,
+    // closeConfigFolder is only for the Compose steps (was: a per-step run without the socket and network, with a tmpfs
+    // over it).
     docker.handler = () => ({ stdout: '' });
     const folders = ['/workspaces/api/data/postgres', '/workspaces/api/logs'];
     await createHelper().createRepositoryFolders({ volumeName: 'vol', repository: 'acme/api', folders });

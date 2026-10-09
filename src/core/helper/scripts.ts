@@ -697,9 +697,11 @@ if (process.exitCode === undefined) {
 
 /**
  * `node -e` script of the model run of a Docker Compose configuration. `argv[1]` = repository folder (absolute), then
- * the compose files (absolute, resolveComposeFiles). The project name comes from COMPOSE_PROJECT_NAME. The run has no
- * Docker socket and no network (the Compose plugin needs no engine for `config`), and the configuration folder of the
- * volume is hidden (WorkspaceHelper.composeModel). Prints one JSON line (ComposeModelOutput of compose.ts):
+ * the compose files (absolute, resolveComposeFiles). The project name comes from COMPOSE_PROJECT_NAME. The Compose
+ * plugin needs no engine for `config`. The step composeModel runs it as the owner of the repository, without the Docker
+ * socket and with the configuration folder of the volume closed to it, unless root owns the repository; the helper has
+ * network, and Compose fetches no remote resource (COMPOSE_REMOTE_OFF of batchSteps.ts; WorkspaceHelper.composeModel).
+ * Prints one JSON line (ComposeModelOutput of compose.ts):
  * - `version`: `docker compose version --short`;
  * - `dollarEscaped`: whether `config` prints a literal `$` as `$$` (a probe with a model of its own);
  * - `model`: `docker compose -f … --profile '*' config --format json` (all services of all profiles), each text value
@@ -744,9 +746,11 @@ const failure = (result, what) => {
   return { error: text || what + ' failed with exit code ' + result.status + '.' };
 };
 // Follow-up of PR #121 (review A): the real paths as the system resolves them (REAL_PATH).
-${REAL_PATH}// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the folder with the token, the folders of the
-// kernel (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one
-// of them. (The Docker socket of isHelperPath is not mounted in this run; the check refuses a Dockerfile there anyway.)
+${REAL_PATH}// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the internal folder
+// /workspaces/.devenv+ (the Git and Docker configuration of the dev container), the folders of the kernel (review round
+// 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one of them. (The Docker
+// socket of isHelperPath is not in this list: the model run reaches it only when root owns the repository, a socket has
+// no text to read, and the check refuses a Dockerfile there anyway.)
 const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
 const isHelperPath = (file) => {
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');

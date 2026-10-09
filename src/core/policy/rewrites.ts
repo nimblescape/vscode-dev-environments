@@ -227,9 +227,9 @@ function normalizedTarget(target: unknown): string | undefined {
  * - every other bind mount, and the types npipe, cluster, and image: refused;
  * - in the dev service, any other mount at WORKSPACES_ROOT: refused (the workspace volume is mounted there);
  * - review round 14 (S14-1): in the dev service, any mount at or below CONFIG_FOLDER (configFolderTarget): refused as not
- *   supported (the token and the Git configuration of the extension are there, and its ownership fix walks the folder in
- *   full). The other services do not have the folder (they cannot mount the workspace volume), so their targets there
- *   stay allowed;
+ *   supported (the Git and Docker configuration of the dev container are there, and the ownership fix of the extension
+ *   walks the folder in full). The other services do not have the folder (they cannot mount the workspace volume), so
+ *   their targets there stay allowed;
  * - review of unit 15: in the dev service, `bind.propagation` shared or rshared at `/` or a parent of the tmpfs of the
  *   token (tokenPropagationTarget): refused whatever the switch says (it would bring the token to the computer).
  */

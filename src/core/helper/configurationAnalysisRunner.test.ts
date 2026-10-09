@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Review round 8 (structural fix of the parser DoS class): the host access analysis in the real worker bundle (as
-// esbuild.mjs builds dist/configurationAnalysisWorker.js), with its limits of time and memory, and the refusal of every
-// failure (fail closed).
+// Review round 8 (structural fix of the parser DoS class): the host access analysis in the real bundle of its thread (as
+// the worker's bundle carries it, the module `devenv:analysis-script` of scripts/workerScripts.mjs; esbuild.mjs built
+// dist/configurationAnalysisWorker.js until plan step 11F1), with its limits of time and memory, and the refusal of
+// every failure (fail closed).
 import { buildSync } from 'esbuild';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -45,7 +46,8 @@ let bundleCode: string;
 beforeAll(() => {
   outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-test-'));
   bundle = path.join(outDir, 'configurationAnalysisWorker.js');
-  // Same options as esbuild.mjs.
+  // The bundle options of the worker's plugin (workerScriptsPlugin of scripts/workerScripts.mjs), but not minified and
+  // written to a file.
   buildSync({
     entryPoints: [path.join(__dirname, 'configurationAnalysisWorker.ts')],
     bundle: true,

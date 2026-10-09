@@ -1855,15 +1855,16 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * Step 5 for a Docker Compose configuration (implementation notes, section "Docker Compose"): devcontainer.json as the
-   * CLI resolves it (`service`, `dockerComposeFile`, `runServices`), then the merged model of its compose files, read in
-   * the workspace helper without the Docker socket, network, and the configuration folder of the container
-   * (WorkspaceHelper.composeModel). Concept section 9 "Host access", before any build: every service of the model and
-   * the settings of devcontainer.json that Compose does not support (checkContainer `composeModel`), then devcontainer.json
-   * and its merged configuration with the rules of a single container (checkContainer `configuration`, without the
-   * properties that the CLI ignores for Compose, withoutComposeIgnored). The merged configuration is read with our
-   * copy of devcontainer.json, whose only compose file is our build model. The switch of the host access checks applies
-   * as for a single container: with the checks off, only the items of the class `computer` are lifted.
+   * Step 5 for a Docker Compose configuration (implementation notes, section "Docker Compose"): devcontainer.json as
+   * the CLI resolves it (`service`, `dockerComposeFile`, `runServices`), then the merged model of its compose files,
+   * read in the workspace helper as the owner of the repository, so without the Docker socket and the configuration
+   * folder of the volume, unless root owns the repository (WorkspaceHelper.composeModel). Concept section 9 "Host
+   * access", before any build: every service of the model and the settings of devcontainer.json that Compose does not
+   * support (checkContainer `composeModel`), then devcontainer.json and its merged configuration with the rules of a
+   * single container (checkContainer `configuration`, without the properties that the CLI ignores for Compose,
+   * withoutComposeIgnored). The merged configuration is read with our copy of devcontainer.json, whose only compose
+   * file is our build model. The switch of the host access checks applies as for a single container: with the checks
+   * off, only the items of the class `computer` are lifted.
    */
   private async loadComposeConfiguration(
     ctx: PipelineContext,
@@ -5135,13 +5136,14 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * Implementation notes 7 "Ownership", before the container exists: the helper clones as root, and the lifecycle
-   * commands (run-user-commands after `up`) run onCreateCommand and postCreateCommand as the remote user in a new
-   * container. A command that writes to the repository (for example `npm install`) would fail, and with it the open. So the files get their owner first.
-   * The fix after `up` (fixOwnership) stays for files that `up` itself creates as root. A failure is logged, it does not
-   * fail the pipeline. Plan step 11G1 ("No extra containers"): no container of the environment image runs for it any
-   * more. The numeric IDs of the remote user come from the `/etc/passwd` of the image (EnvironmentDocker.imageUserIds,
-   * read through the Engine API), and the fix runs as the step repositoryOwnershipFix of the batch helper of the open
+   * Implementation notes 7 "Ownership", before the container exists: the helper clones as its Git user and the files of
+   * the clone then get root, and the lifecycle commands (run-user-commands after `up`) run onCreateCommand and
+   * postCreateCommand as the remote user in a new container. A command that writes to the repository (for example
+   * `npm install`) would fail, and with it the open. So the files get their owner first. The fix after `up`
+   * (fixOwnership) stays for files that `up` itself creates as root. A failure is logged, it does not fail the
+   * pipeline. Plan step 11G1 ("No extra containers"): no container of the environment image runs for it any more. The
+   * numeric IDs of the remote user come from the `/etc/passwd` of the image (EnvironmentDocker.imageUserIds, read
+   * through the Engine API), and the fix runs as the step repositoryOwnershipFix of the batch helper of the open
    * (WorkspaceHelper.fixRepositoryOwnership). IDs that cannot be read that way (no such entry, a link in place of the
    * file, a user that only a name service knows) skip the fix: the fix after `up` gives the files their owner then.
    * Assumption (V-10): the label devcontainer.metadata of the environment image names the remote user as the Dev
@@ -5304,10 +5306,10 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * Implementation notes 7 "Ownership": the helper clones as root. A failure is logged, it does not fail the pipeline.
-   * Plan step 11I (PR B): the script `ownershipFix` of the registry, as root, with the repository folder, the user, and
-   * the arguments of the paths of the services (servicePathArguments; `gitPaths` as in serviceFolderPaths, review round
-   * 15, K4, and round 16, L2).
+   * Implementation notes 7 "Ownership": the helper clones as its Git user, and the files of the clone then get root. A
+   * failure is logged, it does not fail the pipeline. Plan step 11I (PR B): the script `ownershipFix` of the registry,
+   * as root, with the repository folder, the user, and the arguments of the paths of the services
+   * (servicePathArguments; `gitPaths` as in serviceFolderPaths, review round 15, K4, and round 16, L2).
    */
   private async fixOwnership(
     ctx: PipelineContext,
@@ -5884,10 +5886,12 @@ export class EnvironmentService extends OperationBase {
   }
 
   /**
-   * Builds the helper image if needed. The build is shown as a detail of the current step: the steps of concept 6.5
-   * keep their order ("Preparing environment" is the build of the environment image). The check of the base image of
-   * the helper follows the setting updateImagesOnConnect, like the image check (concept 7.7). Review round 2 of PR #64
-   * (A-N1): the first call of a run resolves the helper image of the run (ctx.helperImage); later calls do nothing.
+   * Resolves the helper image of the run. Plan step 11I (U7): in the worker that is its own image, so nothing is built
+   * or checked here any more. Until then it built the helper image if needed, shown as a detail of the current step
+   * (the steps of concept 6.5 keep their order: "Preparing environment" is the build of the environment image), and the
+   * check of the base image of the helper followed the setting updateImagesOnConnect, like the image check (concept
+   * 7.7). Review round 2 of PR #64 (A-N1): the first call of a run resolves the helper image of the run
+   * (ctx.helperImage); later calls do nothing.
    */
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
     // Review round 2 of PR #64 (A-N1): the helper image is resolved once per run.
@@ -5907,7 +5911,8 @@ export class EnvironmentService extends OperationBase {
           announce(PipelineTexts.preparingHelper);
           this.logger.output(text);
         },
-        // A new helper after an extension update, or the rebuild of an existing one from a new base image.
+        // Until plan step 11I (U7): a new helper after an extension update, or the rebuild of an existing one from a
+        // new base image. The worker's own image is never built, so this is not called there.
         onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
         checkBaseImage: this.deps.settings().updateImagesOnConnect,
         signal: ctx.signal,

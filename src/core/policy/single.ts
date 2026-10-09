@@ -102,7 +102,7 @@ export interface HostAccessInput extends VolumeInput {
   dockerfileLength?: number;
   /**
    * The Dockerfile that the configuration of a single container names (as written), when it exists but could not be
-   * read (U2): a link out of the repository (for example into the folder with the token or the cache volume), a real
+   * read (U2): a link out of the repository (for example into the internal folder or the cache volume), a real
    * path outside of it, or a path with a variable that is not resolved. Refused whatever the switch says (`protected`):
    * the CLI and BuildKit in the workspace helper would read that file as the Dockerfile.
    */
@@ -283,14 +283,14 @@ function secondPassProblems(what: string, entries: readonly unknown[]): Problem[
  * `build.context` and `build.dockerfile` (and the older `context` and `dockerFile`) of a single container, resolved as
  * the Dev Container CLI resolves them (against the folder of the configuration): a path of the workspace helper
  * (isHelperPath) stays refused whatever the switch says; the CLI builds in the helper, where the cache volume, the
- * folder with the token, and the Docker socket are mounted. Review round 3 (S3-1): a build context outside of the
- * repository folder is refused whatever the switch says too: it can only be a folder of the workspace helper (never one
- * of the computer), and the check does not resolve its links. `image`: no image ID (imageReferenceFinding); an image of
- * the environments of another account is refused by its ID in the pipeline (otherAccountImageItems). The content of the
- * Dockerfile is not checked (Dockerfile refusals removed, user decision 2026-09-27): it runs as trusted code. The
- * Dockerfile itself is: a Dockerfile that is a link out of the repository or could not be read is refused whatever the
- * switch says (dockerfileUnreadable, U2), and one longer than MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength,
- * U1).
+ * workspace volume with the internal folder (CONFIG_FOLDER), and the Docker socket are mounted. Review round 3 (S3-1):
+ * a build context outside of the repository folder is refused whatever the switch says too: it can only be a folder of
+ * the workspace helper (never one of the computer), and the check does not resolve its links. `image`: no image ID
+ * (imageReferenceFinding); an image of the environments of another account is refused by its ID in the pipeline
+ * (otherAccountImageItems). The content of the Dockerfile is not checked (Dockerfile refusals removed, user decision
+ * 2026-09-27): it runs as trusted code. The Dockerfile itself is: a Dockerfile that is a link out of the repository or
+ * could not be read is refused whatever the switch says (dockerfileUnreadable, U2), and one longer than
+ * MAX_DOCKERFILE_LENGTH is not supported (dockerfileLength, U1).
  */
 function singleBuildProblems(config: Record<string, unknown>, input: HostAccessInput): Problem[] {
   const problems: Problem[] = [];
