@@ -42,6 +42,8 @@ export function cliRunArgs(spec: MonitorRunSpec): string[] {
   args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
   args.push('--log-driver', spec.log.driver, '--log-opt', `max-size=${spec.log.maxSize}`, '--log-opt', `max-file=${spec.log.maxFile}`);
   args.push('-v', `${spec.mounts.socket}:/var/run/docker.sock`, '-v', `${spec.mounts.volume}:${spec.mounts.volumeTarget}`);
+  // Plan step 11H2: the shared VS Code server store, read-write with `nocopy` (engineClient: a mount with NoCopy).
+  if (spec.mounts.store !== undefined) args.push('--mount', `type=volume,source=${spec.mounts.store.volume},target=${spec.mounts.store.target},volume-nocopy`);
   for (const [key, value] of Object.entries(spec.env)) args.push('-e', `${key}=${value}`);
   args.push(spec.image, ...spec.command);
   return args;

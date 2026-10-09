@@ -12,7 +12,10 @@
 //                                                          monitor of the engine: one download of a version at a time)
 //   <store>/tmp/<quality>-<platform>-<commit>-<random>/  the archive and the unpacked folder of one download, removed on
 //                                                          every outcome
-// A present server costs two `lstat` calls: no lock, no network. The host of the update service is fixed here
+// Plan step 11H2: the modification time of the folder of a server version is the time of its last use (markServerUsed:
+// the open and the Session Monitor's link set it), and the cleanup of the monitor takes the lock of a version without a
+// wait (storeTryLock) and reads the released commits of the update service (serverCommits); lock files are never removed.
+// A present server costs two `lstat` calls: no lock, no network (plan step 11H2: and the open sets the time of its use). The host of the update service is fixed here
 // (VSCODE_UPDATE_SERVICE): the extension sends only the commit and the quality, never a URL. The download goes over the
 // worker's HTTPS transport (the proxy of the daemon, decision C1 of 2026-10-05), streamed to a file, its SHA-256 checked
 // against the update service, unpacked with `tar` and renamed into place. Every failure is one line in the log and means
@@ -24,7 +27,7 @@ import * as path from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { FLOCK_FD, openPlainLockFile, startFlockProcess, type FlockProcess } from '../helperChannel/lockFile';
-import { LOCK_BUSY_EXIT, flockArgs, type VscodePlatform, type VscodeServerRef } from '../helperChannel/protocol';
+import { LOCK_BUSY_EXIT, flockArgs, flockNoWaitArgs, type VscodePlatform, type VscodeQuality, type VscodeServerRef } from '../helperChannel/protocol';
 import type { HttpStreamTransport, HttpTransport } from '../http';
 import type { Logger } from '../ports';
 
@@ -95,6 +98,11 @@ export interface VscodeStoreDeps {
   timeoutMs?: number;
   /** The largest archive; default MAX_SERVER_ARCHIVE_BYTES. */
   maxBytes?: number;
+  /**
+   * Plan step 11H2: the fetch of the Session Monitor's background run (its log lines name the run, not an open and the
+   * fallback of the Dev Containers extension).
+   */
+  background?: boolean;
 }
 
 /** A failure of a fetch, with the text of its log line. */
@@ -157,13 +165,17 @@ async function ensureServerWithin(
     return true;
   } catch (error) {
     const why = signal.aborted
-      ? 'the open was cancelled'
+      ? deps.background === true
+        ? 'the run was ended'
+        : 'the open was cancelled'
       : limit.aborted
         ? `the fetch took longer than ${Math.round(timeoutMs / 1000)} s`
         : error instanceof Error
           ? error.message
           : String(error);
-    deps.logger.warn(`The VS Code server ${name} for ${platform} could not be fetched into the shared store (${why}); the Dev Containers extension installs it in the container.`);
+    // Plan step 11H2: the background run of the Session Monitor names no fallback (it fetches ahead of any open).
+    const fallback = deps.background === true ? '' : '; the Dev Containers extension installs it in the container';
+    deps.logger.warn(`The VS Code server ${name} for ${platform} could not be fetched into the shared store (${why})${fallback}.`);
     return false;
   }
 }
@@ -198,7 +210,22 @@ export async function ensureEngineServer(deps: VscodeStoreDeps, server: VscodeSe
     deps.logger.info(`The VS Code server ${name} is not fetched into the shared store: the engine's architecture ${JSON.stringify(architecture)} has no server there.`);
     return undefined;
   }
-  return (await ensureServerWithin(deps, server, platform, signal, limit)) ? platform : undefined;
+  if (!(await ensureServerWithin(deps, server, platform, signal, limit))) return undefined;
+  // Plan step 11H2: the open uses this version now (the marker of the cleanup of the store, markServerUsed).
+  await markServerUsed(serverFolder(deps.root, server, platform));
+  return platform;
+}
+
+/**
+ * Plan step 11H2 (the brief: "used", a cheap marker): the modification time of the folder of a server version in the
+ * store is the time of its last use: the open that needs it (ensureEngineServer) and the link of the Session Monitor into
+ * a running dev container set it to now (without following a link). The cleanup of the store removes a version whose
+ * folder was not touched for SERVER_UNUSED_MS (src/remoteMonitor/backgroundRules.ts). The dev containers mount the store
+ * read-only, so only the workers and the monitor set it. Best effort: a failure is ignored (the version then counts as
+ * used when it was last touched).
+ */
+export async function markServerUsed(folder: string, at: Date = new Date()): Promise<void> {
+  await fs.promises.lutimes(folder, at, at).catch(() => undefined);
 }
 
 /** Waits for `promise`; rejects when `signal` aborts first (a call that ignores its signal ends at the limit too). */
@@ -222,6 +249,66 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 
 /** Plan step 11H1: the folder of the temporary folders of the downloads in the store. */
 export const STORE_TEMP_FOLDER = 'tmp';
+/** Plan step 11H2: the folder of the servers in the store (`server/<quality>/<platform>/<commit>`). */
+export const STORE_SERVER_FOLDER = 'server';
+
+/**
+ * Plan step 11H2: the server version of a temporary folder of the store (`<quality>-<platform>-<commit>-<random>`, as a
+ * download of fetchServer or a removal of the cleanup names it), or undefined for any other name.
+ */
+export function temporaryFolderVersion(name: string): { quality: VscodeQuality; platform: VscodePlatform; commit: string; version: string } | undefined {
+  const match = /^(stable|insider)-(linux-x64|linux-arm64)-([0-9a-f]{40})-[0-9a-f]{1,32}$/.exec(name);
+  if (match === null) return undefined;
+  const [, quality, platform, commit] = match as unknown as [string, VscodeQuality, VscodePlatform, string];
+  return { quality, platform, commit, version: serverVersionName({ commit, quality }, platform) };
+}
+
+/**
+ * Plan step 11H2 (D3 of 2026-10-09): the request of the update service for the released commits of the server of
+ * `quality` on `platform`, newest first (a JSON array of commits).
+ */
+export function serverCommitsUrl(quality: VscodeQuality, platform: VscodePlatform): string {
+  return `${VSCODE_UPDATE_SERVICE}/api/commits/${quality}/server-${platform}`;
+}
+
+/** Plan step 11H2: the largest answer of the commits of the update service (a commit is 43 bytes of JSON). */
+export const MAX_SERVER_COMMITS_BYTES = 1024 * 1024;
+/** Plan step 11H2: at most this many commits of an answer are taken. */
+export const MAX_SERVER_COMMITS = 20_000;
+
+/**
+ * Plan step 11H2: the commits of the update service, newest first, strictly: a JSON array of at least one and at most
+ * MAX_SERVER_COMMITS commits, each 40 lower-case hexadecimal characters, none twice; undefined for anything else.
+ */
+export function parseServerCommits(body: string): string[] | undefined {
+  if (Buffer.byteLength(body, 'utf8') > MAX_SERVER_COMMITS_BYTES) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SERVER_COMMITS) return undefined;
+  if (!value.every((commit) => typeof commit === 'string' && /^[0-9a-f]{40}$/.test(commit))) return undefined;
+  const commits = value as string[];
+  return new Set(commits).size === commits.length ? commits : undefined;
+}
+
+/**
+ * Plan step 11H2 (D3): the released commits of the server of `quality` on `platform`, newest first, from the update
+ * service (VSCODE_UPDATE_SERVICE, the host fixed here; at most MAX_SERVER_COMMITS_BYTES; parseServerCommits). Rejects
+ * with the reason.
+ */
+export async function serverCommits(transport: HttpTransport, quality: VscodeQuality, platform: VscodePlatform, signal: AbortSignal): Promise<string[]> {
+  const response = await transport.request(
+    { method: 'GET', url: serverCommitsUrl(quality, platform), headers: { Accept: 'application/json' }, maxBodyBytes: MAX_SERVER_COMMITS_BYTES },
+    signal,
+  );
+  if (response.status !== 200) throw new FetchError(`the update service answered HTTP ${response.status}`);
+  const commits = parseServerCommits(response.body);
+  if (commits === undefined) throw new FetchError('the update service answered no list of commits');
+  return commits;
+}
 
 /** The fetch itself, under the lock of its server version (ensureServer). */
 async function fetchServer(deps: VscodeStoreDeps, server: VscodeServerRef, platform: VscodePlatform, folder: string, signal: AbortSignal): Promise<void> {
@@ -423,6 +510,60 @@ export async function storeLock(
     release();
     throw error;
   }
+}
+
+/** Plan step 11H2: what an attempt to take the lock of a server version without a wait gave (storeTryLock). */
+export type StoreLockAttempt = { kind: 'locked'; release(): void } | { kind: 'busy' } | { kind: 'failed'; detail: string };
+
+/**
+ * Plan step 11H2 (the plan's 11H2 row: `flock -n`): the lock of one server version in the store (serverLockFile), taken
+ * without a wait, for the cleanup of the Session Monitor: `busy` while a download of that version (an open, another
+ * window, the monitor) holds it, so the cleanup never touches a version that is being fetched. Never rejects; the lock
+ * file stays (lock files are never removed).
+ */
+export async function storeTryLock(
+  root: string,
+  name: string,
+  startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
+): Promise<StoreLockAttempt> {
+  let fd: number;
+  try {
+    const folder = path.posix.join(root, STORE_LOCK_FOLDER);
+    fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+    if (!fs.lstatSync(folder).isDirectory()) return { kind: 'failed', detail: `${folder} is not a folder` };
+    fd = openPlainLockFile(serverLockFile(root, name), 'The lock file of the shared VS Code server store');
+  } catch (error) {
+    return { kind: 'failed', detail: `the lock file could not be opened: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const close = () => {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Closed already.
+    }
+  };
+  let outcome: Awaited<FlockProcess['exited']>;
+  try {
+    outcome = await startFlock(flockNoWaitArgs(FLOCK_FD), fd).exited;
+  } catch (error) {
+    close();
+    return { kind: 'failed', detail: `flock could not be started: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (outcome.error === undefined && outcome.exitCode === 0) {
+    let released = false;
+    return {
+      kind: 'locked',
+      release: () => {
+        if (released) return;
+        released = true;
+        close();
+      },
+    };
+  }
+  close();
+  if (outcome.error !== undefined) return { kind: 'failed', detail: `flock could not be started: ${outcome.error}` };
+  if (outcome.exitCode === LOCK_BUSY_EXIT) return { kind: 'busy' };
+  return { kind: 'failed', detail: `flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})` };
 }
 
 /**

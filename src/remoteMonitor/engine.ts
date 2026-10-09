@@ -28,8 +28,16 @@ export type LoopEngine = Pick<DockerEngine, 'containerSummaries' | 'stop'>;
  */
 export type ImageEngine = Pick<DockerEngine, 'images' | 'inspect' | 'pull' | 'containerIds' | 'removeImage'>;
 
-/** The engine of `run`: the loop's and the image maintenance's. */
-export type MonitorEngineParts = LoopEngine & ImageEngine;
+/**
+ * Plan step 11H2 (decision of 2026-10-09): what the VS Code part of the background run asks of its engine: the proxy of
+ * the daemon (its HTTPS, decision C1 of 2026-10-05) and its architecture (the platform of the server), the running dev
+ * containers (their list and the inspect of each: their mounts and their label devcontainer.metadata), and the exec of the
+ * link script of the registry of the container scripts in each.
+ */
+export type VscodeEngine = Pick<DockerEngine, 'proxy' | 'architecture' | 'containerSummaries' | 'container' | 'exec'>;
+
+/** The engine of `run`: the loop's, the image maintenance's and (plan step 11H2) the VS Code part's of the background run. */
+export type MonitorEngineParts = LoopEngine & ImageEngine & VscodeEngine;
 
 /** The engine of the socket of the monitor container (the one of its engine, as the worker's). */
 export function socketEngine(): MonitorEngineParts {

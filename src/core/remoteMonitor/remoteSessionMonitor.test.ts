@@ -8,7 +8,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_BUNDLE_LINE_LENGTH, PIPE_LOADER, bundleHash, encodeBundle } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import {
-  IMAGE_MAINTENANCE_LABEL_PART,
   LABEL_MONITOR_CREATE,
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
@@ -289,8 +288,8 @@ describe('RemoteSessionMonitor.ensure', () => {
       // exited; a failure (the loader's exit 3) is still restarted.
       '--restart',
       'on-failure',
-      '--network',
-      'none',
+      // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, no `--network none` any more: the monitor always
+      // has the default network (outbound only; still no published port).
       '--cap-drop',
       'ALL',
       '--security-opt',
@@ -882,7 +881,9 @@ describe('RemoteSessionMonitor: images', () => {
 
   it('gives the container the prefixes and outbound network; without prefixes still no network', () => {
     const plain = monitor(new FakeDocker(() => result(0)));
-    expect(cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT))).toEqual(expect.arrayContaining(['--network', 'none']));
+    // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, the default network also without prefixes (was
+    // `--network none`).
+    expect(cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT))).not.toContain('--network');
     const args = cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, IMAGES));
     expect(args).not.toContain('--network');
     expect(args).toContain(`DEVENV_IMAGE_PREFIXES=${JSON.stringify(PREFIXES)}`);
@@ -890,7 +891,12 @@ describe('RemoteSessionMonitor: images', () => {
     // became a cron schedule ("in a guided cron style manner").
     expect(args).toContain('DEVENV_IMAGE_SCHEDULE=7 6 * * *');
     expect(args).toContain('DEVENV_IMAGE_TZ=Europe/Vienna');
-    expect(cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] }))).toEqual(expect.arrayContaining(['--network', 'none']));
+    // Plan step 11H2 (D1 and D2): changed expectation, without prefixes the default network too and the schedule of the
+    // background run (was `--network none`), but no prefixes.
+    const withoutPrefixes = cliRunArgs(plain.runSpec(TAG, SOCKET, LABEL, SCRIPT, { ...IMAGES, prefixes: [] }));
+    expect(withoutPrefixes).not.toContain('--network');
+    expect(withoutPrefixes).toEqual(expect.arrayContaining(['DEVENV_IMAGE_SCHEDULE=7 6 * * *', 'DEVENV_IMAGE_TZ=Europe/Vienna']));
+    expect(withoutPrefixes.some((arg) => arg.startsWith('DEVENV_IMAGE_PREFIXES='))).toBe(false);
     // Still no capability, no published port, no new privileges.
     expect(args).toEqual(expect.arrayContaining(['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']));
     expect(args.some((arg) => arg === '-p' || arg === '--publish')).toBe(false);
@@ -915,15 +921,16 @@ describe('RemoteSessionMonitor: images', () => {
   // Review round 1 of PR #57 (C; K): the prefixes, the time and the time zone were part of the label, so two computers
   // with other settings replaced the monitor of a shared engine at each open. Now only whether it maintains images is
   // (its network); the settings come with `settings -`.
+  // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, the image maintenance is no part of the label any more
+  // (the monitor always has its network), so turning it on or off keeps the running monitor too (was: replaced, with the
+  // label part `image-maintenance`); its mode is (remoteSessionMonitor.11H2.test.ts).
   it('replaces the container when the image maintenance is turned on or off, not when its settings differ', async () => {
-    const withImages = remoteMonitorLabelValue(SCRIPT, TAG, [IMAGE_MAINTENANCE_LABEL_PART]);
-    expect(withImages).not.toBe(LABEL);
+    const withImages = LABEL;
     expect(remoteMonitorLabelValue(SCRIPT, TAG, [])).toBe(LABEL);
     const docker = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, LABEL) : result(0, 'id\n')));
     const withSetting = new RemoteSessionMonitor({ engine: cliMonitorEngine(docker), logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => IMAGES });
-    expect(await withSetting.ensure(TAG, SOCKET)).toBe('created');
-    const run = docker.calls.find((call) => call.args[0] === 'run');
-    expect(run?.args).toContain(`${LABEL_SESSION_MONITOR}=${withImages}`);
+    expect(await withSetting.ensure(TAG, SOCKET)).toBe('running');
+    expect(docker.calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false);
     // Another computer: other prefixes, another schedule, another time zone: the running monitor stays.
     for (const other of [
       { ...IMAGES, prefixes: ['ghcr.io/acme/base'] },
@@ -935,10 +942,10 @@ describe('RemoteSessionMonitor: images', () => {
       expect(await otherComputer.ensure(TAG, SOCKET)).toBe('running');
       expect(running.calls.some((call) => call.args[0] === 'rm' || call.args[0] === 'run')).toBe(false);
     }
-    // Turned off: replaced (no network again).
+    // Turned off: plan step 11H2 (D1), changed expectation, kept (was replaced: no network again).
     const off = new FakeDocker((args) => (args[0] === 'container' ? inspected(true, withImages) : result(0, 'id\n')));
     const offComputer = new RemoteSessionMonitor({ engine: cliMonitorEngine(off), logger: new Log(), script: async () => SCRIPT, imageMaintenance: () => ({ ...IMAGES, prefixes: [] }) });
-    expect(await offComputer.ensure(TAG, SOCKET)).toBe('created');
+    expect(await offComputer.ensure(TAG, SOCKET)).toBe('running');
   });
 
   // Review round 9 of PR #57: the prefixes on the command line were cut to what Windows takes; `settings -` brings all.

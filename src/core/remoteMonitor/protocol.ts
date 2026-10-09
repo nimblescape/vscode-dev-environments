@@ -9,7 +9,8 @@
 // Pure functions without I/O; the script and the extension use the same checks. No `vscode`.
 import { createHash } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
-import { isTimeZone, parseCronSchedule } from './cron';
+import { parseCacheSchedule } from './cacheSettings';
+import { isTimeZone } from './cron';
 
 /**
  * The one Session Monitor container per Docker engine (never a container of an environment: no
@@ -368,13 +369,48 @@ export const MAX_IMAGE_PREFIXES_JSON_LENGTH = 4096;
 
 export interface ImageSettings {
   prefixes: string[];
-  /** A cron expression of five fields. */
+  /**
+   * A cron expression of five fields. Plan step 11H2 (D2, decision of 2026-10-09): or an interval in whole minutes (the
+   * setting cacheUpdateSchedule, parseCacheSchedule); the schedule of the whole background run of the monitor, not only of
+   * its images.
+   */
   schedule: string;
   /** An IANA time zone. */
   timeZone: string;
 }
 
-/** The input of `monitor.js settings -`: `{ "prefixes": [...], "schedule": "…", "timeZone": "…" }`, strict. */
+/**
+ * Plan step 11H2 (D1, decision of 2026-10-09): the settings of the Session Monitor that an open and `monitorEnsure`
+ * carry: the image settings (ImageSettings, which the monitor gets with `settings -`), and whether it runs permanently
+ * (monitorRunsPermanently: on a remote engine, or on a local one with stopLocalMonitorWhenIdle off). The mode is part of
+ * its label (PERMANENT_MONITOR_LABEL_PART), never of `settings -`; missing means false.
+ */
+export interface MonitorSettings extends ImageSettings {
+  permanent?: boolean;
+}
+
+/** Plan step 11H2: the image settings of MonitorSettings, as `settings -` takes them (without the mode). */
+export function imageSettingsOf(settings: ImageSettings): ImageSettings {
+  return { prefixes: settings.prefixes, schedule: settings.schedule, timeZone: settings.timeZone };
+}
+
+/**
+ * Plan step 11H2: the strict check of MonitorSettings (both sides of `open` and `monitorEnsure`): an object with the keys
+ * of parseImageSettingsInput and optionally `permanent` (a boolean). Undefined for anything else.
+ */
+export function parseMonitorSettings(value: unknown): MonitorSettings | undefined {
+  if (!isRecord(value)) return undefined;
+  const { permanent, ...rest } = value;
+  if ('permanent' in value && typeof permanent !== 'boolean') return undefined;
+  const images = parseImageSettingsInput(JSON.stringify(rest));
+  if (images === undefined) return undefined;
+  return typeof permanent === 'boolean' ? { ...images, permanent } : images;
+}
+
+/**
+ * The input of `monitor.js settings -`: `{ "prefixes": [...], "schedule": "…", "timeZone": "…" }`, strict. Plan step
+ * 11H2 (D2): the schedule a cron expression or an interval in minutes (parseCacheSchedule), as the setting gives it.
+ */
 export function parseImageSettingsInput(text: string): ImageSettings | undefined {
   if (text.length > MAX_IMAGE_LIST_LENGTH) return undefined;
   let value: unknown;
@@ -386,7 +422,7 @@ export function parseImageSettingsInput(text: string): ImageSettings | undefined
   if (!isRecord(value) || !hasExactKeys(value, ['prefixes', 'schedule', 'timeZone'])) return undefined;
   const { prefixes, schedule, timeZone } = value;
   if (!Array.isArray(prefixes) || prefixes.length > MAX_IMAGE_PREFIXES || !prefixes.every(isImagePrefix)) return undefined;
-  if (typeof schedule !== 'string' || !parseCronSchedule(schedule) || typeof timeZone !== 'string' || !isTimeZone(timeZone)) return undefined;
+  if (typeof schedule !== 'string' || !parseCacheSchedule(schedule) || typeof timeZone !== 'string' || !isTimeZone(timeZone)) return undefined;
   return { prefixes: [...new Set(prefixes as string[])], schedule, timeZone };
 }
 
@@ -408,10 +444,17 @@ export function inUseByOtherComputer(output: { now: number; records: ReadonlyArr
 }
 
 /**
- * The part of the label of a monitor that maintains images (user requests 2026-09-28): it has a network then, so turning
- * the maintenance on or off replaces it. Review round 1 of PR #57 (C): its settings are not part of the label.
+ * Plan step 11H2 (D1 and the user's decision "unless-stopped" of 2026-10-09): the part of the label of a monitor that runs
+ * permanently (restart policy `unless-stopped`, never an exit when idle), so a change of the mode replaces it at the next
+ * ensure (RemoteSessionMonitor: a running permanent monitor still counts as current for an ensure that wants one that
+ * ends when idle). It replaces the part `image-maintenance` of the user requests of 2026-09-28: the monitor always has
+ * its outbound network now (the VS Code server of its background run), so the image maintenance no longer changes its
+ * container. Review round 1 of PR #57 (C): the settings of the run are not part of the label.
  */
-export const IMAGE_MAINTENANCE_LABEL_PART = 'image-maintenance';
+export const PERMANENT_MONITOR_LABEL_PART = 'permanent';
+
+/** Plan step 11H2: the file of the background run in the volume of the monitor (the end of its last run, its last cleanup). */
+export const CACHE_RUN_FILE = 'cache-run.json';
 
 /**
  * The value of LABEL_SESSION_MONITOR: 12 hex digits of sha256 of the script, the helper tag, the pipe loader (plan step

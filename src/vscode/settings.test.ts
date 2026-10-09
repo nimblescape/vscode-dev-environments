@@ -51,7 +51,12 @@ describe('settings (concept section 8)', () => {
       // User request 2026-09-28 ("in the morning again, at 6:07 CEST"; "in a guided cron style manner"): the schedule of
       // the image maintenance, a cron expression (the daily time 06:07 before).
       // Plan step 8 PR A: renamed imageUpdateSchedule.
-      imageUpdateSchedule: '7 6 * * *',
+      // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, imageUpdateSchedule is replaced by
+      // cacheUpdateSchedule (no migration), the schedule of the whole background run, by default every 17 minutes (was
+      // imageUpdateSchedule '7 6 * * *').
+      cacheUpdateSchedule: '17',
+      // Plan step 11H2 (D1, decision of 2026-10-09): a new setting, true by default (the local monitor ends when idle).
+      stopLocalMonitorWhenIdle: true,
     });
   });
 
@@ -64,12 +69,57 @@ describe('settings (concept section 8)', () => {
     expect(read('ghcr.io/acme/base*')).toEqual([]);
     // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule; an
     // invalid one (also a time HH:MM) gives the default.
-    const schedule = (value: unknown) => normalizeSettings((key) => (key === 'imageUpdateSchedule' ? value : undefined)).imageUpdateSchedule;
+    // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, the setting is cacheUpdateSchedule (was
+    // imageUpdateSchedule), and its default is the interval of 17 minutes (was '7 6 * * *'); a whole number of at least 5
+    // minutes is an interval now (530 was invalid).
+    const schedule = (value: unknown) => normalizeSettings((key) => (key === 'cacheUpdateSchedule' ? value : undefined)).cacheUpdateSchedule;
     expect(schedule('30 5 * * 1-5')).toBe('30 5 * * 1-5');
     expect(schedule('  30  5 * *   mon-fri ')).toBe('30 5 * * mon-fri');
-    expect(schedule('05:30')).toBe('7 6 * * *');
-    expect(schedule('61 5 * * *')).toBe('7 6 * * *');
-    expect(schedule(530)).toBe('7 6 * * *');
+    expect(schedule('05:30')).toBe('17');
+    expect(schedule('61 5 * * *')).toBe('17');
+    expect(schedule(530)).toBe('530');
+  });
+
+  // Plan step 11H2 (D2, decision of 2026-10-09): cacheUpdateSchedule is a cron schedule of five fields or an interval of
+  // whole minutes, at least 5; anything else is the default, every 17 minutes.
+  it('reads cacheUpdateSchedule: five cron fields or whole minutes from 5 on; junk, fewer minutes and fractions give 17', () => {
+    const schedule = (value: unknown) => normalizeSettings((key) => (key === 'cacheUpdateSchedule' ? value : undefined)).cacheUpdateSchedule;
+    expect(schedule(undefined)).toBe('17');
+    expect(schedule('17')).toBe('17');
+    expect(schedule(' 5 ')).toBe('5');
+    expect(schedule(5)).toBe('5');
+    expect(schedule('60')).toBe('60');
+    expect(schedule('0060')).toBe('60');
+    expect(schedule('7 6 * * *')).toBe('7 6 * * *');
+    for (const junk of ['4', 4, '0', '-5', '5.5', 5.5, '1e3', '17 minutes', '', '   ', '7 6 * *', '7 6 * * * *', null, true, ['17'], { minutes: 17 }, '525601']) {
+      expect(schedule(junk), JSON.stringify(junk)).toBe('17');
+    }
+  });
+
+  // Plan step 11H2 (D1 and D2, decision of 2026-10-09): the manifest has the two settings with the defaults of the code
+  // (scope application, as the other settings of the monitor), no imageUpdateSchedule any more, and the pattern of
+  // cacheUpdateSchedule takes whole minutes and five fields, and refuses other text.
+  it('declares cacheUpdateSchedule and stopLocalMonitorWhenIdle in package.json with the defaults of the code', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { configuration: { properties: Record<string, { default?: unknown; pattern?: string; scope?: string; type?: string }> } };
+    };
+    const properties = manifest.contributes.configuration.properties;
+    expect(properties[`${SETTINGS_SECTION}.imageUpdateSchedule`]).toBeUndefined();
+    const schedule = properties[`${SETTINGS_SECTION}.cacheUpdateSchedule`];
+    expect(schedule).toMatchObject({ type: 'string', default: DEFAULT_SETTINGS.cacheUpdateSchedule, scope: 'application' });
+    expect(properties[`${SETTINGS_SECTION}.stopLocalMonitorWhenIdle`]).toMatchObject({ type: 'boolean', default: DEFAULT_SETTINGS.stopLocalMonitorWhenIdle, scope: 'application' });
+    const pattern = new RegExp(schedule.pattern ?? '');
+    for (const text of ['17', ' 60 ', '7 6 * * *', '7 */6 * * 1-5']) expect(pattern.test(text), text).toBe(true);
+    for (const text of ['17 minutes', '7 6 * *', 'soon', '']) expect(pattern.test(text), text).toBe(false);
+  });
+
+  // Plan step 11H2 (D1, decision of 2026-10-09): stopLocalMonitorWhenIdle, a boolean, true by default.
+  it('reads stopLocalMonitorWhenIdle: a boolean; anything else is true', () => {
+    const read = (value: unknown) => normalizeSettings((key) => (key === 'stopLocalMonitorWhenIdle' ? value : undefined)).stopLocalMonitorWhenIdle;
+    expect(read(false)).toBe(false);
+    expect(read(true)).toBe(true);
+    expect(read(undefined)).toBe(true);
+    expect(read('false')).toBe(true);
   });
 
   it('reads the section devEnvLauncher', () => {

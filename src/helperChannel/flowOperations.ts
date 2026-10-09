@@ -58,7 +58,7 @@ import { WorkerConfigurationAnalyzer, analysisSlots } from '../core/helper/confi
 import { analysisFailure, type ConfigurationAnalyzer } from '../core/helper/configurationAnalysis';
 import { monitorImageTag } from '../core/helper/helperState';
 import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, RemoteSessionMonitor } from '../core/remoteMonitor/remoteSessionMonitor';
-import type { ImageSettings } from '../core/remoteMonitor/protocol';
+import { imageSettingsOf, type MonitorSettings } from '../core/remoteMonitor/protocol';
 import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
@@ -500,17 +500,25 @@ export async function monitorImage(engine: DockerEngine, own: { tag: string; id?
  * Plan step 11E4e: the Session Monitor of the worker's engine made sure, as `monitorEnsure` does it, for that operation
  * and for the open in the worker (WorkerServicesDeps.monitorEnsure): from the worker's own helper image (its monitor tag,
  * monitorImage), with the socket that the worker mounts, the monitor script of the worker's bundle and the image
- * maintenance of the operation. Rejects with the cause when it cannot.
+ * maintenance of the operation. Rejects with the cause when it cannot. Plan step 11H2 (decision of 2026-10-09): with the
+ * mode of the monitor (MonitorSettings.permanent), and with the shared VS Code server store that the worker mounts
+ * (OwnHelper.vscodeStore), which the monitor mounts too for its background run.
  */
 export async function ensureWorkerMonitor(
   engine: DockerEngine,
   own: OwnHelper,
   logger: Logger,
   script: () => string,
-  images: ImageSettings,
+  images: MonitorSettings,
   signal: AbortSignal,
 ): Promise<MonitorEnsureValue['outcome']> {
-  const monitor = new RemoteSessionMonitor({ engine: engineMonitor(engine), logger, script: async () => script(), imageMaintenance: () => images });
+  const monitor = new RemoteSessionMonitor({
+    engine: engineMonitor(engine),
+    logger,
+    script: async () => script(),
+    imageMaintenance: () => images,
+    ...(own.vscodeStore !== undefined ? { vscodeStoreVolume: own.vscodeStore } : {}),
+  });
   const image = await monitorImage(engine, own.image, logger, signal);
   return monitor.ensureOrThrow(own.image.tag, own.socket, signal, image.reference, image.id);
 }
@@ -568,8 +576,8 @@ export function operationProgress(context: OperationContext): ProgressReporter {
 
 /**
  * Plan step 11E6 (decision D1 of 2026-10-05): the image settings and the image list of an open for the Session Monitor of
- * the worker's engine, after its ensure: the settings when they name prefixes, the list when the open carries one.
- * Best effort: a failure is logged. Returns whether the monitor took the list.
+ * the worker's engine, after its ensure: the settings (plan step 11H2: always, they hold the schedule of the background
+ * run; before, only when they named prefixes), the list when the open carries one. Best effort: a failure is logged. Returns whether the monitor took the list.
  */
 export async function giveMonitorImages(
   engine: DockerEngine,
@@ -577,10 +585,10 @@ export async function giveMonitorImages(
   logger: Logger,
   signal: AbortSignal,
 ): Promise<boolean> {
-  if (params.images.prefixes.length > 0) {
-    const settings = await sendMonitorSettings(engine, { settings: params.images }, signal);
-    if (!settings.ok) logger.warn(`The image settings could not be given to the Session Monitor: ${settings.detail}`);
-  }
+  // Plan step 11H2 (D2 of 2026-10-09): always, also without prefixes: the schedule of the whole background run (the newest
+  // settings of any computer apply); without the mode, which is part of the label (imageSettingsOf).
+  const settings = await sendMonitorSettings(engine, { settings: imageSettingsOf(params.images) }, signal);
+  if (!settings.ok) logger.warn(`The image settings could not be given to the Session Monitor: ${settings.detail}`);
   if (params.repositories === undefined) return false;
   const list = await sendMonitorSettings(engine, { repositories: params.repositories }, signal);
   if (!list.ok) logger.warn(`The image list could not be given to the Session Monitor: ${list.detail}`);

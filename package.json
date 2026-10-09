@@ -614,23 +614,28 @@
             "patternErrorMessage": "A repository prefix with its registry, for example ghcr.io/owner/name*. Docker Hub (docker.io) is not supported."
           },
           "default": [],
-          "description": "On every Docker engine that Dev Environments uses (local or remote): its Session Monitor container pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all public packages of the owner, read with your GitHub sign-in), one minute after it starts and then by Image Update Schedule (default every day at 06:07), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off; at most 50 patterns."
+          "description": "On every Docker engine that Dev Environments uses (local or remote): its Session Monitor container pulls the latest major version of every image repository that starts with one of these names (for ghcr.io all public packages of the owner, read with your GitHub sign-in), by Cache Update Schedule (default every 17 minutes), and keeps the two newest versions of each. Older versions that no container uses are removed. An empty list turns it off; at most 50 patterns."
         },
-        "devEnvLauncher.imageUpdateSchedule": {
+        "devEnvLauncher.cacheUpdateSchedule": {
           "type": "string",
           "scope": "application",
-          "default": "7 6 * * *",
-          "pattern": "^\\s*\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s*$",
-          "patternErrorMessage": "Five fields: minute hour day-of-month month day-of-week, for example 7 6 * * * (every day at 06:07).",
+          "default": "17",
+          "pattern": "^\\s*(\\d+|\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+)\\s*$",
+          "patternErrorMessage": "An interval in whole minutes (at least 5), for example 17, or a cron schedule of five fields: minute hour day-of-month month day-of-week, for example 7 6 * * * (every day at 06:07).",
           "examples": [
+            "17",
+            "60",
             "7 6 * * *",
             "7 6 * * 1-5",
-            "7 6,18 * * *",
-            "7 */6 * * *",
-            "7 6 * * 1",
-            "7 6 1 * *"
+            "7 */6 * * *"
           ],
-          "markdownDescription": "When the Session Monitor container of each Docker engine updates the images of `#devEnvLauncher.imageUpdates#` after its first pass (one minute after it starts). A cron expression of five fields in the time zone of this computer:\n\n| Field | Values |\n|---|---|\n| minute | 0-59 |\n| hour | 0-23 |\n| day of the month | 1-31 |\n| month | 1-12 or JAN-DEC |\n| day of the week | 0-7 or SUN-SAT (0 and 7: Sunday) |\n\nEach field: `*` (any), a number, a range `1-5`, a list `6,18`, a step `*/6`. Examples: `7 6 * * *` every day at 06:07 (the default); `7 6 * * 1-5` Monday to Friday at 06:07; `7 6,18 * * *` at 06:07 and 18:07; `7 */6 * * *` every six hours; `7 6 * * 1` Mondays; `7 6 1 * *` on the first of each month. An invalid expression means the default."
+          "markdownDescription": "When the Session Monitor container of each Docker engine runs its background work: the updates of the images of `#devEnvLauncher.imageUpdates#`, the download of the newest released VS Code server into the shared store of the engine (and its link into the running dev containers), and the cleanup of that store (at most once a day). Either an interval in whole minutes (at least 5; the default `17`: every 17 minutes from the end of the previous run, and when the monitor starts after a longer pause), or a cron expression of five fields in the time zone of this computer (a monitor that starts runs once when a time of it passed since its last run):\n\n| Field | Values |\n|---|---|\n| minute | 0-59 |\n| hour | 0-23 |\n| day of the month | 1-31 |\n| month | 1-12 or JAN-DEC |\n| day of the week | 0-7 or SUN-SAT (0 and 7: Sunday) |\n\nEach field: `*` (any), a number, a range `1-5`, a list `6,18`, a step `*/6`. Examples: `17` every 17 minutes (the default); `60` every hour; `7 6 * * *` every day at 06:07; `7 6 * * 1-5` Monday to Friday at 06:07; `7 */6 * * *` every six hours. An invalid value means the default."
+        },
+        "devEnvLauncher.stopLocalMonitorWhenIdle": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "description": "On the local Docker engine, the Session Monitor container ends after 5 minutes without a running environment (the next open starts it again). Turn it off to keep it running permanently, as it always does on a remote engine, so that its background work (image updates, VS Code server downloads, cleanup) also runs while no environment runs."
         },
         "devEnvLauncher.updateImagesOnConnect": {
           "type": "boolean",

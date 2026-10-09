@@ -3,7 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The schedule of the image updates on a remote Docker host (user request 2026-09-28: "a setting that tells the monitor
-// to fetch in a guided cron style manner"): a cron expression of five fields, minute hour day-of-month month
+// to fetch in a guided cron style manner"; plan step 11H2: of the whole background run of the monitor, the cron form of
+// the setting cacheUpdateSchedule, cacheSettings.ts): a cron expression of five fields, minute hour day-of-month month
 // day-of-week, in a time zone (that of the computer that created the monitor). Each field: `*`, a number, a range
 // `a-b`, a step `*/n`, `a-b/n` or `a/n`, or a list of these with commas; months and weekdays also by their English
 // three-letter names (JAN, MON); weekday 0 and 7 are Sunday. As in Vixie cron: when both the day of the month and the
@@ -11,8 +12,8 @@
 // match both (so `*/2` in the day of the month is every other day). Used by the extension (the check of the
 // setting) and by the monitor script (the next pass). Only Node.js built-ins; no `vscode`.
 
-/** The default schedule: every day at 06:07 (user request 2026-09-28, "at 6:07 CEST"). */
-export const DEFAULT_IMAGE_SCHEDULE = '7 6 * * *';
+// Plan step 11H2 (D2, decision of 2026-10-09): DEFAULT_IMAGE_SCHEDULE (`7 6 * * *`, the default of imageUpdateSchedule) is
+// removed with that setting; the default of cacheUpdateSchedule is an interval (cacheSettings.ts).
 /** The time zone when the monitor gets none that it knows. */
 export const DEFAULT_IMAGE_TIME_ZONE = 'Europe/Vienna';
 /** The longest schedule text that is accepted. */

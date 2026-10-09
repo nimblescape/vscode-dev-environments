@@ -41,14 +41,23 @@ export interface MonitorRunSpec {
    */
   imageId?: string;
   labels: Record<string, string>;
-  /** Plan step 8, PR B (Q5): `on-failure`. */
-  restartPolicy: string;
-  /** User requests 2026-09-28: the default network with image maintenance (outbound only), else none. */
+  /**
+   * Plan step 8, PR B (Q5): `on-failure`. Plan step 11H2 (the user's decision "unless-stopped" of 2026-10-09):
+   * `unless-stopped` for a monitor that runs permanently (monitorRestartPolicy).
+   */
+  restartPolicy: 'on-failure' | 'unless-stopped';
+  /**
+   * User requests 2026-09-28: the default network with image maintenance (outbound only), else none. Plan step 11H2 (D1
+   * of 2026-10-09): always the default network (the VS Code server of its background run; it publishes no port).
+   */
   network: 'none' | 'default';
   /** Monitor cleanup, user decision 2026-09-29 (R5): the json-file driver with two files of at most 1 MB. */
   log: { driver: 'json-file'; maxSize: string; maxFile: string };
-  /** The socket of the engine and the state volume. */
-  mounts: { socket: string; volume: string; volumeTarget: string };
+  /**
+   * The socket of the engine and the state volume. Plan step 11H2: and the shared VS Code server store of the engine
+   * (`store`: its volume, read-write at its target, with `nocopy` as the worker mounts it), when the worker has one.
+   */
+  mounts: { socket: string; volume: string; volumeTarget: string; store?: { volume: string; target: string } };
   env: Record<string, string>;
   /** The pipe loader with the path, the hash of the script and its entry (loaderCommand). */
   command: string[];

@@ -13,7 +13,7 @@ import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfW
 import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import type { SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
-import { vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
+import { mountsVscodeStore, vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
 import type { VscodePlatform, VscodeServerLink, VscodeServerRef } from '../helperChannel/protocol';
 import { isDevContainer } from '../worker/dockerEngine';
 import {
@@ -120,7 +120,6 @@ import {
   SERVICE_DATA,
   VOLUME_KIND_ADDITIONAL,
   VOLUME_KIND_COMPOSE,
-  VSCODE_STORE_TARGET,
   VSCODE_STORE_VOLUME,
   composeProjectName,
   configurationFolder,
@@ -5071,12 +5070,8 @@ export class EnvironmentService extends OperationBase {
     const store = this.vscodeStoreVolume();
     try {
       const found = await this.deps.docker.findContainer(ctx.env.id, containerName);
-      const mounted =
-        found !== undefined &&
-        (sameContainer(found.id, container) || found.name === container) &&
-        (found.mountTargets ?? []).some(
-          (mount) => mount.type === 'volume' && mount.volume === store && mount.subpath === undefined && mount.readOnly === true && path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') === VSCODE_STORE_TARGET,
-        );
+      // Plan step 11H2: the one check of the mount, shared with the Session Monitor's link (mountsVscodeStore).
+      const mounted = found !== undefined && (sameContainer(found.id, container) || found.name === container) && mountsVscodeStore(found.mountTargets, store);
       if (!mounted) {
         this.logger.info(`The VS Code server ${commit} is not linked: the container of ${ctx.env.repository} does not mount the shared store (it was created before; a rebuild adds it).`);
         return { outcome: 'skipped' };

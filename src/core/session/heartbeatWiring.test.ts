@@ -377,7 +377,9 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
     const source = fs.readFileSync(path.join(__dirname, '..', '..', 'vscode', 'extension.ts'), 'utf8');
     // Plan step 11D2: changed, the operation `monitorEnsure` of the worker of the repair's engine (before:
     // monitorEnsure(remoteMonitor, engineSocket), removed with its test).
-    expect(source).toContain('const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(), signal));');
+    // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, with the mode of the monitor of the repair's engine
+    // (a remote target runs it permanently; was imageMaintenance() without it).
+    expect(source).toContain("const repairSessionMonitor = heartbeats.repair((target, signal) => monitorCalls.monitorEnsure(target, imageMaintenance(target.kind === 'remote'), signal));");
     expect(source).not.toContain('ensureOrThrow(image.tag');
     expect(source).toMatch(/onImageBuilt: \(\) => \{\s*helperChannels\?\.clearFailures\(\);\s*heartbeats\.imageBuilt\(\);\s*\}/);
   });

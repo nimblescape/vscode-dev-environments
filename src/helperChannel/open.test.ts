@@ -158,6 +158,9 @@ describe('the Session Monitor of an open (plan step 11E6, decision D1)', () => {
     answer = ok;
     await monitor.monitorImages(undefined);
     expect(monitor.imageListSent()).toBe(true);
-    expect(execs.map((exec) => exec.input)).toEqual([JSON.stringify({ repositories: ['ghcr.io/acme/app'] }), JSON.stringify({ repositories: ['ghcr.io/acme/app'] })]);
+    // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, the settings go before each list, also without
+    // prefixes (they hold the schedule of the whole background run; was: the lists only).
+    const list = JSON.stringify({ repositories: ['ghcr.io/acme/app'] });
+    expect(execs.map((exec) => exec.input)).toEqual([JSON.stringify(IMAGES), list, JSON.stringify(IMAGES), list]);
   });
 });

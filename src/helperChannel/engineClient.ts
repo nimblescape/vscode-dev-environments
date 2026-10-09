@@ -872,6 +872,11 @@ async function createAttached(
             SecurityOpt: ['no-new-privileges'],
             LogConfig: { Type: spec.log.driver, Config: { 'max-size': spec.log.maxSize, 'max-file': spec.log.maxFile } },
             Binds: [`${spec.mounts.socket}:/var/run/docker.sock`, `${spec.mounts.volume}:${spec.mounts.volumeTarget}`],
+            // Plan step 11H2: the shared VS Code server store read-write, with `nocopy` as the worker mounts it (Docker never
+            // fills an empty store with the content of the image at the target).
+            ...(spec.mounts.store !== undefined
+              ? { Mounts: [{ Type: 'volume', Source: spec.mounts.store.volume, Target: spec.mounts.store.target, ReadOnly: false, VolumeOptions: { NoCopy: true } }] }
+              : {}),
           },
         },
       });

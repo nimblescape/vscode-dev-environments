@@ -42,7 +42,7 @@ import {
   type WindowStateValue,
 } from '../helperChannel/protocol';
 import type { HelperMaintenance } from '../helper/helperImages';
-import type { ImageSettings } from '../remoteMonitor/protocol';
+import type { MonitorSettings } from '../remoteMonitor/protocol';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { Steps, type ProgressStep } from '../messages';
 import { repositoryFolder, splitRepository } from '../names';
@@ -128,8 +128,11 @@ export interface EnvironmentOperationsDeps extends OperationBaseDeps {
   flow: OperationFlow;
   /** Plan step 11C2a: the id of this computer in the Session Monitor (Delete's `forget`, the open's first heartbeat). */
   monitorSource?: () => string;
-  /** Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list of an open. */
-  openMonitor?: (dockerHost: string) => { images: ImageSettings; repositories?: string[]; listSent: () => void };
+  /**
+   * Plan step 11E6 (decision D1 of 2026-10-05): the image maintenance and the image list of an open. Plan step 11H2 (D1
+   * and D2 of 2026-10-09): with the schedule of the monitor's background run and its mode for the engine `dockerHost`.
+   */
+  openMonitor?: (dockerHost: string) => { images: MonitorSettings; repositories?: string[]; listSent: () => void };
   /**
    * Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the VS Code server of this window (the commit
    * and quality of its product.json, only for a build of the Microsoft update service), which the open carries; none: the

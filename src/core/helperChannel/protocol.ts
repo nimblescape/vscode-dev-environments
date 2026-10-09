@@ -30,7 +30,7 @@ import { PIPE_LOADER } from '../loader/pipeLoader';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
-import { LABEL_SESSION_MONITOR, isSourceId, parseHeartbeatInput, parseImageListInput, parseImageSettingsInput, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
+import { LABEL_SESSION_MONITOR, isSourceId, parseHeartbeatInput, parseImageListInput, parseMonitorSettings, type HeartbeatInput, type MonitorSettings } from '../remoteMonitor/protocol';
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
@@ -1376,13 +1376,14 @@ export function parseRecordGitStateValue(value: unknown): RecordGitStateValue | 
  * Plan step 11D2 (decision of 2026-10-03): `monitorEnsure`, the ensure of the Session Monitor container of the worker's
  * engine (RemoteSessionMonitor.ensureOrThrow over the Engine API), with the worker's own helper image (its tag and ID)
  * and socket, and the script of its bundle. `images`: the image maintenance of this computer (the settings imageUpdates
- * and imageUpdateSchedule, in its time zone); with prefixes the monitor gets the default network. A failure fails the
- * operation with its cause. No request, no secret. Parameters MonitorEnsureParams; value MonitorEnsureValue.
+ * and, plan step 11H2, cacheUpdateSchedule, in its time zone) and (plan step 11H2, D1 of 2026-10-09) whether the monitor
+ * runs permanently (MonitorSettings). A failure fails the operation with its cause. No request, no secret. Parameters
+ * MonitorEnsureParams; value MonitorEnsureValue.
  */
 export const OP_MONITOR_ENSURE = 'monitorEnsure';
 
 export interface MonitorEnsureParams {
-  images: ImageSettings;
+  images: MonitorSettings;
 }
 
 export interface MonitorEnsureValue {
@@ -1392,7 +1393,8 @@ export interface MonitorEnsureValue {
 /** The strict check of MonitorEnsureParams (both sides): the settings as the monitor takes them (prefixes may be none). */
 export function parseMonitorEnsureParams(value: unknown): MonitorEnsureParams | undefined {
   if (!isRecord(value) || !hasOnlyKeys(value, ['images'])) return undefined;
-  const images = parseImageSettingsInput(JSON.stringify(value.images) ?? '');
+  // Plan step 11H2: with the mode of the monitor (parseMonitorSettings).
+  const images = parseMonitorSettings(value.images);
   return images === undefined ? undefined : { images };
 }
 
@@ -1435,8 +1437,11 @@ export interface OpenParams {
   /** The id of this computer in the Session Monitor, for the first heartbeat of the open (isSourceId). */
   monitorSource: string;
   settings: OpenSettings;
-  /** Decision D1 of 2026-10-05: the image maintenance of this computer, for the ensure of the Session Monitor. */
-  images: ImageSettings;
+  /**
+   * Decision D1 of 2026-10-05: the image maintenance of this computer, for the ensure of the Session Monitor. Plan step
+   * 11H2 (D1 and D2 of 2026-10-09): with the schedule of its background run and its mode (MonitorSettings).
+   */
+  images: MonitorSettings;
   /** Decision D1: the image repositories that the extension read from GitHub, when it has a list to give. */
   repositories?: string[];
   /** The repository of the open (the questions name it; a first open creates its environment). */
@@ -1560,7 +1565,7 @@ export function parseOpenParams(value: unknown): OpenParams | undefined {
   if (!plainOpenText(repository, 256) || !/^[^/\s]+\/[^/\s]+$/.test(repository)) return undefined;
   const settings = parseOpenSettings(value.settings);
   if (settings === undefined) return undefined;
-  const images = parseImageSettingsInput(JSON.stringify(value.images) ?? '');
+  const images = parseMonitorSettings(value.images);
   if (images === undefined) return undefined;
   let repositories: string[] | undefined;
   if (value.repositories !== undefined) {

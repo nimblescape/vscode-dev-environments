@@ -9,7 +9,7 @@ import { HOST_ACCESS_CHECKS_OFF_SETTING, parseHostAccessChecksOff } from '../cor
 import { Messages } from '../core/messages';
 import type { Logger } from '../core/ports';
 import type { ExtensionSettings } from '../core/types';
-import { DEFAULT_IMAGE_SCHEDULE, parseCronSchedule } from '../core/remoteMonitor/cron';
+import { DEFAULT_CACHE_UPDATE_SCHEDULE, normalizeCacheSchedule } from '../core/remoteMonitor/cacheSettings';
 import { normalizeListOpenMode, type ListOpenMode } from './rowActivation';
 
 export const SETTINGS_SECTION = 'devEnvLauncher';
@@ -36,7 +36,8 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   openInNewWindow: false,
   stopAfterMinutes: 10,
   imageUpdates: [...DEFAULT_IMAGE_UPDATES],
-  imageUpdateSchedule: DEFAULT_IMAGE_SCHEDULE,
+  cacheUpdateSchedule: DEFAULT_CACHE_UPDATE_SCHEDULE,
+  stopLocalMonitorWhenIdle: true,
 });
 
 /**
@@ -161,10 +162,11 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     imageUpdates: Array.isArray(get('imageUpdates'))
       ? (get('imageUpdates') as unknown[]).filter((entry): entry is string => typeof entry === 'string')
       : [...DEFAULT_IMAGE_UPDATES],
-    // User request 2026-09-28 ("in a guided cron style manner"): a cron expression of five fields; invalid: the default.
-    imageUpdateSchedule:
-      typeof get('imageUpdateSchedule') === 'string' && parseCronSchedule(get('imageUpdateSchedule') as string)
-        ? (get('imageUpdateSchedule') as string).trim().split(/\s+/).join(' ')
-        : DEFAULT_IMAGE_SCHEDULE,
+    // Plan step 11H2 (D2, decision of 2026-10-09; it replaces imageUpdateSchedule, no migration): a cron expression of five
+    // fields (user request 2026-09-28, "in a guided cron style manner"), or an interval of at least 5 whole minutes;
+    // anything else: the default, every 17 minutes (normalizeCacheSchedule).
+    cacheUpdateSchedule: normalizeCacheSchedule(get('cacheUpdateSchedule')),
+    // Plan step 11H2 (D1): the local Session Monitor ends when idle unless this is false.
+    stopLocalMonitorWhenIdle: bool('stopLocalMonitorWhenIdle', DEFAULT_SETTINGS.stopLocalMonitorWhenIdle ?? true),
   };
 }

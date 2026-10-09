@@ -99,13 +99,17 @@ describe('the operations of the Session Monitor in the worker (plan step 11D1)',
     expect(await giveMonitorImages(engine, { images: settings, repositories: ['ghcr.io/acme/app'] }, contextLogger(context), context.signal)).toBe(true);
     expect(execs.map((exec) => exec.options?.input)).toEqual([JSON.stringify(settings), JSON.stringify({ repositories: ['ghcr.io/acme/app'] })]);
     // Without prefixes no settings, and without a list nothing more.
+    // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, the settings go also without prefixes (they hold
+    // the schedule of the whole background run; was: no settings), and without a list nothing more; the mode of the monitor
+    // never goes with them.
     const none = engineOf(ok);
-    expect(await giveMonitorImages(none.engine, { images: { ...settings, prefixes: [] } }, contextLogger(context), context.signal)).toBe(false);
-    expect(none.execs).toEqual([]);
+    expect(await giveMonitorImages(none.engine, { images: { ...settings, prefixes: [], permanent: true } }, contextLogger(context), context.signal)).toBe(false);
+    expect(none.execs.map((exec) => exec.options?.input)).toEqual([JSON.stringify({ ...settings, prefixes: [] })]);
     const failing = engineOf(async () => ({ exitCode: 2, stdout: '', stderr: 'Invalid image list.', timedOut: false }));
     const logged = contextOf();
     expect(await giveMonitorImages(failing.engine, { images: { ...settings, prefixes: [] }, repositories: ['ghcr.io/acme/app'] }, contextLogger(logged.context), logged.context.signal)).toBe(false);
-    expect(logged.lines).toEqual(['The image list could not be given to the Session Monitor: Invalid image list.']);
+    // Plan step 11H2 (D2): changed expectation, the failed settings are logged too (they are sent now).
+    expect(logged.lines).toEqual(['The image settings could not be given to the Session Monitor: Invalid image list.', 'The image list could not be given to the Session Monitor: Invalid image list.']);
   });
 
   function recordGitState(setup: { container?: 'running' | 'stopped' | 'missing'; record?: Environment | null; params?: Record<string, unknown> } = {}) {

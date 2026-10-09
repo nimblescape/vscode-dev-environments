@@ -147,6 +147,27 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     expect(JSON.parse(calls[0].body).HostConfig.NetworkMode).toBe('default');
   });
 
+  // Plan step 11H2 (decision of 2026-10-09, D1 and "unless-stopped"): a permanent monitor with the shared VS Code server
+  // store: its restart policy as given, the store read-write with NoCopy as a mount next to the binds, nothing else.
+  it('a permanent monitor with the store: unless-stopped, and the store as a volume mount with NoCopy (plan step 11H2)', async () => {
+    const { engine, calls } = await serve(engineAnswers(), (socket, given) => {
+      if (given.endsWith('\n')) socket.write(frame(1, READY));
+    });
+    const spec: MonitorRunSpec = {
+      ...SPEC,
+      restartPolicy: 'unless-stopped',
+      network: 'default',
+      mounts: { ...SPEC.mounts, store: { volume: 'devenv-vscode', target: '/vscode' } },
+    };
+    await engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 });
+    const host = JSON.parse(calls[0].body).HostConfig;
+    expect(host.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    expect(host.Binds).toEqual(['/var/run/docker.sock:/var/run/docker.sock', 'devenv-session-monitor:/state']);
+    expect(host.Mounts).toEqual([{ Type: 'volume', Source: 'devenv-vscode', Target: '/vscode', ReadOnly: false, VolumeOptions: { NoCopy: true } }]);
+    expect(host.CapDrop).toEqual(['ALL']);
+    expect(host.PortBindings).toBeUndefined();
+  });
+
   it('a name in use is a conflict; another refusal of the create is not; nothing is attached then', async () => {
     const conflict = await serve(() => ({ status: 409, json: { message: 'Conflict. The container name "/devenv-session-monitor" is already in use by container "abc". You have to remove (or rename) that container to be able to reuse that name.' } }));
     expect(await conflict.engine.createAttached(SPEC, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toMatchObject({ kind: 'exited', conflict: true });

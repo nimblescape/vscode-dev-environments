@@ -28,7 +28,10 @@ describe('the ensure over MonitorEngine, probes (review round 1 of PR #100, B)',
 
   it('image maintenance without prefixes sets no variables', () => {
     const monitor = new RemoteSessionMonitor({ engine: engine({}), logger: logger([]), script: async () => SCRIPT });
-    expect(monitor.runSpec('img', '/sock', 'label', SCRIPT, { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, 'n1').env).toEqual({});
+    // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, the schedule and the time zone of the background run
+    // go to the container also without prefixes (the VS Code server and the cleanup always run); was no variable. Still no
+    // prefixes.
+    expect(monitor.runSpec('img', '/sock', 'label', SCRIPT, { prefixes: [], schedule: '7 6 * * *', timeZone: 'UTC' }, 'n1').env).toEqual({ DEVENV_IMAGE_SCHEDULE: '7 6 * * *', DEVENV_IMAGE_TZ: 'UTC' });
   });
 
   it('the create waits for the ready text of the monitor', async () => {

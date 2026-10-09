@@ -53,7 +53,7 @@ import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
 import { SWITCH_RELEASE_BOUNDS, releaseEnvironment, releaseLimitSeconds } from '../../src/core/session/windowRelease';
 import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { Timings, dockerTestContext, testHelperImage, testStateVolume } from './harness';
+import { Timings, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 import { holdLockInContainer, lockIsFree } from './workerLocks';
 
 const SOURCE = crypto.randomBytes(16).toString('hex');
@@ -194,7 +194,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(details.Config.Image).toBe(helperTag);
     expect(details.Config.Labels[LABEL_SESSION_MONITOR]).toMatch(/^[0-9a-f]{12}$/);
     expect(details.Config.Labels[LABEL_ENVIRONMENT_ID]).toBeUndefined();
-    expect(details.HostConfig.NetworkMode).toBe('none');
+    // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, the monitor always has the default network (its
+    // background run reaches the update service of VS Code; it publishes no port); was `none` without image updates.
+    expect(details.HostConfig.NetworkMode).toMatch(/^(default|bridge)$/);
     // Changed expectation, plan step 8 PR B (Q5): was `unless-stopped`; the monitor exits when idle and stays exited.
     expect(details.HostConfig.RestartPolicy.Name).toBe('on-failure');
     expect(details.HostConfig.CapDrop).toEqual(['ALL']);
@@ -667,6 +669,46 @@ describe('the Session Monitor container: the environment lock of its stops and i
     cli.run(['rm', '-f', name]);
   });
 
+  // Plan step 11H2 (decision of 2026-10-09, D1 and "unless-stopped"): a permanent monitor (a remote engine, or
+  // stopLocalMonitorWhenIdle off) has the restart policy `unless-stopped`, mounts the store of the worker read-write with
+  // `nocopy` at /vscode (a volume of this run), and never exits when idle; an ensure of one that ends when idle keeps it.
+  // Its first background run is a day away (DEVENV_IMAGE_FIRST_MS), so nothing is downloaded here.
+  it('a permanent monitor: unless-stopped, the store at /vscode, no exit when idle; an ensure of one that ends when idle keeps it (plan step 11H2)', async () => {
+    cli.run(['rm', '-f', containerName]);
+    const store = testVscodeVolume({ run, cli }, 'remoteMonitor');
+    const options = {
+      engine: engineMonitor(dockerEngine(engineApi(helperDockerSocket(env, process.platform)), engineHijack(helperDockerSocket(env, process.platform)))),
+      logger: log,
+      script: async () => script,
+      containerName,
+      volumeName,
+      labels: { [TEST_RUN_LABEL]: run.runId },
+      containerEnv: { DEVENV_MONITOR_TICK_MS: String(TICK_MS), DEVENV_MONITOR_IDLE_MS: '3000', DEVENV_IMAGE_FIRST_MS: '86400000' },
+      vscodeStoreVolume: store,
+    };
+    const permanent = new RemoteSessionMonitor({ ...options, imageMaintenance: () => ({ prefixes: [], schedule: '17', timeZone: 'UTC', permanent: true }) });
+    expect(await permanent.ensure(helperTag, socket)).toBe('created');
+    const details = cli.container(containerName) as unknown as {
+      HostConfig: { RestartPolicy: { Name: string }; Mounts?: Array<{ Type: string; Source: string; Target: string; VolumeOptions?: { NoCopy?: boolean } }> };
+      Mounts: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }>;
+      Config: { Env: string[] };
+    };
+    expect(details.HostConfig.RestartPolicy.Name).toBe('unless-stopped');
+    expect(details.Mounts).toEqual(expect.arrayContaining([expect.objectContaining({ Type: 'volume', Name: store, Destination: '/vscode', RW: true })]));
+    expect(details.HostConfig.Mounts).toEqual([expect.objectContaining({ Type: 'volume', Source: store, Target: '/vscode', VolumeOptions: expect.objectContaining({ NoCopy: true }) })]);
+    expect(details.Config.Env).toEqual(expect.arrayContaining(['DEVENV_MONITOR_PERMANENT=1', `DEVENV_VSCODE_STORE=${store}`]));
+    await waitUntil(() => logs().includes('runs permanently.'), 'the start of the permanent monitor', 30_000);
+    // Well past its idle time (3 s): still running.
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+    expect(running(containerName)).toBe(true);
+    expect(logs()).not.toContain('the Session Monitor exits');
+    // A window that sees this engine as local keeps it.
+    const idle = new RemoteSessionMonitor({ ...options, imageMaintenance: () => ({ prefixes: [], schedule: '17', timeZone: 'UTC', permanent: false }) });
+    expect(await idle.ensure(helperTag, socket)).toBe('running');
+    expect(cli.container(containerName)!.HostConfig.RestartPolicy?.Name).toBe('unless-stopped');
+    cli.ok(['rm', '-f', containerName]);
+  });
+
   it('exits with 0 when no environment container runs and image updates are off, stays exited, and ensure starts it again (Q5)', async (context) => {
     // The idle exit needs a quiet engine: no running container with the environment label (of this run or another).
     if (cli.lines(['ps', '-q', '--filter', `label=${LABEL_ENVIRONMENT_ID}`]).length > 0) {
@@ -681,7 +723,8 @@ describe('the Session Monitor container: the environment lock of its stops and i
     const exited = cli.container(containerName) as unknown as { State: { Status: string; ExitCode: number }; RestartCount: number };
     expect(exited.State.Status).toBe('exited');
     expect(exited.State.ExitCode).toBe(0);
-    expect(logs()).toContain('image updates are off; the Session Monitor exits.');
+    // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, the text names the mode (was "image updates are off").
+    expect(logs()).toContain('it does not run permanently; the Session Monitor exits.');
     // The restart policy leaves it exited.
     await new Promise((resolve) => setTimeout(resolve, 5_000));
     expect(running(containerName)).toBe(false);
