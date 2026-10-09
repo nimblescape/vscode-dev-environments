@@ -141,6 +141,8 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   // Review round 2 of PR #130 (D1): Buildx reads another scheme as a path relative to its working folder, refused whatever
   // the switch says.
   ['build --build-context with another scheme', input(build('--build-context', 'src=cwd:///devenv-cache')), 'build option --build-context=src=cwd:///devenv-cache', 'protected'],
+  // Review round 3 of PR #130 (R3A-4): only Docker Compose makes `service:` a target; docker buildx build reads a folder.
+  ['build --build-context of service:', input(build('--build-context', 'src=service:app')), 'build option --build-context=src=service:app', 'protected'],
   ['build --build-context with the folder of the token', input(build('--build-context', 'src=/workspaces/.devenv+')), 'build option --build-context=src=/workspaces/.devenv+', 'protected'],
   ['build --build-context with an OCI layout in the cache volume', input(build('--build-context', 'src=oci-layout:///devenv-cache/x:1@sha256:' + 'a'.repeat(64))), `build option --build-context=src=oci-layout:///devenv-cache/x:1@sha256:${'a'.repeat(64)}`, 'protected'],
   ['build --build-context with an OCI layout of the computer', input(build('--build-context', 'src=oci-layout:///Users/x/layout')), 'build option --build-context=src=oci-layout:///Users/x/layout', 'computer'],

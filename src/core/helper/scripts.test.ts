@@ -523,6 +523,28 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(Object.keys(output.realPaths).some((key) => key.includes('alpine') || key.includes('example.com'))).toBe(false);
   });
 
+  it('records the real path of the folder that Buildx reads, as written (review round 3 of PR #130, R3A-1)', () => {
+    const { repo, env } = setup();
+    fs.mkdirSync(path.join(repo, 'x:a'));
+    fs.mkdirSync(path.join(repo, 'x'));
+    const model = {
+      name: PROJECT,
+      services: {
+        tool: {
+          build: {
+            context: repo,
+            dockerfile_inline: 'FROM alpine',
+            // The tag after the last colon (Buildx's ocilayout.Parse); a space before an absolute path makes it relative.
+            additional_contexts: { a: `oci-layout://${repo}/x:a:1`, b: ` ${repo}/x`, c: `OCI-LAYOUT://${repo}/x` },
+          },
+        },
+      },
+    };
+    const output = runModel(repo, [path.join(repo, 'compose.yml')], { ...env, FAKE_MODEL: JSON.stringify(model) }) as { realPaths: Record<string, string | null> };
+    expect(output.realPaths[`${repo}/x:a`]).toBe(fs.realpathSync(path.join(repo, 'x:a')));
+    expect(Object.keys(output.realPaths)).not.toContain(`${repo}/x`);
+  });
+
   it('reads each Dockerfile once, and at most one character more than the extension takes (review round 9, S9-2)', () => {
     const { repo, env } = setup();
     // Five services build the same Dockerfile, which is much longer than MAX_DOCKERFILE_LENGTH.

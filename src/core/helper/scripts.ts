@@ -754,19 +754,20 @@ const isHelperPath = (file) => {
   if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
-// The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts): the path, or the path of an OCI layout;
-// none only for an image, a URL, or a target of the build, by the exact prefix (review round 2 of PR #130, D1).
+// The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts, and service: as its caller in
+// ../policy/compose.ts takes it): the path, or the path of an OCI layout (ociLayoutFolder); none only for an image, a URL, or a
+// target of the build, by the exact prefix (review round 2 of PR #130, D1); not trimmed (review round 3 of PR #130, R3A-1).
 const localFolder = (source) => {
   const raw = String(source);
   if (['docker-image://', 'http://', 'https://', 'target:', 'service:'].some((prefix) => raw.startsWith(prefix))) return undefined;
-  const text = raw.trim();
-  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
-  if (oci) {
-    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
-    const colon = folder.indexOf(':', folder.lastIndexOf('/') + 1);
-    return colon >= 0 ? folder.slice(0, colon) : folder;
-  }
-  return text;
+  if (!raw.startsWith('oci-layout://')) return raw;
+  let folder = raw.slice('oci-layout://'.length);
+  const at = folder.lastIndexOf('@');
+  if (at >= 0 && /[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]{32,}/.test(folder.slice(at + 1))) folder = folder.slice(0, at);
+  const colon = folder.lastIndexOf(':');
+  const drive = colon === 1 && /^[A-Za-z]:[\\/]/.test(folder);
+  if (colon >= 0 && !drive && /\w/.test(folder.slice(colon + 1))) folder = folder.slice(0, colon);
+  return folder;
 };
 // The key files of build.ssh: 'id=path[,path]', { id, path }, or a map.
 const sshFiles = (ssh) => {

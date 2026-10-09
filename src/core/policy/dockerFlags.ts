@@ -388,23 +388,32 @@ export function isUrlContext(source: string): boolean {
 
 /**
  * The folder of a local build context (`--build-context`, `additional_contexts`): the path itself, or the path of an
- * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` only for what Buildx never reads from the files of the
- * build client, each by its exact prefix: an image (`docker-image://`), a URL (`http://`, `https://`), and a target of
- * the build (`target:`, and `service:`, which Docker Compose makes a target). Review round 2 of PR #130 (D1): Buildx
- * reads every other value as a path (bake `cwd://<path>` as `<path>`; a Git reference that it cannot parse, another
- * scheme, or a prefix in another case or after a space, relative to its working folder), so it is checked as written:
- * a relative path, which the checks refuse whatever the switch says.
+ * `oci-layout://<path>[:<tag>][@<digest>]` layout (ociLayoutFolder). `undefined` only for what Buildx never reads from
+ * the files of the build client, each by its exact prefix: an image (`docker-image://`), a URL (`http://`, `https://`),
+ * and a target of the build (`target:`; Docker Compose also makes `service:` one, which its caller takes before). Review
+ * round 2 of PR #130 (D1): Buildx reads every other value as a path (bake `cwd://<path>` as `<path>`; another scheme or
+ * a prefix in another case relative to its working folder), so it is checked as written: a relative path, which the
+ * checks refuse whatever the switch says. A Git reference by SSH or `git://` is fetched by Buildx when it can parse it,
+ * else read as a path: it is refused the same way (a Git context only by `https://`). Review round 3 of PR #130
+ * (R3A-1): the value as Buildx reads it, not trimmed, and `oci-layout://` only by its exact prefix.
  */
 export function localContextPath(source: string): string | undefined {
-  if (imageContext(source) !== undefined || isUrlContext(source) || source.startsWith('target:') || source.startsWith('service:')) return undefined;
-  const text = source.trim();
-  const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
-  if (oci) {
-    let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
-    const last = folder.lastIndexOf('/');
-    const colon = folder.indexOf(':', last + 1);
-    if (colon >= 0) folder = folder.slice(0, colon);
-    return folder;
-  }
-  return text;
+  if (imageContext(source) !== undefined || isUrlContext(source) || source.startsWith('target:')) return undefined;
+  return source.startsWith('oci-layout://') ? ociLayoutFolder(source.slice('oci-layout://'.length)) : source;
+}
+
+/**
+ * Review round 3 of PR #130 (R3A-1): the folder of `oci-layout://<rest>` as Buildx takes it (util/ocilayout Parse, with
+ * the unanchored DigestRegexp and TagRegexp of distribution/reference): without the part after the last `@` when that
+ * part holds a digest, then without the part after the last `:` when that part holds a word character and the colon is
+ * not the one of a Windows drive (`C:/`).
+ */
+export function ociLayoutFolder(rest: string): string {
+  let folder = rest;
+  const at = folder.lastIndexOf('@');
+  if (at >= 0 && /[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]{32,}/.test(folder.slice(at + 1))) folder = folder.slice(0, at);
+  const colon = folder.lastIndexOf(':');
+  const drive = colon === 1 && /^[A-Za-z]:[\\/]/.test(folder);
+  if (colon >= 0 && !drive && /\w/.test(folder.slice(colon + 1))) folder = folder.slice(0, colon);
+  return folder;
 }

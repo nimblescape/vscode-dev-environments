@@ -659,9 +659,11 @@ export function cacheFromIsRegistry(text: string): boolean {
  * what bake makes of it (a path of the repository can become one of the workspace helper, a registry import a local
  * one), and these builds run without the file-system entitlement check of bake (BAKE_FS_ENTITLEMENTS_OFF), so such a
  * value is not supported whatever the switch says. An escape (`$${`, `%%{`) holds the same characters and is refused
- * too. The build arguments and the text of `dockerfile_inline` do not choose what the build client reads.
+ * too. The build arguments and the text of `dockerfile_inline` do not choose what the build client reads. Review round
+ * 3 of PR #130 (R3A-2): the key files of `build.ssh` and the files of the build secrets, too.
  */
-function bakeTemplateProblems(value: Record<string, unknown>): Problem[] {
+function bakeTemplateProblems(value: Record<string, unknown>, ctx: ServiceContext): Problem[] {
+  const secrets = isRecord(ctx.input.model.secrets) ? ctx.input.model.secrets : {};
   const texts: Array<[string, unknown]> = [
     ['build context', value.context],
     ['build dockerfile', value.dockerfile],
@@ -669,6 +671,16 @@ function bakeTemplateProblems(value: Record<string, unknown>): Problem[] {
     ...Object.entries(isRecord(value.additional_contexts) ? value.additional_contexts : {}).map(
       ([name, source]): [string, unknown] => [`build additional_contexts ${name}`, source],
     ),
+    // Review round 3 of PR #130 (R3A-2): the key files of `build.ssh` and the files of the secrets that `build.secrets`
+    // names, which the build client reads too (buildSshProblems, buildSecretProblems).
+    ...(isRecord(value.ssh) ? Object.values(value.ssh) : listOf(value.ssh).map((entry) => (isRecord(entry) ? entry.path : entry))).map(
+      (entry): [string, unknown] => ['build ssh', entry],
+    ),
+    ...listOf(value.secrets).flatMap((entry): Array<[string, unknown]> => {
+      const name = typeof entry === 'string' ? entry : isRecord(entry) && typeof entry.source === 'string' ? entry.source : undefined;
+      const secret = name === undefined ? undefined : secrets[name];
+      return isRecord(secret) ? [[`build secret ${name} file`, secret.file]] : [];
+    }),
   ];
   return texts
     .filter(([, text]) => typeof text === 'string' && (text.includes('${') || text.includes('%{')))
@@ -683,7 +695,7 @@ function bakeTemplateProblems(value: Record<string, unknown>): Problem[] {
 function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   if (isUnset(value)) return [];
   if (!isRecord(value)) return [unsupported(`build ${JSON.stringify(value)}`)];
-  const problems: Problem[] = bakeTemplateProblems(value);
+  const problems: Problem[] = bakeTemplateProblems(value, ctx);
   const context = typeof value.context === 'string' ? value.context : undefined;
   const remote = context !== undefined && isRemoteContext(context);
   // Review round 3 (P3-1): a missing context or Dockerfile of the repository is left to composeMissingBuildPaths.
@@ -748,7 +760,8 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
       else if (!isUrlContext(String(source))) {
         const item = `build additional_contexts ${name}=${String(source)}`;
         // Review round 2 (S2-03): a folder (also of `oci-layout://`) is read by the build client in the workspace helper.
-        const folder = localContextPath(String(source));
+        // Review round 3 of PR #130 (R3A-4): Docker Compose makes `service:<name>` the target of that service.
+        const folder = String(source).startsWith('service:') ? undefined : localContextPath(String(source));
         problems.push(access(item), ...(folder === undefined ? [] : helperInputProblems(item, folder, ctx)));
       }
     }

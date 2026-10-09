@@ -172,8 +172,16 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     // Review round 2 of PR #130 (D1): bake reads `cwd://<path>` as `<path>`, Buildx another scheme or a Git reference that it
     // cannot parse as a path relative to its working folder; only an image, a URL and a target are no path.
     ['an additional context of cwd:// (a path for bake)', 'db', { build: { context: REPO, additional_contexts: { x: 'cwd:///devenv-cache' } } }, A('service db: build additional_contexts x=cwd:///devenv-cache', 'service db: build additional_contexts x=cwd:///devenv-cache (a relative path)')],
-    ['an additional context of another scheme (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: 'ssh://h/../../../devenv-cache' } } }, A('service db: build additional_contexts x=ssh://h/../../../devenv-cache', 'service db: build additional_contexts x=ssh://h/../../../devenv-cache (a relative path)')],
+    // Review round 3 of PR #130 (R3A-3): a Git reference by SSH is fetched by Buildx when it can parse it, else read as a
+    // folder; refused as a relative folder either way (a Git context only by https://).
+    ['an additional context of ssh:// (refused as a relative folder; a Git context only by https://)', 'db', { build: { context: REPO, additional_contexts: { x: 'ssh://h/../../../devenv-cache' } } }, A('service db: build additional_contexts x=ssh://h/../../../devenv-cache', 'service db: build additional_contexts x=ssh://h/../../../devenv-cache (a relative path)')],
     ['an additional context of a target', 'db', { build: { context: REPO, additional_contexts: { x: 'target:base' } } }, A('service db: build additional_contexts x=target:base')],
+    // Review round 3 of PR #130 (R3A-2): bake evaluates the key files of build.ssh and the files of the build secrets as
+    // templates too.
+    ['a key file of build.ssh with a template of bake', 'db', { build: { context: REPO, ssh: ['deploy=%{if true}/devenv-cache/key%{endif}'] } }, {
+      hostAccess: ['service db: build ssh', 'service db: build ssh deploy=%{if true}/devenv-cache/key%{endif} (a relative path)'],
+      unsupported: [`service db: build ssh deploy=%{if true}/devenv-cache/key%{endif} ${TEMPLATE}`],
+    }],
     // Review round 2 of PR #130 (R2A-1): bake reads the build definition of Docker Compose as HCL and evaluates `${…}` and
     // `%{…}` in the values that Compose passes on as written, so such a value is not supported, whatever its text says
     // (here a folder of the repository that bake makes /workspaces/x, or a registry import that it makes a local one).

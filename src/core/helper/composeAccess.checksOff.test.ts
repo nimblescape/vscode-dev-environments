@@ -105,6 +105,12 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   // relative path whatever the switch says, as is any other scheme that Buildx reads as a path.
   ['an additional build context of cwd://', input(service('db', { build: { context: REPO, additional_contexts: { c: 'cwd:///devenv-cache' } } })), 'service db: build additional_contexts c=cwd:///devenv-cache (a relative path)', 'protected'],
   ['an additional build context of another scheme', input(service('db', { build: { context: REPO, additional_contexts: { c: 'foo:///devenv-cache' } } })), 'service db: build additional_contexts c=foo:///devenv-cache (a relative path)', 'protected'],
+  // Review round 3 of PR #130 (R3A-1): Buildx reads the value as written, so `OCI-LAYOUT://` or a space before
+  // `oci-layout://` is a relative folder, and the folder of a layout is the one that Buildx takes the tag and the digest off
+  // (here `x:a` of the repository, which links to the cache volume, not `x`).
+  ['an additional build context of OCI-LAYOUT://', input(service('db', { build: { context: REPO, additional_contexts: { c: 'OCI-LAYOUT:///etc' } } })), 'service db: build additional_contexts c=OCI-LAYOUT:///etc (a relative path)', 'protected'],
+  ['an additional build context of an OCI layout after a space', input(service('db', { build: { context: REPO, additional_contexts: { c: ' oci-layout:///etc' } } })), 'service db: build additional_contexts c= oci-layout:///etc (a relative path)', 'protected'],
+  ['an OCI layout whose folder has a colon and links out', input(service('db', { build: { context: REPO, additional_contexts: { c: `oci-layout://${REPO}/x:a:1` } } }), { realPaths: { [REPO]: REPO, [`${REPO}/x`]: `${REPO}/x`, [`${REPO}/x:a`]: '/devenv-cache' } }), `service db: build additional_contexts c=oci-layout://${REPO}/x:a:1 (a link to /devenv-cache, outside of the repository)`, 'protected'],
   // review round 22, H22-5: changed rows, not supported (the pipeline creates the volumes without them, so the switch
   // cannot lift them).
   ['a volume driver', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } })), 'volume pgdata: driver nfs (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)', 'unsupported'],
@@ -164,6 +170,9 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['an SSH key that links out of the repository', input(service('db', { build: { context: REPO, ssh: [{ id: 'deploy', path: `${REPO}/key` }] } }), { realPaths: { [`${REPO}/key`]: '/workspaces/.devenv+/token' } }), `service db: build ssh deploy=${REPO}/key (a link to /workspaces/.devenv+/token, outside of the repository)`, 'protected'],
   ['the file of a build secret that links out of the repository', input((m) => { m.services.db = { ...m.services.db, build: { context: REPO, secrets: [{ source: 'npm', target: 'npm' }] } }; m.secrets = { npm: { file: `${REPO}/npmrc` } }; }, { realPaths: { [`${REPO}/npmrc`]: '/devenv-cache/npmrc' } }), `service db: build secret npm file ${REPO}/npmrc (a link to /devenv-cache/npmrc, outside of the repository)`, 'protected'],
   ['the file of a build secret in the cache volume', input((m) => { m.services.db = { ...m.services.db, build: { context: REPO, secrets: ['npm'] } }; m.secrets = { npm: { file: '/devenv-cache/npmrc' } }; }), 'service db: build secret npm file /devenv-cache/npmrc', 'protected'],
+  // Review round 3 of PR #130 (R3A-2): bake evaluates the file of a build secret as a template too; refused whatever the
+  // switch says.
+  ['the file of a build secret with a template of bake', input((m) => { m.services.db = { ...m.services.db, build: { context: REPO, secrets: ['npm'] } }; m.secrets = { npm: { file: `${REPO}/%{if true}..%{endif}/x` } }; }), `service db: build secret npm file ${REPO}/%{if true}..%{endif}/x (Buildx evaluates \`\${\` and \`%{\` in it as a template)`, 'unsupported'],
   ['build ssh (the agent)', input(service('db', { build: { context: REPO, ssh: ['default'] } })), 'service db: build ssh', 'computer'],
   // Review round 1, S2: a network of another environment under a name of its own, found by its labels or containers.
   ['a named network of another project', input((m) => (m.networks = { backend: { name: 'backend' } }), { networks: { backend: { labels: { 'com.docker.compose.project': OTHER }, environments: [] } } }), 'network backend of another environment', 'protected'],
