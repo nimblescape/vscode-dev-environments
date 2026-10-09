@@ -13,10 +13,10 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // Unit 15: no copy is in the volume. The token file of the dev container and the sign-in of the GitHub CLI are only in the
 // memory of the dev container (TOKEN_FOLDER, ./containerToken.ts).
-import { CONFIG_FOLDER, GH_VOLUME_FOLDER, WORKSPACES_ROOT } from '../names';
+import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GH_VOLUME_FOLDER, GIT_CONFIG_FILE, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
-import { GIT_CREDENTIALS_CONFIG_CONTENT } from './containerGit';
+import { GIT_CREDENTIALS_CONFIG_CONTENT, GIT_CREDENTIALS_CONFIG_FILE } from './containerGit';
 
 // Plan step 11F2: SECRETS_FOLDER moved to ../names (the window's helper channel uses it without the scripts).
 import { SECRETS_FOLDER } from '../names';
@@ -141,12 +141,31 @@ mv "$work/repo" "$target"
 echo "The repository is in $target."
 `;
 
+/** The name of `path` in the folder `folder`, of which it is a direct entry (GIT_FILES_SCRIPT opens one entry at a time). */
+function entryOf(folder: string, path: string): string {
+  const entry = path.slice(folder.length + 1);
+  if (!path.startsWith(`${folder}/`) || entry === '' || entry.includes('/')) throw new Error(`${path} is not an entry of ${folder}.`);
+  return entry;
+}
+
+/** The entries of GIT_FILES_SCRIPT: CONFIG_FOLDER in WORKSPACES_ROOT, and its folders and files. */
+function gitFilesEntries(): { config: string; docker: string; gh: string; gitconfig: string; credentials: string } {
+  return {
+    config: entryOf(WORKSPACES_ROOT, CONFIG_FOLDER),
+    docker: entryOf(CONFIG_FOLDER, DOCKER_CONFIG_FOLDER),
+    gh: entryOf(CONFIG_FOLDER, GH_VOLUME_FOLDER),
+    gitconfig: entryOf(CONFIG_FOLDER, GIT_CONFIG_FILE),
+    credentials: entryOf(CONFIG_FOLDER, GIT_CREDENTIALS_CONFIG_FILE),
+  };
+}
+
 /**
- * `$1` = folder name of the repository in /workspaces, `$2` = user.name, `$3` = user.email, `$4` = the credential helper
- * of the dev container (CONTAINER_CREDENTIAL_HELPER). No token (unit 15: the token and the sign-in of the GitHub CLI are
- * written into the memory of the dev container after its start, TOKEN_WRITE_SCRIPT). Prepares the configuration folder of
- * the dev container in the volume (CONFIG_FOLDER, concept section 9 "Git inside the container"), which all files and
- * folders get with the owner (numeric uid:gid) of the repository folder, that is the remote user after the ownership fix:
+ * `node -e` script. `argv[1]` = folder name of the repository in /workspaces, `argv[2]` = user.name, `argv[3]` =
+ * user.email, `argv[4]` = the credential helper of the dev container (CONTAINER_CREDENTIAL_HELPER). No token (unit 15: the
+ * token and the sign-in of the GitHub CLI are written into the memory of the dev container after its start,
+ * TOKEN_WRITE_SCRIPT). Prepares the configuration folder of the dev container in the volume (CONFIG_FOLDER, concept
+ * section 9 "Git inside the container"), which all files and folders get with the owner (numeric uid:gid) of the
+ * repository folder, that is the remote user after the ownership fix:
  * - gh/ (GH_VOLUME_FOLDER), mode 0700: the folder of gh's config.yml (the settings of the GitHub CLI, no secret), to which
  *   the link config.yml in GH_CONFIG_DIR leads; config.yml itself belongs to gh and stays as it is;
  * - gitconfig: created when missing, with user.name and user.email; of an existing file, only the section
@@ -155,77 +174,374 @@ echo "The repository is in $target."
  *   created when missing, with an example in comments; an existing file stays as it is;
  * - docker/ (DOCKER_CONFIG), mode 0700.
  * A link or a file in place of one of the folders is removed first.
+ *
+ * Follow-up of plan step 11I (the links of the owner): the script runs as root with the Docker socket in reach, also
+ * while the dev container runs, and every process there can rename and replace the entries of CONFIG_FOLDER at any
+ * moment (root of the dev container, also a remote user with sudo, those of /workspaces too). So root never resolves a
+ * path through an entry of the volume, and never follows a link there: the script opens /workspaces (a mount point of
+ * the helper) and goes down one entry at a time through descriptors (`/proc/self/fd/<descriptor>/<entry>`, the way
+ * openat(2) works). It opens each entry without following a link (O_NOFOLLOW, folders with O_DIRECTORY: a link or
+ * anything else in place of a folder is removed, never followed), sets modes and owners through the descriptor (fchmod,
+ * fchown), reads an existing file through a descriptor that it opened so, and makes each new file with O_EXCL under a
+ * name of its own, then renames it over its entry (a rename replaces the entry itself, also a link, and never follows
+ * it): credentials.gitconfig under a random name, gitconfig as Git's lock gitconfig.lock, which the script holds from
+ * before its read of gitconfig to the rename, as `git config` does (review round 1 of the follow-up, A-F4: a change of Git
+ * in the dev container meanwhile is never lost; when the lock exists, the step fails, as Git does). Review round 2 (A-L1):
+ * only when it changes gitconfig (a first check reads it without the lock); it ignores SIGTERM, SIGINT and SIGHUP, so that
+ * a Cancel cannot end it while it holds the lock; and a lock of root that is a plain file of one link unchanged for more
+ * than 10 minutes is one of a killed run, which it removes (and says so); review round 3 of PR G (A-L1): also such a lock
+ * of the owner. Git edits a copy in a folder of root in the helper's /tmp (`git config --file`, from `/`), outside the
+ * volume, which no process of the dev container can reach; a gitconfig of more than 1 MiB is not copied (A-F2: the step
+ * fails). Whatever the owner renames or replaces in between, root writes, reads and changes only what lies in the volume,
+ * and every folder it writes into is one that it opened as a folder. The owner of an existing file is set only when it
+ * has one link (a hard link could name a file of another user in the volume), and a gitconfig with more links is written
+ * again as a new file, with its text only when it is the owner's (review round 3 of PR G, A-L2). A shell script can
+ * neither open a file without following a link nor keep a folder open, hence a Node.js script.
  */
-export const GIT_FILES_SCRIPT = `set -eu
-folder="$1"
-name="$2"
-email="$3"
-credential_helper="$4"
-work=''
-cleanup() {
-  if [ -n "$work" ]; then rm -rf "$work"; fi
+export const GIT_FILES_SCRIPT = String.raw`'use strict';
+const fs = require('fs');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_NOCTTY } = fs.constants;
+const [folder, name, email, credentialHelper] = process.argv.slice(1);
+// Review round 2 of the follow-up of plan step 11I (A-L1): a Cancel sends SIGTERM to the process group of the step, and
+// SIGKILL 5 seconds later (runStep of the batch helper). The script is synchronous and ends within a fraction of a second,
+// so it ignores SIGTERM, SIGINT and SIGHUP and ends with its cleanup (Git's lock, the work folder): a kill while it holds
+// the lock would leave it there, where it stops Git in the dev container. Its children (Git, rm) end with the signal, and
+// the script fails or goes on as it would after such a failure. SIGKILL still ends it.
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+const root = ${JSON.stringify(WORKSPACES_ROOT)};
+const configFolder = ${JSON.stringify(CONFIG_FOLDER)};
+// The entries of CONFIG_FOLDER in /workspaces, and its own entries.
+const names = ${JSON.stringify(gitFilesEntries())};
+class Refusal extends Error {
+  constructor(exitCode, message) {
+    super(message);
+    this.exitCode = exitCode;
+  }
 }
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-fail() {
-  code="$1"
-  shift
-  printf '%s\\n' "$*" >&2
-  exit "$code"
+// The path of each open folder, for the messages.
+const paths = new Map();
+// The entry of an open folder, as a path that the kernel resolves through the descriptor (no other part of it).
+const at = (descriptor, entry) => '/proc/self/fd/' + descriptor + '/' + entry;
+const readable = (text) => text.replace(/\/proc\/self\/fd\/(\d+)/g, (match, descriptor) => paths.get(Number(descriptor)) || match);
+// The kind of an entry of an open folder (lstat: a link is a link).
+const kindOf = (parent, entry) => {
+  try {
+    const stat = fs.lstatSync(at(parent, entry));
+    return stat.isSymbolicLink() ? 'link' : stat.isFile() ? 'file' : stat.isDirectory() ? 'folder' : 'other';
+  } catch (error) {
+    if (error.code === 'ENOENT') return 'missing';
+    throw error;
+  }
+};
+// Removes an entry of an open folder (a link itself, a folder with its content) with GNU rm, which follows no link, also
+// none inside a folder. rm gets the open folder as its descriptor 3.
+const remove = (parent, entry) => {
+  execFileSync('rm', ['-rf', '--', '/proc/self/fd/3/' + entry], { cwd: '/', stdio: ['ignore', 'inherit', 'inherit', parent] });
+};
+// The folder of an entry of an open folder, opened without following a link: a link or anything else but a folder in its
+// place is removed, a missing folder is created; then it gets the owner and the mode through its descriptor.
+const openFolder = (parent, entry, owner, mode) => {
+  const open = () => fs.openSync(at(parent, entry), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  let descriptor;
+  try {
+    descriptor = open();
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR' && error.code !== 'ELOOP') throw error;
+    if (error.code !== 'ENOENT') fs.unlinkSync(at(parent, entry));
+    fs.mkdirSync(at(parent, entry), { mode });
+    descriptor = open();
+  }
+  paths.set(descriptor, paths.get(parent) + '/' + entry);
+  fs.fchownSync(descriptor, owner.uid, owner.gid);
+  fs.fchmodSync(descriptor, mode);
+  return descriptor;
+};
+// The plain file of an entry of an open folder, opened for reading without following a link (O_NONBLOCK: a FIFO cannot
+// hold the step), with its stat; undefined when the entry is missing. Throws for anything else.
+const openFile = (parent, entry) => {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(at(parent, entry), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const stat = fs.fstatSync(descriptor);
+  if (!stat.isFile()) {
+    fs.closeSync(descriptor);
+    throw new Error(paths.get(parent) + '/' + entry + ' is not a file.');
+  }
+  return { descriptor, stat };
+};
+const writeAll = (descriptor, buffer, length) => {
+  for (let offset = 0; offset < length; ) offset += fs.writeSync(descriptor, buffer, offset, length - offset);
+};
+const copyAll = (from, to) => {
+  const buffer = Buffer.alloc(64 * 1024);
+  for (let count; (count = fs.readSync(from, buffer, 0, buffer.length, null)) > 0; ) writeAll(to, buffer, count);
+};
+// Review round 1 of the follow-up of plan step 11I (A-F2): the most bytes of the gitconfig of the owner that the script
+// copies for Git, which reads it only after the copy (a large, sparse or growing file would otherwise fill the helper).
+const MAX_GITCONFIG = 1024 * 1024;
+// Copies the file from to to and throws problem when it holds more than limit bytes: it reads at most limit + 1 bytes,
+// also of a file that grows while it is read.
+const copyAtMost = (from, to, limit, problem) => {
+  const buffer = Buffer.alloc(64 * 1024);
+  let total = 0;
+  for (let count; (count = fs.readSync(from, buffer, 0, Math.min(buffer.length, limit + 1 - total), null)) > 0; ) {
+    total += count;
+    if (total > limit) throw new Error(problem);
+    writeAll(to, buffer, count);
+  }
+};
+// Puts a new file in place of an entry of an open folder: made under a random name with O_EXCL (never through a link),
+// written by write, given the owner and the mode through its descriptor, then renamed over the entry.
+const place = (parent, entry, owner, mode, write) => {
+  const temporary = '.' + entry + '.' + crypto.randomBytes(8).toString('hex');
+  const descriptor = fs.openSync(at(parent, temporary), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+  try {
+    write(descriptor);
+    fs.fchownSync(descriptor, owner.uid, owner.gid);
+    fs.fchmodSync(descriptor, mode);
+    fs.renameSync(at(parent, temporary), at(parent, entry));
+  } catch (error) {
+    try {
+      fs.unlinkSync(at(parent, temporary));
+    } catch {}
+    throw error;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+};
+// The section of gitconfig that the script ensures: an empty helper (which removes the helpers before it), then ours.
+const KEY = 'credential.https://github.com.helper';
+// Git on a copy of gitconfig in the work folder (never on a file of the volume).
+const gitOn = (copy) => (...args) => execFileSync('git', ['config', '--file', copy, ...args], { cwd: '/', encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+// Whether the section of the copy that git edits is not as the script wants it.
+const sectionChanged = (git) => {
+  let current = '';
+  try {
+    current = git('--get-all', KEY);
+  } catch {}
+  return current.replace(/\n+$/, '') !== ('\n' + credentialHelper).replace(/\n+$/, '');
+};
+// The file existing (openFile) copied into the new file copy of the work folder, at most MAX_GITCONFIG bytes (A-F2).
+const copyFor = (existing, copy, tooLarge) => {
+  if (existing !== undefined && existing.stat.size > MAX_GITCONFIG) throw new Error(tooLarge);
+  const target = fs.openSync(copy, O_WRONLY | O_CREAT | O_EXCL, 0o600);
+  try {
+    if (existing !== undefined) copyAtMost(existing.descriptor, target, MAX_GITCONFIG, tooLarge);
+  } finally {
+    fs.closeSync(target);
+  }
+};
+// Review round 2 of the follow-up of plan step 11I (A-L1): a lock that is root's, a plain file of one link, and unchanged
+// for more than 10 minutes is the lock of a run that was killed (this script's, which stays root's until right before its
+// rename, or that of a Git of root in the dev container): Git holds its lock for the moment of one change and leaves it
+// only when it is killed. Such a lock would stop this step and every \`git config --global\` in the dev container until the
+// user found it, so the script removes it (and says so) and takes the lock. Review round 3 of PR G (A-L1): a lock of the
+// owner of the repository folder too, with the same guards: the ownership fix of CONFIG_FOLDER after the next \`up\`
+// (fixConfigOwnership) gives a killed run's lock to the remote user, and a Git of the owner never holds its lock that long
+// either. Any other lock stays.
+const STALE_LOCK_MS = 10 * 60 * 1000;
+// Git's lock on gitconfig in the open folder config, made with O_CREAT|O_EXCL (never through a link); its descriptor.
+// Review round 3 of PR G (B3-N1): the check of a stale lock (lstat) and its removal (unlink) are two lookups of the entry in
+// the open folder, so an entry that a process of the dev container puts there in between is removed unchecked; it can only
+// be an entry of CONFIG_FOLDER, which whoever puts it there may remove anyway (never a file outside it: the folder is the
+// one that the script opened, and an unlink never follows a link).
+const takeLock = (config, file, owner) => {
+  const entry = names.gitconfig + '.lock';
+  const create = () => {
+    try {
+      return fs.openSync(at(config, entry), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (error) {
+      if (error.code === 'EEXIST') return undefined;
+      throw error;
+    }
+  };
+  let lock = create();
+  if (lock === undefined) {
+    let seen;
+    try {
+      seen = fs.lstatSync(at(config, entry));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    const age = seen === undefined ? 0 : Date.now() - seen.mtimeMs;
+    const stale = seen !== undefined && seen.isFile() && seen.nlink === 1 && (seen.uid === 0 || seen.uid === owner.uid) && age > STALE_LOCK_MS;
+    if (stale) {
+      try {
+        fs.unlinkSync(at(config, entry));
+        process.stdout.write('Removed ' + file + '.lock, the lock of a run that was killed (unchanged for ' + Math.floor(age / 60000) + ' minutes).\n');
+      } catch (error) {
+        // Review round 3 of PR G (B3-N2): removed meanwhile (the user, as the message tells): gone, as below.
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    // Gone meanwhile (a Git of the dev container ended), or removed: once more.
+    if (seen === undefined || stale) lock = create();
+  }
+  if (lock === undefined) throw new Error(file + '.lock exists: a Git in the dev container is changing ' + file + ', which stays as it is (when no Git runs there, remove ' + file + '.lock).');
+  return lock;
+};
+// gitconfig is the file of GIT_CONFIG_GLOBAL in the dev container. Review round 1 of the follow-up of plan step 11I (A-F4):
+// to change it, the script holds the lock of Git on it while it reads and replaces it, as \`git config\` does:
+// gitconfig.lock (takeLock), made before the read; the new text is written into it and it is renamed over gitconfig. So a
+// change that Git makes in the dev container meanwhile is never lost: Git finds the lock and fails ("could not lock
+// config file"), as it does for another Git. When gitconfig.lock exists (a Git of the dev container, or a run that was
+// killed), the step fails and changes nothing, as Git does. The script removes only its own lock (the same file), on
+// every way out but the rename. Review round 2 (A-L1): a run that changes nothing takes no lock, as the shell script
+// before it (whose Git took the lock only in its writes): gitconfig is first read without it (a change of Git meanwhile
+// replaces the file whole, by a rename); when its section is as it must be and it has one link (every open after the
+// first), it only gets the owner. Otherwise all is done again under the lock. Review round 3 of PR G (A-L2): the text of a
+// gitconfig with a second link is read only when the file is the owner's: where fs.protected_hardlinks is off, the owner
+// can link a file of another user there (one that Git can read, for example the configuration of a service with its
+// password), whose text would go into the new gitconfig of the owner. Such a file is no configuration of the owner: the
+// new gitconfig starts empty, as for a missing one, and the file stays unread and as it is.
+const gitconfig = (config, owner, work) => {
+  const file = paths.get(config) + '/' + names.gitconfig;
+  const tooLarge = file + ' is larger than 1 MiB: it stays as it is.';
+  const kind = kindOf(config, names.gitconfig);
+  if (kind !== 'link' && kind !== 'missing') {
+    const existing = openFile(config, names.gitconfig);
+    if (existing !== undefined) {
+      try {
+        // A gitconfig with a second link is written again under the lock in any case: nothing of it is read here.
+        if (existing.stat.nlink === 1) {
+          const check = work + '/check';
+          copyFor(existing, check, tooLarge);
+          if (!sectionChanged(gitOn(check))) {
+            fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
+            return;
+          }
+        }
+      } finally {
+        fs.closeSync(existing.descriptor);
+      }
+    }
+  }
+  const copy = work + '/gitconfig';
+  const git = gitOn(copy);
+  const lockEntry = names.gitconfig + '.lock';
+  const lock = takeLock(config, file, owner);
+  let held = true;
+  const unlock = () => {
+    const own = fs.fstatSync(lock);
+    let seen;
+    try {
+      seen = fs.lstatSync(at(config, lockEntry));
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (seen.dev === own.dev && seen.ino === own.ino) fs.unlinkSync(at(config, lockEntry));
+  };
+  try {
+    try {
+      if (kindOf(config, names.gitconfig) === 'link') fs.unlinkSync(at(config, names.gitconfig));
+      const existing = openFile(config, names.gitconfig);
+      // The text to keep: none of a gitconfig with a second link that is not the owner's (A-L2).
+      const kept = existing !== undefined && (existing.stat.nlink === 1 || existing.stat.uid === owner.uid) ? existing : undefined;
+      try {
+        copyFor(kept, copy, tooLarge);
+        if (kept === undefined) {
+          if (name !== '') git('user.name', name);
+          if (email !== '') git('user.email', email);
+        }
+        const changed = sectionChanged(git);
+        if (changed) {
+          try {
+            git('--unset-all', KEY);
+          } catch {}
+          git('--add', KEY, '');
+          git('--add', KEY, credentialHelper);
+        }
+        if (existing === undefined || changed || existing.stat.nlink !== 1) {
+          // The new text in the lock, with the owner and the mode through its descriptor, then renamed over gitconfig
+          // (a rename replaces the entry itself, also a link, and never follows it).
+          const source = fs.openSync(copy, O_RDONLY);
+          try {
+            copyAll(source, lock);
+          } finally {
+            fs.closeSync(source);
+          }
+          fs.fchownSync(lock, owner.uid, owner.gid);
+          fs.fchmodSync(lock, kept === undefined ? 0o644 : kept.stat.mode & 0o777);
+          fs.renameSync(at(config, lockEntry), at(config, names.gitconfig));
+          held = false;
+        } else {
+          // As it must be meanwhile (a Git of the dev container repaired it).
+          fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
+        }
+      } finally {
+        if (existing !== undefined) fs.closeSync(existing.descriptor);
+      }
+    } catch (error) {
+      if (held) {
+        held = false;
+        try {
+          unlock();
+        } catch {}
+      }
+      throw error;
+    }
+    // Nothing to write: the lock goes (a lock left would stop Git in the dev container).
+    if (held) unlock();
+  } finally {
+    fs.closeSync(lock);
+  }
+};
+const credentials = (config, owner) => {
+  const entry = names.credentials;
+  const kind = kindOf(config, entry);
+  if (kind !== 'missing' && kind !== 'file') remove(config, entry);
+  const existing = openFile(config, entry);
+  if (existing === undefined) {
+    const content = Buffer.from(${JSON.stringify(GIT_CREDENTIALS_CONFIG_CONTENT)});
+    place(config, entry, owner, 0o644, (descriptor) => writeAll(descriptor, content, content.length));
+    return;
+  }
+  try {
+    if (existing.stat.nlink === 1) fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
+  } finally {
+    fs.closeSync(existing.descriptor);
+  }
+};
+const main = () => {
+  if (folder === '' || folder === '.' || folder === '..' || folder.startsWith('-') || folder.includes('/')) {
+    throw new Refusal(2, 'Invalid folder name: ' + folder);
+  }
+  const repo = root + '/' + folder;
+  let isFolder = false;
+  try {
+    isFolder = fs.statSync(repo).isDirectory();
+  } catch {}
+  if (!isFolder) throw new Refusal(4, 'The folder ' + repo + ' does not exist.');
+  const { uid, gid } = fs.lstatSync(repo);
+  const owner = { uid, gid };
+  // Root's folder (0700) in the helper's own /tmp, for the copy that Git edits.
+  const work = fs.mkdtempSync('/tmp/devenv-git-files-');
+  try {
+    const top = fs.openSync(root, O_RDONLY | O_DIRECTORY);
+    paths.set(top, root);
+    const config = openFolder(top, names.config, owner, 0o755);
+    fs.closeSync(openFolder(config, names.docker, owner, 0o700));
+    fs.closeSync(openFolder(config, names.gh, owner, 0o700));
+    gitconfig(config, owner, work);
+    credentials(config, owner);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+  process.stdout.write('The Git configuration of the environment is in ' + configFolder + '.\n');
+};
+try {
+  main();
+} catch (error) {
+  process.stderr.write(readable(String(error && error.message ? error.message : error)) + '\n');
+  process.exitCode = error instanceof Refusal ? error.exitCode : 1;
 }
-case "$folder" in
-  '' | . | .. | -* | */*) fail 2 "Invalid folder name: $folder" ;;
-esac
-repo='${WORKSPACES_ROOT}'/"$folder"
-dir='${CONFIG_FOLDER}'
-gh='${GH_VOLUME_FOLDER}'
-if [ ! -d "$repo" ]; then
-  fail 4 "The folder $repo does not exist."
-fi
-owner=$(stat -c '%u:%g' "$repo")
-for path in "$dir" "$dir/docker" "$gh"; do
-  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
-    rm -f "$path"
-  fi
-  if [ ! -d "$path" ]; then
-    mkdir "$path"
-  fi
-done
-chmod 0755 "$dir"
-chmod 0700 "$dir/docker" "$gh"
-work=$(mktemp -d "$dir/.work.XXXXXX")
-cfg="$dir/gitconfig"
-if [ -L "$cfg" ]; then
-  rm -f "$cfg"
-fi
-if [ ! -e "$cfg" ]; then
-  : > "$work/gitconfig"
-  if [ -n "$name" ]; then git config --file "$work/gitconfig" user.name "$name"; fi
-  if [ -n "$email" ]; then git config --file "$work/gitconfig" user.email "$email"; fi
-  chmod 0644 "$work/gitconfig"
-  mv -fT "$work/gitconfig" "$cfg"
-fi
-key='credential.https://github.com.helper'
-current=$(git config --file "$cfg" --get-all "$key") || current=''
-wanted=$(printf '\n%s' "$credential_helper")
-if [ "$current" != "$wanted" ]; then
-  git config --file "$cfg" --unset-all "$key" || true
-  git config --file "$cfg" --add "$key" ''
-  git config --file "$cfg" --add "$key" "$credential_helper"
-fi
-credentials="$dir/credentials.gitconfig"
-if [ -L "$credentials" ] || { [ -e "$credentials" ] && [ ! -f "$credentials" ]; }; then
-  rm -rf "$credentials"
-fi
-if [ ! -e "$credentials" ]; then
-  printf '%s' '${GIT_CREDENTIALS_CONFIG_CONTENT.replace(/'/g, `'"'"'`)}' > "$work/credentials.gitconfig"
-  chmod 0644 "$work/credentials.gitconfig"
-  mv -fT "$work/credentials.gitconfig" "$credentials"
-fi
-chown -h "$owner" "$dir" "$dir/docker" "$cfg" "$credentials" "$gh"
-echo "The Git configuration of the environment is in $dir."
 `;
 
 /**
@@ -747,15 +1063,18 @@ const failure = (result, what) => {
 };
 // Follow-up of PR #121 (review A): the real paths as the system resolves them (REAL_PATH).
 ${REAL_PATH}// The paths of isHelperPath (../policy/rules.ts): the root, the cache volume, the internal folder
-// /workspaces/.devenv+ (the Git and Docker configuration of the dev container), the folders of the kernel (review round
-// 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one of them. (The Docker
-// socket of isHelperPath is not in this list: the model run reaches it only when root owns the repository, a socket has
-// no text to read, and the check refuses a Dockerfile there anyway.)
+// /workspaces/.devenv+ (the Git and Docker configuration of the dev container), the folders of the batch helper with the
+// socket and the token, also by /var/run (BATCH_HELPER_FOLDERS; follow-up of plan step 11I), the folders of the kernel
+// (review round 3, S3-1), and every path below /workspaces outside the repository, or a folder that contains one of
+// them. (The Docker socket of isHelperPath is not in this list: the model run reaches it only when root owns the
+// repository, a socket has no text to read, and the check refuses a Dockerfile there anyway.) Review round 1 of the
+// follow-up of plan step 11I (A-F5): a path with a \`..\` segment too (\`..\` after a link of the helper image).
 const overlaps = (file, folder) => file === folder || file.startsWith(folder + '/') || folder.startsWith(file + '/');
 const isHelperPath = (file) => {
+  if (file.split('/').includes('..')) return true;
   const normal = path.posix.normalize(file).replace(/(.)\/+$/, '$1');
   if (normal === '/') return true;
-  if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
+  if (['/devenv-cache', '/workspaces/.devenv+', '/run/devenv-docker', '/run/devenv-secrets', '/var/run/devenv-docker', '/var/run/devenv-secrets', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
 // The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts, and service: as its caller in
@@ -951,10 +1270,15 @@ export function cloneCommand(repository: string, folderName: string, branch?: st
 }
 
 /**
- * `sh -c` command that writes the Git configuration of the dev container into the volume (GIT_FILES_SCRIPT). No token.
+ * `node -e` command that writes the Git configuration of the dev container into the volume (GIT_FILES_SCRIPT). No token.
+ * Follow-up of plan step 11I (the links of the owner): a Node.js script (was `sh -c`), see GIT_FILES_SCRIPT. Review round 1
+ * of that follow-up (B-L1): `--` before the arguments, so that Node takes none of them for one of its options (Node reads
+ * options after the script up to the first argument that is none: a folder name such as `--title=x` or `-x` was Node's;
+ * the script itself refuses a name that starts with `-`). The other `node -e` commands of the helper have an absolute
+ * path first (the repository folder of folderOf in batchSteps.ts, OVERRIDE_FOLDER, COMPOSE_MODEL_PATH), never an option.
  */
 export function gitFilesCommand(folderName: string, identity: { name: string; email: string }, credentialHelper: string): string[] {
-  return ['sh', '-c', GIT_FILES_SCRIPT, 'sh', folderName, identity.name, identity.email, credentialHelper];
+  return ['node', '-e', GIT_FILES_SCRIPT, '--', folderName, identity.name, identity.email, credentialHelper];
 }
 
 
@@ -1040,6 +1364,19 @@ export function composeModelCommand(repoFolder: string, files: readonly string[]
  * missing part is created one at a time, without following a link: the nearest path that exists must be a folder whose
  * real path is in the repository, and each created part must be a folder of its own. Exits 0 when all exist afterwards;
  * otherwise 2 with the reason on stderr, and stops at the first problem.
+ *
+ * Follow-up of plan step 11I (the links of the owner): the script runs as the owner of the repository, as root when root
+ * owns it, and a process of the dev container can replace a folder of the repository by a link between a check and a use
+ * (root of the dev container any of them). So after its checks it resolves no path again: it walks from the repository
+ * folder to the real path of the nearest folder and on to each missing part one entry at a time, in the folder that the
+ * process holds as its current folder (`enter`: the entry must be a folder by its lstat, which does not follow a link;
+ * then the process changes into it and checks that the folder entered is that folder, by device and inode), and makes
+ * each missing part as an entry of the current folder (mkdir, which never follows a link). A link put in place of a
+ * folder meanwhile stops the script; nothing is created out of the repository. Review round 1 of the follow-up (A-F3):
+ * no folder is opened, so the walk needs only the search permission on the folders, as the shell script before it did
+ * (`enter` opened each folder for reading before: a folder that the owner may enter but not read, 0711, stopped the
+ * step). (Unlike GIT_FILES_SCRIPT, it needs no /proc/self/fd, which keeps the script and its tests independent of
+ * Linux.)
  */
 export const CREATE_FOLDERS_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -1049,14 +1386,28 @@ const fail = (message) => {
   process.stderr.write(message + '\n');
   process.exit(2);
 };
+// The entry of the current folder (or the repository folder by its absolute path), as the new current folder: a folder
+// by its lstat (a link, a FIFO or a file is none: ENOTDIR), entered only when the folder entered is that folder (device and
+// inode; chdir follows a link that took the place of the entry after the lstat, and then enters another folder). Needs
+// the search permission on the folder only (review round 1 of the follow-up, A-F3). Fails with the text of
+// problem(code) otherwise.
+const enter = (entry, problem) => {
+  let seen;
+  try {
+    seen = fs.lstatSync(entry);
+    if (!seen.isDirectory()) throw Object.assign(new Error('no folder'), { code: 'ENOTDIR' });
+    process.chdir(entry);
+  } catch (error) {
+    fail(problem(error && error.code));
+  }
+  const entered = fs.statSync('.');
+  if (entered.dev !== seen.dev || entered.ino !== seen.ino) fail(problem('EXDEV'));
+};
+const repositoryProblem = (code) => 'The repository folder ' + root + (code === 'ENOENT' ? ' does not exist.' : ' is no folder of its own (' + code + ').');
+enter(root, repositoryProblem);
 // Follow-up of PR #121 (review A): the real paths as the system resolves them (realpath(3)), never a \`..\` of a link
-// target as text.
-let rootReal;
-try {
-  rootReal = fs.realpathSync.native(root);
-} catch {
-  fail('The repository folder ' + root + ' does not exist.');
-}
+// target as text. The real path of the repository folder is the path of the folder that the process entered.
+const rootReal = process.cwd();
 const inRepository = (real) => real === rootReal || real.startsWith(rootReal + '/');
 for (const folder of process.argv.slice(2)) {
   if (!folder.startsWith(root + '/') || path.posix.normalize(folder) !== folder || folder.split('/').includes('..')) fail('Not a folder of the repository: ' + folder);
@@ -1079,16 +1430,22 @@ for (const folder of process.argv.slice(2)) {
     }
     if (!fs.statSync(current).isDirectory()) fail(current + ' is no folder.');
     if (!inRepository(real)) fail(current + ' leads out of the repository, to ' + real + '.');
+    // From the repository folder to the real path of the nearest folder, one entry at a time: none of them may be a link
+    // (a real path has none) or have been replaced by one since the checks.
+    enter(root, repositoryProblem);
+    if (real !== rootReal) {
+      for (const entry of real.slice(rootReal.length + 1).split('/')) enter(entry, () => current + ' is no folder of the repository.');
+    }
     break;
   }
   for (const part of missing) {
+    const entry = path.posix.basename(part);
     try {
-      fs.mkdirSync(part);
+      fs.mkdirSync(entry);
     } catch (error) {
       fail('Cannot create ' + part + ': ' + String(error && error.code));
     }
-    const stat = fs.lstatSync(part);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || !inRepository(fs.realpathSync.native(part))) fail(part + ' is no folder of the repository.');
+    enter(entry, () => part + ' is no folder of the repository.');
   }
 }
 `;

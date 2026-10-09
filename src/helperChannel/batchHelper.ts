@@ -25,6 +25,15 @@
 // closeConfigFolder); OVERRIDE_FOLDER is new, empty and that user's for the step, and
 // is removed after it. After the step every process of that user is killed (not when it is root); its files elsewhere
 // are legitimate and stay (no walk).
+//
+// Follow-up of plan step 11I (the links of the owner): a process of the dev container can rename an entry of the volume
+// and put a link in its place at any moment (root of the dev container every entry; the owner the entries of its own
+// folders, and `.devenv+` itself while /workspaces is 1777 for the clone). So the helper changes the mode and the owner
+// of CONFIG_FOLDER only through a descriptor that it opened without following a link (openConfigFolder), for the close
+// and for the restore after the step; /workspaces and the secrets tmpfs are mount points, which no link can replace.
+// Review round 1 of that follow-up (A-F1): the files of the Git user get root through chown runs in the folder that find
+// holds open (and the walk of `chown -R`, which follows no link), never through a whole path that chown would resolve
+// again (gitUserFilesToRootCommands).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
@@ -70,8 +79,11 @@ export interface BatchHelperDeps {
   spawnStep(command: readonly string[], env: NodeJS.ProcessEnv, input: string | undefined, onStdout: (text: string) => void, onStderr: (text: string) => void): StepProcess;
   /** Runs a fixed command of the helper itself (no output, never fails). */
   runQuiet(command: readonly string[]): Promise<void>;
-  /** The file system calls of the preparation of a Git step (the real `fs`). */
-  fs: Pick<typeof fs, 'lstatSync' | 'chmodSync' | 'chownSync' | 'readdirSync' | 'rmSync' | 'mkdirSync'>;
+  /**
+   * The file system calls of the preparation of a step (the real `fs`). Follow-up of plan step 11I (the links of the
+   * owner): CONFIG_FOLDER is changed only through a descriptor (openConfigFolder).
+   */
+  fs: Pick<typeof fs, 'lstatSync' | 'chmodSync' | 'chownSync' | 'readdirSync' | 'rmSync' | 'mkdirSync' | 'openSync' | 'fstatSync' | 'fchmodSync' | 'fchownSync' | 'closeSync'>;
   /** The environment of the helper process. */
   env: NodeJS.ProcessEnv;
   /** Why the helper is not safe to run steps (prepareBatchHelper), or undefined. */
@@ -119,13 +131,42 @@ function clearSecrets(deps: BatchHelperDeps): void {
 const CLONE_WORK_NAME = '.devenv-clone.*';
 
 /**
+ * Review round 1 of the follow-up of plan step 11I (A-F1): the commands (GNU findutils and coreutils, as in the helper
+ * image) that give the files of the user `uid` in the folder `root` (WORKSPACES_ROOT) to root, never through a link. A
+ * process of the dev container can replace a folder of the volume by a link at any moment (root of the dev container
+ * every folder), and `find … -exec chown -h 0:0 {} +` hands chown whole paths, which it resolves again: through such a
+ * link, root would give a file outside the volume to root (the folder of the socket, the shared cache volume). So:
+ * - first, each entry of that user at the top of the volume (the new clone) goes to root with its content in one
+ *   `chown -R -h --from=<uid>`, run in the folder that find has open (`-execdir`); GNU chown walks with fts, opening each
+ *   folder without following a link (O_NOFOLLOW|O_DIRECTORY, relative to the folder above) and changing each entry
+ *   relative to its folder (fchownat, AT_SYMLINK_NOFOLLOW), and changes only what belongs to that user (`--from`, as
+ *   `-user`); chown has no `-xdev`, and needs none: nothing is mounted below /workspaces in the batch helper
+ *   (batchRunSpec), and a process of the dev container cannot mount into it;
+ * - then every other file of that user with `-execdir chown -h 0:0 {} +`, which runs chown in the folder that find has
+ *   open with `./<name>` (as HELPER_SERVICE_OWNER_FIX of src/core/git/gitSummary.ts, review round 1 of PR #114, A-M1).
+ * The first command keeps the walk after a clone fast: `-execdir … +` runs one chown per folder (about 10 s for 3000
+ * folders; review round 2 of PR #114, A2-M1), and after the first command it finds nothing of that user in the clone.
+ */
+export function gitUserFilesToRootCommands(root: string, uid: string): string[][] {
+  return [
+    ['find', root, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'],
+    ['find', root, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'],
+  ];
+}
+
+/** The files of the Git user in the volume get root (gitUserFilesToRootCommands). */
+async function giveGitUserFilesToRoot(deps: BatchHelperDeps, uid: string): Promise<void> {
+  for (const command of gitUserFilesToRootCommands(WORKSPACES_ROOT, uid)) await deps.runQuiet(command);
+}
+
+/**
  * Review round 1 of PR #80 (A-R1-1, A-R1-2): what a Git step left when its cleanup was cut off (the whole helper killed
  * on a cancel of the batch, `docker rm -f`) is repaired before the next Git step, as root: the files of the Git user in
  * the volume get root, and the temporary folders of killed clones go after 60 minutes (as the clone of the per-step
  * helper removed them, which ran as root; the Git user cannot remove a folder of root in the sticky /workspaces).
  */
 async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<void> {
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await giveGitUserFilesToRoot(deps, uid);
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
@@ -136,6 +177,33 @@ async function repairCutOffGitStep(deps: BatchHelperDeps, uid: string): Promise<
  */
 interface GitUserState {
   repaired: boolean;
+}
+
+/**
+ * Follow-up of plan step 11I (the links of the owner): CONFIG_FOLDER opened as a folder, without following a link
+ * (O_DIRECTORY|O_NOFOLLOW), and its stat; undefined when it is missing, a link or no folder (as its lstat says), also when
+ * the folder that was opened is not the one that lstat saw (another entry took its place in between). Its mode and owner
+ * are changed only through this descriptor, for the close and for the restore after the step, never by its path: a
+ * process of the dev container can rename the entry `.devenv+` and put a link in its place at any moment (root of the dev
+ * container always; its owner during the clone, when /workspaces is 1777 and the entry is the owner's), and a chmod or
+ * chown by the path would then change the target of the link, for example the folder of the socket. The caller closes
+ * the descriptor.
+ */
+function openConfigFolder(deps: BatchHelperDeps): { descriptor: number; stat: fs.Stats } | undefined {
+  const seen = lstatOrUndefined(deps, CONFIG_FOLDER);
+  if (seen === undefined || !seen.isDirectory()) return undefined;
+  let descriptor: number;
+  try {
+    descriptor = deps.fs.openSync(CONFIG_FOLDER, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  } catch {
+    return undefined;
+  }
+  const stat = deps.fs.fstatSync(descriptor);
+  if (stat.dev !== seen.dev || stat.ino !== seen.ino) {
+    deps.fs.closeSync(descriptor);
+    return undefined;
+  }
+  return { descriptor, stat };
 }
 
 /** Runs `run` with the folders of the Git user opened for the step, and cleans up after it (see the module comment). */
@@ -149,11 +217,21 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
       await repairCutOffGitStep(deps, uid);
       state.repaired = true;
     }
-    const config = lstatOrUndefined(deps, CONFIG_FOLDER);
-    if (config?.isDirectory()) {
-      deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
-      restores.push(() => deps.fs.chmodSync(CONFIG_FOLDER, config.mode & 0o7777));
+    // Follow-up of plan step 11I (the links of the owner): through its descriptor (openConfigFolder), the close and the
+    // restore, which reaches the folder that was closed also when the owner moved it during the step.
+    const config = openConfigFolder(deps);
+    if (config !== undefined) {
+      restores.push(() => {
+        try {
+          deps.fs.fchmodSync(config.descriptor, config.stat.mode & 0o7777);
+        } finally {
+          deps.fs.closeSync(config.descriptor);
+        }
+      });
+      deps.fs.fchmodSync(config.descriptor, 0o700);
     }
+    // /workspaces and the secrets tmpfs are mount points of the helper: no process can rename them or put a link in their
+    // place (a rename of a mount point fails with EBUSY), so their paths always reach them.
     const root = deps.fs.lstatSync(WORKSPACES_ROOT);
     deps.fs.chmodSync(WORKSPACES_ROOT, 0o1777);
     // Review round 1 of PR #80 (A-R1-1): never sticky or writable for others afterwards, also when a cut-off step left
@@ -174,11 +252,19 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
     // of its clone (A-R1-2: a clone whose own cleanup was cut off by its kill), and its files outside the volume; in the
     // volume its files get root, as the clone of the per-step helper (which ran as root) left them.
     await deps.runQuiet(killAllCommand(gitPrivilegeArgs()));
-    try {
-      for (const restore of restores.reverse()) restore();
-    } finally {
-      await removeGitUserLeftovers(deps, uid);
+    // Review round 1 of the follow-up of plan step 11I (A-F6): each restore runs, also when one before it throws (as in
+    // asRepositoryOwner, review round 5 of PR #82, A-R5-3), so that a failed restore of the secrets tmpfs neither leaves
+    // CONFIG_FOLDER closed nor its descriptor open; then the walks; then the first error is rethrown.
+    let failure: { error: unknown } | undefined;
+    for (const restore of restores.reverse()) {
+      try {
+        restore();
+      } catch (error) {
+        failure ??= { error };
+      }
     }
+    await removeGitUserLeftovers(deps, uid);
+    if (failure !== undefined) throw failure.error;
   }
 }
 
@@ -188,7 +274,7 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
  */
 async function removeGitUserLeftovers(deps: BatchHelperDeps, uid: string): Promise<void> {
   await deps.runQuiet(['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', CLONE_WORK_NAME, '-user', uid, '-exec', 'rm', '-rf', '{}', '+']);
-  await deps.runQuiet(['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+']);
+  await giveGitUserFilesToRoot(deps, uid);
   await deps.runQuiet(['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+']);
 }
 
@@ -211,24 +297,37 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
     // CONFIG_FOLDER belongs to the owner of the repository (GIT_FILES_SCRIPT): for a step that follows references in
     // repository files (closeConfigFolder: Compose follows `env_file` and `include`) it is root's and 0700, so that the
     // step cannot read it. For a root owner this protects nothing (accepted, docs/implementation-notes.md §17).
-    const config = lstatOrUndefined(deps, CONFIG_FOLDER);
-    if (config?.isDirectory()) {
-      // Review round 5 of PR #82 (A-R5-2): root:root 0700 is only what a killed step left (GIT_FILES_SCRIPT leaves 0755):
-      // it goes back to the owner of a real repository folder, with 0755.
-      const cutOff = config.uid === 0 && config.gid === 0 && (config.mode & 0o7777) === 0o700 && real;
-      const back = cutOff ? { uid: repository.uid, gid: repository.gid, mode: 0o755 } : { uid: config.uid, gid: config.gid, mode: config.mode & 0o7777 };
-      if (step.closeConfigFolder === true) {
-        restores.push(() => {
-          deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
-          deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
-        });
-        deps.fs.chmodSync(CONFIG_FOLDER, 0o700);
-        deps.fs.chownSync(CONFIG_FOLDER, 0, 0);
-      } else if (cutOff) {
-        // Review round 1 of PR #84, A-R1-1: the other owner steps leave CONFIG_FOLDER open (a running dev container
-        // reads its Git configuration there during the step); only the leftover of a killed step is repaired, at once.
-        deps.fs.chownSync(CONFIG_FOLDER, back.uid, back.gid);
-        deps.fs.chmodSync(CONFIG_FOLDER, back.mode);
+    // Follow-up of plan step 11I (the links of the owner): through its descriptor (openConfigFolder), the close, the repair
+    // and the restore, which reaches the folder that was closed also when it was moved during the step.
+    const opened = openConfigFolder(deps);
+    if (opened !== undefined) {
+      const { descriptor, stat: config } = opened;
+      let kept = false;
+      try {
+        // Review round 5 of PR #82 (A-R5-2): root:root 0700 is only what a killed step left (GIT_FILES_SCRIPT leaves
+        // 0755): it goes back to the owner of a real repository folder, with 0755.
+        const cutOff = config.uid === 0 && config.gid === 0 && (config.mode & 0o7777) === 0o700 && real;
+        const back = cutOff ? { uid: repository.uid, gid: repository.gid, mode: 0o755 } : { uid: config.uid, gid: config.gid, mode: config.mode & 0o7777 };
+        if (step.closeConfigFolder === true) {
+          restores.push(() => {
+            try {
+              deps.fs.fchownSync(descriptor, back.uid, back.gid);
+              deps.fs.fchmodSync(descriptor, back.mode);
+            } finally {
+              deps.fs.closeSync(descriptor);
+            }
+          });
+          kept = true;
+          deps.fs.fchmodSync(descriptor, 0o700);
+          deps.fs.fchownSync(descriptor, 0, 0);
+        } else if (cutOff) {
+          // Review round 1 of PR #84, A-R1-1: the other owner steps leave CONFIG_FOLDER open (a running dev container
+          // reads its Git configuration there during the step); only the leftover of a killed step is repaired, at once.
+          deps.fs.fchownSync(descriptor, back.uid, back.gid);
+          deps.fs.fchmodSync(descriptor, back.mode);
+        }
+      } finally {
+        if (!kept) deps.fs.closeSync(descriptor);
       }
     }
     // Review rounds 1 and 3 of PR #82 (B-R1-5, B-R3-2): the step starts without the files that root steps before it

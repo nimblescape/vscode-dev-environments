@@ -4,19 +4,21 @@
 
 // Plan step 6, PR B: the parts of the batch helper around its steps: the checks before the first step, the variables and
 // the log line of a step, the refusal of an unsafe helper, and a step process that ends with its whole group.
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
 import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
-import { HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
+import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
 import {
   BATCH_GIT_HOME,
   batchHelperOperations,
   describeStep,
   gitPrivilegeArgs,
+  gitUserFilesToRootCommands,
   prepareBatchHelper,
   privilegeArgs,
   runQuietProcess,
@@ -27,6 +29,8 @@ import {
 } from './batchHelper';
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
+// Follow-up of plan step 11I (the links of the owner): the descriptor calls of the helper on the fakes by paths.
+import { withDescriptors } from './batchHelperFs.testkit';
 
 function fakeFiles(options: { link?: string; mode?: number; folder?: boolean } = {}) {
   const calls: string[] = [];
@@ -184,7 +188,10 @@ describe('the variables and the log line of a step (plan step 6, PR B)', () => {
   it('logs the command without its script, and the Git user', () => {
     // User decision of 2026-10-01 (agreed extension): listConfigs runs as the repository owner, and its log line says so.
     expect(describeStep(batchStepCommand('listConfigs', { repository: 'o/r' }))).toBe('(as the owner of /workspaces/r) node <script> /workspaces/r');
-    expect(describeStep(batchStepCommand('gitFiles', { repository: 'o/r', identity: { name: 'n', email: 'e' } }))).toMatch(/^sh <script> r n e /);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, gitFiles is a Node.js script (was sh); its
+    // script is left out all the same, and it runs as root (no user in the line). Review round 1 of that follow-up (B-L1):
+    // changed expectation, the `--` before its arguments is in the line too.
+    expect(describeStep(batchStepCommand('gitFiles', { repository: 'o/r', identity: { name: 'n', email: 'e' } }))).toMatch(/^node <script> -- r n e /);
     expect(describeStep(batchStepCommand('clone', { repository: 'o/r', branch: 'b' }))).toBe(`(as ${BATCH_GIT_UID}) sh <script> o/r r b`);
   });
 
@@ -254,14 +261,14 @@ function ownedLstat(name: string) {
  * path of the machine that runs the tests).
  */
 function ownerStepFiles(): BatchHelperDeps['fs'] {
-  return {
+  return withDescriptors({
     lstatSync: ownedLstat as never,
     chmodSync: (() => {}) as never,
     chownSync: (() => {}) as never,
     readdirSync: (() => []) as never,
     rmSync: (() => {}) as never,
     mkdirSync: (() => {}) as never,
-  };
+  });
 }
 
 /** Settles with `promise`, or with 'pending' after `ms` (a step that never ends must fail the test, not hang it). */
@@ -326,7 +333,7 @@ describe('the secrets tmpfs after a step with a secret (review round 1 of PR #80
   /** The file system calls of a Git step; the secrets tmpfs is `secrets` (a real folder) or the fake `readdirSync`. */
   function gitFiles(options: { secrets?: string; readdir?: () => string[] }): BatchHelperDeps['fs'] {
     const real = (name: string) => (options.secrets === undefined ? name : name.replace(SECRETS_FOLDER, options.secrets));
-    return {
+    return withDescriptors({
       // User decision of 2026-10-01: listConfigs runs as the repository owner, so `lstat` names owners (ownedLstat).
       lstatSync: ownedLstat as never,
       chmodSync: (() => {}) as never,
@@ -336,7 +343,7 @@ describe('the secrets tmpfs after a step with a secret (review round 1 of PR #80
       // must never be a path of the machine that runs the tests).
       rmSync: ((name: string, rmOptions: fs.RmOptions) => (name === SECRETS_FOLDER || name.startsWith(`${SECRETS_FOLDER}/`) ? fs.rmSync(real(name), rmOptions) : undefined)) as never,
       mkdirSync: (() => {}) as never,
-    };
+    });
   }
 
   it('review round 1 of PR #80, B-R1-4: the next step still runs after the secrets could not be listed', async () => {
@@ -440,8 +447,20 @@ describeUnix('the real processes of the helper (review round 1 of PR #80, B-R1-1
 describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
   const TOKEN = 'ghp_secret_token_of_the_test';
   const uid = String(BATCH_GIT_UID);
-  const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'].join(' ');
+  // Review round 1 of the follow-up of plan step 11I (A-F1): changed expectation (before: the one walk `find … -exec chown
+  // -h 0:0 {} +`, whose chown resolved each whole path again, also through a link that replaced a folder meanwhile): the
+  // entries of the Git user at the top of the volume go to root with `chown -R` run in the folder that find has open, and
+  // then its other files with `-execdir chown -h` (gitUserFilesToRootCommands; the repair and the walk after a clone).
+  const toRoot = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'].join(' ');
+  const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'].join(' ');
   const volumeWalk = repair;
+  /** Each walk of the volume comes right after the `chown -R` of the top entries. */
+  const expectPairs = (quiet: string[], count: number) => {
+    expect(quiet.filter((call) => call === toRoot)).toHaveLength(count);
+    quiet.forEach((call, index) => {
+      if (call === repair) expect(quiet[index - 1]).toBe(toRoot);
+    });
+  };
   const rootWalk = ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'].join(' ');
   const kill = ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'].join(' ');
 
@@ -452,14 +471,14 @@ describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
       runQuiet: async (command) => {
         quiet.push(command.join(' '));
       },
-      fs: {
+      fs: withDescriptors({
         lstatSync: ownedLstat as never,
         chmodSync: (() => {}) as never,
         chownSync: (() => {}) as never,
         readdirSync: (() => []) as never,
         rmSync: (() => {}) as never,
         mkdirSync: (() => {}) as never,
-      },
+      }),
       env: {},
     });
     return { quiet, operations };
@@ -476,6 +495,7 @@ describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
     // User decision of 2026-10-01: the first walk of the volume is the repair before the clone (was: before
     // composeModel); the second is the chown walk after the clone.
     expect(first.quiet.filter((call) => call === repair)).toHaveLength(2);
+    expectPairs(first.quiet, 2);
     expect(first.quiet.indexOf(repair)).toBeLessThan(first.quiet.indexOf(kill));
     // A new helper process repairs again, once.
     const second = helper();
@@ -483,6 +503,7 @@ describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
     expect(await second.operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
     // Per clone: one chown walk after it; plus the one repair before the first.
     expect(second.quiet.filter((call) => call === repair)).toHaveLength(3);
+    expectPairs(second.quiet, 3);
   });
 
   it('review round 1 of PR #82, A-R1-2: after a Compose read step, no walk of the volume', async () => {
@@ -497,6 +518,146 @@ describe('the walks of the Git user (review round 1 of PR #82, A-R1-2)', () => {
     expect(quiet).not.toContain(kill);
     expect(quiet).not.toContain(rootWalk);
     expect(quiet).not.toContain(volumeWalk);
+    expect(quiet).not.toContain(toRoot);
+  });
+});
+
+// Review round 1 of the follow-up of plan step 11I (A-F1): the commands that give the files of the Git user to root, with
+// the real GNU find in a folder of the test in place of /workspaces. A fake `chown` on PATH records what it gets instead of
+// changing it (the test runs as a user): for `chown -R`, its folder and its arguments; for every other call, the inode of
+// each path that it gets, as chown would reach it (from its folder, the one that find has open with `-execdir`). At its
+// first call that is not `chown -R`, it first plays a process of the dev container: the folder `top/a` is moved away and a
+// link to a folder outside the volume takes its place (in the helper: the folder of the socket, the shared cache volume).
+// The files belong to the test user, which stands for the Git user.
+const gnuFind = process.platform === 'linux' && /GNU findutils/.test(spawnSync('find', ['--version'], { encoding: 'utf8' }).stdout ?? '');
+describe.runIf(gnuFind)('the files of the Git user get root, with the real find (review round 1 of the follow-up of plan step 11I, A-F1)', () => {
+  const folders: string[] = [];
+  afterEach(() => {
+    for (const folder of folders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
+  });
+
+  function tree() {
+    const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-git-user-')));
+    folders.push(base);
+    const ws = path.join(base, 'workspaces');
+    const outside = path.join(base, 'outside');
+    fs.mkdirSync(path.join(ws, 'top', 'a', 'b'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'top', 'a', 'b', 'f'), 'x');
+    fs.mkdirSync(path.join(outside, 'b'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'b', 'f'), 'outside');
+    const bin = path.join(base, 'bin');
+    fs.mkdirSync(bin);
+    const log = path.join(base, 'chowned');
+    fs.writeFileSync(log, '');
+    fs.writeFileSync(
+      path.join(bin, 'chown'),
+      [
+        '#!/bin/sh',
+        'case " $* " in',
+        '  *" -R "*) printf \'R %s %s\\n\' "$(pwd -P)" "$*" >> "$DEVENV_TEST_LOG"; exit 0 ;;',
+        'esac',
+        'if [ ! -e "$DEVENV_TEST_LOG.raced" ]; then',
+        '  : > "$DEVENV_TEST_LOG.raced"',
+        '  mv "$DEVENV_TEST_SWAP" "$DEVENV_TEST_SWAP.moved" && ln -s "$DEVENV_TEST_OUTSIDE" "$DEVENV_TEST_SWAP"',
+        'fi',
+        "owner=''",
+        'for arg do',
+        '  case "$arg" in',
+        '    -h|--) ;;',
+        '    *) if [ -z "$owner" ]; then owner=$arg; else stat -c %i -- "$arg" >> "$DEVENV_TEST_LOG"; fi ;;',
+        '  esac',
+        'done',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const run = () => {
+      for (const [file, ...args] of gitUserFilesToRootCommands(ws, String(process.getuid?.() ?? 0))) {
+        const result = spawnSync(file, args, {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: `${bin}:/usr/local/bin:/usr/bin:/bin`, DEVENV_TEST_LOG: log, DEVENV_TEST_SWAP: path.join(ws, 'top', 'a'), DEVENV_TEST_OUTSIDE: outside },
+        });
+        expect(result.stderr).toBe('');
+        expect(result.status).toBe(0);
+      }
+      const lines = fs.readFileSync(log, 'utf8').split('\n').filter((line) => line !== '');
+      return { recursive: lines.filter((line) => line.startsWith('R ')), inodes: lines.filter((line) => !line.startsWith('R ')).map(Number) };
+    };
+    return { ws, outside, run };
+  }
+
+  it('gives no file outside the volume to root when a process replaces a folder by a link during the walk (fails with `-exec chown`)', () => {
+    const t = tree();
+    const outsideInodes = [path.join(t.outside, 'b'), path.join(t.outside, 'b', 'f')].map((file) => fs.lstatSync(file).ino);
+    const { recursive, inodes } = t.run();
+    expect(fs.lstatSync(path.join(t.ws, 'top', 'a')).isSymbolicLink()).toBe(true);
+    expect(inodes.filter((inode) => outsideInodes.includes(inode))).toEqual([]);
+    // The walk reached the files of the volume in the folder that was moved, through the folders that it had open.
+    expect(inodes).toContain(fs.lstatSync(path.join(t.ws, 'top', 'a.moved', 'b', 'f')).ino);
+    // The top entry went to `chown -R` in the folder that find had open (the volume), by its name there.
+    expect(recursive).toEqual([`R ${t.ws} -R -h --from=${process.getuid?.() ?? 0} 0:0 ./top`]);
+  });
+});
+
+// Review round 1 of the follow-up of plan step 11I (A-F1): the commands with the real chown, as root (as in the helper).
+describe.runIf(gnuFind && process.getuid?.() === 0)('the files of the Git user get root, with the real find and chown as root (A-F1)', () => {
+  const folders: string[] = [];
+  afterEach(() => {
+    for (const folder of folders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
+  });
+  const base = () => {
+    const folder = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-git-user-root-')));
+    folders.push(folder);
+    return folder;
+  };
+  const run = (ws: string) => {
+    for (const [file, ...args] of gitUserFilesToRootCommands(ws, '4321')) {
+      const result = spawnSync(file, args, { encoding: 'utf8', timeout: 60_000 });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    }
+  };
+  const owner = (file: string) => `${fs.lstatSync(file).uid}:${fs.lstatSync(file).gid}`;
+
+  it('gives every file of the Git user to root, follows no link, and keeps the files of other users', () => {
+    const folder = base();
+    const ws = path.join(folder, 'workspaces');
+    const outside = path.join(folder, 'outside');
+    fs.mkdirSync(path.join(ws, 'repo', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'repo', 'src', 'f'), 'x');
+    fs.symlinkSync(outside, path.join(ws, 'repo', 'out'));
+    fs.symlinkSync(outside, path.join(ws, 'top-link'));
+    // A file of the Git user deep in a folder of another user (not a top entry of its own), and a file of another user in
+    // the clone.
+    fs.mkdirSync(path.join(ws, 'other', 'deep'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'other', 'deep', 'g'), 'x');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'data'), 'outside');
+    spawnSync('chown', ['-R', '-h', '4321:4321', path.join(ws, 'repo'), path.join(ws, 'top-link'), path.join(ws, 'other', 'deep', 'g'), outside]);
+    fs.writeFileSync(path.join(ws, 'repo', 'theirs'), 'x');
+    fs.chownSync(path.join(ws, 'repo', 'theirs'), 999, 999);
+    run(ws);
+    for (const file of ['repo', 'repo/src', 'repo/src/f', 'repo/out', 'top-link', 'other/deep/g']) expect(owner(path.join(ws, file)), file).toBe('0:0');
+    expect(owner(path.join(ws, 'repo', 'theirs'))).toBe('999:999');
+    // The targets of the links keep their owner.
+    expect([owner(outside), owner(path.join(outside, 'data'))]).toEqual(['4321:4321', '4321:4321']);
+  });
+
+  // Review round 2 of PR #114 (A2-M1): `-execdir … +` alone runs one chown per folder (about 10 s for 3000 folders here).
+  it('gives a new clone of many folders to root quickly (one chown -R for it, not one chown per folder)', { timeout: 60_000 }, () => {
+    const ws = path.join(base(), 'workspaces');
+    const repository = path.join(ws, 'repo');
+    for (let i = 0; i < 3000; i++) {
+      const dir = path.join(repository, `d${Math.floor(i / 100)}`, `e${i}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'f'), 'x');
+    }
+    expect(spawnSync('chown', ['-R', '4321:4321', repository]).status).toBe(0);
+    const started = Date.now();
+    run(ws);
+    const seconds = (Date.now() - started) / 1000;
+    expect(owner(path.join(repository, 'd29', 'e2999', 'f'))).toBe('0:0');
+    expect(seconds).toBeLessThan(5);
   });
 });
 
@@ -513,7 +674,7 @@ describe('the override folder before a read step (review round 1 of PR #82, B-R1
       const operations = batchHelperOperations({
         spawnStep: recordingSpawn({ endOn: 'SIGTERM', exitCode: 0 }).spawnStep,
         runQuiet: async () => {},
-        fs: {
+        fs: withDescriptors({
           lstatSync: ownedLstat as never,
           chmodSync: (() => {}) as never,
           chownSync: (() => {}) as never,
@@ -522,7 +683,7 @@ describe('the override folder before a read step (review round 1 of PR #82, B-R1
           rmSync: ((name: string, rmOptions: fs.RmOptions) => fs.rmSync(real(name), rmOptions)) as never,
           // User decision of 2026-10-01 (Compose reads as the repository owner): the folder is made new for the step.
           mkdirSync: ((name: string, mkdirOptions: fs.MakeDirectoryOptions) => fs.mkdirSync(real(name), mkdirOptions)) as never,
-        },
+        }),
         env: {},
       });
       expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
@@ -559,7 +720,7 @@ describe('the override folder is cleared before a read step runs (review round 3
           return { exited: new Promise((resolve) => (exit = resolve)), killGroup: () => {} };
         },
         runQuiet: async () => {},
-        fs: {
+        fs: withDescriptors({
           lstatSync: ownedLstat as never,
           chmodSync: (() => {}) as never,
           chownSync: (() => {}) as never,
@@ -579,7 +740,7 @@ describe('the override folder is cleared before a read step runs (review round 3
             events.push('rm override folder');
             fs.rmSync(real(name), rmOptions);
           }) as never,
-        },
+        }),
         env: {},
       });
       const running = operations.composeHash({ repository: 'octo/hello', model: '{}', project: 'p' }, context());
@@ -596,5 +757,322 @@ describe('the override folder is cleared before a read step runs (review round 3
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
     }
+  });
+});
+
+// Follow-up of plan step 11I (the links of the owner): a process of the dev container can rename the entry `.devenv+` and
+// put a link in its place at any moment (root of the dev container always; the owner during the clone, when /workspaces
+// is 1777). The helper changes CONFIG_FOLDER only through a descriptor that it opened without following a link: neither
+// the close before a step nor the restore after it reaches the target of such a link.
+describe('CONFIG_FOLDER replaced by a link (follow-up of plan step 11I, the links of the owner)', () => {
+  const TOKEN = 'ghp_secret_token_of_the_test';
+
+  /**
+   * The real file system below a temporary folder in place of the paths of the helper (/workspaces, the secrets tmpfs,
+   * OVERRIDE_FOLDER), so that a link is followed or not as in the helper. The owner changes are recorded by the inode that
+   * they reach instead of made (the test runs as a user); `rootOwned` reports CONFIG_FOLDER as root:root (what a killed
+   * step leaves). `afterLstat` runs after each lstat: the owner who acts between a check and a use. `outside` stands for
+   * a folder of the helper, for example the folder of the socket.
+   */
+  function volume(options: { configMode?: number; rootOwned?: boolean; afterLstat?: (file: string) => void; afterFstat?: () => void } = {}) {
+    const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-links-')));
+    const config = path.join(base, 'workspaces', '.devenv+');
+    const outside = path.join(base, 'outside');
+    for (const folder of [path.join(base, 'workspaces', 'hello'), config, path.join(base, 'secrets'), outside]) fs.mkdirSync(folder, { recursive: true });
+    fs.chmodSync(config, options.configMode ?? 0o750);
+    fs.writeFileSync(path.join(outside, 'docker.sock'), 'x');
+    fs.chmodSync(outside, 0o751);
+    const configIno = fs.lstatSync(config).ino;
+    const real = (file: string): string => {
+      if (file === WORKSPACES_ROOT || file.startsWith(`${WORKSPACES_ROOT}/`)) return path.join(base, file);
+      for (const [folder, name] of [
+        [SECRETS_FOLDER, 'secrets'],
+        [OVERRIDE_FOLDER, 'override'],
+      ] as const) {
+        if (file === folder || file.startsWith(`${folder}/`)) return path.join(base, name, file.slice(folder.length));
+      }
+      throw new Error(`Not a path of the test: ${file}`);
+    };
+    const owners: Array<[number, string]> = [];
+    const owned = (stat: fs.Stats): fs.Stats => (options.rootOwned === true && stat.ino === configIno ? Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as fs.Stats, stat, { uid: 0, gid: 0 }) : stat);
+    const files = {
+      lstatSync: ((file: string) => {
+        const stat = owned(fs.lstatSync(real(file)));
+        options.afterLstat?.(file);
+        return stat;
+      }) as never,
+      chmodSync: ((file: string, mode: number) => fs.chmodSync(real(file), mode)) as never,
+      chownSync: ((file: string, uid: number, gid: number) => owners.push([fs.statSync(real(file)).ino, `${uid}:${gid}`])) as never,
+      readdirSync: ((file: string) => fs.readdirSync(real(file))) as never,
+      rmSync: ((file: string, rmOptions: fs.RmOptions) => fs.rmSync(real(file), rmOptions)) as never,
+      mkdirSync: ((file: string, mkdirOptions: fs.MakeDirectoryOptions) => fs.mkdirSync(real(file), mkdirOptions)) as never,
+      openSync: ((file: string, flags: number) => fs.openSync(real(file), flags)) as never,
+      fstatSync: ((descriptor: number) => {
+        const stat = owned(fs.fstatSync(descriptor));
+        options.afterFstat?.();
+        return stat;
+      }) as never,
+      fchmodSync: ((descriptor: number, mode: number) => fs.fchmodSync(descriptor, mode)) as never,
+      fchownSync: ((descriptor: number, uid: number, gid: number) => owners.push([fs.fstatSync(descriptor).ino, `${uid}:${gid}`])) as never,
+      closeSync: ((descriptor: number) => fs.closeSync(descriptor)) as never,
+    } satisfies BatchHelperDeps['fs'];
+    /** The owner renames CONFIG_FOLDER away and puts a link to `outside` (or, with `folder`, a folder of its own) in its place. */
+    const swap = (folder = false) => {
+      fs.renameSync(config, `${config}.moved`);
+      if (folder) fs.mkdirSync(config, { mode: 0o755 });
+      else fs.symlinkSync(outside, config);
+    };
+    const outsideState = () => [fs.lstatSync(outside).mode & 0o7777, fs.readdirSync(outside).join(',')];
+    return { base, config, outside, files, owners, swap, outsideState, outsideIno: fs.lstatSync(outside).ino, configIno };
+  }
+
+  /** A step process that runs `atStart` when it starts and exits with 0. */
+  const stepWith = (atStart: () => void): BatchHelperDeps['spawnStep'] => () => {
+    atStart();
+    return { exited: Promise.resolve({ exitCode: 0 }), killGroup: () => {} };
+  };
+
+  const folders: string[] = [];
+  const track = <T extends { base: string }>(value: T): T => {
+    folders.push(value.base);
+    return value;
+  };
+  afterEach(() => {
+    for (const folder of folders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
+  });
+
+  it('the clone: a link put in place of CONFIG_FOLDER between its check and its close is not followed', async () => {
+    let swapped = false;
+    const v = track(
+      volume({
+        afterLstat: (file) => {
+          if (file === CONFIG_FOLDER && !swapped) {
+            swapped = true;
+            v.swap();
+          }
+        },
+      }),
+    );
+    const operations = batchHelperOperations({ spawnStep: stepWith(() => {}), runQuiet: async () => {}, fs: v.files, env: {} });
+    expect(await operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(swapped).toBe(true);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+    // Nothing was closed: the folder that the owner moved keeps its mode.
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o750);
+  });
+
+  it('the clone: the restore reaches the folder that was closed, not a link put in its place during the step', async () => {
+    // The owner chose the mode of its folder: 0777. Its restore through a link would open the folder of the socket.
+    let during: number | undefined;
+    const v = track(volume({ configMode: 0o777 }));
+    const operations = batchHelperOperations({
+      spawnStep: stepWith(() => {
+        during = fs.lstatSync(v.config).mode & 0o7777;
+        v.swap();
+      }),
+      runQuiet: async () => {},
+      fs: v.files,
+      env: {},
+    });
+    expect(await operations.clone({ repository: 'octo/hello' }, context(TOKEN))).toEqual({ exitCode: 0 });
+    expect(during).toBe(0o700);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o777);
+  });
+
+  it('a Compose step: a link put in place of CONFIG_FOLDER between its check and its close is not followed', async () => {
+    let swapped = false;
+    const v = track(
+      volume({
+        afterLstat: (file) => {
+          if (file === CONFIG_FOLDER && !swapped) {
+            swapped = true;
+            v.swap();
+          }
+        },
+      }),
+    );
+    const operations = batchHelperOperations({ spawnStep: stepWith(() => {}), runQuiet: async () => {}, fs: v.files, env: {} });
+    expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+    expect(swapped).toBe(true);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o750);
+  });
+
+  it('a Compose step: the restore gives the owner and the mode back to the folder that was closed, not to a link put in its place during the step', async () => {
+    let during: number | undefined;
+    const v = track(volume());
+    const operations = batchHelperOperations({
+      spawnStep: stepWith(() => {
+        during = fs.lstatSync(v.config).mode & 0o7777;
+        v.swap();
+      }),
+      runQuiet: async () => {},
+      fs: v.files,
+      env: {},
+    });
+    expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+    expect(during).toBe(0o700);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+    // The folder that was closed (wherever it is now) is root's for the step, then its owner's again, with its mode.
+    const { uid, gid } = fs.lstatSync(`${v.config}.moved`);
+    expect(v.owners.filter(([ino]) => ino === v.configIno).map(([, owner]) => owner)).toEqual(['0:0', `${uid}:${gid}`]);
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o750);
+  });
+
+  // The helper keeps CONFIG_FOLDER open from its check to its restore: a link put in its place right after it was opened
+  // changes nothing either (the close, the repair and the restore go through the descriptor).
+  for (const kind of ['clone', 'composeModel'] as const) {
+    it(`${kind}: the close goes through the descriptor, also when a link takes the place of CONFIG_FOLDER right after it was opened`, async () => {
+      let swapped = false;
+      let during: number | undefined;
+      const v = track(
+        volume({
+          afterFstat: () => {
+            if (!swapped) {
+              swapped = true;
+              v.swap();
+            }
+          },
+        }),
+      );
+      const operations = batchHelperOperations({
+        spawnStep: stepWith(() => {
+          during = fs.lstatSync(`${v.config}.moved`).mode & 0o7777;
+        }),
+        runQuiet: async () => {},
+        fs: v.files,
+        env: {},
+      });
+      const result = kind === 'clone' ? await operations.clone({ repository: 'octo/hello' }, context(TOKEN)) : await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context());
+      expect(result).toEqual({ exitCode: 0 });
+      expect(swapped).toBe(true);
+      expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+      expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+      // The folder that was opened was closed for the step and got its mode back after it.
+      expect(during).toBe(0o700);
+      expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o750);
+    });
+  }
+
+  it('an owner step repairs a cut-off CONFIG_FOLDER through its descriptor, also when a link takes its place right after it was opened', async () => {
+    let swapped = false;
+    const v = track(
+      volume({
+        configMode: 0o700,
+        rootOwned: true,
+        afterFstat: () => {
+          if (!swapped) {
+            swapped = true;
+            v.swap();
+          }
+        },
+      }),
+    );
+    const operations = batchHelperOperations({ spawnStep: stepWith(() => {}), runQuiet: async () => {}, fs: v.files, env: {} });
+    expect(await operations.readFiles({ repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }, context())).toEqual({ exitCode: 0 });
+    expect(swapped).toBe(true);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
+    // The folder that was opened is repaired: the owner of the repository folder, 0755.
+    const repository = fs.lstatSync(path.join(v.base, 'workspaces', 'hello'));
+    expect(v.owners.filter(([ino]) => ino === v.configIno).map(([, owner]) => owner)).toEqual([`${repository.uid}:${repository.gid}`]);
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o755);
+  });
+
+  it('changes nothing when another folder takes the place of CONFIG_FOLDER between its check and its open (the descriptor must be the folder that was checked)', async () => {
+    let swapped = false;
+    let during: number | undefined;
+    const v = track(
+      volume({
+        afterLstat: (file) => {
+          if (file === CONFIG_FOLDER && !swapped) {
+            swapped = true;
+            v.swap(true);
+          }
+        },
+      }),
+    );
+    const operations = batchHelperOperations({
+      spawnStep: stepWith(() => {
+        during = fs.lstatSync(v.config).mode & 0o7777;
+      }),
+      runQuiet: async () => {},
+      fs: v.files,
+      env: {},
+    });
+    expect(await operations.composeModel({ repository: 'octo/hello', files: ['/workspaces/hello/compose.yml'], project: 'p' }, context())).toEqual({ exitCode: 0 });
+    expect(swapped).toBe(true);
+    // Neither the folder in its place nor the folder that was checked is closed or changed.
+    const other = fs.lstatSync(v.config).ino;
+    expect(during).toBe(0o755);
+    expect(v.owners.filter(([ino]) => ino === other || ino === v.configIno)).toEqual([]);
+    expect(fs.lstatSync(`${v.config}.moved`).mode & 0o7777).toBe(0o750);
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A-F6): asGitUser ran its restores in one loop, so a restore that threw
+  // (the secrets tmpfs, the first of the reversed list) skipped the others: /workspaces stayed 1777, CONFIG_FOLDER 0700,
+  // and its descriptor open.
+  it('the clone: each restore runs, also when one before it fails; the first error is the error of the step', async () => {
+    const v = track(volume());
+    const workspaces = path.join(v.base, 'workspaces');
+    fs.chmodSync(workspaces, 0o755);
+    const open = new Set<number>();
+    const quiet: string[] = [];
+    const files = {
+      ...v.files,
+      chownSync: ((file: string, uid: number, gid: number) => {
+        if (file === SECRETS_FOLDER && uid === 0) throw Object.assign(new Error('EIO: the restore of the secrets failed'), { code: 'EIO' });
+        return (v.files.chownSync as (file: string, uid: number, gid: number) => void)(file, uid, gid);
+      }) as never,
+      openSync: ((file: string, flags: number) => {
+        const descriptor = (v.files.openSync as (file: string, flags: number) => number)(file, flags);
+        open.add(descriptor);
+        return descriptor;
+      }) as never,
+      closeSync: ((descriptor: number) => {
+        open.delete(descriptor);
+        (v.files.closeSync as (descriptor: number) => void)(descriptor);
+      }) as never,
+    } satisfies BatchHelperDeps['fs'];
+    const operations = batchHelperOperations({
+      spawnStep: stepWith(() => {}),
+      runQuiet: async (command) => {
+        quiet.push(command.join(' '));
+      },
+      fs: files,
+      env: {},
+    });
+    await expect(operations.clone({ repository: 'octo/hello' }, context(TOKEN))).rejects.toThrow('EIO: the restore of the secrets failed');
+    expect(fs.lstatSync(workspaces).mode & 0o7777).toBe(0o755);
+    expect(fs.lstatSync(v.config).mode & 0o7777).toBe(0o750);
+    expect([...open]).toEqual([]);
+    // The walks after the step ran too.
+    expect(quiet.some((call) => call.includes('-prune -exec rm -rf'))).toBe(true);
+  });
+
+  it('an owner step repairs a cut-off CONFIG_FOLDER only through its descriptor, never through a link put in its place after the check', async () => {
+    let swapped = false;
+    const v = track(
+      volume({
+        configMode: 0o700,
+        rootOwned: true,
+        afterLstat: (file) => {
+          if (file === CONFIG_FOLDER && !swapped) {
+            swapped = true;
+            v.swap();
+          }
+        },
+      }),
+    );
+    const operations = batchHelperOperations({ spawnStep: stepWith(() => {}), runQuiet: async () => {}, fs: v.files, env: {} });
+    expect(await operations.readFiles({ repository: 'octo/hello', configPath: '.devcontainer/devcontainer.json' }, context())).toEqual({ exitCode: 0 });
+    expect(swapped).toBe(true);
+    expect(v.outsideState()).toEqual([0o751, 'docker.sock']);
+    expect(v.owners.filter(([ino]) => ino === v.outsideIno)).toEqual([]);
   });
 });

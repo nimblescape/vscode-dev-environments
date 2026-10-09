@@ -1133,6 +1133,24 @@ describe('isHelperPath', () => {
     ['/proc', true],
     ['/sys/fs/cgroup', true],
     ['/dev/fd/3', true],
+    // Follow-up of plan step 11I (the links of the owner): the folders of the batch helper with the Docker socket and the
+    // token, also by /var/run, and the folder that contains them; not a folder that only starts with their names.
+    ['/run/devenv-docker', true],
+    ['/run/devenv-docker/docker.sock', true],
+    ['/run/devenv-secrets', true],
+    ['/run/devenv-secrets/github-token', true],
+    ['/var/run/devenv-docker/docker.sock', true],
+    ['/var/run/devenv-secrets', true],
+    ['/run', true],
+    // Review round 1 of the follow-up of plan step 11I (A-F5): a `..` segment, which the helper resolves after the links
+    // of its image (/var/run → /run, /var/lock → /run/lock, /usr/lib/ssl/certs → /etc/ssl/certs), not as the text says.
+    ['/var/run/../devenv-cache', true],
+    ['/var/lock/../devenv-secrets', true],
+    ['/usr/lib/ssl/certs/../../../run/devenv-secrets', true],
+    ['/opt/tools/../other', true],
+    ['/opt/..tools', false],
+    ['/run/devenv-dockerx', false],
+    ['/run/devenv', false],
     ['/device', false],
     ['/workspaces/api', false],
     ['/workspaces/api/.devcontainer', false],

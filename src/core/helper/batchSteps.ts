@@ -333,7 +333,8 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
     }
     case 'gitFiles': {
       // GIT_FILES_SCRIPT writes CONFIG_FOLDER and gives it the owner of the repository (chown): it runs as root. Its Git
-      // only edits files of that folder (`git config --file`) and runs no program that a repository names.
+      // only edits a copy of the gitconfig of that folder in a folder of root in the helper (`git config --file`) and runs
+      // no program that a repository names; the script follows no link of the owner (follow-up of plan step 11I).
       const p = fields(kind, params, ['repository', 'identity']);
       const { name } = folderOf(kind, p.repository);
       const identity = fields(kind, p.identity, ['name', 'email']);

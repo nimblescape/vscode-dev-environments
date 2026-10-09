@@ -231,7 +231,7 @@ ${SERVICE_REAL_PATHS}  if [ -n "$whole" ]; then
  * again, and the batch helper also mounts the Docker socket of the engine and the shared cache). The fix in the dev
  * container (OWNERSHIP_FIX_SCRIPT) keeps `-exec`: the image may have BusyBox, and it mounts neither.
  */
-export const HELPER_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, () => true);
+export const HELPER_SERVICE_OWNER_FIX = withSingleLinks(withExecdir(SERVICE_OWNER_FIX, () => true));
 
 /**
  * Review round 2 of PR #114 (A2-M1): HELPER_SERVICE_OWNER_FIX for the repository before the create. `-execdir … +` runs
@@ -240,7 +240,7 @@ export const HELPER_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, () => tru
  * `-exec`. The branches with paths of services keep `-execdir`. Review round 3 of PR #114 (A3-M1): a resumed clone uses
  * HELPER_SERVICE_OWNER_FIX (RESUMED_NUMERIC_OWNERSHIP_FIX_SCRIPT), also with an empty list of paths.
  */
-export const REPOSITORY_SERVICE_OWNER_FIX = withExecdir(SERVICE_OWNER_FIX, (line) => line.includes('"$@"') || line.includes('-user 0'));
+export const REPOSITORY_SERVICE_OWNER_FIX = withSingleLinks(withExecdir(SERVICE_OWNER_FIX, (line) => line.includes('"$@"') || line.includes('-user 0')));
 
 /**
  * `script` with `-execdir chown -h --` in place of `-exec chown -h` in the lines of its finds that `inLine` picks. Review
@@ -254,6 +254,29 @@ function withExecdir(script: string, inLine: (line: string) => boolean): string 
     .map((line) => (inLine(line) ? line.split(exec).join(execdir) : line))
     .join('\n');
   if (result === script) throw new Error('The ownership fix has no find with -exec chown to change.');
+  return result;
+}
+
+/**
+ * Follow-up of plan step 11I (the links of the owner): `script` (a fix of the batch helper) with `\( -type d -o -links 1 \)`
+ * before each chown of its finds: a file with a second hard link keeps its owner, because the other name may be a file of
+ * another user elsewhere in the volume (for example the data of a service), which a process of the dev container linked
+ * into the folder (root of the dev container always; the owner where fs.protected_hardlinks is off). A folder cannot have
+ * a hard link. Only for the fixes of the batch helper (GNU find); the fix in the dev container (OWNERSHIP_FIX_SCRIPT) keeps
+ * its test, because a BusyBox find may lack `-links`. Throws when no line changed.
+ *
+ * Review round 2 of that follow-up (A-L2), a known residual: the test holds when find looks at the entry; chown runs
+ * later (`-exec … +` and `-execdir … +` collect names), by the name. A process of the dev container that can make a hard
+ * link (root of the dev container always; the owner only where fs.protected_hardlinks is off) can rename one over an entry
+ * that find already chose, and that file then gets the owner. Closing it needs a walk that opens each file and changes
+ * its owner through the descriptor after it checked the link count there (not done).
+ */
+function withSingleLinks(script: string): string {
+  const result = script
+    .split('\n')
+    .map((line) => line.replace(/ (-exec(?:dir)? chown -h )/, ' \\( -type d -o -links 1 \\) $1'))
+    .join('\n');
+  if (result === script) throw new Error('The ownership fix has no find with chown to change.');
   return result;
 }
 
@@ -477,7 +500,8 @@ ${SERVICE_OWNER_FIX}service_owner_fix "$dir" "$uid" "$gid" "$uid:$gid" "$@"
 
 /**
  * Review round 15 (K3 = P15-1, D15-1, S15-3): gives every file in the folder `$1` that does not have the user `$2` and
- * the group `$3` (numbers) that owner (service_owner_fix without paths of services: `find -xdev`, `chown -h`). For the
+ * the group `$3` (numbers) that owner (service_owner_fix without paths of services: `find -xdev`, `chown -h`; not a file
+ * with a second hard link, HELPER_SERVICE_OWNER_FIX, follow-up of plan step 11I). For the
  * extension's internal folder (CONFIG_FOLDER), run in a container of the workspace helper that mounts only the workspace
  * volume (WorkspaceHelper.fixConfigOwnership), not in the dev container: there, a mount of the dev container (through a
  * link of the repository, `volumes_from`, or a tmpfs) can lie in the folder, and the fix would give its files (for
@@ -495,8 +519,8 @@ ${HELPER_SERVICE_OWNER_FIX}service_owner_fix "$1" "$2" "$3" "$2:$3"
 /**
  * Plan step 11G1 ("No extra containers"): OWNERSHIP_FIX_SCRIPT with the numeric user ID `$2` and group ID `$3` in place
  * of a user name that `id` resolves: gives every file in the repository folder `$1` that does not have that user and
- * group that owner (service_owner_fix), except in the paths of the services `$4`… (servicePathArguments), where only the
- * files of root change. It runs as a step of the batch helper (repositoryOwnershipFix, WorkspaceHelper
+ * group that owner (service_owner_fix; not a file with a second hard link, REPOSITORY_SERVICE_OWNER_FIX, follow-up of plan
+ * step 11I), except in the paths of the services `$4`… (servicePathArguments), where only the files of root change. It runs as a step of the batch helper (repositoryOwnershipFix, WorkspaceHelper
  * .fixRepositoryOwnership), which mounts only the workspace volume, before the dev container is created; the IDs come
  * from the `/etc/passwd` of the environment image (EngineDocker.imageUserIds), so no container of that image runs for
  * it. As CONFIG_OWNERSHIP_FIX_SCRIPT, a link or a missing folder in place of `$1` is not walked (exit code 1).

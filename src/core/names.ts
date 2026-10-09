@@ -320,3 +320,11 @@ export function containerHostname(repositoryName: string): string {
 
 /** tmpfs mount of the helper for the token (only for runs with `secrets: true`). Plan step 11F2: from helper/scripts.ts. */
 export const SECRETS_FOLDER = '/run/devenv-secrets';
+/**
+ * Q2 of 2026-10-01: the folder of the batch helper in which the Docker socket is mounted, which only root can enter (the
+ * image creates it 0700; the helper checks it), so the Git user of the helper cannot reach it. The helper links
+ * /var/run/docker.sock to it for its root steps (the default of the Docker CLI and the Dev Container CLI; DOCKER_HOST is
+ * never set). Follow-up of plan step 11I (the links of the owner): moved from helperChannel/batch.ts, so that the host
+ * access policy names it too (isHelperPath).
+ */
+export const BATCH_SOCKET_FOLDER = '/run/devenv-docker';

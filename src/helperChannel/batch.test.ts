@@ -22,6 +22,8 @@ import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError } from '../core/ports';
 import { workerBatchSession, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';
+// Follow-up of plan step 11I (the links of the owner): the descriptor calls of the helper on the fakes by paths.
+import { withDescriptors } from './batchHelperFs.testkit';
 import { ChannelServer, OperationError, type OperationContext } from './server';
 import type { DockerEngine, EngineAttachedOptions, EngineAttachedRun, EngineAttachedSpec } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
@@ -147,7 +149,7 @@ function setup(options: SetupOptions = {}) {
       quiet.push([...command]);
       order.push(command.join(' '));
     },
-    fs: {
+    fs: withDescriptors({
       lstatSync: ((path: string) => {
         // Review round 2 of PR #80, B-R2-2: CONFIG_FOLDER may be a symbolic link or missing.
         if (path === CONFIG_FOLDER && options.configFolder === 'missing') throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
@@ -172,7 +174,7 @@ function setup(options: SetupOptions = {}) {
       readdirSync: (() => ['github-token']) as never,
       rmSync: ((path: string) => fsCalls.push(`rm ${path}`)) as never,
       mkdirSync: ((path: string, mkdirOptions: { mode: number }) => fsCalls.push(`mkdir ${path} ${mkdirOptions.mode.toString(8)}`)) as never,
-    },
+    }),
     env: { PATH: '/usr/bin', HOME: '/root', DOCKER_HOST: 'tcp://elsewhere:2375', COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'true' },
   };
   const helperChild = (onStdout: (text: string) => void): HelperChild => {
@@ -469,12 +471,20 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // Review round 1 of PR #80 (A-R1-1, A-R1-2): before the step, as root, the repair of a Git step whose cleanup was
     // cut off (its files get root; temporary clone folders older than 60 minutes go); after it, the temporary clone
     // folders of the Git user go too.
+    // Review round 1 of the follow-up of plan step 11I (A-F1): changed expectation (before: one `find … -exec chown -h 0:0
+    // {} +` each time, whose chown resolved each whole path again, also through a link that replaced a folder): the
+    // entries of the Git user at the top of the volume go to root with `chown -R` in the folder that find has open, then
+    // its other files with `-execdir chown -h` (gitUserFilesToRootCommands).
+    const toRoot = [
+      ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'],
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'],
+    ];
     expect(t.quiet).toEqual([
-      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ...toRoot,
       ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'],
       ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
       ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-user', uid, '-exec', 'rm', '-rf', '{}', '+'],
-      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      ...toRoot,
       ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
     ]);
     // Review round 1 of PR #80 (A-R1-1): the modes are restored right after the kill, before the slow walks.
@@ -485,7 +495,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
     // listConfigs runs as the repository owner now, so the root step here is gitFiles, and listConfigs gets the owner's
     // setpriv, without the token.)
     await session.step('gitFiles', { repository: 'octo/hello', identity: { name: 'n', email: 'e' } });
-    expect(t.steps[1].command[0]).toBe('sh');
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, gitFiles is a Node.js script (was sh),
+    // still started directly, without setpriv.
+    expect(t.steps[1].command[0]).toBe('node');
     expect(t.steps[1].input).toBeUndefined();
     await session.step('listConfigs', { repository: 'octo/hello' });
     expect(t.steps[2].command).toEqual(['setpriv', ...privilegeArgs(1000, 1000), ...batchStepCommand('listConfigs', { repository: 'octo/hello' }).command]);
@@ -797,16 +809,21 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
   it('repairs a cut-off Git step only before the first Git step of the helper, and walks the volume after every writing Git step', async () => {
     const { t, session } = await started();
     const uid = String(BATCH_GIT_UID);
-    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    // Review round 1 of the follow-up of plan step 11I (A-F1): changed expectation (before: `-exec chown -h 0:0 {} +`,
+    // one walk): the `chown -R` of the top entries of the Git user in the folder that find has open, then the walk with
+    // `-execdir chown -h`; `repair` is that walk, which the repair and the cleanup after a clone share.
+    const topToRoot = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'];
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'];
     const oldClones = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-mmin', '+60', '-exec', 'rm', '-rf', '{}', '+'];
     const afterWritingStep = [
       ['setpriv', ...gitPrivilegeArgs(), 'sh', '-c', 'kill -9 -1 2>/dev/null; exit 0'],
       ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-name', '.devenv-clone.*', '-user', uid, '-exec', 'rm', '-rf', '{}', '+'],
-      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'],
+      topToRoot,
+      ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'],
       ['find', '/', '/dev/shm', '-xdev', '-user', uid, '-prune', '-exec', 'rm', '-rf', '{}', '+'],
     ];
     expect((await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).exitCode).toBe(0);
-    expect(t.quiet).toEqual([repair, oldClones, ...afterWritingStep]);
+    expect(t.quiet).toEqual([topToRoot, repair, oldClones, ...afterWritingStep]);
     t.quiet.length = 0;
     expect((await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } })).exitCode).toBe(0);
     expect(t.quiet).toEqual(afterWritingStep);
@@ -827,7 +844,10 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
 
   it('repairs a cut-off Git step again in a new helper process', async () => {
     const uid = String(BATCH_GIT_UID);
-    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-exec', 'chown', '-h', '0:0', '{}', '+'];
+    // Review round 1 of the follow-up of plan step 11I (A-F1): changed expectation (before: `-exec chown -h 0:0 {} +`):
+    // the repair starts with the `chown -R` of the top entries of the Git user, then this walk with `-execdir`.
+    const topToRoot = ['find', WORKSPACES_ROOT, '-mindepth', '1', '-maxdepth', '1', '-user', uid, '-execdir', 'chown', '-R', '-h', `--from=${uid}`, '0:0', '{}', '+'];
+    const repair = ['find', WORKSPACES_ROOT, '-xdev', '-user', uid, '-execdir', 'chown', '-h', '0:0', '{}', '+'];
     for (let round = 0; round < 2; round += 1) {
       // Review round 1 of PR #82, A-R1-2: the flag lives in the helper process, so each new helper repairs once.
       const { t, session } = await started();
@@ -836,8 +856,9 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
       await session.step('clone', { repository: 'octo/hello' }, { secrets: { token: TOKEN } });
       // The repair is the first walk; the chown walk after each clone has the same command, so only the first is the repair.
-      expect(t.quiet[0], `helper ${round}`).toEqual(repair);
+      expect(t.quiet.slice(0, 2), `helper ${round}`).toEqual([topToRoot, repair]);
       expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(repair)), `helper ${round}`).toHaveLength(3);
+      expect(t.quiet.filter((call) => JSON.stringify(call) === JSON.stringify(topToRoot)), `helper ${round}`).toHaveLength(3);
     }
   });
 
@@ -940,14 +961,14 @@ describe('the batch helper of the worker (plan step 6, PR B)', () => {
       runQuiet: async () => {},
       // User decision of 2026-10-01 (agreed extension): listConfigs and readFiles run as the repository owner, so the
       // helper reads the owner of the repository folder; every change is a no-op.
-      fs: {
+      fs: withDescriptors({
         lstatSync: (() => ({ isDirectory: () => true, isSymbolicLink: () => false, mode: 0o40755, uid: 1000, gid: 1000 })) as never,
         chmodSync: (() => {}) as never,
         chownSync: (() => {}) as never,
         readdirSync: (() => []) as never,
         rmSync: (() => {}) as never,
         mkdirSync: (() => {}) as never,
-      },
+      }),
       env: {},
     });
     const context = {

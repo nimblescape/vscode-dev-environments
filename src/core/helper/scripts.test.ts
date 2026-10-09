@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { detectConfigurations } from '../discovery/detect';
 // user decision 2026-10-02: Delete runs no Git: GIT_SUMMARY_SCRIPT no longer runs in the workspace helper, so scripts.ts
 // does not re-export it; its syntax is still checked here (it runs in the dev container).
-import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import {
   CLONE_SCRIPT,
   COMPOSE_FILES_MAX_AGE_MS,
@@ -40,7 +40,7 @@ import { CONTAINER_CREDENTIAL_HELPER, GIT_CREDENTIALS_CONFIG_CONTENT } from './c
 import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
-import { composeAccessReport, type ComposeAccessInput } from '../policy';
+import { BATCH_HELPER_FOLDERS, composeAccessReport, isHelperPath, type ComposeAccessInput } from '../policy';
 import { WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
 
 /** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
@@ -89,7 +89,7 @@ function runSh(command: string[], input = ''): { status: number | null; stdout: 
 const SHELL_SCRIPTS: Array<[string, string]> = [
   ['CLONE_SCRIPT', CLONE_SCRIPT],
   // 2026-10-01: the Switch branch command was dropped (user decision). SWITCH_BRANCH_SCRIPT is gone.
-  ['GIT_FILES_SCRIPT', GIT_FILES_SCRIPT],
+  // Follow-up of plan step 11I (the links of the owner): GIT_FILES_SCRIPT is a Node.js script now; its suite below runs it.
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
   // Follow-up of PR #121: BUILD_SCRIPT is gone (every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule).
@@ -113,9 +113,24 @@ describe('shell scripts', () => {
     expect(cloneCommand('acme/api', 'api')).toEqual(['sh', '-c', CLONE_SCRIPT, 'sh', 'acme/api', 'api', '']);
     // 2026-10-01: the Switch branch command was dropped (user decision). switchBranchCommand is gone.
     // unit 15: no login argument (the sign-in of the GitHub CLI is written into the memory of the dev container).
-    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual(['sh', '-c', GIT_FILES_SCRIPT, 'sh', 'api', 'Me', 'me@x', 'helper']);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, a Node.js script (was `sh -c … sh`); the
+    // values are still arguments only. Review round 1 of that follow-up (B-L1): changed expectation, `--` before them, so
+    // that Node takes none of them for one of its options.
+    expect(gitFilesCommand('api', { name: 'Me', email: 'me@x' }, 'helper')).toEqual(['node', '-e', GIT_FILES_SCRIPT, '--', 'api', 'Me', 'me@x', 'helper']);
     expect(upCommand(OVERRIDE_CONFIG_PATH, ['up', '--x'])).toEqual(['sh', '-c', UP_SCRIPT, 'sh', OVERRIDE_CONFIG_PATH, 'up', '--x']);
     // Follow-up of PR #121: buildCommand is gone (every build runs through writeAndRunCommand, whose test names it).
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (B-L1): without `--`, Node read a first argument that starts with `-`
+  // as its own option (`-x`: "bad option", exit 9; `--title=x`: taken, and the next argument became the folder name). The
+  // script refuses such a name before it touches anything, so the real command runs here (the name `..` refuses the
+  // folder name that Node would leave the script after taking `--title=x`).
+  it.each(['-x', '--title=x'])('gitFilesCommand passes the folder name %j to the script, not to Node', (folder) => {
+    const [, ...args] = gitFilesCommand(folder, { name: '..', email: 'me@x' }, 'helper');
+    // Review round 3 of PR G (A-L4): SIGKILL at the time limit (the script ignores SIGTERM).
+    const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+    expect(result.stderr).toBe(`Invalid folder name: ${folder}\n`);
+    expect(result.status).toBe(2);
   });
 
   it.each([
@@ -641,6 +656,55 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
     expect(output.dockerfiles).toEqual({});
   });
 
+  it.each(BATCH_HELPER_FOLDERS)('does not read a Dockerfile in %s, a folder of the batch helper (follow-up of plan step 11I)', (folder) => {
+    // The test cannot write the folder of the helper: in the list of the script, a temporary folder with a Dockerfile
+    // stands for it. The script as it is reads that Dockerfile (outside the repository, no path of the helper).
+    const { dir, repo, env } = setup();
+    const standIn = path.join(dir, 'helper-folder');
+    write(path.join(standIn, 'Dockerfile'), 'FROM secret\n');
+    const script = COMPOSE_MODEL_SCRIPT.split(`'${folder}'`).join(JSON.stringify(standIn));
+    expect(script).not.toBe(COMPOSE_MODEL_SCRIPT);
+    const model = { name: PROJECT, services: { app: { build: { context: standIn } } } };
+    const command = composeModelCommand(repo, [path.join(repo, 'compose.yml')]);
+    const dockerfiles = (text: string): unknown => {
+      const result = spawnSync(process.execPath, ['-e', text, ...command.slice(3)], { encoding: 'utf8', env: { ...env, FAKE_MODEL: JSON.stringify(model) } });
+      expect(result.status, result.stderr).toBe(0);
+      const parsed = parseComposeModelOutput(result.stdout.trim());
+      if ('error' in parsed) throw new Error(parsed.error);
+      return parsed.dockerfiles;
+    };
+    expect(dockerfiles(COMPOSE_MODEL_SCRIPT)).toEqual({ app: 'FROM secret\n' });
+    expect(dockerfiles(script)).toEqual({});
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A-F5): the copy of isHelperPath in the script takes a path with a `..`
+  // segment for a path of the helper, as isHelperPath of ../policy/rules.ts does (`..` after a link of the helper image
+  // leads elsewhere than the text says). Its only caller (readDockerfile) gets paths that path.posix.resolve normalized
+  // and their real paths, so the copy is run here by itself, with the `inside` of the repository folder.
+  it('has a copy of isHelperPath that agrees with isHelperPath, also for a `..` segment', () => {
+    const repo = '/workspaces/api';
+    const start = COMPOSE_MODEL_SCRIPT.indexOf('const overlaps = ');
+    const end = COMPOSE_MODEL_SCRIPT.indexOf('\n};\n', COMPOSE_MODEL_SCRIPT.indexOf('const isHelperPath = (file) => {'));
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const copy = new Function('path', 'inside', `${COMPOSE_MODEL_SCRIPT.slice(start, end + 3)}\nreturn isHelperPath;`)(path, (file: string) => file === repo || file.startsWith(`${repo}/`)) as (file: string) => boolean;
+    for (const [file, expected] of [
+      ['/var/run/../devenv-cache', true],
+      ['/var/lock/../devenv-secrets', true],
+      ['/usr/lib/ssl/certs/../../../run/devenv-secrets', true],
+      ['/opt/tools/../other', true],
+      ['/workspaces/api/../.devenv+', true],
+      ['/opt/..tools', false],
+      ['/run/devenv-secrets/github-token', true],
+      ['/var/run/devenv-docker', true],
+      ['/workspaces/api/x', false],
+      ['/tmp/devenv-override/context', false],
+    ] as const) {
+      expect(copy(file), file).toBe(expected);
+      expect(isHelperPath(file, repo), file).toBe(expected);
+    }
+  });
+
   it('lists the build contexts and Dockerfiles that are missing in the repository, not links that lead out or nowhere (review round 3, P3-1)', () => {
     const { dir, repo, env } = setup();
     fs.mkdirSync(path.join(repo, 'ctx'));
@@ -1100,40 +1164,306 @@ describe('LIST_CONFIGS_SCRIPT', () => {
   });
 });
 
-describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
-  // The script needs Linux (GNU stat and mv). Fake tools on PATH stand in for them; Git is real.
+// Follow-up of plan step 11I (the links of the owner): the script needs Linux (/proc/self/fd, as in the helper), so the suite
+// runs on Linux only (before, fakes of GNU stat and mv let it run elsewhere too).
+describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with fake tools', () => {
+  // The script needs Linux (/proc/self/fd, GNU rm). Git is real. Fake tools stand in for what a test cannot do as a user:
+  // a module that Node loads before the script (`--require`) records the owner changes of the script (fchown, lchown)
+  // instead of making them, by the inode they reach, and gives the repository folder the owner 1000:1001. A fake `git` on
+  // PATH records the file that Git edits and runs the real Git; for the races, it first plays the owner of the repository
+  // once (`race`, a shell command with that file as $1).
   // unit 15: the script gets no token any more; the token and the sign-in of the GitHub CLI go into the memory of the
   // dev container (TOKEN_WRITE_SCRIPT, containerToken.test.ts).
+  // Follow-up of plan step 11I (the links of the owner): GIT_FILES_SCRIPT is a Node.js script (was sh, with a fake stat,
+  // chown and mv).
+  const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
 
-  function setup(): { ws: string; bin: string; log: string } {
+  interface GitFilesEnv {
+    dir: string;
+    ws: string;
+    bin: string;
+    log: string;
+    gitFiles: string;
+    preload: string;
+  }
+
+  function setup(): GitFilesEnv {
     const dir = tempDir();
     const ws = path.join(dir, 'workspaces');
     const bin = path.join(dir, 'bin');
     const log = path.join(dir, 'log');
+    const gitFiles = path.join(dir, 'git-files');
+    const preload = path.join(dir, 'preload.js');
     fs.mkdirSync(path.join(ws, 'api'), { recursive: true });
-    const tool = (name: string, body: string) => {
-      write(path.join(bin, name), `#!/bin/sh\n${body}\n`);
-      fs.chmodSync(path.join(bin, name), 0o755);
-    };
-    tool('stat', 'echo 1000:1001');
-    tool('chown', `echo "chown $*" >> '${log}'`);
-    tool('mv', 'if [ "$1" = -fT ]; then shift; exec /bin/mv -f "$1" "$2"; fi\nexec /bin/mv "$@"');
-    return { ws, bin, log };
+    fs.writeFileSync(log, '');
+    fs.writeFileSync(gitFiles, '');
+    write(
+      preload,
+      [
+        "'use strict';",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        'const { DEVENV_TEST_LOG: log, DEVENV_TEST_REPO: repo, DEVENV_TEST_MKDIR_RACE: race, DEVENV_TEST_GROW: grow, DEVENV_TEST_ROOT_LOCK: rootLock } = process.env;',
+        // Review round 3 of PR G (A-L1, A-L2, B3-N2): the owner of gitconfig.lock as the script sees it; the inodes that
+        // are the owner's (1000:1001) by their fstat; a log of the inodes that the script reads; the lock removed right
+        // after the script's first lstat of it (the user, as the message of the step tells).
+        'const { DEVENV_TEST_LOCK_OWNER: lockOwner, DEVENV_TEST_OWNED_INOS: ownedInos, DEVENV_TEST_READS: reads, DEVENV_TEST_UNLINK_LOCK: unlinkLock, DEVENV_TEST_UNLINK_LOCK_ERROR: unlinkError } = process.env;',
+        "const lockIds = rootLock ? [0, 0] : lockOwner ? lockOwner.split(':').map(Number) : undefined;",
+        "const record = (stat, uid, gid) => fs.appendFileSync(log, stat.ino + ' ' + uid + ':' + gid + '\\n');",
+        'fs.fchownSync = (fd, uid, gid) => record(fs.fstatSync(fd), uid, gid);',
+        'fs.lchownSync = (file, uid, gid) => record(fs.lstatSync(file), uid, gid);',
+        'fs.chownSync = (file, uid, gid) => record(fs.statSync(file), uid, gid);',
+        "for (const name of ['lstatSync', 'statSync']) {",
+        '  const real = fs[name];',
+        '  fs[name] = (file, ...rest) => {',
+        '    const stat = real.call(fs, file, ...rest);',
+        // Review round 2 of the follow-up (A-L1): with DEVENV_TEST_ROOT_LOCK, gitconfig.lock is root's (round 3: or the
+        // owner of DEVENV_TEST_LOCK_OWNER).
+        "    if (lockIds && stat && path.basename(String(file)) === 'gitconfig.lock') return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: lockIds[0], gid: lockIds[1] });",
+        '    return file === repo && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
+        '  };',
+        '}',
+        // The race of the owner between the creation of a folder and its mode: right after the script made the folder
+        // `entry`, the owner renames it away and puts a link to `target` in its place.
+        'if (race) {',
+        '  const [entry, target] = JSON.parse(race);',
+        '  const mkdirSync = fs.mkdirSync;',
+        '  fs.mkdirSync = (file, ...rest) => {',
+        '    const result = mkdirSync.call(fs, file, ...rest);',
+        '    if (path.basename(String(file)) === entry) {',
+        "      fs.renameSync(file, file + '.moved');",
+        '      fs.symlinkSync(target, file);',
+        '    }',
+        '    return result;',
+        '  };',
+        '}',
+        "if (unlinkLock) {",
+        '  const lstatSync = fs.lstatSync;',
+        '  let done = false;',
+        '  fs.lstatSync = (file, ...rest) => {',
+        '    const stat = lstatSync.call(fs, file, ...rest);',
+        "    if (!done && path.basename(String(file)) === 'gitconfig.lock') {",
+        '      done = true;',
+        '      fs.unlinkSync(file);',
+        '    }',
+        '    return stat;',
+        '  };',
+        '}',
+        // With DEVENV_TEST_UNLINK_LOCK_ERROR, the removal of gitconfig.lock fails with that code.
+        'if (unlinkError) {',
+        '  const unlinkSync = fs.unlinkSync;',
+        '  fs.unlinkSync = (file, ...rest) => {',
+        "    if (path.basename(String(file)) === 'gitconfig.lock') throw Object.assign(new Error(unlinkError + ': the removal failed'), { code: unlinkError });",
+        '    return unlinkSync.call(fs, file, ...rest);',
+        '  };',
+        '}',
+        'if (ownedInos) {',
+        "  const owned = ownedInos.split(',').map(Number);",
+        '  const fstatSync = fs.fstatSync;',
+        '  fs.fstatSync = (descriptor, ...rest) => {',
+        '    const stat = fstatSync.call(fs, descriptor, ...rest);',
+        '    return owned.includes(stat.ino) ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
+        '  };',
+        '}',
+        'if (reads) {',
+        '  const readSync = fs.readSync;',
+        '  fs.readSync = (descriptor, ...rest) => {',
+        "    fs.appendFileSync(reads, fs.fstatSync(descriptor).ino + '\\n');",
+        '    return readSync.call(fs, descriptor, ...rest);',
+        '  };',
+        '}',
+        // Review round 1 of the follow-up of plan step 11I (A-F2): the owner appends `grow` bytes to gitconfig right after
+        // the script looked at its size (the fstat of the file that it opened): a file that grows while it is copied.
+        'if (grow) {',
+        '  const { openSync, fstatSync } = fs;',
+        '  let opened;',
+        '  fs.openSync = (file, flags, ...rest) => {',
+        '    const descriptor = openSync.call(fs, file, flags, ...rest);',
+        "    if (opened === undefined && path.basename(String(file)) === 'gitconfig' && typeof flags === 'number' && (flags & fs.constants.O_CREAT) === 0) opened = descriptor;",
+        '    return descriptor;',
+        '  };',
+        '  fs.fstatSync = (descriptor, ...rest) => {',
+        '    const stat = fstatSync.call(fs, descriptor, ...rest);',
+        '    if (descriptor === opened) {',
+        '      opened = -1;',
+        "      fs.appendFileSync('/proc/self/fd/' + descriptor, '#'.repeat(Number(grow)) + '\\n');",
+        '    }',
+        '    return stat;',
+        '  };',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    write(
+      path.join(bin, 'git'),
+      [
+        '#!/bin/sh',
+        "file=''",
+        "previous=''",
+        'for arg do',
+        '  if [ "$previous" = --file ]; then file=$arg; fi',
+        '  previous=$arg',
+        'done',
+        'printf \'%s %s\\n\' "$(stat -c %a "$(dirname "$file")")" "$file" >> "$DEVENV_TEST_GIT_FILES"',
+        // Review round 2 of the follow-up (A-L1): the number of this call of Git, for the race and the signal at a call.
+        'calls=$(($(wc -l < "$DEVENV_TEST_GIT_FILES")))',
+        'if [ -n "${DEVENV_TEST_RACE-}" ] && [ "$calls" -eq "${DEVENV_TEST_RACE_AT:-1}" ]; then',
+        '  sh -c "$DEVENV_TEST_RACE" sh "$file"',
+        'fi',
+        // A Cancel: the signal to the script and to its Git (the batch helper signals the whole process group of the step).
+        'if [ "$calls" -eq "${DEVENV_TEST_SIGNAL_AT:-0}" ]; then',
+        '  kill -s "$DEVENV_TEST_SIGNAL" "$PPID"',
+        '  kill -s "$DEVENV_TEST_SIGNAL" "$$"',
+        'fi',
+        'case " $* " in *" ${DEVENV_TEST_GIT_FAIL-none} "*) exit 1 ;; esac',
+        'exec "$DEVENV_TEST_REAL_GIT" "$@"',
+        '',
+      ].join('\n'),
+    );
+    fs.chmodSync(path.join(bin, 'git'), 0o755);
+    return { dir, ws, bin, log, gitFiles, preload };
   }
 
-  function run(env: { ws: string; bin: string }, folder = 'api') {
+  interface RunOptions {
+    folder?: string;
+    /** A shell command that the fake git runs once, at its first call (or at the call raceAt), as the owner of the repository. */
+    race?: string;
+    /** Review round 2 of the follow-up (A-L1): the call of Git at which `race` runs (1 when not given). */
+    raceAt?: number;
+    /** Review round 2 of the follow-up (A-L1): at this call of Git, the signal goes to the script and to that Git. */
+    signalAt?: { call: number; signal: 'TERM' | 'INT' | 'HUP' | 'KILL' };
+    /** Review round 2 of the follow-up (A-L1): lstat reports gitconfig.lock as root's (as the test may not run as root). */
+    rootLock?: boolean;
+    /** Review round 3 of PR G (A-L1): lstat reports gitconfig.lock with this owner (uid:gid). */
+    lockOwner?: string;
+    /** Review round 3 of PR G (A-L2): fstat reports these inodes as the owner's (1000:1001). */
+    ownedInodes?: number[];
+    /** Review round 3 of PR G (A-L2): the file where the inode of each read of the script is noted. */
+    reads?: string;
+    /** Review round 3 of PR G (B3-N2): the lock is removed right after the script's first lstat of it. */
+    unlinkLockAfterLstat?: boolean;
+    /** Review round 3 of PR G (B3-N2): the removal of gitconfig.lock fails with this code. */
+    unlinkLockError?: string;
+    /** [entry, target]: the folder `entry` is replaced by a link to `target` right after the script created it. */
+    mkdirRace?: [string, string];
+    /** The fake git fails when its arguments contain this one. */
+    gitFails?: string;
+    /** Review round 1 of the follow-up (A-F2): the owner appends this many bytes to gitconfig right after its open. */
+    grow?: number;
+    /** The largest file that the script may write, in blocks of 512 bytes (`ulimit -f`; more ends it with SIGXFSZ). */
+    fileLimit?: number;
+  }
+
+  function run(env: GitFilesEnv, options: RunOptions = {}) {
     const script = GIT_FILES_SCRIPT.split('/workspaces').join(env.ws);
-    const command = gitFilesCommand(folder, { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
-    const result = spawnSync('sh', ['-c', script, ...command.slice(3)], {
+    const command = gitFilesCommand(options.folder ?? 'api', { name: 'Hannes Stauss', email: '1001+scalarion@users.noreply.github.com' }, CONTAINER_CREDENTIAL_HELPER);
+    expect(command.slice(0, 3)).toEqual(['node', '-e', GIT_FILES_SCRIPT]);
+    const argv = [process.execPath, '--require', env.preload, '-e', script, ...command.slice(3)];
+    const [file, ...args] = options.fileLimit === undefined ? argv : ['sh', '-c', 'ulimit -f "$1" && shift && exec "$@"', 'sh', String(options.fileLimit), ...argv];
+    const result = spawnSync(file, args, {
       encoding: 'utf8',
       input: '',
-      env: { ...process.env, PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`, GIT_CONFIG_NOSYSTEM: '1' },
+      timeout: 20_000,
+      // Review round 3 of PR G (A-L4): the script ignores SIGTERM (review round 2, A-L1), the default signal of the time
+      // limit, so a script that hangs is ended with SIGKILL.
+      killSignal: 'SIGKILL',
+      env: {
+        ...process.env,
+        PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`,
+        GIT_CONFIG_NOSYSTEM: '1',
+        DEVENV_TEST_LOG: env.log,
+        DEVENV_TEST_REPO: path.join(env.ws, options.folder ?? 'api'),
+        DEVENV_TEST_GIT_FILES: env.gitFiles,
+        DEVENV_TEST_REAL_GIT: realGit,
+        ...(options.race !== undefined ? { DEVENV_TEST_RACE: options.race } : {}),
+        ...(options.raceAt !== undefined ? { DEVENV_TEST_RACE_AT: String(options.raceAt) } : {}),
+        ...(options.signalAt !== undefined ? { DEVENV_TEST_SIGNAL_AT: String(options.signalAt.call), DEVENV_TEST_SIGNAL: options.signalAt.signal } : {}),
+        ...(options.rootLock === true ? { DEVENV_TEST_ROOT_LOCK: '1' } : {}),
+        ...(options.lockOwner !== undefined ? { DEVENV_TEST_LOCK_OWNER: options.lockOwner } : {}),
+        ...(options.ownedInodes !== undefined ? { DEVENV_TEST_OWNED_INOS: options.ownedInodes.join(',') } : {}),
+        ...(options.reads !== undefined ? { DEVENV_TEST_READS: options.reads } : {}),
+        ...(options.unlinkLockAfterLstat === true ? { DEVENV_TEST_UNLINK_LOCK: '1' } : {}),
+        ...(options.unlinkLockError !== undefined ? { DEVENV_TEST_UNLINK_LOCK_ERROR: options.unlinkLockError } : {}),
+        ...(options.mkdirRace !== undefined ? { DEVENV_TEST_MKDIR_RACE: JSON.stringify(options.mkdirRace) } : {}),
+        ...(options.gitFails !== undefined ? { DEVENV_TEST_GIT_FAIL: options.gitFails } : {}),
+        ...(options.grow !== undefined ? { DEVENV_TEST_GROW: String(options.grow) } : {}),
+      },
     });
-    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    return { status: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr, error: result.error };
   }
 
   function gitConfig(file: string, ...args: string[]): string {
     return spawnSync('git', ['config', '--file', file, ...args], { encoding: 'utf8' }).stdout;
+  }
+
+  /** The owners that the script gave, by inode (the records of the fake chown). */
+  function owners(env: GitFilesEnv): Map<number, string[]> {
+    const result = new Map<number, string[]>();
+    for (const line of fs.readFileSync(env.log, 'utf8').split('\n').filter((entry) => entry !== '')) {
+      const [ino, owner] = line.split(' ');
+      result.set(Number(ino), [...(result.get(Number(ino)) ?? []), owner]);
+    }
+    return result;
+  }
+
+  const ino = (file: string): number => fs.lstatSync(file).ino;
+
+  /**
+   * Follow-up of plan step 11I (the links of the owner): a folder outside the volume (in the helper, the cache volume or
+   * its own files), with files named as those of CONFIG_FOLDER, at which the owner points links; `state` is all that the
+   * script must not change (names, kinds, modes, inodes, contents), `inodes` what it must give no owner.
+   */
+  function outside(env: GitFilesEnv): { folder: string; file: string; state: () => string[]; inodes: () => number[] } {
+    const folder = path.join(env.dir, 'outside');
+    fs.mkdirSync(path.join(folder, 'docker'), { recursive: true });
+    for (const name of ['file', 'gitconfig', 'credentials.gitconfig']) write(path.join(folder, name), `[outside]\n\tname = ${name}\n`);
+    for (const name of ['file', 'gitconfig', 'credentials.gitconfig']) fs.chmodSync(path.join(folder, name), 0o640);
+    fs.chmodSync(path.join(folder, 'docker'), 0o751);
+    fs.chmodSync(folder, 0o751);
+    const entries = (): Array<[string, fs.Stats]> => {
+      const list: Array<[string, fs.Stats]> = [['.', fs.lstatSync(folder)]];
+      const walk = (at: string) => {
+        for (const name of fs.readdirSync(at).sort()) {
+          const file = path.join(at, name);
+          const stat = fs.lstatSync(file);
+          list.push([path.relative(folder, file), stat]);
+          if (stat.isDirectory()) walk(file);
+        }
+      };
+      walk(folder);
+      return list;
+    };
+    return {
+      folder,
+      file: path.join(folder, 'file'),
+      state: () =>
+        entries().map(([name, stat]) => {
+          const kind = stat.isDirectory() ? 'folder' : stat.isSymbolicLink() ? `link ${fs.readlinkSync(path.join(folder, name))}` : JSON.stringify(fs.readFileSync(path.join(folder, name), 'utf8'));
+          return `${name} ${(stat.mode & 0o7777).toString(8)} ${stat.ino} ${kind}`;
+        }),
+      inodes: () => entries().map(([, stat]) => stat.ino),
+    };
+  }
+
+  /** A gitconfig of the user whose credential section the script has to repair, in a new CONFIG_FOLDER. */
+  function userGitConfig(env: GitFilesEnv): string {
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, '[user]\n\tname = Changed Name\n[credential "https://github.com"]\n\thelper = store\n[alias]\n\tst = status\n');
+    return cfg;
+  }
+
+  /** CONFIG_FOLDER `dir` as the script leaves it: the four entries, their modes, the owner 1000:1001 of each. */
+  function expectConfigFolder(env: GitFilesEnv, dir: string): void {
+    expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
+    expect(fs.lstatSync(dir).mode & 0o777).toBe(0o755);
+    for (const name of ['docker', 'gh']) {
+      expect(fs.lstatSync(path.join(dir, name)).isDirectory()).toBe(true);
+      expect(fs.lstatSync(path.join(dir, name)).mode & 0o777).toBe(0o700);
+    }
+    for (const name of ['gitconfig', 'credentials.gitconfig']) expect(fs.lstatSync(path.join(dir, name)).isFile()).toBe(true);
+    expect(gitConfig(path.join(dir, 'gitconfig'), '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    const given = owners(env);
+    for (const name of ['.', 'docker', 'gh', 'gitconfig', 'credentials.gitconfig']) expect(given.get(ino(path.join(dir, name))), name).toEqual(['1000:1001']);
   }
 
   it('writes the Git configuration and the Docker folder, owned by the repository owner, and no token', () => {
@@ -1149,21 +1479,24 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
     expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
     expect(CONTAINER_CREDENTIAL_HELPER).toContain('/run/devenv/github-token');
     expect(fs.statSync(path.join(dir, 'docker')).mode & 0o777).toBe(0o700);
-    const chowned = fs.readFileSync(env.log, 'utf8');
-    expect(chowned).toContain(`chown -h 1000:1001 ${dir} ${dir}/docker ${dir}/gitconfig`);
-    expect(chowned).toContain(cfg);
+    // Follow-up of plan step 11I (the links of the owner): changed expectation, the owner changes are recorded by the inode
+    // that the script gives the owner through its descriptor (fchown), not as a chown command line; the same five entries
+    // (the folder, docker, gitconfig, credentials.gitconfig, gh) get 1000:1001, and nothing else gets an owner.
+    const given = owners(env);
+    const credentials = path.join(dir, 'credentials.gitconfig');
+    const gh = path.join(dir, 'gh');
+    expect([...given.keys()].sort()).toEqual([dir, path.join(dir, 'docker'), cfg, credentials, gh].map(ino).sort());
+    for (const file of [dir, path.join(dir, 'docker'), cfg, credentials, gh]) expect(given.get(ino(file)), file).toEqual(['1000:1001']);
     // No GnuPG folder: the extension does not change where GnuPG works (user decision 2026-09-25). unit 15: no token file.
     expect(fs.readdirSync(dir).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
     // The file for the credential helpers of the user: only comments, readable by every user of the container.
-    const credentials = path.join(dir, 'credentials.gitconfig');
     expect(fs.readFileSync(credentials, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
     expect(fs.statSync(credentials).mode & 0o777).toBe(0o644);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o644);
     expect(spawnSync('git', ['config', '--file', credentials, '--list'], { encoding: 'utf8' })).toMatchObject({ status: 0, stdout: '' });
     // unit 15: the gh folder of the volume (for config.yml), 0700 and empty, owned by the repository owner.
-    const gh = path.join(dir, 'gh');
     expect(fs.statSync(gh).mode & 0o777).toBe(0o700);
     expect(fs.readdirSync(gh)).toEqual([]);
-    expect(chowned).toContain(`${cfg} ${credentials} ${gh}`);
     // No temporary folder is left.
     expect(fs.readdirSync(dir).filter((name) => name.startsWith('.work'))).toEqual([]);
   });
@@ -1237,15 +1570,557 @@ describe.skipIf(!hasGit)('GIT_FILES_SCRIPT with fake tools', () => {
 
   it('writes nothing without the repository folder', () => {
     const env = setup();
-    const missing = run(env, 'other');
+    const missing = run(env, { folder: 'other' });
     expect(missing.status).toBe(4);
     expect(fs.existsSync(path.join(env.ws, '.devenv+'))).toBe(false);
   });
 
   it('rejects an invalid folder name', () => {
-    const result = run(setup(), '../etc');
+    const result = run(setup(), { folder: '../etc' });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('Invalid folder name');
+  });
+
+  // Follow-up of plan step 11I (the links of the owner): root never follows a link that the owner of the repository
+  // planted, before the run or while it runs, and never resolves a path through an entry of the volume.
+
+  it.each([
+    ['gitconfig', 'file'],
+    ['credentials.gitconfig', 'file'],
+    ['docker', 'folder'],
+    ['gh', 'folder'],
+  ] as const)('leaves the target of a link planted at %s before the run unchanged, and writes a correct configuration', (entry, target) => {
+    const env = setup();
+    const out = outside(env);
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    fs.symlinkSync(target === 'file' ? out.file : out.folder, path.join(dir, entry));
+    const before = out.state();
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expectConfigFolder(env, dir);
+  });
+
+  it('edits no gitconfig that the owner replaces by a link while Git runs', () => {
+    const env = setup();
+    const out = outside(env);
+    const cfg = userGitConfig(env);
+    const before = out.state();
+    // The owner renames gitconfig away and puts a link to a file outside the volume in its place when Git starts.
+    // Review round 2 of the follow-up (A-L1): changed test, at the second call of Git (the first under Git's lock, on the
+    // copy that it writes; the first call is now the check without the lock, the next test).
+    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'`, raceAt: 2 });
+    expect(fs.readFileSync(`${cfg}.moved`, 'utf8')).toContain('helper = store');
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // The rename of the new file replaced the link itself: gitconfig is the repaired configuration of the user.
+    expect(fs.lstatSync(cfg).isFile()).toBe(true);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a link that the owner puts in place of gitconfig during the
+  // check without the lock is removed under the lock, and a new gitconfig takes its place (the file of the owner is where
+  // it moved it).
+  it('edits no gitconfig that the owner replaces by a link during its check without the lock', () => {
+    const env = setup();
+    const out = outside(env);
+    const cfg = userGitConfig(env);
+    const before = out.state();
+    const result = run(env, { race: `mv '${cfg}' '${cfg}.moved' && ln -s '${out.file}' '${cfg}'` });
+    expect(fs.readFileSync(`${cfg}.moved`, 'utf8')).toContain('helper = store');
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.lstatSync(cfg).isFile()).toBe(true);
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  it('writes only into the configuration folder that it opened, also when it is replaced by a link while Git runs', () => {
+    // Root of the dev container (also a remote user with sudo) can rename the entries of /workspaces too.
+    const env = setup();
+    const out = outside(env);
+    userGitConfig(env);
+    const dir = path.join(env.ws, '.devenv+');
+    const before = out.state();
+    const result = run(env, { race: `mv '${dir}' '${dir}.moved' && ln -s '${out.folder}' '${dir}'` });
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Everything went into the folder that the script opened, wherever the owner moved it.
+    expectConfigFolder(env, `${dir}.moved`);
+    expect(gitConfig(path.join(`${dir}.moved`, 'gitconfig'), 'alias.st')).toBe('status\n');
+  });
+
+  it.each(['.devenv+', 'docker', 'gh'])('changes no mode through a link that replaces %s between its creation and its mode', (entry) => {
+    const env = setup();
+    const out = outside(env);
+    const before = out.state();
+    const result = run(env, { mkdirRace: [entry, out.folder] });
+    // The script finds a link where it created the folder: it stops (a warning of the open), and follows nothing.
+    const moved = entry === '.devenv+' ? path.join(env.ws, '.devenv+.moved') : path.join(env.ws, '.devenv+', `${entry}.moved`);
+    expect(fs.lstatSync(moved).isDirectory()).toBe(true);
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expect(result.status).toBe(1);
+  });
+
+  it('lets Git edit only a copy in a folder of root outside the volume, which it removes at the end, also after a failure', () => {
+    const env = setup();
+    userGitConfig(env);
+    expect(run(env).status).toBe(0);
+    const edited = fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((line) => line !== '');
+    expect(edited.length).toBeGreaterThan(0);
+    const folders = new Set(edited.map((line) => path.dirname(line.slice(line.indexOf(' ') + 1))));
+    expect(folders.size).toBe(1);
+    const [work] = [...folders];
+    // Root's folder (0700), outside the workspace volume, gone after the run.
+    expect(edited.every((line) => line.startsWith('700 '))).toBe(true);
+    expect(path.relative(env.ws, work).startsWith('..')).toBe(true);
+    expect(fs.existsSync(work)).toBe(false);
+
+    // A failure of Git: the step fails, and neither the folder nor a new file of the script is left.
+    const failing = setup();
+    const cfg = userGitConfig(failing);
+    const original = fs.readFileSync(cfg, 'utf8');
+    const result = run(failing, { gitFails: '--add' });
+    expect(result.status).not.toBe(0);
+    const failedWork = path.dirname(fs.readFileSync(failing.gitFiles, 'utf8').split('\n')[0].split(' ')[1]);
+    expect(path.relative(failing.ws, failedWork).startsWith('..')).toBe(true);
+    expect(fs.existsSync(failedWork)).toBe(false);
+    expect(fs.readdirSync(path.join(failing.ws, '.devenv+')).sort()).toEqual(['docker', 'gh', 'gitconfig']);
+    expect(fs.readFileSync(cfg, 'utf8')).toBe(original);
+  });
+
+  it('gives no owner to a file that has another link, and writes such a gitconfig again as a new file', () => {
+    // A hard link could name a file of another user elsewhere in the volume.
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const sharedCredentials = path.join(env.ws, 'api', 'credentials');
+    const sharedConfig = path.join(env.ws, 'api', 'config');
+    write(sharedCredentials, 'credentials of another file\n');
+    const correct = `[credential "https://github.com"]\n\thelper = \n\thelper = ${JSON.stringify(CONTAINER_CREDENTIAL_HELPER)}\n`;
+    write(sharedConfig, correct);
+    fs.linkSync(sharedCredentials, path.join(dir, 'credentials.gitconfig'));
+    fs.linkSync(sharedConfig, path.join(dir, 'gitconfig'));
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(owners(env).has(ino(sharedCredentials))).toBe(false);
+    expect(owners(env).has(ino(sharedConfig))).toBe(false);
+    expect(fs.readFileSync(sharedConfig, 'utf8')).toBe(correct);
+    expect(fs.readFileSync(sharedCredentials, 'utf8')).toBe('credentials of another file\n');
+    // gitconfig: a new file of the owner; credentials.gitconfig stays as it is. Review round 3 of PR G (A-L2): changed
+    // expectation (was: the new file had the same text): the linked file is not the owner's (1000 here), so its text is
+    // not taken; the new gitconfig starts as a missing one does (the identity and the section).
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(sharedConfig));
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o644);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+    expect(ino(path.join(dir, 'credentials.gitconfig'))).toBe(ino(sharedCredentials));
+  });
+
+  // Review round 3 of PR G (A-L2), older than the follow-up: where fs.protected_hardlinks is off, the owner can link a file
+  // of another user that Git can read (for example the configuration of a service, with its password, mode 0600) at
+  // gitconfig. The script wrote such a gitconfig again as a new file of the owner with its text, so the owner could read
+  // it. Now a linked file that is not the owner's stays unread.
+  it('reads nothing of a file of another user that the owner linked at gitconfig, and starts a new gitconfig without its text', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const secret = path.join(env.dir, 'service', 'my.cnf');
+    write(secret, '[client]\n\tpassword = s3cret-of-the-service\n');
+    fs.chmodSync(secret, 0o600);
+    fs.linkSync(secret, path.join(dir, 'gitconfig'));
+    const reads = path.join(env.dir, 'reads');
+    fs.writeFileSync(reads, '');
+    const result = run(env, { reads });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(secret));
+    expect(fs.readFileSync(cfg, 'utf8')).not.toContain('s3cret');
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+    // The file of the service: never read by the script, nor by its Git, and as it was.
+    expect(fs.readFileSync(reads, 'utf8').split('\n').filter((line) => line !== '').map(Number)).not.toContain(ino(secret));
+    for (const line of fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((entry) => entry !== '')) expect(path.basename(line)).toBe('gitconfig');
+    expect(fs.readFileSync(secret, 'utf8')).toBe('[client]\n\tpassword = s3cret-of-the-service\n');
+    expect(fs.statSync(secret).mode & 0o777).toBe(0o600);
+    expect(owners(env).has(ino(secret))).toBe(false);
+  });
+
+  // Review round 3 of PR G (A-L2): a linked gitconfig of the owner is its configuration: written again as a new file (one
+  // link) with its text and its mode.
+  it('keeps the text of a gitconfig of the owner that has a second link, in a new file', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const shared = path.join(env.ws, 'api', 'dotfiles-gitconfig');
+    write(shared, '[alias]\n\tst = status\n');
+    fs.chmodSync(shared, 0o640);
+    fs.linkSync(shared, path.join(dir, 'gitconfig'));
+    const result = run(env, { ownedInodes: [ino(shared)] });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(shared));
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, 'user.name')).toBe('');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o640);
+    expect(fs.readFileSync(shared, 'utf8')).toBe('[alias]\n\tst = status\n');
+  });
+
+  it('never waits on a FIFO in place of gitconfig', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    expect(spawnSync('mkfifo', [path.join(dir, 'gitconfig')]).status).toBe(0);
+    const result = run(env);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${dir}/gitconfig is not a file.`);
+    // Review round 1 of the follow-up of plan step 11I (A-F4): no lock is left. Review round 3 of PR G (B3-L1): since review
+    // round 2 (A-L1) the step fails in its check without the lock, so it takes none (the removal of its own lock on a
+    // failure is tested elsewhere).
+    expect(fs.existsSync(path.join(dir, 'gitconfig.lock'))).toBe(false);
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A-F4): gitconfig is the GIT_CONFIG_GLOBAL of the dev container. The
+  // script took no lock (the shell script before it ran `git config --file` on it, which took Git's lock each time), so a
+  // `git config --global` in the dev container between its copy and its rename was lost.
+  it("holds Git's lock while it reads and replaces gitconfig: a change of Git in the dev container meanwhile fails, and is never lost", () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const status = path.join(env.dir, 'concurrent-status');
+    const stderr = path.join(env.dir, 'concurrent-stderr');
+    // When the script's Git starts (after the copy), Git in the dev container sets user.name in gitconfig. Review round 2
+    // of the follow-up (A-L1): changed test, at the second call of Git, the first under the lock (the first call is now
+    // the check without the lock, the next test).
+    const result = run(env, { race: `"$DEVENV_TEST_REAL_GIT" config --file '${cfg}' user.name 'Concurrent Name' 2> '${stderr}'; echo $? > '${status}'`, raceAt: 2 });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // Git finds the lock and fails, as for another Git: the user sees it (never a change that is silently lost).
+    expect(fs.readFileSync(status, 'utf8').trim()).not.toBe('0');
+    expect(fs.readFileSync(stderr, 'utf8')).toContain('could not lock config file');
+    expect(gitConfig(cfg, 'user.name')).toBe('Changed Name\n');
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+    expect(fs.readdirSync(path.dirname(cfg)).sort()).toEqual(['credentials.gitconfig', 'docker', 'gh', 'gitconfig']);
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): during the check without the lock, a change of Git in the dev
+  // container succeeds; the script reads gitconfig again under the lock, so the change is kept.
+  it('keeps a change that Git in the dev container makes during the check without the lock', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const status = path.join(env.dir, 'concurrent-status');
+    const result = run(env, { race: `"$DEVENV_TEST_REAL_GIT" config --file '${cfg}' user.name 'Concurrent Name'; echo $? > '${status}'` });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(fs.readFileSync(status, 'utf8').trim()).toBe('0');
+    expect(gitConfig(cfg, 'user.name')).toBe('Concurrent Name\n');
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  it('fails and changes nothing when gitconfig.lock exists (a Git of the dev container holds it), as Git does', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, 'the lock of another Git\n');
+    const before = { text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) };
+    const result = run(env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${lock} exists`);
+    expect(result.stderr).not.toContain('/proc/self/fd');
+    // gitconfig and the lock of the other Git stay as they are; Git did not run. Review round 2 of the follow-up (A-L1):
+    // changed expectation, Git ran once, on the copy of the check without the lock (was: never), and never on a copy to
+    // write.
+    expect({ text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) }).toEqual(before);
+    expect(fs.readFileSync(lock, 'utf8')).toBe('the lock of another Git\n');
+    expect(fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((line) => line !== '').map((line) => path.basename(line))).toEqual(['check']);
+  });
+
+  it('removes only its own lock when it fails: an entry that the owner put in its place stays', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    // When Git starts under the lock (its second call; review round 2 of the follow-up, A-L1: the first is the check
+    // without the lock), the owner moves the lock of the script away and puts a file of its own at gitconfig.lock; then
+    // Git fails.
+    const result = run(env, { race: `mv '${lock}' '${lock}.moved' && printf 'other\\n' > '${lock}'`, raceAt: 2, gitFails: '--add' });
+    expect(result.status).toBe(1);
+    expect(fs.readFileSync(lock, 'utf8')).toBe('other\n');
+    expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): the script took Git's lock at every run, also when nothing
+  // changed (every open, also of a running dev container); a run killed then (a Cancel) left it, and it stopped every
+  // later run and every `git config --global` in the dev container. A run that changes nothing takes no lock now.
+  it.each(['file', 'folder'])('takes no lock when nothing changes: a gitconfig.lock (a %s) does not stop the run, and stays', (kind) => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, `[credential "https://github.com"]\n\thelper = \n\thelper = ${JSON.stringify(CONTAINER_CREDENTIAL_HELPER)}\n`);
+    const lock = `${cfg}.lock`;
+    if (kind === 'folder') fs.mkdirSync(lock);
+    else write(lock, 'the lock of another Git\n');
+    const before = { text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) };
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect({ text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg), lock: ino(lock) }).toEqual(before);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a Cancel sends SIGTERM to the process group of the step (the
+  // script and its Git); the script died with it, and a run killed while it held the lock left it. Now it ignores the
+  // signal and ends at once with its cleanup: at the second call of Git (under the lock) its Git dies, it takes the
+  // section for changed and writes it; at the fourth (the first `--add`) the step fails and changes nothing.
+  it.each([
+    [2, 'TERM'],
+    [4, 'TERM'],
+    [2, 'INT'],
+    [2, 'HUP'],
+  ] as const)('leaves no lock and ends at once at the call %s of Git (under the lock) when it gets SIG%s', (call, signal) => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const started = Date.now();
+    const result = run(env, { signalAt: { call, signal } });
+    // Before the SIGKILL of the batch helper (CHANNEL_KILL_GRACE_MS, 5 seconds).
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.signal).toBeNull();
+    expect(fs.existsSync(`${cfg}.lock`)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    if (call === 2) {
+      expect(result.status).toBe(0);
+      expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    } else {
+      expect(result.status).toBe(1);
+      expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+    }
+  });
+
+  // Review round 2 of the follow-up of plan step 11I (A-L1): a lock that a killed run left (root's, a plain file of one
+  // link, unchanged for more than 10 minutes) is removed, with a line in the log; any other lock stays and stops the step.
+  const staleLock = (lock: string, minutes: number) => {
+    const time = (Date.now() - minutes * 60 * 1000) / 1000;
+    if (fs.lstatSync(lock).isSymbolicLink()) fs.lutimesSync(lock, time, time);
+    else fs.utimesSync(lock, time, time);
+  };
+
+  it('removes a lock of root that is unchanged for more than 10 minutes (a run that was killed), says so, and repairs gitconfig', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  it.each([
+    ['younger than 10 minutes', 9, 'file'],
+    ['of another owner', 11, 'other'],
+    // Review round 3 of PR G (A-L1): the owner of the lock is told by its uid, not by the group of the owner.
+    ['of another user in the group of the owner', 11, 'group'],
+    ['a folder', 11, 'folder'],
+    ['a file with a second link', 11, 'linked'],
+    ['a link', 11, 'link'],
+  ] as const)('keeps a lock that is %s, and fails as for a Git that runs', (_what, minutes, kind) => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    if (kind === 'folder') fs.mkdirSync(lock);
+    else if (kind === 'link') fs.symlinkSync(path.join(env.dir, 'nowhere'), lock);
+    else write(lock, 'the lock of another Git\n');
+    if (kind === 'linked') fs.linkSync(lock, path.join(env.dir, 'second'));
+    staleLock(lock, minutes);
+    const before = fs.lstatSync(lock).ino;
+    // Review round 3 of PR G (A-L1): changed test, the lock of another owner is reported as 4321's (was: the test user's,
+    // or chowned to 4321 as root): a lock of the owner of the repository (1000 here, which the test user may be) is
+    // removed now.
+    const result = run(env, kind === 'other' ? { lockOwner: '4321:4321' } : kind === 'group' ? { lockOwner: '4321:1001' } : { rootLock: true });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${lock} exists`);
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.lstatSync(lock).ino).toBe(before);
+    expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+  });
+
+  // Review round 3 of PR G (A-L1): a run killed while it held the lock leaves a lock of root; the next open within 10
+  // minutes fails the step, and its ownership fix of CONFIG_FOLDER after `up` (fixConfigOwnership, CONFIG_OWNERSHIP_FIX_SCRIPT)
+  // gives the lock to the remote user. The rule took only a lock of root, so that lock stayed for good. A lock of the
+  // owner is taken now too (here as the script sees it; the test below makes it so with the real tools, as root).
+  it('removes a lock of the owner that is unchanged for more than 10 minutes (a killed run, then the ownership fix), and repairs gitconfig', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { lockOwner: '1000:1001' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (A-L1): reviewer A's reproduction with the real tools (scratchpad/pGr3A-work/e2-ownerfix.sh):
+  // the first open is killed (SIGKILL) at its first call of Git, under the lock; the ownership fix of the next open gives
+  // the lock to the remote user (1000:1001); 11 minutes later the step removes it and writes gitconfig.
+  it.skipIf(process.getuid?.() !== 0)('removes the lock of a killed run that the ownership fix gave to the remote user, with the real ownership fix as root', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    const lock = path.join(dir, 'gitconfig.lock');
+    const killed = run(env, { signalAt: { call: 1, signal: 'KILL' } });
+    // A script that the signal ended leaves its work folder (root's, in the helper's /tmp).
+    const work = path.dirname(fs.readFileSync(env.gitFiles, 'utf8').split('\n')[0].split(' ')[1]);
+    expect(path.basename(work)).toMatch(/^devenv-git-files-/);
+    fs.rmSync(work, { recursive: true, force: true });
+    expect(killed.signal).toBe('SIGKILL');
+    expect(fs.lstatSync(lock).uid).toBe(0);
+    const [file, ...args] = configOwnershipFixCommand(dir, '1000', '1001');
+    expect(spawnSync(file, args, { encoding: 'utf8' }).status).toBe(0);
+    expect([fs.lstatSync(lock).uid, fs.lstatSync(lock).gid]).toEqual([1000, 1001]);
+    staleLock(lock, 11);
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(path.join(dir, 'gitconfig'), 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(path.join(dir, 'gitconfig'), '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (B3-N2): a stale lock removed between the script's lstat and its removal (by the user, as the
+  // message of the step tells) failed the step with ENOENT; it is a lock that is gone, so the script takes its own.
+  it('takes the lock when a stale lock is removed between its check and its removal', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true, unlinkLockAfterLstat: true });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (B3-N2): only ENOENT of the removal is a lock that is gone; any other error is the step's error
+  // as it is, never taken for a lock of another Git.
+  it('fails with the error of its removal of a stale lock that it cannot remove', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true, unlinkLockError: 'EPERM' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('EPERM: the removal failed\n');
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A-F2): the script copied the whole gitconfig of the owner into the
+  // helper before Git read a line of it (the shell script before it let Git read the file in place).
+  it('refuses a gitconfig of more than 1 MiB before Git reads it, and changes nothing', () => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, `[alias]\n\tst = status\n# ${'x'.repeat(1024 * 1024)}\n`);
+    const before = { text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg) };
+    const result = run(env);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe(`${cfg} is larger than 1 MiB: it stays as it is.\n`);
+    expect({ text: fs.readFileSync(cfg, 'utf8'), ino: ino(cfg) }).toEqual(before);
+    expect(fs.readFileSync(env.gitFiles, 'utf8')).toBe('');
+    expect(fs.readdirSync(path.dirname(cfg)).sort()).toEqual(['docker', 'gh', 'gitconfig']);
+  });
+
+  it('refuses a gitconfig that grows over 1 MiB while it is copied (after the script looked at its size)', () => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    const text = `[alias]\n\tst = status\n# `;
+    write(cfg, `${text}${'x'.repeat(1024 * 1024 - text.length - 11)}\n`);
+    expect(fs.statSync(cfg).size).toBe(1024 * 1024 - 10);
+    const result = run(env, { grow: 100 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe(`${cfg} is larger than 1 MiB: it stays as it is.\n`);
+    expect(fs.statSync(cfg).size).toBe(1024 * 1024 + 91);
+    expect(fs.readFileSync(env.gitFiles, 'utf8')).toBe('');
+    expect(fs.readdirSync(path.dirname(cfg)).sort()).toEqual(['docker', 'gh', 'gitconfig']);
+  });
+
+  it('repairs a gitconfig of exactly 1 MiB', () => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    const text = `[alias]\n\tst = status\n# `;
+    write(cfg, `${text}${'x'.repeat(1024 * 1024 - text.length - 1)}\n`);
+    expect(fs.statSync(cfg).size).toBe(1024 * 1024);
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // By its size: it copies no byte of it (a run that copies from it fails at the limit of 512 KiB on the files it writes).
+  it('refuses a sparse gitconfig of 1 TiB without copying any of it', () => {
+    const env = setup();
+    const cfg = path.join(env.ws, '.devenv+', 'gitconfig');
+    write(cfg, '');
+    fs.truncateSync(cfg, 2 ** 40);
+    const result = run(env, { fileLimit: 1024 });
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe(`${cfg} is larger than 1 MiB: it stays as it is.\n`);
+    expect(fs.statSync(cfg).size).toBe(2 ** 40);
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A, a test that was missing): a folder at credentials.gitconfig is
+  // removed with GNU rm (through the folder that the script opened), which follows no link inside it either.
+  it('removes a folder at credentials.gitconfig without following the links in it to a folder and a file outside', () => {
+    const env = setup();
+    const out = outside(env);
+    const dir = path.join(env.ws, '.devenv+');
+    const folder = path.join(dir, 'credentials.gitconfig');
+    fs.mkdirSync(path.join(folder, 'sub'), { recursive: true });
+    fs.symlinkSync(out.folder, path.join(folder, 'out'));
+    fs.symlinkSync(out.folder, path.join(folder, 'sub', 'out'));
+    fs.symlinkSync(out.file, path.join(folder, 'file'));
+    const before = out.state();
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(out.state()).toEqual(before);
+    expect(out.inodes().filter((inode) => owners(env).has(inode))).toEqual([]);
+    expectConfigFolder(env, dir);
+    expect(fs.readFileSync(folder, 'utf8')).toBe(GIT_CREDENTIALS_CONFIG_CONTENT.split('/workspaces').join(env.ws));
   });
 });
 
@@ -1694,6 +2569,149 @@ describe('review round 8 of unit 6 (P8-2): folders of the repository for the bin
     expect(created.status).toBe(2);
     expect(created.stderr).toContain('leads out of the repository');
     expect(fs.existsSync(path.join(outside, 'new'))).toBe(false);
+  });
+});
+
+// Follow-up of plan step 11I (the links of the owner): CREATE_FOLDERS_SCRIPT runs as root when root owns the repository,
+// and root of the dev container can replace a folder of the repository by a link between a check and a use. A module
+// that Node loads before the script (`--require`) plays it once: right after the script resolved the real path of
+// DEVENV_TEST_RACE_REAL (its last check of the nearest folder), or right before it creates a folder named
+// DEVENV_TEST_RACE_MKDIR, or right before it changes into a folder named DEVENV_TEST_RACE_CHDIR, the folder
+// DEVENV_TEST_RACE_SWAP is renamed away and a link to DEVENV_TEST_RACE_TARGET takes its place. The script never creates a
+// folder out of the repository.
+describe('CREATE_FOLDERS_SCRIPT and the links of the owner (follow-up of plan step 11I)', () => {
+  function setup(): { dir: string; repo: string; outside: string; preload: string } {
+    const dir = fs.realpathSync.native(tempDir());
+    const repo = path.join(dir, 'repo');
+    const outside = path.join(dir, 'outside');
+    fs.mkdirSync(path.join(repo, 'data'), { recursive: true });
+    fs.mkdirSync(outside);
+    const preload = path.join(dir, 'race.js');
+    write(
+      preload,
+      [
+        "'use strict';",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        'const { DEVENV_TEST_RACE_REAL: real, DEVENV_TEST_RACE_MKDIR: made, DEVENV_TEST_RACE_CHDIR: entered, DEVENV_TEST_RACE_SWAP: swap, DEVENV_TEST_RACE_TARGET: target } = process.env;',
+        'let done = false;',
+        'const act = () => {',
+        '  if (done) return;',
+        '  done = true;',
+        "  fs.renameSync(swap, swap + '.moved');",
+        '  fs.symlinkSync(target, swap);',
+        '};',
+        'const realpath = fs.realpathSync.native;',
+        'fs.realpathSync.native = (file, ...rest) => {',
+        '  const result = realpath(file, ...rest);',
+        '  if (file === real) act();',
+        '  return result;',
+        '};',
+        'const mkdirSync = fs.mkdirSync;',
+        'fs.mkdirSync = (file, ...rest) => {',
+        '  if (made !== undefined && path.basename(String(file)) === made) act();',
+        '  return mkdirSync.call(fs, file, ...rest);',
+        '};',
+        'const chdir = process.chdir;',
+        'process.chdir = (folder) => {',
+        '  if (entered !== undefined && path.basename(String(folder)) === entered) act();',
+        '  return chdir.call(process, folder);',
+        '};',
+        '',
+      ].join('\n'),
+    );
+    return { dir, repo, outside, preload };
+  }
+
+  function run(preload: string, repo: string, folders: string[], env: Record<string, string>) {
+    const command = createFoldersCommand(repo, folders);
+    const result = spawnSync(process.execPath, ['--require', preload, ...command.slice(1)], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ...env } });
+    expect(result.error).toBeUndefined();
+    return result;
+  }
+
+  it('creates nothing out of the repository when its nearest folder is replaced by a link after the checks', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new/sub`], {
+      DEVENV_TEST_RACE_REAL: `${repo}/data`,
+      DEVENV_TEST_RACE_SWAP: `${repo}/data`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${repo}/data is no folder of the repository.`);
+  });
+
+  it('creates each part in the folder that it made before, also when that folder is replaced by a link', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new/sub`], {
+      DEVENV_TEST_RACE_MKDIR: 'sub',
+      DEVENV_TEST_RACE_SWAP: `${repo}/data/new`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data/new`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    // `sub` is in the folder `new` that the script made (the owner moved it to new.moved).
+    expect(fs.lstatSync(`${repo}/data/new.moved/sub`).isDirectory()).toBe(true);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+  });
+
+  // Review round 1 of the follow-up (A-F3): the check is the lstat of the folder now (was: its open for reading).
+  it('stops when a folder is replaced by a link between its check and the change into it (the folder entered must be the folder checked)', () => {
+    const { repo, outside, preload } = setup();
+    const result = run(preload, repo, [`${repo}/data/new`], {
+      DEVENV_TEST_RACE_CHDIR: 'data',
+      DEVENV_TEST_RACE_SWAP: `${repo}/data`,
+      DEVENV_TEST_RACE_TARGET: outside,
+    });
+    expect(fs.lstatSync(`${repo}/data`).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${repo}/data is no folder of the repository.`);
+  });
+
+  // Review round 1 of the follow-up of plan step 11I (A-F3): `enter` opened each folder for reading (O_RDONLY), so a folder
+  // that the owner may enter but not read (0311 here; 0711 of another user in the review) stopped the step ("… is no
+  // folder of the repository."), and the Compose open failed each time; the shell script before it needed only the
+  // search permission. The step runs as the owner of the repository: as root, the script runs without the capabilities
+  // that bypass the permissions (as the batch helper runs a step of a user), so that the modes count.
+  const createPermissions = process.getuid?.() !== 0 ? [] : spawnSync('setpriv', ['--version'], { stdio: 'ignore' }).error === undefined ? ['setpriv', '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--'] : undefined;
+  it.skipIf(createPermissions === undefined || process.platform === 'win32')('creates folders below folders that it may enter but not read, the repository folder too', () => {
+    const { repo } = setup();
+    const data = path.join(repo, 'data');
+    const prefixed = (command: string[]) => {
+      const [file, ...args] = [...(createPermissions ?? []), process.execPath, ...command.slice(1)];
+      return spawnSync(file, args, { encoding: 'utf8', timeout: 20_000 });
+    };
+    fs.chmodSync(data, 0o311);
+    fs.chmodSync(repo, 0o311);
+    try {
+      // The setup holds: the folders cannot be opened for reading.
+      const probe = prefixed(['node', '-e', "for (const folder of process.argv.slice(1)) { try { require('fs').openSync(folder, 'r'); process.stdout.write('read '); } catch (error) { process.stdout.write(error.code + ' '); } }", repo, data]);
+      expect(probe.stdout).toBe('EACCES EACCES ');
+      const result = prefixed(createFoldersCommand(repo, [`${data}/new/sub`, `${repo}/top`]));
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    } finally {
+      fs.chmodSync(repo, 0o755);
+      fs.chmodSync(data, 0o755);
+    }
+    expect(fs.lstatSync(`${data}/new/sub`).isDirectory()).toBe(true);
+    expect(fs.lstatSync(`${repo}/top`).isDirectory()).toBe(true);
+  });
+
+  it('refuses a link in place of the repository folder, and creates nothing where it leads', () => {
+    const { dir, outside } = setup();
+    const link = path.join(dir, 'linked-repo');
+    fs.symlinkSync(outside, link);
+    const result = runNode(createFoldersCommand(link, [`${link}/x`]));
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.status).toBe(2);
+    // Review round 1 of the follow-up (A-F3): the whole message, with the code that the open of the folder gave for a link
+    // before (ENOTDIR), which the check by lstat keeps.
+    expect(result.stderr).toBe(`The repository folder ${link} is no folder of its own (ENOTDIR).\n`);
   });
 });
 
