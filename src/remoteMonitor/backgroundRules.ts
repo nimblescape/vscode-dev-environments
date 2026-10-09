@@ -95,7 +95,10 @@ export function qualitiesToFetch(opened: readonly { quality: VscodeQuality; at: 
 /** Plan step 11H2: a server version of the store as the cleanup sees it: its commit and its last use by an open. */
 export interface StoredServer {
   commit: string;
-  /** Review round 1 of 11H2 (A-M1): the time of its marker (markServerOpened); undefined: no open used it. */
+  /**
+   * Review round 1 of 11H2 (A-M1): the time of its marker (markServerOpened); undefined: no open used it. Review round 2
+   * (A2-L2): the cleanup gives the time of the folder of a version without a marker (cleanupUsedAt of background.ts).
+   */
   usedAt: number | undefined;
 }
 

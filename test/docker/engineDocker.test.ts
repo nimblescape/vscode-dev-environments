@@ -20,6 +20,7 @@ import { NodeProcessRunner } from '../../src/core/process';
 import { EngineDocker } from '../../src/core/worker/engineDocker';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
+import { commitsInProcesses } from '../../src/remoteMonitor/backgroundRules';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { dockerTestContext } from './harness';
 
@@ -226,6 +227,46 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     } finally {
       cli.run(['rm', '-f', `${name}-prune-stopped`, `${name}-prune-guarded`, `${name}-prune-running`]);
     }
+  });
+
+  // Review round 2 of 11H2 (reviewer A, A2-L3): what the cleanup of the shared VS Code server store reads of a real engine
+  // (review round 1, A-M2): the running and paused containers that mount the store volume (containerIds with the volume
+  // and the states, as serversInUse asks), and their processes (`GET /containers/<id>/top`) in the shape that the parse
+  // takes, with the commit that a process names; a stopped container is not listed and has no processes. The 40-hex
+  // path is in the command line of `sh` around `sleep` (the `sleep` of Alpine's BusyBox refuses an argument that is no
+  // number). Everything is removed afterwards, and checked to be gone.
+  it('review round 2 of 11H2 (A2-L3): the containers that mount a volume, running or paused, and their processes', async () => {
+    const engine = dockerEngine(engineApi(socket), engineHijack(socket));
+    const commit = crypto.randomBytes(20).toString('hex');
+    const volume = `${name}-store`;
+    const names = { running: `${name}-top-running`, paused: `${name}-top-paused`, stopped: `${name}-top-stopped` };
+    cli.ok(['volume', 'create', '--label', runLabel, volume]);
+    try {
+      const ids: Record<keyof typeof names, string> = { running: '', paused: '', stopped: '' };
+      const mount = `type=volume,source=${volume},target=/opt/devenv/vscode,readonly`;
+      for (const key of Object.keys(names) as Array<keyof typeof names>) {
+        ids[key] = cli.ok(['run', '-d', '--name', names[key], '--network', 'none', '--init', '--label', runLabel, '--mount', mount, TEST_BASE_IMAGE, 'sh', '-c', `sleep 600; : /x/${commit}/node`]);
+      }
+      cli.ok(['pause', names.paused]);
+      cli.ok(['stop', '-t', '0', names.stopped]);
+      const listed = await engine.containerIds({ volume: [volume], status: ['running', 'paused'] }, AbortSignal.timeout(60_000));
+      expect([...listed].sort()).toEqual([ids.running, ids.paused].sort());
+      for (const key of ['running', 'paused'] as const) {
+        const processes = await engine.processes(ids[key], AbortSignal.timeout(60_000));
+        expect(processes, key).toBeDefined();
+        expect(processes!.every((row) => Array.isArray(row) && row.every((field) => typeof field === 'string')), key).toBe(true);
+        expect([...commitsInProcesses(processes!)], key).toEqual([commit]);
+      }
+      expect(await engine.processes(ids.stopped, AbortSignal.timeout(60_000))).toBeUndefined();
+      expect(await engine.processes('devenv-test-missing', AbortSignal.timeout(60_000))).toBeUndefined();
+    } finally {
+      cli.run(['rm', '-f', names.running, names.paused, names.stopped]);
+      cli.run(['volume', 'rm', volume]);
+    }
+    // No container or volume of this test is left.
+    expect(cli.lines(['ps', '-aq', '--filter', `volume=${volume}`])).toEqual([]);
+    for (const leftover of Object.values(names)) expect(cli.container(leftover), leftover).toBeUndefined();
+    expect(cli.lines(['volume', 'ls', '-q']).filter((entry) => entry === volume)).toEqual([]);
   });
 
   it('stops, renames and removes as the Docker CLI does; a missing container is no failure', async () => {

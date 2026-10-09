@@ -796,8 +796,6 @@ export class CacheSchedule {
   private checking = false;
   /** The observe of a check that runs now; a pass waits for it (review round 9, T1). */
   private observing: Promise<void> | undefined;
-  /** Review round 1 of 11H2 (A-L8): the run that runs now (its end stored), for the idle exit. */
-  private current: Promise<void> | undefined;
 
   constructor(
     private readonly deps: {
@@ -851,17 +849,12 @@ export class CacheSchedule {
     if (missed !== undefined && missed <= this.deps.now()) this.deps.log('A background run was still running; the times of the schedule during it are left out.');
   }
 
-  /** Review round 1 of 11H2 (A-L8): whether a run runs now. */
+  /**
+   * Review round 1 of 11H2 (A-L8): whether a run runs now; review round 2 (R1): until its end is stored. Review round 2
+   * (A2-M1): the idle exit asks at each tick and never waits for the run (settled() of round 1 is gone).
+   */
   get busy(): boolean {
     return this.running;
-  }
-
-  /**
-   * Review round 1 of 11H2 (A-L8): resolves when no run runs (the one that runs now ended and its end is stored). The run
-   * is bounded by the time limits of its own parts (a request to the engine, the update service, a fetch, a pull).
-   */
-  async settled(): Promise<void> {
-    await this.current;
   }
 
   /** One run now, unless one runs; then its end is kept (in the volume too). Never throws. */
@@ -871,9 +864,7 @@ export class CacheSchedule {
       return Promise.resolve();
     }
     this.running = true;
-    const current = this.runOnce();
-    this.current = current;
-    return current;
+    return this.runOnce();
   }
 
   private async runOnce(): Promise<void> {
@@ -885,12 +876,14 @@ export class CacheSchedule {
     } catch (error) {
       this.deps.log(`The background run failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      this.running = false;
       this.loaded = true;
       this.lastEndAt = this.deps.now();
       await this.deps.state.update({ lastEndAt: this.lastEndAt }).catch((error: unknown) => {
         this.deps.log(`The end of the background run could not be stored: ${error instanceof Error ? error.message : String(error)}`);
       });
+      // Review round 2 of 11H2 (reviewer B, R1): the run counts as running (busy) until its end is stored, so the idle
+      // exit never ends the process during that write.
+      this.running = false;
     }
   }
 }
@@ -1037,6 +1030,8 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         }
       }, firstMs).unref?.();
       const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      // Review round 2 of 11H2 (reviewer A, A2-M1): the wait for a run is logged once per idle time.
+      let waitLogged = false;
       for (;;) {
         await loop.tick();
         // Plan step 8, PR B (Q5): only here, between two ticks, so never while it holds a lock or stops a container; the
@@ -1044,11 +1039,13 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         // step 11H2 (D1 of 2026-10-09): a permanent monitor (a remote engine, or stopLocalMonitorWhenIdle off) never exits
         // when idle; one that ends when idle does so also with image updates (before, they kept it).
         if (!permanent && loop.idleMs() >= idleExitMs) {
-          // Review round 1 of 11H2 (A-L8): not during a background run (a download would be cut, and its end not stored):
-          // the exit waits for its end (bounded by the limits of its parts), then the loop looks again.
+          // Review round 1 of 11H2 (A-L8): not during a background run (a download would be cut, and its end not stored).
+          // Review round 2 of 11H2 (reviewer A, A2-M1): the loop does not wait for the run: it goes on ticking (the stops of
+          // environments whose windows closed, the heartbeats) and exits at the first idle tick after the run's end.
           if (schedule.busy) {
-            log('No environment container runs, but a background run is running; the Session Monitor exits after its end.');
-            await schedule.settled();
+            if (!waitLogged) log('No environment container runs, but a background run is running; the Session Monitor exits after its end.');
+            waitLogged = true;
+            await sleep(tickMs);
             continue;
           }
           await loop.removals;
@@ -1056,6 +1053,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
           log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and it does not run permanently; the Session Monitor exits. The next open starts it again.`);
           return 0;
         }
+        waitLogged = false;
         await sleep(tickMs);
       }
     }

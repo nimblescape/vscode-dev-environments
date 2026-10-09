@@ -16,9 +16,10 @@
 //      store (D4), as the remote user of each (its label devcontainer.metadata, as the Dev Containers extension attaches;
 //      containerMetadataUser), by the link script of the open (`vscodeServerLink` of the registry of the container
 //      scripts), so the windows that VS Code restores after its update find their server;
-//   d. the cleanup of the store, at most once a day: the server versions that no open used for 14 days, that are not among
-//      the two newest of their quality and platform, and that no running container that mounts the store runs (its
-//      processes; review round 1, A-M2), each under its lock taken without a wait (`flock -n`), and the temporary folders
+//   d. the cleanup of the store, at most once a day: the server versions that no open used for 14 days (one without a
+//      marker: 14 days after the time of its folder; review round 2, A2-L2), that are not among the two newest of their
+//      quality and platform, and that no running container that mounts the store runs (its processes; review round 1,
+//      A-M2), each under its lock taken without a wait (`flock -n`), and the temporary folders
 //      of a version only while its lock can be taken at once; lock files are never removed.
 // The pure rules are in backgroundRules.ts. No `vscode`.
 import { randomBytes } from 'crypto';
@@ -203,7 +204,8 @@ export class BackgroundRun {
 
   /**
    * Review round 1 of 11H2 (A-L4): keeps the failed fetches that still wait (fetchRetryDue false; the newest
-   * MAX_FAILED_FETCHES), when they changed.
+   * MAX_FAILED_FETCHES), when they changed. Review round 2 of 11H2 (reviewer B, R2): a write that fails is one line of the
+   * log and never fails part b (the cleanup still knows the platform and the releases).
    */
   private async storeFailedFetches(before: Record<string, number>, after: Record<string, number>): Promise<void> {
     const now = this.deps.now();
@@ -212,7 +214,10 @@ export class BackgroundRun {
       .sort(([, a], [, b]) => b - a)
       .slice(0, MAX_FAILED_FETCHES);
     const next = Object.fromEntries(waiting);
-    if (JSON.stringify(next) !== JSON.stringify(before)) await this.deps.state.update({ failedFetches: next });
+    if (JSON.stringify(next) === JSON.stringify(before)) return;
+    await this.deps.state.update({ failedFetches: next }).catch((error: unknown) => {
+      this.deps.log(`The failed fetches of the VS Code server could not be stored: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
 
   /**
@@ -296,7 +301,8 @@ export class BackgroundRun {
   /**
    * Part d: the server versions of each quality for the platform of the engine that serversToRemove names (by the
    * released commits of part b; a quality whose commits are not known is left as it is; review round 1 of 11H2: the last
-   * use by an open, and the versions that running containers run), each under its lock without a wait: busy (a download
+   * use by an open (round 2, A2-L2: without a marker, the time of its folder; cleanupUsedAt), and the versions that
+   * running containers run), each under its lock without a wait: busy (a download
    * of it runs) or a lock that fails leaves it to the next cleanup; with the lock, its folder and its marker are checked
    * again (a use since the list keeps it), and it is renamed into a temporary folder and removed there.
    */
@@ -311,7 +317,7 @@ export class BackgroundRun {
       for (const entry of await fs.promises.readdir(folder).catch(() => [] as string[])) {
         if (!/^[0-9a-f]{40}$/.test(entry)) continue;
         const stat = await fs.promises.lstat(path.posix.join(folder, entry)).catch(() => undefined);
-        if (stat?.isDirectory() === true) stored.push({ commit: entry, usedAt: await serverOpenedAt(root, serverVersionName({ commit: entry, quality }, platform)) });
+        if (stat?.isDirectory() === true) stored.push({ commit: entry, usedAt: await cleanupUsedAt(root, serverVersionName({ commit: entry, quality }, platform), stat) });
       }
       if (stored.length === 0) continue;
       // Review round 1 of 11H2 (A-M1): a quality that part b did not ask for (Insiders that no open used for 14 days) is
@@ -341,7 +347,7 @@ export class BackgroundRun {
           const server = path.posix.join(folder, commit);
           const stat = await fs.promises.lstat(server);
           // Checked again under the lock: an open that marked the version since the list keeps it.
-          if (!stat.isDirectory() || !serverUnused(await serverOpenedAt(root, version), this.deps.now())) continue;
+          if (!stat.isDirectory() || !serverUnused(await cleanupUsedAt(root, version, stat), this.deps.now())) continue;
           const temp = path.posix.join(root, STORE_TEMP_FOLDER);
           await fs.promises.mkdir(temp, { recursive: true, mode: 0o700 });
           const moved = path.posix.join(temp, `${version}-${randomBytes(6).toString('hex')}`);
@@ -413,4 +419,14 @@ export class BackgroundRun {
       }
     }
   }
+}
+
+/**
+ * Review round 2 of 11H2 (reviewer A, A2-L2; reviewer B, R3): the last use of a version for the cleanup only: the time of
+ * its marker (markServerOpened), or for a version without one (fetched before the markers, by 11H1 or by the monitor) the
+ * modification time of its folder (`folder`, its lstat: the time of its unpack, which nothing changes later), so that the
+ * versions of an older store get their 14 days too. The Insiders rule (qualitiesToFetch) reads only the markers.
+ */
+async function cleanupUsedAt(root: string, version: string, folder: fs.Stats): Promise<number> {
+  return (await serverOpenedAt(root, version)) ?? folder.mtimeMs;
 }

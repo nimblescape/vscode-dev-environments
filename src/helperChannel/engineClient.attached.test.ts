@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
-import { engineApi, engineHijack } from './engineApi';
+import { MAX_ENGINE_ANSWER_CHARACTERS, engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
 
 interface Call {
@@ -299,6 +299,16 @@ describe('the attached create and the clock of the daemon over the Engine API (p
       const bad = await serve(() => ({ status: 200, json }));
       await expect(bad.engine.processes('a'), JSON.stringify(json)).rejects.toThrow('an invalid value');
     }
+  });
+
+  // Review round 2 of 11H2 (reviewer A, A2-L1): a container with a large process table (here one command line of 2 MiB)
+  // does not block the cleanup: its processes are read up to the bound of the lists, not the 1 MiB of other answers.
+  it('reads the processes of a container past MAX_ENGINE_ANSWER_CHARACTERS (review round 2 of 11H2, A2-L1)', async () => {
+    const long = `/home/u/.vscode-server/bin/${'c'.repeat(40)}/node ${'x'.repeat(2 * 1024 * 1024)}`;
+    const rows = [['root', '1', 'sleep infinity'], ['1000', '42', long]];
+    const big = await serve(() => ({ status: 200, json: { Titles: ['UID', 'PID', 'CMD'], Processes: rows } }));
+    expect(JSON.stringify(rows).length).toBeGreaterThan(MAX_ENGINE_ANSWER_CHARACTERS);
+    expect(await big.engine.processes('a')).toEqual(rows);
   });
 
   it('reads the architecture of the engine (plan step 11H1: the platform of the shared VS Code server); none is a failure', async () => {

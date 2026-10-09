@@ -420,8 +420,10 @@ export function dockerEngine(
       return value.Architecture;
     },
     // Review round 1 of 11H2 (A-M2): the server versions that running dev containers run, for the cleanup of the store.
+    // Review round 2 of 11H2 (reviewer A, A2-L1): read up to MAX_ENGINE_LIST_ANSWER_CHARACTERS (a container with a large
+    // process table would otherwise block every removal while it runs); an answer cut at that bound is still a failure.
     processes: async (container, signal) => {
-      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/top`, signal });
+      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/top`, signal, maxCharacters: MAX_ENGINE_LIST_ANSWER_CHARACTERS });
       if (answer.status === 404 || answer.status === 409) return undefined;
       if (answer.status !== 200) fail(answer);
       if (answer.truncated) throw new EngineError('The engine answered the processes of a container with more than can be read.', answer.status);

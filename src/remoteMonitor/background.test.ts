@@ -434,10 +434,15 @@ describe('the newest Insiders server follows the use by an open (review round 1 
     expect(h.fetched.map((entry) => entry.server)).toEqual([{ commit: C2, quality: 'stable' }]);
   });
 
-  it('a version that the monitor fetched and no open used is removed once it is not among the two newest', async () => {
+  // Review round 2 of 11H2 (reviewer A, A2-L2; reviewer B, R3): changed expectation, a version without a marker counts
+  // as used at the time of its folder in the cleanup, so the versions here were fetched 15 days ago (their folders' time);
+  // one fetched within 14 days stays (background.11H2R2.test.ts).
+  it('a version that the monitor fetched 15 days ago and no open used is removed once it is not among the two newest', async () => {
     const h = harness({ commits: { stable: [C4, C3, C2] } });
-    await readyServer(h.root, { commit: C2, quality: 'stable' }, 'linux-x64', 'never');
-    await readyServer(h.root, { commit: C3, quality: 'stable' }, 'linux-x64', 'never');
+    for (const server of [C2, C3]) {
+      const folder = await readyServer(h.root, { commit: server, quality: 'stable' }, 'linux-x64', 'never');
+      fs.utimesSync(folder, new Date(NOW - 15 * DAY), new Date(NOW - 15 * DAY));
+    }
     await h.run.run();
     expect(fs.readdirSync(path.join(h.root, 'server', 'stable', 'linux-x64')).sort()).toEqual([C3, C4]);
   });
