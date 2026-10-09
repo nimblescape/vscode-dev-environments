@@ -12,7 +12,9 @@ import { beforeEach, expect, inject } from 'vitest';
 import { labelArgs, type BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DOCKER_QUERY_TIMEOUT_MS } from '../../src/core/docker/dockerTimeouts';
 import { findExecutable } from '../../src/core/docker/dockerCli';
-import { helperImageTag } from '../../src/core/helper/helperImage';
+import { helperImageTag, type HelperImageUse } from '../../src/core/helper/helperImage';
+import { HelperImages, type HelperImageDocker } from '../../src/core/helper/helperImages';
+import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/core/imageCheck/credentials';
 import type { ImageChecker } from '../../src/core/imageCheck/imageCheck';
@@ -55,6 +57,33 @@ export function runInVolume(docker: Pick<BootstrapDocker, 'run'>, volume: string
   const tag = helperImageTag(fs.readFileSync(HELPER_DOCKERFILE, 'utf8'));
   const args = ['run', '--rm', '-i', '--pull', 'never', '--label', `${LABEL_HELPER_RUN}=true`, '--network', 'none', '--mount', `type=volume,source=${volume},target=${WORKSPACES_ROOT}`, tag, ...command];
   return docker.run(args, { input });
+}
+
+/**
+ * Plan step 11I (U7, decision of 2026-10-08): the helper image of the tests (resources/helper/Dockerfile) on the engine
+ * of `docker` (so with its Docker context), built when its tag is missing, as the extension prepares the image of its
+ * worker (HelperImages; without a state file, so without the maintenance). WorkspaceHelper builds no image any more: a
+ * test runs it from this image as its own (testWorkspaceHelper), as the worker runs from its own image (section 3b of
+ * the plan). Each test file calls it once, in its `beforeAll` (before: the `ensureImage` of its WorkspaceHelper).
+ */
+export async function testHelperImage(docker: HelperImageDocker, log: Logger, env: NodeJS.ProcessEnv): Promise<HelperImageUse> {
+  const use = await new HelperImages({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE }).ensureImageUse();
+  if (use.id === undefined) throw new Error(`The ID of the helper image ${use.tag} could not be read.`);
+  return use;
+}
+
+/**
+ * Plan step 11I (U7, decision of 2026-10-08): a WorkspaceHelper of a test as the worker builds it (workerServices.ts):
+ * the helper image of the tests (testHelperImage) as its own image, `socket` as the source of the socket mount of the
+ * engine, and whether a container runs read with the CLI of the tests (the worker asks its engine).
+ */
+export function testWorkspaceHelper(image: HelperImageUse, socket: string, cli: DockerCli, log: Logger): WorkspaceHelper {
+  return new WorkspaceHelper({
+    logger: log,
+    ownImage: image,
+    socket,
+    containerRuns: async (containerId) => cli.container(containerId)?.State.Status === 'running',
+  });
 }
 
 /**

@@ -53,7 +53,7 @@ afterEach(() => {
 });
 
 function images(docker: BuildingDocker): HelperImages {
-  return new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux' });
+  return new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile') });
 }
 
 describe('HelperImages.runImage (review 11F2 R2)', () => {

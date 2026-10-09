@@ -6,31 +6,17 @@
 // worker) every image call answers with that image and touches no Docker image (the worker has no Dockerfile and builds
 // nothing); a step of the batch helper runs on that image with the socket of the engine of the operation (its recorded
 // socket, else the endpoint of its context).
+// Plan step 11I (U7, decision of 2026-10-08): WorkspaceHelper wraps no HelperImages and has no Docker port any more:
+// its two image calls (those of the pipeline) give the own image, and a step runs on it with the socket of HelperDeps
+// (the worker's own); the socket of the endpoint of a Docker context is HelperImages' (helperImages.rules.test.ts).
 import { describe, expect, it } from 'vitest';
 import type { HeldEnvironmentLock } from '../docker/environmentLock';
 import type { HelperBatchSession } from '../helperChannel/helperChannel';
 import { silentLogger } from '../ports';
 import { runWithBatchScope } from './batchScope';
-import { WorkspaceHelper, type HelperDocker } from './workspaceHelper';
-import type { HelperEngine } from './helperImages';
+import { WorkspaceHelper } from './workspaceHelper';
 
 const OWN = { tag: 'devenv-helper:own', id: `sha256:${'b'.repeat(64)}` };
-
-/** A Docker port on which every image call fails: the worker touches no helper image. */
-function noImageDocker(touched: string[]): HelperDocker {
-  const refuse = (name: string) => async (): Promise<never> => {
-    touched.push(name);
-    throw new Error(`${name} must not be called`);
-  };
-  return {
-    imageExists: refuse('imageExists'),
-    imageId: refuse('imageId'),
-    buildImage: refuse('buildImage'),
-    listImagesByLabel: refuse('listImagesByLabel'),
-    removeImage: refuse('removeImage'),
-    run: refuse('run'),
-  };
-}
 
 class SocketLock implements HeldEnvironmentLock {
   readonly environmentId = 'e';
@@ -48,15 +34,16 @@ class SocketLock implements HeldEnvironmentLock {
   }
 }
 
-function helper(touched: string[], engine: () => Promise<HelperEngine>, ownImage: typeof OWN | undefined = OWN, platform: NodeJS.Platform = 'linux'): WorkspaceHelper {
+// Plan step 11I (U7): changed setup, the own image, the socket and containerRuns (before: a Docker port that refused
+// every call, an engine, and an optional own image).
+function helper(socket: string): WorkspaceHelper {
   return new WorkspaceHelper({
-    docker: noImageDocker(touched),
     logger: silentLogger,
-    dockerfilePath: '/nonexistent/Dockerfile',
-    env: {},
-    platform,
-    engine,
-    ownImage,
+    ownImage: OWN,
+    socket,
+    containerRuns: async () => {
+      throw new Error('no container query');
+    },
   });
 }
 
@@ -67,38 +54,32 @@ async function ownershipFix(h: WorkspaceHelper): Promise<{ image: string; socket
 }
 
 describe('WorkspaceHelper with its own image (review 11F2 R1)', () => {
-  it('checks, reads and prebuilds its own image without any Docker image call', async () => {
-    const touched: string[] = [];
-    const h = helper(touched, async () => ({ key: 'box', socket: '/s.sock' }));
-    await expect(h.checkImagePresent()).resolves.toBeUndefined();
-    expect(await h.presentImage()).toEqual(OWN);
-    expect(await h.prebuildImage({ signal: new AbortController().signal })).toEqual(OWN);
-    expect(await h.ensureImage()).toBe(OWN.tag);
-    expect(touched).toEqual([]);
-  });
+  // Plan step 11I (U7, decision of 2026-10-08): the test "checks, reads and prebuilds its own image without any Docker
+  // image call" is deleted with the code that it tested (checkImagePresent, presentImage, prebuildImage and ensureImage
+  // of WorkspaceHelper, and its Docker port).
 
+  // Plan step 11I (U7): changed expectation, the two image calls that WorkspaceHelper keeps (before: also
+  // checkImagePresent, presentImage and prebuildImage, which are removed, and no call of the Docker port, which is
+  // removed).
   it('passes an abort through on each image call', async () => {
-    const touched: string[] = [];
-    const h = helper(touched, async () => ({ key: 'box', socket: '/s.sock' }));
+    const h = helper('/s.sock');
     const controller = new AbortController();
     controller.abort();
     const signal = controller.signal;
-    await expect(h.checkImagePresent({ signal })).rejects.toMatchObject({ name: 'AbortError' });
-    await expect(h.presentImage({ signal })).rejects.toMatchObject({ name: 'AbortError' });
-    await expect(h.prebuildImage({ signal })).rejects.toMatchObject({ name: 'AbortError' });
     await expect(h.ensureImageUse({ signal })).rejects.toMatchObject({ name: 'AbortError' });
-    expect(touched).toEqual([]);
+    await expect(h.ensureImagePresent({ signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(await h.ensureImageUse()).toEqual(OWN);
+    expect(await h.ensureImagePresent()).toEqual(OWN);
   });
 
+  // Plan step 11I (U7): changed setup, the socket is the one of HelperDeps (the worker's own socket; before: the
+  // recorded socket of the engine of the operation).
   it('runs a step of the batch helper on its own image with the recorded socket of the engine', async () => {
-    const touched: string[] = [];
-    const opens = await ownershipFix(helper(touched, async () => ({ key: 'box', socket: '/run/user/1000/docker.sock' })));
+    const opens = await ownershipFix(helper('/run/user/1000/docker.sock'));
     expect(opens).toEqual([{ image: OWN.id, socket: '/run/user/1000/docker.sock' }]);
-    expect(touched).toEqual([]);
   });
 
-  it('follows the endpoint of the Docker context of the operation for the socket when the engine records none', async () => {
-    const opens = await ownershipFix(helper([], async () => ({ key: '', endpoint: 'unix:///run/user/1000/docker.sock' })));
-    expect(opens).toEqual([{ image: OWN.id, socket: '/run/user/1000/docker.sock' }]);
-  });
+  // Plan step 11I (U7): the test "follows the endpoint of the Docker context of the operation for the socket when the
+  // engine records none" is deleted with the code that it tested (WorkspaceHelper no longer computes a socket; the
+  // worker gives its own, and the endpoint rule is helperDockerSocket's, tested in helperImages.rules.test.ts).
 });

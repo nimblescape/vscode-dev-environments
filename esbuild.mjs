@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { fileURLToPath } from 'url';
 import * as esbuild from 'esbuild';
 import { devcontainerCliVersion } from './scripts/cliVersion.mjs';
-import { workerScriptsPlugin } from './scripts/workerScripts.mjs';
+import { workerBundleOptions } from './scripts/workerScripts.mjs';
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -85,13 +85,10 @@ const contexts = await Promise.all([
   // Monitor (the module `devenv:monitor-script`, scripts/workerScripts.mjs), which it gives the monitor container it
   // creates; before, the extension read dist/remoteMonitor.js for it. Plan step 11E2: and the thread of the host access
   // analysis (the module `devenv:analysis-script`), which it starts from that text.
+  // Review round 1 of PR #129 (A-L2): its options (workerBundleOptions) are the ones that src/workerBundle.test.ts builds.
   esbuild.context({
-    ...shared,
-    entryPoints: ['src/helperChannel/main.ts'],
+    ...workerBundleOptions(fileURLToPath(new URL('.', import.meta.url)), shared),
     outfile: outfiles[2],
-    minify: true,
-    sourcemap: false,
-    plugins: [...shared.plugins, workerScriptsPlugin(fileURLToPath(new URL('.', import.meta.url)), shared.define)],
   }),
 ]);
 

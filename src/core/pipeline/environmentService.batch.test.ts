@@ -11,8 +11,6 @@
 // call (Q4: through the worker that holds the lock). The FakeHelper does not route itself; each of its volume steps
 // runs one step of the scope here, as WorkspaceHelper does.
 import { createHash } from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EnvironmentLockError, type HeldEnvironmentLock } from '../docker/environmentLock';
 import { UserFacingError, isBatchHelperUnavailable } from '../errors';
@@ -22,7 +20,7 @@ import { currentBatchScope } from '../helper/batchScope';
 import { abortError, isAbortError, silentLogger, type RunResult } from '../ports';
 import { batchStepCommand, type BatchStepKind } from '../helper/batchSteps';
 import { composeProjectName } from '../names';
-import { WorkspaceHelper, type HelperDocker, type HelperImageUse } from '../helper/workspaceHelper';
+import { WorkspaceHelper, type HelperImageUse } from '../helper/workspaceHelper';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './operationBase';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, REPO, TOKEN, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './pipelineRules';
@@ -47,19 +45,6 @@ const VOLUME_STEPS = [
   // Plan step 11G1: the ownership fix of the repository before the dev container is created.
   'fixRepositoryOwnership',
 ] as const;
-
-/** A HelperDocker for the real WorkspaceHelper (plan step 7): in the scope it runs nothing. */
-const noDockerInScope: HelperDocker = {
-  run: async () => {
-    throw new Error('A docker run in the scope.');
-  },
-  imageExists: async () => true,
-  imageId: async () => PINNED_ID,
-  buildImage: async () => PINNED_ID,
-  listImagesByLabel: async () => [],
-  removeImage: async () => true,
-};
-const PINNED_ID = `sha256:${'4'.repeat(64)}`;
 
 let h: Harness;
 /** In order: `lock`, `open <session>`, `step <name> <session>`, `close <session>`, `docker volume rm`, `release`. */
@@ -90,6 +75,22 @@ let lockWaits: number[];
  */
 let onLockWait: (() => void) | undefined;
 const PINNED: HelperImageUse = { tag: 'devenv-helper:test', id: `sha256:${'4'.repeat(64)}` };
+
+/**
+ * Plan step 11I (U7, decision of 2026-10-08): the real WorkspaceHelper as the worker builds it, on its own image
+ * (PINNED) with its socket; it has no Docker port (before: a HelperDocker whose `docker run` in the scope threw, and
+ * the Dockerfile of a helper image of the window), and a query of a container in the scope throws.
+ */
+function workerHelper(): WorkspaceHelper {
+  return new WorkspaceHelper({
+    logger: silentLogger,
+    ownImage: PINNED,
+    socket: '/var/run/docker.sock',
+    containerRuns: async () => {
+      throw new Error('A container query in the scope.');
+    },
+  });
+}
 
 function batchLock(environmentId: string): HeldEnvironmentLock {
   let sessions = 0;
@@ -247,9 +248,9 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
     // Plan step 7 (user decision of 2026-10-01, "step 7 proposal accepted"): changed expectation, the listing of
     // Select configuration runs as the step listConfigs in one session under the lock (was: no scope, no lock).
     await seedEnvironment(h, { container: 'stopped' });
-    const dockerfile = path.join(h.root, 'Dockerfile');
-    fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
-    realHelper = new WorkspaceHelper({ docker: noDockerInScope, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
+    // Plan step 11I (U7): changed setup, the helper of the worker (workerHelper; before: with the Dockerfile of the
+    // window).
+    realHelper = workerHelper();
     expect(await h.service.listConfigurations(ENV_ID, { progress: h.progress })).toEqual(Object.keys(h.helper.files));
     expect(scopes).toEqual([`listConfigurations ${VOLUME}`]);
     expect(recorded).toEqual([{ kind: 'listConfigs', params: { repository: REPO } }]);
@@ -285,10 +286,9 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
       const controller = new AbortController();
       if (when === 'lock wait') onLockWait = () => controller.abort();
       else onStep = () => controller.abort();
-      // The step runs as the real WorkspaceHelper sends it (kind listConfigs), with the image of the window.
-      const dockerfile = path.join(h.root, 'Dockerfile');
-      fs.writeFileSync(dockerfile, 'FROM node:22-bookworm-slim\n');
-      realHelper = new WorkspaceHelper({ docker: noDockerInScope, logger: silentLogger, dockerfilePath: dockerfile, env: {}, platform: 'linux' });
+      // The step runs as the real WorkspaceHelper sends it (kind listConfigs). Plan step 11I (U7): changed setup, with
+      // the own image of the worker (workerHelper; before: the image of the window, from its Dockerfile).
+      realHelper = workerHelper();
       const error = await h.service.listConfigurations(ENV_ID, { progress: h.progress, signal: controller.signal }).then(
         (paths) => ({ paths }),
         (reason: unknown) => reason,
@@ -362,18 +362,6 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
     expect(frame()).toEqual(['lock', open, 'close s1', 'docker volume rm', 'release']);
   });
 
-  /** A HelperDocker for the real WorkspaceHelper: in the scope it runs nothing. */
-  const noDocker: HelperDocker = {
-    run: async () => {
-      throw new Error('A docker run in the scope.');
-    },
-    imageExists: async () => true,
-    imageId: async () => PINNED.id,
-    buildImage: async () => PINNED.id,
-    listImagesByLabel: async () => [],
-    removeImage: async () => true,
-  };
-
   const COMPOSE_CONFIG = `{
   "name": "API",
   "dockerComposeFile": ["compose.yml"],
@@ -421,7 +409,9 @@ describe('the batch scope of the opens (plan step 6, PR C)', () => {
   ];
   for (const [name, open, kinds] of opens) {
     it(`review round 1 of PR #82, B-R1-4: every step of a whole open is one the batch helper accepts (batchStepCommand): ${name}`, async () => {
-      realHelper = new WorkspaceHelper({ docker: noDocker, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux' });
+      // Plan step 11I (U7): changed setup, the helper of the worker (workerHelper; before: with a Docker port of its
+      // own).
+      realHelper = workerHelper();
       await open();
       expect(frame().filter((event) => event.startsWith('open '))).toHaveLength(1);
       expect(recorded.map((step) => step.kind)).toEqual(expect.arrayContaining(kinds));
@@ -527,7 +517,9 @@ describe('a batch helper that cannot be opened refuses the open (user decision o
   });
 
   it('plan step 11G1: the fix before the container is created runs in the session of the open, before `up`, with parameters the batch helper accepts', async () => {
-    realHelper = new WorkspaceHelper({ docker: noDockerInScope, logger: silentLogger, dockerfilePath: '/nonexistent/Dockerfile', env: {}, platform: 'linux' });
+    // Plan step 11I (U7): changed setup, the helper of the worker (workerHelper; before: with a Docker port of its
+    // own).
+    realHelper = workerHelper();
     await h.service.open(TARGET, { progress: h.progress });
     const kinds = recorded.map((step) => step.kind);
     expect(kinds.indexOf('repositoryOwnershipFix')).toBeGreaterThan(kinds.indexOf('build'));

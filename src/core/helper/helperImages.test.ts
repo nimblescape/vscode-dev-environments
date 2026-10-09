@@ -3,8 +3,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 11F2: the helper image of the bootstrap on its own (HelperImages), as the extension uses it without the
-// steps of the workspace helper. Its rules are tested through the workspace helper (workspaceHelper.test.ts), which
-// delegates to it; here: that it works alone, on the Docker port of the bootstrap.
+// steps of the workspace helper. Its rules are tested in helperImages.rules.test.ts (plan step 11I, U7, decision of
+// 2026-10-08: moved from workspaceHelper.test.ts, which tested them through the workspace helper while it delegated to
+// HelperImages); here: that it works alone, on the Docker port of the bootstrap.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -53,7 +54,7 @@ afterEach(() => {
 });
 
 function images(docker: FakeDocker, onImageBuilt?: () => void): HelperImages {
-  return new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux', onImageBuilt });
+  return new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), onImageBuilt });
 }
 
 describe('HelperImages (plan step 11F2)', () => {
@@ -82,9 +83,11 @@ describe('HelperImages (plan step 11F2)', () => {
     expect(await helper.presentImage()).toEqual({ tag: TAG, id: ID });
   });
 
-  it('names the local engine and its socket without an engine of the operation', async () => {
+  // Review round 1 of PR #129 (A-L3): changed expectation: HelperImages no longer names a socket (socketPathFor is
+  // removed: the steps of the workspace helper take the socket of the worker's own container, plan step 11I, U7).
+  it('names the local engine without an engine of the operation', async () => {
     const helper = images(new FakeDocker());
     expect(await helper.engineKey()).toBe('');
-    expect(helper.socketPathFor(await helper.currentEngine())).toBe('/var/run/docker.sock');
+    expect(await helper.currentEngine()).toEqual({ key: '' });
   });
 });

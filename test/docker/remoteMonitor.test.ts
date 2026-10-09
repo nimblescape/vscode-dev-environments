@@ -29,7 +29,6 @@ import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { LABEL_ENVIRONMENT_ID } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -53,7 +52,7 @@ import { WindowHeartbeats } from '../../src/core/session/windowHeartbeats';
 import { SWITCH_RELEASE_BOUNDS, releaseEnvironment, releaseLimitSeconds } from '../../src/core/session/windowRelease';
 import type { Environment } from '../../src/core/types';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { HELPER_DOCKERFILE, Timings, dockerTestContext, testStateVolume } from './harness';
+import { Timings, dockerTestContext, testHelperImage, testStateVolume } from './harness';
 import { holdLockInContainer, lockIsFree } from './workerLocks';
 
 const SOURCE = crypto.randomBytes(16).toString('hex');
@@ -101,7 +100,6 @@ async function waitUntil(condition: () => boolean, what: string, timeoutMs = 90_
 describe('the Session Monitor container of a remote Docker host', () => {
   const { run, env, cli, log } = dockerTestContext('remoteMonitor');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const containerName = `devenv-test-monitor-${run.runId}`;
   const volumeName = `devenv-test-monitor-${run.runId}`;
   const timings = new Timings();
@@ -168,7 +166,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
 
   beforeAll(async () => {
     script = await timings.measure('bundle the script', bundleScript);
-    helperTag = await timings.measure('workspace helper image ready', () => helper.ensureImage());
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    helperTag = (await timings.measure('workspace helper image ready', () => testHelperImage(docker, log, env))).tag;
   });
 
   afterAll(() => {
@@ -561,7 +561,6 @@ describe('the Session Monitor container of a remote Docker host', () => {
 describe('the Session Monitor container: the environment lock of its stops and its exit when idle (plan step 8 PR B)', () => {
   const { run, env, cli, log } = dockerTestContext('remoteMonitor');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const containerName = `devenv-test-monitor-lock-${run.runId}`;
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);
   let script = '';
@@ -604,7 +603,9 @@ describe('the Session Monitor container: the environment lock of its stops and i
 
   beforeAll(async () => {
     script = await bundleScript();
-    helperTag = await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    helperTag = (await testHelperImage(docker, log, env)).tag;
     // The volume of the workers' lock files is the volume of this monitor, as on an engine.
     volumeName = testStateVolume({ run, cli }, 'remoteMonitor-locks');
     // Long idle time: these tests do not wait for the exit.

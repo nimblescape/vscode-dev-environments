@@ -38,11 +38,6 @@ import { EngineDocker } from './engineDocker';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
 
-/** What a part of the pipeline that is not in the worker yet throws (fail closed); `step` names the plan step that brings it. */
-function notInWorker(what: string, step: string): Error {
-  return new Error(`${what} does not run in the worker before plan step ${step}.`);
-}
-
 /**
  * Plan step 11I (PR D): what a part of the pipeline throws when its operation did not give the worker what it needs (fail
  * closed): only the operation `open` gives the settings and the ensure of the Session Monitor.
@@ -362,32 +357,17 @@ export function workerServiceDeps(deps: WorkerServicesDeps): EnvironmentServiceD
   // one registry secret; review round 1 of PR #109, A-H1).
   const logins = registryLogins(deps.host, () => deps.forgetSecret(SECRET_REGISTRY), deps.logger);
   const docker = new EngineDocker(deps.engine, deps.logger, deps.secretOf, logins);
+  // Plan step 11I (U7, decision of 2026-10-08): the helper runs from the worker's own image with the worker's socket;
+  // it gets no Docker port, so nothing of the helper image of the extension is here (before: stubs that threw for the
+  // build, the listing and the removal of helper images and for a `docker run`).
   const helper = new WorkspaceHelper({
-    docker: {
-      run: async () => {
-        throw notInWorker('A container of the workspace helper of its own', '11G');
-      },
-      imageExists: (reference) => docker.imageExists(reference),
-      imageId: (reference) => docker.imageId(reference),
-      buildImage: async () => {
-        throw new Error('The worker builds no helper image: it runs from its own.');
-      },
-      listImagesByLabel: async () => {
-        throw new Error('The worker maintains no helper images: it runs from its own.');
-      },
-      removeImage: async () => {
-        throw new Error('The worker maintains no helper images: it runs from its own.');
-      },
-    },
     logger: deps.logger,
-    dockerfilePath: '',
-    env: {},
-    platform: 'linux',
-    engine: async () => ({ key: deps.dockerHost, socket: deps.ownHelper.socket }),
     ownImage: deps.ownHelper.image,
+    socket: deps.ownHelper.socket,
     // Review round 1 of PR #111 (A-M2): a container that runs after its lifecycle commands failed is kept (the helper's own
     // inspect would fail closed in the worker, so every such open failed).
-    containerRuns: async (containerId) => (await docker.containerState(containerId)) === 'running',
+    // Review round 1 of PR #129 (B-L4): with the signal of the step, so a cancel does not wait for the inspect.
+    containerRuns: async (containerId, signal) => (await docker.containerState(containerId, signal)) === 'running',
   });
   return {
     docker,

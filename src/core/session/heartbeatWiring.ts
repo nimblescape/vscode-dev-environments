@@ -4,7 +4,7 @@
 
 // Review round 5 of PR #85 (B-R5-1): the wiring of the helper image for the heartbeats of a window, which extension.ts
 // had inline: the preparation of the heartbeats (HeartbeatPreparation, disposed with the window), the end of its waits
-// when a build of the helper image succeeded (WorkspaceHelper's onImageBuilt: the wait of the engine of the operation
+// when a build of the helper image succeeded (HelperImages' onImageBuilt: the wait of the engine of the operation
 // that built it, every wait when that engine is not known), the preparation of a worker (HelperChannels' `prepare`) and
 // the repair of a Session Monitor container, both through heartbeatHelperImage. extension.ts uses it; here so the wiring
 // is tested.

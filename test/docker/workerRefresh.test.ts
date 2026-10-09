@@ -14,7 +14,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { mapContainerState } from '../../src/core/docker/dockerObjects';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL } from '../../src/core/helperChannel/protocol';
@@ -22,7 +21,7 @@ import { LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
 import type { EnvironmentRuntimeState, EnvironmentStates, StateEnvironment } from '../../src/core/pipeline/refreshStates';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
+import { dockerTestContext, testHelperImage, testStateVolume } from './harness';
 
 async function bundleScript(): Promise<string> {
   const result = await esbuild.build({
@@ -56,16 +55,6 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
   // of the removed CLI adapter ContainerAdapter.
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
-  const helper = new WorkspaceHelper({
-    docker,
-    logger: log,
-    dockerfilePath: HELPER_DOCKERFILE,
-    env,
-    engine: async () => {
-      const target = await targets.current();
-      return { key: target.host, endpoint: target.endpoint };
-    },
-  });
   const runLabel = `${TEST_RUN_LABEL}=${run.runId}`;
   const names = { git: `devenv-refresh-git-${run.runId}`, stopped: `devenv-refresh-stopped-${run.runId}`, none: `devenv-refresh-none-${run.runId}`, other: `devenv-refresh-other-${run.runId}` };
   const environments: StateEnvironment[] = [
@@ -82,7 +71,10 @@ describe('the refresh through the worker (plan step 5, PR C)', () => {
 
   beforeAll(async () => {
     const script = await bundleScript();
-    helperTag = await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper on the engine of the current target, whose key and endpoint a build without a state file does not
+    // read).
+    helperTag = (await testHelperImage(docker, log, env)).tag;
     channels = new HelperChannels({
       logger: log,
       open: (target) =>

@@ -14,9 +14,8 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { workerScriptsPlugin } from '../../scripts/workerScripts.mjs';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { NodeProcessRunner } from '../../src/core/process';
-import { HELPER_DOCKERFILE, dockerTestContext } from './harness';
+import { dockerTestContext, testHelperImage } from './harness';
 
 /** The program in the container: the analyzer of the worker over the script of the bundle, three jobs, their results. */
 const PROGRAM = `
@@ -37,7 +36,6 @@ main();
 describe('the analysis thread of the worker in the helper image (plan step 11E2)', () => {
   const { run, env, cli, log } = dockerTestContext('analysisThread');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
-  const helper = new WorkspaceHelper({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE, env });
   const root = path.resolve(__dirname, '../..');
   let bundle = '';
   let helperTag = '';
@@ -62,7 +60,9 @@ describe('the analysis thread of the worker in the helper image (plan step 11E2)
     } finally {
       fs.rmSync(entry, { force: true });
     }
-    helperTag = await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper).
+    helperTag = (await testHelperImage(docker, log, env)).tag;
   });
 
   it('analyzes in a thread started from the script text, and holds its time and memory limits there', () => {

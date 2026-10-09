@@ -31,10 +31,6 @@ export interface HelperImagesDeps {
   logger: Logger;
   /** resources/helper/Dockerfile of the installed extension. */
   dockerfilePath: string;
-  /** Environment of the extension host. Only DOCKER_HOST is read (for the socket path); nothing of it enters the helper. */
-  env: NodeJS.ProcessEnv;
-  /** Default: the platform of this process. */
-  platform?: NodeJS.Platform;
   clock?: Clock;
   /**
    * `helper.json` in the global storage folder (StoragePaths.helperState). With it, ensureImage also checks the base
@@ -50,9 +46,9 @@ export interface HelperImagesDeps {
   /**
    * Unit 7: the Docker engine that the operation uses (the current Docker context). `key` names it ('' for the local
    * Docker, else the remote host): the image found or built for one engine is not reused for another, and a remote
-   * engine has its own state file. `socket`: the source of the socket mount on the machine of that engine (for a remote
-   * host `/var/run/docker.sock`, or the recorded socket of a rootless engine); `endpoint`: the local endpoint of the
-   * context, for helperDockerSocket. Without it, the local Docker of DOCKER_HOST.
+   * engine has its own state file. Without it, the local Docker of DOCKER_HOST. Review round 1 of PR #129 (A-L3): the
+   * socket of the engine is no longer part of it (HelperImages starts no container; the socket mount of the worker is
+   * extension.ts' engineSocket, and the batch helpers take the worker's own).
    */
   engine?: () => Promise<HelperEngine>;
   /** Plan step 5, PR A: called after a build of the helper image succeeded (the worker can be opened again at once). */
@@ -68,11 +64,9 @@ export interface PresentImageOptions {
   onBuild?: (kind: HelperBuildKind) => void;
 }
 
-/** See HelperDeps.engine. */
+/** See HelperImagesDeps.engine. */
 export interface HelperEngine {
   key: string;
-  socket?: string;
-  endpoint?: string;
 }
 
 /**
@@ -96,7 +90,7 @@ export interface EnsureImageOptions {
 }
 
 /**
- * The result of ensureHelperImage that WorkspaceHelper caches, and the helper image of an open (see HelperImageUse in
+ * The result of ensureHelperImage that HelperImages caches, and the helper image of an open (see HelperImageUse in
  * helperImage.ts). Review round 3 of PR #64 (P2): the runs of an open use its `id`, for the current tag too.
  */
 export type { HelperImageUse };
@@ -144,7 +138,7 @@ export class HelperImages {
   /** Last time this instance recorded a use of the tag in the state file. */
   private imageUsedAt: number | undefined;
   private readonly clock: Clock;
-  /** The engine of the cached image (HelperDeps.engine). */
+  /** The engine of the cached image (HelperImagesDeps.engine). */
   private imageEngine = '';
   /**
    * Review round 5 of PR #64 (R5-1): the build that the cached image promise has started (HelperBuildKind), until it
@@ -160,15 +154,9 @@ export class HelperImages {
     this.clock = deps.clock ?? systemClock;
   }
 
-  /** The engine of the operation (HelperDeps.engine); the local Docker without it. */
+  /** The engine of the operation (HelperImagesDeps.engine); the local Docker without it. */
   async currentEngine(): Promise<HelperEngine> {
     return (await this.deps.engine?.()) ?? { key: '' };
-  }
-
-  /** The source of the socket mount for the engine (see HelperDeps.engine and helperDockerSocket). */
-  socketPathFor(engine: HelperEngine): string {
-    if (engine.socket !== undefined) return engine.socket;
-    return helperDockerSocket(this.deps.env, this.deps.platform ?? process.platform, engine.endpoint);
   }
 
   private statePathFor(engine: HelperEngine): string | undefined {
@@ -264,7 +252,7 @@ export class HelperImages {
   }
 
   /**
-   * The key of the engine of the operation (HelperDeps.engine; '' for the local Docker). Plan step 6, PR D: the
+   * The key of the engine of the operation (HelperImagesDeps.engine; '' for the local Docker). Plan step 6, PR D: the
    * background prebuild reads the state file of this engine (helperStatePathFor), the one that an open on it writes.
    */
   async engineKey(): Promise<string> {
@@ -273,7 +261,9 @@ export class HelperImages {
 
   /**
    * Review round 1 of PR #113 (A-L2; round 2, A2-L3: its own place): the helper image of a step of the workspace helper without the image of an open
-   * (the cache, without its maintenance: only a missing tag is built), for WorkspaceHelper.
+   * (the cache, without its maintenance: only a missing tag is built), for WorkspaceHelper. Plan step 11I (U7, decision
+   * of 2026-10-08): WorkspaceHelper no longer calls it (it runs in the worker, from the worker's own image), so it has no
+   * caller outside the tests; it stays with the rest of HelperImages, unchanged.
    */
   runImage(options: EnsureImageOptions): Promise<HelperImageUse> {
     return this.image(options, false);

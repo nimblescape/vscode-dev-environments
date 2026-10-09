@@ -839,7 +839,7 @@ describe('WindowHeartbeats (plan step 8, PR A)', () => {
       vi.useRealTimers();
     });
 
-    /** A shared build like WorkspaceHelper's: started once, cancelled only by the signal of the caller that started it. */
+    /** A shared build like HelperImages': started once, cancelled only by the signal of the caller that started it. */
     function sharedBuild() {
       const build = { count: 0, signal: undefined as AbortSignal | undefined, finish: () => {}, pending: undefined as Promise<void> | undefined };
       const ensure = (signal: AbortSignal | undefined): Promise<void> => {

@@ -323,8 +323,11 @@ export interface EnvironmentDocker {
    * `environmentId`, only those whose label nimblescape.devenv.environment-id names that environment.
    */
   listProjectImages(project: string, environmentId?: string): Promise<string[]>;
-  /** 'missing' if not found; running|restarting|paused → 'running'; else 'stopped'. */
-  containerState(nameOrId: string): Promise<ContainerState>;
+  /**
+   * 'missing' if not found; running|restarting|paused → 'running'; else 'stopped'. Review round 1 of PR #129 (B-L4): an
+   * abort of `signal` ends the read at once (before, a cancel waited for the time limit of the query).
+   */
+  containerState(nameOrId: string, signal?: AbortSignal): Promise<ContainerState>;
   /** A missing container is not an error. */
   stopContainer(nameOrId: string): Promise<void>;
   /** Review round 22 (D22-1): throws when the container does not exist or the name is taken. */
@@ -6449,7 +6452,8 @@ export class EnvironmentService extends OperationBase {
   /**
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
    * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
-   * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent), then the worker with the lock
+   * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent; plan step 11I, U7: in the worker the
+   * worker's own image, nothing is built), then the worker with the lock
    * (the worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the

@@ -188,18 +188,14 @@ async function activateExtension(
     docker,
     logger,
     dockerfilePath: helperDockerfile,
-    env,
     // Implementation notes 7: the weekly check of the base image uses the registry client (and the credentials) of the
     // image check, with its own time limit of 5 seconds, in the background of the open.
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
-    // Unit 7: the engine of the operation. On a remote host the socket mount's source is a path of that computer: the
-    // recorded socket of a rootless engine, else /var/run/docker.sock.
-    engine: async () => {
-      const target = await targets.current();
-      if (target.kind !== 'remote') return { key: target.host, endpoint: target.endpoint };
-      return { key: target.host, socket: (await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET };
-    },
+    // Unit 7: the engine of the operation (its key: '' for the local Docker, else the host). Review round 1 of PR #129
+    // (A-L3): without its socket, which only the steps of the workspace helper read (now the worker's own; the socket
+    // mount of the worker is engineSocket below).
+    engine: async () => ({ key: (await targets.current()).host }),
     // Plan step 5, PR A: a worker that could not be opened for want of the helper image is tried again at once.
     // Review round 4 of PR #85 (A-R4-1): a build that succeeded also ends the wait of the heartbeats' builds on its engine
     // (the target of the operation that built it; every wait when it is not known). Review round 5 of PR #85 (B-R5-1):
@@ -678,7 +674,7 @@ async function activateExtension(
   // User decision 2026-09-29 (no previous helper image): when helper.json does not know the current helper tag (after the
   // installation, or an update that changed it; review round 7 of PR #64, R7-2), the helper image is built in the background, when Docker runs (review round
   // 6 of PR #64, R6-1: no cross-window lock; windows that start together may each build once, later ones find the record).
-  // The build is shared with the open pipeline of this window (WorkspaceHelper.prebuildImage) and cancelled when the
+  // The build is shared with the open pipeline of this window (HelperImages.prebuildImage) and cancelled when the
   // extension is deactivated. Plan step 6, PR D: on the Docker engine of the current Docker context, local or remote
   // alike, as an operation on it (the state file and engine key of an open there); a remote host gets our own SSH check
   // without questions before its `docker info` (dockerEngineAnswers). A host switch starts no new prebuild: the next

@@ -34,7 +34,7 @@ describe('HelperImages.checkImagePresent (PR #119, B-R1)', () => {
       listImagesByLabel: async () => [],
       removeImage: async () => false,
     };
-    const helper = new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile'), env: {}, platform: 'linux' });
+    const helper = new HelperImages({ docker, logger: silentLogger, dockerfilePath: path.join(dir, 'Dockerfile') });
     expect(helperImageTag(DOCKERFILE)).toBeTruthy();
     await expect(helper.checkImagePresent({ signal: controller.signal })).rejects.toSatisfy(isAbortError);
   });

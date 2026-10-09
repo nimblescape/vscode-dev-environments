@@ -14,7 +14,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteCheckValue, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
@@ -24,7 +23,7 @@ import type { Environment } from '../../src/core/types';
 import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';
 import { hostSideHandler } from '../../src/core/worker/hostSideHandler';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
-import { DUMMY_TOKEN, HELPER_DOCKERFILE, dockerTestContext, testStateVolume } from './harness';
+import { DUMMY_TOKEN, dockerTestContext, testHelperImage, testStateVolume } from './harness';
 import { holdLockInContainer } from './workerLocks';
 
 async function bundleScript(): Promise<string> {
@@ -71,23 +70,16 @@ describe('the flows through a real worker (plan step 11B1)', () => {
   const { run, env, cli, log } = dockerTestContext('workerFlows');
   const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
   const targets = new DockerTargets(docker, env, log);
-  const helper = new WorkspaceHelper({
-    docker,
-    logger: log,
-    dockerfilePath: HELPER_DOCKERFILE,
-    env,
-    engine: async () => {
-      const target = await targets.current();
-      return { key: target.host, endpoint: target.endpoint };
-    },
-  });
   const runLabel = `${TEST_RUN_LABEL}=${run.runId}`;
   let helperTag = '';
   let channels: HelperChannels;
 
   beforeAll(async () => {
     const script = await bundleScript();
-    helperTag = await helper.ensureImage();
+    // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
+    // WorkspaceHelper on the engine of the current target, whose key and endpoint a build without a state file does not
+    // read).
+    helperTag = (await testHelperImage(docker, log, env)).tag;
     channels = new HelperChannels({
       logger: log,
       open: (target) =>
