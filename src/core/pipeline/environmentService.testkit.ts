@@ -18,7 +18,7 @@ import * as path from 'path';
 import { EXISTING_PATHS_SCRIPT, type ServiceFolders } from '../git/gitSummary';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
-import type { ContainerInfo, ImageInfo, ImageInspection, MountTarget, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
+import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, MountTarget, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import { CommandError, UserFacingError } from '../errors';
 import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
@@ -300,10 +300,23 @@ export class FakeDocker implements EnvironmentDocker {
     return found && { ...found, labels: { ...found.labels } };
   }
 
-  async listEnvironmentContainers(): Promise<ContainerInfo[]> {
+  /**
+   * Plan step 11I (U4, decision of 2026-10-08): as EngineDocker, each listed container with the time of its create, here
+   * by the order of insertion (the order of creation, as findContainer and fakeDockerEngine take it), for the rule of the
+   * dev container (devContainerOf).
+   */
+  async listEnvironmentContainers(): Promise<ListedContainer[]> {
     return [...this.containers.values()]
-      .filter((c) => LABEL_ENVIRONMENT_ID in c.labels)
-      .map((c) => ({ ...c, labels: { ...c.labels } }));
+      .map((c, index): ListedContainer => ({ ...c, labels: { ...c.labels }, created: (c as ListedContainer).created ?? new Date(T0 + index * 1000).toISOString() }))
+      .filter((c) => LABEL_ENVIRONMENT_ID in c.labels);
+  }
+
+  /**
+   * Plan step 11I (U4): as EngineDocker.environmentContainers: the containers of one environment, by filtering the list
+   * (listEnvironmentContainers, so that a test that replaces the list replaces this one too).
+   */
+  async environmentContainers(environmentId: string): Promise<ListedContainer[]> {
+    return (await this.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId);
   }
 
   async removeContainer(nameOrId: string): Promise<void> {

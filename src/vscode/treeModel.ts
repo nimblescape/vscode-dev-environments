@@ -33,8 +33,11 @@ export const TreeTexts = {
   kept: 'Keeps running when closed: stop it yourself.',
   /** Tooltip line of an environment closed with Close and Keep Running (unit 7, PR 2). */
   keptOnce: 'Keeps running this time: it stops when a window uses it and closes again, or when you stop it.',
-  /** Review round 7, P7-2: tooltip line of an environment whose dev container does not run while another service does. */
-  servicesRunning: 'Other services of Docker Compose run. Stop stops them.',
+  /**
+   * Review round 7, P7-2: tooltip line of an environment whose dev container does not run while another service does.
+   * Plan step 11I (U4, decision of 2026-10-08): or another dev container of the environment (servicesRunning).
+   */
+  servicesRunning: 'Other containers of the environment run. Stop stops them.',
   /** Label of the sign-in row (the title of the command devEnvironments.signIn). */
   signIn: 'Sign in with GitHub',
   signInTooltip: 'Sign in with GitHub to see your repositories that have a Dev Container configuration.',
@@ -45,7 +48,10 @@ export interface EnvironmentRuntime {
   /** The state of the dev container (review round 7, P7-2: not of the other services of Docker Compose). */
   container: ContainerState;
   volume: boolean;
-  /** Review round 7, P7-2: a container of another service of Docker Compose runs. */
+  /**
+   * Review round 7, P7-2: a container of another service of Docker Compose runs. Plan step 11I (U4, decision of
+   * 2026-10-08): or another dev container of the environment (any other of its containers).
+   */
   servicesRunning?: boolean;
 }
 
@@ -333,7 +339,8 @@ export function rowActions(
   const hasEnvironment = state !== undefined;
   return {
     canStart: state !== 'connected' && state !== 'updating',
-    // Review round 7, P7-2: also while only other services of Docker Compose run (the dev container is stopped).
+    // Review round 7, P7-2: also while only other services of Docker Compose run (the dev container is stopped). Plan
+    // step 11I (U4, decision of 2026-10-08): or another dev container of the environment.
     canStop: containerRuns(state) || (servicesRunning && hasEnvironment && state !== 'updating'),
     canDelete: hasEnvironment && !(state === 'updating' && busyOperation === 'delete'),
     canRebuild: hasEnvironment && state !== 'updating',
@@ -649,7 +656,8 @@ function environmentRow(
   const repository = info?.nameWithOwner ?? environment.repository;
   const { owner, name } = info ? { owner: info.owner, name: info.name } : splitName(repository);
   const state = environmentState(environment, input);
-  // Review round 7, P7-2: the state is the one of the dev container; running side services keep Stop and are named.
+  // Review round 7, P7-2: the state is the one of the dev container; running side services keep Stop and are named. Plan
+  // step 11I (U4): so does another running dev container of the environment.
   const servicesRunning = input.runtime?.get(environment.id)?.servicesRunning === true && !containerRuns(state) && state !== 'updating';
   const actions = rowActions(state, info, state === 'updating' ? environment.busy?.operation : undefined, servicesRunning);
   const liveBranch = containerRuns(state) || state === 'updating' ? input.liveBranches.get(environment.id) : undefined;

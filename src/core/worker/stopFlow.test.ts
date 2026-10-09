@@ -8,7 +8,7 @@ import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../names';
 import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
-import { runningDevContainer, runningServices } from './environmentContainers';
+import { runningDevContainers, runningServices } from './environmentContainers';
 import { STOP_CONTAINER_TIMEOUT_MS, STOP_GIT_TIMEOUT_MS, stopFlow } from './stopFlow';
 import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, parseStopValue } from '../helperChannel/protocol';
 
@@ -245,9 +245,58 @@ describe('the containers of an environment for the flows (plan step 11B2)', () =
   it('the running services are the running containers with the service label, never the dev container', () => {
     const dev = container({ labels: { [LABEL_ENVIRONMENT_ID]: ENVIRONMENT_ID, [LABEL_COMPOSE_SERVICE]: 'app' } });
     const db = service(`${NAME}-db`);
-    const all = [dev, db, service(`${NAME}-cache`, 'stopped'), container({ id: 'e'.repeat(64), name: 'plain' })];
-    expect(runningDevContainer(all, NAME)).toBe(dev);
-    expect(runningServices(all, dev)).toEqual([db]);
-    expect(runningServices(all)).toEqual([dev, db]);
+    const plain = container({ id: 'e'.repeat(64), name: 'plain' });
+    const all = [dev, db, service(`${NAME}-cache`, 'stopped'), plain];
+    // Plan step 11I (U4, decision of 2026-10-08): changed calls and expectation. The running dev containers in the order of
+    // the rule (runningDevContainers; before runningDevContainer, only the one chosen: the named one, still first), and
+    // the services by the recorded name (before: apart from a given dev container, and without one every running container
+    // with the service label, which a container that is not named stays).
+    expect(runningDevContainers(all, NAME)[0]).toBe(dev);
+    expect(runningDevContainers(all, NAME)).toEqual([dev, plain]);
+    expect(runningServices(all, NAME)).toEqual([db]);
+    expect(runningServices(all, 'another-name')).toEqual([dev, db]);
+  });
+});
+
+describe('Stop of every running container of the environment (plan step 11I, U4, decision of 2026-10-08)', () => {
+  it('reads the Git state from the first running dev container of the rule, stops it, then the other running dev containers, then the services', async () => {
+    const named = container({ state: 'stopped', rawState: 'exited', created: '2026-10-08T11:00:00Z' });
+    const older = container({ id: 'a'.repeat(64), name: 'older', created: '2026-10-08T08:00:00Z' });
+    const newer = container({ id: 'b'.repeat(64), name: 'newer', created: '2026-10-08T09:00:00Z' });
+    const db = service(`${NAME}-db`);
+    const { engine, calls } = fakeEngine([db, older, named, newer]);
+    const { result, lines } = run(engine);
+    expect(await result).toEqual({
+      outcome: 'stopped',
+      gitSummary: { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: NOW },
+      services: [`${NAME}-db`],
+      failures: [],
+    });
+    expect(calls).toEqual([`list ${LABEL_ENVIRONMENT_ID}=${ENVIRONMENT_ID}`, `exec ${newer.id}`, `stop ${newer.id}`, `stop ${older.id}`, `stop ${db.id}`]);
+    expect(lines).toEqual([
+      `The container ${NAME} does not run; the running container newer of the environment is used.`,
+      'Stopping the container newer.',
+      'Stopping the container older, another dev container of the environment.',
+      `Stopping the container ${NAME}-db of the service db.`,
+    ]);
+  });
+
+  it('the named dev container first while it runs; another running dev container is stopped after it, and its failure is answered', async () => {
+    const other = container({ id: 'b'.repeat(64), name: 'other', created: '2026-10-08T09:00:00Z' });
+    const failing = fakeEngine([other, container()]);
+    const stopped: string[] = [];
+    failing.engine.stop = async (id) => {
+      if (id === other.id) throw new EngineError('cannot stop container: permission denied', 500);
+      stopped.push(id);
+    };
+    const { result } = run(failing.engine);
+    expect(await result).toEqual({
+      outcome: 'stopped',
+      gitSummary: { branch: 'main', uncommittedFiles: 2, unpushedCommits: 1, stashes: 0, recordedAt: NOW },
+      services: [],
+      failures: ['The container other could not be stopped: cannot stop container: permission denied'],
+    });
+    expect(failing.execs.map((exec) => exec.container)).toEqual(['d'.repeat(64)]);
+    expect(stopped).toEqual(['d'.repeat(64)]);
   });
 });

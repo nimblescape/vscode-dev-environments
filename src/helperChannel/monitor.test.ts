@@ -10,8 +10,9 @@ import { describe, expect, it } from 'vitest';
 import { OP_RECORD_GIT_STATE, type AskKind } from '../core/helperChannel/protocol';
 import { LABEL_ENVIRONMENT_ID } from '../core/names';
 import { silentLogger } from '../core/ports';
-import { REMOTE_MONITOR_CONTAINER, heartbeatCommand } from '../core/remoteMonitor/protocol';
+import { REMOTE_MONITOR_CONTAINER } from '../core/remoteMonitor/protocol';
 import type { Environment } from '../core/types';
+import { scriptCommand } from '../core/worker/containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
@@ -70,7 +71,8 @@ describe('the operations of the Session Monitor in the worker (plan step 11D1)',
     const { engine, execs } = engineOf(ok);
     const { context, controller } = contextOf();
     expect(await heartbeatOperation(() => engine)({ heartbeat: HEARTBEAT }, context)).toEqual({ ok: true });
-    expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: heartbeatCommand(HEARTBEAT), options: { timeoutMs: 20_000, signal: controller.signal } }]);
+    // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
+    expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: scriptCommand('monitorHeartbeat', [JSON.stringify(HEARTBEAT)]), options: { timeoutMs: 20_000, signal: controller.signal } }]);
     const missing = engineOf(() => Promise.reject(new EngineError('No such container', 404)));
     expect(await heartbeatOperation(() => missing.engine)({ heartbeat: HEARTBEAT }, contextOf().context)).toMatchObject({ ok: false, missing: true });
   });

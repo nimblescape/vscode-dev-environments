@@ -6,7 +6,7 @@
 // heartbeat is answered as not sent (it does not reject) also when the operation names the computer.
 import { describe, expect, it } from 'vitest';
 import { silentLogger } from '../ports';
-import { heartbeatCommand } from '../remoteMonitor/protocol';
+import { scriptCommand } from './containerScripts';
 import { unusedEngine } from './dockerEngine.testkit';
 import type { DockerEngine } from './dockerEngine';
 import type { HostSide } from './hostSide';
@@ -46,7 +46,8 @@ describe('review round 1 of PR #108 (B): the first heartbeat of the open in the 
     for (const [minutes, seconds] of [[2000, 86_400], [0.5, 60]] as const) {
       const services = deps({ monitorSource: COMPUTER, settings: { stopAfterMinutes: minutes } as never });
       expect(await services.sessionMonitor!.heartbeat(TARGET, ID, false, 5)).toEqual({ ok: true });
-      expect(commands.pop()).toEqual(heartbeatCommand({ source: COMPUTER, limitSeconds: seconds, environments: [{ id: ID, keepRunning: false, seq: 5 }] }));
+      // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
+      expect(commands.pop()).toEqual(scriptCommand('monitorHeartbeat', [JSON.stringify({ source: COMPUTER, limitSeconds: seconds, environments: [{ id: ID, keepRunning: false, seq: 5 }] })]));
     }
   });
 

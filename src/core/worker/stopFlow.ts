@@ -6,7 +6,10 @@
 // environment (the operation takes it), the Git state of the running dev container, then the stop of the dev container
 // and of the running containers of the other services of Docker Compose (D-20: after the dev container). Before, the
 // extension sent each of these Docker calls through the worker that held the lock (6 + n round trips on a remote host);
-// now it is one operation. The extension records the Git state. Pure over the port; no I/O of its own, no `vscode`.
+// now it is one operation. The extension records the Git state. Plan step 11I (U4, decision of 2026-10-08): Stop stops
+// every running container of the environment: its running dev containers in the order of the rule of the dev container
+// (runningDevContainers; the Git state is read from the first), then the running services. Pure over the port; no I/O
+// of its own, no `vscode`.
 import { errorMessage } from '../errors';
 import { parseGitSummaryOutput } from '../git/gitSummary';
 import { LABEL_COMPOSE_SERVICE } from '../names';
@@ -14,7 +17,7 @@ import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH } from '../helperChannel/
 import type { GitSummary } from '../types';
 import { runScript } from './containerScripts';
 import { isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
-import { environmentContainers, runningDevContainer, runningServices } from './environmentContainers';
+import { environmentContainers, runningDevContainers, runningServices } from './environmentContainers';
 
 /** The time limit of the Git state (as before the move: GIT_EXEC_TIMEOUT_MS of the pipeline). */
 export const STOP_GIT_TIMEOUT_MS = 30_000;
@@ -41,6 +44,7 @@ export interface StopFlow {
 }
 
 export interface StopResult {
+  /** `stopped`: a dev container of the environment ran (plan step 11I, U4: one or more), and is stopped now. */
   outcome: 'stopped' | 'notRunning';
   gitSummary?: GitSummary;
   services: string[];
@@ -51,27 +55,30 @@ export interface StopResult {
  * Plan step 11B2: the Stop of the environment, under its lock. The Git state is best effort (a failure is logged, the
  * stop goes on). Review round 1 (A-R1-2): a container that cannot be stopped does not end the flow: the others are
  * stopped anyway, and its reason is answered in `failures` with the Git state (which the extension records before it
- * reports them). A cancel throws its AbortError.
+ * reports them). A cancel throws its AbortError. Plan step 11I (U4, decision of 2026-10-08): every running dev container
+ * is stopped, the one of the Git state first (D-20: the dev containers before the services); `services` stays the
+ * services (the protocol is unchanged), and another dev container that is stopped is named in the log.
  */
 export async function stopFlow(p: StopFlow): Promise<StopResult> {
   const containers = await environmentContainers(p.engine, p.environmentId, p.signal);
-  const dev = runningDevContainer(containers, p.containerName, p.log);
+  const devs = runningDevContainers(containers, p.containerName, p.log);
   const failures: string[] = [];
   let gitSummary: GitSummary | undefined;
-  if (dev === undefined) {
+  if (devs.length === 0) {
     p.log(`The container ${p.containerName} does not run.`);
   } else {
-    gitSummary = await readGitSummary(p, dev);
-    await stopContainer(p, dev, `Stopping the container ${dev.name}.`, failures);
+    gitSummary = await readGitSummary(p, devs[0]);
+    await stopContainer(p, devs[0], `Stopping the container ${devs[0].name}.`, failures);
+    for (const other of devs.slice(1)) await stopContainer(p, other, `Stopping the container ${other.name}, another dev container of the environment.`, failures);
   }
   const services: string[] = [];
-  for (const service of runningServices(containers, dev)) {
+  for (const service of runningServices(containers, p.containerName)) {
     if (await stopContainer(p, service, `Stopping the container ${service.name} of the service ${service.labels[LABEL_COMPOSE_SERVICE]}.`, failures)) {
       // Review round 1 (A-R1-6): the answer names at most MAX_STOPPED_SERVICES of them; all are stopped.
       if (services.length < MAX_STOPPED_SERVICES) services.push(service.name);
     }
   }
-  return { outcome: dev === undefined ? 'notRunning' : 'stopped', ...(gitSummary !== undefined ? { gitSummary } : {}), services, failures };
+  return { outcome: devs.length === 0 ? 'notRunning' : 'stopped', ...(gitSummary !== undefined ? { gitSummary } : {}), services, failures };
 }
 
 /** The Git state of the running dev container, or undefined (logged) when it cannot be read. A cancel throws. */

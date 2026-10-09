@@ -13,7 +13,7 @@ import * as crypto from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { ENGINE_IDENTITY_ARGS, engineIdentity } from '../../src/core/helperChannel/protocol';
-import { mapContainerState, publicInfo, toContainerInfo, toLabels, toVolumeInfo, type ContainerInfo } from '../../src/core/docker/dockerObjects';
+import { mapContainerState, publicInfo, toContainerInfo, toLabels, toVolumeInfo, type ContainerInfo, type ListedContainer } from '../../src/core/docker/dockerObjects';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, newEnvironmentId } from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
@@ -56,6 +56,15 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     return inspected === undefined ? undefined : publicInfo(inspected);
   };
 
+  /**
+   * Plan step 11I (U4, decision of 2026-10-08): a container of a list of the pipeline as the Docker CLI describes it: its
+   * public shape and the time of its create (ListedContainer).
+   */
+  const cliListed = (reference: string): ListedContainer | undefined => {
+    const inspected = toContainerInfo((JSON.parse(cli.ok(['container', 'inspect', reference])) as unknown[])[0]);
+    return inspected === undefined ? undefined : { ...publicInfo(inspected), ...(inspected.created !== '' ? { created: inspected.created } : {}) };
+  };
+
   // Plan step 11I2: changed expectation (before: each answer of EngineDocker equal to the answer of the removed CLI
   // adapter ContainerAdapter): each answer equal to what the Docker CLI of the test harness reports for the same object,
   // read with the same functions as the adapter read it (dockerObjects.ts) or as it read the CLI's answer.
@@ -66,7 +75,10 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     const byId = (list: { id: string }[]) => [...list].sort((a, b) => a.id.localeCompare(b.id));
     const listed = cli.lines(['ps', '-aq', '--no-trunc', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${id}`]);
     expect(listed).toHaveLength(2);
-    expect(byId((await apiDocker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === id))).toEqual(byId(listed.map((listedId) => cliContainer(listedId)!)));
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, each listed container with the time of its create
+    // (before: its public shape only), the list of one environment (environmentContainers) the same.
+    expect(byId((await apiDocker.listEnvironmentContainers()).filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === id))).toEqual(byId(listed.map((listedId) => cliListed(listedId)!)));
+    expect(byId(await apiDocker.environmentContainers(id))).toEqual(byId(listed.map((listedId) => cliListed(listedId)!)));
     expect(await apiDocker.containerState(`${name}-db-1`)).toBe(mapContainerState(cli.container(`${name}-db-1`)!.State.Status));
     expect(await apiDocker.containerState(`${name}-db-1`)).toBe('stopped');
     expect(await apiDocker.containerState('devenv-test-missing')).toBe('missing');
@@ -180,7 +192,11 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
     expect(identity).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
     // A label of this test alone, so that no prune here reaches another container of the run or of the user.
     const pruneLabel = `devenv-test.prune=${tag}`;
+    // Plan step 11I (U5, decision of 2026-10-08): a label key that `label!` names, as the sweep names the label of the
+    // Session Monitor (SWEEP_FILTERS).
+    const guardKey = `devenv-test.guard-${tag}`;
     const stopped = cli.ok(['create', '--name', `${name}-prune-stopped`, '--label', runLabel, '--label', pruneLabel, TEST_BASE_IMAGE, 'true']);
+    const guarded = cli.ok(['create', '--name', `${name}-prune-guarded`, '--label', runLabel, '--label', pruneLabel, '--label', `${guardKey}=1`, TEST_BASE_IMAGE, 'true']);
     cli.ok(['run', '-d', '--name', `${name}-prune-running`, '--network', 'none', '--init', '--label', runLabel, '--label', pruneLabel, TEST_BASE_IMAGE, 'sleep', '600']);
     try {
       // Both are younger than 10 minutes, the age of the sweep (SWEEP_MIN_AGE): it keeps them.
@@ -198,12 +214,17 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
       };
       expect(await prune({ label: [pruneLabel], until: ['10m'] })).toEqual([]);
       expect(cli.container(`${name}-prune-stopped`)).toBeDefined();
-      // Without the age: only the stopped one goes, named by its full ID.
-      expect(await prune({ label: [pruneLabel] })).toEqual([stopped]);
+      // Without the age: only the stopped one goes, named by its full ID. Plan step 11I (U5, decision of 2026-10-08):
+      // changed input, with `label!` as the sweep sends it: the stopped one with that label stays as well.
+      expect(await prune({ label: [pruneLabel], 'label!': [guardKey] })).toEqual([stopped]);
       expect(cli.container(`${name}-prune-stopped`)).toBeUndefined();
       expect(cli.container(`${name}-prune-running`)?.State.Running).toBe(true);
+      expect(cli.container(`${name}-prune-guarded`)).toBeDefined();
+      // Plan step 11I (U5): without `label!`, that one goes too.
+      expect(await prune({ label: [pruneLabel] })).toEqual([guarded]);
+      expect(cli.container(`${name}-prune-running`)?.State.Running).toBe(true);
     } finally {
-      cli.run(['rm', '-f', `${name}-prune-stopped`, `${name}-prune-running`]);
+      cli.run(['rm', '-f', `${name}-prune-stopped`, `${name}-prune-guarded`, `${name}-prune-running`]);
     }
   });
 

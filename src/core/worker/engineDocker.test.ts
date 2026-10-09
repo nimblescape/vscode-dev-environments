@@ -52,6 +52,40 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     expect(await docker.findContainer(ENV, NAME)).not.toHaveProperty('created');
   });
 
+  it('plan step 11I (U4, decision of 2026-10-08): findContainer takes the newest by the time of the create, never by its text, and logs one that is not the named one', async () => {
+    // Half a second later than `text`, which sorts after it as text (the engine trims the zeros of a fraction).
+    const later = container({ id: 'l'.repeat(64), name: 'later', state: 'stopped', rawState: 'exited', created: '2026-10-08T09:00:00.5Z' });
+    const text = container({ id: 't'.repeat(64), name: 'text', state: 'stopped', rawState: 'exited', created: '2026-10-08T09:00:00Z' });
+    let listed = [text, later];
+    const engine: DockerEngine = { ...unusedEngine(), containers: async () => listed };
+    const { logger, lines } = recording();
+    const docker = new EngineDocker(engine, logger);
+    expect((await docker.findContainer(ENV, NAME))?.id).toBe(later.id);
+    expect(lines).toContain(`info There is no container ${NAME}; the container later of the environment is used.`);
+    // The named one whatever its state, also while another runs; then nothing but the warning about several.
+    listed = [container({ id: 'r'.repeat(64), name: 'running', created: '2026-10-08T10:00:00Z' }), container({ state: 'stopped', rawState: 'exited' })];
+    lines.length = 0;
+    expect((await docker.findContainer(ENV, NAME))?.id).toBe('a'.repeat(64));
+    expect(lines).toEqual([`warn 2 containers have the label ${LABEL_ENVIRONMENT_ID}=${ENV}: running, ${NAME}`]);
+  });
+
+  it('plan step 11I (U4, decision of 2026-10-08): environmentContainers lists one environment by its label, with the times of the create, within the time limit', async () => {
+    const asked: Array<{ label: string; signal?: AbortSignal }> = [];
+    const engine: DockerEngine = {
+      ...unusedEngine(),
+      containers: async (label, signal) => (asked.push({ label, signal }), [container({ exitCode: 0, restartCount: 1 }), container({ id: 'b'.repeat(64), name: 'other', created: undefined })]),
+    };
+    const listed = await new EngineDocker(engine).environmentContainers(ENV);
+    expect(asked).toHaveLength(1);
+    expect(asked[0].label).toBe(`${LABEL_ENVIRONMENT_ID}=${ENV}`);
+    // A request with a time limit (as every request of EngineDocker).
+    expect(asked[0].signal).toBeInstanceOf(AbortSignal);
+    expect(listed.map((each) => each.created)).toEqual(['2026-10-03T10:00:00Z', undefined]);
+    expect(listed[0]).not.toHaveProperty('exitCode');
+    expect(listed[0]).not.toHaveProperty('restartCount');
+    expect(listed[1]).not.toHaveProperty('created');
+  });
+
   it('containerState, imageExists, imageId, volumeExists: missing is an answer, not a failure', async () => {
     const engine: DockerEngine = {
       ...unusedEngine(),
@@ -239,7 +273,8 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     const engine: DockerEngine = {
       ...unusedEngine(),
       containerIds: async (filters, signal) => (seen.push(['ids', filters, signal?.aborted]), ['id1']),
-      containers: async (label) => (seen.push(['containers', label]), [container()]),
+      // Plan step 11I (U4): with the exit code and the restarts of the port, which no list of the pipeline carries.
+      containers: async (label) => (seen.push(['containers', label]), [container({ exitCode: 3, restartCount: 2 })]),
       inspect: async (_kind, reference, signal) => (seen.push(['inspect', reference, signal?.aborted]), { Id: 'sha256:1' }),
       version: async (signal) => (seen.push(['version', signal?.aborted]), { apiVersion: '1.48', version: '29.0.0' }),
     };
@@ -250,8 +285,12 @@ describe('the Docker of the pipeline over the port (plan step 11B3)', () => {
     controller.signal.addEventListener('abort', () => (late.aborted = true));
     // The image has no configuration: as `docker image inspect --format {{json .Config}}`, null.
     expect(await docker.imageConfig('img')).toBeNull();
-    expect(await docker.listEnvironmentContainers()).toEqual([expect.not.objectContaining({ created: expect.anything() })]);
-    expect((await docker.listEnvironmentContainers())[0]).not.toHaveProperty('created');
+    // Plan step 11I (U4, decision of 2026-10-08): changed expectation, the list of the environments carries the time of
+    // the create of each container (before: without it), which the rule of the dev container (devContainerOf) needs; the
+    // other fields of the port (the exit code, the restarts) stay out.
+    expect(await docker.listEnvironmentContainers()).toEqual([expect.objectContaining({ created: '2026-10-03T10:00:00Z' })]);
+    expect((await docker.listEnvironmentContainers())[0]).not.toHaveProperty('exitCode');
+    expect((await docker.listEnvironmentContainers())[0]).not.toHaveProperty('restartCount');
     expect(seen).toContainEqual(['containers', LABEL_ENVIRONMENT_ID]);
     expect((await docker.listProjectContainers('acme'))[0]).not.toHaveProperty('created');
     expect(seen.at(-1)).toEqual(['containers', 'com.docker.compose.project=acme']);

@@ -27,10 +27,10 @@
 // src/helperChannel/batch.ts).
 import { createHash, randomBytes } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, WORKSPACES_ROOT } from '../names';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
-import { isSourceId, parseHeartbeatInput, parseImageListInput, parseImageSettingsInput, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
+import { LABEL_SESSION_MONITOR, isSourceId, parseHeartbeatInput, parseImageListInput, parseImageSettingsInput, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
@@ -608,17 +608,27 @@ export const OP_PROBE = 'probe';
  * removed): the prune of the stopped containers with LABEL_HELPER_CHANNEL older than SWEEP_MIN_AGE (so never one of an
  * open that runs now); running channels are never touched. Plan step 11I (PR A): the prune of the port of the engine
  * (`POST /containers/prune` with SWEEP_FILTERS; before: `docker container prune -f` of the worker's Docker CLI with the
- * same two filters). No parameters (parseSweepParams); the value is SweepValue.
+ * same two filters). Plan step 11I (U5, decision of 2026-10-08): every stopped helper container (LABEL_HELPER_RUN), the
+ * channels and the batch helpers of the worker alike, never the Session Monitor: a batch helper has AutoRemove, which
+ * applies only once it started, so one that a killed worker left between its create and its start stayed `created`
+ * forever and held the volume of its environment, which a later Delete then could not remove. No parameters
+ * (parseSweepParams); the value is SweepValue.
  */
 export const OP_SWEEP = 'sweep';
 export const SWEEP_MIN_AGE = '10m';
 
 /**
- * Plan step 11I (PR A): the filters of the prune of the sweep, the two of `docker container prune -f` before: the label
- * LABEL_HELPER_CHANNEL with any value, and created more than SWEEP_MIN_AGE ago (by the clock of the engine). A prune
- * removes stopped containers only.
+ * Plan step 11I (PR A): the filters of the prune of the sweep (a prune removes stopped containers only): created more
+ * than SWEEP_MIN_AGE ago (by the clock of the engine). Plan step 11I (U5, decision of 2026-10-08): the label
+ * LABEL_HELPER_RUN with any value, which every helper container carries (the channels, the batch helpers; before: the
+ * label of the channels, LABEL_HELPER_CHANNEL), and never the label LABEL_SESSION_MONITOR (`label!`): the Session
+ * Monitor carries no LABEL_HELPER_RUN, and this guard keeps it out also if it ever did.
  */
-export const SWEEP_FILTERS: Readonly<Record<'label' | 'until', readonly string[]>> = { label: [LABEL_HELPER_CHANNEL], until: [SWEEP_MIN_AGE] };
+export const SWEEP_FILTERS: Readonly<Record<'label' | 'label!' | 'until', readonly string[]>> = {
+  label: [LABEL_HELPER_RUN],
+  'label!': [LABEL_SESSION_MONITOR],
+  until: [SWEEP_MIN_AGE],
+};
 
 /**
  * Plan step 11I (PR A): the parameters of an operation that takes none (`probe`, `sweep`): `{}`, or null (a missing
@@ -1297,9 +1307,9 @@ export function parseReconcileValue(value: unknown): ReconcileValue | undefined 
 /**
  * Plan step 11D1 (decisions of 2026-10-03, "every remote action is a worker operation"): `heartbeat`, one heartbeat of
  * this computer to the Session Monitor container of the worker's engine (`monitor.js heartbeat` under the lock of the
- * records, heartbeatCommand), over the Engine API. The window decides what it sends (its environments, their keep
- * flags, the limit); the worker sends it. No request to the extension, no secret. Parameters HeartbeatParams; value
- * HeartbeatValue.
+ * records, the entry monitorHeartbeat of the registry of the container scripts since plan step 11I, U2), over the Engine
+ * API. The window decides what it sends (its environments, their keep flags, the limit); the worker sends it. No request
+ * to the extension, no secret. Parameters HeartbeatParams; value HeartbeatValue.
  */
 export const OP_HEARTBEAT = 'heartbeat';
 

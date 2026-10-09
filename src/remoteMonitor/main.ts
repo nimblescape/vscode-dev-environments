@@ -5,30 +5,36 @@
 // Entry point of the Session Monitor of a Docker engine (unit 7, PR 2; plan step 8, PR A: on every engine, local and
 // remote; implementation notes 16). Plan step 11D2: bundled into the worker's script as the module `devenv:monitor-script`
 // (scripts/workerScripts.mjs), which the worker gives the monitor container that it creates. The container
-// devenv-session-monitor (image: the worker's own helper image by its monitor tag, plan step 11D3, which has Node.js and
-// the Docker CLI; the Docker socket of its engine; the volume devenv-session-monitor at /state) runs the pipe loader (plan
-// step 3, src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
+// devenv-session-monitor (image: the worker's own helper image by its monitor tag, plan step 11D3, of which the monitor
+// runs only Node.js, `flock` (the lock of the records, and the environment lock of an automatic stop: stopLock.ts over
+// src/core/helperChannel/lockFile.ts) and `timeout` (the run limit under the lock of the records); the Docker socket of
+// its engine at /var/run/docker.sock; the volume devenv-session-monitor at /state) runs the pipe loader (plan step 3,
+// src/core/loader/pipeLoader.ts): at the first start it gets the script over its standard input, stores it at
 // /opt/devenv/monitor.js and calls startMonitor (`run`); after a restart it starts the stored file again. The workers run
-// the other subcommands in it as `node /opt/devenv/monitor.js …` (an exec over the Engine API, monitorFlow.ts):
+// the other subcommands in it as `node /opt/devenv/monitor.js …` (an exec over the Engine API of an entry of the registry
+// of the container scripts, monitorFlow.ts; plan step 11I, U2):
 //   run                          the loop: a tick every 15 s (rules.ts); each automatic stop under the environment lock
 //                                (plan step 8, PR B, D2); exits with 0 after REMOTE_IDLE_EXIT_MS without a running
 //                                environment container and without a fresh record while it maintains no images (Q5;
 //                                review round 1 of PR #86, A-R1-1; round 2, A-R2-1: a created one does not count)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
-//   records <environment id>     prints { now, records: [{ source, at, keepRunning }] } of that environment
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
 //   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
 //                                (the loop; review round 1 of PR #63, F2; review round 4, N4-2: no other meaning of an `at`)
 //   images -                     writes the image list of standard input (the image maintenance)
 //   settings -                   writes the image settings of standard input (the image maintenance)
-// It uses only Node.js built-ins and small pure modules of src/core. Every argument and every file it reads is checked
-// (protocol.ts); it never acts on a container without the label nimblescape.devenv.environment-id, and it removes
-// nothing but its own files (records, leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29)
-// and, with image maintenance, older images of the prefixes. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
+// Plan step 11I (U10, decision of 2026-10-08): the subcommand `records` is removed (only tests used it).
+// It uses Node.js built-ins, small pure modules of src/core, and (plan step 11I, U1, decision of 2026-10-08) the worker's
+// client of the Engine API (engine.ts: src/helperChannel/engineClient.ts over engineApi.ts): it talks to its engine over
+// that socket, never through a Docker CLI. Every argument and every file it reads is checked (protocol.ts); it never acts
+// on a container without the label nimblescape.devenv.environment-id, and it removes nothing but its own files (records,
+// leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29) and, with image maintenance, older
+// images of the prefixes. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
+import { isMissing, type EngineContainerSummary } from '../core/worker/dockerEngine';
 import {
   HEARTBEAT_FOLDER,
   IMAGE_LIST_FILE,
@@ -50,8 +56,8 @@ import {
   type HeartbeatInput,
   type HeartbeatRecord,
   type ImageSettings,
-  type RecordsOutput,
 } from '../core/remoteMonitor/protocol';
+import { engineFailure, socketEngine, type LoopEngine, type MonitorEngineParts } from './engine';
 import {
   DEFAULT_REMOTE_TIMING,
   REMOTE_TICK_MS,
@@ -80,33 +86,39 @@ import {
 import type { CronSchedule } from '../core/remoteMonitor/cron';
 import { stopLockDeps, stopLocker, type StopLocker } from './stopLock';
 
-/** Time limit of the container list. */
+/** Time limit of the container list (plan step 11I, U1: of the list of the engine). */
 export const LIST_TIMEOUT_MS = 30_000;
-/** Time limit of one `docker stop` (the container gets 10 s before SIGKILL). */
+/**
+ * Time limit of one stop (the container gets its own stop time, 10 s unless it sets another, before SIGKILL; plan step
+ * 11I, U1: the request of the engine, as `docker stop` without a time).
+ */
 export const STOP_TIMEOUT_MS = 60_000;
 /** A record file larger than this is not read. */
 const MAX_RECORD_BYTES = 4096;
 /** Exit code for an invalid argument. */
 export const EXIT_INVALID = 2;
 
-/** `docker ps` in one line per container: id, state, name, environment id, compose service. */
-export const PS_FORMAT = `{{.ID}}\t{{.State}}\t{{.Names}}\t{{.Label "${LABEL_ENVIRONMENT_ID}"}}\t{{.Label "${LABEL_COMPOSE_SERVICE}"}}`;
-
 /** The folder of the records in the volume. */
 export function heartbeatDir(stateDir: string = REMOTE_MONITOR_STATE_DIR): string {
   return path.join(stateDir, HEARTBEAT_FOLDER);
 }
 
-/** The lines of `docker ps --format PS_FORMAT`. A line with an invalid id or environment id is skipped. */
-export function parseContainerLines(stdout: string): RemoteContainer[] {
-  const containers: RemoteContainer[] = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    if (line.trim() === '') continue;
-    const [id, state, name, environmentId, composeService = ''] = line.split('\t');
-    if (!/^[0-9a-f]{12,64}$/.test(id ?? '') || !isRemoteEnvironmentId(environmentId)) continue;
-    containers.push({ id, state: state ?? '', name: name ?? '', environmentId, composeService });
+/**
+ * Plan step 11I (U1, decision of 2026-10-08): the containers of the list of the engine (LoopEngine.containerSummaries, by
+ * the label of an environment; review round 1 of PR #126, F1: the list as it is, no inspect) as the rules take them: the
+ * ID, the state as the list names it (`running`, `exited`, `paused`, …, the word that `{{.State}}` of `docker ps`
+ * printed), the name, and the environment ID and the Compose service of their labels (an empty service for the dev
+ * container, as `{{.Label …}}` printed a missing label). A container with an invalid ID or environment ID is skipped (as
+ * an invalid line of `docker ps` was).
+ */
+export function remoteContainersOf(containers: readonly EngineContainerSummary[]): RemoteContainer[] {
+  const result: RemoteContainer[] = [];
+  for (const container of containers) {
+    const environmentId = container.labels[LABEL_ENVIRONMENT_ID];
+    if (!/^[0-9a-f]{12,64}$/.test(container.id) || !isRemoteEnvironmentId(environmentId)) continue;
+    result.push({ id: container.id, state: container.state, name: container.name, environmentId, composeService: container.labels[LABEL_COMPOSE_SERVICE] ?? '' });
   }
-  return containers;
+  return result;
 }
 
 /**
@@ -142,8 +154,9 @@ export async function readRecords(dir: string): Promise<RemoteRecord[]> {
  *   while an older record is replaced whatever its `seq` (a clock of the computer that was set back);
  * - when it is `clearOnly` and the existing record of the same source does not say keepRunning (review round 3, N1):
  *   it only withdraws a keep of this source, and must not create or refresh a record.
- * Returns the ids of the ignored entries. The caller holds the kernel lock of the records (heartbeatCommand runs
- * `heartbeat` under `flock`), so two heartbeats read and replace the records one after the other.
+ * Returns the ids of the ignored entries. The caller holds the kernel lock of the records (the entry monitorHeartbeat of
+ * the registry of the container scripts runs `heartbeat` under `flock`), so two heartbeats read and replace the records
+ * one after the other.
  */
 export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: number): Promise<string[]> {
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -176,7 +189,7 @@ export async function writeHeartbeat(dir: string, input: HeartbeatInput, now: nu
 /**
  * Review round 3 of PR #58 (F5): removes the temporary files of heartbeats that were killed between the write and the
  * rename (`timeout -s KILL`, a killed container), `.<record name>.<pid>.tmp`. Only under the lock of the records
- * (heartbeatCommand), where no other heartbeat writes one. Nothing else is touched; a failure is ignored.
+ * (the entry monitorHeartbeat), where no other heartbeat writes one. Nothing else is touched; a failure is ignored.
  */
 async function removeLeftoverTemporaryFiles(dir: string): Promise<void> {
   const names = await fs.promises.readdir(dir).catch(() => [] as string[]);
@@ -197,12 +210,6 @@ async function readRecordFile(file: string): Promise<HeartbeatRecord | undefined
   }
 }
 
-/** The records of one environment, for `records <id>`. */
-export async function recordsOf(dir: string, environmentId: string, now: number): Promise<RecordsOutput> {
-  const records = (await readRecords(dir)).filter((record) => record.environmentId === environmentId);
-  return { now, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) };
-}
-
 /**
  * Removes one record. Review round 1 of PR #63 (F2): with `at`, only while the file holds a record with that `at` (the
  * caller holds the lock of the records). With `at`: true when it removed the file, false when the file is missing or does
@@ -215,24 +222,6 @@ export async function removeRecord(dir: string, source: string, environmentId: s
   await fs.promises.rm(file, { force: true });
   return true;
 }
-
-export interface DockerResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-/** Runs the Docker CLI of the container (its socket is the one of the engine). Never rejects. */
-export type DockerRunner = (args: readonly string[], timeoutMs: number) => Promise<DockerResult>;
-
-export const nodeDocker: DockerRunner = (args, timeoutMs) =>
-  new Promise((resolve) => {
-    execFile('docker', [...args], { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
-      const code = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
-      const detail = error && error.killed ? `${stderr}\nThe command did not end within ${timeoutMs / 1000} seconds.` : stderr;
-      resolve({ code, stdout: String(stdout), stderr: String(detail) });
-    });
-  });
 
 /**
  * Review round 1 of PR #63 (F2): removes an old record that `decide` named, under the lock of the records and only while
@@ -271,7 +260,11 @@ export const recordRemover =
     });
 
 export interface RemoteLoopDeps {
-  docker: DockerRunner;
+  /**
+   * Plan step 11I (U1, decision of 2026-10-08): the engine of the monitor over the Engine API (engine.ts), in place of the
+   * Docker CLI of its container: the list of the containers of the environments and their stops.
+   */
+  engine: LoopEngine;
   /** Removes an old record (recordRemover); the tests remove it in the process. */
   removeRecord: RecordRemover;
   /** The folder of the records. */
@@ -352,10 +345,15 @@ export class RemoteMonitorLoop {
 
   /** One tick; returns the environments whose containers were stopped. Never throws. */
   async tick(): Promise<string[]> {
-    const { docker, log } = this.deps;
-    const listed = await docker(['ps', '-a', '--no-trunc', '--filter', `label=${LABEL_ENVIRONMENT_ID}`, '--format', PS_FORMAT], LIST_TIMEOUT_MS);
-    if (listed.code !== 0) {
-      if (!this.listFailing) log(`Docker does not answer; nothing is stopped while it does not answer. ${listed.stderr.trim()}`);
+    const { engine, log } = this.deps;
+    // Plan step 11I (U1, decision of 2026-10-08): the containers with the label of an environment, stopped ones included
+    // (as `docker ps -a --filter label=…` before), from the engine within the time limit of the list; review round 1 of
+    // PR #126 (F1): as its list gives them, without an inspect of each.
+    let listed: EngineContainerSummary[];
+    try {
+      listed = await engine.containerSummaries(LABEL_ENVIRONMENT_ID, AbortSignal.timeout(LIST_TIMEOUT_MS));
+    } catch (error) {
+      if (!this.listFailing) log(`Docker does not answer; nothing is stopped while it does not answer. ${engineFailure(error, LIST_TIMEOUT_MS)}`);
       this.listFailing = true;
       // Plan step 8, PR B (Q5): not known to be idle.
       this.activeAt = this.monotonic();
@@ -363,7 +361,7 @@ export class RemoteMonitorLoop {
     }
     if (this.listFailing) log('Docker answers again.');
     this.listFailing = false;
-    const containers = parseContainerLines(listed.stdout);
+    const containers = remoteContainersOf(listed);
     const anyRunning = containers.some((container) => isRunningState(container.state));
     // Plan step 8, PR B (Q5): also when the records cannot be read below.
     if (anyRunning) this.activeAt = this.monotonic();
@@ -478,16 +476,20 @@ export class RemoteMonitorLoop {
    * read (no stop).
    */
   private async decideAgain(environmentId: string): Promise<RemoteStop | undefined> {
-    const listed = await this.deps.docker(
-      ['ps', '-a', '--no-trunc', '--filter', `label=${LABEL_ENVIRONMENT_ID}=${environmentId}`, '--format', PS_FORMAT],
-      LIST_TIMEOUT_MS,
-    );
-    if (listed.code !== 0) throw new Error(`its containers could not be listed again. ${listed.stderr.trim()}`);
+    // Plan step 11I (U1, decision of 2026-10-08): the containers with the label of this environment from the engine (as
+    // `docker ps -a --filter label=…=<id>` before), filtered by its ID again; review round 1 of PR #126 (F1): as its list
+    // gives them, without an inspect of each.
+    let listed: EngineContainerSummary[];
+    try {
+      listed = await this.deps.engine.containerSummaries(`${LABEL_ENVIRONMENT_ID}=${environmentId}`, AbortSignal.timeout(LIST_TIMEOUT_MS));
+    } catch (error) {
+      throw new Error(`its containers could not be listed again. ${engineFailure(error, LIST_TIMEOUT_MS)}`);
+    }
     const records = (await readRecords(this.deps.dir)).filter((record) => record.environmentId === environmentId);
     const now = this.deps.now();
     const decision = decide({
       now,
-      containers: parseContainerLines(listed.stdout).filter((container) => container.environmentId === environmentId),
+      containers: remoteContainersOf(listed).filter((container) => container.environmentId === environmentId),
       records,
       state: { ...this.state, lastTickAt: now },
       timing: this.deps.timing ?? DEFAULT_REMOTE_TIMING,
@@ -497,17 +499,25 @@ export class RemoteMonitorLoop {
     return stop;
   }
 
-  /** `docker stop` of the containers of one stop, the dev container first. True when all are stopped (or gone). */
+  /**
+   * The stop of the containers of one stop, the dev container first. True when all are stopped (or gone). Plan step 11I
+   * (U1, decision of 2026-10-08): the stop of the engine without a time (the container's own stop time, as `docker stop`
+   * without `-t`) within STOP_TIMEOUT_MS; a container that is gone (404) counts as stopped, as "no such container" of
+   * the CLI did, and any other failure of the request (the engine's refusal, no answer in time, a broken connection) is
+   * a failed stop, as an exit code of the CLI was.
+   */
   private async stopContainers(environmentId: string, { containers, reason }: RemoteStop): Promise<boolean> {
-    const { docker, log } = this.deps;
+    const { engine, log } = this.deps;
     let failed = false;
     for (const container of containers) {
       log(`Stopping the container ${container.name} of ${environmentId}: ${reason}.`);
-      const result = await docker(['stop', container.id], STOP_TIMEOUT_MS);
-      if (result.code !== 0 && !/no such container/i.test(result.stderr)) {
+      try {
+        await engine.stop(container.id, undefined, AbortSignal.timeout(STOP_TIMEOUT_MS));
+      } catch (error) {
+        if (isMissing(error)) continue;
         failed = true;
         // Tried again at the next tick; logged once per series.
-        if (!this.stopFailedLogged.has(environmentId)) log(`The container ${container.name} could not be stopped: ${result.stderr.trim()}`);
+        if (!this.stopFailedLogged.has(environmentId)) log(`The container ${container.name} could not be stopped: ${engineFailure(error, STOP_TIMEOUT_MS)}`);
       }
     }
     if (failed) this.stopFailedLogged.add(environmentId);
@@ -553,7 +563,11 @@ export function idleExitFromEnv(env: NodeJS.ProcessEnv): number {
 export interface MainDeps {
   env: NodeJS.ProcessEnv;
   stateDir?: string;
-  docker?: DockerRunner;
+  /**
+   * Plan step 11I (U1, decision of 2026-10-08): the engine of `run` (the loop and the image maintenance); default: the
+   * port over the socket of the container (socketEngine). The tests pass a fake engine.
+   */
+  engine?: MonitorEngineParts;
   /** The images (user requests 2026-09-28): the registry, and the standard input of `images -`. */
   httpGet?: HttpGet;
   readStdin?: () => Promise<string>;
@@ -731,7 +745,7 @@ export class CurrentImageSettings {
 export class ImageSchedule {
   private checkedUntil: number;
   private running = false;
-  /** Review round 9 of PR #57 (T1): a check that takes longer than a minute (a slow `docker image ls`) is not joined. */
+  /** Review round 9 of PR #57 (T1): a check that takes longer than a minute (a slow list of the images) is not joined. */
   private checking = false;
   /** The observe of a check that runs now; a pass waits for it (review round 9, T1). */
   private observing: Promise<void> | undefined;
@@ -828,14 +842,6 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       await writeHeartbeat(dir, input, now());
       return 0;
     }
-    case 'records': {
-      if (args.length !== 1 || !isRemoteEnvironmentId(args[0])) {
-        err('Invalid environment id.\n');
-        return EXIT_INVALID;
-      }
-      out(`${JSON.stringify(await recordsOf(dir, args[0], now()))}\n`);
-      return 0;
-    }
     case 'forget': {
       // Review round 1 of PR #63 (F2): optionally the `at` of the record as the loop read it.
       const at = args.length === 3 && /^\d{1,16}$/.test(args[2]) ? Number(args[2]) : undefined;
@@ -874,12 +880,13 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
       const { tickMs, timing } = timingFromEnv(deps.env);
       const log = timestamped(out);
-      const docker = deps.docker ?? nodeDocker;
+      // Plan step 11I (U1, decision of 2026-10-08): the engine over the socket of the container, not the Docker CLI.
+      const engine = deps.engine ?? socketEngine();
       // Review round 2 of PR #63 (R2-10): the removals run /opt/devenv/monitor.js under the lock of /state, so they always
       // act on /state; deps.stateDir only moves the reading (the tests).
       // Plan step 8, PR B (D2): the lock files of the volume (as the workers open them; deps.stateDir for the tests).
       const lockEnvironment = deps.lockEnvironment ?? stopLocker(stopLockDeps(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR));
-      const loop = new RemoteMonitorLoop({ docker, removeRecord: recordRemover(deps.exec), dir, now, log, timing, lockEnvironment, monotonic: deps.monotonic });
+      const loop = new RemoteMonitorLoop({ engine, removeRecord: recordRemover(deps.exec), dir, now, log, timing, lockEnvironment, monotonic: deps.monotonic });
       const idleExitMs = idleExitFromEnv(deps.env);
       // Plan step 3 (pipe loading): the extension waits for this line (REMOTE_MONITOR_READY_TEXT) after `docker run`.
       log(`${REMOTE_MONITOR_READY_TEXT} (Node.js ${process.version}, a check every ${tickMs / 1000} s).`);
@@ -895,7 +902,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
         const settings = new CurrentImageSettings(deps.env, stateDir, log);
         await settings.refresh();
         const images = new ImageMaintenance({
-          docker,
+          engine,
           httpGet: deps.httpGet ?? nodeHttpGet,
           log,
           prefixes: () => settings.value.prefixes,
@@ -931,7 +938,8 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       }
     }
     default:
-      err('Usage: monitor.js run | heartbeat <json> | records <environment id> | forget <source> <environment id> [<at>] | images - | settings -\n');
+      // Plan step 11I (U10, decision of 2026-10-08): `records` is no subcommand any more.
+      err('Usage: monitor.js run | heartbeat <json> | forget <source> <environment id> [<at>] | images - | settings -\n');
       return EXIT_INVALID;
   }
 }

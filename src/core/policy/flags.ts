@@ -8,6 +8,8 @@
 import { WORKSPACES_ROOT } from '../names';
 import {
   csvFields,
+  imageContext,
+  isUrlContext,
   localContextPath,
   networkNames,
   optionFields,
@@ -378,12 +380,14 @@ function storageOptionProblems(value: string): Problem[] {
 function buildContextProblems(value: string): Problem[] {
   const index = value.indexOf('=');
   const source = index < 0 ? value : value.slice(index + 1);
-  const image = /^docker-image:\/\/(.*)$/i.exec(source.trim());
-  if (image) {
-    const finding = imageReferenceFinding(image[1], 'build option --build-context image');
+  // Review round 1 of PR #130 (A-F2): an image or a URL only by the exact lower-case prefix that Buildx takes; `HTTPS://…`
+  // or ` docker-image://…` is a path that the build client reads.
+  const image = imageContext(source);
+  if (image !== undefined) {
+    const finding = imageReferenceFinding(image, 'build option --build-context image');
     return finding ? [finding] : [];
   }
-  if (/^https?:\/\//i.test(source)) return [];
+  if (isUrlContext(source)) return [];
   const item = `build option --build-context=${value}`;
   const folder = localContextPath(source);
   if (folder === undefined) return [access(item)];

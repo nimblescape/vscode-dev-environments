@@ -13,17 +13,20 @@
 //      and those of the list that the extension sent ("all images": the registry lists no repositories without a token,
 //      so the extension reads the packages with its GitHub session and sends only the names; `monitor.js images -`).
 //   2. For each: the tags of the registry (anonymous, the token of its challenge); the highest major tag (a plain number,
-//      for example `2`) is pulled (`docker pull <repository>:<major>`: the engine downloads only what changed).
+//      for example `2`) is pulled (`<repository>:<major>`: the engine downloads only what changed).
 //   3. For each: the two newest versions stay (an image ID is one version: its highest version tag, a shorter tag such as
 //      `2` or `latest` above the longer ones of its line, else its creation time); every older one is removed when no
 //      container uses it and no other image is built on it (an environment image: its layers start with those of the
 //      older one), without force.
-// Only Node.js built-ins. Never throws; each problem is one line of the log.
+// Plan step 11I (U1, decision of 2026-10-08): every request to the engine goes over the Engine API (the port of
+// engine.ts; before, the Docker CLI of the container), each within its time limit; the pull without a login, as the CLI
+// of the monitor had none. Never throws; each problem is one line of the log.
 import type { IncomingMessage } from 'http';
 import * as https from 'https';
 import { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
-import type { DockerRunner } from './main';
+import type { EngineImage } from '../core/worker/dockerEngine';
+import { engineFailure, type ImageEngine } from './engine';
 
 export { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, imagePrefixesOf, isTimeZone, nextCronTime, parseCronSchedule };
 
@@ -31,15 +34,16 @@ export { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, imagePrefixesOf, isTim
 export const REMOTE_IMAGE_FIRST_PASS_MS = 60_000;
 /** The number of versions of a repository that stay. */
 export const KEPT_IMAGE_VERSIONS = 2;
-/** Time limits. */
+/**
+ * Time limits. Plan step 11I (U1): of each request of a list or an inspect (IMAGE_LIST_TIMEOUT_MS), of a pull, and of the
+ * removal of one version (all of its references).
+ */
 export const IMAGE_LIST_TIMEOUT_MS = 60_000;
 export const IMAGE_PULL_TIMEOUT_MS = 60 * 60_000;
 export const IMAGE_REMOVE_TIMEOUT_MS = 120_000;
 export const REGISTRY_TIMEOUT_MS = 30_000;
 /** The longest answer of a registry that is read. */
 const MAX_REGISTRY_BODY = 4 * 1024 * 1024;
-/** At most this many images per `docker image inspect`. */
-const INSPECT_CHUNK = 100;
 /** At most this many pages of a tag list. */
 const MAX_TAG_PAGES = 20;
 
@@ -105,32 +109,50 @@ export function httpGetWith(
   });
 }
 
-/** One image of `docker image ls`. */
+/** One image of a repository, as one row of `docker image ls` showed it. */
 export interface LocalImage {
   repository: string;
-  /** `<none>` for an untagged image. */
+  /** `<none>` for an image of the repository without a tag of it. */
   tag: string;
   id: string;
-  /** Creation time as Docker prints it; compared as text (the same form for all images). */
+  /** Creation time (RFC 3339: the list of the engine, or the inspect of an image); compared as a time (createdTime). */
   createdAt: string;
 }
 
-/** The images of `docker image ls --no-trunc --format '{{json .}}'`, one JSON object per line. */
-export function parseImageList(stdout: string): LocalImage[] {
-  const images: LocalImage[] = [];
-  for (const line of stdout.split('\n')) {
-    if (line.trim() === '') continue;
-    try {
-      const item = JSON.parse(line) as Record<string, unknown>;
-      const { Repository, Tag, ID, CreatedAt } = item;
-      if (typeof Repository === 'string' && typeof Tag === 'string' && typeof ID === 'string' && typeof CreatedAt === 'string') {
-        images.push({ repository: Repository, tag: Tag, id: ID, createdAt: CreatedAt });
-      }
-    } catch {
-      // A line that is no JSON object is left out.
+/** A tag as the Docker reference grammar allows it. */
+const TAG = /^[\w][\w.-]{0,127}$/;
+
+/**
+ * Plan step 11I (U1, decision of 2026-10-08): the rows of `docker image ls -a` (the Docker CLI's formatter), from the
+ * images of the list of the engine: a row per repository and tag of an image (its `repository:tag` references), and a
+ * row with the tag `<none>` per repository of which it has only a digest (`repository@sha256:…`, an image that a pull
+ * replaced on the classic image store). An image without any reference (a `<none> <none>` row, of no prefix) has none.
+ * The list without `all`: the engine then leaves out only intermediate images without a reference (the parents of the
+ * classic builder's images), which have no row of a repository either.
+ */
+export function localImagesOf(images: readonly EngineImage[]): LocalImage[] {
+  const rows: LocalImage[] = [];
+  for (const image of images) {
+    const tagged = new Set<string>();
+    for (const reference of image.repoTags) {
+      const colon = reference.lastIndexOf(':');
+      // Only `repository:tag` (the colon of a registry port comes before the last slash).
+      if (colon <= reference.lastIndexOf('/') || !TAG.test(reference.slice(colon + 1))) continue;
+      const repository = reference.slice(0, colon);
+      tagged.add(repository);
+      rows.push({ repository, tag: reference.slice(colon + 1), id: image.id, createdAt: image.created });
+    }
+    const digestOnly = new Set<string>();
+    for (const reference of image.repoDigests) {
+      const at = reference.indexOf('@');
+      if (at <= 0) continue;
+      const repository = reference.slice(0, at);
+      if (tagged.has(repository) || digestOnly.has(repository)) continue;
+      digestOnly.add(repository);
+      rows.push({ repository, tag: '<none>', id: image.id, createdAt: image.created });
     }
   }
-  return images;
+  return rows;
 }
 
 /** The highest major tag of a tag list (a plain number: `2`, `10`), or undefined. */
@@ -219,7 +241,8 @@ export function parseBearerChallenge(header: string | undefined): { realm: strin
 }
 
 export interface ImageMaintenanceDeps {
-  docker: DockerRunner;
+  /** Plan step 11I (U1, decision of 2026-10-08): the engine over the Engine API (engine.ts), not the Docker CLI. */
+  engine: ImageEngine;
   httpGet: HttpGet;
   log: (message: string) => void;
   /**
@@ -231,16 +254,25 @@ export interface ImageMaintenanceDeps {
   knownRepositories: () => Promise<string[]>;
   /**
    * Review round 6 of PR #57 (F1): the IDs that were seen as images of a repository, by repository, kept in the volume.
-   * The image that a pull replaces loses its tag, and `docker image ls` shows it without its repository (the containerd
-   * image store) or not at all (the classic store without `-a`), so without these IDs no older version would ever be
-   * removed. Review round 7: every ID that a pass sees with a tag of the repository, not only those that the monitor's
-   * own pull replaced (the update of the extension at each open, or a user, pulls too). Without it: kept for the pass.
+   * The image that a pull replaces loses its tag, and the list of the images shows it without its repository (the
+   * containerd image store; `docker image ls` of the CLI 29 showed it not at all without `-a`), so without these IDs no
+   * older version would ever be removed. Review round 7: every ID that a pass sees with a tag of the repository, not only
+   * those that the monitor's own pull replaced (the update of the extension at each open, or a user, pulls too). Without
+   * it: kept for the pass.
    */
   replaced?: { read(): Promise<ReplacedImages>; write(value: ReplacedImages): Promise<void> };
 }
 
 /** Image IDs that a pull replaced, by repository. */
 export type ReplacedImages = Record<string, string[]>;
+
+/** Plan step 11I (U1): the fields of the inspect JSON of an image (as `docker image inspect`) that the maintenance reads. */
+interface InspectedImage {
+  Id?: unknown;
+  RepoTags?: unknown;
+  Created?: unknown;
+  RootFS?: { Layers?: unknown } | null;
+}
 /**
  * At most this many IDs are kept per repository. Review round 8 of PR #57 (S2): 200 (was 20), and beyond it the IDs that
  * are tagged now go first (the listing finds them again), then the oldest untagged ones (trimReplaced).
@@ -287,7 +319,10 @@ export function pruneReplacedImages(replaced: ReplacedImages): ReplacedImages {
   return result;
 }
 
-/** The time of `CreatedAt` of `docker image ls` or `Created` of `docker image inspect` (ms; 0 when unknown). */
+/**
+ * The time of a LocalImage (ms; 0 when unknown): RFC 3339 of the list or of the inspect of the engine (plan step 11I,
+ * U1), or the form of `CreatedAt` that `docker image ls` printed before.
+ */
 function createdTime(text: string): number {
   return Date.parse(text.replace(/ ([+-]\d{4}) [A-Z]+$/, ' $1')) || 0;
 }
@@ -351,7 +386,7 @@ export class ImageMaintenance {
 
   /**
    * Review round 8 of PR #57 (S3): remembers the IDs that carry a tag of a repository now, between the passes too (the
-   * schedule calls it every minute; one `docker image ls -a`), so an image that the extension pulls at an open and
+   * schedule calls it every minute; one list of the images), so an image that the extension pulls at an open and
    * replaces at the next one before a pass is known. Never throws.
    */
   async observe(): Promise<void> {
@@ -365,25 +400,40 @@ export class ImageMaintenance {
     }
   }
 
+  /**
+   * Plan step 11I (U1, decision of 2026-10-08): the inspect JSON of an image (as `docker image inspect`), within the time
+   * limit of a list; undefined when it does not exist or cannot be read (the engine does not answer), as a failed
+   * `docker image inspect` was.
+   */
+  private async inspectImage(reference: string): Promise<InspectedImage | undefined> {
+    try {
+      return (await this.deps.engine.inspect('image', reference, AbortSignal.timeout(IMAGE_LIST_TIMEOUT_MS))) as InspectedImage | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The ID of an image reference, or undefined. */
   private async imageId(reference: string): Promise<string | undefined> {
-    const inspected = await this.deps.docker(['image', 'inspect', '--format', '{{.Id}}', reference], IMAGE_LIST_TIMEOUT_MS);
-    const id = inspected.stdout.trim();
-    return inspected.code === 0 && IMAGE_ID.test(id) ? id : undefined;
+    const id = (await this.inspectImage(reference))?.Id;
+    return typeof id === 'string' && IMAGE_ID.test(id) ? id : undefined;
   }
 
   /**
    * Review round 6 of PR #57 (F1): the stored replaced IDs of `repository` that still exist without any tag, as
-   * untagged images of it; the others are forgotten (removed, or tagged again).
+   * untagged images of it; the others are forgotten (removed, or tagged again). Plan step 11I (U1): an image whose
+   * inspect fails is forgotten too, as one of a failed `docker image inspect` was.
    */
   private async replacedImages(repository: string, listed: readonly LocalImage[]): Promise<LocalImage[]> {
     const ids = (this.replaced[repository] ?? []).filter((id) => !listed.some((image) => image.id === id));
     const result: LocalImage[] = [];
     const kept: string[] = [];
     for (const id of ids) {
-      const inspected = await this.deps.docker(['image', 'inspect', '--format', '{{json .RepoTags}}\t{{.Created}}', id], IMAGE_LIST_TIMEOUT_MS);
-      const [tags, created] = inspected.stdout.trim().split('\t');
-      if (inspected.code !== 0 || created === undefined || (tags !== '[]' && tags !== 'null')) continue;
+      const inspected = await this.inspectImage(id);
+      // Untagged: RepoTags `[]` or null (as `{{json .RepoTags}}` printed them); a time of its creation as text.
+      const tags = inspected?.RepoTags;
+      const created = inspected?.Created;
+      if (typeof created !== 'string' || !(tags === null || (Array.isArray(tags) && tags.length === 0))) continue;
       kept.push(id);
       result.push({ repository, tag: '<none>', id, createdAt: created });
     }
@@ -395,10 +445,16 @@ export class ImageMaintenance {
   /** The images of the repositories with one of the prefixes, by repository. */
   private async repositories(prefixes: readonly string[]): Promise<Map<string, LocalImage[]>> {
     // Review round 7 of PR #57: `-a`, as the Docker CLI 29 shows untagged images (`<repository> <none>`) only with it.
-    const listed = await this.deps.docker(['image', 'ls', '-a', '--no-trunc', '--format', '{{json .}}'], IMAGE_LIST_TIMEOUT_MS);
-    if (listed.code !== 0) throw new Error(`docker image ls failed: ${listed.stderr.trim()}`);
+    // Plan step 11I (U1, decision of 2026-10-08): the list of the engine has them (the CLI hid them), as rows of
+    // `docker image ls -a` (localImagesOf).
+    let listed: EngineImage[];
+    try {
+      listed = await this.deps.engine.images({}, AbortSignal.timeout(IMAGE_LIST_TIMEOUT_MS));
+    } catch (error) {
+      throw new Error(`the list of the images failed: ${engineFailure(error, IMAGE_LIST_TIMEOUT_MS)}`);
+    }
     const byRepository = new Map<string, LocalImage[]>();
-    for (const image of parseImageList(listed.stdout)) {
+    for (const image of localImagesOf(listed)) {
       if (!prefixes.some((prefix) => image.repository.startsWith(prefix))) continue;
       if (splitRepository(image.repository) === undefined) continue;
       const list = byRepository.get(image.repository) ?? [];
@@ -421,9 +477,12 @@ export class ImageMaintenance {
     if (major === undefined) return;
     const reference = `${repository}:${major}`;
     const before = await this.imageId(reference);
-    const pulled = await this.deps.docker(['pull', '--quiet', reference], IMAGE_PULL_TIMEOUT_MS);
-    if (pulled.code !== 0) {
-      this.deps.log(`${reference} could not be pulled: ${pulled.stderr.trim() || `exit code ${pulled.code}`}`);
+    // Plan step 11I (U1, decision of 2026-10-08): the pull of the engine without a login (anonymous, as `docker pull
+    // --quiet` of the monitor's CLI, which had none); an error in its stream fails it as an exit code did.
+    try {
+      await this.deps.engine.pull(reference, { signal: AbortSignal.timeout(IMAGE_PULL_TIMEOUT_MS) });
+    } catch (error) {
+      this.deps.log(`${reference} could not be pulled: ${engineFailure(error, IMAGE_PULL_TIMEOUT_MS)}`);
       return;
     }
     // Review round 6 of PR #57 (F1): the image that the pull replaced, also when Docker lists it without its repository.
@@ -440,24 +499,22 @@ export class ImageMaintenance {
    * the maintenance itself leaves such an image alone.
    */
   private async layersById(): Promise<Map<string, string[]> | undefined> {
-    const listed = await this.deps.docker(['image', 'ls', '-a', '-q', '--no-trunc'], IMAGE_LIST_TIMEOUT_MS);
-    if (listed.code !== 0) return undefined;
-    const ids = [...new Set(listed.stdout.split('\n').map((line) => line.trim()).filter((id) => /^[A-Za-z0-9:]{1,100}$/.test(id)))];
+    // Plan step 11I (U1, decision of 2026-10-08): the IDs of the list of the engine (as `docker image ls -a -q`; without
+    // `all`, an intermediate image of the classic builder is left out, while the image built on it, whose layers start
+    // with the same ones, is listed), then the inspect of each (as `docker image inspect` of chunks of IDs).
+    let ids: string[];
+    try {
+      ids = [...new Set((await this.deps.engine.images({}, AbortSignal.timeout(IMAGE_LIST_TIMEOUT_MS))).map((image) => image.id).filter((id) => IMAGE_ID.test(id)))];
+    } catch {
+      return undefined;
+    }
     const byId = new Map<string, string[]>();
-    for (let start = 0; start < ids.length; start += INSPECT_CHUNK) {
-      const inspected = await this.deps.docker(['image', 'inspect', '--format', '{{.Id}} {{json .RootFS.Layers}}', ...ids.slice(start, start + INSPECT_CHUNK)], IMAGE_LIST_TIMEOUT_MS);
-      // An image removed meanwhile: nothing is removed in this pass.
-      if (inspected.code !== 0) return undefined;
-      for (const line of inspected.stdout.split('\n')) {
-        const match = /^(\S+) (\[.*\])$/.exec(line.trim());
-        if (!match) continue;
-        try {
-          const layers = JSON.parse(match[2]) as unknown;
-          if (Array.isArray(layers) && layers.every((layer) => typeof layer === 'string')) byId.set(match[1], layers as string[]);
-        } catch {
-          // Not such a line.
-        }
-      }
+    for (const id of ids) {
+      const inspected = await this.inspectImage(id);
+      // An image removed meanwhile, or an engine that does not answer: nothing is removed in this pass.
+      if (inspected === undefined) return undefined;
+      const layers = inspected.RootFS?.Layers;
+      if (Array.isArray(layers) && layers.every((layer) => typeof layer === 'string')) byId.set(typeof inspected.Id === 'string' ? inspected.Id : id, layers as string[]);
     }
     return byId;
   }
@@ -489,14 +546,45 @@ export class ImageMaintenance {
         this.deps.log(`The older image ${repository} (${label}) stays: another image is built on it.`);
         continue;
       }
-      const users = await this.deps.docker(['ps', '-a', '-q', '--filter', `ancestor=${version.id}`], IMAGE_LIST_TIMEOUT_MS);
-      if (users.code !== 0 || users.stdout.trim() !== '') continue;
+      // Plan step 11I (U1, decision of 2026-10-08): the containers of the image or of one built on it, stopped ones
+      // included (as `docker ps -a -q --filter ancestor=<id>`); one, or a list that fails, keeps it.
+      let users: string[];
+      try {
+        users = await this.deps.engine.containerIds({ ancestor: [version.id] }, AbortSignal.timeout(IMAGE_LIST_TIMEOUT_MS));
+      } catch {
+        continue;
+      }
+      if (users.length > 0) continue;
       // By its references in this repository, then by its ID when no reference is left; never with force.
       const references = version.tags.map((tag) => `${repository}:${tag}`);
-      const removed = await this.deps.docker(['image', 'rm', ...(references.length > 0 ? references : [version.id])], IMAGE_REMOVE_TIMEOUT_MS);
-      if (removed.code === 0) this.deps.log(`Removed the older image ${repository} (${label}).`);
-      else this.deps.log(`The older image ${repository} (${label}) stays: ${removed.stderr.trim().split('\n')[0] ?? ''}`);
+      const failure = await this.removeReferences(references.length > 0 ? references : [version.id]);
+      if (failure === undefined) this.deps.log(`Removed the older image ${repository} (${label}).`);
+      else this.deps.log(`The older image ${repository} (${label}) stays: ${failure}`);
     }
+  }
+
+  /**
+   * Plan step 11I (U1, decision of 2026-10-08): `docker image rm <references…>` over the Engine API: one DELETE of each
+   * reference without force (the engine removes the untagged parents with it, as the CLI asks), each tried even after a
+   * refusal, all within one time limit. Undefined when the engine removed every one; else the reason of the first that it
+   * did not remove, as the first line of the CLI's errors: an image in use (409) or one that is gone (404) is an answer of
+   * the engine (removeImage), any other failure its message.
+   */
+  private async removeReferences(references: readonly string[]): Promise<string | undefined> {
+    const signal = AbortSignal.timeout(IMAGE_REMOVE_TIMEOUT_MS);
+    let failure: string | undefined;
+    for (const reference of references) {
+      let reason: string | undefined;
+      try {
+        const outcome = await this.deps.engine.removeImage(reference, signal);
+        if (outcome === 'inUse') reason = `${reference} is in use (a container, or an image built on it); the engine answered 409.`;
+        else if (outcome === 'missing') reason = `No such image: ${reference}`;
+      } catch (error) {
+        reason = engineFailure(error, IMAGE_REMOVE_TIMEOUT_MS);
+      }
+      failure ??= reason;
+    }
+    return failure;
   }
 
   /** The tags of a repository at its registry, anonymous with the token of its challenge; all pages. */

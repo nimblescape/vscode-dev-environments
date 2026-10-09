@@ -42,7 +42,7 @@ export const REMOTE_MONITOR_READY_TEXT = 'Session Monitor started';
 export const REMOTE_MONITOR_STATE_DIR = '/state';
 /** The folder of the heartbeat records in the volume: `<source>.<environment id>.json`. */
 export const HEARTBEAT_FOLDER = 'heartbeats';
-/** The kernel lock (`flock`) of the heartbeat records, in the volume (heartbeatCommand). */
+/** The kernel lock (`flock`) of the heartbeat records, in the volume (underRecordsLock). */
 export const HEARTBEAT_LOCK_PATH = `${REMOTE_MONITOR_STATE_DIR}/.heartbeats.lock`;
 /** How long a heartbeat waits for HEARTBEAT_LOCK_PATH, in seconds. */
 export const HEARTBEAT_LOCK_WAIT_SECONDS = 5;
@@ -221,9 +221,11 @@ export const RECORDS_RUN_LIMIT_EXIT = 137;
  * so no lock is ever left over; a command that does not get the lock within HEARTBEAT_LOCK_WAIT_SECONDS fails with
  * RECORDS_LOCK_BUSY_EXIT (review round 3, F7) and writes nothing, and one that holds it longer than
  * HEARTBEAT_RUN_LIMIT_SECONDS is killed (`timeout`, coreutils; RECORDS_RUN_LIMIT_EXIT), so a hanging heartbeat cannot
- * block the others. Together at most 15 s, within the 20 s of a `docker exec` of a heartbeat.
+ * block the others. Together at most 15 s, within the 20 s of a `docker exec` of a heartbeat. Plan step 11I (U2, decision
+ * of 2026-10-08): the prefix of the entries monitorHeartbeat and monitorForget of the registry of the container scripts
+ * (src/core/worker/containerScripts.ts), and of forgetIfUnchangedCommand of the monitor itself.
  */
-function underRecordsLock(command: readonly string[]): string[] {
+export function underRecordsLock(command: readonly string[]): string[] {
   return [
     'flock',
     '-w',
@@ -239,7 +241,10 @@ function underRecordsLock(command: readonly string[]): string[] {
   ];
 }
 
-/** Whether `command` runs under the lock of the records (heartbeatCommand, forgetCommand, forgetIfUnchangedCommand). */
+/**
+ * Whether `command` runs under the lock of the records (underRecordsLock: the entries monitorHeartbeat and monitorForget
+ * of the registry, forgetIfUnchangedCommand).
+ */
 export function isUnderRecordsLock(command: readonly string[]): boolean {
   return command[0] === 'flock';
 }
@@ -262,23 +267,13 @@ export function monitorExecFailure(exitCode: number | null, stderr: string, unde
   return `exit code ${exitCode}`;
 }
 
-/** The command of `docker exec` that writes a heartbeat, under the lock of the records. No secret (ids and flags only). */
-export function heartbeatCommand(input: HeartbeatInput): string[] {
-  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'heartbeat', JSON.stringify(input)]);
-}
-
-/** The command of `docker exec` that prints the records of an environment (RecordsOutput). */
-export function recordsCommand(environmentId: string): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'records', environmentId];
-}
-
-/**
- * The command of `docker exec` that removes the record of `source` for an environment (Delete). Review round 3 of PR #58
- * (F6): under the lock of the records, so a heartbeat that read the record before cannot write it back after.
- */
-export function forgetCommand(source: string, environmentId: string): string[] {
-  return underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', source, environmentId]);
-}
+// Plan step 11I (U2, decision of 2026-10-08): the commands that the worker runs in the monitor container (a heartbeat,
+// Delete's forget, the image settings and list) are entries of the registry of the container scripts
+// (monitorHeartbeat, monitorForget, monitorSettings, monitorImages in src/core/worker/containerScripts.ts) with the same
+// command lines; heartbeatCommand, forgetCommand, imageSettingsCommand and imagesCommand are removed. Review round 3 of
+// PR #58 (F6): Delete's forget runs under the lock of the records, so a heartbeat that read the record before cannot
+// write it back after. Plan step 11I (U10, decision of 2026-10-08): the subcommand `records` and its recordsCommand are
+// removed.
 
 /**
  * Review round 1 of PR #63 (F2): the command with which the monitor itself removes an old record (`forget` with the `at`
@@ -395,49 +390,16 @@ export function parseImageSettingsInput(text: string): ImageSettings | undefined
   return { prefixes: [...new Set(prefixes as string[])], schedule, timeZone };
 }
 
-/** The command of `docker exec -i` that stores the settings of the image maintenance; they go on stdin. */
-export function imageSettingsCommand(): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'];
-}
-
-/** The command of `docker exec -i` that stores the list of repositories; the list goes on stdin. */
-export function imagesCommand(): string[] {
-  return ['node', REMOTE_MONITOR_SCRIPT_PATH, 'images', '-'];
-}
-
-/** The output of `monitor.js records <id>`: the clock of the remote host and the records of that environment. */
-export interface RecordsOutput {
-  now: number;
-  records: Array<{ source: string; at: number; keepRunning: boolean }>;
-}
-
-/** Parses the output of `monitor.js records`; `undefined` when it is not such an object. */
-export function parseRecordsOutput(stdout: string): RecordsOutput | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(stdout.trim());
-  } catch {
-    return undefined;
-  }
-  if (!isRecord(value) || typeof value.now !== 'number' || !Number.isFinite(value.now) || !Array.isArray(value.records)) return undefined;
-  const records: RecordsOutput['records'] = [];
-  for (const entry of value.records) {
-    if (!isRecord(entry) || !isSourceId(entry.source) || typeof entry.at !== 'number' || !Number.isFinite(entry.at)) return undefined;
-    if (typeof entry.keepRunning !== 'boolean') return undefined;
-    records.push({ source: entry.source, at: entry.at, keepRunning: entry.keepRunning });
-  }
-  return { now: value.now, records };
-}
-
 /**
  * Shared engine (reviewer note of PR 2), consistent with "the newest record decides" of the remote monitor (review round
  * 2 of PR #39, M1): true when a computer other than `ownSource` sent a heartbeat for the environment less than
  * OTHER_COMPUTER_FRESH_MS ago (it uses it), or has a record that keeps it running and that is at least as new as the
  * newest record of this computer (by the clock of the remote host). A later choice of this computer (a heartbeat without
  * the flag) overrules an older keep of another one, for example of a computer that no longer sends. Then this computer
- * does not stop it.
+ * does not stop it. `output`: the clock of the remote host and the records of the environment (plan step 11I, U10: the
+ * output of the removed subcommand `records` is no longer a type of its own).
  */
-export function inUseByOtherComputer(output: RecordsOutput, ownSource: string): boolean {
+export function inUseByOtherComputer(output: { now: number; records: ReadonlyArray<{ source: string; at: number; keepRunning: boolean }> }, ownSource: string): boolean {
   const own = output.records.filter((record) => record.source === ownSource).reduce((newest, record) => Math.max(newest, record.at), Number.NEGATIVE_INFINITY);
   return output.records.some(
     (record) =>
