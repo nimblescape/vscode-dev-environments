@@ -97,8 +97,14 @@ const TABLE: Array<[string, ComposeAccessInput, string, HostAccessClass]> = [
   ['a secret of a file of the repository', input((m) => (m.secrets = { pw: { file: `${REPO}/pw` } })), `secret pw: file ${REPO}/pw (a file of the repository is not supported; mount it read-only instead, for example ./pw:/run/secrets/pw:ro)`, 'unsupported'],
   ['a privileged hook', input(service('db', { post_start: [{ command: 'x', privileged: true }] })), 'service db: privileged post_start', 'computer'],
   ['a build context outside the repository', input(service('db', { build: { context: '/etc' } })), 'service db: build context /etc', 'computer'],
+  // Review round 2 of PR #130 (R2A-1): a value that bake evaluates as a template can become a path of the workspace helper.
+  ['a build context with a template of bake', input(service('db', { build: { context: `${REPO}/%{if true}..%{endif}/x` } })), `service db: build context ${REPO}/%{if true}..%{endif}/x (Buildx evaluates \`\${\` and \`%{\` in it as a template)`, 'unsupported'],
   ['build secrets', input(service('db', { build: { context: REPO, secrets: ['npmrc'] } })), 'service db: build secrets', 'computer'],
   ['an additional build context of a folder', input(service('db', { build: { context: REPO, additional_contexts: { home: '/root' } } })), 'service db: build additional_contexts home=/root', 'computer'],
+  // Review round 2 of PR #130 (D1): bake reads `cwd:///devenv-cache` as the cache volume of the helper; it is refused as a
+  // relative path whatever the switch says, as is any other scheme that Buildx reads as a path.
+  ['an additional build context of cwd://', input(service('db', { build: { context: REPO, additional_contexts: { c: 'cwd:///devenv-cache' } } })), 'service db: build additional_contexts c=cwd:///devenv-cache (a relative path)', 'protected'],
+  ['an additional build context of another scheme', input(service('db', { build: { context: REPO, additional_contexts: { c: 'foo:///devenv-cache' } } })), 'service db: build additional_contexts c=foo:///devenv-cache (a relative path)', 'protected'],
   // review round 22, H22-5: changed rows, not supported (the pipeline creates the volumes without them, so the switch
   // cannot lift them).
   ['a volume driver', input((m) => (m.volumes = { pgdata: { name: `${PROJECT}_pgdata`, driver: 'nfs' } })), 'volume pgdata: driver nfs (Dev Environments creates the volumes with the local driver and without options; for a tmpfs, use the tmpfs option of the service)', 'unsupported'],

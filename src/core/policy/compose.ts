@@ -652,6 +652,30 @@ export function cacheFromIsRegistry(text: string): boolean {
 }
 
 /**
+ * Review round 2 of PR #130 (R2A-1): the values of a build that bake evaluates as an HCL template. Docker Compose writes
+ * its build definition as JSON to `buildx bake --file -`, and bake reads it as HCL, so it evaluates `${…}` and `%{…}`
+ * in a string; Compose escapes `${` only in the build arguments and `dockerfile_inline`, and passes the context, the
+ * Dockerfile, the additional contexts and the cache imports on as written. The checks of this file see the text, not
+ * what bake makes of it (a path of the repository can become one of the workspace helper, a registry import a local
+ * one), and these builds run without the file-system entitlement check of bake (BAKE_FS_ENTITLEMENTS_OFF), so such a
+ * value is not supported whatever the switch says. An escape (`$${`, `%%{`) holds the same characters and is refused
+ * too. The build arguments and the text of `dockerfile_inline` do not choose what the build client reads.
+ */
+function bakeTemplateProblems(value: Record<string, unknown>): Problem[] {
+  const texts: Array<[string, unknown]> = [
+    ['build context', value.context],
+    ['build dockerfile', value.dockerfile],
+    ...listOf(value.cache_from).map((entry): [string, unknown] => ['build cache_from', entry]),
+    ...Object.entries(isRecord(value.additional_contexts) ? value.additional_contexts : {}).map(
+      ([name, source]): [string, unknown] => [`build additional_contexts ${name}`, source],
+    ),
+  ];
+  return texts
+    .filter(([, text]) => typeof text === 'string' && (text.includes('${') || text.includes('%{')))
+    .map(([what, text]) => unsupported(`${what} ${String(text)} (Buildx evaluates \`\${\` and \`%{\` in it as a template)`));
+}
+
+/**
  * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it);
  * a remote context is not supported yet (review round 5, S5-4); the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
  * access to the computer; tags and exported caches could overwrite images or write files.
@@ -659,7 +683,7 @@ export function cacheFromIsRegistry(text: string): boolean {
 function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   if (isUnset(value)) return [];
   if (!isRecord(value)) return [unsupported(`build ${JSON.stringify(value)}`)];
-  const problems: Problem[] = [];
+  const problems: Problem[] = bakeTemplateProblems(value);
   const context = typeof value.context === 'string' ? value.context : undefined;
   const remote = context !== undefined && isRemoteContext(context);
   // Review round 3 (P3-1): a missing context or Dockerfile of the repository is left to composeMissingBuildPaths.

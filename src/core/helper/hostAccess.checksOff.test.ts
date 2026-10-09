@@ -138,6 +138,9 @@ const TABLE: Array<[string, HostAccessInput, string, HostAccessClass]> = [
   ['build --build-context with a folder', input(build('--build-context', 'src=../other')), 'build option --build-context=src=../other', 'protected'],
   ['build --build-context with a folder of the computer', input(build('--build-context', 'src=/Users/x/other')), 'build option --build-context=src=/Users/x/other', 'computer'],
   ['build --build-context with the cache volume of the helper', input(build('--build-context', 'src=/devenv-cache')), 'build option --build-context=src=/devenv-cache', 'protected'],
+  // Review round 2 of PR #130 (D1): Buildx reads another scheme as a path relative to its working folder, refused whatever
+  // the switch says.
+  ['build --build-context with another scheme', input(build('--build-context', 'src=cwd:///devenv-cache')), 'build option --build-context=src=cwd:///devenv-cache', 'protected'],
   ['build --build-context with the folder of the token', input(build('--build-context', 'src=/workspaces/.devenv+')), 'build option --build-context=src=/workspaces/.devenv+', 'protected'],
   ['build --build-context with an OCI layout in the cache volume', input(build('--build-context', 'src=oci-layout:///devenv-cache/x:1@sha256:' + 'a'.repeat(64))), `build option --build-context=src=oci-layout:///devenv-cache/x:1@sha256:${'a'.repeat(64)}`, 'protected'],
   ['build --build-context with an OCI layout of the computer', input(build('--build-context', 'src=oci-layout:///Users/x/layout')), 'build option --build-context=src=oci-layout:///Users/x/layout', 'computer'],

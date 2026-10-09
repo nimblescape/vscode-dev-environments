@@ -754,16 +754,19 @@ const isHelperPath = (file) => {
   if (['/devenv-cache', '/workspaces/.devenv+', '/proc', '/sys', '/dev'].some((helperPath) => overlaps(normal, helperPath))) return true;
   return !inside(normal) && overlaps(normal, '/workspaces');
 };
-// The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts): the path, or the path of an OCI layout.
+// The folder of a local additional context (localContextPath of ../policy/dockerFlags.ts): the path, or the path of an OCI layout;
+// none only for an image, a URL, or a target of the build, by the exact prefix (review round 2 of PR #130, D1).
 const localFolder = (source) => {
-  const text = String(source).trim();
+  const raw = String(source);
+  if (['docker-image://', 'http://', 'https://', 'target:', 'service:'].some((prefix) => raw.startsWith(prefix))) return undefined;
+  const text = raw.trim();
   const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
   if (oci) {
     let folder = oci[1].replace(/@[a-z0-9]+:[0-9a-f]+$/i, '');
     const colon = folder.indexOf(':', folder.lastIndexOf('/') + 1);
     return colon >= 0 ? folder.slice(0, colon) : folder;
   }
-  return /^[a-z][a-z0-9+.-]*:/i.test(text) ? undefined : text;
+  return text;
 };
 // The key files of build.ssh: 'id=path[,path]', { id, path }, or a map.
 const sshFiles = (ssh) => {

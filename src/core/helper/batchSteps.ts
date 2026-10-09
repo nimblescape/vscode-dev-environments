@@ -52,8 +52,10 @@ export const COMPOSE_REMOTE_OFF: Readonly<Record<string, string>> = {
  * `rawjson` of Docker Compose). In the checked mode the host access policy keeps every path of a Compose build in the
  * repository (policy/compose.ts buildProblems: the contexts and Dockerfiles, the additional contexts and the cache
  * imports as Buildx reads them) and refuses `ssh`, `secrets` and `entitlements`; the helper has no SSH agent, and a
- * request can pass none (SSH_AUTH_SOCK). With the checks off, the user allowed access to the computer. Set after the
- * variables of the request (which cannot name `BUILDX_*` anyway: isPassableEnvName).
+ * request can pass none (SSH_AUTH_SOCK). With the checks off, the user allowed access to the computer. Whatever the
+ * switch says, it refuses those values when they hold `${` or `%{`, which bake evaluates as a template (review round 2
+ * of PR #130, R2A-1: bakeTemplateProblems), so the paths of the workspace helper stay out. Set after the variables of
+ * the request (which cannot name `BUILDX_*` anyway: isPassableEnvName).
  */
 export const BAKE_FS_ENTITLEMENTS_OFF: Readonly<Record<string, string>> = {
   BUILDX_BAKE_ENTITLEMENTS_FS: '0',

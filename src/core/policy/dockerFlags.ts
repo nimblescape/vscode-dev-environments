@@ -388,10 +388,15 @@ export function isUrlContext(source: string): boolean {
 
 /**
  * The folder of a local build context (`--build-context`, `additional_contexts`): the path itself, or the path of an
- * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` for other kinds of source (for example `service:…` of
- * Docker Compose, or another scheme).
+ * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` only for what Buildx never reads from the files of the
+ * build client, each by its exact prefix: an image (`docker-image://`), a URL (`http://`, `https://`), and a target of
+ * the build (`target:`, and `service:`, which Docker Compose makes a target). Review round 2 of PR #130 (D1): Buildx
+ * reads every other value as a path (bake `cwd://<path>` as `<path>`; a Git reference that it cannot parse, another
+ * scheme, or a prefix in another case or after a space, relative to its working folder), so it is checked as written:
+ * a relative path, which the checks refuse whatever the switch says.
  */
 export function localContextPath(source: string): string | undefined {
+  if (imageContext(source) !== undefined || isUrlContext(source) || source.startsWith('target:') || source.startsWith('service:')) return undefined;
   const text = source.trim();
   const oci = /^oci-layout:\/\/(.*)$/i.exec(text);
   if (oci) {
@@ -401,6 +406,5 @@ export function localContextPath(source: string): string | undefined {
     if (colon >= 0) folder = folder.slice(0, colon);
     return folder;
   }
-  if (/^[a-z][a-z0-9+.-]*:/i.test(text)) return undefined;
   return text;
 }
