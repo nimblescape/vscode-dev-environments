@@ -10,10 +10,13 @@
 // Monitor's background run downloads the newest compatible releases from the Marketplace into the store and cleans it
 // up. The store layout (under the shared store, VSCODE_STORE_DIR in the worker and the monitor):
 //   <store>/extensions/<universal|linux-x64|linux-arm64>/<cache name>   one `.vsix` (readable for all)
-//   <store>/extensions/wanted/<environment-id>.json                     the recorded list of an environment's last open
 //   <store>/extensions/tmp/<cache name>-<random>                         one download, renamed into place
-//   <store>/extensions/failures.json                                     the monitor's failed entries (retried after a day)
 //   <store>/locks/extension-<cache name>.lock                            the `flock` of one file (never removed)
+// Review round 1 of 11H3 (A-L5, B-D4): what the lists say stays out of the store, which every dev container mounts; it is
+// in the volume of the Session Monitor (mounted at /state by the workers and the monitor, never by a dev container):
+//   <state>/extensions/wanted/<environment-id>.json                     the recorded list of an environment's last open
+//   <state>/extensions/failures.json                                     the monitor's failed entries (retried after a day)
+//   <state>/extensions/chosen.json                                       the files that the monitor's runs chose
 // No I/O, no `vscode`.
 import type { VscodePlatform } from './helperChannel/protocol';
 
@@ -170,15 +173,22 @@ export function parseExtensionRecord(text: string): ExtensionRecord | undefined 
 
 /** Plan step 11H3 (the brief): a recorded list counts for the monitor's downloads and cleanup for this long. */
 export const RECORDED_LIST_MS = 14 * 24 * 60 * 60_000;
+/**
+ * Review round 1 of 11H3 (B-D3): a record whose time lies more than this ahead of `now` is left out (a clock that was
+ * far ahead wrote it; it would otherwise count for ever, until the clock passes it by RECORDED_LIST_MS). A time less far
+ * ahead counts as now.
+ */
+export const RECORD_AHEAD_MS = 24 * 60 * 60_000;
 
 /**
- * Plan step 11H3: the union of the lists recorded within RECORDED_LIST_MS of `now` (a time in the future counts as now):
- * each entry (an ID, or an ID with its pinned version) once, sorted, at most MAX_WANTED_EXTENSIONS.
+ * Plan step 11H3: the union of the lists recorded within RECORDED_LIST_MS of `now` (a time up to RECORD_AHEAD_MS in the
+ * future counts as now; one further ahead is left out): each entry (an ID, or an ID with its pinned version) once,
+ * sorted, at most MAX_WANTED_EXTENSIONS.
  */
 export function wantedExtensions(records: readonly ExtensionRecord[], now: number): ExtensionRef[] {
   const byText = new Map<string, ExtensionRef>();
   for (const record of records) {
-    if (now - record.at >= RECORDED_LIST_MS) continue;
+    if (now - record.at >= RECORDED_LIST_MS || record.at - now > RECORD_AHEAD_MS) continue;
     for (const ref of combinedExtensions(record.configuration, record.defaults)) byText.set(extensionEntryText(ref), ref);
   }
   return [...byText.keys()]
@@ -235,16 +245,28 @@ export function compareVersions(a: string, b: string): number {
  * Plan step 11H3 (the brief: "the newest cached `.vsix` in the store for the container's platform (or universal)"): the
  * files that the open seeds, as `<folder>/<name>`: for each entry of `wanted`, its pinned version, else its newest version
  * among the files of `universal` and of `platform` (the engine's; none: only `universal`); the same version in both: the
- * file of the platform (the server prefers it). An entry without a file is left out.
+ * file of the platform (the server prefers it). An entry without a file is left out. Review round 1 of 11H3 (A-L3,
+ * B-D1): for an entry without a pin, the file that the monitor chose for it (`choices`, by the entry's text: the newest
+ * compatible release) comes first when the store has it in one of these folders; a newer file (a version that another
+ * list pins, often a pre-release the server never installs) is not seeded then.
  */
 export function seedSelection(
   wanted: readonly ExtensionRef[],
   files: Partial<Record<ExtensionFolder, readonly string[]>>,
   platform: VscodePlatform | undefined,
+  choices?: ReadonlyMap<string, string>,
 ): string[] {
   const folders: ExtensionFolder[] = platform !== undefined ? [platform, 'universal'] : ['universal'];
   const chosen: string[] = [];
   for (const ref of wanted) {
+    const choice = ref.version === undefined ? choices?.get(ref.id) : undefined;
+    if (choice !== undefined) {
+      const [folder, name] = choice.split('/') as [ExtensionFolder, string | undefined];
+      if (name !== undefined && folders.includes(folder) && (files[folder] ?? []).includes(name) && parseCachedExtension(name, folder)?.id === ref.id) {
+        chosen.push(choice);
+        continue;
+      }
+    }
     let best: { folder: ExtensionFolder; name: string; version: string } | undefined;
     for (const folder of folders) {
       for (const name of files[folder] ?? []) {
@@ -262,9 +284,18 @@ export function seedSelection(
 /**
  * Plan step 11H3 (the brief, item 4): the files of one folder of the store that the cleanup removes: those that are not
  * the newest of their ID in that folder and whose version no recorded list of the last 14 days pins (`pinned`: the
- * entries `id@version` of wantedExtensions). A name of no cache name is left alone.
+ * entries `id@version` of wantedExtensions). A name of no cache name is left alone. Review round 1 of 11H3: a file that
+ * the monitor's runs chose (`keep.chosen`, as `<folder>/<name>`) stays (A-L3, B-D1: a pinned newer version never
+ * displaces the release of the entry without a pin); with `keep.named` (the IDs of the lists of the last 14 days), every
+ * file of an ID that no such list names goes first, its newest and a chosen one too (A-L4: the cache holds only what
+ * recent lists want).
  */
-export function extensionFilesToRemove(folder: ExtensionFolder, names: readonly string[], pinned: ReadonlySet<string>): string[] {
+export function extensionFilesToRemove(
+  folder: ExtensionFolder,
+  names: readonly string[],
+  pinned: ReadonlySet<string>,
+  keep: { named?: ReadonlySet<string>; chosen?: ReadonlySet<string> } = {},
+): string[] {
   const newest = new Map<string, string>();
   const parsed: { name: string; id: string; version: string }[] = [];
   for (const name of names) {
@@ -275,7 +306,11 @@ export function extensionFilesToRemove(folder: ExtensionFolder, names: readonly 
     if (known === undefined || compareVersions(cached.version, known) > 0) newest.set(cached.id, cached.version);
   }
   return parsed
-    .filter((file) => newest.get(file.id) !== file.version && !pinned.has(`${file.id}@${file.version}`))
+    .filter((file) => {
+      if (keep.named !== undefined && !keep.named.has(file.id)) return true;
+      if (keep.chosen?.has(`${folder}/${file.name}`) === true) return false;
+      return newest.get(file.id) !== file.version && !pinned.has(`${file.id}@${file.version}`);
+    })
     .map((file) => file.name)
     .sort();
 }
@@ -344,6 +379,32 @@ export const MAX_MARKETPLACE_ANSWER_BYTES = 16 * 1024 * 1024;
  */
 export const MARKETPLACE_FLAGS = 0x1 | 0x2 | 0x10 | 0x80;
 export const MARKETPLACE_LATEST_ONLY_FLAG = 0x10000;
+/**
+ * Review round 1 of 11H3 (A-L7): the most IDs of one query for all versions (the pinned entries, and the entries whose
+ * newest versions had no compatible release), so one long history fails only its own small query.
+ */
+export const MARKETPLACE_ALL_VERSIONS_CHUNK = 5;
+/**
+ * Review round 1 of 11H3 (A-L8): the most entries without a pin that one run asks again for all versions when the newest
+ * versions had no compatible release (VS Code's gallery service does the same); the others wait for their retry.
+ */
+export const MAX_EXTENSION_FALLBACKS = 20;
+
+/**
+ * Review round 1 of 11H3 (A-L6): the hosts of a `.vsix` download: `https:` on `marketplace.visualstudio.com` or a host
+ * under `.gallerycdn.vsassets.io` or `.gallery.vsassets.io` (the Marketplace's CDN); the first URL and every redirect.
+ */
+export function isMarketplaceDownloadUrl(url: string | URL): boolean {
+  let parsed: URL;
+  try {
+    parsed = typeof url === 'string' ? new URL(url) : url;
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== '' || (parsed.port !== '' && parsed.port !== '443')) return false;
+  const host = parsed.hostname.toLowerCase();
+  return host === 'marketplace.visualstudio.com' || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.(gallerycdn|gallery)\.vsassets\.io$/.test(host);
+}
 
 /**
  * Plan step 11H3: the body of one query for the extensions `ids` (filter type 7, the full name; 8, the target VS Code;
@@ -373,7 +434,7 @@ export interface MarketplaceVersion {
   preRelease: boolean;
   /** `Microsoft.VisualStudio.Code.Engine`. */
   engine?: string;
-  /** The URL of its `.vsix` (the asset Microsoft.VisualStudio.Services.VSIXPackage), always `https:`. */
+  /** The URL of its `.vsix` (the asset Microsoft.VisualStudio.Services.VSIXPackage), always isMarketplaceDownloadUrl. */
   vsix?: string;
 }
 
@@ -384,7 +445,8 @@ const MAX_VERSIONS_PER_EXTENSION = 20_000;
 /**
  * Plan step 11H3: the versions of each extension of an answer, by its ID (lower case), strictly: the answer must be
  * `{ results: [{ extensions: [...] }] }` with each extension's publisher and name valid; a version entry that does not
- * fit (no `x.y.z` version, a property or a file of another shape, a VSIX URL that is not `https:`) is left out;
+ * fit (no `x.y.z` version, a property or a file of another shape) is left out, and so is a VSIX URL that is not
+ * `https:` on a host of the Marketplace (isMarketplaceDownloadUrl; review round 1 of 11H3, A-L6);
  * undefined for an answer of any other shape or larger than MAX_MARKETPLACE_ANSWER_BYTES.
  */
 export function parseMarketplaceAnswer(body: string): Map<string, MarketplaceVersion[]> | undefined {
@@ -432,7 +494,7 @@ function marketplaceVersion(entry: unknown): MarketplaceVersion | undefined {
     ...(targetPlatform !== undefined ? { targetPlatform } : {}),
     preRelease: property('Microsoft.VisualStudio.Code.PreRelease') === 'true',
     ...(engine !== undefined ? { engine } : {}),
-    ...(vsix !== undefined && isHttpsUrl(vsix) ? { vsix } : {}),
+    ...(vsix !== undefined && isMarketplaceDownloadUrl(vsix) ? { vsix } : {}),
   };
 }
 
@@ -506,14 +568,40 @@ export function extensionRetryWaits(failedAt: number | undefined, now: number): 
   return failedAt !== undefined && Math.abs(now - failedAt) < EXTENSION_RETRY_MS;
 }
 
+/** Review round 1 of 11H3: the largest file of the chosen files (MAX_WANTED_EXTENSIONS entries of an entry and a file each). */
+export const MAX_EXTENSION_CHOICES_BYTES = 256 * 1024;
+
+/**
+ * Review round 1 of 11H3 (A-L3, B-D1): the files that the monitor's runs chose (`<state>/extensions/chosen.json`:
+ * `{ "<entry>": "<folder>/<cache name>" }`), strictly: an entry and a file of a cache name of that folder whose ID is the
+ * entry's; anything else is left out.
+ */
+export function parseExtensionChoices(text: string): Map<string, string> {
+  const choices = new Map<string, string>();
+  if (Buffer.byteLength(text, 'utf8') > MAX_EXTENSION_CHOICES_BYTES) return choices;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return choices;
+  }
+  if (!isRecord(value)) return choices;
+  for (const [entry, file] of Object.entries(value)) {
+    const ref = parseExtensionEntry(entry);
+    if (ref === undefined || extensionEntryText(ref) !== entry || typeof file !== 'string') continue;
+    const [folder, name, ...rest] = file.split('/');
+    if (rest.length > 0 || name === undefined || !(EXTENSION_FOLDERS as readonly string[]).includes(folder)) continue;
+    if (parseCachedExtension(name, folder as ExtensionFolder)?.id === ref.id) choices.set(entry, file);
+  }
+  return choices;
+}
+
+/** Review round 1 of 11H3: the text of the chosen files (sorted by entry). */
+export function formatExtensionChoices(choices: ReadonlyMap<string, string>): string {
+  return `${JSON.stringify(Object.fromEntries([...choices].sort(([a], [b]) => a.localeCompare(b))))}\n`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isHttpsUrl(text: string): boolean {
-  try {
-    return new URL(text).protocol === 'https:';
-  } catch {
-    return false;
-  }
-}

@@ -21,7 +21,7 @@ import { ImageChecker } from '../imageCheck/imageCheck';
 import { RegistryClient, type CredentialsProvider } from '../imageCheck/registryClient';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
 import { proxiedHttpsTransport } from '../proxyTransport';
-import { SECRET_REGISTRY, type VscodeServerRef } from '../helperChannel/protocol';
+import { LOCK_STATE_DIR, SECRET_REGISTRY, type VscodeServerRef } from '../helperChannel/protocol';
 import { VSCODE_STORE_DIR } from '../names';
 import { Messages } from '../messages';
 import { EnvironmentService, type EnvironmentServiceDeps, type EnvironmentSessionMonitor, type VscodeExtensionCache } from '../pipeline/environmentService';
@@ -39,7 +39,7 @@ import { EngineDocker } from './engineDocker';
 import type { HostSide } from './hostSide';
 import type { OwnHelper } from './ownHelper';
 import { ensureEngineServer, storeLock, unpackServer, type VscodeStoreDeps } from './vscodeServerStore';
-import { cachedExtensionFiles, recordExtensions } from './vscodeExtensionStore';
+import { cachedExtensionFiles, readExtensionChoices, recordExtensions } from './vscodeExtensionStore';
 import { parseExtensionEntry, seedSelection, type ExtensionRef } from '../vscodeExtensions';
 
 /**
@@ -364,12 +364,18 @@ export interface WorkerServicesDeps {
 /**
  * Plan step 11H3 (decision of 2026-10-09; live check 3): the shared extension cache of the store at VSCODE_STORE_DIR for
  * an open: its record of the extension list (with the user's `defaults`, at the time of the open) and the files to seed.
+ * Review round 1 of 11H3 (A-L5, B-D4): the record goes into the volume of the Session Monitor at LOCK_STATE_DIR, which
+ * no dev container mounts; the seed prefers the files that the monitor chose (A-L3, B-D1), read from there too.
  */
-export function workerExtensionCache(defaults: readonly string[] | undefined, root = VSCODE_STORE_DIR, now: () => number = Date.now): VscodeExtensionCache {
+export function workerExtensionCache(
+  defaults: readonly string[] | undefined,
+  folders: { store: string; state: string } = { store: VSCODE_STORE_DIR, state: LOCK_STATE_DIR },
+  now: () => number = Date.now,
+): VscodeExtensionCache {
   const refs = (defaults ?? []).map(parseExtensionEntry).filter((ref): ref is ExtensionRef => ref !== undefined);
   return {
-    record: (environmentId, configuration) => recordExtensions(root, environmentId, configuration, refs, now()),
-    seedFiles: async (list, platform) => seedSelection(list, await cachedExtensionFiles(root), platform),
+    record: (environmentId, configuration) => recordExtensions(folders.state, environmentId, configuration, refs, now()),
+    seedFiles: async (list, platform) => seedSelection(list, await cachedExtensionFiles(folders.store), platform, await readExtensionChoices(folders.state)),
   };
 }
 

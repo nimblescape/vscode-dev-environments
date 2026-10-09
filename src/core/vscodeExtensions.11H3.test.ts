@@ -6,6 +6,8 @@
 // list of an open (merged or own configuration, `-` entries, defaults, pins, bounds), the record, the union of 14 days,
 // the cache name, the seed's choice of files, the cleanup's choice, the engine rules of VS Code, and the Marketplace
 // query and its strict parse.
+// Review round 1 of 11H3 (A-L6): the `.vsix` URLs of these tests are on a host of the Marketplace's CDN
+// (`cdn.gallerycdn.vsassets.io`, was `cdn.example`), as a VSIX URL on any other host is now refused; nothing else changed.
 import { describe, expect, it } from 'vitest';
 import {
   MARKETPLACE_QUERY_URL,
@@ -162,7 +164,7 @@ describe('the engine rules of VS Code (plan step 11H3; isEngineValid of VS Code)
 /** A version of an answer. */
 function v(version: string, extra: Partial<MarketplaceVersion> & { pre?: boolean } = {}): MarketplaceVersion {
   const { pre, ...rest } = extra;
-  return { version, preRelease: pre === true, engine: '^1.80.0', vsix: `https://cdn.example/${version}.vsix`, ...rest };
+  return { version, preRelease: pre === true, engine: '^1.80.0', vsix: `https://cdn.gallerycdn.vsassets.io/${version}.vsix`, ...rest };
 }
 
 describe('the Marketplace (plan step 11H3)', () => {
@@ -195,9 +197,9 @@ describe('the Marketplace (plan step 11H3)', () => {
                     { key: 'Microsoft.VisualStudio.Code.Engine', value: '^1.80.0' },
                     { key: 'Microsoft.VisualStudio.Code.PreRelease', value: 'true' },
                   ],
-                  files: [{ assetType: 'Microsoft.VisualStudio.Services.VSIXPackage', source: 'https://cdn.example/yaml-1.25.0.vsix' }],
+                  files: [{ assetType: 'Microsoft.VisualStudio.Services.VSIXPackage', source: 'https://cdn.gallerycdn.vsassets.io/yaml-1.25.0.vsix' }],
                 },
-                { version: '1.24.0', targetPlatform: 'linux-x64', properties: [{ key: 'Microsoft.VisualStudio.Code.Engine', value: '^1.80.0' }], assetUri: 'https://cdn.example/yaml/1.24.0/' },
+                { version: '1.24.0', targetPlatform: 'linux-x64', properties: [{ key: 'Microsoft.VisualStudio.Code.Engine', value: '^1.80.0' }], assetUri: 'https://cdn.gallerycdn.vsassets.io/yaml/1.24.0/' },
                 { version: '1.23.0', files: [{ assetType: 'Microsoft.VisualStudio.Services.VSIXPackage', source: 'http://cdn.example/plain.vsix' }] },
                 { version: 'latest' },
                 { version: '1.22.0', properties: 'junk' },
@@ -213,8 +215,8 @@ describe('the Marketplace (plan step 11H3)', () => {
         [
           'redhat.vscode-yaml',
           [
-            { version: '1.25.0', preRelease: true, engine: '^1.80.0', vsix: 'https://cdn.example/yaml-1.25.0.vsix' },
-            { version: '1.24.0', targetPlatform: 'linux-x64', preRelease: false, engine: '^1.80.0', vsix: 'https://cdn.example/yaml/1.24.0/Microsoft.VisualStudio.Services.VSIXPackage' },
+            { version: '1.25.0', preRelease: true, engine: '^1.80.0', vsix: 'https://cdn.gallerycdn.vsassets.io/yaml-1.25.0.vsix' },
+            { version: '1.24.0', targetPlatform: 'linux-x64', preRelease: false, engine: '^1.80.0', vsix: 'https://cdn.gallerycdn.vsassets.io/yaml/1.24.0/Microsoft.VisualStudio.Services.VSIXPackage' },
             { version: '1.23.0', preRelease: false },
           ],
         ],
@@ -231,7 +233,7 @@ describe('the Marketplace (plan step 11H3)', () => {
       v('1.25.0', { pre: true }),
       v('1.24.1', { engine: '^1.106.0' }),
       v('1.24.0'),
-      v('1.24.0', { targetPlatform: 'linux-x64', vsix: 'https://cdn.example/x64.vsix' }),
+      v('1.24.0', { targetPlatform: 'linux-x64', vsix: 'https://cdn.gallerycdn.vsassets.io/x64.vsix' }),
       v('1.30.0', { targetPlatform: 'darwin-arm64' }),
       v('1.29.0', { vsix: undefined }),
       v('1.28.0', { engine: undefined }),
@@ -240,7 +242,7 @@ describe('the Marketplace (plan step 11H3)', () => {
     expect(chooseExtensionVersion({ id: 'redhat.vscode-yaml' }, versions, '1.105.0', 'linux-x64')).toEqual({
       version: '1.24.0',
       targetPlatform: 'linux-x64',
-      vsix: 'https://cdn.example/x64.vsix',
+      vsix: 'https://cdn.gallerycdn.vsassets.io/x64.vsix',
       folder: 'linux-x64',
       cacheName: 'redhat.vscode-yaml-1.24.0-linux-x64',
     });

@@ -418,6 +418,14 @@ async function serverDownload(transport: HttpTransport, server: VscodeServerRef,
   return { url, sha256: sha256hash.toLowerCase() };
 }
 
+function urlAllowed(text: string, allowedUrl: (url: URL) => boolean): boolean {
+  try {
+    return allowedUrl(new URL(text));
+  } catch {
+    return false;
+  }
+}
+
 function isHttpsUrl(text: string): boolean {
   try {
     return new URL(text).protocol === 'https:';
@@ -430,10 +438,20 @@ function isHttpsUrl(text: string): boolean {
  * Plan step 11H1: downloads `url` to the new file `file` (0600; an existing one is refused), streamed: at most
  * `maxBytes` (also by its Content-Length), MAX_SERVER_REDIRECTS redirects each to an `https:` URL, status 200 at the
  * end. Resolves with the SHA-256 of the content (lower-case hexadecimal). The caller removes the file on a failure.
+ * Review round 1 of 11H3 (A-L6): `allowedUrl`, when given, must accept the first URL and every redirect (the download of
+ * a `.vsix` only from the hosts of the Marketplace); 11H1's server download gives none.
  */
-export async function downloadToFile(transport: HttpStreamTransport, url: string, file: string, maxBytes: number, signal: AbortSignal): Promise<string> {
+export async function downloadToFile(
+  transport: HttpStreamTransport,
+  url: string,
+  file: string,
+  maxBytes: number,
+  signal: AbortSignal,
+  allowedUrl?: (url: URL) => boolean,
+): Promise<string> {
   let current = url;
   for (let redirects = 0; ; redirects++) {
+    if (allowedUrl !== undefined && !urlAllowed(current, allowedUrl)) throw new FetchError('the download URL is not on an allowed host');
     const response = await transport.stream(current, signal);
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       response.body.destroy();

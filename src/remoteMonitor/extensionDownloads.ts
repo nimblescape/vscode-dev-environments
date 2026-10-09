@@ -6,12 +6,16 @@
 // "the monitor shall do maintenance and pulls of new images, vscode server downloads and extension downloads in the
 // background"; live check 3): the part "extensions" of the Session Monitor's background run (BackgroundRun of
 // background.ts, after the part of the server) and its share of the daily cleanup of the store. The part takes the union
-// of the extension lists that the opens recorded in the last 14 days, asks the Marketplace once (one query for the
-// entries without a pin, one for the pinned ones) for the newest release of each that the VS Code of the newest stable
-// server of the store runs on the engine's platform, and downloads the `.vsix` files that the store lacks (ensureExtension:
-// under the lock of the file, streamed, renamed into place). Each failure is one line and is retried after a day. The
-// cleanup removes the files that are not the newest of their ID and that no recorded list pins, each under its lock taken
-// without a wait; lock files are never removed. The rules are in src/core/worker/vscodeExtensions.ts. No `vscode`.
+// of the extension lists that the opens recorded in the last 14 days, asks the Marketplace (one query for the newest
+// versions of the entries without a pin; review round 1 of 11H3: queries of at most MARKETPLACE_ALL_VERSIONS_CHUNK IDs
+// for all versions of the pinned ones and of those whose newest versions had no compatible release) for the newest
+// release of each that the VS Code of the newest stable server of the store runs on the engine's platform, records the
+// files it chose, and downloads the `.vsix` files that the store lacks (ensureExtension: under the lock of the file,
+// streamed, renamed into place; at most MAX_EXTENSION_BYTES_PER_RUN a run). Each failure is one line and is retried after
+// a day. The cleanup removes the files of IDs that no recorded list names, and the files that are not the newest of their
+// ID, that no recorded list pins and that no run chose, each under its lock taken without a wait; lock files are never
+// removed. The lists, the failures and the chosen files are in the volume of the monitor (`stateDir`). The rules are in
+// src/core/vscodeExtensions.ts. No `vscode`.
 import * as fs from 'fs';
 import * as path from 'path';
 import type { HttpStreamTransport, HttpTransport } from '../core/http';
@@ -21,14 +25,19 @@ import {
   STORE_EXTENSION_FOLDER,
   cachedExtensionFiles,
   ensureExtension,
+  extensionFile,
   extensionLockFile,
+  readExtensionChoices,
   readExtensionFailures,
   readExtensionRecords,
+  writeExtensionChoices,
   writeExtensionFailures,
 } from '../core/worker/vscodeExtensionStore';
 import {
   EXTENSION_FOLDERS,
+  MARKETPLACE_ALL_VERSIONS_CHUNK,
   MARKETPLACE_QUERY_URL,
+  MAX_EXTENSION_FALLBACKS,
   MAX_MARKETPLACE_ANSWER_BYTES,
   chooseExtensionVersion,
   compareVersions,
@@ -39,6 +48,7 @@ import {
   parseExtensionFailures,
   parseMarketplaceAnswer,
   wantedExtensions,
+  type ChosenExtension,
   type ExtensionRef,
   type MarketplaceVersion,
 } from '../core/vscodeExtensions';
@@ -51,11 +61,23 @@ export const MARKETPLACE_TIMEOUT_MS = 60_000;
 const ARCHITECTURE_TIMEOUT_MS = 60_000;
 /** Plan step 11H3: the largest `product.json` of a server that is read for its version. */
 const MAX_PRODUCT_JSON_BYTES = 1024 * 1024;
+/**
+ * Review round 1 of 11H3 (A-L4): the most bytes that one run downloads; when they are reached, no further download starts
+ * (the rest comes with the next run; one file may pass the bound by at most its own size, MAX_VSIX_BYTES).
+ */
+export const MAX_EXTENSION_BYTES_PER_RUN = 1024 * 1024 * 1024;
 
 /** Plan step 11H3: what the part "extensions" and its cleanup use (extensionRunDeps of background.ts). */
 export interface ExtensionRunDeps {
   /** The store (VSCODE_STORE_DIR in the monitor). */
   root: string;
+  /**
+   * Review round 1 of 11H3 (A-L5, B-D4): the volume of the monitor (REMOTE_MONITOR_STATE_DIR), with the recorded lists,
+   * the failures and the chosen files; no dev container mounts it.
+   */
+  stateDir: string;
+  /** Default MAX_EXTENSION_BYTES_PER_RUN. */
+  maxRunBytes?: number;
   /** The HTTPS of the proxy of the daemon (decision C1 of 2026-10-05). */
   transport: HttpTransport & HttpStreamTransport;
   /** The architecture of the engine (`GET /info`). */
@@ -128,9 +150,9 @@ export async function queryMarketplace(transport: HttpTransport, ids: readonly s
  * for a failure of the whole part (the run logs it); each entry fails on its own.
  */
 export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> {
-  const { log, root } = deps;
+  const { log, root, stateDir } = deps;
   const now = deps.now();
-  const wanted = wantedExtensions(await readExtensionRecords(root), now);
+  const wanted = wantedExtensions(await readExtensionRecords(stateDir), now);
   if (wanted.length === 0) {
     log('No open recorded an extension list in the last 14 days; no extension is fetched.');
     return;
@@ -152,7 +174,7 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
     log(`The shared store has no stable VS Code server for ${platform}, so the compatible extension versions are not known; no extension is fetched.`);
     return;
   }
-  const failures = parseExtensionFailures(await readExtensionFailures(root));
+  const failures = parseExtensionFailures(await readExtensionFailures(stateDir));
   const before = JSON.stringify([...failures]);
   const due = wanted.filter((ref) => !extensionRetryWaits(failures.get(extensionEntryText(ref)), now));
   const waiting = wanted.length - due.length;
@@ -162,44 +184,98 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
     failures.set(extensionEntryText(ref), now);
     log(`The extension ${extensionEntryText(ref)} is not in the shared extension cache (${why}); it is tried again after a day.`);
   };
-  const signal = new AbortController().signal;
-  // One query for the entries without a pin (only the newest versions), one for the pinned ones (all versions).
-  for (const pinned of [false, true]) {
-    const group = due.filter((ref) => (ref.version !== undefined) === pinned);
-    if (group.length === 0) continue;
-    let answer: Map<string, MarketplaceVersion[]>;
+  const noRelease = (ref: ExtensionRef) => (ref.version !== undefined ? `the Marketplace has no such version for ${platform}` : `the Marketplace has no release for VS Code ${vscodeVersion} on ${platform}`);
+  const query = (ids: readonly string[], latestOnly: boolean) => queryMarketplace(deps.transport, ids, latestOnly, AbortSignal.timeout(MARKETPLACE_TIMEOUT_MS));
+  const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+  const queryFailure = (count: number, error: unknown) => `The Marketplace could not be asked for ${count} extension(s): ${message(error)}`;
+  /** The version that each entry gets, in the order of the downloads. */
+  const choices: Array<{ ref: ExtensionRef; chosen: ChosenExtension }> = [];
+  // The entries without a pin: one query for the newest versions (a failed query records nothing: the next run asks again).
+  const unpinned = due.filter((ref) => ref.version === undefined);
+  /** The entries whose answers need all versions: the pinned ones, and (A-L8) those without a compatible newest release. */
+  const allVersions = due.filter((ref) => ref.version !== undefined);
+  if (unpinned.length > 0) {
+    let answer: Map<string, MarketplaceVersion[]> | undefined;
     try {
-      answer = await queryMarketplace(deps.transport, [...new Set(group.map((ref) => ref.id))], !pinned, AbortSignal.timeout(MARKETPLACE_TIMEOUT_MS));
+      answer = await query([...new Set(unpinned.map((ref) => ref.id))], true);
     } catch (error) {
-      log(`The Marketplace could not be asked for ${group.length} extension(s): ${error instanceof Error ? error.message : String(error)}`);
-      continue;
+      log(queryFailure(unpinned.length, error));
     }
-    for (const ref of group) {
-      const versions = answer.get(ref.id);
-      if (versions === undefined) {
-        fail(ref, 'the Marketplace does not have it');
-        continue;
-      }
-      const chosen = chooseExtensionVersion(ref, versions, vscodeVersion, platform);
-      if (chosen === undefined) {
-        fail(ref, ref.version !== undefined ? `the Marketplace has no such version for ${platform}` : `the Marketplace has no release for VS Code ${vscodeVersion} on ${platform}`);
-        continue;
-      }
-      try {
-        const outcome = await ensureExtension({ root, transport: deps.transport, lock: locks(deps).lock, logger: { warn: log } }, chosen, signal);
-        counts[outcome]++;
-        failures.delete(extensionEntryText(ref));
-        if (outcome === 'downloaded') log(`Downloaded the extension ${chosen.cacheName} into the shared extension cache.`);
-      } catch (error) {
-        fail(ref, error instanceof Error ? error.message : String(error));
-      }
+    let fallbacks = 0;
+    for (const ref of answer !== undefined ? unpinned : []) {
+      const versions = answer!.get(ref.id);
+      const chosen = versions !== undefined ? chooseExtensionVersion(ref, versions, vscodeVersion, platform) : undefined;
+      if (versions === undefined) fail(ref, 'the Marketplace does not have it');
+      else if (chosen !== undefined) choices.push({ ref, chosen });
+      // Review round 1 of 11H3 (A-L8): asked once more for all its versions (an older release may fit), a bounded number.
+      else if (fallbacks++ < MAX_EXTENSION_FALLBACKS) allVersions.push(ref);
+      else fail(ref, noRelease(ref));
     }
   }
-  // Only the entries that are still wanted keep their failure.
+  // Review round 1 of 11H3 (A-L7): all versions in queries of at most MARKETPLACE_ALL_VERSIONS_CHUNK IDs; a failed query
+  // fails only its own entries (each waits a day).
+  const ids = [...new Set(allVersions.map((ref) => ref.id))];
+  for (let start = 0; start < ids.length; start += MARKETPLACE_ALL_VERSIONS_CHUNK) {
+    const chunk = ids.slice(start, start + MARKETPLACE_ALL_VERSIONS_CHUNK);
+    const refs = allVersions.filter((ref) => chunk.includes(ref.id));
+    let answer: Map<string, MarketplaceVersion[]>;
+    try {
+      answer = await query(chunk, false);
+    } catch (error) {
+      log(queryFailure(refs.length, error));
+      for (const ref of refs) fail(ref, `its query failed: ${message(error)}`);
+      continue;
+    }
+    for (const ref of refs) {
+      const versions = answer.get(ref.id);
+      const chosen = versions !== undefined ? chooseExtensionVersion(ref, versions, vscodeVersion, platform) : undefined;
+      if (versions === undefined) fail(ref, 'the Marketplace does not have it');
+      else if (chosen === undefined) fail(ref, noRelease(ref));
+      else choices.push({ ref, chosen });
+    }
+  }
+  // Review round 1 of 11H3 (A-L3, B-D1): the chosen files, which the cleanup keeps and the seed of an entry without a pin
+  // prefers; an entry that this run did not decide keeps its earlier choice while a list wants it.
   const kept = new Set(wanted.map(extensionEntryText));
+  const previous = await readExtensionChoices(stateDir);
+  const chosenFiles = new Map([...previous].filter(([entry]) => kept.has(entry)));
+  for (const { ref, chosen } of choices) chosenFiles.set(extensionEntryText(ref), `${chosen.folder}/${chosen.cacheName}`);
+  if (JSON.stringify([...chosenFiles].sort()) !== JSON.stringify([...previous].sort())) {
+    await writeExtensionChoices(stateDir, chosenFiles).catch((error: unknown) => {
+      log(`The chosen extension files could not be stored: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  // Review round 1 of 11H3 (A-L4): at most maxRunBytes downloaded a run; the rest comes with the next run.
+  const maxRunBytes = deps.maxRunBytes ?? MAX_EXTENSION_BYTES_PER_RUN;
+  let downloadedBytes = 0;
+  let deferred = 0;
+  const signal = new AbortController().signal;
+  for (const { ref, chosen } of choices) {
+    const target = extensionFile(root, chosen.folder, chosen.cacheName);
+    if (downloadedBytes >= maxRunBytes) {
+      if ((await fs.promises.lstat(target).catch(() => undefined))?.isFile() === true) {
+        counts.present++;
+        failures.delete(extensionEntryText(ref));
+      } else deferred++;
+      continue;
+    }
+    try {
+      const outcome = await ensureExtension({ root, transport: deps.transport, lock: locks(deps).lock, logger: { warn: log } }, chosen, signal);
+      counts[outcome]++;
+      failures.delete(extensionEntryText(ref));
+      if (outcome === 'downloaded') {
+        downloadedBytes += (await fs.promises.lstat(target).catch(() => undefined))?.size ?? 0;
+        log(`Downloaded the extension ${chosen.cacheName} into the shared extension cache.`);
+      }
+    } catch (error) {
+      fail(ref, error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (deferred > 0) log(`This run downloaded ${downloadedBytes} bytes, its bound; ${deferred} extension(s) are left for the next run.`);
+  // Only the entries that are still wanted keep their failure.
   for (const entry of [...failures.keys()]) if (!kept.has(entry)) failures.delete(entry);
   if (JSON.stringify([...failures]) !== before) {
-    await writeExtensionFailures(root, failures).catch((error: unknown) => {
+    await writeExtensionFailures(stateDir, failures).catch((error: unknown) => {
       log(`The failed extensions could not be stored: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
@@ -211,7 +287,8 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
 /**
  * Plan step 11H3 (the brief, item 4): the share of the daily cleanup of the store (cleanupWhenDue of background.ts): the
  * files of each folder of the cache that extensionFilesToRemove names (not the newest of their ID, and pinned by no list
- * recorded in the last 14 days), each under its lock taken without a wait (`flock -n`; busy: left to the next cleanup),
+ * recorded in the last 14 days; review round 1 of 11H3: never a file that the runs chose, A-L3/B-D1, and every file of an
+ * ID that no such list names, A-L4), each under its lock taken without a wait (`flock -n`; busy: left to the next cleanup),
  * checked again under it and removed; then the leftovers of downloads in `extensions/tmp` (`<cache name>-<random>`),
  * those of a file only while its lock can be taken at once. Lock files are never removed. Never throws.
  */
@@ -219,15 +296,14 @@ export async function cleanupExtensions(deps: ExtensionRunDeps): Promise<void> {
   const { log, root } = deps;
   const { tryLock } = locks(deps);
   try {
-    const pinned = new Set(
-      wantedExtensions(await readExtensionRecords(root), deps.now())
-        .filter((ref) => ref.version !== undefined)
-        .map(extensionEntryText),
-    );
+    const wanted = wantedExtensions(await readExtensionRecords(deps.stateDir), deps.now());
+    const pinned = new Set(wanted.filter((ref) => ref.version !== undefined).map(extensionEntryText));
+    const named = new Set(wanted.map((ref) => ref.id));
+    const chosen = new Set((await readExtensionChoices(deps.stateDir)).values());
     const files = await cachedExtensionFiles(root);
     let removed = 0;
     for (const folder of EXTENSION_FOLDERS) {
-      for (const name of extensionFilesToRemove(folder, files[folder], pinned)) {
+      for (const name of extensionFilesToRemove(folder, files[folder], pinned, { named, chosen })) {
         const attempt = await tryLock(name);
         if (attempt.kind !== 'locked') {
           log(`The extension ${name} is not removed from the shared extension cache now: ${attempt.kind === 'busy' ? 'its lock is held (a download of it runs)' : `its lock could not be taken (${attempt.detail})`}.`);
@@ -245,7 +321,7 @@ export async function cleanupExtensions(deps: ExtensionRunDeps): Promise<void> {
         }
       }
     }
-    if (removed > 0) log(`Removed ${removed} older extension version(s) from the shared extension cache.`);
+    if (removed > 0) log(`Removed ${removed} extension file(s) that no recent list wants from the shared extension cache.`);
     const temp = path.posix.join(root, STORE_EXTENSION_FOLDER, EXTENSION_TEMP_FOLDER);
     for (const entry of await fs.promises.readdir(temp).catch(() => [] as string[])) {
       const cacheName = /^([a-z0-9][a-z0-9.-]*)-[0-9a-f]{12}$/.exec(entry)?.[1];

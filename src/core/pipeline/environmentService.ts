@@ -530,7 +530,8 @@ export interface EnvironmentServiceDeps extends OperationBaseDeps {
 
 /**
  * Plan step 11H3 (decision of 2026-10-09; live check 3): the shared extension cache of the store for an open with a VS
- * Code server (the worker's: recordExtensions, cachedExtensionFiles and seedSelection at VSCODE_STORE_DIR).
+ * Code server (the worker's: recordExtensions, cachedExtensionFiles and seedSelection at VSCODE_STORE_DIR; review round 1
+ * of 11H3: the record and the monitor's chosen files in the volume of the Session Monitor at LOCK_STATE_DIR).
  */
 export interface VscodeExtensionCache {
   /**

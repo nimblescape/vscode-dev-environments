@@ -22,8 +22,9 @@ import { SCRIPT_ENTER_FOLDER, SCRIPT_HOME_OF_USER } from './vscodeServerLink';
  * naming musl, takes only `universal`). The data folder and its `extensionsCache` must each be missing (then created) or
  * a plain folder of the user (the checks of the link, SCRIPT_ENTER_FOLDER); a file that is in the cache already (a
  * file, a folder or a link of that name) is never replaced. Each file is copied with `cp -n` into a new temporary file of
- * the checked folder and then given its name with `ln` (a hard link, which never replaces a name and never follows a
- * link), and the temporary name goes. Its output is one line: `seeded: <copied> copied, <present> present, <other>
+ * the checked folder and then given its name with `ln -n` (a hard link, which never replaces a name; review round 1 of
+ * 11H3, A-L1: `-n` treats a link to a folder that a process of the container planted at the name after the check as a
+ * name that exists, instead of creating the hard link inside that folder), and the temporary name goes. Its output is one line: `seeded: <copied> copied, <present> present, <other>
  * skipped, <failed> failed`, or `skipped: <why>` / `refused: <why>`; it exits 0 for each, non-zero only when a command
  * of its setup failed. Works with GNU and BusyBox tools.
  */
@@ -69,7 +70,7 @@ for entry in "$@"; do
   temp=".devenv-seed-$$-$name"
   if [ -e "$temp" ] || [ -L "$temp" ]; then failed=$((failed + 1)); continue; fi
   if cp -n "$source" "$temp" 2>/dev/null && [ -f "$temp" ] && [ ! -L "$temp" ]; then
-    if ln "$temp" "$name" 2>/dev/null; then copied=$((copied + 1)); else present=$((present + 1)); fi
+    if ln -n "$temp" "$name" 2>/dev/null; then copied=$((copied + 1)); else present=$((present + 1)); fi
   else
     failed=$((failed + 1))
   fi

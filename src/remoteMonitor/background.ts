@@ -61,6 +61,7 @@ import {
 } from './backgroundRules';
 import { engineFailure, type VscodeEngine } from './engine';
 import { cleanupExtensions, downloadExtensions, type ExtensionRunDeps } from './extensionDownloads';
+import { REMOTE_MONITOR_STATE_DIR } from '../core/remoteMonitor/protocol';
 
 /** Plan step 11H2: the time limit of a request to the engine of the VS Code part (the architecture, a list, an inspect). */
 export const BACKGROUND_ENGINE_TIMEOUT_MS = 60_000;
@@ -89,12 +90,15 @@ export interface VscodeBackgroundDeps {
   ensure?: typeof ensureServer;
   /** Plan step 11H3: the locks of the files of the extension cache (default: storeLock and storeTryLock; the tests give their own). */
   extensionLocks?: Pick<ExtensionRunDeps, 'lock' | 'tryLock'>;
+  /** Review round 1 of 11H3 (A-L5): the volume of the monitor with the extension lists (default REMOTE_MONITOR_STATE_DIR). */
+  extensionStateDir?: string;
 }
 
 /** Plan step 11H3: what the part "extensions" and its cleanup use, from the VS Code part of the run. */
 export function extensionRunDeps(vscode: VscodeBackgroundDeps, deps: Pick<BackgroundRunDeps, 'log' | 'now'>): ExtensionRunDeps {
   return {
     root: vscode.store.root,
+    stateDir: vscode.extensionStateDir ?? REMOTE_MONITOR_STATE_DIR,
     transport: vscode.store.transport,
     architecture: (signal) => vscode.engine.architecture(signal),
     ...vscode.extensionLocks,

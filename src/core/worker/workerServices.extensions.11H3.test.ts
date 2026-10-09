@@ -49,7 +49,9 @@ describe('the shared extension cache of the pipeline in the worker (plan step 11
   it('records the list of the open with its defaults, and gives the cached files for the platform', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-ext-worker-'));
     temps.push(root);
-    const cache = workerExtensionCache(['c.d', 'not valid'], root, () => 77);
+    // Review round 1 of 11H3 (A-L5, B-D4): the record is in the volume of the Session Monitor, a folder of its own here
+    // (the same temporary folder holds both; the layout below it is the same).
+    const cache = workerExtensionCache(['c.d', 'not valid'], { store: root, state: root }, () => 77);
     expect(await cache.record(ENV, [{ id: 'a.b' }])).toEqual([{ id: 'a.b' }, { id: 'c.d' }]);
     expect(JSON.parse(fs.readFileSync(path.join(root, 'extensions', 'wanted', `${ENV}.json`), 'utf8'))).toEqual({ at: 77, configuration: ['a.b'], defaults: ['c.d'] });
     fs.mkdirSync(path.join(root, 'extensions', 'linux-x64'), { recursive: true });

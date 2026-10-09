@@ -6,18 +6,27 @@
 // 3 of the user): the files of the shared extension cache in the store (the layout is in vscodeExtensions.ts): the record
 // of an open's extension list (the worker), the listing of the cached `.vsix` files (the worker's seed, the monitor's
 // cleanup), the read of the records (the monitor), and the download of one `.vsix` under the lock of its file (the
-// monitor), streamed into a temporary file and renamed into place, as 11H1 fetches a server. No `vscode`.
+// monitor), streamed into a temporary file and renamed into place, as 11H1 fetches a server. Review round 1 of 11H3
+// (A-L5, B-D4): the records, the failures and the chosen files are in the volume of the Session Monitor (`stateDir`:
+// LOCK_STATE_DIR in the worker, REMOTE_MONITOR_STATE_DIR in the monitor), which no dev container mounts. No `vscode`.
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
+import { createGunzip } from 'zlib';
 import { isStorageId } from '../storage/paths';
 import type { HttpStreamTransport } from '../http';
 import type { Logger } from '../ports';
 import {
   EXTENSION_FOLDERS,
   MAX_EXTENSION_RECORD_BYTES,
+  MAX_EXTENSION_CHOICES_BYTES,
   combinedExtensions,
+  formatExtensionChoices,
   formatExtensionRecord,
+  isMarketplaceDownloadUrl,
+  parseExtensionChoices,
   parseExtensionRecord,
   type ChosenExtension,
   type ExtensionFolder,
@@ -28,12 +37,16 @@ import { STORE_LOCK_FOLDER, downloadToFile } from './vscodeServerStore';
 
 /** Plan step 11H3: the folder of the extension cache in the store. */
 export const STORE_EXTENSION_FOLDER = 'extensions';
-/** Plan step 11H3: the folder of the recorded lists (`extensions/wanted`). */
+/** Review round 1 of 11H3 (A-L5, B-D4): the folder of the extension lists in the volume of the Session Monitor. */
+export const STATE_EXTENSION_FOLDER = 'extensions';
+/** Plan step 11H3: the folder of the recorded lists (`<state>/extensions/wanted`). */
 export const EXTENSION_WANTED_FOLDER = 'wanted';
-/** Plan step 11H3: the folder of the downloads (`extensions/tmp`). */
+/** Plan step 11H3: the folder of the downloads (`<store>/extensions/tmp`). */
 export const EXTENSION_TEMP_FOLDER = 'tmp';
-/** Plan step 11H3: the file of the monitor's failed entries (`extensions/failures.json`). */
+/** Plan step 11H3: the file of the monitor's failed entries (`<state>/extensions/failures.json`). */
 export const EXTENSION_FAILURES_FILE = 'failures.json';
+/** Review round 1 of 11H3 (A-L3, B-D1): the file of the files that the monitor's runs chose (`<state>/extensions/chosen.json`). */
+export const EXTENSION_CHOICES_FILE = 'chosen.json';
 /** Plan step 11H3 (the brief: "size cap e.g. 200 MiB"): the largest `.vsix` that the monitor downloads. */
 export const MAX_VSIX_BYTES = 200 * 1024 * 1024;
 /** Plan step 11H3: the longest download of one `.vsix`, the wait for its lock included. */
@@ -51,7 +64,8 @@ export function extensionFile(root: string, folder: ExtensionFolder, cacheName: 
 
 /**
  * Makes `folder` (and the folders above it up to `root`) with `mode` when it is missing, and checks that each is a plain
- * folder (never a link); 0755 folders get that mode back (the dev containers read the cache as their remote user).
+ * folder (never a link); 0755 folders get that mode back (the dev containers read the cache as their remote user), and
+ * (review round 1 of 11H3) 0700 folders theirs.
  */
 async function plainFolder(root: string, parts: readonly string[], modes: readonly number[]): Promise<string> {
   let folder = root;
@@ -62,7 +76,7 @@ async function plainFolder(root: string, parts: readonly string[], modes: readon
     });
     const stat = await fs.promises.lstat(folder);
     if (!stat.isDirectory()) throw new Error(`${folder} is not a folder`);
-    if (modes[index] === 0o755 && (stat.mode & 0o777) !== 0o755) await fs.promises.chmod(folder, 0o755);
+    if ((stat.mode & 0o777) !== modes[index]) await fs.promises.chmod(folder, modes[index]);
   }
   return folder;
 }
@@ -95,21 +109,22 @@ async function readPlainFile(file: string, maxBytes: number): Promise<string | u
 }
 
 /**
- * Plan step 11H3 (the brief, item 1): records the extension list of an open of the environment `environmentId` in the
- * store (`extensions/wanted/<environment-id>.json`, written atomically, at most MAX_EXTENSION_RECORD_BYTES): the
+ * Plan step 11H3 (the brief, item 1): records the extension list of an open of the environment `environmentId`
+ * (`extensions/wanted/<environment-id>.json`, written atomically, at most MAX_EXTENSION_RECORD_BYTES): the
  * configuration's extensions and the user's defaults, with the time of the open. `configuration` undefined (the open
  * could not read its configuration): the recorded configuration's list stays. Resolves with the list of the open
- * (combinedExtensions); rejects with the cause (the caller logs it).
+ * (combinedExtensions); rejects with the cause (the caller logs it). Review round 1 of 11H3 (A-L5, B-D4): under
+ * `stateDir`, the volume of the Session Monitor (folders 0700), not in the store that the dev containers mount.
  */
 export async function recordExtensions(
-  root: string,
+  stateDir: string,
   environmentId: string,
   configuration: readonly ExtensionRef[] | undefined,
   defaults: readonly ExtensionRef[],
   at: number,
 ): Promise<ExtensionRef[]> {
   if (!isStorageId(environmentId)) throw new Error(`the environment ID ${JSON.stringify(environmentId)} is invalid`);
-  const folder = await plainFolder(root, [STORE_EXTENSION_FOLDER, EXTENSION_WANTED_FOLDER], [0o755, 0o700]);
+  const folder = await plainFolder(stateDir, [STATE_EXTENSION_FOLDER, EXTENSION_WANTED_FOLDER], [0o700, 0o700]);
   const name = `${environmentId}.json`;
   const previous = configuration === undefined ? parseExtensionRecord((await readPlainFile(path.posix.join(folder, name), MAX_EXTENSION_RECORD_BYTES)) ?? '') : undefined;
   const record: ExtensionRecord = { at, configuration: [...(configuration ?? previous?.configuration ?? [])], defaults: [...defaults] };
@@ -117,11 +132,19 @@ export async function recordExtensions(
   return combinedExtensions(record.configuration, record.defaults);
 }
 
-/** Plan step 11H3: the recorded lists of the store (a file that is not a valid record of an environment is left out). */
-export async function readExtensionRecords(root: string): Promise<ExtensionRecord[]> {
-  const folder = path.posix.join(root, STORE_EXTENSION_FOLDER, EXTENSION_WANTED_FOLDER);
+/**
+ * Plan step 11H3: the recorded lists under `stateDir` (a file that is not a valid record of an environment is left out).
+ * Review round 1 of 11H3 (A-L4): a missing folder has none; any other failure of its listing rejects (the cleanup then
+ * removes nothing as unwanted).
+ */
+export async function readExtensionRecords(stateDir: string): Promise<ExtensionRecord[]> {
+  const folder = path.posix.join(stateDir, STATE_EXTENSION_FOLDER, EXTENSION_WANTED_FOLDER);
   const records: ExtensionRecord[] = [];
-  for (const entry of await fs.promises.readdir(folder).catch(() => [] as string[])) {
+  const entries = await fs.promises.readdir(folder).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return [] as string[];
+    throw error;
+  });
+  for (const entry of entries) {
     if (!entry.endsWith('.json') || !isStorageId(entry.slice(0, -'.json'.length))) continue;
     const record = parseExtensionRecord((await readPlainFile(path.posix.join(folder, entry), MAX_EXTENSION_RECORD_BYTES)) ?? '');
     if (record !== undefined) records.push(record);
@@ -146,15 +169,26 @@ export async function cachedExtensionFiles(root: string): Promise<Record<Extensi
   return files;
 }
 
-/** Plan step 11H3: the failed entries of the monitor (`extensions/failures.json`); the text, or '' when it is missing. */
-export async function readExtensionFailures(root: string): Promise<string> {
-  return (await readPlainFile(path.posix.join(root, STORE_EXTENSION_FOLDER, EXTENSION_FAILURES_FILE), MAX_EXTENSION_RECORD_BYTES)) ?? '';
+/** Plan step 11H3: the failed entries of the monitor (`<state>/extensions/failures.json`); the text, or '' when it is missing. */
+export async function readExtensionFailures(stateDir: string): Promise<string> {
+  return (await readPlainFile(path.posix.join(stateDir, STATE_EXTENSION_FOLDER, EXTENSION_FAILURES_FILE), MAX_EXTENSION_RECORD_BYTES)) ?? '';
 }
 
 /** Plan step 11H3: writes the failed entries of the monitor atomically (`{ "<entry>": <time> }`). */
-export async function writeExtensionFailures(root: string, failures: ReadonlyMap<string, number>): Promise<void> {
-  const folder = await plainFolder(root, [STORE_EXTENSION_FOLDER], [0o755]);
+export async function writeExtensionFailures(stateDir: string, failures: ReadonlyMap<string, number>): Promise<void> {
+  const folder = await plainFolder(stateDir, [STATE_EXTENSION_FOLDER], [0o700]);
   await writeAtomically(folder, EXTENSION_FAILURES_FILE, `${JSON.stringify(Object.fromEntries([...failures].sort(([a], [b]) => a.localeCompare(b))))}\n`);
+}
+
+/** Review round 1 of 11H3 (A-L3, B-D1): the files that the monitor's runs chose (parseExtensionChoices; none when missing). */
+export async function readExtensionChoices(stateDir: string): Promise<Map<string, string>> {
+  return parseExtensionChoices((await readPlainFile(path.posix.join(stateDir, STATE_EXTENSION_FOLDER, EXTENSION_CHOICES_FILE), MAX_EXTENSION_CHOICES_BYTES)) ?? '');
+}
+
+/** Review round 1 of 11H3 (A-L3, B-D1): writes the files that the monitor's runs chose atomically. */
+export async function writeExtensionChoices(stateDir: string, choices: ReadonlyMap<string, string>): Promise<void> {
+  const folder = await plainFolder(stateDir, [STATE_EXTENSION_FOLDER], [0o700]);
+  await writeAtomically(folder, EXTENSION_CHOICES_FILE, formatExtensionChoices(choices));
 }
 
 /** Plan step 11H3: what ensureExtension uses (the monitor's: its store, its HTTPS, the lock of a file). */
@@ -173,15 +207,62 @@ export interface ExtensionStoreDeps {
 
 /** The first bytes of a `.vsix` (a ZIP archive). */
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+/** The first bytes of a gzip stream. */
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
+
+/** The first `length` bytes of the plain file `file` (never through a link). */
+async function headOf(file: string, length: number): Promise<Buffer> {
+  const head = Buffer.alloc(length);
+  const handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const { bytesRead } = await handle.read(head, 0, length, 0);
+    return head.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
+/** The temporary file of one download of `cacheName` (`<cache name>-<12 hexadecimal digits>`, as the cleanup knows it). */
+function temporaryName(temp: string, cacheName: string): string {
+  return path.posix.join(temp, `${cacheName}-${randomBytes(6).toString('hex')}`);
+}
+
+/**
+ * Review round 1 of 11H3 (A-M1): decodes the gzip file `source` into the new file `target` (0600), streamed, at most
+ * `maxBytes` after decoding (a small file that decodes to much more stops there).
+ */
+async function gunzipFile(source: string, target: string, maxBytes: number, signal: AbortSignal): Promise<void> {
+  let size = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        done(new Error(`the download is larger than ${maxBytes} bytes after its gzip decoding`));
+        return;
+      }
+      done(null, chunk);
+    },
+  });
+  const input = await fs.promises.open(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  await pipeline(input.createReadStream(), createGunzip(), counter, fs.createWriteStream(target, { flags: 'wx', mode: 0o600 }), { signal });
+}
 
 /**
  * Plan step 11H3 (the brief, item 3): makes sure that the store has the `.vsix` of `chosen`
  * (`extensions/<folder>/<cache name>`). Present (a plain file): `present`, no lock, no network. Otherwise, under the
  * lock of that file (extensionLockFile; a bounded wait), it checks again, removes the leftovers of an earlier download of
- * the same file (`extensions/tmp/<cache name>-*`), downloads the VSIX URL (`https:` only, every redirect too, at most
- * `maxBytes`, streamed; downloadToFile of 11H1) into a temporary file of its own, checks that it is a ZIP archive (the
- * Marketplace gives no hash), makes it readable for all, and renames it into place: `downloaded`. The temporary file goes
- * on every outcome. Rejects with the reason (the caller logs it); the time limit of the whole fetch is `timeoutMs`.
+ * the same file (`extensions/tmp/<cache name>-<12 hexadecimal digits>`, exactly: review round 1 of 11H3, A-L2/B-D2),
+ * downloads the VSIX URL (`https:` on a host of the Marketplace, every redirect too: isMarketplaceDownloadUrl, review
+ * round 1 of 11H3, A-L6; at most `maxBytes`, streamed; downloadToFile of 11H1) into a temporary file of its own, decodes
+ * it when it is gzip (review round 1 of 11H3, A-M1: the Marketplace's CDN may answer with `Content-Encoding: gzip`, which
+ * the HTTPS transport does not decode; a gzip stream starts with 1f 8b, a ZIP archive never does; at most `maxBytes` after
+ * the decoding), checks that it is a ZIP archive (the Marketplace gives no hash), makes it readable for all, and renames it
+ * into place: `downloaded`. The temporary files go on every outcome. Rejects with the reason (the caller logs it); the
+ * time limit of the whole fetch is `timeoutMs`.
  */
 export async function ensureExtension(deps: ExtensionStoreDeps, chosen: ChosenExtension, signal: AbortSignal): Promise<'present' | 'downloaded'> {
   const target = extensionFile(deps.root, chosen.folder, chosen.cacheName);
@@ -195,28 +276,33 @@ export async function ensureExtension(deps: ExtensionStoreDeps, chosen: ChosenEx
       if ((await fs.promises.lstat(target).catch(() => undefined))?.isFile() === true) return 'present';
       const temp = await plainFolder(deps.root, [STORE_EXTENSION_FOLDER, EXTENSION_TEMP_FOLDER], [0o755, 0o700]);
       // Under the lock of this file no other download of it runs: a file of it here was left by one that ended without its
-      // cleanup. The files of other downloads are never touched.
+      // cleanup. The files of other downloads are never touched (review round 1 of 11H3, A-L2/B-D2: the name exactly, as
+      // the universal `a.b-1.0.0` is a prefix of the temporary files of `a.b-1.0.0-linux-x64`, under another lock).
+      const leftover = new RegExp(`^${escapeRegExp(chosen.cacheName)}-[0-9a-f]{12}$`);
       for (const entry of await fs.promises.readdir(temp)) {
-        if (entry.startsWith(`${chosen.cacheName}-`)) await fs.promises.rm(path.posix.join(temp, entry), { force: true, recursive: true });
+        if (leftover.test(entry)) await fs.promises.rm(path.posix.join(temp, entry), { force: true, recursive: true });
       }
-      const own = path.posix.join(temp, `${chosen.cacheName}-${randomBytes(6).toString('hex')}`);
+      const maxBytes = deps.maxBytes ?? MAX_VSIX_BYTES;
+      const own = temporaryName(temp, chosen.cacheName);
+      let decoded: string | undefined;
       try {
-        await downloadToFile(deps.transport, chosen.vsix, own, deps.maxBytes ?? MAX_VSIX_BYTES, both);
-        const head = Buffer.alloc(ZIP_MAGIC.length);
-        const handle = await fs.promises.open(own, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-        try {
-          await handle.read(head, 0, head.length, 0);
-        } finally {
-          await handle.close();
+        await downloadToFile(deps.transport, chosen.vsix, own, maxBytes, both, isMarketplaceDownloadUrl);
+        let file = own;
+        if ((await headOf(own, GZIP_MAGIC.length)).equals(GZIP_MAGIC)) {
+          decoded = temporaryName(temp, chosen.cacheName);
+          await gunzipFile(own, decoded, maxBytes, both);
+          file = decoded;
         }
-        if (!head.equals(ZIP_MAGIC)) throw new Error('the download is no VSIX (ZIP) file');
-        await fs.promises.chmod(own, 0o644);
+        if (!(await headOf(file, ZIP_MAGIC.length)).equals(ZIP_MAGIC)) throw new Error('the download is no VSIX (ZIP) file');
+        await fs.promises.chmod(file, 0o644);
         const folder = await plainFolder(deps.root, [STORE_EXTENSION_FOLDER, chosen.folder], [0o755, 0o755]);
-        await fs.promises.rename(own, path.posix.join(folder, chosen.cacheName));
+        await fs.promises.rename(file, path.posix.join(folder, chosen.cacheName));
       } finally {
-        await fs.promises.rm(own, { force: true }).catch((error: unknown) => {
-          deps.logger?.warn(`A temporary file of the shared extension cache could not be removed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+        for (const name of decoded !== undefined ? [own, decoded] : [own]) {
+          await fs.promises.rm(name, { force: true }).catch((error: unknown) => {
+            deps.logger?.warn(`A temporary file of the shared extension cache could not be removed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
       }
       return 'downloaded';
     } finally {

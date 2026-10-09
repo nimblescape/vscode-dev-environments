@@ -7,6 +7,8 @@
 // read its own), the read of the records, the listing of the cached files, and the download of one `.vsix` (present: no
 // lock and no network; under the lock of its file; a temporary file renamed into place; `https:` only; a size cap; a ZIP
 // check, as the Marketplace gives no hash; leftovers of the same file removed, other files never touched).
+// Review round 1 of 11H3 (A-L6): the `.vsix` URLs of these tests are on a host of the Marketplace's CDN
+// (`cdn.gallerycdn.vsassets.io`, was `cdn.example`), as a VSIX URL on any other host is now refused; nothing else changed.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -40,7 +42,7 @@ function store(): string {
 }
 
 const VSIX = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('rest of a zip')]);
-const CHOSEN: ChosenExtension = { version: '1.24.0', vsix: 'https://cdn.example/yaml.vsix', folder: 'universal', cacheName: 'redhat.vscode-yaml-1.24.0' };
+const CHOSEN: ChosenExtension = { version: '1.24.0', vsix: 'https://cdn.gallerycdn.vsassets.io/yaml.vsix', folder: 'universal', cacheName: 'redhat.vscode-yaml-1.24.0' };
 
 /** A transport whose downloads answer by URL; it records each URL. */
 function transport(answers: Record<string, () => HttpStreamResponse>) {
@@ -74,7 +76,9 @@ describe('the record of an open (plan step 11H3)', () => {
     const folder = path.join(root, 'extensions', 'wanted');
     expect(fs.readdirSync(folder)).toEqual([`${ENV}.json`]);
     expect(JSON.parse(fs.readFileSync(path.join(folder, `${ENV}.json`), 'utf8'))).toEqual({ at: 1234, configuration: ['a.b@1.0.0'], defaults: ['c.d', 'a.b'] });
-    expect(fs.statSync(path.join(root, 'extensions')).mode & 0o777).toBe(0o755);
+    // Review round 1 of 11H3 (A-L5, B-D4): changed expectation, the record is in the volume of the Session Monitor (here
+    // the temporary folder), whose `extensions` folder is 0700 (no dev container reads it), not 0755.
+    expect(fs.statSync(path.join(root, 'extensions')).mode & 0o777).toBe(0o700);
     expect(fs.statSync(folder).mode & 0o777).toBe(0o700);
     expect(await readExtensionRecords(root)).toEqual([{ at: 1234, configuration: [{ id: 'a.b', version: '1.0.0' }], defaults: [{ id: 'c.d' }, { id: 'a.b' }] }]);
   });

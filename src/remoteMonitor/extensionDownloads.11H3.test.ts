@@ -8,6 +8,8 @@
 // one for the pinned ones, the compatibility with the newest stable server of the store, the downloads of what is new,
 // each failure on its own and retried after a day; and its share of the daily cleanup (the choice, the lock without a
 // wait, the leftovers of downloads, lock files never removed).
+// Review round 1 of 11H3 (A-L6): the `.vsix` URLs of these tests are on a host of the Marketplace's CDN
+// (`cdn.gallerycdn.vsassets.io`, was `cdn.example`), as a VSIX URL on any other host is now refused; nothing else changed.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -79,7 +81,7 @@ function version(number: string, extra: { engine?: string; pre?: boolean; target
       { key: 'Microsoft.VisualStudio.Code.Engine', value: extra.engine ?? '^1.90.0' },
       ...(extra.pre === true ? [{ key: 'Microsoft.VisualStudio.Code.PreRelease', value: 'true' }] : []),
     ],
-    files: [{ assetType: 'Microsoft.VisualStudio.Services.VSIXPackage', source: extra.url ?? `https://cdn.example/${number}${extra.targetPlatform ?? ''}.vsix` }],
+    files: [{ assetType: 'Microsoft.VisualStudio.Services.VSIXPackage', source: extra.url ?? `https://cdn.gallerycdn.vsassets.io/${number}${extra.targetPlatform ?? ''}.vsix` }],
   };
 }
 
@@ -98,6 +100,10 @@ function fake(root: string, options: { answer?: (ids: string[]) => HttpResponse;
   const logs: string[] = [];
   const deps: ExtensionRunDeps = {
     root,
+    // Review round 1 of 11H3 (A-L5, B-D4): the lists, the failures and the chosen files are in the volume of the monitor;
+    // here the same temporary folder as the store (the layout below it, `extensions/wanted` and
+    // `extensions/failures.json`, is the same).
+    stateDir: root,
     transport: {
       request: async (request: HttpRequest) => {
         expect(request).toMatchObject({ method: 'POST', url: MARKETPLACE_QUERY_URL });
@@ -161,7 +167,7 @@ describe('the part "extensions" of the background run (plan step 11H3)', () => {
       { ids: ['redhat.vscode-yaml', 'rust.ra'], flags: 0x1 | 0x2 | 0x10 | 0x80 | 0x10000 },
       { ids: ['pin.ned'], flags: 0x1 | 0x2 | 0x10 | 0x80 },
     ]);
-    expect(f.downloads).toEqual(['https://cdn.example/1.24.0.vsix', 'https://cdn.example/0.3.0linux-x64.vsix', 'https://cdn.example/1.0.0.vsix']);
+    expect(f.downloads).toEqual(['https://cdn.gallerycdn.vsassets.io/1.24.0.vsix', 'https://cdn.gallerycdn.vsassets.io/0.3.0linux-x64.vsix', 'https://cdn.gallerycdn.vsassets.io/1.0.0.vsix']);
     expect(fs.readdirSync(path.join(root, 'extensions', 'universal')).sort()).toEqual(['pin.ned-1.0.0', 'redhat.vscode-yaml-1.24.0']);
     expect(fs.readdirSync(path.join(root, 'extensions', 'linux-x64'))).toEqual(['rust.ra-0.3.0-linux-x64']);
     expect(f.locks).toEqual(['redhat.vscode-yaml-1.24.0', 'rust.ra-0.3.0-linux-x64', 'pin.ned-1.0.0']);
@@ -178,7 +184,7 @@ describe('the part "extensions" of the background run (plan step 11H3)', () => {
     const root = store();
     server(root, 'a'.repeat(40), '1.105.0');
     record(root, 'aaaaaaaaaa', { at: NOW, configuration: [{ id: 'gone.ext' }, { id: 'new.ext' }, { id: 'bad.download' }, { id: 'good.ext' }], defaults: [] });
-    const body = answer({ 'new.ext': [version('2.0.0', { engine: '^1.200.0' })], 'bad.download': [version('1.0.0', { url: 'https://cdn.example/bad.vsix' })], 'good.ext': [version('1.0.0', { url: 'https://cdn.example/good.vsix' })] });
+    const body = answer({ 'new.ext': [version('2.0.0', { engine: '^1.200.0' })], 'bad.download': [version('1.0.0', { url: 'https://cdn.gallerycdn.vsassets.io/bad.vsix' })], 'good.ext': [version('1.0.0', { url: 'https://cdn.gallerycdn.vsassets.io/good.vsix' })] });
     const download = (url: string): HttpStreamResponse => (url.endsWith('bad.vsix') ? { status: 500, headers: {}, body: Readable.from([]) } : { status: 200, headers: {}, body: Readable.from([VSIX]) });
     const f = fake(root, { answer: () => ({ status: 200, headers: {}, body }), download });
     await downloadExtensions(f.deps);
@@ -201,7 +207,9 @@ describe('the part "extensions" of the background run (plan step 11H3)', () => {
     // After the day: all of them again; a success clears its failure.
     const h = fake(root, { now: NOW + DAY, answer: () => ({ status: 200, headers: {}, body }) });
     await downloadExtensions(h.deps);
-    expect(h.queries.map((q) => q.ids)).toEqual([['bad.download', 'gone.ext', 'good.ext', 'new.ext']]);
+    // Review round 1 of 11H3 (A-L8): changed expectation, new.ext (no compatible release among the newest versions) is
+    // asked once more for all its versions.
+    expect(h.queries.map((q) => q.ids)).toEqual([['bad.download', 'gone.ext', 'good.ext', 'new.ext'], ['new.ext']]);
     expect(Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'extensions', 'failures.json'), 'utf8')) as object).sort()).toEqual(['gone.ext', 'new.ext']);
   });
 
@@ -262,6 +270,9 @@ describe('the cleanup of the extension cache (plan step 11H3)', () => {
     const root = store();
     record(root, 'aaaaaaaaaa', { at: NOW - DAY, configuration: [{ id: 'a.b', version: '1.0.0' }], defaults: [] });
     record(root, 'bbbbbbbbbb', { at: NOW - RECORDED_LIST_MS, configuration: [{ id: 'c.d', version: '1.0.0' }], defaults: [] });
+    // Review round 1 of 11H3 (A-L4): the files of an ID that no recent list names all go now; a recent list names these
+    // IDs, so this test still holds the rule of the newest file and of the pins.
+    record(root, 'cccccccccc', { at: NOW, configuration: [{ id: 'c.d' }, { id: 'e.f' }, { id: 'busy.one' }], defaults: [] });
     const keep = [cachedFile(root, 'universal', 'a.b-1.0.0'), cachedFile(root, 'universal', 'a.b-2.0.0'), cachedFile(root, 'universal', 'c.d-3.0.0'), cachedFile(root, 'linux-x64', 'e.f-1.0.0-linux-x64'), cachedFile(root, 'universal', 'busy.one-1.0.0'), cachedFile(root, 'universal', 'busy.one-2.0.0')];
     const gone = [cachedFile(root, 'universal', 'a.b-1.5.0'), cachedFile(root, 'universal', 'c.d-1.0.0'), cachedFile(root, 'linux-x64', 'e.f-0.9.0-linux-x64')];
     const locksFolder = path.join(root, 'locks');
