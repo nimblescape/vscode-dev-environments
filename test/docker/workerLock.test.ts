@@ -22,7 +22,7 @@ import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { FakeUi, RecordingProgress, TEST_ACCOUNT, dockerTestContext, testHelperImage } from './harness';
-import { monitorOfUser, removeTestMonitor, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
+import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/worker-lock';
 
@@ -79,6 +79,8 @@ describe('the environment lock with real workers (plan step 5, PR B)', () => {
     // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
     // WorkspaceHelper).
     await testHelperImage(docker, log, env);
+    // Review round 1 of 11H2 (A-L5): the real monitor of the opens runs no background run during the tests.
+    await seedTestMonitorRun(docker, { run });
   });
 
   afterAll(async () => {

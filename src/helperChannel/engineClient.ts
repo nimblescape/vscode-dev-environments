@@ -419,6 +419,23 @@ export function dockerEngine(
       if (typeof value?.Architecture !== 'string' || value.Architecture === '') throw new EngineError('The engine answered /info without its architecture.', 200);
       return value.Architecture;
     },
+    // Review round 1 of 11H2 (A-M2): the server versions that running dev containers run, for the cleanup of the store.
+    // Review round 2 of 11H2 (reviewer A, A2-L1): read up to MAX_ENGINE_LIST_ANSWER_CHARACTERS (a container with a large
+    // process table would otherwise block every removal while it runs); an answer cut at that bound is still a failure.
+    processes: async (container, signal) => {
+      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/top`, signal, maxCharacters: MAX_ENGINE_LIST_ANSWER_CHARACTERS });
+      if (answer.status === 404 || answer.status === 409) return undefined;
+      if (answer.status !== 200) fail(answer);
+      if (answer.truncated) throw new EngineError('The engine answered the processes of a container with more than can be read.', answer.status);
+      const value = json(answer.body) as { Processes?: unknown } | undefined;
+      const rows = value?.Processes;
+      // An empty list may come as null.
+      if (rows === null) return [];
+      if (!Array.isArray(rows) || !rows.every((row) => Array.isArray(row) && row.every((field) => typeof field === 'string'))) {
+        throw new EngineError('The engine answered the processes of a container with an invalid value.', answer.status);
+      }
+      return rows as string[][];
+    },
     createAttached: (spec, options) => createAttached(api, hijack, spec, options),
     runAttached: (spec, options) => runAttached(api, hijack, spec, options),
   };
@@ -872,6 +889,11 @@ async function createAttached(
             SecurityOpt: ['no-new-privileges'],
             LogConfig: { Type: spec.log.driver, Config: { 'max-size': spec.log.maxSize, 'max-file': spec.log.maxFile } },
             Binds: [`${spec.mounts.socket}:/var/run/docker.sock`, `${spec.mounts.volume}:${spec.mounts.volumeTarget}`],
+            // Plan step 11H2: the shared VS Code server store read-write, with `nocopy` as the worker mounts it (Docker never
+            // fills an empty store with the content of the image at the target).
+            ...(spec.mounts.store !== undefined
+              ? { Mounts: [{ Type: 'volume', Source: spec.mounts.store.volume, Target: spec.mounts.store.target, ReadOnly: false, VolumeOptions: { NoCopy: true } }] }
+              : {}),
           },
         },
       });

@@ -10,7 +10,20 @@
 // Rebuild, recreate, a running container: the commit changes with each update of VS Code), after the open made sure that
 // the store has the server for the engine's platform (decision of 2026-10-09); a container of another platform is skipped.
 // The dev container is untrusted: the script follows and writes through no link that it did not create. No I/O here, no `vscode`.
+import * as path from 'path';
+import type { MountTarget } from '../docker/dockerObjects';
 import { VSCODE_STORE_TARGET } from '../names';
+
+/**
+ * Plan step 11H1: the dev container mounts the shared VS Code server store `store` (the volume of the worker's store)
+ * read-only at VSCODE_STORE_TARGET, the whole volume, as an open creates it (its inspect, ContainerInfo.mountTargets).
+ * Plan step 11H2: one function for the open (linkVscodeServer) and the Session Monitor's link into running containers.
+ */
+export function mountsVscodeStore(mounts: readonly MountTarget[] | undefined, store: string): boolean {
+  return (mounts ?? []).some(
+    (mount) => mount.type === 'volume' && mount.volume === store && mount.subpath === undefined && mount.readOnly === true && path.posix.normalize(mount.target).replace(/(.)\/+$/, '$1') === VSCODE_STORE_TARGET,
+  );
+}
 
 /**
  * Plan step 11H1: runs as the remote user in the dev container, with the commit (`$1`), the quality (`$2`), and the

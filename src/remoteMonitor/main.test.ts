@@ -20,10 +20,10 @@ import {
   idleExitFromEnv,
   RemoteMonitorLoop,
   heartbeatDir,
-  imageScheduleFromEnv,
+  cacheScheduleFromEnv,
   imageTimesFromEnv,
-  CurrentImageSettings,
-  ImageSchedule,
+  CurrentCacheSettings,
+  CacheSchedule,
   main,
   readImageList,
   readRecords,
@@ -43,6 +43,8 @@ import type { LoopEngine } from './engine';
 import { lockFilePath, lockFolder } from '../core/helperChannel/protocol';
 import { REMOTE_GAP_MS, REMOTE_GRACE_MS, REMOTE_TICK_MS, decide, type RemoteRecord } from './rules';
 import type { StopLockAttempt } from './stopLock';
+import type { CacheRunStore } from './background';
+import type { CacheRunState } from './backgroundRules';
 
 const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const B = '7c1d2e3f-0000-4000-8000-000000000002';
@@ -1318,7 +1320,9 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     expect(monitor.mono()).toBeLessThan(10 * MINUTE + REMOTE_IDLE_EXIT_MS + 2 * REMOTE_TICK_MS);
     // Changed expectation, review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats (was "No environment
     // container ran for 300 s and image updates are off; …").
-    expect(monitor.out()).toContain('No environment container ran and no heartbeat was fresh for 300 s, and image updates are off; the Session Monitor exits.');
+    // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, the text names the mode (was "…, and image updates
+    // are off; …"): a monitor that ends when idle does so with image updates too.
+    expect(monitor.out()).toContain('No environment container ran and no heartbeat was fresh for 300 s, and it does not run permanently; the Session Monitor exits.');
     expect(recordFiles()).toEqual([heartbeatFileName(SOURCE, A)]);
   });
 
@@ -1462,12 +1466,18 @@ describe('monitor.js run: the exit when idle (plan step 8 PR B, Q5)', () => {
     expect(await pending(monitor.result)).toBe('pending');
   });
 
+  // Plan step 11H2 (D1, decision of 2026-10-09): changed expectation, image updates no longer keep the monitor (was: "does
+  // not exit with image updates on"); a permanent monitor (DEVENV_MONITOR_PERMANENT, a remote engine or
+  // stopLocalMonitorWhenIdle off) never exits when idle, one that ends when idle exits with image updates on too.
   it('does not exit with image updates on', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'] });
     try {
-      const monitor = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']) }, ps: () => listed(), maxTicks: 100 });
+      const monitor = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']), DEVENV_MONITOR_PERMANENT: '1' }, ps: () => listed(), maxTicks: 100 });
       await vi.waitFor(() => expect(monitor.ticks()).toBe(100));
       expect(monitor.out()).not.toContain('exits');
+      const idle = startRun({ env: { DEVENV_IMAGE_PREFIXES: JSON.stringify(['ghcr.io/example/']), DEVENV_MONITOR_IDLE_MS: '1000' }, ps: () => listed() });
+      expect(await idle.result).toBe(0);
+      expect(idle.out()).toContain('it does not run permanently; the Session Monitor exits.');
     } finally {
       vi.useRealTimers();
     }
@@ -1729,14 +1739,19 @@ describe('monitor.js images', () => {
     expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '500', DEVENV_IMAGE_INTERVAL_MS: '2000' })).toEqual({ firstMs: 500, intervalMs: 2000 });
     expect(imageTimesFromEnv({ DEVENV_IMAGE_FIRST_MS: '5', DEVENV_IMAGE_INTERVAL_MS: 'x' })).toEqual({ firstMs: 60_000, intervalMs: undefined });
     // User request 2026-09-28 ("in a guided cron style manner"): the daily time HH:MM became a cron schedule.
+    // Plan step 11H2 (D2, decision of 2026-10-09): changed expectation, the schedule of the whole background run
+    // (cacheScheduleFromEnv, was imageScheduleFromEnv): the default is the interval of 17 minutes (was '7 6 * * *'), and an
+    // interval in minutes is taken too.
     const scheduleOf = (env: NodeJS.ProcessEnv) => {
-      const { text, timeZone } = imageScheduleFromEnv(env);
-      return { text, timeZone };
+      const { schedule, timeZone } = cacheScheduleFromEnv(env);
+      return { text: schedule.text, timeZone };
     };
-    expect(scheduleOf({})).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
+    expect(scheduleOf({})).toEqual({ text: '17', timeZone: 'Europe/Vienna' });
     expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5', DEVENV_IMAGE_TZ: 'America/New_York' })).toEqual({ text: '30 5 * * 1-5', timeZone: 'America/New_York' });
-    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ text: '7 6 * * *', timeZone: 'Europe/Vienna' });
-    expect(imageScheduleFromEnv({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5' }).schedule.weekdays).toEqual(new Set([1, 2, 3, 4, 5]));
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: 'soon', DEVENV_IMAGE_TZ: 'nowhere' })).toEqual({ text: '17', timeZone: 'Europe/Vienna' });
+    expect(scheduleOf({ DEVENV_IMAGE_SCHEDULE: '45' })).toEqual({ text: '45', timeZone: 'Europe/Vienna' });
+    const cron = cacheScheduleFromEnv({ DEVENV_IMAGE_SCHEDULE: '30 5 * * 1-5' }).schedule;
+    expect(cron.kind === 'cron' ? cron.cron.weekdays : undefined).toEqual(new Set([1, 2, 3, 4, 5]));
   });
 });
 
@@ -1750,16 +1765,29 @@ describe('the settings and the schedule of the image maintenance', () => {
     return main(['settings', '-'], { env: {}, stateDir, readStdin: async () => input, err: () => {} });
   }
 
+  /**
+   * Plan step 11H2 (D2, decision of 2026-10-09): changed fixture, CacheSchedule counts from the end of the last run that it
+   * keeps in the volume (ImageSchedule counted from its construction); here that end is the time of the construction.
+   */
+  function endedAt(at: number): Pick<CacheRunStore, 'read' | 'update'> {
+    let state: CacheRunState = { lastEndAt: at };
+    return { read: async () => state, update: async (change) => void (state = { ...state, ...change }) };
+  }
+
   it('stores valid settings; the monitor takes them instead of those of its container at the next check', async () => {
     const log: string[] = [];
-    const current = new CurrentImageSettings(ENV, stateDir, (message) => log.push(message));
+    // Plan step 11H2 (D2, decision of 2026-10-09): CurrentCacheSettings (was CurrentImageSettings), the settings of the whole
+    // background run.
+    const current = new CurrentCacheSettings(ENV, stateDir, (message) => log.push(message));
     await current.refresh();
     expect(current.value).toMatchObject({ prefixes: ['ghcr.io/majikmate/devcontainer-dev'], schedule: '7 6 * * *', timeZone: 'Europe/Vienna' });
     expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
     await current.refresh();
     expect(current.value).toMatchObject(SETTINGS);
-    expect(current.value.cron.hours).toEqual(new Set([5]));
-    expect(log).toEqual(['Image update settings: ghcr.io/acme/base; at "0 5 * * 1-5" (cron, America/New_York).']);
+    // Plan step 11H2 (D2): changed expectation, the parsed schedule is a cron schedule or an interval (`parsed`, was `cron`),
+    // and the log line names the background run (was "Image update settings: ghcr.io/acme/base; at …").
+    expect(current.value.parsed.kind === 'cron' ? current.value.parsed.cron.hours : undefined).toEqual(new Set([5]));
+    expect(log).toEqual(['Background run settings: images of ghcr.io/acme/base; at "0 5 * * 1-5" (cron, America/New_York).']);
     // Unchanged: no second log line.
     await current.refresh();
     expect(log).toHaveLength(1);
@@ -1785,7 +1813,7 @@ describe('the settings and the schedule of the image maintenance', () => {
     ]) {
       expect(await settings(input), input).toBe(EXIT_INVALID);
     }
-    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    const current = new CurrentCacheSettings(ENV, stateDir, () => {});
     await current.refresh();
     expect(current.value).toMatchObject(SETTINGS);
   });
@@ -1793,10 +1821,10 @@ describe('the settings and the schedule of the image maintenance', () => {
   it('runs a pass when a time of the schedule came since the last check, at most one at a time', async () => {
     let time = Date.parse('2026-09-29T04:05:00Z');
     const log: string[] = [];
-    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    const current = new CurrentCacheSettings(ENV, stateDir, () => {});
     let passes = 0;
     let release: (() => void) | undefined;
-    const schedule = new ImageSchedule({
+    const schedule = new CacheSchedule({ state: endedAt(time),
       now: () => time,
       log: (message) => log.push(message),
       settings: current,
@@ -1816,7 +1844,8 @@ describe('the settings and the schedule of the image maintenance', () => {
     // A pass that is still running: the next one is left out.
     await schedule.run();
     expect(passes).toBe(1);
-    expect(log).toEqual(['An image update is still running; this time of the schedule is left out.']);
+    // Plan step 11H2 (D2): changed expectation, the text names the background run (was "An image update is still running; …").
+    expect(log).toEqual(['A background run is still running; this time of the schedule is left out.']);
     release?.();
     await first;
     time += 60_000;
@@ -1832,7 +1861,7 @@ describe('the settings and the schedule of the image maintenance', () => {
   it('does not run a time again after the clock stepped back', async () => {
     let time = Date.parse('2026-09-29T04:06:00Z');
     let passes = 0;
-    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    const schedule = new CacheSchedule({ state: endedAt(time), now: () => time, log: () => {}, settings: new CurrentCacheSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
     time = Date.parse('2026-09-29T04:08:00Z');
     await schedule.check();
     expect(passes).toBe(1);
@@ -1848,13 +1877,14 @@ describe('the settings and the schedule of the image maintenance', () => {
     let time = Date.parse('2027-09-29T04:06:00Z');
     let passes = 0;
     const log: string[] = [];
-    const schedule = new ImageSchedule({ now: () => time, log: (message) => log.push(message), settings: new CurrentImageSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
+    const schedule = new CacheSchedule({ state: endedAt(time), now: () => time, log: (message) => log.push(message), settings: new CurrentCacheSettings(ENV, stateDir, () => {}), pass: async () => void passes++ });
     time = Date.parse('2027-09-29T04:08:00Z');
     await schedule.check();
     expect(passes).toBe(1);
     time = Date.parse('2026-09-29T04:05:00Z');
     await schedule.check();
-    expect(log[0]).toMatch(/^The clock of the host went back by \d+ minutes; the image schedule goes on from now\.$/);
+    // Plan step 11H2 (D2): changed expectation, the text names the schedule of the background run (was "the image schedule").
+    expect(log[0]).toMatch(/^The clock of the host went back by \d+ minutes; the schedule of the background run goes on from now\.$/);
     time = Date.parse('2026-09-29T04:08:00Z');
     await schedule.check();
     expect(passes).toBe(2);
@@ -1864,10 +1894,10 @@ describe('the settings and the schedule of the image maintenance', () => {
   it('observes the images at each check while no pass runs', async () => {
     let observed = 0;
     let release!: () => void;
-    const schedule = new ImageSchedule({
+    const schedule = new CacheSchedule({ state: endedAt(Date.parse('2026-09-29T12:00:00Z')),
       now: () => Date.parse('2026-09-29T12:00:00Z'),
       log: () => {},
-      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      settings: new CurrentCacheSettings(ENV, stateDir, () => {}),
       pass: () => new Promise<void>((resolve) => (release = resolve)),
       observe: async () => void observed++,
     });
@@ -1887,10 +1917,10 @@ describe('the settings and the schedule of the image maintenance', () => {
   it('runs no second check while one is still running', async () => {
     let observed = 0;
     let release!: () => void;
-    const schedule = new ImageSchedule({
+    const schedule = new CacheSchedule({ state: endedAt(Date.parse('2026-09-29T12:00:00Z')),
       now: () => Date.parse('2026-09-29T12:00:00Z'),
       log: () => {},
-      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      settings: new CurrentCacheSettings(ENV, stateDir, () => {}),
       pass: async () => {},
       observe: () => {
         observed++;
@@ -1915,10 +1945,10 @@ describe('the settings and the schedule of the image maintenance', () => {
   it('starts a pass only after the observe of a running check', async () => {
     const order: string[] = [];
     let release!: () => void;
-    const schedule = new ImageSchedule({
+    const schedule = new CacheSchedule({ state: endedAt(Date.parse('2026-09-29T12:00:00Z')),
       now: () => Date.parse('2026-09-29T12:00:00Z'),
       log: () => {},
-      settings: new CurrentImageSettings(ENV, stateDir, () => {}),
+      settings: new CurrentCacheSettings(ENV, stateDir, () => {}),
       pass: async () => void order.push('pass'),
       observe: () => {
         order.push('observe');
@@ -1941,8 +1971,8 @@ describe('the settings and the schedule of the image maintenance', () => {
     let time = Date.parse('2026-09-29T06:04:30Z');
     const log: string[] = [];
     let passes = 0;
-    const settings = new CurrentImageSettings({ ...ENV, DEVENV_IMAGE_SCHEDULE: '*/5 * * * *', DEVENV_IMAGE_TZ: 'UTC' }, stateDir, () => {});
-    const schedule = new ImageSchedule({
+    const settings = new CurrentCacheSettings({ ...ENV, DEVENV_IMAGE_SCHEDULE: '*/5 * * * *', DEVENV_IMAGE_TZ: 'UTC' }, stateDir, () => {});
+    const schedule = new CacheSchedule({ state: endedAt(time),
       now: () => time,
       log: (message) => log.push(message),
       settings,
@@ -1955,7 +1985,8 @@ describe('the settings and the schedule of the image maintenance', () => {
     time = Date.parse('2026-09-29T06:05:10Z');
     await schedule.check();
     expect(passes).toBe(1);
-    expect(log).toEqual(['An image update was still running; the times of the schedule during it are left out.']);
+    // Plan step 11H2 (D2): changed expectation, the text names the background run (was "An image update was still running; …").
+    expect(log).toEqual(['A background run was still running; the times of the schedule during it are left out.']);
     time = Date.parse('2026-09-29T06:18:00Z');
     await schedule.check();
     expect(passes).toBe(1);
@@ -1966,9 +1997,9 @@ describe('the settings and the schedule of the image maintenance', () => {
 
   it('follows new settings of another computer at the next check', async () => {
     let time = Date.parse('2026-09-29T08:58:00Z');
-    const current = new CurrentImageSettings(ENV, stateDir, () => {});
+    const current = new CurrentCacheSettings(ENV, stateDir, () => {});
     let passes = 0;
-    const schedule = new ImageSchedule({ now: () => time, log: () => {}, settings: current, pass: async () => void passes++ });
+    const schedule = new CacheSchedule({ state: endedAt(time), now: () => time, log: () => {}, settings: current, pass: async () => void passes++ });
     // 05:00 in New York (EDT) is 09:00 UTC; 2026-09-29 is a Tuesday.
     expect(await settings(JSON.stringify(SETTINGS))).toBe(0);
     time += 60_000;

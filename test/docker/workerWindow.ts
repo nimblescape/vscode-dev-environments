@@ -21,7 +21,8 @@ import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { EnvironmentOperations, type EnvironmentOperationsDeps } from '../../src/core/pipeline/environmentOperations';
 import { windowLifecycleMemory } from '../../src/core/pipeline/lifecycleMemory';
 import { systemClock, type GitHubAuth } from '../../src/core/ports';
-import { REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_VOLUME } from '../../src/core/remoteMonitor/protocol';
+import { WORKSPACES_ROOT } from '../../src/core/names';
+import { CACHE_RUN_FILE, REMOTE_MONITOR_CONTAINER, REMOTE_MONITOR_VOLUME } from '../../src/core/remoteMonitor/protocol';
 import { StoragePaths } from '../../src/core/storage/paths';
 import { EnvironmentRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
@@ -30,7 +31,7 @@ import type { DockerTarget } from '../../src/core/docker/dockerHost';
 import type { VscodeServerRef } from '../../src/core/helperChannel/protocol';
 import { extensionFlow, extensionHostSide } from '../../src/vscode/hostSide';
 import { readBaseline } from './dockerRun';
-import { FakeUi, HELPER_DOCKERFILE, fakeAuth, type DockerTestContext } from './harness';
+import { FakeUi, HELPER_DOCKERFILE, fakeAuth, runInVolume, type DockerTestContext } from './harness';
 import { workerLocks, type WorkerLocks } from './workerLocks';
 
 /** The settings of a window of the tests (each test file changes what it needs). */
@@ -193,6 +194,20 @@ export function workerWindow(context: DockerTestContext, docker: BootstrapDocker
 export function monitorOfUser(context: Pick<DockerTestContext, 'run'>): boolean {
   const baseline = readBaseline(context.run);
   return baseline.containers.some((container) => container.name === REMOTE_MONITOR_CONTAINER) || baseline.volumes.includes(REMOTE_MONITOR_VOLUME);
+}
+
+/**
+ * Review round 1 of 11H2 (A-L5): before the first open of a test file whose opens make sure of the real Session Monitor,
+ * its state volume gets a background run that ended now (cache-run.json: the end of the last run and of the last cleanup),
+ * so the monitor runs nothing within the 17 minutes of the default schedule: no download of a VS Code server, no link into
+ * the test containers, no cleanup during the tests. Nothing when the engine had a monitor before the tests (decision D9 of
+ * 2026-10-07: never touched); removeTestMonitor removes the volume afterwards. Needs the helper image (runInVolume).
+ */
+export async function seedTestMonitorRun(docker: Pick<BootstrapDocker, 'run'>, context: Pick<DockerTestContext, 'run'>): Promise<void> {
+  if (monitorOfUser(context)) return;
+  const script = 'umask 077 && printf \'{"lastEndAt":%s,"lastCleanupAt":%s}\' "$1" "$1" > "$2"';
+  const seeded = await runInVolume(docker, REMOTE_MONITOR_VOLUME, ['sh', '-c', script, 'sh', String(Date.now()), `${WORKSPACES_ROOT}/${CACHE_RUN_FILE}`]);
+  if (seeded.exitCode !== 0) throw new Error(`The state of the background run could not be seeded: ${seeded.stderr}`);
 }
 
 /** Decision D9 of 2026-10-07: removes the Session Monitor that the opens of a test file made, its state volume and its tag. */

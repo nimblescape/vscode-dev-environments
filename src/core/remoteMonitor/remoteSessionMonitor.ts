@@ -16,9 +16,10 @@ import { randomUUID } from 'crypto';
 import { errorMessage } from '../errors';
 import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
 import { abortError, isAbortError, type Logger } from '../ports';
+import { VSCODE_STORE_DIR } from '../names';
+import { IDLE_MONITOR_RESTART_POLICY, monitorRestartPolicy } from './cacheSettings';
 import type { MonitorEngine, MonitorInspected, MonitorRunSpec } from './monitorEngine';
 import {
-  IMAGE_MAINTENANCE_LABEL_PART,
   LABEL_MONITOR_CREATE,
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_CONTAINER,
@@ -27,7 +28,13 @@ import {
   REMOTE_MONITOR_SCRIPT_PATH,
   REMOTE_MONITOR_STATE_DIR,
   REMOTE_MONITOR_VOLUME,
+  PERMANENT_LOCAL_LABEL_PART,
+  PERMANENT_REMOTE_LABEL_PART,
+  monitorModeOf,
   remoteMonitorLabelValue,
+  vscodeStoreLabelPart,
+  type MonitorMode,
+  type MonitorSettings,
 } from './protocol';
 
 /** Time limit of each Docker call of ensure (an SSH connection plus the call). */
@@ -44,9 +51,11 @@ export const REMOTE_MONITOR_LOG: MonitorRunSpec['log'] = { driver: 'json-file', 
 
 /**
  * Plan step 8, PR B (Q5): the restart policy of the monitor container (see runArgs). Every monitor of an older version
- * is replaced at the next open, as its script, and so its label, changed with this policy.
+ * is replaced at the next open, as its script, and so its label, changed with this policy. Plan step 11H2 (the user's
+ * decision "unless-stopped" of 2026-10-09): the policy of a monitor that ends when idle; a permanent one has
+ * `unless-stopped` (monitorRestartPolicy).
  */
-export const MONITOR_RESTART_POLICY = 'on-failure';
+export const MONITOR_RESTART_POLICY = IDLE_MONITOR_RESTART_POLICY;
 
 export interface RemoteSessionMonitorOptions {
   /** Plan step 11D2: the engine of the monitor (the worker's, over the Engine API). */
@@ -57,9 +66,17 @@ export interface RemoteSessionMonitorOptions {
   /**
    * User requests 2026-09-28: the image maintenance of the monitor: the prefixes of the images that it updates and cleans
    * (the setting imageUpdates, a trailing `*` dropped; none: no image maintenance), the schedule (a cron expression,
-   * the setting imageUpdateSchedule), and the time zone of this computer.
+   * the setting imageUpdateSchedule), and the time zone of this computer. Plan step 11H2 (D1 and D2 of 2026-10-09): the
+   * schedule of its whole background run (the setting cacheUpdateSchedule: a cron expression or an interval in minutes),
+   * and whether it runs permanently.
    */
   imageMaintenance?: () => ImageMaintenanceSettings;
+  /**
+   * Plan step 11H2: the shared VS Code server store of the engine (the volume that the worker mounts at VSCODE_STORE_DIR,
+   * OwnHelper.vscodeStore), which the monitor mounts there too; none: the monitor has no store, and its background run
+   * leaves the VS Code server out.
+   */
+  vscodeStoreVolume?: string;
   /** Only for the Docker tests: another container and volume name, more labels, and variables of the container. */
   containerName?: string;
   volumeName?: string;
@@ -70,10 +87,22 @@ export interface RemoteSessionMonitorOptions {
 /** See RemoteSessionMonitorOptions.imageMaintenance. */
 export interface ImageMaintenanceSettings {
   prefixes: readonly string[];
-  /** A cron expression of five fields (user request 2026-09-28, "in a guided cron style manner"). */
+  /**
+   * A cron expression of five fields (user request 2026-09-28, "in a guided cron style manner"). Plan step 11H2 (D2): or
+   * an interval in whole minutes (parseCacheSchedule).
+   */
   schedule: string;
   timeZone: string;
+  /** Plan step 11H2 (D1): the monitor runs permanently (MonitorSettings.permanent); missing: it ends when idle. */
+  permanent?: MonitorSettings['permanent'];
+  /** Review round 1 of 11H2 (A-L2): permanent because the engine is remote for this computer (MonitorSettings.remote). */
+  remote?: MonitorSettings['remote'];
 }
+
+/** Plan step 11H2 (D1): the environment variable that tells the monitor that it runs permanently (`1`). */
+export const MONITOR_PERMANENT_ENV = 'DEVENV_MONITOR_PERMANENT';
+/** Plan step 11H2: the environment variable with the name of the VS Code server store that the monitor mounts. */
+export const MONITOR_VSCODE_STORE_ENV = 'DEVENV_VSCODE_STORE';
 
 /** What ensure found or did. `failed`: logged as a warning (ensureOrThrow rejects instead; plan step 8, PR A). */
 export type EnsureOutcome = 'running' | 'started' | 'created' | 'failed';
@@ -212,10 +241,21 @@ export class RemoteSessionMonitor {
       throw new Error(`The script of the Session Monitor is too long (${scriptLine.length - 1} characters as JSON).`);
     }
     const images = this.options.imageMaintenance?.();
-    // Review round 1 of PR #57 (C): only whether it maintains images is part of the label (its network); the prefixes,
-    // the schedule and the time zone come with `settings -` (imageSettings), so computers with other settings or another
-    // time zone on the same engine do not replace it at each open.
-    const label = remoteMonitorLabelValue(script, helperTag, images && images.prefixes.length > 0 ? [IMAGE_MAINTENANCE_LABEL_PART] : []);
+    // Review round 1 of PR #57 (C): the prefixes, the schedule and the time zone come with `settings -` (imageSettings),
+    // so computers with other settings or another time zone on the same engine do not replace it at each open. Plan step
+    // 11H2 (D1 of 2026-10-09): the label holds the mode (permanent or not: its restart policy and its exit when idle) in
+    // place of whether it maintains images (its network, which it now always has).
+    // Review round 1 of 11H2 (A-L2, A-L6): the label holds why it is permanent, and the store that it mounts.
+    const mode = monitorModeOf(images);
+    const store = this.options.vscodeStoreVolume;
+    const label = monitorLabel(script, helperTag, mode, store);
+    // Plan step 11H2 (D1): one engine can be local for one computer and remote for another, so an ensure takes a running
+    // monitor of the same version that another computer runs permanently as current (acceptedLabels). Review round 1 of
+    // 11H2 (A-L2): an ensure that sees the engine as local (permanent or not) takes a running `permanent-remote` one; one
+    // that sees it as remote takes a running `permanent-local` one. So turning stopLocalMonitorWhenIdle on again replaces
+    // this computer's own permanent monitor (`permanent-local`) at its next ensure.
+    const other: MonitorMode = mode === PERMANENT_REMOTE_LABEL_PART ? PERMANENT_LOCAL_LABEL_PART : PERMANENT_REMOTE_LABEL_PART;
+    const accepted = { label, running: monitorLabel(script, helperTag, other, store) };
     // Review round 1 of PR #69 (A-R1-2): the nonce of this create, so that a failure removes only its own container.
     const createId = randomUUID();
     const spec = this.runSpec(helperImage ?? helperTag, socketPath, label, script, images, createId, imageId);
@@ -224,7 +264,7 @@ export class RemoteSessionMonitor {
     // between its create and its start: look again for a while before anything is decided.
     if (current.exists && current.status === 'created') current = await this.waitWhileCreated(current, signal);
     if (current.exists) {
-      const decided = await this.decide(current, label, script, signal);
+      const decided = await this.decide(current, accepted, script, signal);
       if (decided !== 'replace') return decided;
       // Review round 2 of PR #69 (A-R2-2), review round 4 (A-R4-5): by its ID only, so never a container that another
       // window created meanwhile.
@@ -244,7 +284,7 @@ export class RemoteSessionMonitor {
         await this.removeBestEffort(createId);
         throw new Error(`docker run failed: ${created.detail}`);
       }
-      const found = await this.resolveConflict(label, script, signal);
+      const found = await this.resolveConflict(accepted, script, signal);
       if (found === 'running') return 'running';
       if (found === 'missing' && !triedAgain) {
         triedAgain = true;
@@ -272,7 +312,7 @@ export class RemoteSessionMonitor {
    * (removed by its ID, then created). Throws when it is kept but ensure fails (a `created` one that may still be
    * starting, an ID that cannot be read).
    */
-  private async decide(current: Inspected & { exists: true }, label: string, script: string, signal: AbortSignal | undefined): Promise<'running' | 'started' | 'replace'> {
+  private async decide(current: Inspected & { exists: true }, accepted: AcceptedLabels, script: string, signal: AbortSignal | undefined): Promise<'running' | 'started' | 'replace'> {
     const { logger } = this.options;
     if (current.status === 'created') {
       // Review round 4 of PR #69 (A-R4-1): still `created` after the waits. Removed only when it is certainly abandoned.
@@ -287,7 +327,9 @@ export class RemoteSessionMonitor {
       logger.info(`The Session Monitor on the Docker host was created ${Math.round(age / 1000)} seconds ago and never started; it is replaced (${this.containerName}).`);
       return 'replace';
     }
-    if (current.label !== label) {
+    // Plan step 11H2 (D1): a running permanent monitor of the same version counts as current for an ensure that wants one
+    // that ends when idle (accepted.running); anything else of another label is replaced.
+    if (!labelAccepted(current, accepted)) {
       this.idOf(current);
       logger.info(`The Session Monitor on the Docker host is of another version; it is replaced (${this.containerName}).`);
       return 'replace';
@@ -431,11 +473,12 @@ export class RemoteSessionMonitor {
    * (A-R4-3): a running one that Docker restarted (RestartCount > 0) is accepted only when it holds the stored script of
    * this version (storedScript `same`); otherwise `other` (the next open's first look decides on evidence).
    */
-  private async resolveConflict(label: string, script: string, signal: AbortSignal | undefined): Promise<'running' | 'missing' | 'other'> {
+  private async resolveConflict(accepted: AcceptedLabels, script: string, signal: AbortSignal | undefined): Promise<'running' | 'missing' | 'other'> {
     for (let attempt = 0; ; attempt += 1) {
       const found = await this.inspect(signal);
       if (!found.exists) return 'missing';
-      if (found.label === label && isRunning(found.status)) {
+      // Plan step 11H2 (D1): also a running permanent monitor of the same version for an ensure of one that ends when idle.
+      if (labelAccepted(found, accepted) && isRunning(found.status)) {
         if (found.status === 'paused' || found.restartCount === 0) return 'running';
         return (await this.storedScript(script, signal)) === 'same' ? 'running' : 'other';
       }
@@ -511,6 +554,7 @@ export class RemoteSessionMonitor {
    */
   runSpec(helperImage: string, socketPath: string, label: string, script: string, images?: ImageMaintenanceSettings, createId?: string, imageId?: string): MonitorRunSpec {
     const imagePrefixes = images?.prefixes ?? [];
+    const permanent = images?.permanent === true;
     const labels: Record<string, string> = { [LABEL_SESSION_MONITOR]: label };
     if (createId !== undefined) labels[LABEL_MONITOR_CREATE] = createId;
     for (const [key, value] of Object.entries(this.options.labels ?? {})) labels[key] = value;
@@ -519,9 +563,17 @@ export class RemoteSessionMonitor {
       // Plan step 3: the command line holds no script, so all prefixes fit (imagePrefixesOf keeps them within
       // MAX_IMAGE_PREFIXES_JSON_LENGTH); the whole list comes with `settings -` at each open anyway.
       env.DEVENV_IMAGE_PREFIXES = JSON.stringify(imagePrefixes);
+    }
+    if (images) {
+      // Plan step 11H2 (D2 of 2026-10-09): the schedule of the whole background run (the names of the variables stay
+      // those of the image maintenance), also without prefixes: the VS Code server and the cleanup always run.
       env.DEVENV_IMAGE_SCHEDULE = images.schedule;
       env.DEVENV_IMAGE_TZ = images.timeZone;
     }
+    // Plan step 11H2 (D1): the mode, fixed for the life of the container (it is part of its label).
+    if (permanent) env[MONITOR_PERMANENT_ENV] = '1';
+    const store = this.options.vscodeStoreVolume;
+    if (store !== undefined) env[MONITOR_VSCODE_STORE_ENV] = store;
     return {
       name: this.containerName,
       image: helperImage,
@@ -529,16 +581,25 @@ export class RemoteSessionMonitor {
       labels,
       // Our own container (the refusal of restart policies is for the containers of repositories). Plan step 8, PR B
       // (user decision Q5 of 2026-10-02): `on-failure`, no longer `unless-stopped`: the monitor exits with 0 when it is
-      // idle (no running environment container for 5 minutes, REMOTE_IDLE_EXIT_MS of src/remoteMonitor/main.ts, no image
-      // maintenance) and stays exited until an open ensures it or the heartbeats of a window repair it; a failure (an
-      // uncaught error, the loader's exit 3) is restarted, and the loader resumes from the stored script. No published
-      // port, no capability: it needs the socket and its volume.
-      restartPolicy: MONITOR_RESTART_POLICY,
-      // User requests 2026-09-28: with image maintenance it reads the tags of the registry, so it has the default network
-      // then (outbound only); without it, no network.
-      network: imagePrefixes.length === 0 ? 'none' : 'default',
+      // idle (no running environment container for 5 minutes, REMOTE_IDLE_EXIT_MS of src/remoteMonitor/main.ts) and
+      // stays exited until an open ensures it or the heartbeats of a window repair it; a failure (an uncaught error, the
+      // loader's exit 3) is restarted, and the loader resumes from the stored script. Plan step 11H2 (the user's decision
+      // "unless-stopped" of 2026-10-09): a permanent monitor (a remote engine, or stopLocalMonitorWhenIdle off) never
+      // exits when idle and has `unless-stopped`, so Docker starts it again after a crash and after a restart of the
+      // engine. No published port, no capability: it needs the socket and its volumes.
+      restartPolicy: monitorRestartPolicy(permanent),
+      // User requests 2026-09-28: with image maintenance it read the tags of the registry. Plan step 11H2 (D1 of
+      // 2026-10-09): the background run always reaches the update service of VS Code, so it always has the default network
+      // (outbound only: it publishes no port and accepts no connection).
+      network: 'default',
       log: REMOTE_MONITOR_LOG,
-      mounts: { socket: socketPath, volume: this.volumeName, volumeTarget: REMOTE_MONITOR_STATE_DIR },
+      // Plan step 11H2: the store of the worker read-write at VSCODE_STORE_DIR, as the worker mounts it (nocopy).
+      mounts: {
+        socket: socketPath,
+        volume: this.volumeName,
+        volumeTarget: REMOTE_MONITOR_STATE_DIR,
+        ...(store !== undefined ? { store: { volume: store, target: VSCODE_STORE_DIR } } : {}),
+      },
       env,
       command: loaderCommand({ path: REMOTE_MONITOR_SCRIPT_PATH, hash: bundleHash(script), entry: REMOTE_MONITOR_ENTRY }),
     };
@@ -547,6 +608,29 @@ export class RemoteSessionMonitor {
   private inspect(signal: AbortSignal | undefined): Promise<Inspected> {
     return this.options.engine.inspect(this.containerName, signal);
   }
+}
+
+/**
+ * Plan step 11H2 (D1 of 2026-10-09): the label of the monitor container (remoteMonitorLabelValue) for its mode: none for
+ * one that ends when idle. Review round 1 of 11H2 (A-L2): `permanent-remote` or `permanent-local` for a permanent one
+ * (PERMANENT_REMOTE_LABEL_PART, PERMANENT_LOCAL_LABEL_PART); (A-L6) and the store that it mounts (vscodeStoreLabelPart).
+ */
+export function monitorLabel(script: string, helperTag: string, mode: MonitorMode, store?: string): string {
+  return remoteMonitorLabelValue(script, helperTag, [...(mode === 'idle' ? [] : [mode]), ...(store !== undefined ? [vscodeStoreLabelPart(store)] : [])]);
+}
+
+/**
+ * Plan step 11H2 (D1): the labels that an ensure takes as current: its own `label`, and for an ensure of a monitor that
+ * ends when idle also `running`, the label of the permanent monitor of the same version, while that container runs.
+ */
+interface AcceptedLabels {
+  label: string;
+  running?: string;
+}
+
+/** Plan step 11H2 (D1): whether the container `found` has a label that the ensure takes as current (AcceptedLabels). */
+function labelAccepted(found: Inspected & { exists: true }, accepted: AcceptedLabels): boolean {
+  return found.label === accepted.label || (accepted.running !== undefined && found.label === accepted.running && isRunning(found.status));
 }
 
 /** Review round 3 of PR #69 (A-R3-1, A-R3-2): waits `ms`; a cancellation ends the wait with an AbortError. */

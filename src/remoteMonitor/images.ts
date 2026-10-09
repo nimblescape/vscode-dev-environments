@@ -8,7 +8,9 @@
 // images and clean the images from docker regularly"; "only in the remote scenario"; "1 minute after the monitor starts
 // then in the morning again, at 6:07 CEST"; "a setting that tells the monitor to fetch in a guided cron style manner"). A
 // pass one minute after the start of the monitor, then at each time of the cron schedule of the setting
-// imageUpdateSchedule (default `7 6 * * *`: 06:07) in the time zone of the computer that created the monitor:
+// imageUpdateSchedule (default `7 6 * * *`: 06:07) in the time zone of the computer that created the monitor (plan step
+// 11H2, decision of 2026-10-09: part a of the monitor's background run, background.ts, by the schedule of the setting
+// cacheUpdateSchedule, which replaces imageUpdateSchedule; D5: the setting imageUpdates names the images):
 //   1. The repositories whose name starts with one of the prefixes (the setting imageUpdates): those on the engine,
 //      and those of the list that the extension sent ("all images": the registry lists no repositories without a token,
 //      so the extension reads the packages with its GitHub session and sends only the names; `monitor.js images -`).
@@ -23,12 +25,12 @@
 // of the monitor had none. Never throws; each problem is one line of the log.
 import type { IncomingMessage } from 'http';
 import * as https from 'https';
-import { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime, parseCronSchedule } from '../core/remoteMonitor/cron';
+import { DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import type { EngineImage } from '../core/worker/dockerEngine';
 import { engineFailure, type ImageEngine } from './engine';
 
-export { DEFAULT_IMAGE_SCHEDULE, DEFAULT_IMAGE_TIME_ZONE, imagePrefixesOf, isTimeZone, nextCronTime, parseCronSchedule };
+export { DEFAULT_IMAGE_TIME_ZONE, imagePrefixesOf, isTimeZone, nextCronTime, parseCronSchedule };
 
 /** Time from the start of the monitor to the first pass. */
 export const REMOTE_IMAGE_FIRST_PASS_MS = 60_000;

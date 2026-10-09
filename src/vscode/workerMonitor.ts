@@ -24,7 +24,7 @@ import {
   parseWindowStateValue,
 } from '../core/helperChannel/protocol';
 import type { Logger } from '../core/ports';
-import type { HeartbeatInput, ImageSettings } from '../core/remoteMonitor/protocol';
+import type { HeartbeatInput, MonitorSettings } from '../core/remoteMonitor/protocol';
 import type { HeartbeatSendResult } from '../core/session/windowHeartbeats';
 import type { Environment } from '../core/types';
 
@@ -81,9 +81,10 @@ export function workerMonitor(deps: WorkerMonitorDeps) {
 
     /**
      * Plan step 11D2: makes sure that the Session Monitor container of `target` runs (the operation `monitorEnsure`), with
-     * the image maintenance of this computer. Rejects with the cause when it cannot.
+     * the image maintenance of this computer (plan step 11H2: with the schedule of the background run and the mode of the
+     * monitor). Rejects with the cause when it cannot.
      */
-    async monitorEnsure(target: DockerTarget, images: ImageSettings, signal?: AbortSignal): Promise<void> {
+    async monitorEnsure(target: DockerTarget, images: MonitorSettings, signal?: AbortSignal): Promise<void> {
       const params = parseMonitorEnsureParams({ images });
       if (params === undefined) throw new Error('The image maintenance of this computer cannot be sent to the worker.');
       const value = parseMonitorEnsureValue(await flow(OP_MONITOR_ENSURE, params, { target, timeoutMs: MONITOR_ENSURE_FLOW_TIMEOUT_MS, ...(signal ? { signal } : {}) }));

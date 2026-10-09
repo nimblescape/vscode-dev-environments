@@ -12,7 +12,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
-import { engineApi, engineHijack } from './engineApi';
+import { MAX_ENGINE_ANSWER_CHARACTERS, engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
 
 interface Call {
@@ -147,6 +147,27 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     expect(JSON.parse(calls[0].body).HostConfig.NetworkMode).toBe('default');
   });
 
+  // Plan step 11H2 (decision of 2026-10-09, D1 and "unless-stopped"): a permanent monitor with the shared VS Code server
+  // store: its restart policy as given, the store read-write with NoCopy as a mount next to the binds, nothing else.
+  it('a permanent monitor with the store: unless-stopped, and the store as a volume mount with NoCopy (plan step 11H2)', async () => {
+    const { engine, calls } = await serve(engineAnswers(), (socket, given) => {
+      if (given.endsWith('\n')) socket.write(frame(1, READY));
+    });
+    const spec: MonitorRunSpec = {
+      ...SPEC,
+      restartPolicy: 'unless-stopped',
+      network: 'default',
+      mounts: { ...SPEC.mounts, store: { volume: 'devenv-vscode', target: '/vscode' } },
+    };
+    await engine.createAttached(spec, { input: 'x\n', readyText: READY, timeoutMs: 5_000 });
+    const host = JSON.parse(calls[0].body).HostConfig;
+    expect(host.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    expect(host.Binds).toEqual(['/var/run/docker.sock:/var/run/docker.sock', 'devenv-session-monitor:/state']);
+    expect(host.Mounts).toEqual([{ Type: 'volume', Source: 'devenv-vscode', Target: '/vscode', ReadOnly: false, VolumeOptions: { NoCopy: true } }]);
+    expect(host.CapDrop).toEqual(['ALL']);
+    expect(host.PortBindings).toBeUndefined();
+  });
+
   it('a name in use is a conflict; another refusal of the create is not; nothing is attached then', async () => {
     const conflict = await serve(() => ({ status: 409, json: { message: 'Conflict. The container name "/devenv-session-monitor" is already in use by container "abc". You have to remove (or rename) that container to be able to reuse that name.' } }));
     expect(await conflict.engine.createAttached(SPEC, { input: 'x\n', readyText: READY, timeoutMs: 5_000 })).toMatchObject({ kind: 'exited', conflict: true });
@@ -258,6 +279,36 @@ describe('the attached create and the clock of the daemon over the Engine API (p
     expect(await none.engine.proxy()).toEqual({});
     const failing = await serve(() => ({ status: 500, json: { message: 'daemon busy' } }));
     await expect(failing.engine.proxy()).rejects.toThrow('daemon busy');
+  });
+
+  // Review round 1 of 11H2 (A-M2): the processes of a container (`GET /containers/<id>/top`), for the cleanup of the store.
+  it('reads the processes of a container; a missing or stopped one has none; another answer is a failure (review round 1 of 11H2)', async () => {
+    const rows = [['root', '1', '0', '0', '10:00', '?', '00:00:00', 'sleep infinity']];
+    const good = await serve(() => ({ status: 200, json: { Titles: ['UID', 'PID', 'PPID', 'C', 'STIME', 'TTY', 'TIME', 'CMD'], Processes: rows } }));
+    expect(await good.engine.processes('dev a')).toEqual(rows);
+    expect(good.calls[0]).toMatchObject({ method: 'GET', url: '/containers/dev%20a/top' });
+    const empty = await serve(() => ({ status: 200, json: { Titles: ['PID'], Processes: null } }));
+    expect(await empty.engine.processes('a')).toEqual([]);
+    for (const status of [404, 409]) {
+      const gone = await serve(() => ({ status, json: { message: 'is not running' } }));
+      expect(await gone.engine.processes('a'), String(status)).toBeUndefined();
+    }
+    const failing = await serve(() => ({ status: 500, json: { message: 'daemon busy' } }));
+    await expect(failing.engine.processes('a')).rejects.toThrow('daemon busy');
+    for (const json of [{ Titles: [] }, { Processes: [['1', 2]] }, { Processes: 'x' }, [1]]) {
+      const bad = await serve(() => ({ status: 200, json }));
+      await expect(bad.engine.processes('a'), JSON.stringify(json)).rejects.toThrow('an invalid value');
+    }
+  });
+
+  // Review round 2 of 11H2 (reviewer A, A2-L1): a container with a large process table (here one command line of 2 MiB)
+  // does not block the cleanup: its processes are read up to the bound of the lists, not the 1 MiB of other answers.
+  it('reads the processes of a container past MAX_ENGINE_ANSWER_CHARACTERS (review round 2 of 11H2, A2-L1)', async () => {
+    const long = `/home/u/.vscode-server/bin/${'c'.repeat(40)}/node ${'x'.repeat(2 * 1024 * 1024)}`;
+    const rows = [['root', '1', 'sleep infinity'], ['1000', '42', long]];
+    const big = await serve(() => ({ status: 200, json: { Titles: ['UID', 'PID', 'CMD'], Processes: rows } }));
+    expect(JSON.stringify(rows).length).toBeGreaterThan(MAX_ENGINE_ANSWER_CHARACTERS);
+    expect(await big.engine.processes('a')).toEqual(rows);
   });
 
   it('reads the architecture of the engine (plan step 11H1: the platform of the shared VS Code server); none is a failure', async () => {

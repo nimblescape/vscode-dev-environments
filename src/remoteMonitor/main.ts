@@ -16,7 +16,10 @@
 //   run                          the loop: a tick every 15 s (rules.ts); each automatic stop under the environment lock
 //                                (plan step 8, PR B, D2); exits with 0 after REMOTE_IDLE_EXIT_MS without a running
 //                                environment container and without a fresh record while it maintains no images (Q5;
-//                                review round 1 of PR #86, A-R1-1; round 2, A-R2-1: a created one does not count)
+//                                review round 1 of PR #86, A-R1-1; round 2, A-R2-1: a created one does not count);
+//                                plan step 11H2 (D1 of 2026-10-09): unless it runs permanently (DEVENV_MONITOR_PERMANENT:
+//                                a remote engine, or stopLocalMonitorWhenIdle off), image updates or not; and its
+//                                background run (background.ts) by the schedule of cacheUpdateSchedule (CacheSchedule)
 //   heartbeat <json>             writes the records of one heartbeat (exit 0; 2 for an invalid argument, nothing written)
 //   forget <source> <env id>     removes that record file, valid or not (Delete of an environment)
 //   forget <source> <env id> <at>  removes it only while it holds a valid record with that `at`, then prints `removed`
@@ -29,15 +32,17 @@
 // that socket, never through a Docker CLI. Every argument and every file it reads is checked (protocol.ts); it never acts
 // on a container without the label nimblescape.devenv.environment-id, and it removes nothing but its own files (records,
 // leftover temporary files of the volume; monitor cleanup, user decision 2026-09-29) and, with image maintenance, older
-// images of the prefixes. The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
+// images of the prefixes; plan step 11H2: and, in the shared VS Code server store that it mounts at /vscode, the server
+// versions and the temporary folders that its cleanup names (background.ts). The log goes to stdout (`docker logs devenv-session-monitor`), one line per event.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
+import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, VSCODE_STORE_DIR } from '../core/names';
 import { isMissing, type EngineContainerSummary } from '../core/worker/dockerEngine';
 import {
   HEARTBEAT_FOLDER,
   IMAGE_LIST_FILE,
+  CACHE_RUN_FILE,
   IMAGE_SETTINGS_FILE,
   MAX_IMAGE_LIST_LENGTH,
   parseImageListInput,
@@ -57,7 +62,13 @@ import {
   type HeartbeatRecord,
   type ImageSettings,
 } from '../core/remoteMonitor/protocol';
-import { engineFailure, socketEngine, type LoopEngine, type MonitorEngineParts } from './engine';
+import { engineFailure, socketEngine, type LoopEngine, type MonitorEngineParts, type VscodeEngine } from './engine';
+import { BACKGROUND_ENGINE_TIMEOUT_MS, BackgroundRun, type CacheRunStore, type VscodeBackgroundDeps } from './background';
+import { CLOCK_RESET_MS, parseCacheRunState, type CacheRunState } from './backgroundRules';
+import { DEFAULT_CACHE_UPDATE_SCHEDULE, cacheRunDue, parseCacheSchedule, type CacheSchedule as ParsedCacheSchedule } from '../core/remoteMonitor/cacheSettings';
+import { MONITOR_PERMANENT_ENV, MONITOR_VSCODE_STORE_ENV } from '../core/remoteMonitor/remoteSessionMonitor';
+import { proxiedHttpsTransport } from '../core/proxyTransport';
+import { storeLock, storeTryLock, unpackServer } from '../core/worker/vscodeServerStore';
 import {
   DEFAULT_REMOTE_TIMING,
   REMOTE_TICK_MS,
@@ -71,19 +82,16 @@ import {
   type RemoteTiming,
 } from './rules';
 import {
-  DEFAULT_IMAGE_SCHEDULE,
   DEFAULT_IMAGE_TIME_ZONE,
   ImageMaintenance,
   REMOTE_IMAGE_FIRST_PASS_MS,
   isTimeZone,
   nextCronTime,
   nodeHttpGet,
-  parseCronSchedule,
   parseReplacedImages,
   prefixesFromEnv,
   type HttpGet,
 } from './images';
-import type { CronSchedule } from '../core/remoteMonitor/cron';
 import { stopLockDeps, stopLocker, type StopLocker } from './stopLock';
 
 /** Time limit of the container list (plan step 11I, U1: of the list of the engine). */
@@ -575,6 +583,11 @@ export interface MainDeps {
   exec?: ExecFile;
   /** Plan step 8, PR B (D2): the lock of an automatic stop (default: stopLocker on the lock files of the volume). */
   lockEnvironment?: StopLocker;
+  /**
+   * Plan step 11H2: the VS Code part of the background run (default: vscodeBackgroundDeps of the environment and the
+   * engine; the tests give their own or none).
+   */
+  vscodeBackground?: () => VscodeBackgroundDeps | undefined;
   /** Plan step 8, PR B (Q5): the monotonic clock of the idle time, and the wait between two ticks (the tests). */
   monotonic?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -628,8 +641,9 @@ async function writeStateFile(stateDir: string, name: string, text: string): Pro
 /**
  * Monitor cleanup, user decision 2026-09-29 (R4): the temporary files of writeStateFile
  * (`<name>.<pid>.<count>.tmp` of images.json, image-settings.json, replaced-images.json) that a killed write left behind.
+ * Review round 1 of 11H2 (reviewer B, D2): and of cache-run.json (written at the end of every background run).
  */
-export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images)\.json\.\d+\.\d+\.tmp$/;
+export const STATE_TEMPORARY_FILE = /^(images|image-settings|replaced-images|cache-run)\.json\.\d+\.\d+\.tmp$/;
 /**
  * Such a file whose modification time is more than this from now is removed at the start of `run` (only then: a younger
  * one stays until the next start; review round 9 of PR #63, A2).
@@ -672,7 +686,8 @@ export async function readImageList(stateDir: string): Promise<string[]> {
 
 /**
  * The times of the Docker tests: DEVENV_IMAGE_FIRST_MS (the first pass) and DEVENV_IMAGE_INTERVAL_MS (a fixed interval
- * instead of the daily time), 100..86400000 ms each.
+ * instead of the daily time), 100..86400000 ms each. Plan step 11H2: of the whole background run (the first check of its
+ * schedule after the start, and a fixed interval of runs instead of the schedule).
  */
 export function imageTimesFromEnv(env: NodeJS.ProcessEnv): { firstMs: number; intervalMs?: number } {
   const read = (text: string | undefined) => (text !== undefined && /^\d{3,8}$/.test(text) && Number(text) >= 100 ? Number(text) : undefined);
@@ -681,13 +696,21 @@ export function imageTimesFromEnv(env: NodeJS.ProcessEnv): { firstMs: number; in
 
 /**
  * The schedule of the passes (user request 2026-09-28, "in a guided cron style manner"): DEVENV_IMAGE_SCHEDULE (a cron
- * expression of five fields, the setting imageUpdateSchedule) in DEVENV_IMAGE_TZ (the time zone of the computer
- * that created the monitor). Invalid or missing: `7 6 * * *` (06:07) in Europe/Vienna.
+ * expression of five fields, the setting imageUpdateSchedule before plan step 11H2) in DEVENV_IMAGE_TZ (the time zone of the computer
+ * that created the monitor). Invalid or missing: `7 6 * * *` (06:07) in Europe/Vienna. Plan step 11H2 (D2, decision of
+ * 2026-10-09): the schedule of the whole background run, the setting cacheUpdateSchedule (parseCacheSchedule: a cron
+ * expression or an interval in minutes); invalid or missing: DEFAULT_CACHE_UPDATE_SCHEDULE (every 17 minutes).
  */
-export function imageScheduleFromEnv(env: NodeJS.ProcessEnv): { text: string; schedule: CronSchedule; timeZone: string } {
-  const valid = parseCronSchedule(env.DEVENV_IMAGE_SCHEDULE);
-  const text = valid ? env.DEVENV_IMAGE_SCHEDULE!.trim() : DEFAULT_IMAGE_SCHEDULE;
-  return { text, schedule: valid ?? parseCronSchedule(DEFAULT_IMAGE_SCHEDULE)!, timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE };
+export function cacheScheduleFromEnv(env: NodeJS.ProcessEnv): { schedule: ParsedCacheSchedule; timeZone: string } {
+  return {
+    schedule: parseCacheSchedule(env.DEVENV_IMAGE_SCHEDULE) ?? parseCacheSchedule(DEFAULT_CACHE_UPDATE_SCHEDULE)!,
+    timeZone: isTimeZone(env.DEVENV_IMAGE_TZ) ? env.DEVENV_IMAGE_TZ : DEFAULT_IMAGE_TIME_ZONE,
+  };
+}
+
+/** Plan step 11H2 (D1): the monitor runs permanently (DEVENV_MONITOR_PERMANENT `1`, part of its label). */
+export function permanentFromEnv(env: NodeJS.ProcessEnv): boolean {
+  return env[MONITOR_PERMANENT_ENV] === '1';
 }
 
 /** The IDs of images that pulls replaced (review round 6 of PR #57, F1), in the volume. */
@@ -695,20 +718,29 @@ export const REPLACED_IMAGES_FILE = 'replaced-images.json';
 /** How often the monitor looks whether a time of the schedule has come (as cron: every minute). */
 export const IMAGE_CHECK_MS = 60_000;
 /** A clock that steps back by more than this starts the image schedule again from its time (review round 4, L1). */
-export const IMAGE_CLOCK_RESET_MS = 60 * 60_000;
+export const IMAGE_CLOCK_RESET_MS = CLOCK_RESET_MS;
 
-/** The settings of the image maintenance with the parsed schedule. */
-export interface ActiveImageSettings extends ImageSettings {
-  cron: CronSchedule;
+/**
+ * The settings of the image maintenance with the parsed schedule. Plan step 11H2 (D2): the schedule of the whole
+ * background run (a cron expression or an interval).
+ */
+export interface ActiveCacheSettings extends ImageSettings {
+  parsed: ParsedCacheSchedule;
+}
+
+/** Plan step 11H2: the text of the schedule for the log. */
+function scheduleText({ parsed, timeZone }: ActiveCacheSettings): string {
+  return parsed.kind === 'interval' ? `every ${parsed.minutes} minutes` : `at "${parsed.text}" (cron, ${timeZone})`;
 }
 
 /**
  * Review round 1 of PR #57 (C): the settings of the image maintenance: those of the container (DEVENV_IMAGE_*), or the
  * newer ones that an extension stored in the volume (`monitor.js settings -`, image-settings.json), read again before
- * each check. So another computer (another time zone, another schedule) does not replace the container.
+ * each check. So another computer (another time zone, another schedule) does not replace the container. Plan step 11H2
+ * (D2): the settings of the whole background run (CurrentImageSettings before).
  */
-export class CurrentImageSettings {
-  value: ActiveImageSettings;
+export class CurrentCacheSettings {
+  value: ActiveCacheSettings;
   private stored = '';
 
   constructor(
@@ -716,8 +748,8 @@ export class CurrentImageSettings {
     private readonly stateDir: string,
     private readonly log: (message: string) => void,
   ) {
-    const { text, schedule, timeZone } = imageScheduleFromEnv(env);
-    this.value = { prefixes: prefixesFromEnv(env), schedule: text, timeZone, cron: schedule };
+    const { schedule, timeZone } = cacheScheduleFromEnv(env);
+    this.value = { prefixes: prefixesFromEnv(env), schedule: schedule.text, timeZone, parsed: schedule };
   }
 
   /** Reads the stored settings; keeps the current ones when there are none or they are invalid. Never throws. */
@@ -732,18 +764,33 @@ export class CurrentImageSettings {
     this.stored = text;
     const settings = parseImageSettingsInput(text);
     if (!settings) return;
-    this.value = { ...settings, cron: parseCronSchedule(settings.schedule)! };
-    this.log(`Image update settings: ${settings.prefixes.join(', ') || 'no prefixes'}; at "${settings.schedule}" (cron, ${settings.timeZone}).`);
+    this.value = { ...settings, parsed: parseCacheSchedule(settings.schedule)! };
+    this.log(`Background run settings: images of ${settings.prefixes.join(', ') || 'no prefixes'}; ${scheduleText(this.value)}.`);
   }
+}
+
+/** Plan step 11H2: the state of the background run in the volume (CACHE_RUN_FILE), written atomically (writeStateFile). */
+export function cacheRunStore(stateDir: string): CacheRunStore {
+  const read = async (): Promise<CacheRunState> => parseCacheRunState(await fs.promises.readFile(path.join(stateDir, CACHE_RUN_FILE), 'utf8').catch(() => '{}'));
+  return {
+    read,
+    update: async (change) => writeStateFile(stateDir, CACHE_RUN_FILE, JSON.stringify({ ...(await read()), ...change })),
+  };
 }
 
 /**
  * The passes of the image maintenance by the cron schedule (user request 2026-09-28, "in a guided cron style manner"):
  * every IMAGE_CHECK_MS, a pass when a time of the schedule came since the last check. At most one pass at a time: a time
- * that comes during a pass is left out.
+ * that comes during a pass is left out. Plan step 11H2 (D2, decision of 2026-10-09): the one schedule of the whole
+ * background run (ImageSchedule before), by the setting cacheUpdateSchedule: with an interval, a run when the end of the
+ * last run is at least the interval ago; with a cron schedule, a run when a time of it came after the end of the last run
+ * (cacheRunDue). The end of the last run is kept in the volume (CacheRunStore), so a restart of the monitor does not run
+ * again at once: at its start it runs only when the run is due by that time (never ran: due).
  */
-export class ImageSchedule {
-  private checkedUntil: number;
+export class CacheSchedule {
+  /** The end of the last run (the stored one at first; undefined: none is known). */
+  private lastEndAt: number | undefined;
+  private loaded = false;
   private running = false;
   /** Review round 9 of PR #57 (T1): a check that takes longer than a minute (a slow list of the images) is not joined. */
   private checking = false;
@@ -754,16 +801,16 @@ export class ImageSchedule {
     private readonly deps: {
       now: () => number;
       log: (message: string) => void;
-      settings: Pick<CurrentImageSettings, 'value' | 'refresh'>;
+      settings: Pick<CurrentCacheSettings, 'value' | 'refresh'>;
       pass: () => Promise<void>;
       /** Review round 8 of PR #57 (S3): at each check while no pass runs (the IDs of the images of the repositories). */
       observe?: () => Promise<void>;
+      /** Plan step 11H2: the end of the last run in the volume. */
+      state: Pick<CacheRunStore, 'read' | 'update'>;
     },
-  ) {
-    this.checkedUntil = deps.now();
-  }
+  ) {}
 
-  /** One check: a pass when a time of the schedule lies after the previous check and not after now. */
+  /** One check: a run when it is due (cacheRunDue). */
   async check(): Promise<void> {
     if (this.checking) return;
     this.checking = true;
@@ -776,50 +823,94 @@ export class ImageSchedule {
 
   private async checkOnce(): Promise<void> {
     await this.deps.settings.refresh();
+    if (!this.loaded) {
+      this.loaded = true;
+      this.lastEndAt = (await this.deps.state.read().catch((): CacheRunState => ({}))).lastEndAt;
+    }
     if (!this.running && this.deps.observe) {
       this.observing = this.deps.observe().finally(() => (this.observing = undefined));
       await this.observing;
     }
     const time = this.deps.now();
-    const { cron, timeZone } = this.deps.settings.value;
-    const due = nextCronTime(this.checkedUntil, cron, timeZone);
-    // Review round 2 of PR #57 (R3): a clock that steps back a little does not run a time that was handled already again.
-    // Review round 4 (L1): one that steps back by more (a clock that was far ahead, then corrected) starts the schedule
-    // again from now; otherwise no pass would come until the clock caught up.
-    if (time < this.checkedUntil - IMAGE_CLOCK_RESET_MS) {
-      this.deps.log(`The clock of the host went back by ${Math.round((this.checkedUntil - time) / 60_000)} minutes; the image schedule goes on from now.`);
-      this.checkedUntil = time;
-    } else {
-      this.checkedUntil = Math.max(this.checkedUntil, time);
+    // Review round 4 of PR #57 (L1): a clock that steps back by more than CLOCK_RESET_MS behind the end of the last run (a
+    // clock that was far ahead, then corrected) starts the schedule again from now; otherwise no run would come until the
+    // clock caught up. Review round 2 of PR #57 (R3): a smaller step back runs no time that was handled already again.
+    if (this.lastEndAt !== undefined && time < this.lastEndAt - CLOCK_RESET_MS) {
+      this.deps.log(`The clock of the host went back by ${Math.round((this.lastEndAt - time) / 60_000)} minutes; the schedule of the background run goes on from now.`);
+      this.lastEndAt = time;
+      await this.deps.state.update({ lastEndAt: time }).catch(() => undefined);
     }
-    if (due === undefined || due > time) return;
+    if (this.running || !cacheRunDue(this.deps.settings.value.parsed, this.lastEndAt, time, this.deps.settings.value.timeZone)) return;
     await this.run();
-    // Review round 10 of PR #57 (U1): the times of the schedule that came during the pass are left out (logged); the
-    // checks of those minutes were not run (`checking`), so without this a second pass would follow at once.
-    const after = this.deps.now();
-    const missed = nextCronTime(time, cron, timeZone);
-    if (missed !== undefined && missed <= after) this.deps.log('An image update was still running; the times of the schedule during it are left out.');
-    this.checkedUntil = Math.max(this.checkedUntil, after);
+    // Review round 10 of PR #57 (U1): the times of a cron schedule that came during the run are left out (logged); the
+    // end of the run counts, so no second run follows at once.
+    const { parsed, timeZone } = this.deps.settings.value;
+    const missed = parsed.kind === 'cron' ? nextCronTime(time, parsed.cron, timeZone) : undefined;
+    if (missed !== undefined && missed <= this.deps.now()) this.deps.log('A background run was still running; the times of the schedule during it are left out.');
   }
 
-  /** One pass now, unless one runs. Never throws. */
-  async run(): Promise<void> {
+  /**
+   * Review round 1 of 11H2 (A-L8): whether a run runs now; review round 2 (R1): until its end is stored. Review round 2
+   * (A2-M1): the idle exit asks at each tick and never waits for the run (settled() of round 1 is gone).
+   */
+  get busy(): boolean {
+    return this.running;
+  }
+
+  /** One run now, unless one runs; then its end is kept (in the volume too). Never throws. */
+  run(): Promise<void> {
     if (this.running) {
-      this.deps.log('An image update is still running; this time of the schedule is left out.');
-      return;
+      this.deps.log('A background run is still running; this time of the schedule is left out.');
+      return Promise.resolve();
     }
     this.running = true;
+    return this.runOnce();
+  }
+
+  private async runOnce(): Promise<void> {
     try {
       // Review round 9 of PR #57 (T1): not together with the observe of a check (both keep the store of IDs).
       await this.observing?.catch(() => undefined);
       await this.deps.settings.refresh();
       await this.deps.pass();
     } catch (error) {
-      this.deps.log(`The images could not be maintained: ${error instanceof Error ? error.message : String(error)}`);
+      this.deps.log(`The background run failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
+      this.loaded = true;
+      this.lastEndAt = this.deps.now();
+      await this.deps.state.update({ lastEndAt: this.lastEndAt }).catch((error: unknown) => {
+        this.deps.log(`The end of the background run could not be stored: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      // Review round 2 of 11H2 (reviewer B, R1): the run counts as running (busy) until its end is stored, so the idle
+      // exit never ends the process during that write.
       this.running = false;
     }
   }
+}
+
+/**
+ * Plan step 11H2: the VS Code part of the background run in the container: the store that the worker mounts, read-write
+ * at VSCODE_STORE_DIR (its volume named by DEVENV_VSCODE_STORE, which RemoteSessionMonitor.runSpec sets with the mount),
+ * the HTTPS of the proxy of the daemon (decision C1 of 2026-10-05, as the worker), the lock of a server version with and
+ * without a wait, and `tar`. Undefined without a valid store name (no store mounted).
+ */
+export function vscodeBackgroundDeps(env: NodeJS.ProcessEnv, engine: VscodeEngine, log: (message: string) => void): VscodeBackgroundDeps | undefined {
+  const storeVolume = env[MONITOR_VSCODE_STORE_ENV];
+  if (storeVolume === undefined || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(storeVolume)) return undefined;
+  return {
+    store: {
+      root: VSCODE_STORE_DIR,
+      transport: proxiedHttpsTransport(() => engine.proxy(AbortSignal.timeout(BACKGROUND_ENGINE_TIMEOUT_MS))),
+      architecture: (signal) => engine.architecture(signal),
+      lock: (root, name, waitSeconds, signal) => storeLock(root, name, waitSeconds, signal),
+      unpack: (archive, folder, signal) => unpackServer(archive, folder, signal),
+      logger: { info: log, warn: log, error: (message) => log(message), output: () => {} },
+      background: true,
+    },
+    storeVolume,
+    engine,
+    tryLock: (name) => storeTryLock(VSCODE_STORE_DIR, name),
+  };
 }
 
 /**
@@ -895,45 +986,77 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       // next start (review round 9 of PR #63, A2).
       const leftovers = await removeStaleStateTemporaryFiles(deps.stateDir ?? REMOTE_MONITOR_STATE_DIR, now());
       if (leftovers.length > 0) log(`Removed ${leftovers.length} leftover temporary file(s) of the volume.`);
-      // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the schedule.
-      // Only when the container got prefixes: only then it has a network (the label says whether it has).
-      if (prefixesFromEnv(deps.env).length > 0) {
-        const stateDir = deps.stateDir ?? REMOTE_MONITOR_STATE_DIR;
-        const settings = new CurrentImageSettings(deps.env, stateDir, log);
-        await settings.refresh();
-        const images = new ImageMaintenance({
-          engine,
-          httpGet: deps.httpGet ?? nodeHttpGet,
-          log,
-          prefixes: () => settings.value.prefixes,
-          knownRepositories: () => readImageList(stateDir),
-          // Review round 6 of PR #57 (F1): the IDs that pulls replaced, in the volume.
-          replaced: {
-            read: async () => parseReplacedImages(await fs.promises.readFile(path.join(stateDir, REPLACED_IMAGES_FILE), 'utf8').catch(() => '{}')),
-            write: (value) => writeStateFile(stateDir, REPLACED_IMAGES_FILE, JSON.stringify(value)),
-          },
-        });
-        const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
-        const schedule = new ImageSchedule({ now, log, settings, pass: () => images.pass(), observe: () => images.observe() });
-        log(`Image updates of ${settings.value.prefixes.join(', ')}: in ${Math.round(firstMs / 1000)} s, then at "${settings.value.schedule}" (cron, ${settings.value.timeZone}).`);
-        setTimeout(() => void schedule.run(), firstMs);
-        // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) instead of the schedule.
-        if (intervalMs !== undefined) setInterval(() => void schedule.run(), intervalMs);
-        else setInterval(() => void schedule.check(), IMAGE_CHECK_MS);
-      }
-      // Plan step 8, PR B (Q5): with image maintenance, the monitor never exits by itself.
-      const maintainsImages = prefixesFromEnv(deps.env).length > 0;
+      const stateDir = deps.stateDir ?? REMOTE_MONITOR_STATE_DIR;
+      // User requests 2026-09-28: the images of the prefixes, one minute after the start and then at each time of the
+      // schedule. Plan step 11H2 (D2, decision of 2026-10-09): the whole background run (the images, the VS Code server,
+      // the cleanup of the store) by the one schedule of the setting cacheUpdateSchedule, also without prefixes (D5: they
+      // govern only the images); the first check one minute after the start runs it when it is due by the end of the last
+      // run in the volume.
+      const settings = new CurrentCacheSettings(deps.env, stateDir, log);
+      await settings.refresh();
+      const images = new ImageMaintenance({
+        engine,
+        httpGet: deps.httpGet ?? nodeHttpGet,
+        log,
+        prefixes: () => settings.value.prefixes,
+        knownRepositories: () => readImageList(stateDir),
+        // Review round 6 of PR #57 (F1): the IDs that pulls replaced, in the volume.
+        replaced: {
+          read: async () => parseReplacedImages(await fs.promises.readFile(path.join(stateDir, REPLACED_IMAGES_FILE), 'utf8').catch(() => '{}')),
+          write: (value) => writeStateFile(stateDir, REPLACED_IMAGES_FILE, JSON.stringify(value)),
+        },
+      });
+      const state = cacheRunStore(stateDir);
+      // Plan step 11H2: the VS Code part afresh for each run (BackgroundRunDeps.vscode).
+      const vscodeOf = deps.vscodeBackground ?? (() => vscodeBackgroundDeps(deps.env, engine, log));
+      const vscode = vscodeOf();
+      const background = new BackgroundRun({ log, now, images: () => images.pass(), vscode: vscodeOf, state });
+      const schedule = new CacheSchedule({ now, log, settings, pass: () => background.run(), observe: () => images.observe(), state });
+      const { firstMs, intervalMs } = imageTimesFromEnv(deps.env);
+      const permanent = permanentFromEnv(deps.env);
+      log(
+        `Background run (images of ${settings.value.prefixes.join(', ') || 'no prefixes'}, the VS Code server${vscode === undefined ? ' left out: no store' : ''}, the cleanup): ` +
+          `first check in ${Math.round(firstMs / 1000)} s, then ${scheduleText(settings.value)}; ${permanent ? 'runs permanently' : `ends after ${Math.round(idleExitMs / 1000)} s without a running environment`}.`,
+      );
+      // Unreferenced: the loop below keeps the process; a monitor that exits when idle does not wait for them.
+      setTimeout(() => {
+        // The Docker tests: a fixed interval (DEVENV_IMAGE_INTERVAL_MS) of runs instead of the schedule.
+        if (intervalMs !== undefined) {
+          void schedule.run();
+          setInterval(() => void schedule.run(), intervalMs).unref?.();
+        } else {
+          void schedule.check();
+          setInterval(() => void schedule.check(), IMAGE_CHECK_MS).unref?.();
+        }
+      }, firstMs).unref?.();
       const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      // Review round 2 of 11H2 (reviewer A, A2-M1): the wait for a run is logged once per idle time.
+      let waitLogged = false;
       for (;;) {
         await loop.tick();
         // Plan step 8, PR B (Q5): only here, between two ticks, so never while it holds a lock or stops a container; the
-        // removals of the records (each under the lock of the records) end first. The records stay in the volume.
-        if (!maintainsImages && loop.idleMs() >= idleExitMs) {
+        // removals of the records (each under the lock of the records) end first. The records stay in the volume. Plan
+        // step 11H2 (D1 of 2026-10-09): a permanent monitor (a remote engine, or stopLocalMonitorWhenIdle off) never exits
+        // when idle; one that ends when idle does so also with image updates (before, they kept it).
+        if (!permanent && loop.idleMs() >= idleExitMs) {
+          // Review round 1 of 11H2 (A-L8): not during a background run (a download would be cut, and its end not stored).
+          // Review round 2 of 11H2 (reviewer A, A2-M1): the loop does not wait for the run: it goes on ticking (the stops of
+          // environments whose windows closed, the heartbeats) and exits at the first idle tick after the run's end.
+          if (schedule.busy) {
+            if (!waitLogged) log('No environment container runs, but a background run is running; the Session Monitor exits after its end.');
+            waitLogged = true;
+            await sleep(tickMs);
+            continue;
+          }
           await loop.removals;
+          // Review round 3 of 11H2 (reviewer A, A3-L1; reviewer B, D1): the timer of the schedule can start a run while the
+          // removals end, so the exit looks again; the next idle tick waits for that run as above.
+          if (schedule.busy) continue;
           // Review round 1 of PR #86, A-R1-1: the text names the fresh heartbeats too.
-          log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and image updates are off; the Session Monitor exits. The next open starts it again.`);
+          log(`No environment container ran and no heartbeat was fresh for ${Math.round(idleExitMs / 1000)} s, and it does not run permanently; the Session Monitor exits. The next open starts it again.`);
           return 0;
         }
+        waitLogged = false;
         await sleep(tickMs);
       }
     }

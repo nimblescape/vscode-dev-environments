@@ -61,7 +61,7 @@ import {
   expectLabelledEnvironmentImage,
   runInVolume,
   testHelperImage } from './harness';
-import { monitorOfUser, removeTestMonitor, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
+import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, testComputer, workerWindow, type WorkerWindow } from './workerWindow';
 
 const ALIAS = 'devenv-test-remote';
 const REPOSITORY = 'devenv-test/remote';
@@ -279,6 +279,9 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
           // harness (before: ensureImage of a WorkspaceHelper with the engine of the target, whose key and socket a
           // build without a state file does not read).
           await testHelperImage(docker, log, env);
+          // Review round 1 of 11H2 (A-L5): the real (permanent: remote) monitor of the open runs no background run during
+          // the tests; the engine behind SSH is the engine of the runner.
+          await seedTestMonitorRun(docker, { run });
           const devcontainerJson = JSON.stringify({
             name: 'Remote',
             build: { dockerfile: 'Dockerfile' },

@@ -4,7 +4,11 @@
 
 // User request 2026-09-28: "a setting that tells the monitor to fetch in a guided cron style manner".
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_IMAGE_SCHEDULE, isTimeZone, nextCronTime, parseCronSchedule, usableTimeZone, type CronSchedule } from './cron';
+import { isTimeZone, nextCronTime, parseCronSchedule, usableTimeZone, type CronSchedule } from './cron';
+
+// Plan step 11H2 (D2, decision of 2026-10-09): changed fixture, DEFAULT_IMAGE_SCHEDULE is removed with imageUpdateSchedule;
+// its value stays a sample here.
+const DEFAULT_IMAGE_SCHEDULE = '7 6 * * *';
 
 const at = (iso: string) => Date.parse(iso);
 const next = (iso: string, text: string, timeZone = 'Europe/Vienna') => {

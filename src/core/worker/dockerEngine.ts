@@ -249,6 +249,13 @@ export interface DockerEngine {
    */
   architecture(signal?: AbortSignal): Promise<string>;
   /**
+   * Review round 1 of 11H2 (A-M2): the processes of a running container as the engine lists them (`GET
+   * /containers/<id>/top`, `ps -ef` in its namespace, read from the host: nothing runs in the container), each the fields
+   * of its line (the last one its command line). Undefined when the container does not exist or does not run (404, 409);
+   * rejects with an EngineError for any other failure, an answer that is too long, or one of another form.
+   */
+  processes(container: string, signal?: AbortSignal): Promise<string[][] | undefined>;
+  /**
    * Plan step 11D2 (the Session Monitor container, plan step 3 pipe loading): creates the container of `spec` with an open
    * input, attaches to it, starts it, writes `input`, and waits for `readyText` on its output, its end, `timeoutMs`, or
    * the cancellation; then its input is closed (the container goes on alone). A create that the engine refuses is

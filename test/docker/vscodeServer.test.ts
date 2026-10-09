@@ -18,7 +18,7 @@ import { NodeProcessRunner } from '../../src/core/process';
 import { serverPlatform } from '../../src/core/worker/vscodeServerStore';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { RecordingProgress, TEST_ACCOUNT, createVolume, dockerTestContext, runInVolume, testHelperImage, testVscodeVolume } from './harness';
-import { monitorOfUser as engineHadMonitor, removeTestMonitor, workerWindow } from './workerWindow';
+import { monitorOfUser as engineHadMonitor, removeTestMonitor, seedTestMonitorRun, workerWindow } from './workerWindow';
 
 const NAME = 'vscodeServer';
 const REPOSITORY = 'devenv-test/vscode-server';
@@ -75,6 +75,9 @@ describe('the shared VS Code server of an open through a real worker (plan step 
       return;
     }
     await testHelperImage(docker, log, env);
+    // Review round 1 of 11H2 (A-L5): the real monitor of the opens runs no background run during the tests (it would
+    // download the newest server into the store of this file and link it into its container).
+    await seedTestMonitorRun(docker, { run });
     paths.ensureDirectoriesSync();
     const seededStore = await runInVolume(docker, store, ['sh', '-c', STORE_SEED_SCRIPT, 'sh', platform!, COMMIT]);
     expect(seededStore.exitCode, seededStore.stderr).toBe(0);

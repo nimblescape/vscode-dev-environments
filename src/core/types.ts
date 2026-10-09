@@ -379,10 +379,18 @@ export interface ExtensionSettings {
    */
   imageUpdates?: string[];
   /**
-   * User requests 2026-09-28: when the image maintenance runs after its first pass: a cron expression of five fields
-   * (minute hour day-of-month month day-of-week) in the time zone of this computer. Default `7 6 * * *`.
+   * Plan step 11H2 (D2, decision of 2026-10-09; it replaces imageUpdateSchedule, no migration): when the Session Monitor
+   * container of each engine runs its background run (the images of imageUpdates, the newest VS Code server, the cleanup
+   * of the store at most once a day): a cron expression of five fields (minute hour day-of-month month day-of-week) in the
+   * time zone of this computer, or an interval in whole minutes (at least 5), as normalizeCacheSchedule gives it. Default
+   * `17` (every 17 minutes).
    */
-  imageUpdateSchedule?: string;
+  cacheUpdateSchedule?: string;
+  /**
+   * Plan step 11H2 (D1, decision of 2026-10-09): the Session Monitor of a local engine ends after 5 minutes without a
+   * running environment (true, the default); false: it runs permanently, as on a remote engine.
+   */
+  stopLocalMonitorWhenIdle?: boolean;
 }
 
 /** State of a container as Docker reports it, simplified. */

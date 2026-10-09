@@ -26,7 +26,7 @@ import {
   runInVolume,
   testHelperImage,
 } from './harness';
-import { monitorOfUser as engineHadMonitor, removeTestMonitor, workerWindow } from './workerWindow';
+import { monitorOfUser as engineHadMonitor, removeTestMonitor, seedTestMonitorRun, workerWindow } from './workerWindow';
 
 const REPOSITORY = 'devenv-test/worker-open';
 const FOLDER = '/workspaces/worker-open';
@@ -73,6 +73,8 @@ describe('the open through a real worker (plan step 11E6)', () => {
     // Plan step 11I (U7, decision of 2026-10-08): the helper image through the harness (before: ensureImage of a
     // WorkspaceHelper).
     await testHelperImage(docker, log, env);
+    // Review round 1 of 11H2 (A-L5): the real monitor of the opens runs no background run during the tests.
+    await seedTestMonitorRun(docker, { run });
     paths.ensureDirectoriesSync();
     const devcontainerJson = JSON.stringify(
       {
