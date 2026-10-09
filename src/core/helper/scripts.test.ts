@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { detectConfigurations } from '../discovery/detect';
 // user decision 2026-10-02: Delete runs no Git: GIT_SUMMARY_SCRIPT no longer runs in the workspace helper, so scripts.ts
 // does not re-export it; its syntax is still checked here (it runs in the dev container).
-import { GIT_SUMMARY_SCRIPT } from '../git/gitSummary';
+import { GIT_SUMMARY_SCRIPT, configOwnershipFixCommand } from '../git/gitSummary';
 import {
   CLONE_SCRIPT,
   COMPOSE_FILES_MAX_AGE_MS,
@@ -127,7 +127,8 @@ describe('shell scripts', () => {
   // folder name that Node would leave the script after taking `--title=x`).
   it.each(['-x', '--title=x'])('gitFilesCommand passes the folder name %j to the script, not to Node', (folder) => {
     const [, ...args] = gitFilesCommand(folder, { name: '..', email: 'me@x' }, 'helper');
-    const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 20_000 });
+    // Review round 3 of PR G (A-L4): SIGKILL at the time limit (the script ignores SIGTERM).
+    const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
     expect(result.stderr).toBe(`Invalid folder name: ${folder}\n`);
     expect(result.status).toBe(2);
   });
@@ -1203,6 +1204,11 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         "const fs = require('fs');",
         "const path = require('path');",
         'const { DEVENV_TEST_LOG: log, DEVENV_TEST_REPO: repo, DEVENV_TEST_MKDIR_RACE: race, DEVENV_TEST_GROW: grow, DEVENV_TEST_ROOT_LOCK: rootLock } = process.env;',
+        // Review round 3 of PR G (A-L1, A-L2, B3-N2): the owner of gitconfig.lock as the script sees it; the inodes that
+        // are the owner's (1000:1001) by their fstat; a log of the inodes that the script reads; the lock removed right
+        // after the script's first lstat of it (the user, as the message of the step tells).
+        'const { DEVENV_TEST_LOCK_OWNER: lockOwner, DEVENV_TEST_OWNED_INOS: ownedInos, DEVENV_TEST_READS: reads, DEVENV_TEST_UNLINK_LOCK: unlinkLock, DEVENV_TEST_UNLINK_LOCK_ERROR: unlinkError } = process.env;',
+        "const lockIds = rootLock ? [0, 0] : lockOwner ? lockOwner.split(':').map(Number) : undefined;",
         "const record = (stat, uid, gid) => fs.appendFileSync(log, stat.ino + ' ' + uid + ':' + gid + '\\n');",
         'fs.fchownSync = (fd, uid, gid) => record(fs.fstatSync(fd), uid, gid);',
         'fs.lchownSync = (file, uid, gid) => record(fs.lstatSync(file), uid, gid);',
@@ -1211,8 +1217,9 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         '  const real = fs[name];',
         '  fs[name] = (file, ...rest) => {',
         '    const stat = real.call(fs, file, ...rest);',
-        // Review round 2 of the follow-up (A-L1): with DEVENV_TEST_ROOT_LOCK, gitconfig.lock is root's.
-        "    if (rootLock && stat && path.basename(String(file)) === 'gitconfig.lock') return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 0, gid: 0 });",
+        // Review round 2 of the follow-up (A-L1): with DEVENV_TEST_ROOT_LOCK, gitconfig.lock is root's (round 3: or the
+        // owner of DEVENV_TEST_LOCK_OWNER).
+        "    if (lockIds && stat && path.basename(String(file)) === 'gitconfig.lock') return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: lockIds[0], gid: lockIds[1] });",
         '    return file === repo && stat ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
         '  };',
         '}',
@@ -1228,6 +1235,41 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         '      fs.symlinkSync(target, file);',
         '    }',
         '    return result;',
+        '  };',
+        '}',
+        "if (unlinkLock) {",
+        '  const lstatSync = fs.lstatSync;',
+        '  let done = false;',
+        '  fs.lstatSync = (file, ...rest) => {',
+        '    const stat = lstatSync.call(fs, file, ...rest);',
+        "    if (!done && path.basename(String(file)) === 'gitconfig.lock') {",
+        '      done = true;',
+        '      fs.unlinkSync(file);',
+        '    }',
+        '    return stat;',
+        '  };',
+        '}',
+        // With DEVENV_TEST_UNLINK_LOCK_ERROR, the removal of gitconfig.lock fails with that code.
+        'if (unlinkError) {',
+        '  const unlinkSync = fs.unlinkSync;',
+        '  fs.unlinkSync = (file, ...rest) => {',
+        "    if (path.basename(String(file)) === 'gitconfig.lock') throw Object.assign(new Error(unlinkError + ': the removal failed'), { code: unlinkError });",
+        '    return unlinkSync.call(fs, file, ...rest);',
+        '  };',
+        '}',
+        'if (ownedInos) {',
+        "  const owned = ownedInos.split(',').map(Number);",
+        '  const fstatSync = fs.fstatSync;',
+        '  fs.fstatSync = (descriptor, ...rest) => {',
+        '    const stat = fstatSync.call(fs, descriptor, ...rest);',
+        '    return owned.includes(stat.ino) ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 1000, gid: 1001 }) : stat;',
+        '  };',
+        '}',
+        'if (reads) {',
+        '  const readSync = fs.readSync;',
+        '  fs.readSync = (descriptor, ...rest) => {',
+        "    fs.appendFileSync(reads, fs.fstatSync(descriptor).ino + '\\n');",
+        '    return readSync.call(fs, descriptor, ...rest);',
         '  };',
         '}',
         // Review round 1 of the follow-up of plan step 11I (A-F2): the owner appends `grow` bytes to gitconfig right after
@@ -1289,9 +1331,19 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     /** Review round 2 of the follow-up (A-L1): the call of Git at which `race` runs (1 when not given). */
     raceAt?: number;
     /** Review round 2 of the follow-up (A-L1): at this call of Git, the signal goes to the script and to that Git. */
-    signalAt?: { call: number; signal: 'TERM' | 'INT' | 'HUP' };
+    signalAt?: { call: number; signal: 'TERM' | 'INT' | 'HUP' | 'KILL' };
     /** Review round 2 of the follow-up (A-L1): lstat reports gitconfig.lock as root's (as the test may not run as root). */
     rootLock?: boolean;
+    /** Review round 3 of PR G (A-L1): lstat reports gitconfig.lock with this owner (uid:gid). */
+    lockOwner?: string;
+    /** Review round 3 of PR G (A-L2): fstat reports these inodes as the owner's (1000:1001). */
+    ownedInodes?: number[];
+    /** Review round 3 of PR G (A-L2): the file where the inode of each read of the script is noted. */
+    reads?: string;
+    /** Review round 3 of PR G (B3-N2): the lock is removed right after the script's first lstat of it. */
+    unlinkLockAfterLstat?: boolean;
+    /** Review round 3 of PR G (B3-N2): the removal of gitconfig.lock fails with this code. */
+    unlinkLockError?: string;
     /** [entry, target]: the folder `entry` is replaced by a link to `target` right after the script created it. */
     mkdirRace?: [string, string];
     /** The fake git fails when its arguments contain this one. */
@@ -1312,6 +1364,9 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
       encoding: 'utf8',
       input: '',
       timeout: 20_000,
+      // Review round 3 of PR G (A-L4): the script ignores SIGTERM (review round 2, A-L1), the default signal of the time
+      // limit, so a script that hangs is ended with SIGKILL.
+      killSignal: 'SIGKILL',
       env: {
         ...process.env,
         PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`,
@@ -1324,6 +1379,11 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
         ...(options.raceAt !== undefined ? { DEVENV_TEST_RACE_AT: String(options.raceAt) } : {}),
         ...(options.signalAt !== undefined ? { DEVENV_TEST_SIGNAL_AT: String(options.signalAt.call), DEVENV_TEST_SIGNAL: options.signalAt.signal } : {}),
         ...(options.rootLock === true ? { DEVENV_TEST_ROOT_LOCK: '1' } : {}),
+        ...(options.lockOwner !== undefined ? { DEVENV_TEST_LOCK_OWNER: options.lockOwner } : {}),
+        ...(options.ownedInodes !== undefined ? { DEVENV_TEST_OWNED_INOS: options.ownedInodes.join(',') } : {}),
+        ...(options.reads !== undefined ? { DEVENV_TEST_READS: options.reads } : {}),
+        ...(options.unlinkLockAfterLstat === true ? { DEVENV_TEST_UNLINK_LOCK: '1' } : {}),
+        ...(options.unlinkLockError !== undefined ? { DEVENV_TEST_UNLINK_LOCK_ERROR: options.unlinkLockError } : {}),
         ...(options.mkdirRace !== undefined ? { DEVENV_TEST_MKDIR_RACE: JSON.stringify(options.mkdirRace) } : {}),
         ...(options.gitFails !== undefined ? { DEVENV_TEST_GIT_FAIL: options.gitFails } : {}),
         ...(options.grow !== undefined ? { DEVENV_TEST_GROW: String(options.grow) } : {}),
@@ -1661,12 +1721,69 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     expect(owners(env).has(ino(sharedConfig))).toBe(false);
     expect(fs.readFileSync(sharedConfig, 'utf8')).toBe(correct);
     expect(fs.readFileSync(sharedCredentials, 'utf8')).toBe('credentials of another file\n');
-    // gitconfig: a new file of the owner with the same text; credentials.gitconfig stays as it is.
+    // gitconfig: a new file of the owner; credentials.gitconfig stays as it is. Review round 3 of PR G (A-L2): changed
+    // expectation (was: the new file had the same text): the linked file is not the owner's (1000 here), so its text is
+    // not taken; the new gitconfig starts as a missing one does (the identity and the section).
     const cfg = path.join(dir, 'gitconfig');
     expect(ino(cfg)).not.toBe(ino(sharedConfig));
-    expect(fs.readFileSync(cfg, 'utf8')).toBe(correct);
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o644);
     expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
     expect(ino(path.join(dir, 'credentials.gitconfig'))).toBe(ino(sharedCredentials));
+  });
+
+  // Review round 3 of PR G (A-L2), older than the follow-up: where fs.protected_hardlinks is off, the owner can link a file
+  // of another user that Git can read (for example the configuration of a service, with its password, mode 0600) at
+  // gitconfig. The script wrote such a gitconfig again as a new file of the owner with its text, so the owner could read
+  // it. Now a linked file that is not the owner's stays unread.
+  it('reads nothing of a file of another user that the owner linked at gitconfig, and starts a new gitconfig without its text', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const secret = path.join(env.dir, 'service', 'my.cnf');
+    write(secret, '[client]\n\tpassword = s3cret-of-the-service\n');
+    fs.chmodSync(secret, 0o600);
+    fs.linkSync(secret, path.join(dir, 'gitconfig'));
+    const reads = path.join(env.dir, 'reads');
+    fs.writeFileSync(reads, '');
+    const result = run(env, { reads });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(secret));
+    expect(fs.readFileSync(cfg, 'utf8')).not.toContain('s3cret');
+    expect(gitConfig(cfg, 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(owners(env).get(ino(cfg))).toEqual(['1000:1001']);
+    // The file of the service: never read by the script, nor by its Git, and as it was.
+    expect(fs.readFileSync(reads, 'utf8').split('\n').filter((line) => line !== '').map(Number)).not.toContain(ino(secret));
+    for (const line of fs.readFileSync(env.gitFiles, 'utf8').split('\n').filter((entry) => entry !== '')) expect(path.basename(line)).toBe('gitconfig');
+    expect(fs.readFileSync(secret, 'utf8')).toBe('[client]\n\tpassword = s3cret-of-the-service\n');
+    expect(fs.statSync(secret).mode & 0o777).toBe(0o600);
+    expect(owners(env).has(ino(secret))).toBe(false);
+  });
+
+  // Review round 3 of PR G (A-L2): a linked gitconfig of the owner is its configuration: written again as a new file (one
+  // link) with its text and its mode.
+  it('keeps the text of a gitconfig of the owner that has a second link, in a new file', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    fs.mkdirSync(dir);
+    const shared = path.join(env.ws, 'api', 'dotfiles-gitconfig');
+    write(shared, '[alias]\n\tst = status\n');
+    fs.chmodSync(shared, 0o640);
+    fs.linkSync(shared, path.join(dir, 'gitconfig'));
+    const result = run(env, { ownedInodes: [ino(shared)] });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const cfg = path.join(dir, 'gitconfig');
+    expect(ino(cfg)).not.toBe(ino(shared));
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, 'user.name')).toBe('');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+    expect(fs.statSync(cfg).mode & 0o777).toBe(0o640);
+    expect(fs.readFileSync(shared, 'utf8')).toBe('[alias]\n\tst = status\n');
   });
 
   it('never waits on a FIFO in place of gitconfig', () => {
@@ -1678,7 +1795,9 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`${dir}/gitconfig is not a file.`);
-    // Review round 1 of the follow-up of plan step 11I (A-F4): the step held Git's lock; it removed it when it failed.
+    // Review round 1 of the follow-up of plan step 11I (A-F4): no lock is left. Review round 3 of PR G (B3-L1): since review
+    // round 2 (A-L1) the step fails in its check without the lock, so it takes none (the removal of its own lock on a
+    // failure is tested elsewhere).
     expect(fs.existsSync(path.join(dir, 'gitconfig.lock'))).toBe(false);
   });
 
@@ -1824,6 +1943,8 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
   it.each([
     ['younger than 10 minutes', 9, 'file'],
     ['of another owner', 11, 'other'],
+    // Review round 3 of PR G (A-L1): the owner of the lock is told by its uid, not by the group of the owner.
+    ['of another user in the group of the owner', 11, 'group'],
     ['a folder', 11, 'folder'],
     ['a file with a second link', 11, 'linked'],
     ['a link', 11, 'link'],
@@ -1835,15 +1956,94 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT with 
     else if (kind === 'link') fs.symlinkSync(path.join(env.dir, 'nowhere'), lock);
     else write(lock, 'the lock of another Git\n');
     if (kind === 'linked') fs.linkSync(lock, path.join(env.dir, 'second'));
-    // Not root's: as root, another owner; as a user, the lock is the user's already (no fake owner below).
-    if (kind === 'other' && process.getuid?.() === 0) fs.chownSync(lock, 4321, 4321);
     staleLock(lock, minutes);
     const before = fs.lstatSync(lock).ino;
-    const result = run(env, { rootLock: kind !== 'other' });
+    // Review round 3 of PR G (A-L1): changed test, the lock of another owner is reported as 4321's (was: the test user's,
+    // or chowned to 4321 as root): a lock of the owner of the repository (1000 here, which the test user may be) is
+    // removed now.
+    const result = run(env, kind === 'other' ? { lockOwner: '4321:4321' } : kind === 'group' ? { lockOwner: '4321:1001' } : { rootLock: true });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`${lock} exists`);
     expect(result.stdout).not.toContain('Removed');
     expect(fs.lstatSync(lock).ino).toBe(before);
+    expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
+  });
+
+  // Review round 3 of PR G (A-L1): a run killed while it held the lock leaves a lock of root; the next open within 10
+  // minutes fails the step, and its ownership fix of CONFIG_FOLDER after `up` (fixConfigOwnership, CONFIG_OWNERSHIP_FIX_SCRIPT)
+  // gives the lock to the remote user. The rule took only a lock of root, so that lock stayed for good. A lock of the
+  // owner is taken now too (here as the script sees it; the test below makes it so with the real tools, as root).
+  it('removes a lock of the owner that is unchanged for more than 10 minutes (a killed run, then the ownership fix), and repairs gitconfig', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { lockOwner: '1000:1001' });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, 'alias.st')).toBe('status\n');
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (A-L1): reviewer A's reproduction with the real tools (scratchpad/pGr3A-work/e2-ownerfix.sh):
+  // the first open is killed (SIGKILL) at its first call of Git, under the lock; the ownership fix of the next open gives
+  // the lock to the remote user (1000:1001); 11 minutes later the step removes it and writes gitconfig.
+  it.skipIf(process.getuid?.() !== 0)('removes the lock of a killed run that the ownership fix gave to the remote user, with the real ownership fix as root', () => {
+    const env = setup();
+    const dir = path.join(env.ws, '.devenv+');
+    const lock = path.join(dir, 'gitconfig.lock');
+    const killed = run(env, { signalAt: { call: 1, signal: 'KILL' } });
+    // A script that the signal ended leaves its work folder (root's, in the helper's /tmp).
+    const work = path.dirname(fs.readFileSync(env.gitFiles, 'utf8').split('\n')[0].split(' ')[1]);
+    expect(path.basename(work)).toMatch(/^devenv-git-files-/);
+    fs.rmSync(work, { recursive: true, force: true });
+    expect(killed.signal).toBe('SIGKILL');
+    expect(fs.lstatSync(lock).uid).toBe(0);
+    const [file, ...args] = configOwnershipFixCommand(dir, '1000', '1001');
+    expect(spawnSync(file, args, { encoding: 'utf8' }).status).toBe(0);
+    expect([fs.lstatSync(lock).uid, fs.lstatSync(lock).gid]).toEqual([1000, 1001]);
+    staleLock(lock, 11);
+    const result = run(env);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Removed ${lock}, the lock of a run that was killed (unchanged for 11 minutes).\n`);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(path.join(dir, 'gitconfig'), 'user.name')).toBe('Hannes Stauss\n');
+    expect(gitConfig(path.join(dir, 'gitconfig'), '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (B3-N2): a stale lock removed between the script's lstat and its removal (by the user, as the
+  // message of the step tells) failed the step with ENOENT; it is a lock that is gone, so the script takes its own.
+  it('takes the lock when a stale lock is removed between its check and its removal', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true, unlinkLockAfterLstat: true });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(gitConfig(cfg, '--get-all', 'credential.https://github.com.helper')).toBe(`\n${CONTAINER_CREDENTIAL_HELPER}\n`);
+  });
+
+  // Review round 3 of PR G (B3-N2): only ENOENT of the removal is a lock that is gone; any other error is the step's error
+  // as it is, never taken for a lock of another Git.
+  it('fails with the error of its removal of a stale lock that it cannot remove', () => {
+    const env = setup();
+    const cfg = userGitConfig(env);
+    const lock = `${cfg}.lock`;
+    write(lock, '');
+    staleLock(lock, 11);
+    const result = run(env, { rootLock: true, unlinkLockError: 'EPERM' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('EPERM: the removal failed\n');
+    expect(result.stdout).not.toContain('Removed');
+    expect(fs.existsSync(lock)).toBe(true);
     expect(fs.readFileSync(cfg, 'utf8')).toContain('helper = store');
   });
 

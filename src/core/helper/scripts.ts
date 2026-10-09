@@ -188,14 +188,15 @@ function gitFilesEntries(): { config: string; docker: string; gh: string; gitcon
  * before its read of gitconfig to the rename, as `git config` does (review round 1 of the follow-up, A-F4: a change of Git
  * in the dev container meanwhile is never lost; when the lock exists, the step fails, as Git does). Review round 2 (A-L1):
  * only when it changes gitconfig (a first check reads it without the lock); it ignores SIGTERM, SIGINT and SIGHUP, so that
- * a Cancel cannot end it while it holds the lock; and a lock of root that is a plain file unchanged for more than 10
- * minutes is one of a killed run, which it removes (and says so). Git edits a copy in a
- * folder of root in the helper's /tmp (`git config --file`, from `/`), outside the volume, which no process of the dev
- * container can reach; a gitconfig of more than 1 MiB is not copied (A-F2: the step fails). Whatever the owner renames
- * or replaces in between, root writes, reads and changes only what lies in the volume, and every folder it writes into
- * is one that it opened as a folder. The owner of an existing file is set only when it has one link (a hard link could
- * name a file of another user in the volume), and a gitconfig with more links is written again as a new file. A shell
- * script can neither open a file without following a link nor keep a folder open, hence a Node.js script.
+ * a Cancel cannot end it while it holds the lock; and a lock of root that is a plain file of one link unchanged for more
+ * than 10 minutes is one of a killed run, which it removes (and says so); review round 3 of PR G (A-L1): also such a lock
+ * of the owner. Git edits a copy in a folder of root in the helper's /tmp (`git config --file`, from `/`), outside the
+ * volume, which no process of the dev container can reach; a gitconfig of more than 1 MiB is not copied (A-F2: the step
+ * fails). Whatever the owner renames or replaces in between, root writes, reads and changes only what lies in the volume,
+ * and every folder it writes into is one that it opened as a folder. The owner of an existing file is set only when it
+ * has one link (a hard link could name a file of another user in the volume), and a gitconfig with more links is written
+ * again as a new file, with its text only when it is the owner's (review round 3 of PR G, A-L2). A shell script can
+ * neither open a file without following a link nor keep a folder open, hence a Node.js script.
  */
 export const GIT_FILES_SCRIPT = String.raw`'use strict';
 const fs = require('fs');
@@ -340,11 +341,17 @@ const copyFor = (existing, copy, tooLarge) => {
 // for more than 10 minutes is the lock of a run that was killed (this script's, which stays root's until right before its
 // rename, or that of a Git of root in the dev container): Git holds its lock for the moment of one change and leaves it
 // only when it is killed. Such a lock would stop this step and every \`git config --global\` in the dev container until the
-// user found it, so the script removes it (and says so) and takes the lock. Any other lock stays (the lock of a Git of the
-// owner: the owner removes it, as Git tells it).
+// user found it, so the script removes it (and says so) and takes the lock. Review round 3 of PR G (A-L1): a lock of the
+// owner of the repository folder too, with the same guards: the ownership fix of CONFIG_FOLDER after the next \`up\`
+// (fixConfigOwnership) gives a killed run's lock to the remote user, and a Git of the owner never holds its lock that long
+// either. Any other lock stays.
 const STALE_LOCK_MS = 10 * 60 * 1000;
 // Git's lock on gitconfig in the open folder config, made with O_CREAT|O_EXCL (never through a link); its descriptor.
-const takeLock = (config, file) => {
+// Review round 3 of PR G (B3-N1): the check of a stale lock (lstat) and its removal (unlink) are two lookups of the entry in
+// the open folder, so an entry that a process of the dev container puts there in between is removed unchecked; it can only
+// be an entry of CONFIG_FOLDER, which whoever puts it there may remove anyway (never a file outside it: the folder is the
+// one that the script opened, and an unlink never follows a link).
+const takeLock = (config, file, owner) => {
   const entry = names.gitconfig + '.lock';
   const create = () => {
     try {
@@ -363,10 +370,15 @@ const takeLock = (config, file) => {
       if (error.code !== 'ENOENT') throw error;
     }
     const age = seen === undefined ? 0 : Date.now() - seen.mtimeMs;
-    const stale = seen !== undefined && seen.isFile() && seen.nlink === 1 && seen.uid === 0 && age > STALE_LOCK_MS;
+    const stale = seen !== undefined && seen.isFile() && seen.nlink === 1 && (seen.uid === 0 || seen.uid === owner.uid) && age > STALE_LOCK_MS;
     if (stale) {
-      fs.unlinkSync(at(config, entry));
-      process.stdout.write('Removed ' + file + '.lock, the lock of a run that was killed (unchanged for ' + Math.floor(age / 60000) + ' minutes).\n');
+      try {
+        fs.unlinkSync(at(config, entry));
+        process.stdout.write('Removed ' + file + '.lock, the lock of a run that was killed (unchanged for ' + Math.floor(age / 60000) + ' minutes).\n');
+      } catch (error) {
+        // Review round 3 of PR G (B3-N2): removed meanwhile (the user, as the message tells): gone, as below.
+        if (error.code !== 'ENOENT') throw error;
+      }
     }
     // Gone meanwhile (a Git of the dev container ended), or removed: once more.
     if (seen === undefined || stale) lock = create();
@@ -383,7 +395,11 @@ const takeLock = (config, file) => {
 // every way out but the rename. Review round 2 (A-L1): a run that changes nothing takes no lock, as the shell script
 // before it (whose Git took the lock only in its writes): gitconfig is first read without it (a change of Git meanwhile
 // replaces the file whole, by a rename); when its section is as it must be and it has one link (every open after the
-// first), it only gets the owner. Otherwise all is done again under the lock.
+// first), it only gets the owner. Otherwise all is done again under the lock. Review round 3 of PR G (A-L2): the text of a
+// gitconfig with a second link is read only when the file is the owner's: where fs.protected_hardlinks is off, the owner
+// can link a file of another user there (one that Git can read, for example the configuration of a service with its
+// password), whose text would go into the new gitconfig of the owner. Such a file is no configuration of the owner: the
+// new gitconfig starts empty, as for a missing one, and the file stays unread and as it is.
 const gitconfig = (config, owner, work) => {
   const file = paths.get(config) + '/' + names.gitconfig;
   const tooLarge = file + ' is larger than 1 MiB: it stays as it is.';
@@ -392,11 +408,14 @@ const gitconfig = (config, owner, work) => {
     const existing = openFile(config, names.gitconfig);
     if (existing !== undefined) {
       try {
-        const check = work + '/check';
-        copyFor(existing, check, tooLarge);
-        if (existing.stat.nlink === 1 && !sectionChanged(gitOn(check))) {
-          fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
-          return;
+        // A gitconfig with a second link is written again under the lock in any case: nothing of it is read here.
+        if (existing.stat.nlink === 1) {
+          const check = work + '/check';
+          copyFor(existing, check, tooLarge);
+          if (!sectionChanged(gitOn(check))) {
+            fs.fchownSync(existing.descriptor, owner.uid, owner.gid);
+            return;
+          }
         }
       } finally {
         fs.closeSync(existing.descriptor);
@@ -406,7 +425,7 @@ const gitconfig = (config, owner, work) => {
   const copy = work + '/gitconfig';
   const git = gitOn(copy);
   const lockEntry = names.gitconfig + '.lock';
-  const lock = takeLock(config, file);
+  const lock = takeLock(config, file, owner);
   let held = true;
   const unlock = () => {
     const own = fs.fstatSync(lock);
@@ -423,9 +442,11 @@ const gitconfig = (config, owner, work) => {
     try {
       if (kindOf(config, names.gitconfig) === 'link') fs.unlinkSync(at(config, names.gitconfig));
       const existing = openFile(config, names.gitconfig);
+      // The text to keep: none of a gitconfig with a second link that is not the owner's (A-L2).
+      const kept = existing !== undefined && (existing.stat.nlink === 1 || existing.stat.uid === owner.uid) ? existing : undefined;
       try {
-        copyFor(existing, copy, tooLarge);
-        if (existing === undefined) {
+        copyFor(kept, copy, tooLarge);
+        if (kept === undefined) {
           if (name !== '') git('user.name', name);
           if (email !== '') git('user.email', email);
         }
@@ -447,7 +468,7 @@ const gitconfig = (config, owner, work) => {
             fs.closeSync(source);
           }
           fs.fchownSync(lock, owner.uid, owner.gid);
-          fs.fchmodSync(lock, existing === undefined ? 0o644 : existing.stat.mode & 0o777);
+          fs.fchmodSync(lock, kept === undefined ? 0o644 : kept.stat.mode & 0o777);
           fs.renameSync(at(config, lockEntry), at(config, names.gitconfig));
           held = false;
         } else {

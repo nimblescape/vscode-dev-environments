@@ -176,6 +176,8 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT, revi
     return spawnSync(process.execPath, ['--require', env.preload, '-e', script, ...command.slice(3)], {
       encoding: 'utf8',
       timeout: 20_000,
+      // Review round 3 of PR G (A-L4): SIGKILL at the time limit (the script ignores SIGTERM since review round 2, A-L1).
+      killSignal: 'SIGKILL',
       env: {
         ...process.env,
         PATH: `${env.bin}${path.delimiter}${process.env.PATH ?? ''}`,
