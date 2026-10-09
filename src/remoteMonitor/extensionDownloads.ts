@@ -29,7 +29,9 @@ import {
   extensionLockFile,
   readExtensionChoices,
   readExtensionFailures,
+  readExtensionRecordFiles,
   readExtensionRecords,
+  removeStaleExtensionStateFiles,
   writeExtensionChoices,
   writeExtensionFailures,
 } from '../core/worker/vscodeExtensionStore';
@@ -39,6 +41,7 @@ import {
   MARKETPLACE_QUERY_URL,
   MAX_EXTENSION_FALLBACKS,
   MAX_MARKETPLACE_ANSWER_BYTES,
+  MAX_MARKETPLACE_SINGLE_QUERIES,
   chooseExtensionVersion,
   compareVersions,
   extensionEntryText,
@@ -63,7 +66,8 @@ const ARCHITECTURE_TIMEOUT_MS = 60_000;
 const MAX_PRODUCT_JSON_BYTES = 1024 * 1024;
 /**
  * Review round 1 of 11H3 (A-L4): the most bytes that one run downloads; when they are reached, no further download starts
- * (the rest comes with the next run; one file may pass the bound by at most its own size, MAX_VSIX_BYTES).
+ * (the rest comes with the next run; one file may pass the bound by at most its own size, MAX_VSIX_BYTES). Review round 2
+ * of 11H3 (A-L1): the bytes transferred by every download, also by one that failed afterwards.
  */
 export const MAX_EXTENSION_BYTES_PER_RUN = 1024 * 1024 * 1024;
 
@@ -213,19 +217,10 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
     }
   }
   // Review round 1 of 11H3 (A-L7): all versions in queries of at most MARKETPLACE_ALL_VERSIONS_CHUNK IDs; a failed query
-  // fails only its own entries (each waits a day).
-  const ids = [...new Set(allVersions.map((ref) => ref.id))];
-  for (let start = 0; start < ids.length; start += MARKETPLACE_ALL_VERSIONS_CHUNK) {
-    const chunk = ids.slice(start, start + MARKETPLACE_ALL_VERSIONS_CHUNK);
-    const refs = allVersions.filter((ref) => chunk.includes(ref.id));
-    let answer: Map<string, MarketplaceVersion[]>;
-    try {
-      answer = await query(chunk, false);
-    } catch (error) {
-      log(queryFailure(refs.length, error));
-      for (const ref of refs) fail(ref, `its query failed: ${message(error)}`);
-      continue;
-    }
+  // fails only its own entries (each waits a day). Review round 2 of 11H3 (A-L2, B R2-D2): a failed query of several IDs
+  // is asked again one ID at a time (at most MAX_MARKETPLACE_SINGLE_QUERIES a run), so one ID whose answer fails (e.g. a
+  // history larger than MAX_MARKETPLACE_ANSWER_BYTES) fails only its own entries, not those of its neighbours.
+  const decide = (refs: readonly ExtensionRef[], answer: ReadonlyMap<string, MarketplaceVersion[]>) => {
     for (const ref of refs) {
       const versions = answer.get(ref.id);
       const chosen = versions !== undefined ? chooseExtensionVersion(ref, versions, vscodeVersion, platform) : undefined;
@@ -233,45 +228,68 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
       else if (chosen === undefined) fail(ref, noRelease(ref));
       else choices.push({ ref, chosen });
     }
+  };
+  const ask = (chunk: readonly string[]) => query(chunk, false).then((answer) => ({ answer }), (error: unknown) => ({ error }));
+  let singleQueries = 0;
+  const ids = [...new Set(allVersions.map((ref) => ref.id))];
+  for (let start = 0; start < ids.length; start += MARKETPLACE_ALL_VERSIONS_CHUNK) {
+    const chunk = ids.slice(start, start + MARKETPLACE_ALL_VERSIONS_CHUNK);
+    const refs = allVersions.filter((ref) => chunk.includes(ref.id));
+    const result = await ask(chunk);
+    if ('answer' in result) {
+      decide(refs, result.answer);
+      continue;
+    }
+    log(queryFailure(refs.length, result.error));
+    for (const id of chunk) {
+      const own = refs.filter((ref) => ref.id === id);
+      const single = chunk.length > 1 && singleQueries++ < MAX_MARKETPLACE_SINGLE_QUERIES ? await ask([id]) : result;
+      if ('answer' in single) decide(own, single.answer);
+      else for (const ref of own) fail(ref, `its query failed: ${message(single.error)}`);
+    }
   }
   // Review round 1 of 11H3 (A-L3, B-D1): the chosen files, which the cleanup keeps and the seed of an entry without a pin
-  // prefers; an entry that this run did not decide keeps its earlier choice while a list wants it.
+  // prefers; an entry that this run did not decide keeps its earlier choice while a list wants it. Review round 2 of 11H3
+  // (B R2-D1): a new choice is recorded only once its file is in the store (present, or downloaded by this run); until
+  // then the entry keeps its earlier choice (a failed or deferred download never names a missing file).
   const kept = new Set(wanted.map(extensionEntryText));
   const previous = await readExtensionChoices(stateDir);
   const chosenFiles = new Map([...previous].filter(([entry]) => kept.has(entry)));
-  for (const { ref, chosen } of choices) chosenFiles.set(extensionEntryText(ref), `${chosen.folder}/${chosen.cacheName}`);
-  if (JSON.stringify([...chosenFiles].sort()) !== JSON.stringify([...previous].sort())) {
-    await writeExtensionChoices(stateDir, chosenFiles).catch((error: unknown) => {
-      log(`The chosen extension files could not be stored: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  }
-  // Review round 1 of 11H3 (A-L4): at most maxRunBytes downloaded a run; the rest comes with the next run.
+  const inStore = (ref: ExtensionRef, chosen: ChosenExtension) => {
+    failures.delete(extensionEntryText(ref));
+    chosenFiles.set(extensionEntryText(ref), `${chosen.folder}/${chosen.cacheName}`);
+  };
+  // Review round 1 of 11H3 (A-L4): at most maxRunBytes downloaded a run; the rest comes with the next run. Review round 2
+  // of 11H3 (A-L1): every transferred byte counts, also those of a download that failed.
   const maxRunBytes = deps.maxRunBytes ?? MAX_EXTENSION_BYTES_PER_RUN;
   let downloadedBytes = 0;
   let deferred = 0;
   const signal = new AbortController().signal;
+  const storeDeps = { root, transport: deps.transport, lock: locks(deps).lock, logger: { warn: log }, onBytes: (bytes: number) => void (downloadedBytes += bytes) };
   for (const { ref, chosen } of choices) {
     const target = extensionFile(root, chosen.folder, chosen.cacheName);
     if (downloadedBytes >= maxRunBytes) {
       if ((await fs.promises.lstat(target).catch(() => undefined))?.isFile() === true) {
         counts.present++;
-        failures.delete(extensionEntryText(ref));
+        inStore(ref, chosen);
       } else deferred++;
       continue;
     }
     try {
-      const outcome = await ensureExtension({ root, transport: deps.transport, lock: locks(deps).lock, logger: { warn: log } }, chosen, signal);
+      const outcome = await ensureExtension(storeDeps, chosen, signal);
       counts[outcome]++;
-      failures.delete(extensionEntryText(ref));
-      if (outcome === 'downloaded') {
-        downloadedBytes += (await fs.promises.lstat(target).catch(() => undefined))?.size ?? 0;
-        log(`Downloaded the extension ${chosen.cacheName} into the shared extension cache.`);
-      }
+      inStore(ref, chosen);
+      if (outcome === 'downloaded') log(`Downloaded the extension ${chosen.cacheName} into the shared extension cache.`);
     } catch (error) {
       fail(ref, error instanceof Error ? error.message : String(error));
     }
   }
   if (deferred > 0) log(`This run downloaded ${downloadedBytes} bytes, its bound; ${deferred} extension(s) are left for the next run.`);
+  if (JSON.stringify([...chosenFiles].sort()) !== JSON.stringify([...previous].sort())) {
+    await writeExtensionChoices(stateDir, chosenFiles).catch((error: unknown) => {
+      log(`The chosen extension files could not be stored: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   // Only the entries that are still wanted keep their failure.
   for (const entry of [...failures.keys()]) if (!kept.has(entry)) failures.delete(entry);
   if (JSON.stringify([...failures]) !== before) {
@@ -290,15 +308,28 @@ export async function downloadExtensions(deps: ExtensionRunDeps): Promise<void> 
  * recorded in the last 14 days; review round 1 of 11H3: never a file that the runs chose, A-L3/B-D1, and every file of an
  * ID that no such list names, A-L4), each under its lock taken without a wait (`flock -n`; busy: left to the next cleanup),
  * checked again under it and removed; then the leftovers of downloads in `extensions/tmp` (`<cache name>-<random>`),
- * those of a file only while its lock can be taken at once. Lock files are never removed. Never throws.
+ * those of a file only while its lock can be taken at once. Lock files are never removed. Never throws. Review round 2 of
+ * 11H3: first the records older than RECORDED_LIST_MS and the leftover temporary files of the monitor's volume
+ * (removeStaleExtensionStateFiles; A-L3, B R2-D3); a record that is present but cannot be read or parsed keeps the files
+ * of the IDs that no list names for this cleanup, with one line (A-L5).
  */
 export async function cleanupExtensions(deps: ExtensionRunDeps): Promise<void> {
   const { log, root } = deps;
   const { tryLock } = locks(deps);
   try {
-    const wanted = wantedExtensions(await readExtensionRecords(deps.stateDir), deps.now());
+    const now = deps.now();
+    // Review round 2 of 11H3 (A-L3, B R2-D3): the records that no longer count and the leftovers of killed writes.
+    const stale = await removeStaleExtensionStateFiles(deps.stateDir, now);
+    if (stale.length > 0) log(`Removed ${stale.length} old extension list(s) and leftover temporary file(s) from the monitor's volume: ${stale.join(', ')}.`);
+    const { records, unreadable } = await readExtensionRecordFiles(deps.stateDir);
+    const wanted = wantedExtensions(records, now);
     const pinned = new Set(wanted.filter((ref) => ref.version !== undefined).map(extensionEntryText));
-    const named = new Set(wanted.map((ref) => ref.id));
+    // Review round 2 of 11H3 (A-L5): a record that is present but cannot be read or parsed may name IDs; this cleanup then
+    // keeps the files of the IDs that no list names (the rule of the newest, pinned and chosen files still applies).
+    const named = unreadable.length === 0 ? new Set(wanted.map((ref) => ref.id)) : undefined;
+    if (unreadable.length > 0) {
+      log(`The extension list(s) ${unreadable.join(', ')} could not be read; this cleanup keeps the extension files of the IDs that no list names.`);
+    }
     const chosen = new Set((await readExtensionChoices(deps.stateDir)).values());
     const files = await cachedExtensionFiles(root);
     let removed = 0;

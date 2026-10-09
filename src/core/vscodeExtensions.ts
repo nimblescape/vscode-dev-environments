@@ -385,6 +385,12 @@ export const MARKETPLACE_LATEST_ONLY_FLAG = 0x10000;
  */
 export const MARKETPLACE_ALL_VERSIONS_CHUNK = 5;
 /**
+ * Review round 2 of 11H3 (A-L2, B R2-D2): when a query for all versions of several IDs fails (e.g. one answer larger than
+ * MAX_MARKETPLACE_ANSWER_BYTES), its IDs are asked again one at a time, so only the IDs whose own query fails fail; at
+ * most this many such queries a run (a Marketplace that fails every query costs a bounded time).
+ */
+export const MAX_MARKETPLACE_SINGLE_QUERIES = 20;
+/**
  * Review round 1 of 11H3 (A-L8): the most entries without a pin that one run asks again for all versions when the newest
  * versions had no compatible release (VS Code's gallery service does the same); the others wait for their retry.
  */

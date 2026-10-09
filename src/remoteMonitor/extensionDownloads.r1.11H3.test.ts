@@ -136,20 +136,25 @@ describe('the queries for all versions (review round 1 of 11H3, A-L7 and A-L8)',
       ids.includes('p.e05') ? { status: 200, headers: {}, body: 'x'.repeat(10) } : ok(answer(Object.fromEntries(ids.map((id) => [id, [{ version: '1.0.0' }, { version: '2.0.0' }]])))),
     );
     await downloadExtensions(f.deps);
+    // Review round 2 of 11H3 (A-L2, B R2-D2): changed expectation: the failed query of five IDs is asked again one ID at a
+    // time, so only p.e05 (whose own query fails too) fails; its four neighbours are downloaded (before: all five failed).
     expect(f.queries).toEqual([
       { ids: ['p.e00', 'p.e01', 'p.e02', 'p.e03', 'p.e04'], latestOnly: false },
       { ids: ['p.e05', 'p.e06', 'p.e07', 'p.e08', 'p.e09'], latestOnly: false },
+      ...['p.e05', 'p.e06', 'p.e07', 'p.e08', 'p.e09'].map((id) => ({ ids: [id], latestOnly: false })),
       { ids: ['p.e10', 'p.e11'], latestOnly: false },
     ]);
-    expect(f.downloads).toHaveLength(7);
+    expect(f.downloads).toHaveLength(11);
     expect(f.logs).toContain('The Marketplace could not be asked for 5 extension(s): the Marketplace answered no list of extensions');
     expect(f.logs).toContain('The extension p.e05@1.0.0 is not in the shared extension cache (its query failed: the Marketplace answered no list of extensions); it is tried again after a day.');
-    expect(Object.keys(JSON.parse(fs.readFileSync(path.join(state, 'extensions', 'failures.json'), 'utf8')) as object)).toEqual(['p.e05@1.0.0', 'p.e06@1.0.0', 'p.e07@1.0.0', 'p.e08@1.0.0', 'p.e09@1.0.0']);
+    expect(Object.keys(JSON.parse(fs.readFileSync(path.join(state, 'extensions', 'failures.json'), 'utf8')) as object)).toEqual(['p.e05@1.0.0']);
 
     // Within the day only the others are asked for again (all present: no download).
     const g = fake(root, state, (ids) => ok(answer(Object.fromEntries(ids.map((id) => [id, [{ version: '1.0.0' }]])))));
     await downloadExtensions(g.deps);
-    expect(g.queries.map((q) => q.ids)).toEqual([['p.e00', 'p.e01', 'p.e02', 'p.e03', 'p.e04'], ['p.e10', 'p.e11']]);
+    // Review round 2 of 11H3 (A-L2, B R2-D2): changed expectation: only p.e05 waits for its retry, so its neighbours fill
+    // the chunks (before: the five of the failed query waited).
+    expect(g.queries.map((q) => q.ids)).toEqual([['p.e00', 'p.e01', 'p.e02', 'p.e03', 'p.e04'], ['p.e06', 'p.e07', 'p.e08', 'p.e09', 'p.e10'], ['p.e11']]);
     expect(g.downloads).toEqual([]);
   });
 

@@ -894,7 +894,12 @@ export class CacheSchedule {
  * the HTTPS of the proxy of the daemon (decision C1 of 2026-10-05, as the worker), the lock of a server version with and
  * without a wait, and `tar`. Undefined without a valid store name (no store mounted).
  */
-export function vscodeBackgroundDeps(env: NodeJS.ProcessEnv, engine: VscodeEngine, log: (message: string) => void): VscodeBackgroundDeps | undefined {
+export function vscodeBackgroundDeps(
+  env: NodeJS.ProcessEnv,
+  engine: VscodeEngine,
+  log: (message: string) => void,
+  stateDir: string = REMOTE_MONITOR_STATE_DIR,
+): VscodeBackgroundDeps | undefined {
   const storeVolume = env[MONITOR_VSCODE_STORE_ENV];
   if (storeVolume === undefined || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(storeVolume)) return undefined;
   return {
@@ -910,6 +915,8 @@ export function vscodeBackgroundDeps(env: NodeJS.ProcessEnv, engine: VscodeEngin
     storeVolume,
     engine,
     tryLock: (name) => storeTryLock(VSCODE_STORE_DIR, name),
+    // Review round 2 of 11H3 (A-L4): the extension lists in the run's own volume (deps.stateDir of `run` for the tests).
+    extensionStateDir: stateDir,
   };
 }
 
@@ -1008,7 +1015,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       });
       const state = cacheRunStore(stateDir);
       // Plan step 11H2: the VS Code part afresh for each run (BackgroundRunDeps.vscode).
-      const vscodeOf = deps.vscodeBackground ?? (() => vscodeBackgroundDeps(deps.env, engine, log));
+      const vscodeOf = deps.vscodeBackground ?? (() => vscodeBackgroundDeps(deps.env, engine, log, stateDir));
       const vscode = vscodeOf();
       const background = new BackgroundRun({ log, now, images: () => images.pass(), vscode: vscodeOf, state });
       const schedule = new CacheSchedule({ now, log, settings, pass: () => background.run(), observe: () => images.observe(), state });

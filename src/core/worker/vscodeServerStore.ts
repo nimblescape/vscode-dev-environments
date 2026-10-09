@@ -439,7 +439,9 @@ function isHttpsUrl(text: string): boolean {
  * `maxBytes` (also by its Content-Length), MAX_SERVER_REDIRECTS redirects each to an `https:` URL, status 200 at the
  * end. Resolves with the SHA-256 of the content (lower-case hexadecimal). The caller removes the file on a failure.
  * Review round 1 of 11H3 (A-L6): `allowedUrl`, when given, must accept the first URL and every redirect (the download of
- * a `.vsix` only from the hosts of the Marketplace); 11H1's server download gives none.
+ * a `.vsix` only from the hosts of the Marketplace); 11H1's server download gives none. Review round 2 of 11H3 (A-L1):
+ * `onBytes`, when given, is told the length of every chunk of the body as it arrives (also of a download that fails
+ * afterwards), so that the monitor's bound of a run counts every transferred byte.
  */
 export async function downloadToFile(
   transport: HttpStreamTransport,
@@ -448,6 +450,7 @@ export async function downloadToFile(
   maxBytes: number,
   signal: AbortSignal,
   allowedUrl?: (url: URL) => boolean,
+  onBytes?: (bytes: number) => void,
 ): Promise<string> {
   let current = url;
   for (let redirects = 0; ; redirects++) {
@@ -481,6 +484,7 @@ export async function downloadToFile(
     const counter = new Transform({
       transform(chunk: Buffer, _encoding, done) {
         size += chunk.length;
+        onBytes?.(chunk.length);
         if (size > maxBytes) {
           done(new FetchError(`the download is larger than ${maxBytes} bytes`));
           return;

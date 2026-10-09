@@ -17,6 +17,7 @@ import { silentLogger } from '../core/ports';
 import { scriptCommand } from '../core/worker/containerScripts';
 import type { EngineContainer, EngineContainerSummary, EngineExecOptions, EngineExecResult } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
+import { formatExtensionRecord } from '../core/vscodeExtensions';
 import { markServerOpened, serverCommitsUrl, serverFolder, serverLockFile, type StoreLockAttempt, type VscodeStoreDeps } from '../core/worker/vscodeServerStore';
 import { BackgroundRun, type CacheRunStore, type VscodeBackgroundDeps } from './background';
 import { SERVER_UNUSED_MS, type CacheRunState } from './backgroundRules';
@@ -81,6 +82,9 @@ function harness(options: {
 }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-'));
   temps.push(root);
+  // Review round 2 of 11H3 (A-L4): the monitor's volume of the run is a temporary folder too (never the real /state).
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-state-'));
+  temps.push(stateDir);
   const log: string[] = [];
   const requests: HttpRequest[] = [];
   const fetched: Array<{ server: VscodeServerRef; platform: VscodePlatform }> = [];
@@ -117,6 +121,7 @@ function harness(options: {
   const vscode: VscodeBackgroundDeps = {
     store,
     storeVolume: STORE,
+    extensionStateDir: stateDir,
     engine: {
       ...unusedEngine(),
       architecture: async () => {
@@ -183,7 +188,7 @@ function harness(options: {
     vscode: () => (options.vscode === false ? undefined : vscode),
     state: stateStore,
   });
-  return { run, root, log, requests, fetched, execs, inspected, locks, released, listed: () => listed, topped, state: () => state, imagesCalled };
+  return { run, root, stateDir, log, requests, fetched, execs, inspected, locks, released, listed: () => listed, topped, state: () => state, imagesCalled };
 }
 
 const linkCommand = (server: string, quality = 'stable') => scriptCommand('vscodeServerLink', [server, quality, 'linux-x64']);
@@ -541,5 +546,18 @@ describe('a failed fetch of the background run waits a day (review round 1 of 11
     await opened.run.run();
     expect(opened.fetched).toEqual([]);
     expect(opened.state().failedFetches).toEqual({});
+  });
+});
+
+describe('the monitor volume of the background run (review round 2 of 11H3, A-L4)', () => {
+  it('the extension part reads the lists of the volume that the run is given, never the real /state', async () => {
+    const h = harness({});
+    const wanted = path.join(h.stateDir, 'extensions', 'wanted');
+    fs.mkdirSync(wanted, { recursive: true });
+    fs.writeFileSync(path.join(wanted, 'aaaaaaaaaa.json'), formatExtensionRecord({ at: NOW - DAY, configuration: [{ id: 'a.b' }], defaults: [] }));
+    await h.run.run();
+    expect(h.log).not.toContain('No open recorded an extension list in the last 14 days; no extension is fetched.');
+    // The fetched server of the harness has no product.json: the part reads the list and stops at the version.
+    expect(h.log).toContain('The shared store has no stable VS Code server for linux-x64, so the compatible extension versions are not known; no extension is fetched.');
   });
 });

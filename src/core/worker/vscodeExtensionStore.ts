@@ -22,6 +22,7 @@ import {
   EXTENSION_FOLDERS,
   MAX_EXTENSION_RECORD_BYTES,
   MAX_EXTENSION_CHOICES_BYTES,
+  RECORDED_LIST_MS,
   combinedExtensions,
   formatExtensionChoices,
   formatExtensionRecord,
@@ -138,18 +139,86 @@ export async function recordExtensions(
  * removes nothing as unwanted).
  */
 export async function readExtensionRecords(stateDir: string): Promise<ExtensionRecord[]> {
+  return (await readExtensionRecordFiles(stateDir)).records;
+}
+
+/** Review round 2 of 11H3 (A-L5): the recorded lists, and the names of the record files that are present but not valid. */
+export interface ExtensionRecordFiles {
+  records: ExtensionRecord[];
+  /** The record files (`<environment-id>.json`) that are present but could not be read or are no valid record. */
+  unreadable: string[];
+}
+
+/**
+ * Review round 2 of 11H3 (A-L5): readExtensionRecords, and the names of the record files that are present (not missing
+ * when they are read: one removed meanwhile is not counted) but could not be read (a link, too large, a failed read) or
+ * parsed; the cleanup then keeps the files of the IDs that no list names. The listing fails as readExtensionRecords.
+ */
+export async function readExtensionRecordFiles(stateDir: string): Promise<ExtensionRecordFiles> {
   const folder = path.posix.join(stateDir, STATE_EXTENSION_FOLDER, EXTENSION_WANTED_FOLDER);
   const records: ExtensionRecord[] = [];
+  const unreadable: string[] = [];
   const entries = await fs.promises.readdir(folder).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return [] as string[];
     throw error;
   });
-  for (const entry of entries) {
+  for (const entry of entries.sort()) {
     if (!entry.endsWith('.json') || !isStorageId(entry.slice(0, -'.json'.length))) continue;
-    const record = parseExtensionRecord((await readPlainFile(path.posix.join(folder, entry), MAX_EXTENSION_RECORD_BYTES)) ?? '');
+    const file = path.posix.join(folder, entry);
+    const text = await readPlainFile(file, MAX_EXTENSION_RECORD_BYTES).catch(() => undefined);
+    const record = parseExtensionRecord(text ?? '');
     if (record !== undefined) records.push(record);
+    else if (await fs.promises.lstat(file).then(() => true, (error: NodeJS.ErrnoException) => error.code !== 'ENOENT')) unreadable.push(entry);
   }
-  return records;
+  return { records, unreadable };
+}
+
+/**
+ * Review round 2 of 11H3 (A-L3, B R2-D3): a temporary file of writeAtomically (`.<name>.<12 hexadecimal digits>.tmp`)
+ * that a killed write left behind.
+ */
+export const EXTENSION_STATE_TEMPORARY_FILE = /^\..+\.[0-9a-f]{12}\.tmp$/;
+/** Review round 2 of 11H3 (A-L3, B R2-D3): such a file whose modification time is more than this from now is removed. */
+export const EXTENSION_STATE_TEMPORARY_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * Review round 2 of 11H3 (A-L3, B R2-D3; as removeStaleStateTemporaryFiles of the monitor's own state files): removes,
+ * in `<state>/extensions` and its `wanted` folder, the temporary files of writeAtomically whose modification time is
+ * more than EXTENSION_STATE_TEMPORARY_MAX_AGE_MS from `now` in either direction (a younger one may belong to a write that
+ * runs now), and the records (`wanted/<environment-id>.json`) that were written more than RECORDED_LIST_MS ago and name
+ * no time within RECORDED_LIST_MS of `now` (their `at` is older, or the file is no valid record): such a record no longer
+ * counts (wantedExtensions), and the next open of its environment writes a new one. Only regular files, never a link;
+ * the file is checked again (the same file, unchanged) right before it is removed, as a worker may rename a new record
+ * into place meanwhile. Every error is ignored. Returns the names it removed (relative to `<state>/extensions`).
+ */
+export async function removeStaleExtensionStateFiles(stateDir: string, now: number): Promise<string[]> {
+  const removed: string[] = [];
+  const base = path.posix.join(stateDir, STATE_EXTENSION_FOLDER);
+  for (const sub of ['', EXTENSION_WANTED_FOLDER]) {
+    const folder = sub === '' ? base : path.posix.join(base, sub);
+    for (const entry of (await fs.promises.readdir(folder).catch(() => [] as string[])).sort()) {
+      const file = path.posix.join(folder, entry);
+      try {
+        const stat = await fs.promises.lstat(file);
+        if (!stat.isFile()) continue;
+        if (EXTENSION_STATE_TEMPORARY_FILE.test(entry)) {
+          if (Math.abs(now - stat.mtimeMs) <= EXTENSION_STATE_TEMPORARY_MAX_AGE_MS) continue;
+        } else {
+          if (sub !== EXTENSION_WANTED_FOLDER || !entry.endsWith('.json') || !isStorageId(entry.slice(0, -'.json'.length))) continue;
+          if (now - stat.mtimeMs < RECORDED_LIST_MS) continue;
+          const record = parseExtensionRecord((await readPlainFile(file, MAX_EXTENSION_RECORD_BYTES).catch(() => undefined)) ?? '');
+          if (record !== undefined && now - record.at < RECORDED_LIST_MS) continue;
+          const again = await fs.promises.lstat(file);
+          if (!again.isFile() || again.ino !== stat.ino || again.mtimeMs !== stat.mtimeMs) continue;
+        }
+        await fs.promises.unlink(file);
+        removed.push(sub === '' ? entry : `${sub}/${entry}`);
+      } catch {
+        // Removed meanwhile, or not removable: left alone.
+      }
+    }
+  }
+  return removed;
 }
 
 /** Plan step 11H3: the plain files of each folder of the cache (a missing folder has none; links are left out). */
@@ -203,6 +272,11 @@ export interface ExtensionStoreDeps {
   maxBytes?: number;
   /** Default VSIX_FETCH_TIMEOUT_MS. */
   timeoutMs?: number;
+  /**
+   * Review round 2 of 11H3 (A-L1): told the length of every chunk of the download as it arrives (downloadToFile), also of
+   * a download that fails afterwards (the monitor's bound of a run counts the transferred bytes).
+   */
+  onBytes?: (bytes: number) => void;
 }
 
 /** The first bytes of a `.vsix` (a ZIP archive). */
@@ -286,7 +360,7 @@ export async function ensureExtension(deps: ExtensionStoreDeps, chosen: ChosenEx
       const own = temporaryName(temp, chosen.cacheName);
       let decoded: string | undefined;
       try {
-        await downloadToFile(deps.transport, chosen.vsix, own, maxBytes, both, isMarketplaceDownloadUrl);
+        await downloadToFile(deps.transport, chosen.vsix, own, maxBytes, both, isMarketplaceDownloadUrl, deps.onBytes);
         let file = own;
         if ((await headOf(own, GZIP_MAGIC.length)).equals(GZIP_MAGIC)) {
           decoded = temporaryName(temp, chosen.cacheName);
