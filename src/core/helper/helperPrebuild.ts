@@ -7,7 +7,10 @@
 // activation, in the background, so the first open after the update does not wait for it and does not fail when the
 // network goes away later. Without a previous helper image, an open that finds no usable helper image and cannot build
 // one fails with helperFailed. Plan step 6, PR D (decision "Local and remote work the same" of 2026-09-30): it runs on the
-// Docker engine of the current Docker context, local or remote alike.
+// Docker engine of the current Docker context, local or remote alike. PR H (decision of 2026-10-09): with the setting
+// updateImagesOnConnect on, it also runs when the refresh of the helper image is due (the rebuild that a check asked
+// for, the weekly check of the base image), and its maintaining ensure then also runs the daily cleanup when that is due;
+// the cleanup alone never makes it run.
 import * as fs from 'fs';
 import { LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
 import { runWithDockerTarget } from '../docker/dockerTargets';
@@ -19,10 +22,11 @@ import { readHelperState } from './helperState';
 import { helperStatePathFor, type HelperImages } from './helperImages';
 
 /**
- * What a prebuild did. `notDue`: the state file of the engine knows the current tag; `unsupported`: the Docker endpoint
- * is neither local nor SSH (plan step 6, PR D; `remote` is gone, a remote host is prebuilt too); `dockerNotRunning`: the
- * Docker engine does not answer; `built`: the tag was missing and was built; `present`: the tag exists; `failed`: the
- * build failed (the next open tries again); `cancelled`: dispose ended it.
+ * What a prebuild did. `notDue`: the state file of the engine knows the current tag, and no refresh is due (PR H);
+ * `unsupported`: the Docker endpoint is neither local nor SSH (plan step 6, PR D; `remote` is gone, a remote host is
+ * prebuilt too); `dockerNotRunning`: the Docker engine does not answer; `built`: the tag was missing and was built;
+ * `present`: the tag exists (PR H: also after the maintenance that was due, a rebuild that failed keeping the existing
+ * image); `failed`: the build failed (the next open tries again); `cancelled`: dispose ended it.
  */
 export type HelperPrebuildOutcome = 'notDue' | 'unsupported' | 'dockerNotRunning' | 'built' | 'present' | 'failed' | 'cancelled';
 
@@ -35,7 +39,14 @@ export type HelperPrebuildOutcome = 'notDue' | 'unsupported' | 'dockerNotRunning
 export const HELPER_PREBUILD_TIMEOUT_MS = 15 * 60_000;
 
 export interface HelperPrebuildDeps {
-  helper: Pick<HelperImages, 'engineKey' | 'prebuildImage'>;
+  helper: Pick<HelperImages, 'engineKey' | 'prebuildImage' | 'refreshDue'>;
+  /**
+   * PR H (decision of 2026-10-09): the setting updateImagesOnConnect, read when the prebuild runs. With it on, the
+   * rebuild that a check asked for and the weekly check of the base image make the prebuild due and run. The daily
+   * cleanup never makes it due; it runs, with the setting on or off, whenever the prebuild runs and it is due too (the
+   * setting governs the check and the rebuild, not the cleanup).
+   */
+  checkBaseImage: () => boolean;
   /**
    * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker. Called within the
    * operation on `target`. Never throws, except an AbortError.
@@ -97,19 +108,23 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * cancels it (the build of the Docker CLI is ended).
  *
  * It runs when the helper state file of the engine has no record of the current helper tag (after an update that
- * changed the tag, a first installation, or a tag that the cleanup removed). Review round 5 of PR #64 (R5-2): the state
- * file alone decides, so a window that starts after the build of another one finds the record and does nothing. It asks
- * Docker nothing when it is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor
- * connect to a remote host. Plan step 6, PR D: on the Docker engine of the target that `start` gets, local or remote
- * alike (it runs as an operation on it, so the engine key, the state file and every Docker call are those of an open on
- * that engine), and only when that engine answers (Docker is never started for this). The build is the one of
- * HelperImages.prebuildImage, shared with ensureImagePresent, so the preparation of a worker in the same window that
- * starts meanwhile never builds a second time. Review round 6 of PR #64 (R6-1): there is no lock across windows (a lock
- * left behind by a window that closed during the prebuild would block the prebuild of every window). Windows that start
- * at the same time may each build the tag once (BuildKit shares the layer cache; the extra images are dangling, and the
- * daily cleanup that removes them has no caller in this version; the decision of 2026-10-09, docs/plan-remote-worker.md
- * section 2, restores it in the extension's preparation of the worker for an open and in the background prebuild, with
- * a follow-up PR); windows that start later find the record and do nothing.
+ * changed the tag, a first installation, or a tag that the cleanup removed), or (PR H, decision of 2026-10-09,
+ * docs/plan-remote-worker.md section 2), with the setting updateImagesOnConnect on, when the refresh of that tag is due
+ * by the state file (HelperImages.refreshDue: the rebuild that a check asked for, the weekly check of the base image).
+ * The daily cleanup alone never makes it due: it is housekeeping, and runs when the prebuild runs anyway and in the
+ * preparation of the worker for an open. Review round 5 of PR #64 (R5-2): the state file alone decides, so a window that
+ * starts after the prebuild of another one finds the record (and no refresh due) and does nothing. It asks Docker
+ * nothing when it is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor connect
+ * to a remote host, for housekeeping. Plan step 6, PR D: on the Docker engine of the target that `start` gets, local
+ * or remote alike (it runs as an operation on it, so the engine key, the state file and every Docker call are those of
+ * an open on that engine), and only when that engine answers (Docker is never started for this). The ensure is the
+ * maintaining one of HelperImages.prebuildImage (PR H: it builds a missing tag, runs the rebuild itself so that the next
+ * open does not wait for it, starts the check, and runs the cleanup when that is due too), shared with the preparation
+ * of a worker in the same window, so one that needs the missing tag meanwhile never builds a second time, and one before
+ * an open joins the rebuild. Review round 6 of PR #64 (R6-1): there is no lock across windows (a lock left behind by a
+ * window that closed during the prebuild would block the prebuild of every window). Windows that start at the same time
+ * may each build the tag, or run the rebuild, once (BuildKit shares the layer cache; the extra images stay dangling
+ * until the daily cleanup removes them); windows that start later find the record and no refresh due, and do nothing.
  */
 export class HelperPrebuild {
   private readonly controller = new AbortController();
@@ -164,9 +179,16 @@ export class HelperPrebuild {
       return 'dockerNotRunning';
     }
     let built = false;
+    // PR H (decision of 2026-10-09): the maintaining ensure, with the setting updateImagesOnConnect. A rebuild that fails
+    // keeps the existing image (helperImage.ts logs it), so only the build of a missing tag counts as `built`.
     const use = await deps.helper.prebuildImage({
       signal,
-      onBuild: () => {
+      checkBaseImage: deps.checkBaseImage(),
+      onBuild: (kind) => {
+        if (kind === 'refresh') {
+          deps.logger.info('The workspace helper image is built again in the background.');
+          return;
+        }
         built = true;
         deps.logger.info('The workspace helper image is built in the background.');
       },
@@ -180,10 +202,11 @@ export class HelperPrebuild {
   }
 
   /**
-   * The state file of the engine has no record of the current tag (or only a removal mark). Plan step 6, PR D: the state
-   * file of the engine of the operation (helperStatePathFor with the engine key of an open), read after the tag, so a
-   * dispose while the Dockerfile is read does not even read the engine. The engine key comes from the target of the
-   * operation; Docker is not asked.
+   * The state file of the engine has no record of the current tag (or only a removal mark), or (PR H) the refresh of the
+   * tag is due by that file (HelperImages.refreshDue, with the setting updateImagesOnConnect; never the cleanup alone).
+   * Plan step 6, PR D: the state file of the engine of the operation (helperStatePathFor with the engine key of an open),
+   * read after the tag, so a dispose while the Dockerfile is read does not even read the engine. The engine key comes
+   * from the target of the operation; Docker is not asked.
    */
   private async isDue(signal: AbortSignal): Promise<boolean> {
     const { deps } = this;
@@ -191,6 +214,7 @@ export class HelperPrebuild {
     if (signal.aborted) return false;
     const statePath = helperStatePathFor(deps.statePath, await deps.helper.engineKey());
     const record = (await readHelperState(statePath)).images[tag];
-    return record === undefined || record.removedAt !== undefined;
+    if (record === undefined || record.removedAt !== undefined) return true;
+    return deps.helper.refreshDue({ checkBaseImage: deps.checkBaseImage() });
   }
 }

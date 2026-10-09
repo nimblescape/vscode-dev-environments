@@ -5,11 +5,12 @@
 // Plan step 11F2: the helper image (implementation notes 7) on the engine of an operation, apart from the steps of the
 // workspace helper (workspaceHelper.ts), which run in the worker on the worker's own image. The extension prepares it
 // for the bootstrap (the image of the worker and of the Session Monitor): it is checked, and built when its tag is
-// missing. The maintenance of ensureImage (the rebuild that a check of its base image asked for, the removal of old
-// helper images) has no caller in this version; the decision of 2026-10-09 (docs/plan-remote-worker.md section 2)
-// restores it in the extension's preparation of the worker for an open and in the background prebuild (a follow-up PR).
-// No `vscode`.
+// missing. PR H (decision of 2026-10-09, docs/plan-remote-worker.md section 2): the maintenance of ensureImageUse (the
+// rebuild that a check of its base image asked for, the weekly check, the removal of old helper images) runs in the
+// extension's preparation of the worker for an operation `open` (HelperMaintenance) and in the background prebuild
+// (prebuildImage). No `vscode`.
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import type { BootstrapDocker } from '../docker/bootstrapDocker';
 import { UserFacingError, errorMessage, isUserFacingError } from '../errors';
 import { Messages } from '../messages';
@@ -19,11 +20,13 @@ import {
   HELPER_LAST_USED_INTERVAL_MS,
   currentHelperImageTag,
   ensureHelperImageUse,
+  helperRefreshDue,
   recordHelperImageUse,
   type BaseDigestLookup,
   type HelperBuildKind,
   type HelperImageUse,
 } from './helperImage';
+import { readHelperState } from './helperState';
 
 /** The part of BootstrapDocker that the helper image uses. */
 export type HelperImageDocker = Pick<BootstrapDocker, 'imageExists' | 'imageId' | 'buildImage' | 'listImagesByLabel' | 'removeImage'>;
@@ -36,12 +39,11 @@ export interface HelperImagesDeps {
   dockerfilePath: string;
   clock?: Clock;
   /**
-   * `helper.json` in the global storage folder (StoragePaths.helperState). With it, ensureImage also checks the base
-   * image weekly (in the background), rebuilds the image when a check asked for it, and removes old helper images daily
-   * (ensureHelperImage; ensureImage has no caller in this version, and the decision of 2026-10-09,
-   * docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the worker for an
-   * open and in the background prebuild, with a follow-up PR); the other calls (ensureImagePresent, prebuildImage) only
-   * build a missing tag and record the use. Without it, the image is only built when its tag is missing.
+   * `helper.json` in the global storage folder (StoragePaths.helperState). With it, the maintaining ensure
+   * (ensureImageUse, prebuildImage; PR H: the preparation of the worker for an operation `open` and the background
+   * prebuild) also checks the base image weekly (in the background), rebuilds the image when a check asked for it, and
+   * removes old helper images daily (ensureHelperImage); the other calls (ensureImagePresent) only build a missing tag
+   * and record the use. Without it, the image is only built when its tag is missing.
    */
   statePath?: string;
   /** Current digest of the base image of the helper (registryBaseDigest). Without it, the base image is not checked. */
@@ -95,16 +97,29 @@ export interface EnsureImageOptions {
 }
 
 /**
+ * PR H (decision of 2026-10-09): the helper image maintenance of the preparation of the worker for an operation `open`
+ * (HelperChannelsOptions.prepare): that preparation runs the maintaining ensure (ensureImageUse) instead of
+ * ensureImagePresent. Only the open passes it; every other operation, a heartbeat and a repair keep ensureImagePresent.
+ */
+export interface HelperMaintenance {
+  /** The setting updateImagesOnConnect of the open: the check of the base image and the rebuild that a check asks for. */
+  checkBaseImage: boolean;
+  /** The progress of the open: the preparation starts or joins a build of the helper image (`create` or `refresh`). */
+  onBuild?: (kind: HelperBuildKind) => void;
+  /** The progress of the open: the preparation that called onBuild ended (its build succeeded or failed). */
+  onBuildEnd?: () => void;
+}
+
+/**
  * The result of ensureHelperImage that HelperImages caches, and the helper image of an open (see HelperImageUse in
  * helperImage.ts). Review round 3 of PR #64 (P2): the runs of an open use its `id`, for the current tag too.
  */
 export type { HelperImageUse };
 
 /**
- * ensureImage reuses its result for this long. After that, it runs ensureHelperImage again, so that a window that stays
- * open for days would still check the base image and clean up when that is due (ensureImage has no caller in this
- * version; the decision of 2026-10-09, docs/plan-remote-worker.md section 2, restores the maintenance in the
- * extension's preparation of the worker for an open and in the background prebuild, with a follow-up PR).
+ * The maintaining ensure (ensureImageUse, prebuildImage) reuses its result for this long. After that, it runs
+ * ensureHelperImage again, so that a window that stays open for days still checks the base image and cleans up when that
+ * is due (PR H: at the next preparation of a worker for an open in that window).
  */
 export const HELPER_IMAGE_RECHECK_MS = 60 * 60 * 1000;
 
@@ -175,9 +190,9 @@ export class HelperImages {
    * ensureHelperImage, shared by concurrent callers (cached promise; retried after a failure). With `statePath`, it
    * also does the maintenance that is due (implementation notes 7): a rebuild that a check asked for, the check of the
    * base image (in the background), the cleanup of old helper images. The open pipeline called it (as ensureImageUse)
-   * before the helper runs, until the open moved into the worker; in this version it has no caller (the decision of
-   * 2026-10-09, docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the
-   * worker for an open and in the background prebuild, with a follow-up PR). A result older than
+   * before the helper runs, until the open moved into the worker; PR H (decision of 2026-10-09,
+   * docs/plan-remote-worker.md section 2): the preparation of the worker for an operation `open` calls it (as
+   * ensureImageUse, HelperMaintenance), and the background prebuild (as prebuildImage). A result older than
    * HELPER_IMAGE_RECHECK_MS, or one of a call without the maintenance, is not reused. A failed build throws
    * UserFacingError('helperFailed', Messages.helperFailed, detail); AbortError and other UserFacingErrors pass through.
    * Returns the tag.
@@ -191,9 +206,8 @@ export class HelperImages {
    * round 3 of PR #64 (P1): the open pipeline pinned this return value as the helper image of the open and passed it as
    * `image` to every helper run of the open, because the cache of this instance is shared by all opens of the window
    * and may be replaced meanwhile (another engine). Since the open moved into the worker, it pins the worker's own
-   * image; this method has no caller in this version (the decision of 2026-10-09, docs/plan-remote-worker.md section 2,
-   * restores the maintenance in the extension's preparation of the worker for an open and in the background prebuild,
-   * with a follow-up PR).
+   * image. PR H (decision of 2026-10-09): the preparation of the worker for an operation `open` calls it
+   * (heartbeatHelperImage, with HelperMaintenance), before the worker of the open starts.
    */
   async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
     return this.image(options, true);
@@ -205,14 +219,12 @@ export class HelperImages {
    * operation, local or remote alike. It only builds a missing tag: no check of the base image, no rebuild of an
    * existing tag, no cleanup, so nothing long runs before the lock. A cached result whose image is gone (a prune, or
    * another window moved the tag) is not trusted: the cache is reset and the tag ensured again. PR #74 review round 2,
-   * A-R2-1: it does not join a pending maintaining ensure (a `--pull --no-cache` rebuild, the cleanup; that of an open
-   * until the open moved into the worker, none in this version, and the decision of 2026-10-09,
-   * docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the worker for an
-   * open and in the background prebuild, with a follow-up PR), which the caller could not cancel: when the tag exists,
-   * its image is used at once (the worker is pinned to its ID; a rebuild that moves the tag later cannot remove an
-   * image that a container uses). Only a missing tag, or a tag that cannot be checked, joins it, like before. Throws
-   * like ensureImage. Review round 4 of PR #85 (A-R4-1): `onBuild` is called when the call starts or joins a build (a
-   * failure before it, such as an engine that does not answer, is no failed build).
+   * A-R2-1: it does not join a pending maintaining ensure (a `--pull --no-cache` rebuild, the cleanup; PR H: that of the
+   * preparation of the worker for an open, or of the background prebuild), which the caller could not cancel: when the
+   * tag exists, its image is used at once (the worker started from it keeps it; a rebuild that moves the tag later
+   * cannot remove an image that a container uses). Only a missing tag, or a tag that cannot be checked, joins it, like
+   * before. Throws like ensureImage. Review round 4 of PR #85 (A-R4-1): `onBuild` is called when the call starts or
+   * joins a build (a failure before it, such as an engine that does not answer, is no failed build).
    */
   async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
     const engine = await this.currentEngine();
@@ -287,28 +299,46 @@ export class HelperImages {
 
   /**
    * The background prebuild (user decision 2026-09-29: no previous helper image; HelperPrebuild): makes sure that the
-   * helper tag exists on the engine of the operation, and builds it when it is missing, without the maintenance of
-   * ensureImage (like ensureImagePresent). It shares the cached promise of this instance with ensureImagePresent, the
-   * preparation of a worker, so a preparation that starts meanwhile waits for this build instead of building a second
-   * time; when `signal` aborts, the build is cancelled, and a preparation that waited for it builds again for itself.
-   * Plan step 6, PR D: on every engine, local or remote (it no longer returns `undefined` for a remote one). Throws
-   * like ensureImage.
+   * helper tag exists on the engine of the operation, and builds it when it is missing. PR H (decision of 2026-10-09):
+   * with the maintenance of ensureImageUse (`checkBaseImage`: the setting updateImagesOnConnect): the rebuild that a
+   * check asked for (so the next open does not wait for it), the weekly check of the base image, the daily cleanup,
+   * when they are due. It shares the cached promise of this instance with the preparation of a worker
+   * (ensureImagePresent; ensureImageUse before an open), so a preparation that needs the missing tag meanwhile waits for
+   * this build instead of building a second time (one before an open also for the rebuild, with its progress); when
+   * `signal` aborts, the build is cancelled, and a preparation that waited for it builds again for itself. Plan step 6,
+   * PR D: on every engine, local or remote (it no longer returns `undefined` for a remote one). Throws like ensureImage.
    */
-  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void }): Promise<HelperImageUse> {
-    return this.image({ signal: options.signal, onBuild: options.onBuild }, false);
+  async prebuildImage(options: { signal: AbortSignal; onBuild?: (kind: HelperBuildKind) => void; checkBaseImage?: boolean }): Promise<HelperImageUse> {
+    return this.image({ signal: options.signal, onBuild: options.onBuild, checkBaseImage: options.checkBaseImage }, true);
   }
 
+  /**
+   * PR H (decision of 2026-10-09): whether the refresh of the current tag is due on the engine of the operation, by its
+   * state file alone (helperRefreshDue: no Docker call): with `checkBaseImage` (the setting updateImagesOnConnect), the
+   * rebuild that a check asked for, or the weekly check of the base image (with a lookup of its digest). Never for the
+   * daily cleanup alone. `false` without a state file. The background prebuild asks Docker only then, or when the state
+   * file has no record of the current tag.
+   */
+  async refreshDue(options: { checkBaseImage: boolean }): Promise<boolean> {
+    const statePath = this.statePathFor(await this.currentEngine());
+    if (statePath === undefined) return false;
+    const content = await fs.promises.readFile(this.deps.dockerfilePath, 'utf8');
+    return helperRefreshDue(await readHelperState(statePath), content, {
+      now: this.clock.now(),
+      checkBaseImage: options.checkBaseImage,
+      baseDigest: this.deps.baseDigest !== undefined,
+    });
+  }
 
   /**
-   * The helper image (HelperImageUse). `recheck` (ensureImage, which has no caller in this version, and the decision of
-   * 2026-10-09, docs/plan-remote-worker.md section 2, restores the maintenance in the extension's preparation of the
-   * worker for an open and in the background prebuild, with a follow-up PR): ensureHelperImage with the maintenance; a
-   * result older than HELPER_IMAGE_RECHECK_MS, or one without the maintenance, is not reused. The other calls
-   * (`recheck` false: ensureImagePresent, prebuildImage) reuse any result and only record the use (at most once per
-   * hour); without a result (a new window), they run ensureHelperImage without the maintenance, which only builds a
-   * missing tag. So no check of the base image, no rebuild, and no cleanup delays an operation. Review round 2 of PR
-   * #64 (A-N1): until the open moved into the worker, a run with the helper image of an open (`image`) did not use this
-   * cache; the open recorded the use when it resolved the image (ensureImage).
+   * The helper image (HelperImageUse). `recheck` (the maintaining ensure: ensureImageUse, prebuildImage; PR H, decision
+   * of 2026-10-09: the preparation of the worker for an operation `open`, and the background prebuild):
+   * ensureHelperImage with the maintenance; a result older than HELPER_IMAGE_RECHECK_MS, or one without the maintenance,
+   * is not reused. The other calls (`recheck` false: ensureImagePresent, runImage) reuse any result and only record the
+   * use (at most once per hour); without a result (a new window), they run ensureHelperImage without the maintenance,
+   * which only builds a missing tag. So no check of the base image, no rebuild, and no cleanup delays another operation
+   * or a heartbeat. Review round 2 of PR #64 (A-N1): until the open moved into the worker, a run with the helper image
+   * of an open (`image`) did not use this cache; the open recorded the use when it resolved the image (ensureImage).
    */
   private async image(options: EnsureImageOptions, recheck: boolean): Promise<HelperImageUse> {
     const engine = await this.currentEngine();

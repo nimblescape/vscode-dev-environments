@@ -13,6 +13,7 @@
 import * as crypto from 'crypto';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
+import type { HelperMaintenance } from '../helper/helperImages';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN } from '../names';
 import { errorMessage, isUserFacingError } from '../errors';
@@ -228,9 +229,12 @@ export interface HelperChannelsOptions {
   /**
    * Plan step 5, PR D (rule D1 of 2026-09-30): makes the state that a worker of `target` needs consistent before it is
    * opened for a call (a flow, the refresh): the helper image, built when its tag is missing (HelperImages.ensureImagePresent).
-   * Rejects when it cannot; the call is then refused. An AbortError when `signal` aborts.
+   * PR H (decision of 2026-10-09): `maintenance` when the call is an operation `open` (its flow option
+   * `helperMaintenance`): the maintaining ensure instead (HelperImages.ensureImageUse: the rebuild that a check asked
+   * for, the weekly check of the base image, the daily cleanup), before the worker of the open starts. Rejects when it
+   * cannot; the call is then refused. An AbortError when `signal` aborts.
    */
-  prepare?(target: DockerTarget, signal: AbortSignal | undefined): Promise<void>;
+  prepare?(target: DockerTarget, signal: AbortSignal | undefined, maintenance?: HelperMaintenance): Promise<void>;
   /**
    * PR #76 review round 1 (A-R1-1, A-R1-2): what the refresh of the sidebar, which no user starts, checks instead of
    * `prepare`: that the helper image is present (HelperImages.checkImagePresent), never a build, so a refresh neither
@@ -350,9 +354,11 @@ export class HelperChannels {
    * none is open, first `prepare` (the helper image; `checkPresent` when `passive`, for the refresh), then the open in
    * full (openInFull; when `passive`, the open that keeps the wait after a failed open, PR #76 review round 2, A-R2-1).
    * Throws
-   * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts.
+   * HelperChannelError('unavailable') with the cause when either fails, and an AbortError when `signal` aborts. PR H
+   * (decision of 2026-10-09): `maintenance` (the flow of an operation `open`) goes to `prepare`; a worker that is open
+   * already is used as it is, without a preparation.
    */
-  private async ready(target: DockerTarget, signal: AbortSignal | undefined, passive = false): Promise<HelperChannel> {
+  private async ready(target: DockerTarget, signal: AbortSignal | undefined, passive = false, maintenance?: HelperMaintenance): Promise<HelperChannel> {
     if (signal?.aborted) throw abortError();
     const open = this.entries.get(keyOf(target))?.channel;
     if (open?.isOpen) return open;
@@ -361,7 +367,10 @@ export class HelperChannels {
     const prepare = passive ? this.options.checkPresent : this.options.prepare;
     if (prepare !== undefined) {
       try {
-        await prepare(target, signal);
+        // PR H (decision of 2026-10-09): the maintenance of the flow of an operation `open` goes to `prepare`; the
+        // check of a passive read (checkPresent) never gets one.
+        if (!passive && maintenance !== undefined) await this.options.prepare?.(target, signal, maintenance);
+        else await prepare(target, signal);
       } catch (error) {
         if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError();
         const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);
@@ -408,17 +417,30 @@ export class HelperChannels {
    * ('unavailable') when that fails), and sent once more through a channel made ready again when it was not sent because
    * the channel closed before (`closed`: it did not run); never the way without the worker. Plan step 11C1, review round 1 (A-R1-1): with `passive` (a read in the
    * background, as the refresh), the worker is made ready as for the refresh: the helper image is only checked, never
-   * built, and the wait after a failed open is kept (ready).
+   * built, and the wait after a failed open is kept (ready). PR H (decision of 2026-10-09): `helperMaintenance` (only
+   * the operation `open` passes it) makes the preparation of a worker that is not open yet the maintaining ensure (ready);
+   * it is not sent to the worker.
    */
-  async flow(target: DockerTarget, op: string, params: unknown, options: Parameters<HelperChannel['flow']>[2] & { passive?: boolean } = {}): Promise<unknown> {
-    const { passive, ...flowOptions } = options;
-    return this.withChannel(target, options.signal, (channel) => channel.flow(op, params, flowOptions), passive === true);
+  async flow(
+    target: DockerTarget,
+    op: string,
+    params: unknown,
+    options: Parameters<HelperChannel['flow']>[2] & { passive?: boolean; helperMaintenance?: HelperMaintenance } = {},
+  ): Promise<unknown> {
+    const { passive, helperMaintenance, ...flowOptions } = options;
+    return this.withChannel(target, options.signal, (channel) => channel.flow(op, params, flowOptions), passive === true, helperMaintenance);
   }
 
   /** Plan step 10A: `call` with the channel of `target` (ready), once more through a new channel when it was `closed`. */
-  private async withChannel<T>(target: DockerTarget, signal: AbortSignal | undefined, call: (channel: HelperChannel) => Promise<T>, passive = false): Promise<T> {
+  private async withChannel<T>(
+    target: DockerTarget,
+    signal: AbortSignal | undefined,
+    call: (channel: HelperChannel) => Promise<T>,
+    passive = false,
+    maintenance?: HelperMaintenance,
+  ): Promise<T> {
     for (let attempt = 0; ; attempt++) {
-      const channel = await this.ready(target, signal, passive);
+      const channel = await this.ready(target, signal, passive, maintenance);
       try {
         return await call(channel);
       } catch (error) {

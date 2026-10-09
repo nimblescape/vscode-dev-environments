@@ -23,6 +23,14 @@ const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh
 const OTHER: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: 'devenv-remote-22222222' };
 const IMAGE: HelperImageUse = { tag: 'devenv-helper:0123456789ab', id: 'sha256:1111' };
 
+/**
+ * PR H (decision of 2026-10-09): the maintaining ensure, which only the preparation for an operation `open` calls; the
+ * preparations of the heartbeats and repairs of these tests must never call it.
+ */
+const unexpectedEnsureImageUse = async (): Promise<HelperImageUse> => {
+  throw new Error('ensureImageUse is only for the preparation of an open');
+};
+
 /** The wiring with a helper whose tag is missing and whose builds fail (or succeed), with the targets of its builds. */
 function setup() {
   const now = { value: T0 };
@@ -44,6 +52,7 @@ function setup() {
         if (state.buildFails) throw new Error('docker build failed: no space left on device');
         return IMAGE;
       },
+      ensureImageUse: unexpectedEnsureImageUse,
       presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
     },
     inTarget: async (target, fn) => {
@@ -177,7 +186,9 @@ describe('heartbeatWiring (review round 5 of PR #85, B-R5-1)', () => {
     expect(source).toContain('subscriptions: closingWork.deferredSubscriptions(context.subscriptions),');
     expect(source).toContain('operationTarget: operationDockerTarget,');
     expect(source).toContain('heartbeats.imageBuilt();');
-    expect(source).toContain('await heartbeats.prepareWorker(target, signal);');
+    // PR H (decision of 2026-10-09): changed expectation, the preparation passes the helper image maintenance of an
+    // operation `open` on to the wiring (before: `prepareWorker(target, signal)`).
+    expect(source).toContain('await heartbeats.prepareWorker(target, signal, maintenance);');
     expect(source).toContain('const repairSessionMonitor = heartbeats.repair(');
     expect(source).toContain('repair: repairSessionMonitor,');
     expect(source).not.toContain('new HeartbeatPreparation(');
@@ -213,6 +224,7 @@ describe('heartbeatWiring: waits, target and failures (review round 6 of PR #85)
           builds.push({ target: operation.getStore(), signal: options.signal, done });
           return done.promise;
         },
+        ensureImageUse: unexpectedEnsureImageUse,
         presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
       },
       inTarget: (target, fn) => operation.run(target, fn),

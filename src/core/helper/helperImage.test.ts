@@ -720,7 +720,9 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
     const { h, oldId } = await changed();
     // The check itself builds nothing: the ensure that started it did not wait for it.
     expect(h.docker.builds).toHaveLength(0);
-    expect(h.logger.lines.join('\n')).toContain(`has changed. The image ${h.tag} is built again at the next open.`);
+    // PR H (decision of 2026-10-09): changed expectation, the rebuild runs at the next maintaining ensure: the background
+    // prebuild when a window starts, or the preparation of a new worker for an open (before: "at the next open").
+    expect(h.logger.lines.join('\n')).toContain(`has changed. The image ${h.tag} is built again when a window starts or a worker is set up for an open.`);
     expect(h.state().images[h.tag]).toMatchObject({ baseDigest: DIGEST_A, latestBaseDigest: DIGEST_B, checkedAt: h.iso() });
 
     const output: string[] = [];

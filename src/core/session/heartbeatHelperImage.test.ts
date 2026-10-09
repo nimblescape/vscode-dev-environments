@@ -17,6 +17,14 @@ const LOCAL: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///var/ru
 const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devenv-remote-11111111' };
 const IMAGE: HelperImageUse = { tag: 'devenv-helper:0123456789ab', id: 'sha256:1111' };
 
+/**
+ * PR H (decision of 2026-10-09): the maintaining ensure, which only the preparation for an operation `open` calls; the
+ * preparations of the heartbeats and repairs of these tests must never call it.
+ */
+const unexpectedEnsureImageUse = async (): Promise<HelperImageUse> => {
+  throw new Error('ensureImageUse is only for the preparation of an open');
+};
+
 /** A helper whose tag is missing and whose build fails (or succeeds), with the targets its calls ran on. */
 function setup() {
   const now = { value: T0 };
@@ -34,6 +42,7 @@ function setup() {
       state.present = true;
       return IMAGE;
     },
+    ensureImageUse: unexpectedEnsureImageUse,
     presentImage: async (): Promise<HelperImageUse | undefined> => {
       checks.push(current as DockerTarget);
       return state.present ? IMAGE : undefined;
@@ -137,6 +146,7 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
         cache = { target, image };
         return image;
       },
+      ensureImageUse: unexpectedEnsureImageUse,
       presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
     };
     const image = heartbeatHelperImage({ preparation, helper, inTarget: (target, fn) => ambient.run(target, fn), onOutput: () => {} });
@@ -171,6 +181,7 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
           got.push(options.signal);
           return new Promise<HelperImageUse>(() => {});
         },
+        ensureImageUse: unexpectedEnsureImageUse,
         presentImage: async (): Promise<HelperImageUse | undefined> => undefined,
       };
       const image = heartbeatHelperImage({ preparation, helper, inTarget: (_target, fn) => fn(), onOutput: () => {} });
@@ -199,6 +210,7 @@ describe('heartbeatHelperImage (review round 5 of PR #85)', () => {
           options.onBuild?.('create');
           throw new Error('docker build failed: no space left on device');
         },
+        ensureImageUse: unexpectedEnsureImageUse,
         presentImage: async (options: { signal?: AbortSignal }): Promise<HelperImageUse | undefined> => {
           checks.push({ target: ambient.getStore(), signal: options.signal });
           return IMAGE;

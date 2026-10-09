@@ -715,6 +715,8 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
       dockerRunning: async () => true,
       dockerfilePath: path.join(dir, 'Dockerfile'),
       statePath: statePath(),
+      // PR H (decision of 2026-10-09): the setting updateImagesOnConnect (its default, on).
+      checkBaseImage: () => true,
       logger,
       ...overrides,
     });
@@ -1082,6 +1084,8 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
         if (options.signal.aborted) throw abortError();
         return { tag: TAG, id: fakeImageId(TAG) };
       }),
+      // PR H (decision of 2026-10-09): the refresh due by the state file (asked only when the tag has a record).
+      refreshDue: vi.fn(async () => false),
     };
     const running = vi.fn(async () => true);
     const task = prebuild(stateHelper(), { helper, dockerRunning: running });
@@ -1104,6 +1108,8 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
             options.signal.addEventListener('abort', () => reject(new UserFacingError('helperFailed', 'The workspace helper could not be prepared.', 'exit code 143')), { once: true });
           }),
       ),
+      // PR H (decision of 2026-10-09): the refresh due by the state file (asked only when the tag has a record).
+      refreshDue: vi.fn(async () => false),
     };
     const task = prebuild(stateHelper(), { helper });
     const outcome = task.start();
@@ -1123,6 +1129,8 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
         throw new Error('the Docker context cannot be read');
       },
       prebuildImage: async () => ({ tag: TAG, id: fakeImageId(TAG) }),
+      // PR H (decision of 2026-10-09): the refresh due by the state file (asked only when the tag has a record).
+      refreshDue: async () => false,
     };
     task = prebuild(stateHelper(), { helper });
     expect(await task.start()).toBe('cancelled');
@@ -1159,7 +1167,8 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
     it('asks Docker nothing for a live record of the current tag', async () => {
       fs.mkdirSync(path.dirname(statePath()), { recursive: true });
       fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: { builtAt: '2026-09-20T12:00:00.000Z' } } }));
-      const helper = { engineKey: vi.fn(async () => ''), prebuildImage: vi.fn(async () => ({ tag: TAG, id: fakeImageId(TAG) })) };
+      // PR H (decision of 2026-10-09): with the refresh that the state file says is due (none here).
+      const helper = { engineKey: vi.fn(async () => ''), prebuildImage: vi.fn(async () => ({ tag: TAG, id: fakeImageId(TAG) })), refreshDue: vi.fn(async () => false) };
       const running = vi.fn(async () => true);
       expect(await prebuild(stateHelper(), { helper, dockerRunning: running }).start()).toBe('notDue');
       // Changed expectation (Plan step 6, PR D): the engine key is read now (it picks the state file of the engine; in
@@ -1171,8 +1180,12 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
     });
   });
 
-  // Review round 5 of PR #64, R5-3 (a): the prebuild does no maintenance.
-  it('does no maintenance: no rebuild that a check asked for, no check of the base image, no cleanup', async () => {
+  // Review round 5 of PR #64, R5-3 (a): the prebuild did no maintenance. PR H (decision of 2026-10-09): changed
+  // expectation (and name; it was "does no maintenance: no rebuild that a check asked for, no check of the base image, no
+  // cleanup"), prebuildImage is the maintaining ensure: when it runs, it runs the maintenance that is due, the rebuild
+  // that a check asked for only with the setting updateImagesOnConnect on, the cleanup also with it off (what makes
+  // HelperPrebuild run is helperImages.11IH.test.ts).
+  it('prebuildImage runs the maintenance that is due: the rebuild that a check asked for only with the setting on, the cleanup also with it off', async () => {
     docker.images.add(TAG);
     fs.mkdirSync(path.dirname(statePath()), { recursive: true });
     const old = '2026-09-01T12:00:00.000Z';
@@ -1184,11 +1197,18 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild, us
       checkedAt: old,
       lastUsedAt: old,
     };
-    fs.writeFileSync(statePath(), JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old }));
-    const helper = stateHelper();
-    expect(await helper.prebuildImage({ signal: new AbortController().signal })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    const state = JSON.stringify({ version: 1, images: { [TAG]: record }, lastCleanupAt: old });
+    fs.writeFileSync(statePath(), state);
+    // The setting off: no rebuild, but the cleanup.
+    expect(await stateHelper().prebuildImage({ signal: new AbortController().signal, checkBaseImage: false })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
     expect(docker.builds).toEqual([]);
-    expect(docker.listCalls).toBe(0);
+    expect(docker.listCalls).toBe(1);
+    // The setting on (another window, the same state): the rebuild with --pull --no-cache, and the cleanup.
+    fs.writeFileSync(statePath(), state);
+    expect(await stateHelper().prebuildImage({ signal: new AbortController().signal, checkBaseImage: true })).toEqual({ tag: TAG, id: fakeImageId(TAG) });
+    expect(docker.builds).toHaveLength(1);
+    expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true, noCache: true });
+    expect(docker.listCalls).toBe(2);
     expect(docker.removals).toEqual([]);
   });
 

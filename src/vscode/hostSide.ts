@@ -20,6 +20,7 @@ import type { HelperChannels } from '../core/helperChannel/helperChannels';
 import type { DockerTarget } from '../core/docker/dockerHost';
 import { errorMessage } from '../core/errors';
 import type { GitHubViewer } from '../core/helper/containerGit';
+import type { HelperMaintenance } from '../core/helper/helperImages';
 import type { LifecycleMemory } from '../core/pipeline/lifecycleMemory';
 
 export interface HostSideDeps {
@@ -225,6 +226,8 @@ export function extensionFlow(
     // Plan step 11D1: the engine of the flow when it is not the current one (the heartbeats and the release of a window
     // go to the engine that the window uses the environment on).
     target?: DockerTarget;
+    // PR H (decision of 2026-10-09): the helper image maintenance of the preparation of the worker of an operation `open`.
+    helperMaintenance?: HelperMaintenance;
   },
 ) => Promise<unknown> {
   return async (op, params, options) =>
@@ -234,6 +237,8 @@ export function extensionFlow(
       // Plan step 11C1, review round 1 (A-R1-1): a read in the background never builds the helper image.
       ...(options.passive === true ? { passive: true } : {}),
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+      // PR H (decision of 2026-10-09): only the open passes it; the worker of the open is prepared with it (HelperChannels).
+      ...(options.helperMaintenance ? { helperMaintenance: options.helperMaintenance } : {}),
       // Review round 1 of 11C2b (A-R1-M1, A-R1-M2): the repository that the questions name, and the observer of the answers.
       onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
         environmentId: environmentOf(params),
