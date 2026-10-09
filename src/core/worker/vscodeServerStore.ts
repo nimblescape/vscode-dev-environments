@@ -418,6 +418,14 @@ async function serverDownload(transport: HttpTransport, server: VscodeServerRef,
   return { url, sha256: sha256hash.toLowerCase() };
 }
 
+function urlAllowed(text: string, allowedUrl: (url: URL) => boolean): boolean {
+  try {
+    return allowedUrl(new URL(text));
+  } catch {
+    return false;
+  }
+}
+
 function isHttpsUrl(text: string): boolean {
   try {
     return new URL(text).protocol === 'https:';
@@ -430,10 +438,23 @@ function isHttpsUrl(text: string): boolean {
  * Plan step 11H1: downloads `url` to the new file `file` (0600; an existing one is refused), streamed: at most
  * `maxBytes` (also by its Content-Length), MAX_SERVER_REDIRECTS redirects each to an `https:` URL, status 200 at the
  * end. Resolves with the SHA-256 of the content (lower-case hexadecimal). The caller removes the file on a failure.
+ * Review round 1 of 11H3 (A-L6): `allowedUrl`, when given, must accept the first URL and every redirect (the download of
+ * a `.vsix` only from the hosts of the Marketplace); 11H1's server download gives none. Review round 2 of 11H3 (A-L1):
+ * `onBytes`, when given, is told the length of every chunk of the body as it arrives (also of a download that fails
+ * afterwards), so that the monitor's bound of a run counts every transferred byte.
  */
-export async function downloadToFile(transport: HttpStreamTransport, url: string, file: string, maxBytes: number, signal: AbortSignal): Promise<string> {
+export async function downloadToFile(
+  transport: HttpStreamTransport,
+  url: string,
+  file: string,
+  maxBytes: number,
+  signal: AbortSignal,
+  allowedUrl?: (url: URL) => boolean,
+  onBytes?: (bytes: number) => void,
+): Promise<string> {
   let current = url;
   for (let redirects = 0; ; redirects++) {
+    if (allowedUrl !== undefined && !urlAllowed(current, allowedUrl)) throw new FetchError('the download URL is not on an allowed host');
     const response = await transport.stream(current, signal);
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       response.body.destroy();
@@ -463,6 +484,7 @@ export async function downloadToFile(transport: HttpStreamTransport, url: string
     const counter = new Transform({
       transform(chunk: Buffer, _encoding, done) {
         size += chunk.length;
+        onBytes?.(chunk.length);
         if (size > maxBytes) {
           done(new FetchError(`the download is larger than ${maxBytes} bytes`));
           return;
@@ -507,7 +529,8 @@ export function serverLockFile(root: string, name: string): string {
  * Plan step 11H1: the lock of one server version in the store (serverLockFile), taken as the environment lock is taken
  * (lockFile.ts: the lock file opened without following a link, `flock` on its descriptor with a bounded wait), so it holds
  * across the workers of all windows and the Session Monitor of the engine; resolves with its release. Rejects when the
- * lock stayed held for the whole wait, when `flock` fails, or when `signal` aborts (flock is ended then).
+ * lock stayed held for the whole wait, when `flock` fails, or when `signal` aborts (flock is ended then). Plan step 11H3:
+ * `lockFile` names the lock file of another entry of the store (the lock of one extension file, extensionLockFile).
  */
 export async function storeLock(
   root: string,
@@ -515,11 +538,12 @@ export async function storeLock(
   waitSeconds: number,
   signal: AbortSignal,
   startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
+  lockFile: string = serverLockFile(root, name),
 ): Promise<() => void> {
   const folder = path.posix.join(root, STORE_LOCK_FOLDER);
   fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
   if (!fs.lstatSync(folder).isDirectory()) throw new FetchError(`${folder} is not a folder`);
-  const fd = openPlainLockFile(serverLockFile(root, name), 'The lock file of the shared VS Code server store');
+  const fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
   const release = () => {
     try {
       fs.closeSync(fd);
@@ -557,19 +581,20 @@ export type StoreLockAttempt = { kind: 'locked'; release(): void } | { kind: 'bu
  * Plan step 11H2 (the plan's 11H2 row: `flock -n`): the lock of one server version in the store (serverLockFile), taken
  * without a wait, for the cleanup of the Session Monitor: `busy` while a download of that version (an open, another
  * window, the monitor) holds it, so the cleanup never touches a version that is being fetched. Never rejects; the lock
- * file stays (lock files are never removed).
+ * file stays (lock files are never removed). Plan step 11H3: `lockFile` as for storeLock.
  */
 export async function storeTryLock(
   root: string,
   name: string,
   startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
+  lockFile: string = serverLockFile(root, name),
 ): Promise<StoreLockAttempt> {
   let fd: number;
   try {
     const folder = path.posix.join(root, STORE_LOCK_FOLDER);
     fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
     if (!fs.lstatSync(folder).isDirectory()) return { kind: 'failed', detail: `${folder} is not a folder` };
-    fd = openPlainLockFile(serverLockFile(root, name), 'The lock file of the shared VS Code server store');
+    fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
   } catch (error) {
     return { kind: 'failed', detail: `the lock file could not be opened: ${error instanceof Error ? error.message : String(error)}` };
   }

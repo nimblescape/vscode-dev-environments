@@ -207,6 +207,12 @@ describe('the VS Code part of the container (plan step 11H2)', () => {
     expect(deps?.store.root).toBe('/vscode');
     expect(deps?.store.background).toBe(true);
   });
+
+  it('the extension lists in the volume of the run: /state, or the state folder that `run` is given (review round 2 of 11H3, A-L4)', () => {
+    const engine = unusedEngine();
+    expect(vscodeBackgroundDeps({ DEVENV_VSCODE_STORE: 'devenv-vscode' }, engine, () => {})?.extensionStateDir).toBe('/state');
+    expect(vscodeBackgroundDeps({ DEVENV_VSCODE_STORE: 'devenv-vscode' }, engine, () => {}, '/tmp/devenv-state')?.extensionStateDir).toBe('/tmp/devenv-state');
+  });
 });
 
 // Review round 1 of 11H2 (reviewer A, A-L8): the idle exit of a monitor that ends when idle waits for a background run
@@ -223,6 +229,9 @@ describe('the idle exit during a background run (review round 1 of 11H2, A-L8)',
     const vscode = {
       store: { root: store },
       storeVolume: 'devenv-vscode',
+      // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is the temporary
+      // state folder of the test, as main gives its own to vscodeBackgroundDeps; never the real /state.
+      extensionStateDir: stateDir,
       engine: {
         ...unusedEngine(),
         architecture: async () => {
@@ -277,6 +286,9 @@ describe('the idle exit during a background run (review round 1 of 11H2, A-L8)',
     const vscode = {
       store: { root: store },
       storeVolume: 'devenv-vscode',
+      // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is the temporary
+      // state folder of the test, as main gives its own to vscodeBackgroundDeps; never the real /state.
+      extensionStateDir: stateDir,
       engine: {
         ...unusedEngine(),
         architecture: async () => {

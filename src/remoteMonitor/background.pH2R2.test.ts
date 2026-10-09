@@ -49,6 +49,8 @@ function harness(options: {
 }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-ph2r2-'));
   temps.push(root);
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devenv-background-ph2r2-state-'));
+  temps.push(stateDir);
   const log: string[] = [];
   const requests: HttpRequest[] = [];
   const locks: string[] = [];
@@ -78,6 +80,9 @@ function harness(options: {
   const vscode: VscodeBackgroundDeps = {
     store,
     storeVolume: 'devenv-vscode',
+    // Integration of 11H3 with the final 11H2 (#135): the monitor's volume of the run (the extension lists of 11H3) is a temporary folder,
+    // never the real /state (as background.test.ts since review round 2 of 11H3, A-L4).
+    extensionStateDir: stateDir,
     engine: {
       ...unusedEngine(),
       architecture: async () => 'x86_64',

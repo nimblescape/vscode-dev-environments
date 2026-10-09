@@ -249,6 +249,8 @@ describe('the Docker of the pipeline over the Engine API (plan step 11B3)', () =
       }
       cli.ok(['pause', names.paused]);
       cli.ok(['stop', '-t', '0', names.stopped]);
+      // CI of #136: the stopped container was once still listed as running right after `docker stop`; wait for its exit.
+      cli.ok(['wait', names.stopped]);
       const listed = await engine.containerIds({ volume: [volume], status: ['running', 'paused'] }, AbortSignal.timeout(60_000));
       expect([...listed].sort()).toEqual([ids.running, ids.paused].sort());
       for (const key of ['running', 'paused'] as const) {

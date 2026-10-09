@@ -34,6 +34,7 @@ import { LABEL_SESSION_MONITOR, isSourceId, parseHeartbeatInput, parseImageListI
 import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
+import { parseExtensionList } from '../vscodeExtensions';
 
 export { LABEL_HELPER_CHANNEL };
 
@@ -1464,6 +1465,13 @@ export interface OpenParams {
    * the open runs without the shared server.
    */
   vscodeServer?: VscodeServerRef;
+  /**
+   * Plan step 11H3 (decision of 2026-10-09; live check 3): the user's `dev.containers.defaultExtensions` (read by the
+   * extension, defaultExtensionsOf: the valid entries `publisher.name` or `publisher.name@x.y.z`, the ID in lower case,
+   * each ID once, at most MAX_LISTED_EXTENSIONS), only with `vscodeServer` (the official VS Code). The worker records them
+   * with the configuration's extensions for the Session Monitor's downloads and seeds the cached `.vsix` files.
+   */
+  defaultExtensions?: string[];
 }
 
 /** Plan step 11H1: the qualities of VS Code whose server the store holds (`quality` of `product.json`). */
@@ -1554,7 +1562,7 @@ function parseOpenSettings(value: unknown): OpenSettings | undefined {
 export function parseOpenParams(value: unknown): OpenParams | undefined {
   if (
     !isRecord(value) ||
-    !hasOnlyKeys(value, ['dockerHost', 'owner', 'monitorSource', 'settings', 'images', 'repository'], ['repositories', 'environmentId', 'target', 'forceRebuild', 'configPath', 'vscodeServer'])
+    !hasOnlyKeys(value, ['dockerHost', 'owner', 'monitorSource', 'settings', 'images', 'repository'], ['repositories', 'environmentId', 'target', 'forceRebuild', 'configPath', 'vscodeServer', 'defaultExtensions'])
   ) {
     return undefined;
   }
@@ -1592,6 +1600,12 @@ export function parseOpenParams(value: unknown): OpenParams | undefined {
     vscodeServer = parseVscodeServerRef(value.vscodeServer);
     if (vscodeServer === undefined) return undefined;
   }
+  // Plan step 11H3: the defaults, strictly (parseExtensionList), and only with a VS Code server.
+  let defaultExtensions: string[] | undefined;
+  if (value.defaultExtensions !== undefined) {
+    if (vscodeServer === undefined || parseExtensionList(value.defaultExtensions) === undefined) return undefined;
+    defaultExtensions = [...(value.defaultExtensions as string[])];
+  }
   return {
     ...operationTarget,
     monitorSource,
@@ -1604,6 +1618,7 @@ export function parseOpenParams(value: unknown): OpenParams | undefined {
     ...(forceRebuild === true ? { forceRebuild } : {}),
     ...(configPath !== undefined ? { configPath } : {}),
     ...(vscodeServer !== undefined ? { vscodeServer } : {}),
+    ...(defaultExtensions !== undefined ? { defaultExtensions } : {}),
   };
 }
 

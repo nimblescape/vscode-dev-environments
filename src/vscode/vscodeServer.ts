@@ -10,6 +10,7 @@
 // The URL itself is never sent: the worker has the host of the download fixed.
 import * as path from 'path';
 import { parseVscodeServerRef, type VscodeServerRef } from '../core/helperChannel/protocol';
+import { defaultExtensionsOf, extensionEntryText } from '../core/vscodeExtensions';
 
 /** Plan step 11H1: the update service of the builds of Microsoft, the only `updateUrl` whose server the worker fetches. */
 export const MICROSOFT_UPDATE_URL = 'https://update.code.visualstudio.com';
@@ -38,4 +39,18 @@ export function windowVscodeServer(appRoot: string, readFile: (file: string) => 
         return undefined;
       }
     })());
+}
+
+/**
+ * Plan step 11H3 (decision of 2026-10-09; live check 3): the user's `dev.containers.defaultExtensions` (the value of the
+ * setting of the Dev Containers extension) as the entries that an open carries (OpenParams.defaultExtensions): the valid
+ * ones (`publisher.name` or `publisher.name@x.y.z`), the ID in lower case, each ID once, at most MAX_LISTED_EXTENSIONS
+ * (defaultExtensionsOf); the others are left out, with one line through `onDropped`.
+ */
+export function defaultExtensionEntries(value: unknown, onDropped: (message: string) => void): string[] {
+  const { list, dropped } = defaultExtensionsOf(value);
+  if (dropped > 0) {
+    onDropped(`${dropped} value(s) of dev.containers.defaultExtensions are no extension ID (publisher.name, optionally @x.y.z), are named twice or are too many; the shared extension cache leaves them out.`);
+  }
+  return list.map(extensionEntryText);
 }

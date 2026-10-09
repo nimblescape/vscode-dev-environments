@@ -662,6 +662,8 @@ export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelpe
       monitorImages: monitor.monitorImages,
       // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): the server of the window's VS Code.
       ...(checked.vscodeServer !== undefined ? { vscodeServer: checked.vscodeServer } : {}),
+      // Plan step 11H3 (decision of 2026-10-09): the user's default extensions, for the shared extension cache.
+      ...(checked.defaultExtensions !== undefined ? { defaultExtensions: checked.defaultExtensions } : {}),
     });
     const sent = (): { imageListSent?: true } => (monitor.imageListSent() ? { imageListSent: true } : {});
     const options = {
