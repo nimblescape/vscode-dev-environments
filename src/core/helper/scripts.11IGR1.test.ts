@@ -397,7 +397,7 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT, revi
     expect(result.stderr).not.toContain('/proc/self/fd');
   });
 
-  it('removes its new file when the rename into place fails (kills G36)', () => {
+  it('removes its lock when the rename of the new gitconfig into place fails (kills L15, L23, L34; was G36)', () => {
     const env = setup();
     const dir = path.join(env.ws, '.devenv+');
     // Right before the rename, the owner puts a folder (not empty) at gitconfig: the rename fails.
@@ -406,7 +406,7 @@ describe.skipIf(!hasGit || process.platform !== 'linux')('GIT_FILES_SCRIPT, revi
     expect(fs.readdirSync(dir).sort()).toEqual(['docker', 'gh', 'gitconfig']);
   });
 
-  it('sets the owner and the mode of a new file before its rename, never through the entry afterwards (kills G39)', () => {
+  it('sets the owner and the mode of the new gitconfig in its lock before the rename, never through the entry afterwards (kills L06, L07, L23; was G39)', () => {
     const env = setup();
     const out = outside(env);
     const dir = path.join(env.ws, '.devenv+');
