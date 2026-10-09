@@ -23,6 +23,20 @@ export interface EngineContainer extends ContainerInfo {
   created?: string;
 }
 
+/**
+ * Plan step 11I (review round 1 of PR #126, F1): a container as the list of the engine gives it (`GET /containers/json`,
+ * what `docker ps` reads), without an inspect.
+ */
+export interface EngineContainerSummary {
+  /** Its full ID. */
+  id: string;
+  /** Its first name, without the leading `/`; empty when the list names none. */
+  name: string;
+  /** Its state as the list names it (`State`: `running`, `exited`, `paused`, …, as `{{.State}}` of `docker ps`); empty when it names none. */
+  state: string;
+  labels: Record<string, string>;
+}
+
 /** Plan step 11B3: the kinds of objects whose inspect JSON the port reads. */
 export type EngineObjectKind = 'container' | 'image' | 'volume' | 'network';
 
@@ -146,6 +160,14 @@ export interface DockerEngine {
   container(reference: string, signal?: AbortSignal): Promise<EngineContainer | undefined>;
   /** The containers with the label `label` (`<key>` or `<key>=<value>`), stopped ones included. */
   containers(label: string, signal?: AbortSignal): Promise<EngineContainer[]>;
+  /**
+   * Plan step 11I (review round 1 of PR #126, F1): the containers with the label `label` (`<key>` or `<key>=<value>`),
+   * stopped ones included, as the list of the engine gives them, with no inspect (`containers` inspects each one): an
+   * inspect takes the lock of the container, which a start holds until it ends, and fails for a container whose layer is
+   * broken, while the list, as `docker ps`, reads neither. An entry without an ID is left out. The Session Monitor's loop
+   * reads its containers only so.
+   */
+  containerSummaries(label: string, signal?: AbortSignal): Promise<EngineContainerSummary[]>;
   /** One process in a running container (the one primitive for the scripts of containerScripts.ts). */
   exec(container: string, command: readonly string[], options?: EngineExecOptions): Promise<EngineExecResult>;
   /**

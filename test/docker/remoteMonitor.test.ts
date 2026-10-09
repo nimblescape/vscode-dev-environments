@@ -9,7 +9,8 @@
 // nimblescape.devenv.environment-id with new ids, so the monitor acts on them. The tick of the monitor is shortened
 // with DEVENV_MONITOR_TICK_MS (read only by main.ts). Checked: a labeled container with a stale record is stopped; one
 // whose record keeps it running is not; one with a fresh heartbeat is not; one without any record is never touched;
-// ensure on a running, a stopped, and a missing container; the records and forget subcommands; an invalid heartbeat
+// ensure on a running, a stopped, and a missing container; the forget subcommand and the record files of the volume
+// (plan step 11I, U10: the subcommand `records` is removed; the test reads the files itself); an invalid heartbeat
 // writes nothing. Plan step 3 (pipe loading): the container runs the pipe loader and gets the script on its input only;
 // `docker restart` resumes from the stored script; a changed stored script makes the loader exit with 3, and ensure then
 // replaces the container (review round 1 of PR #69, A-R1-1: with the restart policy kept); a monitor whose first load
@@ -38,10 +39,9 @@ import {
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
   heartbeatFileName,
-  parseRecordsOutput,
-  recordsCommand,
+  parseHeartbeatFileName,
+  parseHeartbeatRecord,
   remoteMonitorLabelValue,
-  type RecordsOutput,
 } from '../../src/core/remoteMonitor/protocol';
 import { forgetRecord, sendHeartbeat, sendMonitorSettings } from '../../src/core/worker/monitorFlow';
 import { engineMonitor } from '../../src/core/worker/engineMonitor';
@@ -59,6 +59,12 @@ import { holdLockInContainer, lockIsFree } from './workerLocks';
 const SOURCE = crypto.randomBytes(16).toString('hex');
 const OTHER_SOURCE = crypto.randomBytes(16).toString('hex');
 const TICK_MS = 500;
+
+/** Plan step 11I (U10, decision of 2026-10-08): the records of an environment as the removed subcommand `records` printed them. */
+interface Recorded {
+  now: number;
+  records: Array<{ source: string; at: number; keepRunning: boolean }>;
+}
 /**
  * Plan step 8, PR C: the waiting time of the release test, and the release limit it gives (review round 1 of PR #87,
  * A-R1-1 (release margin): max(60 s, waiting time) plus RELEASE_MARGIN_SECONDS, computed by releaseLimitSeconds, not
@@ -140,9 +146,24 @@ describe('the Session Monitor container of a remote Docker host', () => {
   // Plan step 11D1: the commands of the monitor as the worker sends them (monitorFlow over the Engine API of the local
   // engine), to the monitor container of this run; the operations of the worker name the real one.
   const engine = dockerEngine(engineApi(helperDockerSocket(env, process.platform)), engineHijack(helperDockerSocket(env, process.platform)));
-  const records = async (environmentId: string): Promise<RecordsOutput | undefined> => {
-    const result = await docker.run(['exec', containerName, ...recordsCommand(environmentId)]);
-    return result.exitCode === 0 ? parseRecordsOutput(result.stdout) : undefined;
+  /**
+   * Plan step 11I (U10, decision of 2026-10-08): the records of an environment, read from the record files of the state
+   * volume in the monitor container (each `<source>.<environment id>.json` of /state/heartbeats with `cat`, checked by
+   * the protocol's parsers), as the removed subcommand `records` printed them; `now` is the clock of the test, which runs
+   * on the host of the engine. Undefined while the container does not run (its exec fails).
+   */
+  const records = async (environmentId: string): Promise<Recorded | undefined> => {
+    const listed = cli.run(['exec', containerName, 'sh', '-c', 'cd /state/heartbeats 2>/dev/null || exit 0; for file in *.json; do [ -f "$file" ] && printf "%s %s\\n" "$file" "$(cat "$file")"; done; exit 0']);
+    if (listed.code !== 0) return undefined;
+    const found: Recorded['records'] = [];
+    for (const line of listed.out.split('\n')) {
+      const space = line.indexOf(' ');
+      const parts = space < 0 ? undefined : parseHeartbeatFileName(line.slice(0, space));
+      if (parts === undefined || parts.environmentId !== environmentId) continue;
+      const record = parseHeartbeatRecord(line.slice(space + 1));
+      if (record !== undefined) found.push({ source: parts.source, at: record.at, keepRunning: record.keepRunning });
+    }
+    return { now: Date.now(), records: found };
   };
 
   beforeAll(async () => {
@@ -219,6 +240,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
 
   it('prints the records of an environment, forgets one, and writes nothing for an invalid heartbeat', async () => {
     // Plan step 11D1: changed, the records read by the test itself (RemoteSessionMonitor.records is removed: no caller).
+    // Plan step 11I (U10, decision of 2026-10-08): changed, read from the record files of the volume (`records` removed).
     const recorded = await records(ids.fresh);
     expect(recorded?.records).toEqual([{ source: SOURCE, at: expect.any(Number), keepRunning: false }]);
     expect(Math.abs(recorded!.now - recorded!.records[0].at)).toBeLessThan(5 * 60_000);
@@ -247,7 +269,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
     }
     expect(cli.container(containerName)!.Id).not.toBe(before);
     // The new container writes its script at its start; the records of the volume stay.
-    let kept: RecordsOutput | undefined;
+    let kept: Recorded | undefined;
     const deadline = Date.now() + 30_000;
     while ((kept = await records(ids.kept)) === undefined && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
     expect(kept?.records.map((record) => record.source)).toEqual([OTHER_SOURCE]);
@@ -267,8 +289,9 @@ describe('the Session Monitor container of a remote Docker host', () => {
     expect(cli.container(containerName)!.Id).toBe(id);
     expect(cli.run(['logs', containerName]).err).not.toContain('devenv loader:');
     expect(await monitor.ensure(helperTag, socket)).toBe('running');
-    // It still answers the subcommands of `docker exec` from the stored script.
-    expect(await records(ids.kept)).toBeDefined();
+    // It still answers the subcommands of `docker exec` from the stored script. Plan step 11I (U10, decision of
+    // 2026-10-08): changed test, a heartbeat without environments (it writes nothing) in place of the removed `records`.
+    expect(await sendHeartbeat(engine, { source: SOURCE, limitSeconds: 60, environments: [] }, undefined, containerName)).toEqual({ ok: true });
   });
 
   it('exits with 3 after a restart when the stored script was changed, and ensure then creates it again', async () => {

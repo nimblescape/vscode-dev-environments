@@ -13,7 +13,6 @@ import {
   LABEL_SESSION_MONITOR,
   REMOTE_MONITOR_READY_TEXT,
   REMOTE_MONITOR_SCRIPT_PATH,
-  heartbeatCommand,
   imagePrefixesOf,
   remoteMonitorLabelValue,
 } from './protocol';
