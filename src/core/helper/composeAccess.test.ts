@@ -151,9 +151,21 @@ describe('composeAccessReport: services (rule table 4.2)', () => {
     ['an unknown build key', 'db', { build: { context: REPO, future: 1 } }, U('service db: build future')],
     ['cache_from of an image and a registry', 'db', { build: { context: REPO, cache_from: ['acme/cache:1', 'type=registry,ref=acme/cache'] } }, NONE],
     ['cache_from of a local folder', 'db', { build: { context: REPO, cache_from: ['type=local,src=/x'] } }, U('service db: build cache_from type=local,src=/x')],
+    // Review round 1 of PR #130 (A-F1): Buildx reads the CSV fields with keys in any case, and its last `type` counts, so a
+    // registry entry with a second `type` (or a quoted one) is a local cache import; a field without `=` is not read.
+    ['cache_from with a second type', 'db', { build: { context: REPO, cache_from: ['type=registry,type=local,src=/tmp/c'] } }, U('service db: build cache_from type=registry,type=local,src=/tmp/c')],
+    ['cache_from with a second TYPE', 'db', { build: { context: REPO, cache_from: ['type=registry,TYPE=local,src=/tmp/c'] } }, U('service db: build cache_from type=registry,TYPE=local,src=/tmp/c')],
+    ['cache_from with a quoted second type', 'db', { build: { context: REPO, cache_from: ['type=registry,"type=local",src=/tmp/c'] } }, U('service db: build cache_from type=registry,"type=local",src=/tmp/c')],
+    ['cache_from of a registry in another case', 'db', { build: { context: REPO, cache_from: ['TYPE=registry,ref=acme/cache'] } }, NONE],
+    ['cache_from with a field without a value', 'db', { build: { context: REPO, cache_from: ['type=registry,ref'] } }, U('service db: build cache_from type=registry,ref')],
     ['additional contexts of images and URLs', 'db', { build: { context: REPO, additional_contexts: { base: 'docker-image://alpine', src: 'https://x/y.git' } } }, NONE],
     ['an additional context of a folder', 'db', { build: { context: REPO, additional_contexts: { home: '/root' } } }, A('service db: build additional_contexts home=/root')],
     ['an additional context of a service', 'db', { build: { context: REPO, additional_contexts: { base: 'service:app' } } }, A('service db: build additional_contexts base=service:app')],
+    // Review round 1 of PR #130 (A-F2): Buildx takes an image or a URL only by the exact lower-case prefix; any other
+    // spelling is a path that the build client reads, so it is refused like a folder.
+    ['an additional context of HTTPS:// (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: 'HTTPS://example.com/dir' } } }, A('service db: build additional_contexts x=HTTPS://example.com/dir')],
+    ['an additional context of DOCKER-IMAGE:// (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: 'DOCKER-IMAGE://alpine' } } }, A('service db: build additional_contexts x=DOCKER-IMAGE://alpine')],
+    ['an additional context of an image after a space (a path for Buildx)', 'db', { build: { context: REPO, additional_contexts: { x: ' docker-image://alpine' } } }, A('service db: build additional_contexts x= docker-image://alpine')],
     // container_name (rewritten, D-12)
     ['a container_name', 'db', { container_name: 'db1' }, NONE],
     // labels

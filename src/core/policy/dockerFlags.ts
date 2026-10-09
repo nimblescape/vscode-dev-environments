@@ -373,6 +373,20 @@ export function withLoopbackAddress(spec: string): string {
 // Build contexts
 
 /**
+ * Review round 1 of PR #130 (A-F2): the image of a build context `docker-image://<image>`, by the exact lower-case
+ * prefix that Buildx takes (no trimming: Buildx reads ` docker-image://…` or `DOCKER-IMAGE://…` as a path); else
+ * `undefined`.
+ */
+export function imageContext(source: string): string | undefined {
+  return source.startsWith('docker-image://') ? source.slice('docker-image://'.length) : undefined;
+}
+
+/** Review round 1 of PR #130 (A-F2): a build context that Buildx fetches as a URL (exact lower-case `http://`, `https://`). */
+export function isUrlContext(source: string): boolean {
+  return source.startsWith('http://') || source.startsWith('https://');
+}
+
+/**
  * The folder of a local build context (`--build-context`, `additional_contexts`): the path itself, or the path of an
  * `oci-layout://<path>[:<tag>][@<digest>]` layout. `undefined` for other kinds of source (for example `service:…` of
  * Docker Compose, or another scheme).

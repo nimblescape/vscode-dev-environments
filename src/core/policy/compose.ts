@@ -22,7 +22,7 @@ import {
   WORKSPACE_VOLUME_KEY,
   type ComposeModel,
 } from '../helper/composeModel';
-import { localContextPath } from './dockerFlags';
+import { csvFields, imageContext, isUrlContext, localContextPath } from './dockerFlags';
 import { imageReferenceFinding, type NamedImageReference } from './images';
 import { access, guarded, unsupported, type HostAccessFinding, type HostAccessReport, type Problem } from './report';
 import { decideServiceMount, decideServicePort, type ComposeMountContext } from './rewrites';
@@ -629,6 +629,29 @@ const BUILD_ALLOWED = new Set([
 ]);
 
 /**
+ * Review round 1 of PR #130 (A-F1): an entry of `cache_from` as Buildx reads it (util/buildflags/cache.go): without `=`
+ * the reference of a registry image; else CSV fields `key=value` whose keys Buildx compares in lower case, the last
+ * `type` counting. Only a registry import is allowed: exactly one `type` field, with the value `registry`. Every other
+ * entry (a local or another cache import, a second `type`, a field without `=`, a quote that does not close) is not
+ * supported. Before the user decision of 2026-10-09 the file-system entitlement check of bake refused a local import
+ * outside the repository; since then this check alone keeps it out.
+ */
+export function cacheFromIsRegistry(text: string): boolean {
+  if (!text.includes('=')) return text !== '';
+  const fields = csvFields(text);
+  if (fields === undefined) return false;
+  let types = 0;
+  for (const field of fields) {
+    const index = field.indexOf('=');
+    if (index < 0) return false;
+    if (field.slice(0, index).trim().toLowerCase() !== 'type') continue;
+    types += 1;
+    if (field.slice(index + 1) !== 'registry') return false;
+  }
+  return types === 1;
+}
+
+/**
  * `build`: the context goes from the workspace helper to the builder, so only the repository folder (or a folder in it);
  * a remote context is not supported yet (review round 5, S5-4); the Dockerfile in the repository. Build secrets, SSH, entitlements, and privileged builds are
  * access to the computer; tags and exported caches could overwrite images or write files.
@@ -690,13 +713,15 @@ function buildProblems(value: unknown, ctx: ServiceContext): Problem[] {
   problems.push(...buildSshProblems(value.ssh, ctx), ...buildSecretProblems(value.secrets, ctx));
   for (const entry of listOf(value.cache_from)) {
     const text = String(entry).trim();
-    if (text.includes('=') ? !/^type=registry(,|$)/.test(text) : text === '') problems.push(unsupported(`build cache_from ${text}`));
+    if (!cacheFromIsRegistry(text)) problems.push(unsupported(`build cache_from ${text}`));
   }
   if (isRecord(value.additional_contexts)) {
     for (const [name, source] of Object.entries(value.additional_contexts)) {
-      const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
-      if (image) problems.push(...imageProblems(image[1], `build additional_contexts ${name} image`));
-      else if (!/^https?:\/\//i.test(String(source))) {
+      // Review round 1 of PR #130 (A-F2): Buildx takes a context for an image or a URL only by its exact lower-case
+      // prefix (no trimming); every other value, `HTTPS://…` too, is a path that the build client reads.
+      const image = imageContext(String(source));
+      if (image !== undefined) problems.push(...imageProblems(image, `build additional_contexts ${name} image`));
+      else if (!isUrlContext(String(source))) {
         const item = `build additional_contexts ${name}=${String(source)}`;
         // Review round 2 (S2-03): a folder (also of `oci-layout://`) is read by the build client in the workspace helper.
         const folder = localContextPath(String(source));
@@ -1144,8 +1169,8 @@ export function composeImageReferences(model: ComposeModel): NamedImageReference
     }
     if (isRecord(build.additional_contexts)) {
       for (const [key, source] of Object.entries(build.additional_contexts)) {
-        const image = /^docker-image:\/\/(.*)$/i.exec(String(source).trim());
-        if (image) references.push({ reference: image[1].trim(), what: `${at}build additional_contexts ${key} image` });
+        const image = imageContext(String(source));
+        if (image !== undefined) references.push({ reference: image.trim(), what: `${at}build additional_contexts ${key} image` });
       }
     }
   }

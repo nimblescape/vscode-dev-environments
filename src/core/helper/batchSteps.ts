@@ -45,10 +45,15 @@ export const COMPOSE_REMOTE_OFF: Readonly<Record<string, string>> = {
  * through bake whose Dockerfile lies outside the build context (`additional privileges requested:
  * --allow=fs.read=…`), and the Dev Container CLI always writes its Dockerfile with the Features into a folder of its own
  * outside the context; Docker Compose grants only the contexts (docker/compose#14285). So the steps of the CLI that
- * build with Docker Compose (`build`, `up`) run with the file-system entitlement check of bake off, as every build ran
- * before Buildx 0.37.2. In the checked mode the host access policy keeps the contexts and Dockerfiles of a Compose build
- * in the repository (policy/compose.ts buildProblems); with the checks off, the user allowed access to the computer.
- * Set after the variables of the request (which cannot name `BUILDX_*` anyway: isPassableEnvName).
+ * build with Docker Compose (`build`, `up`) run without the checks of bake that the variable turns off: `fs.read` and
+ * `fs.write` (the files of the computer that a build reads or writes) and `ssh` (the forwarding of the default SSH
+ * agent; review round 1 of PR #130, A-F3); `network.host`, `security.insecure`, devices and the removal of a local
+ * output stay checked. That is how every build ran before Buildx 0.37.2 (it checked only the removal with the progress
+ * `rawjson` of Docker Compose). In the checked mode the host access policy keeps every path of a Compose build in the
+ * repository (policy/compose.ts buildProblems: the contexts and Dockerfiles, the additional contexts and the cache
+ * imports as Buildx reads them) and refuses `ssh`, `secrets` and `entitlements`; the helper has no SSH agent, and a
+ * request can pass none (SSH_AUTH_SOCK). With the checks off, the user allowed access to the computer. Set after the
+ * variables of the request (which cannot name `BUILDX_*` anyway: isPassableEnvName).
  */
 export const BAKE_FS_ENTITLEMENTS_OFF: Readonly<Record<string, string>> = {
   BUILDX_BAKE_ENTITLEMENTS_FS: '0',
