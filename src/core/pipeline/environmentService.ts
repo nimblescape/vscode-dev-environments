@@ -12,7 +12,7 @@ import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfW
 import type { ContainerInfo, ImageInfo, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import { isValidToken, redact } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
-import { mountsVscodeStore, vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
+import { mountsVscodeStore, vscodeServerLinkOutcome, vscodeServerPresent } from '../worker/vscodeServerLink';
 import { vscodeExtensionSeedOutcome } from '../worker/vscodeExtensionSeed';
 import { configurationExtensions, type ExtensionRef } from '../vscodeExtensions';
 import type { VscodePlatform, VscodeServerLink } from '../helperChannel/protocol';
@@ -4815,6 +4815,13 @@ export class EnvironmentService extends OperationBase {
         return { outcome: 'skipped' };
       }
       const fetch: VscodeServerFetch = ctx.vscodeServer ?? { ready: Promise.resolve(undefined), settled: true };
+      // Fix after the live check of 2026-10-10: a container that has the server of the window already (the Dev Containers
+      // extension installed it at an earlier connect) keeps it (the link answers `present`), so the open does not wait for
+      // a fetch that still runs; the fetch goes on for the store.
+      if (!fetch.settled && (await this.vscodeServerInContainer(container, commit, quality, user, ctx.signal))) {
+        this.logger.info(`The VS Code server ${commit} is in the container of ${ctx.env.repository} already; the open does not wait for its download into the shared store.`);
+        return { outcome: 'present' };
+      }
       // The detail only while the fetch still runs (a present server: no wait, no detail).
       const shown = !fetch.settled;
       if (shown) ctx.steps.detail(PipelineTexts.downloadingVscodeServer);
@@ -4852,6 +4859,21 @@ export class EnvironmentService extends OperationBase {
       if (this.isCancellation(error, ctx.signal)) throw error;
       this.logger.warn(`The VS Code server ${commit} could not be linked into the container of ${ctx.env.repository} (${errorMessage(error)}); the Dev Containers extension installs it.`);
       return { outcome: 'skipped' };
+    }
+  }
+
+  /**
+   * Fix after the live check of 2026-10-10: the home folder of the remote user in the container has the server of the
+   * window (the script `vscodeServerPresent`, as that user). A failure is false (the open then waits as before); only a
+   * cancel of the open ends it.
+   */
+  private async vscodeServerInContainer(container: string, commit: string, quality: string, user: string, signal: AbortSignal | undefined): Promise<boolean> {
+    try {
+      const result = await runScript(this.deps.docker, container, 'vscodeServerPresent', [commit, quality], { user, signal, timeoutMs: GIT_EXEC_TIMEOUT_MS });
+      return vscodeServerPresent(result);
+    } catch (error) {
+      if (this.isCancellation(error, signal)) throw error;
+      return false;
     }
   }
 

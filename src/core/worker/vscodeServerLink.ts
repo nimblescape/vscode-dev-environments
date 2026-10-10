@@ -119,6 +119,40 @@ ln -sn "$server" "$commit" || exit 1
 echo 'linked'
 `;
 
+/**
+ * Fix after the live check of 2026-10-10 (a second open of a running container waited the whole time limit of a stalled
+ * download for a server that the container had already): runs as the remote user in the dev container, with the commit
+ * (`$1`) and the quality (`$2`), and answers `present` when anything is at `~/.vscode-server/bin/<commit>`
+ * (`~/.vscode-server-insiders` for the quality `insider`): VSCODE_SERVER_LINK_SCRIPT then leaves it as it is (`present`),
+ * so the open does not wait for the store. Else `missing` (also for an invalid commit or quality, or a user without a home
+ * folder). It only tests; it creates, changes and enters nothing.
+ */
+export const VSCODE_SERVER_PRESENT_SCRIPT = `set -u
+commit="$1"
+quality="$2"
+case "$commit" in
+  *[!0-9a-f]*|'') echo 'missing'; exit 0 ;;
+esac
+if [ \${#commit} -ne 40 ]; then echo 'missing'; exit 0; fi
+case "$quality" in
+  stable) data=.vscode-server ;;
+  insider) data=.vscode-server-insiders ;;
+  *) echo 'missing'; exit 0 ;;
+esac
+uid=$(id -u) || exit 1
+home=$(awk -F: -v u="$uid" '$3 == u { print $6; exit }' /etc/passwd)
+if [ -z "$home" ] || [ ! -d "$home" ]; then echo 'missing'; exit 0; fi
+if [ -e "$home/$data/bin/$commit" ] || [ -L "$home/$data/bin/$commit" ]; then echo 'present'; else echo 'missing'; fi
+`;
+
+/**
+ * Fix after the live check of 2026-10-10: the answer of a run of VSCODE_SERVER_PRESENT_SCRIPT; true only for `present`
+ * with exit code 0 (anything else, a failure included, means that the open waits for the store as before).
+ */
+export function vscodeServerPresent(result: { exitCode: number | null; stdout: string; timedOut?: boolean }): boolean {
+  return result.timedOut !== true && result.exitCode === 0 && (result.stdout.trim().split('\n')[0]?.trim() ?? '') === 'present';
+}
+
 /** Plan step 11H1: the outcome of VSCODE_SERVER_LINK_SCRIPT. */
 export type VscodeServerLinkOutcome = { kind: 'linked' } | { kind: 'present' } | { kind: 'skipped' | 'refused' | 'failed'; reason: string };
 

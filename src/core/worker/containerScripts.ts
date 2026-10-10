@@ -19,7 +19,7 @@ import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { REMOTE_MONITOR_SCRIPT_PATH, underRecordsLock } from '../remoteMonitor/protocol';
 import type { EngineExecOptions, EngineExecResult } from './dockerEngine';
 import { VSCODE_EXTENSION_SEED_SCRIPT } from './vscodeExtensionSeed';
-import { VSCODE_SERVER_LINK_SCRIPT } from './vscodeServerLink';
+import { VSCODE_SERVER_LINK_SCRIPT, VSCODE_SERVER_PRESENT_SCRIPT } from './vscodeServerLink';
 
 /**
  * How a script runs. A script for a program of the container: its text, whether it takes the token on its standard
@@ -106,6 +106,12 @@ export const CONTAINER_SCRIPTS = {
    * home folder of the remote user (its arguments: the commit and the quality), as that user, when the store has it.
    */
   vscodeServerLink: { program: 'sh', script: VSCODE_SERVER_LINK_SCRIPT },
+  /**
+   * Fix after the live check of 2026-10-10: answers whether the home folder of the remote user has the server of the
+   * window already (its arguments: the commit and the quality), as that user; it only tests, so the open does not wait for
+   * a download into the store that the link would not use.
+   */
+  vscodeServerPresent: { program: 'sh', script: VSCODE_SERVER_PRESENT_SCRIPT },
   /**
    * Plan step 11H3 (decision of 2026-10-09; live check 3): copies the cached `.vsix` files of the shared store into the
    * extension cache of the remote user's VS Code server (its arguments: the quality, the engine's platform, the files), as

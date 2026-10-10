@@ -134,7 +134,7 @@ describe('the platform and the URL of a server (plan step 11H1)', () => {
     expect(serverVersionUrl(SERVER, 'linux-arm64')).toBe(`https://update.code.visualstudio.com/api/versions/commit:${SERVER.commit}/server-linux-arm64/stable`);
     expect(serverFolder('/vscode', { ...SERVER, quality: 'insider' }, 'linux-x64')).toBe(`/vscode/server/insider/linux-x64/${SERVER.commit}`);
     expect(SERVER_FETCH_TIMEOUT_MS).toBe(600_000);
-    expect(MAX_SERVER_ARCHIVE_BYTES).toBe(256 * 1024 * 1024);
+    expect(MAX_SERVER_ARCHIVE_BYTES).toBe(512 * 1024 * 1024);
     expect(MAX_SERVER_REDIRECTS).toBe(5);
   });
 });
