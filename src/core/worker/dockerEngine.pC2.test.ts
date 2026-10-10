@@ -62,10 +62,10 @@ describe('the callers whose rule changed (PR #138, B5, behaviour change)', () =>
     expect(await forgetRecord(vanished, '0'.repeat(32), 'env', REMOTE_MONITOR_CONTAINER)).toEqual({ ok: false, missing: true, detail: `No such exec instance: ${ID}` });
     const lines: string[] = [];
     const logger = { ...silentLogger, warn: (text: string) => lines.push(text) } as Logger;
-    await workerSessionMonitor(vanished, '0'.repeat(32), logger).forget!({ kind: 'local', host: '', endpoint: '' }, 'env');
+    await workerSessionMonitor(vanished, '0'.repeat(32), logger).forget('env');
     expect(lines).toEqual([]);
     // A paused monitor (409, not "is not running") is still a failure that Delete logs.
-    await workerSessionMonitor(failingExec(new EngineError(`Container ${ID} is paused, unpause the container before exec`, 409)), '0'.repeat(32), logger).forget!({ kind: 'local', host: '', endpoint: '' }, 'env');
+    await workerSessionMonitor(failingExec(new EngineError(`Container ${ID} is paused, unpause the container before exec`, 409)), '0'.repeat(32), logger).forget('env');
     expect(lines).toEqual([`The heartbeat record of env could not be removed from the Session Monitor: Container ${ID} is paused, unpause the container before exec`]);
   });
 });

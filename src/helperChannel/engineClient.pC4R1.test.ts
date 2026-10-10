@@ -12,7 +12,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
+import type { MonitorRunSpec } from '../core/worker/dockerEngine';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
 

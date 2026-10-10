@@ -7,10 +7,14 @@
 // `lock`) and, since plan step 8, PR B (user decision D2), the Session Monitor container before an automatic stop
 // (src/remoteMonitor/stopLock.ts). Only Node.js built-ins and the pure protocol module. The lock lives with the open
 // file of the process that opened it: `flock` takes the kernel lock on that open file (its file descriptor FLOCK_FD) and
-// exits; closing the file, or the end of the process, frees it. The lock files are never deleted.
+// exits; closing the file, or the end of the process, frees it. The lock files are never deleted. Cleanup C5 (plan step
+// 11J, B3): the one acquisition (acquireFlock: open, `flock`, its outcome) of every lock of this kind: the environment
+// lock of the worker (takeEnvironmentLock), the stop lock of the monitor (stopLocker), and the locks of the shared VS
+// Code store (storeLock, storeTryLock; also the lock of one extension file). Each caller maps the outcome to its own
+// errors.
 import { spawn } from 'child_process';
 import * as fs from 'fs';
-import { lockFilePath, lockFolder } from './protocol';
+import { LOCK_BUSY_EXIT, flockArgs, flockNoWaitArgs, lockFilePath, lockFolder } from './protocol';
 import { isStorageId } from '../storage/paths';
 
 /** The file descriptor of the lock file in `flock`. */
@@ -89,4 +93,113 @@ export function startFlockProcess(args: readonly string[], fd: number): FlockPro
       if (child.exitCode === null && child.signalCode === null) child.kill(signal);
     },
   };
+}
+
+/**
+ * Cleanup C5 (plan step 11J, B3): what acquireFlock gave. `locked`: the lock is held until `release` closes the file
+ * (once; a second call does nothing). Every other outcome has closed the file already: `openFailed` (the open threw
+ * `error`), `cancelled` (`signal` aborted before `flock` started, or while it ran: flock is killed), `startThrew` (the
+ * start of `flock` threw `error`), `startFailed` (`flock` could not be started: `detail`), `timeout` (it did not end
+ * within `timeoutMs`; it is killed and its end awaited), `busy` (another holder kept the lock: LOCK_BUSY_EXIT), and
+ * `failed` (another exit code, or `null` after a signal; its error output).
+ */
+export type FlockAttempt =
+  | { kind: 'locked'; release(): void }
+  | { kind: 'openFailed'; error: unknown }
+  | { kind: 'cancelled' }
+  | { kind: 'startThrew'; error: unknown }
+  | { kind: 'startFailed'; detail: string }
+  | { kind: 'timeout' }
+  | { kind: 'busy' }
+  | { kind: 'failed'; exitCode: number | null; stderr?: string };
+
+/**
+ * Cleanup C5 (plan step 11J, B3): opens the lock file (`open`; its descriptor becomes FLOCK_FD of `flock`) and takes the
+ * lock with `flock`: with a wait of `waitSeconds` (flockArgs), or without a wait when it is undefined (flockNoWaitArgs).
+ * `signal` ends the wait (flock is killed with SIGKILL); `timeoutMs` bounds a flock without a signal of its own (it is
+ * killed with SIGKILL, and its end awaited). A cancellation counts before the outcome of flock, a time limit before the
+ * rest. Rejects only when the end of flock rejects (never for startFlockProcess); the file is closed first.
+ */
+export async function acquireFlock(how: {
+  open: () => number;
+  close: (fd: number) => void;
+  start: (args: readonly string[], fd: number) => FlockProcess;
+  waitSeconds?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<FlockAttempt> {
+  let fd: number;
+  try {
+    fd = how.open();
+  } catch (error) {
+    return { kind: 'openFailed', error };
+  }
+  const close = () => {
+    try {
+      how.close(fd);
+    } catch {
+      // Closed already.
+    }
+  };
+  const { signal } = how;
+  if (signal?.aborted) {
+    close();
+    return { kind: 'cancelled' };
+  }
+  let flock: FlockProcess;
+  try {
+    flock = how.start(how.waitSeconds === undefined ? flockNoWaitArgs(FLOCK_FD) : flockArgs(how.waitSeconds, FLOCK_FD), fd);
+  } catch (error) {
+    close();
+    return { kind: 'startThrew', error };
+  }
+  // A cancel while it waits: flock ends without the lock.
+  const end = () => flock.kill('SIGKILL');
+  signal?.addEventListener('abort', end, { once: true });
+  if (signal?.aborted) end();
+  let timer: NodeJS.Timeout | undefined;
+  let outcome: Awaited<FlockProcess['exited']> | 'timeout';
+  try {
+    const exited = flock.exited;
+    outcome =
+      how.timeoutMs === undefined
+        ? await exited
+        : await Promise.race([exited, new Promise<'timeout'>((resolve) => (timer = setTimeout(() => resolve('timeout'), how.timeoutMs)))]);
+    if (outcome === 'timeout') {
+      flock.kill('SIGKILL');
+      await exited;
+    }
+  } catch (error) {
+    close();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', end);
+  }
+  if (signal?.aborted) {
+    close();
+    return { kind: 'cancelled' };
+  }
+  if (outcome !== 'timeout' && outcome.error === undefined && outcome.exitCode === 0) {
+    let released = false;
+    return {
+      kind: 'locked',
+      release: () => {
+        if (released) return;
+        released = true;
+        close();
+      },
+    };
+  }
+  // Not held (a killed flock that took it lets it go with the close).
+  close();
+  if (outcome === 'timeout') return { kind: 'timeout' };
+  if (outcome.error !== undefined) return { kind: 'startFailed', detail: outcome.error };
+  if (outcome.exitCode === LOCK_BUSY_EXIT) return { kind: 'busy' };
+  return { kind: 'failed', exitCode: outcome.exitCode, ...(outcome.stderr !== undefined ? { stderr: outcome.stderr } : {}) };
+}
+
+/** The text of a `failed` FlockAttempt: `flock failed (exit code N)` or `(ended by a signal)`, with its error output when asked. */
+export function flockFailure(attempt: { exitCode: number | null; stderr?: string }, withStderr: boolean): string {
+  return `flock failed (${attempt.exitCode === null ? 'ended by a signal' : `exit code ${attempt.exitCode}`})${withStderr && attempt.stderr ? `: ${attempt.stderr}` : ''}`;
 }

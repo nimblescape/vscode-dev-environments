@@ -5,7 +5,7 @@
 // Review round 2 of PR #100 (B, mutation probes): the log driver of the spec reaches the create of the monitor
 // container, and the operation `monitorEnsure` of the worker gets the script of this bundle.
 import { describe, expect, it, vi } from 'vitest';
-import type { MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
+import type { MonitorRunSpec } from '../core/worker/dockerEngine';
 import type { EngineApi, EngineRequest } from './engineApi';
 import { dockerEngine, type EngineHijack } from './engineClient';
 import stubScript from './monitorScript.stub';

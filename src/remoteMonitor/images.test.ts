@@ -2,8 +2,9 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import * as http from 'http';
 import { describe, expect, it, vi } from 'vitest';
+import type { HttpResponse, HttpTransport } from '../core/http';
+import { RegistryClient } from '../core/imageCheck/registryClient';
 import { abortError } from '../core/ports';
 import { EngineError, type EngineFilters, type EngineImage } from '../core/worker/dockerEngine';
 import { MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineApi, type EngineAnswer, type EngineRequest } from '../helperChannel/engineApi';
@@ -16,15 +17,13 @@ import {
   IMAGE_REMOVE_TIMEOUT_MS,
   ImageMaintenance,
   highestMajorTag,
-  httpGetWith,
   localImagesOf,
-  parseBearerChallenge,
   parseReplacedImages,
   prefixesFromEnv,
   pruneReplacedImages,
+  requestsWithin,
   splitRepository,
   versionsOf,
-  type HttpGet,
   type LocalImage,
   type ReplacedImages,
 } from './images';
@@ -132,15 +131,19 @@ function fakeEngine(options: {
 /** Plan step 11I (U1): the calls of removeImage of a fake engine (`docker image rm` before). */
 const removed = (calls: string[][]): string[][] => calls.filter((call) => call[0] === 'removeImage');
 
-/** A registry that wants a token from its challenge, then lists `tags` per repository path. */
+/**
+ * A registry that wants a token from its challenge, then lists `tags` per repository path. Cleanup C5 (plan step 11J,
+ * C1): a transport of the worker's registry client, which the image maintenance now uses (before: an HttpGet of the
+ * monitor's own client); the same answers.
+ */
 function fakeRegistry(tags: Record<string, string[]>) {
   const requests: Array<{ url: string; auth?: string }> = [];
-  const httpGet: HttpGet = async (url, headers): ReturnType<HttpGet> => {
-    requests.push({ url, auth: headers.authorization });
+  const request = async ({ url, headers = {} }: { url: string; headers?: Record<string, string> }): Promise<HttpResponse> => {
+    requests.push({ url, auth: headers.Authorization });
     if (url.startsWith('https://ghcr.io/token?')) return { status: 200, headers: {}, body: JSON.stringify({ token: 'anon-token' }) };
     const match = /^https:\/\/ghcr\.io\/v2\/(.+)\/tags\/list$/.exec(url);
     if (!match) return { status: 404, headers: {}, body: '' };
-    if (headers.authorization !== 'Bearer anon-token') {
+    if (headers.Authorization !== 'Bearer anon-token') {
       return {
         status: 401,
         headers: { 'www-authenticate': `Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:${match[1]}:pull"` },
@@ -150,7 +153,7 @@ function fakeRegistry(tags: Record<string, string[]>) {
     const list = tags[match[1]];
     return list ? { status: 200, headers: {}, body: JSON.stringify({ name: match[1], tags: list }) } : { status: 404, headers: {}, body: '' };
   };
-  return { httpGet, requests };
+  return { transport: (): HttpTransport => ({ request }), requests };
 }
 
 describe('the images of the remote Session Monitor (user requests 2026-09-28)', () => {
@@ -200,17 +203,27 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     ]);
   });
 
-  it('splits a repository and reads a Bearer challenge', () => {
+  it('splits a repository and reads a Bearer challenge', async () => {
     expect(splitRepository(DEV)).toEqual({ registry: 'ghcr.io', path: 'majikmate/devcontainer-dev' });
     expect(splitRepository('library/ubuntu')).toBeUndefined();
-    expect(parseBearerChallenge('Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull"')).toEqual({
-      realm: 'https://ghcr.io/token',
-      service: 'ghcr.io',
-      scope: 'repository:a/b:pull',
+    // Cleanup C5 (plan step 11J, C1): changed expectation, the challenge is read by the worker's registry client
+    // (listTags) instead of the monitor's parseBearerChallenge: its realm, service and scope make the token request; a
+    // realm without TLS gets no request; a Basic challenge without credentials (the monitor has none) is no token.
+    const tokens: string[] = [];
+    const answering = (challenge: string): HttpTransport => ({
+      request: async ({ url }): Promise<HttpResponse> => {
+        if (url.includes('/v2/')) return { status: 401, headers: { 'www-authenticate': challenge }, body: '' };
+        tokens.push(url);
+        return { status: 200, headers: {}, body: JSON.stringify({ token: 't' }) };
+      },
     });
+    const tagsWith = (challenge: string) => new RegistryClient(answering(challenge), async () => undefined).listTags('ghcr.io', 'a/b');
+    await tagsWith('Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull"');
+    expect(tokens).toEqual(['https://ghcr.io/token?service=ghcr.io&scope=repository%3Aa%2Fb%3Apull']);
     // Only https realms.
-    expect(parseBearerChallenge('Bearer realm="http://evil/token"')).toBeUndefined();
-    expect(parseBearerChallenge('Basic realm="x"')).toBeUndefined();
+    expect(await tagsWith('Bearer realm="http://evil/token"')).toEqual({ kind: 'error', registry: 'ghcr.io', error: 'The registry requires an insecure token service (http://evil).' });
+    expect(await tagsWith('Basic realm="x"')).toEqual({ kind: 'authRequired', registry: 'ghcr.io' });
+    expect(tokens).toHaveLength(1);
   });
 
   it('pulls the latest major version of each repository on the host and of the list of the extension (all images)', async () => {
@@ -221,7 +234,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const log: string[] = [];
     await new ImageMaintenance({
       engine: engine.engine,
-      httpGet: registry.httpGet,
+      registryTransport: registry.transport,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       // A repository that the host has no image of yet, and one of no prefix (left out).
@@ -256,7 +269,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] });
     const log: string[] = [];
-    await new ImageMaintenance({ engine: engine.engine, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine: engine.engine, registryTransport: registry.transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     // Plan step 11I (U1, decision of 2026-10-08): changed expectation, one removal of the engine per reference (was
     // `docker image rm <references…>`), each with the reference and its time limit only: never with force (was: no `-f`
     // or `--force` among the arguments).
@@ -293,7 +306,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     });
     const registry = fakeRegistry({ 'majikmate/devcontainer-dev': ['2', '2.0.15'], 'majikmate/devcontainer-classroom-web': ['1'] });
     const log: string[] = [];
-    await new ImageMaintenance({ engine: engine.engine, httpGet: registry.httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine: engine.engine, registryTransport: registry.transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removals of the engine (was `docker image rm`).
     expect(removed(engine.calls)).toEqual([
       ['removeImage', `${DEV}:2.0.13`],
@@ -321,7 +334,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const log: string[] = [];
     await new ImageMaintenance({
       engine: engine.engine,
-      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -332,41 +345,36 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
 
   // Review round 2 of PR #57 (R5): the idle time limit of the socket alone let a registry that sends a byte now and then,
   // or a connection cut in the middle of an answer, keep a pass (and every later one) open for ever.
+  // Cleanup C5 (plan step 11J, C1): changed expectation, the limit of each request is requestsWithin over the transport of
+  // the worker's registry client (was: the deadline of the monitor's own httpGetWith; "did not answer in time" is now an
+  // AbortError); a transport that never answers (a trickle), one that fails (a cut), and one that answers. The trickle and
+  // the cut over real TLS through the proxy of the daemon: images.pC5.test.ts.
   it('the registry request ends within its time limit, also when the answer trickles or is cut', async () => {
-    const server = http.createServer((request, response) => {
-      if (request.url === '/trickle') {
-        response.writeHead(200, { 'content-length': '1000' });
-        const timer = setInterval(() => response.write('x'), 50);
-        response.on('close', () => clearInterval(timer));
-      } else if (request.url === '/cut') {
-        response.writeHead(200, { 'content-length': '1000' });
-        response.write('xyz', () => setTimeout(() => request.socket.destroy(), 20));
-      } else {
-        response.end('{"tags":[]}');
-      }
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    const get = http.get as unknown as Parameters<typeof httpGetWith>[0];
-    try {
-      const started = Date.now();
-      await expect(httpGetWith(get, `${base}/trickle`, {}, 400)).rejects.toThrow('did not answer in time');
-      expect(Date.now() - started).toBeLessThan(2_000);
-      await expect(httpGetWith(get, `${base}/cut`, {}, 5_000)).rejects.toThrow();
-      await expect(httpGetWith(get, `${base}/ok`, {}, 5_000)).resolves.toMatchObject({ status: 200, body: '{"tags":[]}' });
-    } finally {
-      server.closeAllConnections();
-      await new Promise((resolve) => server.close(resolve));
-    }
+    const never: HttpTransport = { request: () => new Promise(() => {}) };
+    const started = Date.now();
+    await expect(requestsWithin(never, 400).request({ method: 'GET', url: 'https://ghcr.io/v2/' })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    const cut: HttpTransport = { request: async () => Promise.reject(new Error('aborted')) };
+    await expect(requestsWithin(cut, 5_000).request({ method: 'GET', url: 'https://ghcr.io/v2/' })).rejects.toThrow('aborted');
+    const ok: HttpTransport = { request: async () => ({ status: 200, headers: {}, body: '{"tags":[]}' }) };
+    await expect(requestsWithin(ok, 5_000).request({ method: 'GET', url: 'https://ghcr.io/v2/' })).resolves.toMatchObject({ status: 200, body: '{"tags":[]}' });
+    // The signal of the transport ends at the limit, also with a signal of the caller.
+    let seen: AbortSignal | undefined;
+    const watching: HttpTransport = { request: (_request, signal) => ((seen = signal), new Promise(() => {})) };
+    await expect(requestsWithin(watching, 50).request({ method: 'GET', url: 'https://ghcr.io/v2/' }, new AbortController().signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen?.aborted).toBe(true);
   });
 
   // Review round 3 of PR #57 (N1): `get` throws at once for an invalid URL or header; the time limit then ended the
-  // monitor with an uncaught error.
+  // monitor with an uncaught error. Cleanup C5 (plan step 11J, C1): changed expectation, over requestsWithin (was:
+  // httpGetWith).
   it('a registry request that cannot start rejects and leaves no timer behind', async () => {
-    const throwing = (() => {
-      throw new TypeError('Invalid URL');
-    }) as unknown as Parameters<typeof httpGetWith>[0];
-    await expect(httpGetWith(throwing, 'https://[bad', {}, 50)).rejects.toThrow('Invalid URL');
+    const throwing: HttpTransport = {
+      request: () => {
+        throw new TypeError('Invalid URL');
+      },
+    };
+    await expect(requestsWithin(throwing, 50).request({ method: 'GET', url: 'https://[bad' })).rejects.toThrow('Invalid URL');
     // Past the time limit: nothing is thrown (vitest fails on an uncaught error).
     await new Promise((resolve) => setTimeout(resolve, 120));
   });
@@ -381,7 +389,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const run = () =>
       new ImageMaintenance({
         engine: engine.engine,
-        httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+        registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport,
         log: () => {},
         prefixes: () => PREFIXES,
         knownRepositories: async () => [],
@@ -400,7 +408,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     dangling['sha256:v2'] = '2026-09-28T00:00:00Z';
     await new ImageMaintenance({
       engine: second.engine,
-      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -423,7 +431,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       const engine = fakeEngine({ images: [image(DEV, '2', current, created)], dangling });
       await new ImageMaintenance({
         engine: engine.engine,
-        httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+        registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport,
         log: () => {},
         prefixes: () => PREFIXES,
         knownRepositories: async () => [],
@@ -450,7 +458,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const stored: ReplacedImages = { [DEV]: ['sha256:x'], [MINE]: ['sha256:x'] };
     await new ImageMaintenance({
       engine: engine.engine,
-      httpGet: fakeRegistry({}).httpGet,
+      registryTransport: fakeRegistry({}).transport,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -467,7 +475,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     let stored: ReplacedImages = { [DEV]: ['sha256:old1', 'sha256:old2'] };
     const maintenance = new ImageMaintenance({
       engine: fakeEngine({ images: tagged }).engine,
-      httpGet: fakeRegistry({}).httpGet,
+      registryTransport: fakeRegistry({}).transport,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -495,7 +503,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     let stored: ReplacedImages = { [DEV]: ['sha256:v1'], [WEB]: [], [OLD]: ['sha256:gone'] };
     await new ImageMaintenance({
       engine: fakeEngine({ images: [image(DEV, '2', 'sha256:v1', '2026-09-01')] }).engine,
-      httpGet: fakeRegistry({}).httpGet,
+      registryTransport: fakeRegistry({}).transport,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -516,7 +524,7 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
     const engine = fakeEngine({ images, layers: { 'sha256:base': ['l1', 'l2'], 'sha256:environment': ['l1', 'l2', 'l3'] } });
     const log: string[] = [];
     const run = (target: ImageEngine) =>
-      new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      new ImageMaintenance({ engine: target, registryTransport: fakeRegistry({}).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     await run(engine.engine);
     // Plan step 11I (U1, decision of 2026-10-08): no removal of the engine (`docker image rm` before), here and below.
     expect(removed(engine.calls)).toEqual([]);
@@ -537,10 +545,12 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       images: [image(DEV, '2.0.14', 'sha256:a', '2026-09-20'), image(DEV, '2.0.13', 'sha256:b', '2026-09-10'), image(DEV, '2.0.12', 'sha256:c', '2026-09-01')],
     });
     const log: string[] = [];
-    const httpGet: HttpGet = async () => ({ status: 500, headers: {}, body: '' });
-    await new ImageMaintenance({ engine: engine.engine, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    const registryTransport = (): HttpTransport => ({ request: async () => ({ status: 500, headers: {}, body: '' }) });
+    await new ImageMaintenance({ engine: engine.engine, registryTransport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(engine.calls.some((call) => call[0] === 'pull')).toBe(false);
-    expect(log[0]).toBe(`The tags of ${DEV} could not be read; it is not updated: HTTP 500`);
+    // Cleanup C5 (plan step 11J, C1): changed expectation, the reason as the worker's registry client gives it (was: `HTTP
+    // 500`).
+    expect(log[0]).toBe(`The tags of ${DEV} could not be read; it is not updated: The registry answered with HTTP 500.`);
     // Plan step 11I (U1, decision of 2026-10-08): changed expectation, the removal of the engine (was `docker image rm`).
     expect(removed(engine.calls)).toEqual([['removeImage', `${DEV}:2.0.12`]]);
   });
@@ -557,11 +567,11 @@ describe('the images of the remote Session Monitor (user requests 2026-09-28)', 
       throw new Error('connect ECONNREFUSED /var/run/docker.sock');
     };
     const engine: ImageEngine = { images: failing('images'), inspect: failing('inspect'), pull: failing('pull'), containerIds: failing('containerIds'), removeImage: failing('removeImage') };
-    const httpGet: HttpGet = async () => ({ status: 200, headers: {}, body: '{}' });
-    await new ImageMaintenance({ engine, httpGet, log: () => {}, prefixes: () => [], knownRepositories: async () => [] }).pass();
+    const registryTransport = (): HttpTransport => ({ request: async () => ({ status: 200, headers: {}, body: '{}' }) });
+    await new ImageMaintenance({ engine, registryTransport, log: () => {}, prefixes: () => [], knownRepositories: async () => [] }).pass();
     expect(calls).toEqual([]);
     const log: string[] = [];
-    await new ImageMaintenance({ engine, httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine, registryTransport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     // Plan step 11I (U1): changed expectation, the failure of the list of the engine (was "docker image ls failed: Cannot
     // connect to the Docker daemon").
     expect(log).toEqual(['The images could not be maintained: the list of the images failed: connect ECONNREFUSED /var/run/docker.sock']);
@@ -582,7 +592,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     await new ImageMaintenance({
       // The engine answers 200, and its stream carries the error (the port rejects with its message).
       engine: { ...engine.engine, pull: async (reference) => (engine.calls.push(['pull', reference]), Promise.reject(new EngineError('manifest unknown', 200))) },
-      httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet,
+      registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -597,7 +607,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
   it('tries every reference of a version; one in use (409) keeps it, and the log names the first refusal', async () => {
     const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '1.0.0', 'sha256:old', '2026-08-01'), image(DEV, '1.0', 'sha256:old', '2026-08-01')], failRemove: [`${DEV}:1.0.0`] });
     const log: string[] = [];
-    await new ImageMaintenance({ engine: engine.engine, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine: engine.engine, registryTransport: fakeRegistry({}).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     // As `docker image rm a b`: each reference in turn, also after a refusal.
     expect(removed(engine.calls)).toEqual([
       ['removeImage', `${DEV}:1.0.0`],
@@ -612,7 +622,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     const engine = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')] });
     const log: string[] = [];
     const run = (target: ImageEngine) =>
-      new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      new ImageMaintenance({ engine: target, registryTransport: fakeRegistry({}).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     await run({ ...engine.engine, removeImage: async () => 'missing' });
     // (The registry of this test lists no tags: each pass logs that first.)
     expect(log.filter((line) => line.startsWith('The older image'))).toEqual([`The older image ${DEV} (2.0.12) stays: No such image: ${DEV}:2.0.12`]);
@@ -632,7 +642,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
       const engine = fakeEngine({ images, layers });
       const log: string[] = [];
       const target: ImageEngine = { ...engine.engine, inspect: async (kind, reference, signal) => (reference === 'sha256:environment' ? answer() : engine.engine.inspect(kind, reference, signal)) };
-      await new ImageMaintenance({ engine: target, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      await new ImageMaintenance({ engine: target, registryTransport: fakeRegistry({}).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
       expect(removed(engine.calls)).toEqual([]);
       expect(log).toContain(`The older image ${DEV} (2.0.12) stays: its layers could not be read.`);
     }
@@ -646,7 +656,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     const target: ImageEngine = { ...engine.engine, inspect: async (kind, reference, signal) => (reference === 'sha256:x' ? Promise.reject(new Error('connect ECONNREFUSED /var/run/docker.sock')) : engine.engine.inspect(kind, reference, signal)) };
     await new ImageMaintenance({
       engine: target,
-      httpGet: fakeRegistry({}).httpGet,
+      registryTransport: fakeRegistry({}).transport,
       log: () => {},
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -661,7 +671,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     const log: string[] = [];
     await new ImageMaintenance({
       engine: { ...engine.engine, containerIds: async () => Promise.reject(new Error('connect ECONNREFUSED /var/run/docker.sock')) },
-      httpGet: fakeRegistry({}).httpGet,
+      registryTransport: fakeRegistry({}).transport,
       log: (message) => log.push(message),
       prefixes: () => PREFIXES,
       knownRepositories: async () => [],
@@ -671,7 +681,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     expect(log).toEqual([`The tags of ${DEV} could not be read; it is not updated: HTTP 404`]);
     // One used by a container (the ancestor check of the engine): kept too.
     const used = fakeEngine({ images: [...VERSIONS, image(DEV, '2.0.12', 'sha256:old', '2026-09-01')], usedBy: { 'sha256:old': 'c'.repeat(64) } });
-    await new ImageMaintenance({ engine: used.engine, httpGet: fakeRegistry({}).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine: used.engine, registryTransport: fakeRegistry({}).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     expect(used.calls).toContainEqual(['containerIds', JSON.stringify({ ancestor: ['sha256:old'] })]);
     expect(removed(used.calls)).toEqual([]);
   });
@@ -697,7 +707,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
         containerIds: async (filters, signal) => (timed.push(['containerIds', limit(signal)]), engine.engine.containerIds(filters)),
         removeImage: async (reference, signal) => (timed.push(['removeImage', limit(signal)]), engine.engine.removeImage(reference)),
       };
-      await new ImageMaintenance({ engine: target, httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet, log: () => {}, prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+      await new ImageMaintenance({ engine: target, registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport, log: () => {}, prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
       const byCall = new Map<string, Set<number | undefined>>();
       for (const [call, ms] of timed) byCall.set(call, new Set([...(byCall.get(call) ?? []), ms]));
       expect(Object.fromEntries([...byCall].map(([call, values]) => [call, [...values]]))).toEqual({
@@ -747,7 +757,7 @@ describe('the image maintenance over the Engine API (plan step 11I, U1)', () => 
     };
     const engine = dockerEngine(api, async () => Promise.reject(new Error('no exec in this test')));
     const log: string[] = [];
-    await new ImageMaintenance({ engine, httpGet: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).httpGet, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
+    await new ImageMaintenance({ engine, registryTransport: fakeRegistry({ 'majikmate/devcontainer-dev': ['2'] }).transport, log: (message) => log.push(message), prefixes: () => PREFIXES, knownRepositories: async () => [] }).pass();
     const paths = requests.map((request) => `${request.method} ${decodeURIComponent(request.path)}`);
     // The list without `all` (no intermediate images; none of a repository), with no filter. Review round 1 of PR #126
     // (F2): within the bound of a list of every image, not the 1 MiB of the other requests.

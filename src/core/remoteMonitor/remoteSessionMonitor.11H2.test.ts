@@ -9,7 +9,8 @@
 // except that an ensure of a monitor that ends when idle takes a running permanent one of the same version as current.
 import { describe, expect, it } from 'vitest';
 import type { Logger } from '../ports';
-import type { MonitorCreated, MonitorEngine, MonitorInspected, MonitorRunSpec } from './monitorEngine';
+import type { MonitorCreated, MonitorRunSpec } from '../worker/dockerEngine';
+import type { MonitorEngine, MonitorInspected } from './monitorEngine';
 import { PERMANENT_LOCAL_LABEL_PART, PERMANENT_REMOTE_LABEL_PART, remoteMonitorLabelValue, vscodeStoreLabelPart } from './protocol';
 import { RemoteSessionMonitor, monitorLabel } from './remoteSessionMonitor';
 

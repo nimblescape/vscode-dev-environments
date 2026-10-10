@@ -29,8 +29,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
-import { FLOCK_FD, openPlainLockFile, startFlockProcess, type FlockProcess } from '../helperChannel/lockFile';
-import { LOCK_BUSY_EXIT, flockArgs, flockNoWaitArgs, type VscodePlatform, type VscodeQuality, type VscodeServerRef } from '../helperChannel/protocol';
+import { errorMessage } from '../errors';
+import { acquireFlock, flockFailure, openPlainLockFile, startFlockProcess, type FlockAttempt, type FlockProcess } from '../helperChannel/lockFile';
+import { type VscodePlatform, type VscodeQuality, type VscodeServerRef } from '../helperChannel/protocol';
 import type { HttpStreamTransport, HttpTransport } from '../http';
 import type { Logger } from '../ports';
 
@@ -541,34 +542,31 @@ export async function storeLock(
   const folder = path.posix.join(root, STORE_LOCK_FOLDER);
   fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
   if (!fs.lstatSync(folder).isDirectory()) throw new FetchError(`${folder} is not a folder`);
-  const fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
-  const release = () => {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Closed already.
-    }
-  };
-  try {
-    if (signal.aborted) throw new FetchError('the wait for the lock of the server ended');
-    const flock = startFlock(flockArgs(waitSeconds, FLOCK_FD), fd);
-    const end = () => flock.kill('SIGKILL');
-    signal.addEventListener('abort', end, { once: true });
-    if (signal.aborted) end();
-    let outcome: Awaited<FlockProcess['exited']>;
-    try {
-      outcome = await flock.exited;
-    } finally {
-      signal.removeEventListener('abort', end);
-    }
-    if (signal.aborted) throw new FetchError('the wait for the lock of the server ended');
-    if (outcome.error !== undefined) throw new FetchError(`flock could not be started: ${outcome.error}`);
-    if (outcome.exitCode === LOCK_BUSY_EXIT) throw new FetchError(`the lock of the server stayed held for ${waitSeconds} s`);
-    if (outcome.exitCode !== 0) throw new FetchError(`flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})`);
-    return release;
-  } catch (error) {
-    release();
-    throw error;
+  // Cleanup C5 (plan step 11J, B3): the acquisition of lockFile.ts; the outcomes keep their errors.
+  const attempt = await acquireFlock({
+    open: () => openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store'),
+    close: (fd) => fs.closeSync(fd),
+    start: startFlock,
+    waitSeconds,
+    signal,
+  });
+  switch (attempt.kind) {
+    case 'locked':
+      return attempt.release;
+    case 'openFailed':
+    case 'startThrew':
+      throw attempt.error;
+    case 'cancelled':
+      throw new FetchError('the wait for the lock of the server ended');
+    case 'startFailed':
+      throw new FetchError(`flock could not be started: ${attempt.detail}`);
+    case 'busy':
+      throw new FetchError(`the lock of the server stayed held for ${waitSeconds} s`);
+    case 'failed':
+      throw new FetchError(flockFailure(attempt, false));
+    case 'timeout':
+      // Never: no time limit is given.
+      throw new FetchError('flock did not end in time');
   }
 }
 
@@ -587,44 +585,42 @@ export async function storeTryLock(
   startFlock: (args: readonly string[], fd: number) => FlockProcess = startFlockProcess,
   lockFile: string = serverLockFile(root, name),
 ): Promise<StoreLockAttempt> {
-  let fd: number;
   try {
     const folder = path.posix.join(root, STORE_LOCK_FOLDER);
     fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
     if (!fs.lstatSync(folder).isDirectory()) return { kind: 'failed', detail: `${folder} is not a folder` };
-    fd = openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store');
   } catch (error) {
-    return { kind: 'failed', detail: `the lock file could not be opened: ${error instanceof Error ? error.message : String(error)}` };
+    return { kind: 'failed', detail: `the lock file could not be opened: ${errorMessage(error)}` };
   }
-  const close = () => {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Closed already.
-    }
-  };
-  let outcome: Awaited<FlockProcess['exited']>;
+  // Cleanup C5 (plan step 11J, B3): the acquisition of lockFile.ts (no wait); the outcomes keep their texts.
+  let attempt: FlockAttempt;
   try {
-    outcome = await startFlock(flockNoWaitArgs(FLOCK_FD), fd).exited;
+    attempt = await acquireFlock({
+      open: () => openPlainLockFile(lockFile, 'The lock file of the shared VS Code server store'),
+      close: (fd) => fs.closeSync(fd),
+      start: startFlock,
+    });
   } catch (error) {
-    close();
-    return { kind: 'failed', detail: `flock could not be started: ${error instanceof Error ? error.message : String(error)}` };
+    return { kind: 'failed', detail: `flock could not be started: ${errorMessage(error)}` };
   }
-  if (outcome.error === undefined && outcome.exitCode === 0) {
-    let released = false;
-    return {
-      kind: 'locked',
-      release: () => {
-        if (released) return;
-        released = true;
-        close();
-      },
-    };
+  switch (attempt.kind) {
+    case 'locked':
+      return { kind: 'locked', release: attempt.release };
+    case 'busy':
+      return { kind: 'busy' };
+    case 'openFailed':
+      return { kind: 'failed', detail: `the lock file could not be opened: ${errorMessage(attempt.error)}` };
+    case 'startThrew':
+      return { kind: 'failed', detail: `flock could not be started: ${errorMessage(attempt.error)}` };
+    case 'startFailed':
+      return { kind: 'failed', detail: `flock could not be started: ${attempt.detail}` };
+    case 'failed':
+      return { kind: 'failed', detail: flockFailure(attempt, false) };
+    case 'cancelled':
+    case 'timeout':
+      // Never: neither a signal nor a time limit is given.
+      return { kind: 'failed', detail: 'flock did not end' };
   }
-  close();
-  if (outcome.error !== undefined) return { kind: 'failed', detail: `flock could not be started: ${outcome.error}` };
-  if (outcome.exitCode === LOCK_BUSY_EXIT) return { kind: 'busy' };
-  return { kind: 'failed', detail: `flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})` };
 }
 
 /**

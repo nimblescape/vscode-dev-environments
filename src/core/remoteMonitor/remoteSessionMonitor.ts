@@ -15,10 +15,11 @@
 import { randomUUID } from 'crypto';
 import { errorMessage } from '../errors';
 import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
-import { abortError, isAbortError, type Logger } from '../ports';
+import { abortError, isAbortError, sleep, type Logger } from '../ports';
 import { VSCODE_STORE_DIR } from '../names';
 import { monitorRestartPolicy } from './cacheSettings';
-import type { MonitorEngine, MonitorInspected, MonitorRunSpec } from './monitorEngine';
+import type { MonitorRunSpec } from '../worker/dockerEngine';
+import type { MonitorEngine, MonitorInspected } from './monitorEngine';
 import {
   LABEL_MONITOR_CREATE,
   LABEL_SESSION_MONITOR,
@@ -421,7 +422,8 @@ export class RemoteSessionMonitor {
     let restarted = false;
     let step = 0;
     for (let looks = 0; looks < 2 * waits.length && step < waits.length; looks += 1) {
-      await wait(waits[step], signal);
+      // Cleanup C5 (plan step 11J, B4): the wait of ports.ts (a cancellation ends it with an AbortError), not a copy.
+      await sleep(waits[step], signal);
       step += 1;
       found = await this.inspect(signal);
       if (!found.exists || found.status !== 'created') return found;
@@ -481,7 +483,7 @@ export class RemoteSessionMonitor {
       // repeats its last wait, so a status that changes late (`created`, then `removing`) still gets a wait.
       const waits = found.status === 'created' ? REMOTE_MONITOR_CREATED_WAITS_MS : found.status === 'removing' ? REMOTE_MONITOR_CONFLICT_WAITS_MS : undefined;
       if (waits === undefined || attempt >= CONFLICT_LOOK_BUDGET) return 'other';
-      await wait(waits[Math.min(attempt, waits.length - 1)], signal);
+      await sleep(waits[Math.min(attempt, waits.length - 1)], signal);
     }
   }
 
@@ -623,23 +625,4 @@ interface AcceptedLabels {
 /** Plan step 11H2 (D1): whether the container `found` has a label that the ensure takes as current (AcceptedLabels). */
 function labelAccepted(found: Inspected & { exists: true }, accepted: AcceptedLabels): boolean {
   return found.label === accepted.label || (accepted.running !== undefined && found.label === accepted.running && isRunning(found.status));
-}
-
-/** Review round 3 of PR #69 (A-R3-1, A-R3-2): waits `ms`; a cancellation ends the wait with an AbortError. */
-function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError());
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(abortError());
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }

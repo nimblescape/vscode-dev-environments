@@ -21,11 +21,12 @@ import {
   type EngineObjectKind,
   type EnginePullLogin,
   MAX_IMAGE_FILE_BYTES,
+  type MonitorCreated,
+  type MonitorRunSpec,
 } from '../core/worker/dockerEngine';
 import { abortError, isAbortError, type StartedProcess } from '../core/ports';
 import { errorMessage } from '../core/errors';
 import { readableStderr } from '../core/loader/pipeLoader';
-import type { MonitorCreated, MonitorRunSpec } from '../core/remoteMonitor/monitorEngine';
 import * as crypto from 'crypto';
 import { hasTagOrDigest, parseEngineIdentity, StreamRedactor } from '../core/helperChannel/protocol';
 import { StringDecoder } from 'string_decoder';

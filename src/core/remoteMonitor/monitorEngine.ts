@@ -6,7 +6,10 @@
 // Monitor container (RemoteSessionMonitor) asks of its Docker engine, as a port of its own. Before, the extension's
 // RemoteMonitorDocker took the arguments of the Docker CLI (`docker container inspect --format …`, `docker run -i …`); now
 // the worker implements it over the Engine API (src/core/worker/engineMonitor.ts). The decision logic of the ensure is
-// unchanged. Pure types and the shared readings of the engine's answers; no I/O, no `vscode`.
+// unchanged. Pure types and the shared readings of the engine's answers; no I/O, no `vscode`. Cleanup C5 (plan step 11J,
+// E3): the spec and the outcome of the attached create are types of the port DockerEngine (dockerEngine.ts), which this
+// port uses; the generic port no longer imports the monitor's types.
+import type { MonitorCreated, MonitorRunSpec } from '../worker/dockerEngine';
 
 /**
  * The state of the monitor container: missing, or its status (`created`, `running`, `paused`, `restarting`, `removing`,
@@ -25,43 +28,6 @@ export type MonitorInspected =
  * does not run), or `unknown` (the check itself failed: no answer in time, a transport error, an unexpected answer).
  */
 export type MonitorStoredScript = { hash: string } | 'none' | 'unknown';
-
-/** How the attached create of the monitor ended: its ready line, its end (with a name conflict), the time limit, a cancel. */
-export type MonitorCreated = { kind: 'ready' } | { kind: 'exited'; detail: string; conflict: boolean } | { kind: 'timeout' } | { kind: 'aborted' };
-
-/** The container of the monitor as its create makes it (RemoteSessionMonitor.runSpec). */
-export interface MonitorRunSpec {
-  name: string;
-  /** The helper tag, or the checked image ID of the helper image, or its monitor tag (plan step 11D3; never pulled). */
-  image: string;
-  /**
-   * Plan step 11D3 (option B of 2026-10-03): the image ID that the container must have when `image` is a tag (the
-   * monitor tag of the pinned helper image). The create checks it before the start; another image is a failure of the
-   * create (`exited`), and the caller removes the container by its labels.
-   */
-  imageId?: string;
-  labels: Record<string, string>;
-  /**
-   * Plan step 8, PR B (Q5): `on-failure`. Plan step 11H2 (the user's decision "unless-stopped" of 2026-10-09):
-   * `unless-stopped` for a monitor that runs permanently (monitorRestartPolicy).
-   */
-  restartPolicy: 'on-failure' | 'unless-stopped';
-  /**
-   * User requests 2026-09-28: the default network with image maintenance (outbound only), else none. Plan step 11H2 (D1
-   * of 2026-10-09): always the default network (the VS Code server of its background run; it publishes no port).
-   */
-  network: 'none' | 'default';
-  /** Monitor cleanup, user decision 2026-09-29 (R5): the json-file driver with two files of at most 1 MB. */
-  log: { driver: 'json-file'; maxSize: string; maxFile: string };
-  /**
-   * The socket of the engine and the state volume. Plan step 11H2: and the shared VS Code server store of the engine
-   * (`store`: its volume, read-write at its target, with `nocopy` as the worker mounts it), when the worker has one.
-   */
-  mounts: { socket: string; volume: string; volumeTarget: string; store?: { volume: string; target: string } };
-  env: Record<string, string>;
-  /** The pipe loader with the path, the hash of the script and its entry (loaderCommand). */
-  command: string[];
-}
 
 /** The engine of the monitor container (see the module comment). Each call is bounded by the implementation. */
 export interface MonitorEngine {

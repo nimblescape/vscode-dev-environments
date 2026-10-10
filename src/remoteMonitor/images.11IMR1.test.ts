@@ -7,18 +7,20 @@ import { describe, expect, it } from 'vitest';
 import { abortError } from '../core/ports';
 import type { EngineFilters, EngineImage } from '../core/worker/dockerEngine';
 import type { ImageEngine } from './engine';
-import { ImageMaintenance, localImagesOf, versionsOf, type HttpGet, type ReplacedImages } from './images';
+import type { HttpTransport } from '../core/http';
+import { ImageMaintenance, localImagesOf, versionsOf, type ReplacedImages } from './images';
 
 const DEV = 'ghcr.io/majikmate/devcontainer-dev';
 const PREFIXES = ['ghcr.io/majikmate/devcontainer-dev'];
 
 /** A registry that lists no tags (no pull): only the removals of a pass run. */
-const NO_TAGS: HttpGet = async () => ({ status: 404, headers: {}, body: '' });
+// Cleanup C5 (plan step 11J, C1): the registries are transports of the worker's registry client (before: an HttpGet).
+const NO_TAGS = (): HttpTransport => ({ request: async () => ({ status: 404, headers: {}, body: '' }) });
 
 /** A registry that lists the tags `tags` of every repository, without a token. */
 const tagsOf =
-  (tags: string[]): HttpGet =>
-  async () => ({ status: 200, headers: {}, body: JSON.stringify({ tags }) });
+  (tags: string[]) =>
+  (): HttpTransport => ({ request: async () => ({ status: 200, headers: {}, body: JSON.stringify({ tags }) }) });
 
 /**
  * An engine of images over the port: `listed` is its list (one entry per image ID), `inspected` the inspect JSON of an
@@ -56,11 +58,11 @@ function listedImage(id: string, created: string, repoTags: string[] = [], repoD
 
 const TWO_NEWEST = [listedImage('sha256:new', '2026-09-20T00:00:00.000Z', [`${DEV}:2`, `${DEV}:2.0.14`]), listedImage('sha256:prev', '2026-09-10T00:00:00.000Z', [`${DEV}:2.0.13`])];
 
-async function pass(engine: ImageEngine, options: { httpGet?: HttpGet; log?: string[]; replaced?: ReplacedImages } = {}): Promise<ReplacedImages> {
+async function pass(engine: ImageEngine, options: { registryTransport?: () => HttpTransport; log?: string[]; replaced?: ReplacedImages } = {}): Promise<ReplacedImages> {
   let stored: ReplacedImages = options.replaced ?? {};
   await new ImageMaintenance({
     engine,
-    httpGet: options.httpGet ?? NO_TAGS,
+    registryTransport: options.registryTransport ?? NO_TAGS,
     log: (message) => options.log?.push(message),
     prefixes: () => PREFIXES,
     knownRepositories: async () => [],
@@ -113,7 +115,7 @@ describe('the image maintenance over the Engine API (review round 1 of PR #126, 
       containerIds: async () => [],
       removeImage: async () => 'removed',
     };
-    const stored = await pass(engine, { httpGet: tagsOf(['2']) });
+    const stored = await pass(engine, { registryTransport: tagsOf(['2']) });
     expect(stored[DEV]).toContain('sha256:v1b');
   });
 
@@ -137,7 +139,7 @@ describe('the image maintenance over the Engine API (review round 1 of PR #126, 
     await pass({ ...engine, images: async () => Promise.reject(abortError()) }, { log });
     expect(log).toEqual(['The images could not be maintained: the list of the images failed: Docker did not answer within 60 seconds.']);
     const pulls: string[] = [];
-    await pass({ ...engine, pull: async () => Promise.reject(abortError()) }, { log: pulls, httpGet: tagsOf(['2']) });
+    await pass({ ...engine, pull: async () => Promise.reject(abortError()) }, { log: pulls, registryTransport: tagsOf(['2']) });
     expect(pulls).toContain(`${DEV}:2 could not be pulled: Docker did not answer within 3600 seconds.`);
   });
 

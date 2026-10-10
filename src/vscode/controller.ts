@@ -119,10 +119,10 @@ export interface ControllerDeps {
   docker: BootstrapDocker;
   /**
    * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the current engine
-   * (`tokenRemove` first), with the HostSide of this computer answering its requests. Undefined only in tests that do not
-   * exercise a flow.
+   * (`tokenRemove` first), with the HostSide of this computer answering its requests. Cleanup C5 (plan step 11J, A11):
+   * required (the extension always gives it).
    */
-  flow?: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
   service: EnvironmentOperations;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
@@ -1936,11 +1936,6 @@ export class Controller implements vscode.Disposable {
         return;
       }
       // Plan step 11B1: the flow runs in the worker of the engine (its log lines come from there).
-      if (this.deps.flow === undefined) {
-        // Review round 1 of plan step 11B1 (A-R1-9): never silent.
-        this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: this window runs no flow in a worker.`);
-        return;
-      }
       // Review round 1 of plan step 11B1 (A-R1-5): bounded, as the docker exec was before.
       const value = await this.deps.flow(OP_TOKEN_REMOVE, { environmentId: left.environmentId, containerName }, { timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS });
       if (parseTokenRemoveValue(value) === undefined) throw new Error('The worker answered the token removal with an invalid value.');

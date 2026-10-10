@@ -67,6 +67,7 @@ import { BACKGROUND_ENGINE_TIMEOUT_MS, BackgroundRun, type CacheRunStore, type V
 import { CLOCK_RESET_MS, parseCacheRunState, type CacheRunState } from './backgroundRules';
 import { DEFAULT_CACHE_UPDATE_SCHEDULE, cacheRunDue, parseCacheSchedule, type CacheSchedule as ParsedCacheSchedule } from '../core/remoteMonitor/cacheSettings';
 import { MONITOR_PERMANENT_ENV, MONITOR_VSCODE_STORE_ENV } from '../core/remoteMonitor/remoteSessionMonitor';
+import type { HttpTransport } from '../core/http';
 import { proxiedHttpsTransport } from '../core/proxyTransport';
 import { storeLock, storeTryLock, unpackServer } from '../core/worker/vscodeServerStore';
 import {
@@ -85,10 +86,8 @@ import { DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime } from '../core/remot
 import {
   ImageMaintenance,
   REMOTE_IMAGE_FIRST_PASS_MS,
-  nodeHttpGet,
   parseReplacedImages,
   prefixesFromEnv,
-  type HttpGet,
 } from './images';
 import { stopLockDeps, stopLocker, type StopLocker } from './stopLock';
 
@@ -574,8 +573,12 @@ export interface MainDeps {
    * port over the socket of the container (socketEngine). The tests pass a fake engine.
    */
   engine?: MonitorEngineParts;
-  /** The images (user requests 2026-09-28): the registry, and the standard input of `images -`. */
-  httpGet?: HttpGet;
+  /**
+   * The images (user requests 2026-09-28): the registry, and the standard input of `images -`. Cleanup C5 (plan step
+   * 11J, C1; decision of 2026-10-10): the HTTPS of the registry requests, made afresh for each pass of the images
+   * (default: the proxy of the daemon of the engine, proxiedHttpsTransport, as the VS Code part and the worker).
+   */
+  registryTransport?: () => HttpTransport;
   readStdin?: () => Promise<string>;
   /** Review round 2 of PR #63 (R2-4): the start of the removals of `run` (recordRemover). */
   exec?: ExecFile;
@@ -885,6 +888,16 @@ export class CacheSchedule {
 }
 
 /**
+ * The HTTPS of the monitor: through the proxy of the daemon of `engine` (decision C1 of 2026-10-05, as the worker; its
+ * settings read once, when the first request needs them, within BACKGROUND_ENGINE_TIMEOUT_MS). Plan step 11H2: the VS
+ * Code part of the background run; cleanup C5 (plan step 11J, C1; decision of 2026-10-10): the registry requests of the
+ * image maintenance too.
+ */
+export function daemonProxyTransport(engine: Pick<VscodeEngine, 'proxy'>): ReturnType<typeof proxiedHttpsTransport> {
+  return proxiedHttpsTransport(() => engine.proxy(AbortSignal.timeout(BACKGROUND_ENGINE_TIMEOUT_MS)));
+}
+
+/**
  * Plan step 11H2: the VS Code part of the background run in the container: the store that the worker mounts, read-write
  * at VSCODE_STORE_DIR (its volume named by DEVENV_VSCODE_STORE, which RemoteSessionMonitor.runSpec sets with the mount),
  * the HTTPS of the proxy of the daemon (decision C1 of 2026-10-05, as the worker), the lock of a server version with and
@@ -901,7 +914,7 @@ export function vscodeBackgroundDeps(
   return {
     store: {
       root: VSCODE_STORE_DIR,
-      transport: proxiedHttpsTransport(() => engine.proxy(AbortSignal.timeout(BACKGROUND_ENGINE_TIMEOUT_MS))),
+      transport: daemonProxyTransport(engine),
       architecture: (signal) => engine.architecture(signal),
       lock: (root, name, waitSeconds, signal) => storeLock(root, name, waitSeconds, signal),
       unpack: (archive, folder, signal) => unpackServer(archive, folder, signal),
@@ -999,7 +1012,7 @@ export async function main(argv: readonly string[], deps: MainDeps): Promise<num
       await settings.refresh();
       const images = new ImageMaintenance({
         engine,
-        httpGet: deps.httpGet ?? nodeHttpGet,
+        registryTransport: deps.registryTransport ?? (() => daemonProxyTransport(engine)),
         log,
         prefixes: () => settings.value.prefixes,
         knownRepositories: () => readImageList(stateDir),

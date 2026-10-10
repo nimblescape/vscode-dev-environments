@@ -12,7 +12,6 @@ import type { DockerEngine } from './dockerEngine';
 import type { HostSide } from './hostSide';
 import { workerServiceDeps, type WorkerServicesDeps } from './workerServices';
 
-const TARGET = { kind: 'local', host: undefined, endpoint: undefined } as never;
 const ID = 'e0123456789a';
 
 function setup() {
@@ -45,7 +44,7 @@ describe('review round 1 of PR #108 (B): the first heartbeat of the open in the 
     const { commands, deps } = setup();
     for (const [minutes, seconds] of [[2000, 86_400], [0.5, 60]] as const) {
       const services = deps({ monitorSource: COMPUTER, settings: { stopAfterMinutes: minutes } as never });
-      expect(await services.sessionMonitor!.heartbeat(TARGET, ID, false, 5)).toEqual({ ok: true });
+      expect(await services.sessionMonitor!.heartbeat(ID, false, 5)).toEqual({ ok: true });
       // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
       expect(commands.pop()).toEqual(scriptCommand('monitorHeartbeat', [JSON.stringify({ source: COMPUTER, limitSeconds: seconds, environments: [{ id: ID, keepRunning: false, seq: 5 }] })]));
     }
@@ -54,7 +53,7 @@ describe('review round 1 of PR #108 (B): the first heartbeat of the open in the 
   it('with the computer but without the settings: not sent, answered with its cause (no rejection)', async () => {
     const { commands, deps } = setup();
     const services = deps({ monitorSource: COMPUTER });
-    expect(await services.sessionMonitor!.heartbeat(TARGET, ID, true, 1)).toEqual({
+    expect(await services.sessionMonitor!.heartbeat(ID, true, 1)).toEqual({
       ok: false,
       detail: 'The operation has no settings for the time limit of the heartbeat.',
     });

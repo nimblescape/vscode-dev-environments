@@ -3,7 +3,10 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Digest requests to image registries (concept 7.7, implementation notes 9), as defined by the
-// OCI Distribution Specification, with the token authentication of the Docker registry API.
+// OCI Distribution Specification, with the token authentication of the Docker registry API. Cleanup C5 (plan step 11J,
+// C1; the user's decision of 2026-10-10): also the tag lists of the image maintenance of the Session Monitor
+// (listTags), so that the monitor reads them over the transport of its caller (the proxy of the daemon) with the same
+// challenge, token and redirect handling as the worker's image check.
 import * as crypto from 'crypto';
 import { errorMessage } from '../errors';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
@@ -32,6 +35,8 @@ export const CREDENTIALS_TIMEOUT_MS = 2500;
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const DIGEST = /^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]+$/;
+/** A token of a token service: visible ASCII only (review round 1 of PR #141, A-L1). */
+const VISIBLE_ASCII = /^[\x21-\x7e]+$/;
 
 export type DigestResult =
   | { kind: 'digest'; digest: string }
@@ -125,11 +130,25 @@ export function parseWwwAuthenticate(header: string): AuthChallenge[] {
   return challenges;
 }
 
+/** Why a registry request gave no answer to use (every DigestResult but the digest). */
+export type RegistryFailure = Exclude<DigestResult, { kind: 'digest' }>;
+
+/** Cleanup C5 (plan step 11J, C1): the tags of a repository, or why they could not be read. */
+export type TagListResult = { kind: 'tags'; tags: string[] } | RegistryFailure;
+
+/** Cleanup C5 (plan step 11J, C1): at most this many pages of a tag list (as the monitor's own client read them). */
+export const MAX_TAG_PAGES = 20;
+/** Cleanup C5 (plan step 11J, C1): the longest page of a tag list that is read (as the monitor's own client). */
+export const MAX_TAG_LIST_BYTES = 4 * 1024 * 1024;
+
+/** The registry and the repository path of a request (a manifest, a tag list). */
+type RepositoryRef = Pick<ImageReference, 'registry' | 'repository'>;
+
 /** Thrown for a failed connection or a request without an answer in time. */
 class TransportFailure extends Error {}
 
-type AuthResult = { kind: 'ok'; authorization: string } | { kind: 'result'; result: DigestResult };
-type TokenResult = { kind: 'token'; token: string } | { kind: 'denied'; status: number } | { kind: 'result'; result: DigestResult };
+type AuthResult = { kind: 'ok'; authorization: string } | { kind: 'result'; result: RegistryFailure };
+type TokenResult = { kind: 'token'; token: string } | { kind: 'denied'; status: number } | { kind: 'result'; result: RegistryFailure };
 
 /** Client for the manifest digest of a tag (HEAD request). Talks HTTPS only. */
 export class RegistryClient {
@@ -164,14 +183,75 @@ export class RegistryClient {
    */
   async getDigest(reference: ImageReference, signal?: AbortSignal): Promise<DigestResult> {
     if (reference.digest) return { kind: 'digest', digest: reference.digest };
-    const registry = reference.registry;
     try {
       return await this.resolve(reference, signal);
     } catch (error) {
-      if (error instanceof TransportFailure) return { kind: 'unreachable', registry, error: error.message };
-      if (isAbortError(error)) return { kind: 'unreachable', registry, error: 'No answer in time.' };
-      return { kind: 'error', registry, error: errorMessage(error) };
+      return failureOf(reference.registry, error);
     }
+  }
+
+  /**
+   * Cleanup C5 (plan step 11J, C1; decision of 2026-10-10): the tags of `repository` at `registry`: `GET
+   * https://<registry>/v2/<repository>/tags/list`, first without credentials; on 401 it follows the `WWW-Authenticate`
+   * challenge as getDigest does (with the credentials of the provider, if it has some; a 401 of another host that the
+   * registry redirected to gives `authRequired`), and keeps that authorization for the further pages. All pages (the
+   * RFC 5988 `Link` with `rel="next"`, only on the same registry; at most MAX_TAG_PAGES, each at most
+   * MAX_TAG_LIST_BYTES). Never throws: an aborted signal gives `unreachable`.
+   */
+  async listTags(registry: string, repository: string, signal?: AbortSignal): Promise<TagListResult> {
+    try {
+      return await this.tagPages({ registry, repository }, signal);
+    } catch (error) {
+      return failureOf(registry, error);
+    }
+  }
+
+  private async tagPages(reference: RepositoryRef, signal: AbortSignal | undefined): Promise<TagListResult> {
+    const registry = reference.registry;
+    const base = `https://${registry}`;
+    const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': USER_AGENT };
+    // Review round 1 of PR #141 (B, defect 1): the origin as the URL parser writes it (host in lower case, without the
+    // default port 443), so that a registry written as `Host:443` or in upper case pages on.
+    const origin = new URL(base).origin;
+    const tags: string[] = [];
+    let url: string | undefined = `${base}/v2/${reference.repository}/tags/list`;
+    for (let page = 0; url !== undefined && page < MAX_TAG_PAGES; page++) {
+      const request: HttpRequest = { method: 'GET', url, headers, maxBodyBytes: MAX_TAG_LIST_BYTES };
+      const first = await this.sendTracked(request, signal);
+      let response = first.response;
+      if (response.status === 401 && headers.Authorization === undefined) {
+        if (first.url.host !== new URL(url).host) {
+          this.logger.warn(
+            `The registry ${registryDisplayName(registry)} redirected to ${first.url.host}, which asked for a sign-in. ` +
+              'Registry credentials are not sent to another host.',
+          );
+          return { kind: 'authRequired', registry };
+        }
+        const auth = await this.authenticate(reference, response, signal);
+        if (auth.kind === 'result') return auth.result;
+        headers.Authorization = auth.authorization;
+        response = await this.send({ ...request, headers }, signal);
+      }
+      if (response.status !== 200) return statusResult(registry, response.status);
+      let body: unknown;
+      try {
+        body = JSON.parse(response.body);
+      } catch {
+        return { kind: 'error', registry, error: 'The registry sent an invalid tag list.' };
+      }
+      const listed = typeof body === 'object' && body !== null ? (body as { tags?: unknown }).tags : undefined;
+      if (Array.isArray(listed)) for (const tag of listed) if (typeof tag === 'string') tags.push(tag);
+      // The next page (RFC 5988 Link), only on the same registry.
+      const next = /<([^>]+)>;\s*rel="next"/.exec(response.headers.link ?? '')?.[1];
+      url = next === undefined ? undefined : new URL(next, base).origin === origin ? new URL(next, base).toString() : undefined;
+    }
+    if (url !== undefined) {
+      // Review round 1 of PR #141 (B, defect 1): the list stays the partial one, and the log says so.
+      this.logger.warn(
+        `The tag list of ${reference.repository} at ${registryDisplayName(registry)} has more than ${MAX_TAG_PAGES} pages; only the first ${MAX_TAG_PAGES} were read.`,
+      );
+    }
+    return { kind: 'tags', tags };
   }
 
   private async resolve(reference: ImageReference, signal: AbortSignal | undefined): Promise<DigestResult> {
@@ -234,7 +314,7 @@ export class RegistryClient {
   }
 
   private async authenticate(
-    reference: ImageReference,
+    reference: RepositoryRef,
     response: HttpResponse,
     signal: AbortSignal | undefined,
   ): Promise<AuthResult> {
@@ -252,7 +332,7 @@ export class RegistryClient {
     return { kind: 'result', result: { kind: 'authRequired', registry } };
   }
 
-  private async bearer(reference: ImageReference, challenge: AuthChallenge, signal: AbortSignal | undefined): Promise<AuthResult> {
+  private async bearer(reference: RepositoryRef, challenge: AuthChallenge, signal: AbortSignal | undefined): Promise<AuthResult> {
     const registry = reference.registry;
     let realm: URL;
     try {
@@ -304,7 +384,9 @@ export class RegistryClient {
   ): Promise<TokenResult> {
     const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': USER_AGENT };
     if (credentials) headers.Authorization = `Basic ${basic(credentials)}`;
-    const response = await this.send({ method: 'GET', url: url.toString(), headers }, signal);
+    // Review round 1 of PR #141 (A-L2): the token answer has the body limit of a tag list, as every answer of the
+    // monitor's former client had (not the transport's 16 MiB).
+    const response = await this.send({ method: 'GET', url: url.toString(), headers, maxBodyBytes: MAX_TAG_LIST_BYTES }, signal);
     if (response.status === 401 || response.status === 403) return { kind: 'denied', status: response.status };
     if (response.status !== 200) {
       const result = statusResult(registry, response.status);
@@ -319,6 +401,11 @@ export class RegistryClient {
     }
     if (typeof token !== 'string' || token === '') {
       return { kind: 'result', result: { kind: 'error', registry, error: 'The token service returned no token.' } };
+    }
+    // Review round 1 of PR #141 (A-L1): a token goes into the Authorization header, so one with a character that is not
+    // visible ASCII (CR, LF, a space, a control or non-ASCII character) is refused before any request carries it.
+    if (!VISIBLE_ASCII.test(token)) {
+      return { kind: 'result', result: { kind: 'error', registry, error: 'The token service returned an invalid token.' } };
     }
     return { kind: 'token', token };
   }
@@ -388,12 +475,20 @@ export class RegistryClient {
       const next = new URL(location, url);
       const headers = { ...current.headers };
       if (next.host !== url.host) delete headers.Authorization;
-      current = { method: current.method, url: next.toString(), headers };
+      // Cleanup C5 (plan step 11J, C1): the body limit of the request (a tag list) stays for the redirected one.
+      current = { ...current, url: next.toString(), headers };
     }
   }
 }
 
-function statusResult(registry: string, status: number): DigestResult {
+/** The result of a request that threw: a transport failure or an abort is `unreachable`, anything else an `error`. */
+function failureOf(registry: string, error: unknown): RegistryFailure {
+  if (error instanceof TransportFailure) return { kind: 'unreachable', registry, error: error.message };
+  if (isAbortError(error)) return { kind: 'unreachable', registry, error: 'No answer in time.' };
+  return { kind: 'error', registry, error: errorMessage(error) };
+}
+
+function statusResult(registry: string, status: number): RegistryFailure {
   if (status === 401 || status === 403) return { kind: 'authRequired', registry };
   if (status === 404) return { kind: 'notFound', registry };
   if (status >= 500) return { kind: 'unreachable', registry, error: `The registry answered with HTTP ${status}.` };
