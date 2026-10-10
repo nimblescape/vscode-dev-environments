@@ -11,7 +11,8 @@
 # repositories of the dev environments: changes that are not pushed are lost. Close the VS Code windows that use the
 # engine first (their worker and their containers go too).
 #
-#   bash scripts/purge-docker-context.sh                 # shows what it removes, then asks for the context name
+#   bash scripts/purge-docker-context.sh                 # shows everything (docker system df -v) and what it removes,
+#                                                        # then asks for the context name
 #   bash scripts/purge-docker-context.sh --dry-run       # only shows what it would remove
 #   bash scripts/purge-docker-context.sh --yes devenv    # no question; runs only when the current context is devenv
 #
@@ -59,6 +60,10 @@ count() { if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l | tr -d '
 echo "Docker context: $ctx"
 echo "Endpoint:       ${endpoint:-unknown}"
 echo "Engine:         $engine"
+echo
+# Everything that is there first: the images, containers, volumes and build cache of the engine, each with its size.
+echo "== Everything on $ctx (docker system df -v)"
+d system df -v
 echo
 echo "It removes: $(count "$containers") container(s) ($(count "$running") running), $(count "$volumes") volume(s), $(count "$images") image(s), the unused networks and the build cache."
 envs=$(printf '%s\n' "$volumes" | grep '^devenv-' | grep -v '^devenv-vscode$' || true)
