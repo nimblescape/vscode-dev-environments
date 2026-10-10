@@ -103,7 +103,7 @@ export const SECRET_REGISTRY = 'registry';
 export const MIN_SECRET_LENGTH = 4;
 
 /**
- * Cleanup after plan step 11 (PR C3, B2): the one check of a GitHub token before it is used (the clone, the token write
+ * Cleanup after plan step 11 (PR #139, B2): the one check of a GitHub token before it is used (the clone, the token write
  * into the dev container, the secret input of an exec): not empty and without white space. Before: three copies of the
  * same rule (WorkspaceHelper, EngineDocker.exec, EnvironmentService.writeGitToken).
  */

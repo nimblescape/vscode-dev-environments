@@ -245,7 +245,7 @@ export class EngineDocker implements EnvironmentDocker {
     // Plan step 11I (PR B): no other secret of the operation (a registry login) ever goes into a container, and a token
     // that the operation does not hold is refused before anything is sent. Review round 1 of PR #124 (A, L-1): the token
     // that is sent is checked here, where it is sent (not only the token of the pipeline's session): a value that is
-    // empty or holds white space is refused too (cleanup after plan step 11, PR C3, B2: the one check, isValidToken).
+    // empty or holds white space is refused too (cleanup after plan step 11, PR #139, B2: the one check, isValidToken).
     const token = options.secretInputName !== undefined ? this.secretOf(SECRET_TOKEN) : undefined;
     if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || !isValidToken(token))) {
       throw new EngineError('A docker exec with a secret input needs it as the token secret of the operation.', 0);

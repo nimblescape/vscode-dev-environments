@@ -428,8 +428,8 @@ describe('WorkspaceHelper.clone', () => {
     expect(docker.calls).toHaveLength(0);
   });
 
-  // Cleanup after plan step 11 (PR C3, B2): the one token check of the protocol (isValidToken).
-  it('refuses a token with white space before any Docker call (PR C3, B2)', async () => {
+  // Cleanup after plan step 11 (PR #139, B2): the one token check of the protocol (isValidToken).
+  it('refuses a token with white space before any Docker call (PR #139, B2)', async () => {
     const helper = createHelper();
     for (const token of ['gho_a b', 'gho_line\nbreak', '\t']) {
       await expect(helper.clone({ volumeName: 'vol', repository: 'acme/api', token }), JSON.stringify(token)).rejects.toMatchObject({ code: 'signInRequired' });
@@ -437,9 +437,9 @@ describe('WorkspaceHelper.clone', () => {
     expect(docker.calls).toHaveLength(0);
   });
 
-  // Cleanup after plan step 11 (PR C3, B2): each stream of the clone through the protocol's StreamRedactor. Failed with
+  // Cleanup after plan step 11 (PR #139, B2): each stream of the clone through the protocol's StreamRedactor. Failed with
   // the former masking of each chunk on its own.
-  it('masks a token split across two chunks of its output, and the start of one that its output ends with (PR C3, B2)', async () => {
+  it('masks a token split across two chunks of its output, and the start of one that its output ends with (PR #139, B2)', async () => {
     docker.forwardOutput = false;
     docker.handler = (args, options) => {
       if (args[0] !== 'run') return {};
@@ -1250,10 +1250,10 @@ describe('review PL-1: the token in the output of run-user-commands and up', () 
     expect(output.join('')).toBe('a *** b\n***\n');
   });
 
-  // Cleanup after plan step 11 (PR C3, B2): the output goes through the protocol's StreamRedactor. Failed with
+  // Cleanup after plan step 11 (PR #139, B2): the output goes through the protocol's StreamRedactor. Failed with
   // WorkspaceHelper's own RedactingStream (stderr), whose flush passed the start of a token that a cut stream ended with
   // on unmasked, and with the line-by-line masking of stdout.
-  it('masks the start of a token that a cut stream ends with, on stderr and on stdout (PR C3, B2)', async () => {
+  it('masks the start of a token that a cut stream ends with, on stderr and on stdout (PR #139, B2)', async () => {
     streams({ stderr: ['npm ERR! ', TOKEN.slice(0, 10)], stdout: [RESULT] });
     const output: string[] = [];
     await runUserCommands(output);

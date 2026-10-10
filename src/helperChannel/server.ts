@@ -248,11 +248,18 @@ export class ChannelServer {
     });
   }
 
-  /** The output of an operation as `out` messages, in pieces of at most OUTPUT_CHUNK_CHARACTERS. */
+  /**
+   * The output of an operation as `out` messages, in pieces of at most OUTPUT_CHUNK_CHARACTERS. Review round 1 of PR
+   * #139 (A-L1): a piece never ends between the two halves of a surrogate pair (it ends one character earlier).
+   */
   private sendOutput(id: number, stream: 'stdout' | 'stderr'): (text: string) => void {
     return (text) => {
-      for (let start = 0; start < text.length; start += OUTPUT_CHUNK_CHARACTERS) {
-        this.send({ t: 'out', id, stream, data: text.slice(start, start + OUTPUT_CHUNK_CHARACTERS) });
+      for (let start = 0; start < text.length; ) {
+        let end = Math.min(start + OUTPUT_CHUNK_CHARACTERS, text.length);
+        const last = text.charCodeAt(end - 1);
+        if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+        this.send({ t: 'out', id, stream, data: text.slice(start, end) });
+        start = end;
       }
     };
   }

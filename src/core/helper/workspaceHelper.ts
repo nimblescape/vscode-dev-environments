@@ -74,7 +74,7 @@ export interface HelperDeps {
  */
 export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
 
-// Cleanup after plan step 11 (PR C3, B2): the token check (isValidToken) and the masking (redact, StreamRedactor) are the
+// Cleanup after plan step 11 (PR #139, B2): the token check (isValidToken) and the masking (redact, StreamRedactor) are the
 // protocol's, the one implementation. Before: a copy of the check, an own `redact`, and an own line-buffered stream
 // (RedactingStream) whose flush passed the start of a token that a cut stream ended with on unmasked.
 function checkToken(token: string): void {
@@ -182,7 +182,7 @@ export class WorkspaceHelper {
     checkToken(p.token);
     checkRepository(p.repository);
     const output = p.onOutput ?? this.logOutput;
-    // Cleanup after plan step 11 (PR C3, B2): each stream through a StreamRedactor, so a token split across two chunks is
+    // Cleanup after plan step 11 (PR #139, B2): each stream through a StreamRedactor, so a token split across two chunks is
     // masked too (before: each chunk on its own).
     const streams = { stdout: new StreamRedactor(p.token, output), stderr: new StreamRedactor(p.token, output) };
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
@@ -378,6 +378,11 @@ export class WorkspaceHelper {
     override?: Record<string, unknown>;
     files?: HelperFiles;
     env?: Record<string, string>;
+    /**
+     * Review round 1 of PR #139 (A-L3): the token of the open, removed from the output and from the error like for `up`
+     * and run-user-commands (also when it is split across chunks; none of the commands of the build reads it).
+     */
+    token?: string;
     /** The helper image of the open (HelperImageUse). */
     image?: HelperImageUse;
     onOutput?: (text: string) => void;
@@ -402,6 +407,7 @@ export class WorkspaceHelper {
         },
       },
       env: p.env,
+      secret: p.token,
       image: p.image,
       onOutput: p.onOutput,
       signal: p.signal,
@@ -776,7 +782,7 @@ export class WorkspaceHelper {
     const output = options.onOutput ?? this.logOutput;
     const secret = options.secret;
     // Review PL-1: stdout goes on in whole lines without the result line (ResultLineFilter). Cleanup after plan step 11
-    // (PR C3, B2): both streams through a StreamRedactor (without a secret it passes the text on as it is); its flush
+    // (PR #139, B2): both streams through a StreamRedactor (without a secret it passes the text on as it is); its flush
     // masks the start of a token that a cut stream ended with (before: stderr through RedactingStream, which passed it
     // on unmasked, and stdout masked line by line).
     const stdout = new StreamRedactor(secret, output);
@@ -785,7 +791,8 @@ export class WorkspaceHelper {
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, {
-        // Plan step 6, PR C: `up` and run-user-commands take the token only to mask their output in the helper.
+        // Plan step 6, PR C: `up` and run-user-commands (and the build, review round 1 of PR #139, A-L3) take the token
+        // only to mask their output in the helper.
         batch: { ...options.batch, ...(secret !== undefined ? { secret } : {}) },
         env: options.env,
         image: options.image,

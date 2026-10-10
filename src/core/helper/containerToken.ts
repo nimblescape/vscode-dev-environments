@@ -325,7 +325,7 @@ export function tokenLogin(login: string): string {
 }
 
 /**
- * The text of a failed run of the scripts, without the token. Cleanup after plan step 11 (PR C3, B2): masked by the
+ * The text of a failed run of the scripts, without the token. Cleanup after plan step 11 (PR #139, B2): masked by the
  * protocol's `redact` (before: an own copy of its rule).
  */
 export function tokenRunMessage(result: RunResult, token?: string): string {

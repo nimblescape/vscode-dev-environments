@@ -11,7 +11,7 @@ import { type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision, type RemovableVolumes } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
-import { isValidToken, type SECRET_TOKEN } from '../helperChannel/protocol';
+import { isValidToken, redact, type SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
 import { mountsVscodeStore, vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
 import { vscodeExtensionSeedOutcome } from '../worker/vscodeExtensionSeed';
@@ -2681,6 +2681,8 @@ export class EnvironmentService extends OperationBase {
         configPath: loaded.configPath,
         imageName,
         ...(loaded.compose ? this.composeBuildOptions(env, loaded.compose) : {}),
+        // Review round 1 of PR #139 (A-L3): only masked in the build's output, like for `up`.
+        token: ctx.session.token,
         onOutput: this.output,
         image: ctx.helperImage,
         signal: ctx.signal,
@@ -5024,7 +5026,7 @@ export class EnvironmentService extends OperationBase {
       this.logger.warn(`The GitHub login ${JSON.stringify(account.login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
     }
     try {
-      // Cleanup after plan step 11 (PR C3, B2): the one token check (isValidToken).
+      // Cleanup after plan step 11 (PR #139, B2): the one token check (isValidToken).
       if (!isValidToken(token)) throw new Error('No valid GitHub token.');
       const result = await runScript(this.deps.docker, container, 'tokenWrite', [user, tokenLogin(account.login)], {
         user: 'root',
@@ -5032,7 +5034,9 @@ export class EnvironmentService extends OperationBase {
         timeoutMs: GIT_EXEC_TIMEOUT_MS,
       });
       if (result.exitCode !== 0) throw new Error(tokenRunMessage(result, token));
-      const output = tokenRunMessage({ ...result, stderr: '' }, token);
+      // Review round 1 of PR #139 (B, other observations): the standard output of a successful write, masked; a write
+      // without output logs nothing (before: tokenRunMessage, which logged "exit code 0" for it).
+      const output = redact(result.stdout.trim(), token);
       if (output !== '') this.logger.info(output);
     } catch (error) {
       if (this.isCancellation(error, ctx.signal)) throw error;

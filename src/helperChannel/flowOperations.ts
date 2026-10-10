@@ -65,7 +65,7 @@ import { OperationError, type OperationContext, type OperationHandler } from './
 
 /**
  * Plan step 5, PR C: the log of the extension as the Logger of the worker's code (plan step 11B3b: shared here).
- * Cleanup after plan step 11 (PR C3, D1, decision of 2026-10-10): `output`, the raw output of the tools (the Dev
+ * Cleanup after plan step 11 (PR #139, D1, decision of 2026-10-10): `output`, the raw output of the tools (the Dev
  * Container CLI's build and up, the clone, the lifecycle commands, the pulls), goes to the extension's log as the
  * operation's output (OperationContext.output: masked by its StreamRedactor with every secret that the operation ever
  * held, also one split between two pieces; the rest is flushed, masked, when the operation ends; sent in pieces of at

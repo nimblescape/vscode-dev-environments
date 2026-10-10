@@ -771,6 +771,8 @@ export class FakeHelper implements EnvironmentHelper {
   readonly userCommandContext: Array<{ execsBefore: number; token?: string }> = [];
   /** Review PL-1: the token that each `up` got for the redaction of its output. */
   readonly upTokens: Array<string | undefined> = [];
+  /** Review round 1 of PR #139 (A-L3): the token that each build got (only for the redaction of its output). */
+  readonly buildTokens: Array<string | undefined> = [];
   /** runUserCommands fails with this error (not a lifecycle failure: that is lifecycleFailure). */
   userCommandsError: Maybe<Error>;
   /** Each readConfiguration, with what a Docker Compose configuration passes. */
@@ -958,10 +960,12 @@ export class FakeHelper implements EnvironmentHelper {
     override?: Record<string, unknown>;
     files?: Readonly<Record<string, string>>;
     env?: Record<string, string>;
+    token?: string;
     image?: HelperImageUse;
     signal?: AbortSignal;
   }): Promise<DevcontainerResult> {
     this.usedImage('build', p.image);
+    this.buildTokens.push(p.token);
     this.mount(p.volumeName);
     this.calls.push(`build ${p.imageName}`);
     this.builds.push({

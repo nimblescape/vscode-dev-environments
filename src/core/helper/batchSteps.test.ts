@@ -139,21 +139,23 @@ describe('batchStepCommand (plan step 6, PR B)', () => {
       git: false,
     });
     const configFile = `${FOLDER}/.devcontainer/devcontainer.json`;
-    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: buildCommand, with
-    // no input).
-    // User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: build and up run with the entitlement check of
-    // bake off (BAKE_FS_ENTITLEMENTS_OFF).
+    // Follow-up of PR #121: every build runs through WRITE_AND_RUN_SCRIPT, for its lockfile rule (was: buildCommand,
+    // with no input). User decision of 2026-10-09 (Buildx 0.37.2): changed expectation: build and up run with the
+    // entitlement check of bake off (BAKE_FS_ENTITLEMENTS_OFF). Review round 1 of PR #139 (A-L3): changed expectation:
+    // the build takes the token to mask its output (`secret: 'mask'`, as up and run-user-commands; before: no secret).
     expect(batchStepCommand('build', { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1' })).toEqual({
       command: writeAndRunCommand({ repositoryConfig: configFile }, buildArgs({ workspaceFolder: FOLDER, configPath: configFile, imageName: 'devenv-x:1' })),
       input: writeAndRunInput(undefined, undefined),
       env: { BUILDX_BAKE_ENTITLEMENTS_FS: '0' },
       git: false,
+      secret: 'mask',
     });
     expect(batchStepCommand('build', { repository: REPO, configPath: '.devcontainer/devcontainer.json', imageName: 'devenv-x:1', override, files })).toEqual({
       command: writeAndRunCommand({ repositoryConfig: configFile, config: OVERRIDE_CONFIG_PATH }, buildArgs({ workspaceFolder: FOLDER, configPath: OVERRIDE_CONFIG_PATH, imageName: 'devenv-x:1' })),
       input: writeAndRunInput(files, override),
       env: { BUILDX_BAKE_ENTITLEMENTS_FS: '0' },
       git: false,
+      secret: 'mask',
     });
     const up = upArgs({ workspaceFolder: FOLDER, overrideConfigPath: OVERRIDE_CONFIG_PATH, idLabel, removeExistingContainer: true });
     expect(batchStepCommand('up', { repository: REPO, override, environmentId: ID, removeExistingContainer: true })).toEqual({

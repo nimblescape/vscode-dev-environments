@@ -240,6 +240,56 @@ export async function collectBatchStep(
   }
 }
 
+/**
+ * Review round 1 of PR #139 (A-M1): the raw output of an operation that the extension writes to its log (no `onOutput`)
+ * is held per operation and stream until its line ends, so that the log's pattern masking (redactSecrets of
+ * OutputChannelLogger: a GitHub token that the operation does not hold) sees whole lines, not pieces that a cut in the
+ * worker split (the pipe reads, the OUTPUT_CHUNK_CHARACTERS pieces). Bounded: a line longer than
+ * MAX_HELD_OUTPUT_CHARACTERS is written up to the last HELD_OUTPUT_TAIL_CHARACTERS (more than any token the pattern
+ * matches), cut after a character that cannot be part of a token (the pattern matches a whole run of the characters
+ * [A-Za-z0-9_]). The rest is written when the operation ends (its result, failure, cancel, time limit, or the loss of
+ * the channel).
+ */
+export const MAX_HELD_OUTPUT_CHARACTERS = 64 * 1024;
+/** Review round 1 of PR #139 (A-M1): what stays held of a line beyond MAX_HELD_OUTPUT_CHARACTERS. */
+export const HELD_OUTPUT_TAIL_CHARACTERS = 256;
+
+/** Review round 1 of PR #139 (A-M1): one stream of raw output, written in whole lines (MAX_HELD_OUTPUT_CHARACTERS). */
+export class OutputLines {
+  private held = '';
+
+  constructor(private readonly write: (text: string) => void) {}
+
+  push(piece: string): void {
+    const text = this.held + piece;
+    let cut = Math.max(text.lastIndexOf('\n'), text.lastIndexOf('\r')) + 1;
+    if (text.length - cut > MAX_HELD_OUTPUT_CHARACTERS) cut = tokenSafeCut(text, text.length - HELD_OUTPUT_TAIL_CHARACTERS);
+    this.held = text.slice(cut);
+    if (cut > 0) this.write(text.slice(0, cut));
+  }
+
+  /** Writes what is held. */
+  flush(): void {
+    const rest = this.held;
+    this.held = '';
+    if (rest !== '') this.write(rest);
+  }
+}
+
+/**
+ * The end of the text to write before `limit`: after its last character that is not one of [A-Za-z0-9_] (nor the first
+ * half of a surrogate pair), else at `limit` (a run of such characters longer than MAX_HELD_OUTPUT_CHARACTERS).
+ */
+function tokenSafeCut(text: string, limit: number): number {
+  for (let index = limit - 1; index >= 0; index--) {
+    const code = text.charCodeAt(index);
+    const word = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+    if (!word && !(code >= 0xd800 && code <= 0xdbff)) return index + 1;
+  }
+  const code = text.charCodeAt(limit - 1);
+  return code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit;
+}
+
 interface Pending {
   op: string;
   /** Review round 4 (M2): the cancel was sent; waiting for the script to confirm it. */
@@ -252,6 +302,8 @@ interface Pending {
   onAbort?: () => void;
   /** Plan step 11A: aborts the handlers of its requests when the operation ends. */
   asks?: AbortController;
+  /** Review round 1 of PR #139 (A-M1): its raw output for the log, held until its line ends (OutputLines). */
+  output?: Record<'stdout' | 'stderr', OutputLines>;
 }
 
 /** One open channel. Create it with HelperChannel.open. */
@@ -444,8 +496,14 @@ export class HelperChannel {
       case 'out': {
         const pending = this.pending.get(message.id);
         if (!pending || pending.cancelling) return;
-        if (pending.options.onOutput) pending.options.onOutput(message.stream, message.data);
-        else this.options.logger.output(message.data);
+        if (pending.options.onOutput) {
+          pending.options.onOutput(message.stream, message.data);
+          return;
+        }
+        // Review round 1 of PR #139 (A-M1): in whole lines, so that the log's pattern masking sees a token whole.
+        const write = (text: string) => this.options.logger.output(text);
+        pending.output ??= { stdout: new OutputLines(write), stderr: new OutputLines(write) };
+        pending.output[message.stream].push(message.data);
         return;
       }
       case 'ask':
@@ -544,6 +602,9 @@ export class HelperChannel {
     const pending = this.pending.get(id);
     if (!pending) return undefined;
     this.pending.delete(id);
+    // Review round 1 of PR #139 (A-M1): the held output is written when the operation ends, however it ends.
+    pending.output?.stdout.flush();
+    pending.output?.stderr.flush();
     pending.asks?.abort();
     if (pending.timer) clearTimeout(pending.timer);
     if (pending.onAbort) pending.options.signal?.removeEventListener('abort', pending.onAbort);

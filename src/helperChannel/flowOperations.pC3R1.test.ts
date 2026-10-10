@@ -2,18 +2,21 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR #139, D1, decision of 2026-10-10): the raw output of the tools of a flow in the worker
-// (contextLogger(context).output) reaches the Dev Environments log of the extension, through the secret masking of the
-// operation (its StreamRedactor). The worker's ChannelServer and the extension's HelperChannel are connected in memory;
-// the log is the Logger of the channel (as in the extension, a flow passes no onOutput, so its output goes to the log).
+// Review round 1 of cleanup PR #139 (B, mutation probes): the raw tool output of a flow in the worker
+// (contextLogger(context).output, D1) reaches the log of the extension in full (also beyond one piece of the channel),
+// and every secret of the operation is masked in it (also one that a later answer gave, split across pieces). The
+// harness is the one of flowOperations.pC3.test.ts: the worker's ChannelServer and the extension's HelperChannel in
+// memory.
 import { afterEach, describe, expect, it } from 'vitest';
 import { HelperChannel } from '../core/helperChannel/helperChannel';
 import type { Logger, StartedProcess } from '../core/ports';
+import { OUTPUT_CHUNK_CHARACTERS } from '../core/helperChannel/protocol';
 import { contextLogger } from './flowOperations';
 import { ChannelServer, type OperationHandler } from './server';
 
 const TOKEN = 'gho_0123456789abcdefSECRETtoken';
 const OP = 'toolOutput';
+const REGISTRY = 'registry-password-PROBE-0123';
 
 /**
  * The extension's HelperChannel on a ChannelServer of the worker in this process (the first line, the script, dropped).
@@ -77,7 +80,8 @@ function writesOutput(pieces: string[], options: { forget?: boolean } = {}): Ope
   };
 }
 
-const answerToken = async () => ({ value: null, secrets: { token: TOKEN } });
+const answerToken = async (_kind: unknown, payload: unknown): Promise<{ value: unknown; secrets: Record<string, string> }> =>
+  (payload as { name?: string }).name === 'registry' ? { value: null, secrets: { registry: REGISTRY } } : { value: null, secrets: { token: TOKEN } };
 
 let opened: Awaited<ReturnType<typeof connect>> | undefined;
 
@@ -93,37 +97,38 @@ async function run(pieces: string[], options: { forget?: boolean } = {}): Promis
   return { output: opened.log.output.join(''), pieces: opened.log.output };
 }
 
-describe('the raw tool output of a flow in the worker reaches the log of the extension (PR #139, D1)', () => {
-  it('passes the output on as it is, in its order, before the result', async () => {
-    const { output } = await run(["Cloning into 'api'...\n", 'Receiving objects: 100% (12/12), done.\n', '[2 ms] Start: Run: docker build\n']);
-    expect(output).toBe("Cloning into 'api'...\nReceiving objects: 100% (12/12), done.\n[2 ms] Start: Run: docker build\n");
+describe('the raw tool output of a flow in the worker (review round 1 of PR #139, B)', () => {
+  it('reaches the log in full and in order, also a piece longer than OUTPUT_CHUNK_CHARACTERS', async () => {
+    const long = Array.from({ length: 3 * 1024 }, (_, index) => `line ${String(index).padStart(5, '0')}\n`).join('');
+    expect(long.length).toBeGreaterThan(2 * OUTPUT_CHUNK_CHARACTERS);
+    const { output, pieces } = await run(['start\n', long, 'end\n']);
+    expect(output).toBe(`start\n${long}end\n`);
+    expect(pieces.every((piece) => piece.length <= OUTPUT_CHUNK_CHARACTERS)).toBe(true);
   });
 
-  it('masks the token also when two pieces split it, at every split', async () => {
-    for (let at = 1; at < TOKEN.length; at += 5) {
-      const { output } = await run([`remote: https://x-access-token:${TOKEN.slice(0, at)}`, `${TOKEN.slice(at)}@github.com\n`, 'done\n']);
-      expect(output, `split at ${at}`).toBe('remote: https://x-access-token:***@github.com\ndone\n');
-      opened?.channel.closeNow();
-      opened?.server.shutdown();
-    }
+  it('masks a secret that a later answer gave (a registry login), also split across pieces', async () => {
+    opened = await connect(async (_params, context) => {
+      await context.ask('secret', { name: 'token' });
+      const logger = contextLogger(context);
+      logger.output(`token ${TOKEN}\n`);
+      await context.ask('secret', { name: 'registry' });
+      logger.output(`login ${REGISTRY.slice(0, 10)}`);
+      logger.output(`${REGISTRY.slice(10)} ok\n`);
+      logger.output(`cut ${REGISTRY.slice(0, 6)}`);
+      return { done: true };
+    });
+    expect(await opened.channel.flow(OP, {}, { onAsk: answerToken })).toEqual({ done: true });
+    expect(opened.log.output.join('')).toBe('token ***\nlogin *** ok\ncut ***');
   });
 
-  it('masks the token at the very end of the output, also when the operation ends in the middle of it (flushed, masked)', async () => {
-    expect((await run(['npm ERR! last line without a line feed ', TOKEN])).output).toBe('npm ERR! last line without a line feed ***');
-    opened?.channel.closeNow();
-    opened?.server.shutdown();
-    // The stream was cut after the start of the token: the held-back start goes on as `***` when the operation ends.
-    const cut = await run(['npm ERR! cut ', TOKEN.slice(0, 12)]);
-    expect(cut.output).toBe('npm ERR! cut ***');
-    expect(cut.output).not.toContain(TOKEN.slice(0, 4));
-  });
-
-  it('a trailing partial line goes to the log too', async () => {
-    expect((await run(['line\n', 'partial line without a line feed'])).output).toBe('line\npartial line without a line feed');
-  });
-
-  it('masks a token that the operation held and no longer holds', async () => {
-    const { output } = await run([`token ${TOKEN.slice(0, 7)}`, `${TOKEN.slice(7)} forgotten\n`], { forget: true });
-    expect(output).toBe('token *** forgotten\n');
+  it('the stderr of an operation is flushed (masked) at its end too, after the stdout of the flow', async () => {
+    opened = await connect(async (_params, context) => {
+      await context.ask('secret', { name: 'token' });
+      contextLogger(context).output('tool line\n');
+      context.output('stderr', `cut ${TOKEN.slice(0, 9)}`);
+      return { done: true };
+    });
+    expect(await opened.channel.flow(OP, {}, { onAsk: answerToken })).toEqual({ done: true });
+    expect(opened.log.output.join('')).toBe('tool line\ncut ***');
   });
 });
