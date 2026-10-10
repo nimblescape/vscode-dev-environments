@@ -427,6 +427,31 @@ describe('WorkspaceHelper.clone', () => {
     await expect(helper.clone({ volumeName: 'vol', repository: 'acme/..', token: TOKEN })).rejects.toThrow(/Invalid repository/);
     expect(docker.calls).toHaveLength(0);
   });
+
+  // Cleanup after plan step 11 (PR #139, B2): the one token check of the protocol (isValidToken).
+  it('refuses a token with white space before any Docker call (PR #139, B2)', async () => {
+    const helper = createHelper();
+    for (const token of ['gho_a b', 'gho_line\nbreak', '\t']) {
+      await expect(helper.clone({ volumeName: 'vol', repository: 'acme/api', token }), JSON.stringify(token)).rejects.toMatchObject({ code: 'signInRequired' });
+    }
+    expect(docker.calls).toHaveLength(0);
+  });
+
+  // Cleanup after plan step 11 (PR #139, B2): each stream of the clone through the protocol's StreamRedactor. Failed with
+  // the former masking of each chunk on its own.
+  it('masks a token split across two chunks of its output, and the start of one that its output ends with (PR #139, B2)', async () => {
+    docker.forwardOutput = false;
+    docker.handler = (args, options) => {
+      if (args[0] !== 'run') return {};
+      options.onStderr?.(`remote: ${TOKEN.slice(0, 9)}`);
+      options.onStderr?.(`${TOKEN.slice(9)}\n`);
+      options.onStdout?.(`cut ${TOKEN.slice(0, 5)}`);
+      return { exitCode: 0 };
+    };
+    const output: string[] = [];
+    await createHelper().clone({ volumeName: 'vol', repository: 'acme/api', token: TOKEN, onOutput: (text) => output.push(text) });
+    expect(output.join('')).toBe('remote: ***\ncut ***');
+  });
 });
 
 describe('WorkspaceHelper.prepareGit (concept section 9 "Git inside the container")', () => {
@@ -1223,6 +1248,23 @@ describe('review PL-1: the token in the output of run-user-commands and up', () 
     expect((error as DevcontainerCommandError).stderr).toBe('a *** b\n');
     expect((error as DevcontainerCommandError).stdout).toBe('***\n');
     expect(output.join('')).toBe('a *** b\n***\n');
+  });
+
+  // Cleanup after plan step 11 (PR #139, B2): the output goes through the protocol's StreamRedactor. Failed with
+  // WorkspaceHelper's own RedactingStream (stderr), whose flush passed the start of a token that a cut stream ended with
+  // on unmasked, and with the line-by-line masking of stdout.
+  it('masks the start of a token that a cut stream ends with, on stderr and on stdout (PR #139, B2)', async () => {
+    streams({ stderr: ['npm ERR! ', TOKEN.slice(0, 10)], stdout: [RESULT] });
+    const output: string[] = [];
+    await runUserCommands(output);
+    expect(output.join('')).toBe('npm ERR! ***');
+    streams({ stdout: [`last ${TOKEN.slice(0, 6)}`], exitCode: 1 });
+    const upOutput: string[] = [];
+    const error = await createHelper()
+      .up({ volumeName: 'vol', repository: 'acme/api', override: {}, environmentId: 'e', removeExistingContainer: false, token: TOKEN, onOutput: (text) => upOutput.push(text) })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DevcontainerCommandError);
+    expect(upOutput.join('')).toBe('last ***');
   });
 });
 

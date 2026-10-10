@@ -101,6 +101,16 @@ export const SECRET_TOKEN = 'token';
 export const SECRET_REGISTRY = 'registry';
 /** Review round 1 (S6): the shortest secret; a shorter one could not be masked, so it is refused. */
 export const MIN_SECRET_LENGTH = 4;
+
+/**
+ * Cleanup after plan step 11 (PR #139, B2): the one check of a GitHub token before it is used (the clone, the token write
+ * into the dev container, the secret input of an exec): not empty and without white space. Before: three copies of the
+ * same rule (WorkspaceHelper, EngineDocker.exec, EnvironmentService.writeGitToken).
+ */
+export function isValidToken(token: string | undefined): token is string {
+  return token !== undefined && token !== '' && !/\s/.test(token);
+}
+
 /** The largest time limit of an operation (one day). */
 export const MAX_OPERATION_TIMEOUT_MS = 24 * 60 * 60_000;
 /** At most this many operations of one channel run at the same time; more wait in the extension. */

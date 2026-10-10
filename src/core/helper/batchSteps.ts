@@ -270,6 +270,8 @@ export function batchStepCommand(kind: string, params: unknown): BatchStepComman
         input: checked(kind, () => writeAndRunInput(files, override)),
         env,
         git: false,
+        // Review round 1 of PR #139 (A-L3): the token only masked in the output, as for `up` and run-user-commands.
+        secret: 'mask',
       };
     }
     case 'composeModel': {

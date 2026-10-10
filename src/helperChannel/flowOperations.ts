@@ -63,13 +63,20 @@ import { workerHostSide } from '../core/worker/workerHostSide';
 import type { HostRequest } from '../core/worker/hostSide';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
-/** Plan step 5, PR C: the log of the extension as the Logger of the worker's code (plan step 11B3b: shared here). */
+/**
+ * Plan step 5, PR C: the log of the extension as the Logger of the worker's code (plan step 11B3b: shared here).
+ * Cleanup after plan step 11 (PR #139, D1, decision of 2026-10-10): `output`, the raw output of the tools (the Dev
+ * Container CLI's build and up, the clone, the lifecycle commands, the pulls), goes to the extension's log as the
+ * operation's output (OperationContext.output: masked by its StreamRedactor with every secret that the operation ever
+ * held, also one split between two pieces; the rest is flushed, masked, when the operation ends; sent in pieces of at
+ * most OUTPUT_CHUNK_CHARACTERS). Before, it was dropped.
+ */
 export function contextLogger(context: OperationContext): Logger {
   return {
     info: (message) => context.log(message),
     warn: (message) => context.log(message, 'warn'),
     error: (message) => context.log(message, 'warn'),
-    output: () => {},
+    output: (text) => context.output('stdout', text),
   };
 }
 

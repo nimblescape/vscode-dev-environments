@@ -6164,6 +6164,23 @@ describe('lifecycle token (user decision 2026-09-27): up --skip-post-create, the
     expect(h.helper.userCommandContext.map((run) => run.token)).toEqual([TOKEN]);
   });
 
+  it('review round 1 of PR #139 (A-L3): the build gets the token of the session for the redaction of its output', async () => {
+    await h.service.open(TARGET, options());
+    expect(h.helper.builds).toHaveLength(1);
+    expect(h.helper.buildTokens).toEqual([TOKEN]);
+  });
+
+  it('review round 1 of PR #139 (B): a token write without output logs nothing; its output is logged with the token masked', async () => {
+    await h.service.open(TARGET, options());
+    expect(h.docker.tokenWrites()).toHaveLength(1);
+    expect(h.logger.infos).not.toContain('exit code 0');
+    h.docker.execHandler = (_container, command) => (command[2] === TOKEN_WRITE_SCRIPT ? { stdout: `wrote ${TOKEN}\n` } : {});
+    await h.service.open(TARGET, options());
+    expect(h.docker.tokenWrites()).toHaveLength(2);
+    expect(h.logger.infos).toContain('wrote ***');
+    expect(h.logger.infos).not.toContain('exit code 0');
+  });
+
   it('first open: writes the token after up and before run-user-commands, which gets the inputs of up', async () => {
     const result = await h.service.open(TARGET, options());
     const env = result.environment;
