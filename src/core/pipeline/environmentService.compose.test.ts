@@ -4485,7 +4485,7 @@ describe('review round 22 (D22-1): Select configuration… between two configura
       const web = byService('web')!;
       await h.operations.stop(ENV_ID);
       // For example started by hand.
-      await h.docker.runChecked(['start', app.id]);
+      await h.docker.startContainer(app.id);
       const result = await h.service.openEnvironment(ENV_ID, { progress: h.progress });
       expect(result.containerName).toBe(NAME);
       expect(h.docker.containers.get(web.id)?.state).toBe('running');

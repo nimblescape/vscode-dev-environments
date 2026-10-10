@@ -45,7 +45,7 @@ import {
 } from '../../src/core/remoteMonitor/protocol';
 import { forgetRecord, sendHeartbeat, sendMonitorSettings } from '../../src/core/worker/monitorFlow';
 import { engineMonitor } from '../../src/core/worker/engineMonitor';
-import { cliRunArgs } from '../../src/core/remoteMonitor/cliMonitorEngine.testkit';
+import type { MonitorRunSpec } from '../../src/core/remoteMonitor/monitorEngine';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
@@ -88,6 +88,27 @@ async function bundleScript(): Promise<string> {
     logLevel: 'silent',
   });
   return result.outputFiles[0].text;
+}
+
+/**
+ * The arguments of an attached `docker run -i` of the container of `spec`, for the arrangement of a first load that is cut
+ * off (a client that the test kills before it writes the script). Cleanup C4 (plan step 11J): moved here from the removed
+ * CLI testkit of the ensure (cliMonitorEngine.testkit.ts, cliRunArgs), unchanged; the ensure itself creates over the
+ * Engine API (engineMonitor).
+ */
+function attachedRunArgs(spec: MonitorRunSpec): string[] {
+  const { [LABEL_SESSION_MONITOR]: label, ...others } = spec.labels;
+  const args = ['run', '-i', '--sig-proxy=false', '--pull', 'never', '--name', spec.name, '--label', `${LABEL_SESSION_MONITOR}=${label}`];
+  for (const [key, value] of Object.entries(others)) args.push('--label', `${key}=${value}`);
+  args.push('--restart', spec.restartPolicy);
+  if (spec.network === 'none') args.push('--network', 'none');
+  args.push('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges');
+  args.push('--log-driver', spec.log.driver, '--log-opt', `max-size=${spec.log.maxSize}`, '--log-opt', `max-file=${spec.log.maxFile}`);
+  args.push('-v', `${spec.mounts.socket}:/var/run/docker.sock`, '-v', `${spec.mounts.volume}:${spec.mounts.volumeTarget}`);
+  if (spec.mounts.store !== undefined) args.push('--mount', `type=volume,source=${spec.mounts.store.volume},target=${spec.mounts.store.target},volume-nocopy`);
+  for (const [key, value] of Object.entries(spec.env)) args.push('-e', `${key}=${value}`);
+  args.push(spec.image, ...spec.command);
+  return args;
 }
 
 async function waitUntil(condition: () => boolean, what: string, timeoutMs = 90_000): Promise<void> {
@@ -331,7 +352,7 @@ describe('the Session Monitor container of a remote Docker host', () => {
     const label = remoteMonitorLabelValue(script, helperTag, []);
     // Plan step 11D2: changed, the attached `docker run` of the container of runSpec, as the extension ran it before (a
     // client that a test can kill before it wrote the script).
-    const client = spawn(run.dockerPath, cliRunArgs(monitor.runSpec(helperTag, socket, label, script)), { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const client = spawn(run.dockerPath, attachedRunArgs(monitor.runSpec(helperTag, socket, label, script)), { env, stdio: ['pipe', 'pipe', 'pipe'] });
     client.stdin.on('error', () => {});
     client.stdout.resume();
     client.stderr.resume();

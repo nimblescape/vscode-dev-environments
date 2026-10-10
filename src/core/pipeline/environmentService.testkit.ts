@@ -47,7 +47,8 @@ import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_STOP, OP_WINDOW_STATE, SECRET
 import { EngineDocker } from '../worker/engineDocker';
 import { windowStateFlow } from '../worker/windowStateFlow';
 import { readEnvironmentStates } from './refreshStates';
-import { isDevContainer, type DockerEngine, type EngineContainer } from '../worker/dockerEngine';
+import { EngineError, type DockerEngine, type EngineContainer } from '../worker/dockerEngine';
+import { devContainerOf } from '../worker/environmentContainers';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { stopFlow } from '../worker/stopFlow';
 import { abortError, type Clock, type Logger, type PipelineUi, type ProgressReporter, type RunResult } from '../ports';
@@ -238,35 +239,22 @@ export class FakeDocker implements EnvironmentDocker {
     return this.running;
   }
 
-  async runChecked(args: readonly string[], _options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string> {
-    if (args[0] === 'image' && args[1] === 'inspect') {
-      const reference = args[args.length - 1];
-      // Review round 1 of PR #88 (A-R1-1): also by the ID of an image, as Docker resolves it.
-      const name = this.imageNamed(reference);
-      if (name === undefined) throw new CommandError(`docker ${args.join(' ')}`, 1, '', `Error: No such image: ${reference}`);
-      return `${JSON.stringify(this.imageConfigs.get(name) ?? { User: '', Labels: {} })}\n`;
-    }
-    this.log.push(args.join(' '));
-    if (args[0] === 'start') {
-      const container = this.containerByRef(args[1]);
-      if (!container) throw new CommandError(`docker start ${args[1]}`, 1, '', 'No such container');
-      container.state = 'running';
-      container.rawState = 'running';
-    }
-    return '';
-  }
-
   /**
    * Review round 2 of 11B3a (B-R2-12): the options of the typed calls of the ownership fix before up (imageConfig; plan
-   * step 11G1: imageUserIds in place of runOnVolume and containerIdsWithLabel), in order; imageConfig also reaches
-   * runChecked, as the Docker CLI was reached (plan step 11I2: by the removed CLI adapter ContainerAdapter).
+   * step 11G1: imageUserIds in place of runOnVolume and containerIdsWithLabel), in order.
    */
   readonly typedCalls: { method: 'imageConfig' | 'imageUserIds'; options: { signal?: AbortSignal; timeoutMs?: number } }[] = [];
 
-  /** Plan step 11B3: like EngineDocker.imageConfig (recorded as the `image inspect` of runChecked). */
+  /**
+   * Plan step 11B3: like EngineDocker.imageConfig: `Config` of the image (imageConfigs; default no labels, no user); a
+   * missing image fails as there (review round 1 of PR #88, A-R1-1: also found by the ID of an image, as Docker resolves
+   * it). Cleanup C4 (plan step 11J): read directly (before: through an emulation of `docker image inspect`, runChecked).
+   */
   async imageConfig(reference: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<unknown> {
     this.typedCalls.push({ method: 'imageConfig', options });
-    return JSON.parse((await this.runChecked(['image', 'inspect', '--format', '{{json .Config}}', reference], options)).trim()) as unknown;
+    const name = this.imageNamed(reference);
+    if (name === undefined) throw new EngineError(`No such image: ${reference}`, 404);
+    return JSON.parse(JSON.stringify(this.imageConfigs.get(name) ?? { User: '', Labels: {} })) as unknown;
   }
 
   /**
@@ -283,23 +271,39 @@ export class FakeDocker implements EnvironmentDocker {
     return passwd === null || passwd === undefined ? undefined : passwdUserIds(passwd, user);
   }
 
-  /** Plan step 10A: like EngineDocker.startContainer (recorded as the `start` of runChecked). */
+  /**
+   * Plan step 10A: like EngineDocker.startContainer, recorded in `log` as `start <id>`. Cleanup C4 (plan step 11J):
+   * directly (before: through an emulation of `docker start`, runChecked); a missing container fails as the engine does.
+   */
   async startContainer(id: string, _options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<void> {
-    await this.runChecked(['start', id]);
+    this.log.push(`start ${id}`);
+    const container = this.containerByRef(id);
+    if (!container) throw new EngineError(`No such container: ${id}`, 404);
+    container.state = 'running';
+    container.rawState = 'running';
   }
 
   /**
-   * Like EngineDocker.findContainer: the other services of a Docker Compose environment are skipped; the container
-   * with the name of the environment first (final review, FC-1), then a running one, then the newest (the order of
-   * insertion is the order of creation).
+   * Like EngineDocker.findContainer: the dev container of the environment by the production rule (devContainerOf, plan
+   * step 11I, U4: the one with the recorded name whatever its state, else the newest running one, else the newest one),
+   * over the containers of the fake with their time of create (listedContainers). Cleanup C4 (plan step 11J): before, the
+   * fake had its own copy of the rule, by the order of insertion.
    */
   async findContainer(environmentId: string, containerName: string): Promise<ContainerInfo | undefined> {
-    const matching = [...this.containers.values()].filter(
-      (c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId && isDevContainer(c, containerName),
+    const found = devContainerOf(
+      this.listedContainers().filter((c) => c.labels[LABEL_ENVIRONMENT_ID] === environmentId),
+      containerName,
     );
-    const newestFirst = [...matching].reverse();
-    const found = matching.find((c) => c.name === containerName) ?? newestFirst.find((c) => c.state === 'running') ?? newestFirst[0];
-    return found && { ...found, labels: { ...found.labels } };
+    const stored = found && this.containers.get(found.id);
+    return stored && { ...stored, labels: { ...stored.labels } };
+  }
+
+  /**
+   * The containers of the fake as EngineDocker lists them (ListedContainer): each with the time of its create, `created`
+   * when a test set it, else by the order of insertion (the order of creation).
+   */
+  private listedContainers(): ListedContainer[] {
+    return [...this.containers.values()].map((c, index): ListedContainer => ({ ...c, labels: { ...c.labels }, created: (c as ListedContainer).created ?? new Date(T0 + index * 1000).toISOString() }));
   }
 
   /**
@@ -308,9 +312,7 @@ export class FakeDocker implements EnvironmentDocker {
    * dev container (devContainerOf).
    */
   async listEnvironmentContainers(): Promise<ListedContainer[]> {
-    return [...this.containers.values()]
-      .map((c, index): ListedContainer => ({ ...c, labels: { ...c.labels }, created: (c as ListedContainer).created ?? new Date(T0 + index * 1000).toISOString() }))
-      .filter((c) => LABEL_ENVIRONMENT_ID in c.labels);
+    return this.listedContainers().filter((c) => LABEL_ENVIRONMENT_ID in c.labels);
   }
 
   /**

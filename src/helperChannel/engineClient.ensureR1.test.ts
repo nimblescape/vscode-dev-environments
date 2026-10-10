@@ -111,6 +111,18 @@ describe('createAttached probes (review round 1 of PR #100, B)', () => {
     expect(await engine.createAttached(SPEC, options())).toEqual({ kind: 'ready' });
   });
 
+  // Cleanup C4 (plan step 11J): moved here from remoteSessionMonitor.test.ts (review round 1 of PR #69, B-R1-2, and "the
+  // ready line also when it comes in pieces, after other output"), which checked it on the removed CLI testkit of the
+  // ensure: other output of the container is no start; its ready line after other output is.
+  it('other output without the ready line is no start; the ready line after other output is', async () => {
+    const other = await serve(CREATED, undefined, (socket) => writeApart(socket, [frame(1, '2026-09-29T10:00:00.000Z something else\n')], true));
+    expect(await other.engine.createAttached(SPEC, options())).toEqual({ kind: 'exited', detail: 'the container ended before it reported its start', conflict: false });
+    const after = await serve(CREATED, undefined, (socket) =>
+      writeApart(socket, [frame(1, '2026-09-29T10:00:00.000Z something else\n'), frame(1, '2026-09-29T10:00:00.000Z Session Mon'), frame(1, 'itor started (Node.js v24.0.0).\n')]),
+    );
+    expect(await after.engine.createAttached(SPEC, options())).toEqual({ kind: 'ready' });
+  });
+
   it('a container that was started already (304) goes on to its ready line', async () => {
     const { engine } = await serve(CREATED, { status: 304 }, (socket) => socket.write(frame(1, `${READY}\n`)));
     expect(await engine.createAttached(SPEC, options())).toEqual({ kind: 'ready' });

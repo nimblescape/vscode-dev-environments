@@ -13,7 +13,7 @@ import { labelArgs, type BootstrapDocker } from '../../src/core/docker/bootstrap
 import { DOCKER_QUERY_TIMEOUT_MS } from '../../src/core/docker/dockerTimeouts';
 import { findExecutable } from '../../src/core/docker/dockerCli';
 import { helperImageTag, type HelperImageUse } from '../../src/core/helper/helperImage';
-import { HelperImages, type HelperImageDocker } from '../../src/core/helper/helperImages';
+import { HelperImages, helperDockerSocket, type HelperImageDocker } from '../../src/core/helper/helperImages';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
 import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/core/imageCheck/credentials';
@@ -32,6 +32,9 @@ import {
   type RunResult,
 } from '../../src/core/ports';
 import type { Environment } from '../../src/core/types';
+import type { DockerEngine } from '../../src/core/worker/dockerEngine';
+import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
+import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { DockerCli, TEST_RUN_LABEL, failureMarker, testDockerEnv, type DockerTestRun } from './dockerRun';
 
 /** resources/helper/Dockerfile: the real workspace helper. */
@@ -104,6 +107,18 @@ export function expectLabelledEnvironmentImage(cli: DockerCli, entry: Environmen
 
 /** Token for the helper runs. The tests clone only public repositories, so Git never sends it. */
 export const DUMMY_TOKEN = 'dummy-token-of-the-docker-tests';
+
+/**
+ * Cleanup C4 (plan step 11J): the worker's port over the Engine API of the engine of the tests, built as the worker builds
+ * the port of an operation (operations.ts ENGINE_OF): the production client (engineClient.ts) with `secrets` as the
+ * secrets of the operation, for the standard input of an exec by its name and the masking of every secret in its output
+ * (before: test/docker/cliEngine.ts, a port over the Docker CLI without time limits, signal, or masking, and with trimmed
+ * output).
+ */
+export function testEngine(env: NodeJS.ProcessEnv, secrets: Readonly<Record<string, string>> = {}): DockerEngine {
+  const socket = helperDockerSocket(env, process.platform);
+  return dockerEngine(engineApi(socket), engineHijack(socket), (name) => secrets[name], () => Object.values(secrets));
+}
 
 /** The account of the fake GitHub session; the environments of the tests belong to it. */
 export const TEST_ACCOUNT = { id: '4242', login: 'devenv-test' };
