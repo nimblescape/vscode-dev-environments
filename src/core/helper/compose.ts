@@ -51,10 +51,7 @@ import {
   type ComposeService,
 } from './composeModel';
 import { OVERRIDE_FOLDER } from './scripts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+import { isRecord } from '../valueChecks';
 
 /** The model that we write for the Dev Container CLI: the only compose file of `read-configuration`, `build`, and `up`. */
 export const COMPOSE_MODEL_PATH = `${OVERRIDE_FOLDER}/compose.json`;

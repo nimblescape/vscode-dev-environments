@@ -16,7 +16,7 @@ import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { UserFacingError, errorMessage } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
-import { OP_TOKEN_REMOVE, parseTokenRemoveValue, type WindowStateValue } from '../core/helperChannel/protocol';
+import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { repositoryFolder, splitRepository } from '../core/names';
 import { availableEnvironments, isAvailableTo } from '../core/ownership';
@@ -85,11 +85,6 @@ const HANDOFF_CHECK_MS = 30_000;
  */
 const LEAVE_CHECK_MS = 10_000;
 /**
- * The whole token removal in the worker (plan step 11B1): the two tries of the flow (TOKEN_REMOVE_TIMEOUT_MS each) and
- * the requests around them.
- */
-const TOKEN_REMOVAL_TIMEOUT_MS = 60_000;
-/**
  * The reopen rule (concept 7.10) looks at the other windows. Windows that VS Code restores at the same start write their
  * status files during their own activation; this pause lets them do so first.
  */
@@ -118,11 +113,9 @@ export interface ControllerDeps {
   disconnectRequests: DisconnectRequests;
   docker: BootstrapDocker;
   /**
-   * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): runs a flow in the worker of the current engine
-   * (`tokenRemove` first), with the HostSide of this computer answering its requests. Cleanup C5 (plan step 11J, A11):
-   * required (the extension always gives it).
+   * The operations of this window, each a flow in the worker of the Docker target. Cleanup after plan step 11 (PR #142, C3):
+   * also the token removal (removeTokenInWorker; before: a `flow` of its own here).
    */
-  flow: (op: string, params: unknown, options: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
   service: EnvironmentOperations;
   discovery: DiscoveryService;
   auth: VsCodeGitHubAuth;
@@ -1935,10 +1928,10 @@ export class Controller implements vscode.Disposable {
         this.logger.info(`The container ${containerName} is on another Docker host. Its token is not removed from here.`);
         return;
       }
-      // Plan step 11B1: the flow runs in the worker of the engine (its log lines come from there).
-      // Review round 1 of plan step 11B1 (A-R1-5): bounded, as the docker exec was before.
-      const value = await this.deps.flow(OP_TOKEN_REMOVE, { environmentId: left.environmentId, containerName }, { timeoutMs: TOKEN_REMOVAL_TIMEOUT_MS });
-      if (parseTokenRemoveValue(value) === undefined) throw new Error('The worker answered the token removal with an invalid value.');
+      // Plan step 11B1: the flow runs in the worker of the engine (its log lines come from there). Review round 1 of plan
+      // step 11B1 (A-R1-5): bounded (TOKEN_REMOVE_FLOW_TIMEOUT_MS). Cleanup after plan step 11 (PR #142, C3): through the
+      // operations of the window, as every other flow.
+      await this.deps.service.removeTokenInWorker(left.environmentId, containerName);
     } catch (error) {
       this.logger.warn(`The GitHub token could not be removed from the container ${containerName}: ${errorMessage(error)}`);
     }

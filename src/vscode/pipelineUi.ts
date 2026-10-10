@@ -9,12 +9,10 @@ import type { DeleteConfirmation } from '../core/pipeline/deleteCheck';
 import { ControllerTexts } from './controllerTexts';
 import { systemClock, type Clock, type Logger, type PipelineUi } from '../core/ports';
 import type { VsCodeGitHubAuth } from './auth';
+import { GITHUB_PACKAGES_REGISTRY } from '../core/imageCheck/credentials';
 
 /** Identical non-blocking messages within this time are shown once. */
 export const MESSAGE_DEDUPLICATION_MS = 60_000;
-
-/** The only registry for which the GitHub session can provide credentials (scope `read:packages`). */
-const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
 
 export class VsCodePipelineUi implements PipelineUi {
   private readonly lastShown = new Map<string, number>();

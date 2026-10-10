@@ -11,6 +11,7 @@ import { createHash } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
 import { parseCacheSchedule } from './cacheSettings';
 import { isTimeZone } from './cron';
+import { hasExactKeys, isRecord } from '../valueChecks';
 
 /**
  * The one Session Monitor container per Docker engine (never a container of an environment: no
@@ -473,13 +474,4 @@ export function remoteMonitorLabelValue(script: string, helperTag: string, extra
   hash.update('\n', 'utf8').update(PIPE_LOADER, 'utf8');
   if (extra.length > 0) hash.update('\n', 'utf8').update(JSON.stringify(extra), 'utf8');
   return hash.digest('hex').slice(0, 12);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const own = Object.keys(value);
-  return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }

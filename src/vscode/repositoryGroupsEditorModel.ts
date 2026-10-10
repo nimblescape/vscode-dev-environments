@@ -9,6 +9,7 @@
 // sidebar will show. repositoryGroupsEditor.ts is the thin webview glue.
 import { checkRepositoryGroupEntry, matchRepositoryGroup, parseRepositoryGroups } from './repositoryGroups';
 import { buildTreeModel, repositoryRows, type GroupNode, type HintRow, type RepositoryRow, type TreeInput } from './treeModel';
+import { hasExactKeys } from '../core/valueChecks';
 
 /** The flags that the editor offers, in this order (the only flags that parseRepositoryGroups keeps). */
 export const EDITOR_FLAGS = ['i', 'u', 's'] as const;
@@ -235,14 +236,14 @@ export function parseEditorRequest(raw: unknown, context: { generation: number }
   switch (raw.type) {
     case 'ready':
     case 'cancel':
-      return hasOnlyKeys(raw, ['type']) ? { type: raw.type } : undefined;
+      return hasExactKeys(raw, ['type']) ? { type: raw.type } : undefined;
     case 'reload':
-      return hasOnlyKeys(raw, ['type', 'testName']) && isText(raw.testName, EditorLimits.testName)
+      return hasExactKeys(raw, ['type', 'testName']) && isText(raw.testName, EditorLimits.testName)
         ? { type: 'reload', testName: raw.testName }
         : undefined;
     case 'update':
     case 'save': {
-      if (!hasOnlyKeys(raw, ['type', 'seq', 'generation', 'entries', 'testName']) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
+      if (!hasExactKeys(raw, ['type', 'seq', 'generation', 'entries', 'testName']) || !isSeq(raw.seq) || !isSeq(raw.generation)) return undefined;
       const entries = parseEntries(raw.entries);
       if (!entries || !isText(raw.testName, EditorLimits.testName)) return undefined;
       const message = { seq: raw.seq, generation: raw.generation, entries, testName: raw.testName };
@@ -264,7 +265,7 @@ function parseEntries(value: unknown): EditorEntry[] | undefined {
   if (!Array.isArray(value) || value.length > EditorLimits.entries) return undefined;
   const entries: EditorEntry[] = [];
   for (const item of value) {
-    if (!isPlainObject(item) || !hasOnlyKeys(item, ['name', 'pattern', 'flags'])) return undefined;
+    if (!isPlainObject(item) || !hasExactKeys(item, ['name', 'pattern', 'flags'])) return undefined;
     const { name, pattern, flags } = item;
     if (!isText(name, EditorLimits.name) || !isText(pattern, EditorLimits.pattern)) return undefined;
     if (typeof flags !== 'string' || !/^[ius]{0,3}$/.test(flags) || normalizeFlags(flags).length !== flags.length) return undefined;
@@ -273,15 +274,11 @@ function parseEntries(value: unknown): EditorEntry[] | undefined {
   return entries;
 }
 
+/** A plain object (prototype Object or none). Cleanup after plan step 11 (PR #142, B7): not isRecord, which takes any object. */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value) as unknown;
   return prototype === Object.prototype || prototype === null;
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const own = Object.keys(value);
-  return own.every((key) => keys.includes(key)) && keys.every((key) => own.includes(key));
 }
 
 function isText(value: unknown, maxLength: number): value is string {

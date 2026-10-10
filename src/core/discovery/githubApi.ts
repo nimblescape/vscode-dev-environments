@@ -6,6 +6,7 @@
 // it never appears in a log line or in an error message (concept section 9).
 import type { HttpResponse, HttpTransport } from '../http';
 import { abortError, isAbortError, silentLogger, type Logger } from '../ports';
+import { isRecord } from '../valueChecks';
 
 export const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
 export const GITHUB_USER_AGENT = 'vscode-dev-environments';
@@ -152,10 +153,6 @@ export class GitHubApi {
       signal?.removeEventListener('abort', onAbort);
     }
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** Keeps only well-formed error entries. An entry without a message gets a generic one. */

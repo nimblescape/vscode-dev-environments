@@ -10,6 +10,7 @@ import type { BuildRecord, DevcontainerConfig } from '../types';
 import { buildArgumentTexts, extractBaseImages } from './dockerfile';
 import { hasDigest, isOciFeatureReference, parseFeatureReference, parseImageReference, registryDisplayName } from './reference';
 import { IMAGE_CHECK_TIMEOUT_MS, type DigestResult, type RegistryClient } from './registryClient';
+import { isRecord } from '../valueChecks';
 
 /** References of a configuration, as written in the configuration (Dockerfile references with ARG values applied). */
 export interface ConfigReferences {
@@ -205,8 +206,4 @@ function uniqueWithoutDigest(references: string[]): string[] {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

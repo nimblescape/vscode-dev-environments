@@ -39,9 +39,9 @@ import { EngineDocker } from '../core/worker/engineDocker';
 import { batchDeps, workerBatchSession } from './batch';
 import { engineApi, engineHijack } from './engineApi';
 import { dockerEngine } from './engineClient';
-import { contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorEnsureOperation, openOperation, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
+import { cancelledIfAborted, checkedOperation, contextLogger, deleteCheckOperation, deleteOperation, listConfigurationsOperation, ownHelperOfEngine, reconcileOperation, heartbeatOperation, monitorEnsureOperation, openOperation, operationFailure, recordGitStateOperation, stopOperation, tokenRemoveOperation, windowStateOperation, type EngineOfOperation, type OwnHelperOf } from './flowOperations';
 import * as os from 'os';
-import { OperationError, type OperationHandler } from './server';
+import type { OperationHandler } from './server';
 import monitorScript from 'devenv:monitor-script';
 
 /**
@@ -53,16 +53,14 @@ import monitorScript from 'devenv:monitor-script';
  * request (the extension sets it).
  */
 export function probeOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    if (parseProbeParams(params) === undefined) throw new OperationError('invalid', 'The probe operation takes no parameters.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The probe operation takes no secret.');
+  return checkedOperation('probe', parseProbeParams, async (_checked, context) => {
     context.progress('probe');
     const engine = engineOf(context);
     let version: string;
     try {
       version = (await engine.version(context.signal)).version;
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The probe operation was cancelled.');
+      cancelledIfAborted('probe', context);
       const failed: ProbeValue = { detail: errorMessage(error).slice(-MAX_PROBE_DETAIL_LENGTH) };
       return failed;
     }
@@ -74,12 +72,12 @@ export function probeOperation(engineOf: EngineOfOperation): OperationHandler {
     try {
       value.engine = await engine.identity(context.signal);
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The probe operation was cancelled.');
+      cancelledIfAborted('probe', context);
       // Plan step 5, PR A: no identity, so the extension refuses this worker; the log says why.
       context.log(`The identity of the Docker engine could not be read: ${errorMessage(error)}`, 'warn');
     }
     return value;
-  };
+  }, { invalid: 'The probe operation takes no parameters.' });
 }
 
 /**
@@ -90,9 +88,7 @@ export function probeOperation(engineOf: EngineOfOperation): OperationHandler {
  * helpers), never the Session Monitor.
  */
 export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    if (parseSweepParams(params) === undefined) throw new OperationError('invalid', 'The sweep operation takes no parameters.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The sweep operation takes no secret.');
+  return checkedOperation('sweep', parseSweepParams, async (_checked, context) => {
     try {
       const removed = await engineOf(context).pruneContainers(SWEEP_FILTERS, context.signal);
       const value: SweepValue = { removed: removed.length };
@@ -101,10 +97,9 @@ export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
       context.log(`The sweep removed ${removed.length} stopped helper container(s) older than 10 minutes.`);
       return value;
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The sweep operation was cancelled.');
-      throw new OperationError('failed', errorMessage(error));
+      throw operationFailure('sweep', error, context);
     }
-  };
+  }, { invalid: 'The sweep operation takes no parameters.' });
 }
 
 /**
@@ -113,14 +108,11 @@ export function sweepOperation(engineOf: EngineOfOperation): OperationHandler {
  * secret.
  */
 export function refreshOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    const checked = parseRefreshParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the refresh operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The refresh operation takes no secret.');
+  return checkedOperation('refresh', parseRefreshParams, async (checked, context) => {
     context.progress('refresh');
     const value: RefreshValue = refreshValue(await readEnvironmentStates(new EngineDocker(engineOf(context), contextLogger(context)), checked.environments));
     return value;
-  };
+  });
 }
 
 /** Plan step 10A: the Engine API of the worker's engine, over its socket. */

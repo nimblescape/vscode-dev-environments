@@ -28,6 +28,7 @@ import {
   type GraphQLError,
 } from './githubApi';
 import { normalizeScope, scopeLogins } from './scope';
+import { isRecord } from '../valueChecks';
 
 /** Repositories per list request (concept 7.4): without the configuration lookups, so the most that GitHub allows. */
 export const DISCOVERY_PAGE_SIZE = 100;
@@ -1220,10 +1221,6 @@ class HintCollector {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Helpers
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function asArray<T>(value: T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : [];

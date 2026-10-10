@@ -7,6 +7,7 @@
 // are refused by the host access policy, and its parser also gives the named volumes of an environment (../policy/single.ts,
 // mountedVolumeNames).
 import { parseJsonc, stripJsonc } from '../jsonc';
+import { isRecord } from '../valueChecks';
 
 export interface ConfigurationProblems {
   /** `dockerComposeFile` is present: a Docker Compose configuration (the pipeline reads its merged model). */
@@ -22,10 +23,6 @@ const LOCAL_WORKSPACE_FOLDER = /\$\{localWorkspaceFolder\}/;
 // (`mounts`, and `-v`/`--mount` of runArgs), and the other runArgs and the compose files of `dockerComposeFile` are read
 // in the workspace helper, where the variable is the folder of the repository in the volume (for example `--env-file`).
 const HARMLESS_PROPERTIES = ['workspaceFolder', 'workspaceMount', 'name', 'initializeCommand', 'mounts', 'runArgs', 'dockerComposeFile'];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /**
  * configText: raw devcontainer.json text (JSONC). Finds `${localWorkspaceFolder}` outside of the properties where it

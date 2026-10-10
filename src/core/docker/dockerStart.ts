@@ -18,7 +18,8 @@ export const START_COMMAND_WAIT_MS = 10_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_INTERVAL_MS = 2_000;
 const MIN_INFO_TIMEOUT_MS = 2_000;
-const MAC_OPEN = '/usr/bin/open';
+/** macOS: the `open` tool (Docker Desktop's start, and the disk image of its installation in src/vscode/dockerSetup.ts). */
+export const MAC_OPEN = '/usr/bin/open';
 const WINDOWS_DESKTOP_EXE = 'Docker Desktop.exe';
 /** `docker info` of a user without access to the socket of a running engine. */
 const SOCKET_PERMISSION_DENIED = /permission denied/i;

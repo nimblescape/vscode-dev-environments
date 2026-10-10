@@ -15,7 +15,8 @@ import { loaderCommand } from '../loader/pipeLoader';
 import { BATCH_SOCKET_FOLDER, HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
 import { isBatchStepKind, type BatchStepKind } from '../helper/batchStepKinds';
 import type { EngineAttachedSpec } from '../worker/dockerEngine';
-import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, hasOnlyKeys, isCleanupLabel, isRecord } from './protocol';
+import { LOCK_HOLD_LIMIT_MS, MAX_OPERATION_TIMEOUT_MS, isCleanupLabel } from './protocol';
+import { hasOnlyKeys, isRecord } from '../valueChecks';
 
 /** The failure code of a batch whose volume does not exist (it is never created). */
 export const BATCH_MISSING_VOLUME_CODE = 'missingVolume';

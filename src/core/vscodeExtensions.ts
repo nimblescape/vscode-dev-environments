@@ -19,6 +19,7 @@
 //   <state>/extensions/chosen.json                                       the files that the monitor's runs chose
 // No I/O, no `vscode`.
 import type { VscodePlatform } from './helperChannel/protocol';
+import { isRecord } from './valueChecks';
 
 /** Plan step 11H3: an extension of a list: its ID (`publisher.name`, lower case) and a pinned version (`@x.y.z`). */
 export interface ExtensionRef {
@@ -605,9 +606,5 @@ export function parseExtensionChoices(text: string): Map<string, string> {
 /** Review round 1 of 11H3: the text of the chosen files (sorted by entry). */
 export function formatExtensionChoices(choices: ReadonlyMap<string, string>): string {
   return `${JSON.stringify(Object.fromEntries([...choices].sort(([a], [b]) => a.localeCompare(b))))}\n`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 

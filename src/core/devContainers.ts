@@ -13,6 +13,7 @@
 // label devcontainer.metadata after the environment of the shell (V-8; containerGit.ts remoteEnvironment). Its own
 // variables (REMOTE_CONTAINERS_IPC, REMOTE_CONTAINERS*, SSH_AUTH_SOCK, BROWSER) are never set or changed (user decision
 // 2026-09-25).
+import { isRecord } from './valueChecks';
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Authority of attached containers
@@ -82,10 +83,6 @@ export const SKIP_POST_ATTACH_ARG = '--skip-post-attach';
 
 /** The VS Code setting that decides on which addresses of the computer forwarded ports listen. */
 export const LOCAL_PORT_HOST_SETTING = 'remote.localPortHost';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /**
  * The values of `remote.localPortHost` other than `localhost` in the VS Code settings of a configuration

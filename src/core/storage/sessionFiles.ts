@@ -30,6 +30,7 @@ import {
   retryTransientSync,
   type StoragePaths,
 } from './paths';
+import { isRecord } from '../valueChecks';
 
 /** Default age after which `cleanupStaleClaims` removes a claimed operation file. */
 export const DEFAULT_CLAIM_MAX_AGE_MS = 60 * 60 * 1000;
@@ -244,10 +245,6 @@ async function readAllKnown<T>(
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Validation of the file contents. Unknown fields are allowed.
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function isTime(value: unknown): value is string {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value));

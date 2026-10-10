@@ -23,6 +23,8 @@ import type {
 import { isGitSummary } from '../git/gitSummary';
 import { writeJsonAtomic } from './atomicJson';
 import { errorCode, isStorageId, isTransientFsError, parseJson, readTextFile, retryTransient, type StoragePaths } from './paths';
+import { isRecord } from '../valueChecks';
+import { DEFAULT_CONFIG_PATH } from '../pipeline/recordRules';
 
 /** The registry format that this version reads and writes. */
 export const REGISTRY_VERSION = 1;
@@ -55,7 +57,6 @@ const LOCK_RETRY_MS = 20;
 // On Windows, a lock folder that its last holder is still removing cannot be created again for a moment (EPERM). On
 // macOS and Linux these errors are permanent, so they are thrown after about one second instead of a lock timeout.
 const MAX_TRANSIENT_LOCK_ERRORS = 50;
-const DEFAULT_CONFIG_PATH = '.devcontainer/devcontainer.json';
 const EPOCH = new Date(0).toISOString();
 
 /**
@@ -599,10 +600,6 @@ function isBusyMark(value: unknown): value is BusyMark {
     value.pid > 0 &&
     isString(value.windowId)
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isString(value: unknown): value is string {

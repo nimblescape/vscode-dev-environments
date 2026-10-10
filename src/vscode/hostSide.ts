@@ -10,8 +10,8 @@ import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { GitHubAuth, Logger, PipelineUi } from '../core/ports';
 import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
-import { IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
-import { FLOW_REQUESTS, type HostSide } from '../core/worker/hostSide';
+import { GITHUB_PACKAGES_REGISTRY, IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
+import { FLOW_REQUESTS, VIEWER_TIMEOUT_MS, type HostSide } from '../core/worker/hostSide';
 import { registryBusyMarks, type BusyMarkView } from '../core/pipeline/busyMarks';
 import { requestOpenRecords, type OpenRequestScope, type OpenRequests } from '../core/worker/openRequests';
 import { isoTime, type Clock } from '../core/ports';
@@ -47,12 +47,6 @@ export interface HostSideDeps {
   lifecycleMemory: LifecycleMemory;
   logger: Logger;
 }
-
-/** Plan step 11E4d: the time limit of the question to GitHub for the profile (as EnvironmentService.identityOf). */
-const VIEWER_TIMEOUT_MS = 5_000;
-
-/** The only registry for which the GitHub sign-in is a login (concept 7.7); everything else comes from Docker's store. */
-const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
 
 /** Plan step 11B1: what a flow in the worker may ask this computer for. */
 export function extensionHostSide(deps: HostSideDeps): HostSide {

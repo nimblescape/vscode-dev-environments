@@ -33,6 +33,7 @@ import {
   type OpenRecords,
   type StepMarkResult,
 } from '../pipeline/openRecords';
+import { isRecord } from '../valueChecks';
 
 /**
  * What the worker sends of the end of an open (OpenFinish): the time of the last use and the liveness of the marks are
@@ -86,10 +87,6 @@ function invalid(what: string): HelperOperationError {
   return new HelperOperationError('invalid', `The ${what} of the request is invalid.`, false);
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function plainText(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -108,7 +105,7 @@ export function isContainerId(value: unknown): value is string {
  * any time text, other keys allowed), each bounded, for the lookup of a remembered mark; undefined when they are not.
  */
 export function busyMarkFields(value: unknown): BusyMark | undefined {
-  if (!isPlainObject(value)) return undefined;
+  if (!isRecord(value)) return undefined;
   const { operation, since, pid, windowId } = value;
   if (!plainText(operation, MAX_TIME_LENGTH) || !plainText(since, MAX_TIME_LENGTH) || !plainText(windowId, MAX_WINDOW_ID_LENGTH)) return undefined;
   if (typeof pid !== 'number' || !Number.isSafeInteger(pid)) return undefined;
@@ -117,7 +114,7 @@ export function busyMarkFields(value: unknown): BusyMark | undefined {
 
 /** A busy mark of a request: its four fields only, each bounded; rebuilt from them. */
 export function checkedBusyMark(value: unknown): BusyMark {
-  if (!isPlainObject(value) || Object.keys(value).some((key) => !BUSY_MARK_FIELDS.has(key))) throw invalid('busy mark');
+  if (!isRecord(value) || Object.keys(value).some((key) => !BUSY_MARK_FIELDS.has(key))) throw invalid('busy mark');
   const { operation, since, pid, windowId } = value;
   if (!(BUSY_OPERATIONS as readonly unknown[]).includes(operation) || !isTime(since)) throw invalid('busy mark');
   if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) throw invalid('busy mark');
@@ -141,7 +138,7 @@ export function checkedGitSummary(value: unknown): GitSummary {
 /** The change of the lifecycle mark of a request: `'clear'`, or `{ set }` with a container ID. */
 export function checkedLifecycleChange(value: unknown): LifecycleMarkChange {
   if (value === 'clear') return 'clear';
-  if (!isPlainObject(value) || Object.keys(value).length !== 1 || !isContainerId(value.set)) throw invalid('lifecycle mark');
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !isContainerId(value.set)) throw invalid('lifecycle mark');
   return { set: value.set };
 }
 
@@ -150,7 +147,7 @@ export function checkedLifecycleChange(value: unknown): LifecycleMarkChange {
  * are not among them (the extension takes its own).
  */
 export function checkedOpenFinish(value: unknown): HostOpenFinish {
-  if (!isPlainObject(value) || Object.keys(value).some((key) => !FINISH_FIELDS.has(key))) throw invalid('end of the open');
+  if (!isRecord(value) || Object.keys(value).some((key) => !FINISH_FIELDS.has(key))) throw invalid('end of the open');
   const { lifecycleMarkRead, lifecycleRanFor, remoteUser, remoteWorkspaceFolder, gitSummary } = value;
   if (lifecycleMarkRead !== undefined && !isContainerId(lifecycleMarkRead)) throw invalid('lifecycle mark of the end of the open');
   if (lifecycleRanFor !== undefined && !isContainerId(lifecycleRanFor)) throw invalid('container of the end of the open');
@@ -200,7 +197,7 @@ function volumeNames(value: unknown, what: string): string[] {
  * else (the owner, the Docker host, the times, the names and the create mark are the extension's).
  */
 export function checkedCreateRequest(value: unknown): CreateRequest {
-  if (!isPlainObject(value) || !hasOnlyFields(value, CREATE_FIELDS)) throw invalid('environment');
+  if (!isRecord(value) || !hasOnlyFields(value, CREATE_FIELDS)) throw invalid('environment');
   const { id, repository, configPath } = value;
   if (!isStorageId(id)) throw invalid('environment ID');
   if (!isRepositoryName(repository) || !plainText(repository, MAX_REPOSITORY_LENGTH)) throw invalid('repository');
@@ -214,20 +211,20 @@ export function checkedCreateRequest(value: unknown): CreateRequest {
  * decided under the registry lock (requestOpenRecords).
  */
 export function checkedConfigurationChange(value: unknown): ConfigurationChange {
-  if (!isPlainObject(value) || !hasOnlyFields(value, CONFIGURATION_FIELDS)) throw invalid('change of the configuration');
+  if (!isRecord(value) || !hasOnlyFields(value, CONFIGURATION_FIELDS)) throw invalid('change of the configuration');
   const { select, shutdownActionNone, addVolumes, addServiceVolumes, keepRefusedFor, serviceFolders, cloned } = value;
   if (select !== undefined && !isConfigPath(select)) throw invalid('selected configuration');
   if (shutdownActionNone !== undefined && typeof shutdownActionNone !== 'boolean') throw invalid('shutdown action');
   let keep: ConfigurationChange['keepRefusedFor'];
   if (keepRefusedFor !== undefined) {
-    if (!isPlainObject(keepRefusedFor) || Object.keys(keepRefusedFor).length !== 2) throw invalid('configuration of the refused update');
+    if (!isRecord(keepRefusedFor) || Object.keys(keepRefusedFor).length !== 2) throw invalid('configuration of the refused update');
     const { configPath, configHash } = keepRefusedFor;
     if (!isConfigPath(configPath) || !plainText(configHash, MAX_HASH_LENGTH)) throw invalid('configuration of the refused update');
     keep = { configPath, configHash };
   }
   let folders: ConfigurationChange['serviceFolders'];
   if (serviceFolders !== undefined) {
-    if (!isPlainObject(serviceFolders) || Object.keys(serviceFolders).length !== 2 || typeof serviceFolders.overflow !== 'boolean') throw invalid('service folders');
+    if (!isRecord(serviceFolders) || Object.keys(serviceFolders).length !== 2 || typeof serviceFolders.overflow !== 'boolean') throw invalid('service folders');
     const list = serviceFolders.folders;
     if (!Array.isArray(list) || list.length > MAX_SERVICE_FOLDERS || !list.every((folder) => plainText(folder, MAX_SERVICE_PATH_LENGTH))) throw invalid('service folders');
     folders = { folders: [...(list as string[])], overflow: serviceFolders.overflow };
@@ -256,7 +253,7 @@ function checkedBuildNumber(value: unknown): number {
 
 /** Plan step 11E4c: a reference → digest map of a build record or a refused update: bounded, each digest a sha256. */
 function digests(value: unknown, what: string): Record<string, string> {
-  if (!isPlainObject(value)) throw invalid(what);
+  if (!isRecord(value)) throw invalid(what);
   const entries = Object.entries(value);
   if (entries.length > MAX_RECORD_REFERENCES) throw invalid(what);
   for (const [reference, digest] of entries) {
@@ -278,14 +275,14 @@ function imageList(value: unknown, what: string): string[] {
  * project: buildRecordFits) is decided under the registry lock (requestOpenRecords).
  */
 export function checkedBuildRecord(value: unknown): BuildRecord {
-  if (!isPlainObject(value) || !hasOnlyFields(value, BUILD_RECORD_FIELDS)) throw invalid('build record');
+  if (!isRecord(value) || !hasOnlyFields(value, BUILD_RECORD_FIELDS)) throw invalid('build record');
   const { builtAt, environmentImage, imageId, buildNumber, configPath, configHash, images, features, compose } = value;
   if (!isTime(builtAt) || !plainText(environmentImage, MAX_REFERENCE_LENGTH) || environmentImage === '') throw invalid('build record');
   if (imageId !== undefined && (typeof imageId !== 'string' || !SHA256.test(imageId))) throw invalid('image ID of the build record');
   if (!isConfigPath(configPath) || !plainText(configHash, MAX_HASH_LENGTH)) throw invalid('configuration of the build record');
   let composeRecord: ComposeBuildRecord | undefined;
   if (compose !== undefined) {
-    if (!isPlainObject(compose) || !hasOnlyFields(compose, COMPOSE_RECORD_FIELDS)) throw invalid('Docker Compose part of the build record');
+    if (!isRecord(compose) || !hasOnlyFields(compose, COMPOSE_RECORD_FIELDS)) throw invalid('Docker Compose part of the build record');
     const { service, version, inputsHash } = compose;
     if (!plainText(service, MAX_REFERENCE_LENGTH) || service === '' || !plainText(version, MAX_HASH_LENGTH) || !plainText(inputsHash, MAX_HASH_LENGTH)) {
       throw invalid('Docker Compose part of the build record');
@@ -312,7 +309,7 @@ export function checkedBuildRecord(value: unknown): BuildRecord {
  * (its items at most MAX_REFUSED_ITEMS_LENGTH characters and the `…` of their middle), rebuilt.
  */
 export function checkedRefusedUpdate(value: unknown): RefusedUpdate {
-  if (!isPlainObject(value) || !hasOnlyFields(value, REFUSED_FIELDS)) throw invalid('refused update');
+  if (!isRecord(value) || !hasOnlyFields(value, REFUSED_FIELDS)) throw invalid('refused update');
   const { configPath, configHash, images, features, items, hostAccessChecks, reason } = value;
   if (!isConfigPath(configPath) || !plainText(configHash, MAX_HASH_LENGTH)) throw invalid('configuration of the refused update');
   if (typeof items !== 'string' || items.length > MAX_REFUSED_ITEMS_LENGTH + 1) throw invalid('items of the refused update');

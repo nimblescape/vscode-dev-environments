@@ -8,6 +8,7 @@
 import * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
 import type { Credentials, GitHubAuth, Logger } from '../core/ports';
+import { GITHUB_PACKAGES_REGISTRY } from '../core/imageCheck/credentials';
 import type { GitHubAccount } from '../core/types';
 
 export const GITHUB_PROVIDER_ID = 'github';
@@ -225,7 +226,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
  */
 export function ghcrRejectionReporter(auth: Pick<VsCodeGitHubAuth, 'reportRejectedToken'>): (registry: string, credentials: Credentials) => void {
   return (registry, credentials) => {
-    if (registry.toLowerCase() === 'ghcr.io') auth.reportRejectedToken(credentials.password);
+    if (registry.toLowerCase() === GITHUB_PACKAGES_REGISTRY) auth.reportRejectedToken(credentials.password);
   };
 }
 

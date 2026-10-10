@@ -10,6 +10,7 @@ import type { Environment } from '../types';
 import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
+import { TOKEN_REMOVE_FLOW_TIMEOUT_MS } from '../pipeline/operationBase';
 import { removeTokenFlow, TOKEN_REMOVE_TIMEOUT_MS } from './tokenRemoveFlow';
 
 const ENVIRONMENT_ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
@@ -212,9 +213,11 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     await expect(flow(engine)).rejects.toThrow(/^said on stdout$/);
     const exact = fakeEngine([container()], () => ok(1, 'y'.repeat(1000)));
     expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
-    // The controller allows 60 s for the whole removal (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts). PR #127
-    // review round 1 (A, L3): for the container of the request, which the flow tries first (plan step 11I, U4).
-    expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(60_000);
+    // The extension allows 60 s for the whole removal (TOKEN_REMOVE_FLOW_TIMEOUT_MS). PR #127 review round 1 (A, L3): for
+    // the container of the request, which the flow tries first (plan step 11I, U4). Cleanup after plan step 11 (PR #142,
+    // D5): tied to the constant of the extension (before: its value, 60_000, with its name in this comment).
+    expect(TOKEN_REMOVE_FLOW_TIMEOUT_MS).toBe(60_000);
+    expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(TOKEN_REMOVE_FLOW_TIMEOUT_MS);
   });
 
   it('takes any failure but a cancel as a failed try, and a removed container as notRunning (review round 3, A-R3-2, A-R3-3)', async () => {

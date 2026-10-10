@@ -25,6 +25,7 @@ import {
   runArgsDecideHostname,
   type HostAccessChecks,
 } from '../policy';
+import { isRecord } from '../valueChecks';
 
 /**
  * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:
@@ -133,10 +134,6 @@ export function runUserCommandsArgs(p: { workspaceFolder: string; overrideConfig
     HELPER_CACHE_FOLDER,
     SKIP_POST_ATTACH_ARG,
   ];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** The result object if `line` is the JSON result of `build` or `up`, otherwise undefined. */

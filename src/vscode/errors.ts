@@ -7,6 +7,7 @@
 import * as vscode from 'vscode';
 import { isUserFacingError, type UserErrorCode } from '../core/errors';
 import { Actions } from '../core/messages';
+import { Commands } from './commands';
 import { isAbortError, type Logger } from '../core/ports';
 import { RegistryVersionError } from '../core/storage/registry';
 
@@ -14,8 +15,6 @@ import { RegistryVersionError } from '../core/storage/registry';
 /** Message for an error without a plain-language message of its own. */
 export const OPERATION_FAILED = 'The operation failed.';
 
-/** Command of the welcome view and of the action "Sign in" (package.json). */
-const SIGN_IN_COMMAND = 'devEnvironments.signIn';
 /**
  * Command of the action "Install Docker…" (Show Docker Setup, hidden): shows the sidebar view, whose welcome view has
  * the steps of the Docker setup while the CLI is missing (a CLI lost since it was found is reported by BootstrapDocker).
@@ -151,7 +150,7 @@ function runAction(action: ErrorAction, options: ShowErrorOptions): void {
         return;
       case 'signIn':
         vscode.commands
-          .executeCommand(SIGN_IN_COMMAND)
+          .executeCommand(Commands.signIn)
           .then(undefined, (error: unknown) => options.logger.error('The sign-in failed.', error));
         return;
     }

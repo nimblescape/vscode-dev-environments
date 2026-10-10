@@ -14,7 +14,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 import type { ContainerInfo } from '../core/docker/dockerObjects';
 import { containerIsCurrent, isUnrestrictedContainer } from '../core/pipeline/pipelineRules';
 import { hostAccessChecks } from '../core/policy/hostAccessChecks';
-import type { WindowStateValue } from '../core/helperChannel/protocol';
+import type { TokenRemoveValue, WindowStateValue } from '../core/helperChannel/protocol';
 import { DockerContextKeys } from '../core/docker/dockerSetup';
 import { UserFacingError } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
@@ -22,6 +22,7 @@ import { CONTAINER_VERSION, HOST_ACCESS_UNRESTRICTED, LABEL_CONTAINER_VERSION, L
 import { OP_TOKEN_REMOVE } from '../core/helperChannel/protocol';
 import type { OpenOptions, OpenResult, OperationOptions, RepositoryTarget } from '../core/pipeline/operationBase';
 import { PipelineTexts } from '../core/pipeline/operationBase';
+import { removeTokenThroughWorker } from '../core/pipeline/environmentOperations';
 import { StoragePaths } from '../core/storage/paths';
 import { EnvironmentRegistry } from '../core/storage/registry';
 import { SessionFiles } from '../core/storage/sessionFiles';
@@ -193,6 +194,8 @@ interface Harness {
     windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; signal?: AbortSignal }) => Promise<WindowStateValue | undefined>>>;
     // Plan step 11C3: changed, the restore runs in the worker (reconcileInWorker).
     reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean }) => Promise<number>>>;
+    /** Cleanup after plan step 11 (PR #142, C3): the token removal, sent by the operations of the window over `flow`. */
+    removeTokenInWorker: ReturnType<typeof vi.fn<(environmentId: string, containerName: string) => Promise<TokenRemoveValue>>>;
     // Plan step 11I (D3; PR #127 review round 1, A L6): the three reads of this fake service are its own fixtures (the
     // tests of the dialogs of Delete give each list), which its deleteCheckInWorker joins into the one read of the
     // removable volumes (removableVolumes); EnvironmentService has only removableVolumesOf.
@@ -290,6 +293,9 @@ function createHarness(
     deleteInWorker: vi.fn(async () => {}),
     listConfigurationsInWorker: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
+    // Cleanup after plan step 11 (PR #142, C3): the token removal of the operations of the window (removeTokenThroughWorker,
+    // the production code) over the fake flow of this harness, so that the tests below still see the flow it sends.
+    removeTokenInWorker: vi.fn((environmentId: string, containerName: string) => removeTokenThroughWorker(flow, environmentId, containerName)),
     // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
     // that fails is unknown (undefined, decision of 2026-10-04).
     windowStateInWorker: vi.fn(async (env: Environment, containerName: string, options: { branch?: boolean } = {}) => {
@@ -408,9 +414,9 @@ function createHarness(
     sessionFiles,
     disconnectRequests,
     docker,
-    // Plan step 11B1: the flows that run in the worker (the token removal); the flow itself is tested in
-    // src/core/worker/tokenRemoveFlow.test.ts.
-    flow,
+    // Plan step 11B1: the flows that run in the worker (the token removal; the flow itself is tested in
+    // src/core/worker/tokenRemoveFlow.test.ts). Cleanup after plan step 11 (PR #142, C3): `flow` goes to the controller
+    // through `service` (removeTokenInWorker) only.
     service,
     discovery,
     auth,

@@ -40,6 +40,7 @@ import {
   securityOptionProblems,
 } from './rules';
 import { foreignNetworkItem, isOtherEnvironmentProjectName, volumeNameFindings, type VolumeInput } from './volumes';
+import { isRecord } from '../valueChecks';
 
 export interface ComposeAccessInput extends VolumeInput {
   /** The merged model (ComposeModelOutput.model). */
@@ -82,10 +83,6 @@ export interface ComposeAccessInput extends VolumeInput {
 function decisionProblem(decision: { item: string; kind: 'hostAccess' | 'unsupported'; guarded?: true }): Problem {
   if (decision.kind === 'unsupported') return unsupported(decision.item);
   return decision.guarded ? guarded(decision.item) : access(decision.item);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** A value that `docker compose config` prints for a key that is not set, or that sets nothing. */

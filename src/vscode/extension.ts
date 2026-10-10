@@ -432,7 +432,8 @@ async function activateExtension(
   coordinator = sessionCoordinator;
   context.subscriptions.push(sessionCoordinator);
   // Plan step 11B1, 11B2 (decision of 2026-10-03, the worker is the deputy): the flows that run in the worker of the
-  // current engine, with the HostSide of this computer answering their requests; one for the service and the controller.
+  // current engine, with the HostSide of this computer answering their requests; one for the service (cleanup after plan
+  // step 11, PR #142, C3: also the token removal of the controller) and the calls to the Session Monitor.
   // Plan step 11E4d (decision of 2026-09-29): the containers that this window remembers, for its pipeline and its worker.
   const lifecycleMemory = windowLifecycleMemory();
   const workerFlow = extensionFlow(
@@ -580,9 +581,8 @@ async function activateExtension(
     sessionFiles,
     disconnectRequests,
     docker,
-    // Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): a flow runs in the worker of the current engine,
-    // and the HostSide of this computer answers its requests (hostSideHandler).
-    flow: workerFlow,
+    // Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): the flows of the window, also the token removal,
+    // run in the worker of the current engine through `service` (cleanup after plan step 11, PR #142, C3).
     service,
     discovery,
     auth,

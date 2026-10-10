@@ -68,9 +68,6 @@ const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = {
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
 export type TreeNode = OwnerGroup | GroupNode | RepositoryRow | HintRow | SignInRow | DockerHostRow;
 
-/** Command of the sign-in row (package.json). */
-const SIGN_IN_COMMAND = 'devEnvironments.signIn';
-
 export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNode>, vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
   private groups: OwnerGroup[] = [];
@@ -201,7 +198,7 @@ function signInItem(row: SignInRow): vscode.TreeItem {
   item.tooltip = row.tooltip;
   item.contextValue = 'signIn';
   item.iconPath = new vscode.ThemeIcon('account');
-  item.command = { command: SIGN_IN_COMMAND, title: row.label };
+  item.command = { command: Commands.signIn, title: row.label };
   return item;
 }
 

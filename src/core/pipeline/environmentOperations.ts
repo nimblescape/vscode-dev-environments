@@ -22,6 +22,7 @@ import {
   OPEN_PROGRESS_DETAIL,
   OP_RECONCILE,
   OP_STOP,
+  OP_TOKEN_REMOVE,
   OP_WINDOW_STATE,
   parseDeleteCheckParams,
   parseDeleteCheckValue,
@@ -35,9 +36,11 @@ import {
   parseOpenValue,
   parseStopParams,
   parseStopValue,
+  parseTokenRemoveValue,
   parseWindowStateParams,
   parseWindowStateValue,
   type OpenParams,
+  type TokenRemoveValue,
   type VscodeServerRef,
   type WindowStateValue,
 } from '../helperChannel/protocol';
@@ -70,6 +73,7 @@ import {
   DELETE_CHECK_FLOW_TIMEOUT_MS,
   RECONCILE_FLOW_TIMEOUT_MS,
   OPEN_FLOW_TIMEOUT_MS,
+  TOKEN_REMOVE_FLOW_TIMEOUT_MS,
   type DockerStarter,
   type OpenOptions,
   type OpenResult,
@@ -106,6 +110,19 @@ export type OperationFlow = (
     helperMaintenance?: HelperMaintenance;
   },
 ) => Promise<unknown>;
+
+/**
+ * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): the token removal of concept 7.5 (`tokenRemove`) by
+ * the worker of the current engine (`flow`), within TOKEN_REMOVE_FLOW_TIMEOUT_MS (review round 1, A-R1-5). Rejects when
+ * the flow fails or answers with an invalid value; its caller logs that (best effort). Cleanup after plan step 11 (PR #142,
+ * C3): here with the other flows of a window (EnvironmentOperations.removeTokenInWorker; before: in the controller); apart
+ * from the class for the tests of the controller, which give it their fake flow.
+ */
+export async function removeTokenThroughWorker(flow: OperationFlow, environmentId: string, containerName: string): Promise<TokenRemoveValue> {
+  const value = parseTokenRemoveValue(await flow(OP_TOKEN_REMOVE, { environmentId, containerName }, { timeoutMs: TOKEN_REMOVE_FLOW_TIMEOUT_MS }));
+  if (value === undefined) throw new Error('The worker answered the token removal with an invalid value.');
+  return value;
+}
 
 /** The deps of the operations of a window. */
 export interface EnvironmentOperationsDeps extends OperationBaseDeps {
@@ -670,5 +687,14 @@ export class EnvironmentOperations extends OperationBase {
     );
     if (value === undefined) throw new Error('The worker answered the rebuild of the registry with an invalid value.');
     return value.added;
+  }
+
+  /**
+   * Concept 7.5 (plan step 11B1): the token removal from the dev container `containerName` of an environment by the worker
+   * of the current engine (removeTokenThroughWorker). Cleanup after plan step 11 (PR #142, C3): through the operations of
+   * the window, as every other flow (before: `deps.flow` of the controller). Its caller checks the Docker host first.
+   */
+  async removeTokenInWorker(environmentId: string, containerName: string): Promise<TokenRemoveValue> {
+    return removeTokenThroughWorker(this.deps.flow, environmentId, containerName);
   }
 }

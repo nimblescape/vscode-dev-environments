@@ -66,9 +66,10 @@ export async function removeTokenFlow(p: TokenRemoveFlow): Promise<TokenRemoveRe
     ));
   let emptied: EngineContainer | undefined;
   const kept: string[] = [];
-  // PR #127 review round 1 (A, L3): the time limit of the extension (TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts)
-  // covers the two tries of one container; the container of the request comes first (runningDevContainers: the named one
-  // first), so a later one may not be tried before that limit ends the operation.
+  // PR #127 review round 1 (A, L3): the time limit of the extension (TOKEN_REMOVE_FLOW_TIMEOUT_MS of operationBase.ts;
+  // tokenRemoveFlow.test.ts ties it to TOKEN_REMOVE_TIMEOUT_MS) covers the two tries of one container; the container of
+  // the request comes first (runningDevContainers: the named one first), so a later one may not be tried before that
+  // limit ends the operation.
   for (const container of running) {
     const outcome = await emptyTokenFolder(p, container, container.name === p.containerName, userOfRecord);
     if (outcome === 'notRunning') continue;

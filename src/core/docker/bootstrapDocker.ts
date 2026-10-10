@@ -20,6 +20,7 @@ import { isSshClosedBeforeLogin } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
 import { operationDockerTarget } from './dockerTargets';
+import { isRecord } from '../valueChecks';
 
 /** Result of `docker info`. */
 export interface DaemonStatus {
@@ -53,7 +54,6 @@ export function sshDroppedReadCall(args: readonly string[], result: RunResult): 
   return /\bdial-stdio\b[^\n]*exit status 255/.test(result.stderr) && isSshClosedBeforeLogin(result.stderr);
 }
 
-
 /** Docker objects whose command is the second word (`docker image rm`, `docker context create`). */
 const DOCKER_OBJECTS = new Set(['container', 'image', 'volume', 'network', 'context', 'system', 'builder', 'buildx', 'compose', 'plugin', 'manifest']);
 
@@ -67,14 +67,11 @@ export function directCommandName(args: readonly string[]): string {
   return DOCKER_OBJECTS.has(command) && subcommand !== undefined && !subcommand.startsWith('-') ? `${command} ${subcommand}` : command;
 }
 
-
 /** Plan step 11I (PR D): what `docker image inspect` and `docker image rm` say of an image that does not exist. */
 const IMAGE_MISSING_PATTERN = /no such (image|object)/i;
 
-
 /** Docker refuses to remove an image that a container or another image uses. */
 export const IMAGE_IN_USE_PATTERN = /conflict|in use|being used|is using|dependent child images/i;
-
 
 /** Parses output with one JSON value per line (`--format '{{json …}}'`). Empty and invalid lines are skipped. */
 export function parseJsonLines(stdout: string): unknown[] {
@@ -91,11 +88,6 @@ export function parseJsonLines(stdout: string): unknown[] {
   return values;
 }
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-
 /** Parses the output of `--format '{{json .X}}'` for a single object. */
 export function parseJsonOutput(stdout: string): unknown {
   const text = stdout.trim();
@@ -106,7 +98,6 @@ export function parseJsonOutput(stdout: string): unknown {
     return undefined;
   }
 }
-
 
 /** Options of `docker run` / `docker exec` whose `NAME=value` can hold a secret (for example a `${localEnv:…}` token). */
 const ENV_FLAGS = new Set(['-e', '--env']);
@@ -126,7 +117,6 @@ export function commandText(args: readonly string[]): string {
   const text = `docker ${shown.join(' ')}`;
   return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
-
 
 /** Removes a variable in every spelling of its name (names are case-insensitive on Windows). */
 export function deleteEnv(env: NodeJS.ProcessEnv, name: string): void {

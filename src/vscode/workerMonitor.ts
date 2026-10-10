@@ -23,6 +23,7 @@ import {
   parseWindowStateParams,
   parseWindowStateValue,
 } from '../core/helperChannel/protocol';
+import { MONITOR_ENSURE_FLOW_TIMEOUT_MS, MONITOR_FLOW_TIMEOUT_MS } from '../core/pipeline/operationBase';
 import type { Logger } from '../core/ports';
 import type { HeartbeatInput, MonitorSettings } from '../core/remoteMonitor/protocol';
 import type { HeartbeatSendResult } from '../core/session/windowHeartbeats';
@@ -30,16 +31,6 @@ import type { Environment } from '../core/types';
 
 /** A flow in the worker of `target` (extensionFlow with its target). */
 export type TargetFlow = (op: string, params: unknown, options: { target: DockerTarget; signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
-
-/**
- * Plan step 11D2: the longest ensure of the Session Monitor in the worker: its looks and waits (a name conflict, a
- * container that another window creates: 25.5 s at most), the create and the wait for its ready line (60 s), each call of
- * the engine bounded by 60 s.
- */
-export const MONITOR_ENSURE_FLOW_TIMEOUT_MS = 5 * 60_000;
-
-/** The longest heartbeat or monitor command in the worker: its `docker exec` (20 s) and the way there. */
-export const MONITOR_FLOW_TIMEOUT_MS = 30_000;
 
 export interface WorkerMonitorDeps {
   flow: TargetFlow;
