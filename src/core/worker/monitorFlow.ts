@@ -13,7 +13,7 @@ import { errorMessage } from '../errors';
 import { MAX_MONITOR_DETAIL_LENGTH, type HeartbeatValue } from '../helperChannel/protocol';
 import { REMOTE_MONITOR_CONTAINER, isUnderRecordsLock, monitorExecFailure, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
 import { runScript, scriptCommand, type ContainerScript } from './containerScripts';
-import { isNotRunning, type DockerEngine } from './dockerEngine';
+import { isMissing, isNotRunning, type DockerEngine } from './dockerEngine';
 
 /** The time limit of a command in the Session Monitor container (as REMOTE_MONITOR_EXEC_TIMEOUT_MS of the extension). */
 export const MONITOR_EXEC_TIMEOUT_MS = 20_000;
@@ -23,7 +23,7 @@ export type MonitorScript = Extract<ContainerScript, 'monitorHeartbeat' | 'monit
 
 /**
  * One command in the monitor container: ok, or the reason it failed; `missing` when the container does not exist or does
- * not run (a 404, or a 409 "is not running" of the engine). Never throws, except an AbortError of `signal`. `container`:
+ * not run (isNotRunning, or the caller's own rule `missing`). Never throws, except an AbortError of `signal`. `container`:
  * the monitor container (REMOTE_MONITOR_CONTAINER; a test names its own, the operations never do). Plan step 11I (U2,
  * decision of 2026-10-08): the command is the entry `name` of the registry with its arguments, run by runScript; `input`
  * only for an entry that reads one (runScript refuses it for any other). A command under the lock of the records still
@@ -33,7 +33,7 @@ export async function monitorCommand(
   engine: DockerEngine,
   name: MonitorScript,
   args: readonly string[],
-  options: { input?: string; signal?: AbortSignal; container?: string } = {},
+  options: { input?: string; signal?: AbortSignal; container?: string; missing?: (error: unknown) => boolean } = {},
 ): Promise<HeartbeatValue> {
   try {
     const result = await runScript(engine, options.container ?? REMOTE_MONITOR_CONTAINER, name, args, {
@@ -48,8 +48,9 @@ export async function monitorCommand(
     return { ok: false, missing: false, detail: clip(detail) };
   } catch (error) {
     if (options.signal?.aborted) throw error;
-    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning); before, any 404 counted.
-    const missing = isNotRunning(error);
+    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning) unless the caller gives its own (Delete's
+    // forget); before, any 404 counted.
+    const missing = (options.missing ?? isNotRunning)(error);
     return { ok: false, missing, detail: clip(errorMessage(error)) };
   }
 }
@@ -71,9 +72,20 @@ export function sendMonitorSettings(engine: DockerEngine, params: { settings: Im
     : monitorCommand(engine, 'monitorImages', [], { input: JSON.stringify({ repositories: params.repositories }), signal, ...named });
 }
 
-/** Delete's `forget`: the heartbeat record of `source` for the environment (the entry monitorForget, under the lock of the records). */
+/**
+ * Delete's `forget`: the heartbeat record of `source` for the environment (the entry monitorForget, under the lock of the
+ * records). Cleanup after plan step 11 (PR C2, B5; review round 1, A-C2-5): `missing` keeps its rule from before, any 404
+ * (also "No such exec instance": the monitor container went away between the create and the start of the exec) or a 409
+ * "is not running", because Delete logs no record of a monitor that does not run (workerSessionMonitor); the one rule
+ * would make that race a warning.
+ */
 export function forgetRecord(engine: DockerEngine, source: string, environmentId: string, container?: string): Promise<HeartbeatValue> {
-  return monitorCommand(engine, 'monitorForget', [source, environmentId], container !== undefined ? { container } : {});
+  return monitorCommand(engine, 'monitorForget', [source, environmentId], { missing: forgetMissing, ...(container !== undefined ? { container } : {}) });
+}
+
+/** The rule of `missing` for Delete's forget (forgetRecord): any 404 of the engine, or the container does not run. */
+function forgetMissing(error: unknown): boolean {
+  return isMissing(error) || isNotRunning(error);
 }
 
 function clip(text: string): string {

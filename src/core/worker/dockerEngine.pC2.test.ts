@@ -5,11 +5,13 @@
 // Cleanup after plan step 11 (PR C2, B5): isNotRunning, the one rule for "the container of an exec does not exist or does
 // not run", and what it changed for its callers (a 404 that names no container is no evidence any more).
 import { describe, expect, it } from 'vitest';
+import { silentLogger, type Logger } from '../ports';
 import { REMOTE_MONITOR_CONTAINER } from '../remoteMonitor/protocol';
 import { EngineError, isNotRunning, type DockerEngine } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { engineMonitor } from './engineMonitor';
-import { sendHeartbeat } from './monitorFlow';
+import { forgetRecord, sendHeartbeat } from './monitorFlow';
+import { workerSessionMonitor } from './workerServices';
 
 const ID = 'feed'.padEnd(64, '1');
 
@@ -50,5 +52,20 @@ describe('the callers whose rule changed (PR C2, B5, behaviour change)', () => {
   it('the stored script: a 404 "No such exec instance" is unknown, not none', async () => {
     expect(await engineMonitor(failingExec(new EngineError(`No such exec instance: ${ID}`, 404))).storedScript('devenv-session-monitor')).toBe('unknown');
     expect(await engineMonitor(failingExec(new EngineError('No such container: devenv-session-monitor', 404))).storedScript('devenv-session-monitor')).toBe('none');
+  });
+
+  // Review round 1 of PR C2 (A-C2-5): Delete's forget keeps its rule from before (any 404 is `missing`), so that the race
+  // of a monitor container that went away between the create and the start of the exec is not logged as a failed
+  // removal; a monitor that does not run has no record that matters (workerSessionMonitor).
+  it("Delete's forget: a 404 \"No such exec instance\" is a missing monitor as before, and is not logged", async () => {
+    const vanished = failingExec(new EngineError(`No such exec instance: ${ID}`, 404));
+    expect(await forgetRecord(vanished, '0'.repeat(32), 'env', REMOTE_MONITOR_CONTAINER)).toEqual({ ok: false, missing: true, detail: `No such exec instance: ${ID}` });
+    const lines: string[] = [];
+    const logger = { ...silentLogger, warn: (text: string) => lines.push(text) } as Logger;
+    await workerSessionMonitor(vanished, '0'.repeat(32), logger).forget!({ kind: 'local', host: '', endpoint: '' }, 'env');
+    expect(lines).toEqual([]);
+    // A paused monitor (409, not "is not running") is still a failure that Delete logs.
+    await workerSessionMonitor(failingExec(new EngineError(`Container ${ID} is paused, unpause the container before exec`, 409)), '0'.repeat(32), logger).forget!({ kind: 'local', host: '', endpoint: '' }, 'env');
+    expect(lines).toEqual([`The heartbeat record of env could not be removed from the Session Monitor: Container ${ID} is paused, unpause the container before exec`]);
   });
 });

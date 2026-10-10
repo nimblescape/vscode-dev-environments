@@ -3,15 +3,13 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Plan step 5, PR B: Stop and Delete under the lock of the environment on the Docker host (EnvironmentService
-// withEnvironmentLock). User decision D1: the helper image is ensured (built when missing) and the worker opened
-// before;
-// when that fails, the operation is refused and nothing is stopped or removed. User decision D2: Stop and Delete in
-// step 5.
-// User decision D3: a lock held elsewhere is refused after the wait, with its message. The busy mark comes first, then
-// the lock; both are released in `finally`.
+// withEnvironmentLock). User decision D1: the worker is opened before (its lock); when that fails, the operation is
+// refused and nothing is stopped or removed. Cleanup after plan step 11 (PR C2, A4): no helper image is prepared before
+// the lock any more (before: the helper image was ensured, built when missing, and a failure refused the operation).
+// User decision D2: Stop and Delete in step 5. User decision D3: a lock held elsewhere is refused after the wait, with
+// its message. The busy mark comes first, then the lock; both are released in `finally`.
 //
-// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the same lock. An
-// open
+// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the same lock. An open
 // of an existing environment takes it after the start of Docker and the wait for another window's operation, around
 // everything through the pipeline; a first open after its registry entry, before the volume. A refusal leaves no busy
 // mark and nothing changed (a first open removes its new registry entry again). Re-entrant: the Delete of Clone again
@@ -71,10 +69,8 @@ beforeEach(() => {
   });
   // PR #74 review round 1, A-R1-1: the image before the lock is the non-maintaining ensureImagePresent (event
   // `ensureImage`); the maintaining ensureImageUse would add its own event, which no expectation of Stop or Delete has.
-  // Cleanup after plan step 11 (PR C2, A4): ensureImagePresent is called only by the worker of the tests
-  // (fakeWorkerFlow:
-  // Stop), as the extension's preparation of the worker; the pipeline's withEnvironmentLock (Delete, the opens)
-  // prepares
+  // Cleanup after plan step 11 (PR C2, A4): ensureImagePresent is called only by the worker of the tests (fakeWorkerFlow:
+  // Stop), as the extension's preparation of the worker; the pipeline's withEnvironmentLock (Delete, the opens) prepares
   // no image. The image of an open is the own image (ownImageUse, before ensureImageUse; event `ownImageUse`).
   const ensure = h.helper.ensureImagePresent.bind(h.helper);
   h.helper.ensureImagePresent = async (options) => {
@@ -208,8 +204,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
     expect(h.docker.containersOf(ENV_ID)[0].state).toBe('running');
   });
 
-  // PR #74 review round 1, A-R1-1: an earlier check recorded a new base digest, so the maintaining ensure would wait
-  // for
+  // PR #74 review round 1, A-R1-1: an earlier check recorded a new base digest, so the maintaining ensure would wait for
   // a `--pull --no-cache` rebuild (here: forever). Stop does not run it: it only ensures that the tag exists.
   it('A-R1-1: a pending rebuild of the maintaining ensure does not delay Stop: only the tag is ensured, then the lock', async () => {
     await seedEnvironment(h, { container: 'running' });
@@ -264,8 +259,7 @@ describe('no unlocked path (plan step 5, PR B, D1: no unlocked path)', () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the environment
-// lock.
+// Plan step 6, PR A (user decision D2): Start, Rebuild, Select configuration and Clone again under the environment lock.
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 
@@ -346,8 +340,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     };
     await h.service.open(TARGET, openOptions());
     expect(h.dockerStarts).toBe(1);
-    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it
-    // exists).
+    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
     // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` after the wait).
     expect(openEvents().slice(0, 4)).toEqual(['busy wait', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker volume inspect (locked)']);
@@ -409,8 +402,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     expect(openEvents().slice(0, 6)).toEqual([
       `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
       'busy=none',
-      // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it
-      // exists).
+      // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
       'docker volume inspect (locked)',
       'docker volume create (locked)',
       // Review round 4 of PR #88 (A-R4-1): changed expectation, and whose the new volume is before the clone.
@@ -442,8 +434,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     const staleCreate = { operation: 'create' as const, since: '2026-09-24T15:00:00.000Z', pid: 999, windowId: 'window-old' };
     await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
     await h.service.open(TARGET, openOptions());
-    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it
-    // exists).
+    // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
     // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` first).
     expect(openEvents().slice(0, 4)).toEqual([`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create', 'docker volume inspect (locked)', 'clone (locked)']);
@@ -509,8 +500,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
         `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
         'busy=create',
         'docker volume create (locked)',
-        // Review round 2 of PR #88 (A-R2-2): changed expectation, the labels of the new volume are read
-        // (requireOwnVolume).
+        // Review round 2 of PR #88 (A-R2-2): changed expectation, the labels of the new volume are read (requireOwnVolume).
         'docker volume inspect (locked)',
         'clone (locked)',
       ]);
@@ -561,8 +551,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
         `lock ${id} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
         'busy=create',
         'docker volume create (locked)',
-        // Review rounds 2 and 1 of PR #88 (A-R2-2, A-R1-4): changed expectation, the labels of the volume are read
-        // after its
+        // Review rounds 2 and 1 of PR #88 (A-R2-2, A-R1-4): changed expectation, the labels of the volume are read after its
         // creation and before its removal, both under the lock.
         'docker volume inspect (locked)',
         'clone (locked)',
@@ -689,10 +678,8 @@ describe('a failed first open whose volume cannot be removed (PR #78 review roun
     expect(h.docker.volumes.size).toBe(0);
   });
 
-  // PR #78 review round 2 (A-R2-1): the kept create mark of this window counts as ended, so it blocks nothing while
-  // this
-  // window lives (the sidebar of every window, other windows' Start and Delete); any window's next open completes the
-  // clone.
+  // PR #78 review round 2 (A-R2-1): the kept create mark of this window counts as ended, so it blocks nothing while this
+  // window lives (the sidebar of every window, other windows' Start and Delete); any window's next open completes the clone.
   const statuses = (now: number) =>
     [
       { windowId: WINDOW_ID, pid: PID, updatedAt: new Date(now).toISOString(), environmentId: null, state: 'idle' },

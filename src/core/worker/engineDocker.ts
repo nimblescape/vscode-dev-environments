@@ -31,6 +31,14 @@ interface PullCredentials extends Credentials {
   registry: string;
 }
 
+/**
+ * Cleanup after plan step 11 (PR C2, D2; review round 1, A-C2-1): the time limit of EngineDocker.labelImage (10 min),
+ * longer than that of a query (DOCKER_QUERY_TIMEOUT_MS), because the commit can walk the whole filesystem of the image on
+ * some storage drivers (the containerd image store, fuse-overlayfs, vfs); still far below the time limit of the open, so
+ * that a stalled engine cannot hold the lock of the environment for long.
+ */
+export const LABEL_IMAGE_TIMEOUT_MS = 10 * 60_000;
+
 /** An Engine API answer about the reference itself (400): an invalid reference, as `docker image inspect` reports it. */
 const INVALID_REFERENCE = 400;
 
@@ -336,10 +344,10 @@ export class EngineDocker implements EnvironmentDocker {
   async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
     const previous = await this.imageId(image);
     if (previous === undefined) throw new EngineError(`The image ${image} does not exist.`, 404);
-    // Cleanup after plan step 11 (PR C2, D2): within the time limit of each call (DOCKER_QUERY_TIMEOUT_MS), so that a
-    // stalled engine cannot hold the lock of the environment up to the time limit of the open; the inspect and the commit
-    // of DockerEngine.labelImage run on its signal (before: on the signal of the operation only).
-    const now = await this.call(`the labels of ${image}`, signal, (limited) => this.engine.labelImage(image, labels, limited));
+    // Cleanup after plan step 11 (PR C2, D2): within a time limit of its own (LABEL_IMAGE_TIMEOUT_MS, review round 1,
+    // A-C2-1), so that a stalled engine cannot hold the lock of the environment up to the time limit of the open; the
+    // inspect and the commit of DockerEngine.labelImage run on its signal (before: on the signal of the operation only).
+    const now = await this.call(`the labels of ${image}`, signal, (limited) => this.engine.labelImage(image, labels, limited), LABEL_IMAGE_TIMEOUT_MS);
     if (now === previous) return;
     try {
       const names = await this.imageNames(previous);

@@ -6121,16 +6121,11 @@ export class EnvironmentService extends OperationBase {
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
     // Review round 2 of PR #64 (A-N1): the helper image is resolved once per run.
     if (ctx.helperImage !== undefined) return;
-    let image: HelperImageUse;
-    try {
-      // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
-      // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
-      image = await this.deps.helper.ownImageUse(ctx.signal);
-    } catch (error) {
-      // The own image fails only on a cancel; a helperFailed (of a test's helper) marks the run as for a failed helper run.
-      if (isUserFacingError(error) && error.code === 'helperFailed') ctx.helperUnavailable = true;
-      throw error;
-    }
+    // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
+    // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
+    // Review round 1 of PR C2 (B-H2): no catch of its own; the own image fails only on a cancel, and a helperFailed (only
+    // a test's helper throws one here) marks the run in the catch of the open's step that called it (loadConfiguration).
+    const image = await this.deps.helper.ownImageUse(ctx.signal);
     // Plan step 8, PR A (Q3): the Session Monitor first; when it cannot be ensured, the open is refused, and the helper
     // image is not taken for resolved, so no later step of this run goes on without the monitor.
     await this.ensureSessionMonitor(ctx, image);
