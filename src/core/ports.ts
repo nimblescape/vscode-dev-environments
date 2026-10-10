@@ -62,6 +62,22 @@ export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
+/**
+ * Cleanup after plan step 11 (PR C2, B4): `run` within `ms`, the one time-limited call of the worker (EngineDocker's
+ * calls, the engine of the Session Monitor's ensure, the stops of Stop). `run` gets a signal that aborts at `signal` or
+ * after `ms`. When the time limit ended it and `signal` did not abort, it rejects with the error of `timedOut`, whatever
+ * `run` rejected with; any other failure, and a cancel of `signal`, passes unchanged.
+ */
+export async function withTimeLimit<T>(ms: number, signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>, timedOut: () => Error): Promise<T> {
+  const limit = AbortSignal.timeout(ms);
+  try {
+    return await run(signal ? AbortSignal.any([signal, limit]) : limit);
+  } catch (error) {
+    if (limit.aborted && !signal?.aborted) throw timedOut();
+    throw error;
+  }
+}
+
 export interface RunOptions {
   /** Complete environment of the process. Default: the environment of this process. */
   env?: NodeJS.ProcessEnv;

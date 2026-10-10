@@ -13,7 +13,7 @@ import { errorMessage } from '../errors';
 import { MAX_MONITOR_DETAIL_LENGTH, type HeartbeatValue } from '../helperChannel/protocol';
 import { REMOTE_MONITOR_CONTAINER, isUnderRecordsLock, monitorExecFailure, type HeartbeatInput, type ImageSettings } from '../remoteMonitor/protocol';
 import { runScript, scriptCommand, type ContainerScript } from './containerScripts';
-import { EngineError, isMissing, type DockerEngine } from './dockerEngine';
+import { isNotRunning, type DockerEngine } from './dockerEngine';
 
 /** The time limit of a command in the Session Monitor container (as REMOTE_MONITOR_EXEC_TIMEOUT_MS of the extension). */
 export const MONITOR_EXEC_TIMEOUT_MS = 20_000;
@@ -48,7 +48,8 @@ export async function monitorCommand(
     return { ok: false, missing: false, detail: clip(detail) };
   } catch (error) {
     if (options.signal?.aborted) throw error;
-    const missing = isMissing(error) || (error instanceof EngineError && error.status === 409 && /is not running/i.test(error.message));
+    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning); before, any 404 counted.
+    const missing = isNotRunning(error);
     return { ok: false, missing, detail: clip(errorMessage(error)) };
   }
 }

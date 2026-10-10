@@ -10,7 +10,7 @@
 // picks the named one even when it is stopped, and a running other dev container must not keep a token. Pure over the
 // port and the seams; no I/O of its own, no `vscode`.
 import { runScript } from './containerScripts';
-import { EngineError, type DockerEngine, type EngineContainer, type EngineExecResult } from './dockerEngine';
+import { isNotRunning, type DockerEngine, type EngineContainer, type EngineExecResult } from './dockerEngine';
 import { environmentContainers, runningDevContainers } from './environmentContainers';
 import type { HostRecords } from './hostSide';
 
@@ -127,9 +127,9 @@ async function tryRemoval(p: TokenRemoveFlow, container: string, user: string): 
     // Review round 3 of plan step 11B1 (A-R3-2): any failure but a cancel is a failed try, as with `docker exec`.
     if (error instanceof Error && error.name === 'AbortError') throw error;
     // A container that stopped (409) or was removed (404, A-R3-3) since the lookup holds no token any more.
-    if (error instanceof EngineError && ((error.status === 409 && /is not running/i.test(error.message)) || (error.status === 404 && /no such container/i.test(error.message)))) {
-      return 'notRunning';
-    }
+    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning); a paused or restarting container still holds
+    // the token (review round 3, B-R3-1 to B-R3-3).
+    if (isNotRunning(error)) return 'notRunning';
     return { exitCode: null, stdout: '', stderr: error instanceof Error ? error.message : String(error), timedOut: false };
   }
 }

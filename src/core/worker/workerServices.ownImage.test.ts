@@ -63,11 +63,12 @@ describe("the worker's WorkspaceHelper (plan step 11I, U7)", () => {
     const helper = workerHelper();
     const deps = (helper as unknown as { deps: Record<string, unknown> }).deps;
     expect(Object.keys(deps).sort()).toEqual(['containerRuns', 'logger', 'ownImage', 'socket']);
-    for (const removed of ['ensureImage', 'checkImagePresent', 'presentImage', 'engineKey', 'prebuildImage', 'runImage']) {
+    // Cleanup after plan step 11 (PR C2, A4): the two image calls of the pipeline are one read of the own image
+    // (ownImageUse); ensureImageUse and ensureImagePresent are removed.
+    for (const removed of ['ensureImage', 'checkImagePresent', 'presentImage', 'engineKey', 'prebuildImage', 'runImage', 'ensureImageUse', 'ensureImagePresent']) {
       expect((helper as unknown as Record<string, unknown>)[removed], removed).toBeUndefined();
     }
-    expect(await helper.ensureImageUse()).toEqual(OWN);
-    expect(await helper.ensureImagePresent()).toEqual(OWN);
+    expect(await helper.ownImageUse()).toEqual(OWN);
   });
 
   // Review round 1 of PR #129 (B-L4): whether a container runs (after a failed lifecycle command of `up`) is read with

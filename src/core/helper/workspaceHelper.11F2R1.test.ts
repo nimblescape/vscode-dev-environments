@@ -61,15 +61,15 @@ describe('WorkspaceHelper with its own image (review 11F2 R1)', () => {
   // Plan step 11I (U7): changed expectation, the two image calls that WorkspaceHelper keeps (before: also
   // checkImagePresent, presentImage and prebuildImage, which are removed, and no call of the Docker port, which is
   // removed).
+  // Cleanup after plan step 11 (PR C2, A4): the two image calls are one (ownImageUse), so each expectation is asserted
+  // once (before: once for ensureImageUse and once for ensureImagePresent, both removed).
   it('passes an abort through on each image call', async () => {
     const h = helper('/s.sock');
     const controller = new AbortController();
     controller.abort();
     const signal = controller.signal;
-    await expect(h.ensureImageUse({ signal })).rejects.toMatchObject({ name: 'AbortError' });
-    await expect(h.ensureImagePresent({ signal })).rejects.toMatchObject({ name: 'AbortError' });
-    expect(await h.ensureImageUse()).toEqual(OWN);
-    expect(await h.ensureImagePresent()).toEqual(OWN);
+    await expect(h.ownImageUse(signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(await h.ownImageUse()).toEqual(OWN);
   });
 
   // Plan step 11I (U7): changed setup, the socket is the one of HelperDeps (the worker's own socket; before: the

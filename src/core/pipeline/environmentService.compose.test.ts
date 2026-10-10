@@ -234,8 +234,9 @@ describe('first open of a Docker Compose configuration', () => {
     const result = await h.service.open(TARGET, options());
 
     // Plan step 6, PR A: changed expectation, the open first ensures the helper image of the worker for its lock (D1).
+    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (the worker's own
+    // image; before: `ensureImagePresent` first).
     expect(h.helper.calls.filter((call) => !call.startsWith('readConfigFiles') && call !== 'ensureImage')).toEqual([
-      'ensureImagePresent',
       'clone main',
       `readConfiguration ${DEFAULT_CONFIG_PATH}`,
       `composeModel ${PROJECT}`,

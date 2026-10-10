@@ -295,6 +295,19 @@ export function isMissing(error: unknown): boolean {
 }
 
 /**
+ * Cleanup after plan step 11 (PR C2, B5): true when the engine refused an exec because its container does not exist (404
+ * "No such container") or does not run (409 "is not running"); with `restarting`, also because it restarts (409 "is
+ * restarting"). Not for a paused container, another 404 (for example "No such exec instance"), or another status. One rule
+ * for the token removal (tokenRemoveFlow), the commands in the Session Monitor container (monitorFlow) and the check of
+ * its stored script (engineMonitor, with `restarting`); before, each had its own.
+ */
+export function isNotRunning(error: unknown, options: { restarting?: boolean } = {}): boolean {
+  if (!(error instanceof EngineError)) return false;
+  if (error.status === 404) return /no such container/i.test(error.message);
+  return error.status === 409 && (options.restarting === true ? /is (?:not running|restarting)\b/i : /is not running/i).test(error.message);
+}
+
+/**
  * Whether a container of an environment is its dev container: without the label nimblescape.devenv.compose-service of
  * the other services of Docker Compose, or with the name of the environment.
  */

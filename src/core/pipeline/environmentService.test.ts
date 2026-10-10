@@ -5,7 +5,6 @@
 import type { EnvironmentOperationsDeps, OperationFlow } from './environmentOperations';
 import type { EnvironmentStates } from './refreshStates';
 import * as fs from 'fs';
-import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
 import { devContainersSettings } from '../devContainers';
@@ -27,8 +26,6 @@ import {
 } from '../helper/configurationAnalysis';
 import { inProcessAnalyzer } from '../helper/configurationAnalysis.testkit';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
-import { ensureHelperImageUse, helperImageTag, type HelperImageDocker } from '../helper/helperImage';
-import type { EnsureImageOptions } from '../helper/helperImages';
 import { Messages } from '../messages';
 import {
   CONTAINER_VERSION,
@@ -715,24 +712,9 @@ describe('open: first open', () => {
     expect(error.code).toBe('dockerStartFailed');
     expect(await h.registry.list()).toEqual([]);
   });
-
-  it('shows the build of the helper image as a detail of the current step, so the steps keep their order', async () => {
-    const original = h.helper.ensureImageUse.bind(h.helper);
-    let first = true;
-    h.helper.ensureImageUse = async (opts?: { onOutput?: (text: string) => void }) => {
-      if (first) {
-        opts?.onOutput?.('Step 1/5 : FROM node');
-        opts?.onOutput?.('Step 2/5 : RUN apt-get install git');
-      }
-      first = false;
-      return original();
-    };
-    await h.service.open(TARGET, options());
-    // Concept 6.5: no step comes back after a later one, and "Preparing environment" is the build of the environment.
-    expect(h.progress.steps).toEqual(['downloadingRepository', 'checkingImage', 'downloadingImage', 'preparing', 'starting']);
-    expect(h.progress.details).toEqual([PipelineTexts.preparingHelper, '']);
-    expect(h.logger.outputs).toEqual(expect.arrayContaining(['Step 1/5 : FROM node', 'Step 2/5 : RUN apt-get install git']));
-  });
+  // Cleanup after plan step 11 (PR C2, A4): the test "shows the build of the helper image as a detail of the current
+  // step, so the steps keep their order" is removed with the progress detail of prepareHelper that it tested (the own
+  // image of the worker is never built); the steps of a first open stay pinned by the tests above.
 });
 
 describe('open: existing environment', () => {
@@ -1056,8 +1038,9 @@ describe('open: existing environment', () => {
       expect(h.ui.prompts).toEqual([`filesMissing ${REPO}`]);
       expect(h.docker.volumes.size).toBe(0);
       // Plan step 6, PR A: changed expectation, the question is asked under the lock, so the helper image of the worker
-      // was ensured before it (D1); no helper run.
-      expect(h.helper.calls).toEqual(['ensureImagePresent']);
+      // was ensured before it (D1); no helper run. Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper
+      // image before the lock (the worker's own image; before: ensureImagePresent).
+      expect(h.helper.calls).toEqual([]);
       expect(await pendingIds()).toEqual([]);
     });
 
@@ -1244,109 +1227,11 @@ describe('open: existing environment', () => {
     expect(h.progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
   });
 
-  it('shows a build of the helper image during a reconnect as a detail of "Checking for a newer image"', async () => {
-    await seedEnvironment(h);
-    const original = h.helper.ensureImageUse.bind(h.helper);
-    h.helper.ensureImageUse = async (opts?: { onOutput?: (text: string) => void }) => {
-      opts?.onOutput?.('Step 1/5 : FROM node');
-      return original();
-    };
-    await h.service.open(TARGET, options());
-    expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
-    expect(h.progress.details).toEqual([PipelineTexts.preparingHelper, '']);
-  });
-
-  it('shows the rebuild of an existing helper image from a new base image as an update, not as a first preparation', async () => {
-    await seedEnvironment(h);
-    const original = h.helper.ensureImageUse.bind(h.helper);
-    h.helper.ensureImageUse = async (opts?: EnsureImageOptions) => {
-      opts?.onBuild?.('refresh');
-      opts?.onOutput?.('#5 [2/4] RUN apt-get update');
-      return original();
-    };
-    await h.service.open(TARGET, options());
-    expect(h.progress.steps).toEqual(['checkingImage', 'starting']);
-    expect(h.progress.details).toEqual([PipelineTexts.updatingHelper, '']);
-    expect(PipelineTexts.updatingHelper).not.toMatch(/once/);
-  });
-
-  it('checks the base image of the helper only when the setting updateImagesOnConnect is on', async () => {
-    await seedEnvironment(h);
-    const seen: Array<boolean | undefined> = [];
-    const original = h.helper.ensureImageUse.bind(h.helper);
-    h.helper.ensureImageUse = async (opts?: EnsureImageOptions) => {
-      seen.push(opts?.checkBaseImage);
-      return original();
-    };
-    await h.service.open(TARGET, options());
-    await h.operations.stop(ENV_ID);
-    h.settings.updateImagesOnConnect = false;
-    await h.service.open(TARGET, options());
-    // PR #74 review round 1, A-R1-1: changed expectation: the Stop between the opens ensures the helper image before its
-    // lock without the maintenance (ensureImagePresent), so only the opens reach ensureImageUse (before: [true, true, false]).
-    expect(seen).toEqual([true, false]);
-  });
-
-  it('does not wait for the check of the base image of the helper: the image check runs meanwhile, so both share its time limit', async () => {
-    await seedEnvironment(h);
-    const dockerfilePath = path.join(h.root, 'helper', 'Dockerfile');
-    fs.mkdirSync(path.dirname(dockerfilePath), { recursive: true });
-    fs.writeFileSync(dockerfilePath, 'FROM node:24-trixie-slim\n');
-    const tag = helperImageTag('FROM node:24-trixie-slim\n');
-    const eightDaysAgo = new Date(T0 - 8 * 24 * 60 * 60 * 1000).toISOString();
-    fs.writeFileSync(
-      h.paths.helperState,
-      JSON.stringify({
-        version: 1,
-        images: { [tag]: { baseImage: 'node:24-trixie-slim', baseDigest: DIGEST_OLD, checkedAt: eightDaysAgo, lastUsedAt: eightDaysAgo } },
-        lastCleanupAt: new Date(T0).toISOString(),
-      }),
-    );
-    const helperDocker: HelperImageDocker = {
-      imageExists: async () => true,
-      imageId: async () => 'sha256:helper',
-      buildImage: async () => {
-        throw new Error('no build expected');
-      },
-      listImagesByLabel: async () => [],
-      removeImage: async () => false,
-    };
-    // The registry does not answer the helper: its lookup runs until its time limit (5 seconds) ends it.
-    let lookupSignal: AbortSignal | undefined;
-    let answer: (value: 'unreachable') => void = () => undefined;
-    const checks: Array<Promise<void>> = [];
-    h.helper.ensureImageUse = (opts?: EnsureImageOptions) =>
-      ensureHelperImageUse(helperDocker, dockerfilePath, {
-        ...opts,
-        statePath: h.paths.helperState,
-        clock: { now: () => T0 },
-        baseDigest: (_reference, signal) => {
-          lookupSignal = signal;
-          return new Promise((resolve) => (answer = resolve));
-        },
-        onBaseImageCheck: (check) => checks.push(check),
-      });
-    let helperLookupRunning: boolean | undefined;
-    const check = h.checker.check.bind(h.checker);
-    h.checker.check = async (references) => {
-      helperLookupRunning = lookupSignal !== undefined && !lookupSignal.aborted;
-      return check(references);
-    };
-
-    await h.service.open(TARGET, options());
-    expect(h.checker.calls).toHaveLength(1);
-    // The image check started while the lookup of the helper still ran: the two waits overlap, and the start is delayed
-    // by one time limit at most (NFR-08), not by two.
-    expect(helperLookupRunning).toBe(true);
-
-    answer('unreachable');
-    await Promise.all(checks);
-    expect(lookupSignal?.aborted).toBe(true);
-    expect(JSON.parse(fs.readFileSync(h.paths.helperState, 'utf8')).images[tag]).toMatchObject({
-      checkedAt: eightDaysAgo,
-      attemptedAt: new Date(T0).toISOString(),
-    });
-  });
+  // Cleanup after plan step 11 (PR C2, A4): four tests are removed with the code of prepareHelper that they tested (the
+  // own image of the worker is never built or checked): "shows a build of the helper image during a reconnect as a detail
+  // of …", "shows the rebuild of an existing helper image from a new base image as an update …", "checks the base image
+  // of the helper only when the setting updateImagesOnConnect is on", and "does not wait for the check of the base image
+  // of the helper …". The steps of a reconnect stay pinned by the tests above.
 
   it('offers the sign-in once per registry that requires it', async () => {
     await seedEnvironment(h);
@@ -4039,7 +3924,8 @@ describe('safetyCheck', () => {
   });
 
   // Review round 6 of PR #84 (B-R6-2): the refresh's exec gets the operation's signal and the time limit of the Git
-  // execs (GIT_EXEC_TIMEOUT_MS, 30 s), so a hanging Git in the container never holds Delete up.
+  // execs (GIT_EXEC_TIMEOUT_MS, 30 s; since PR C2 GIT_SUMMARY_TIMEOUT_MS of readGitSummary), so a hanging Git in the
+  // container never holds Delete up.
   it('review round 6 of PR #84 (B-R6-2): the refresh runs with the signal of the Delete and a time limit of 30 s', async () => {
     await seedEnvironment(h, { container: 'running' });
     h.docker.execHandler = () => ({ stdout: gitExecOutput('feature-z', [5, 6, 2]) });
@@ -4209,6 +4095,22 @@ describe('recordGitState (plan step 8, PR C, Q2)', () => {
     };
     await expect(h.service.recordGitState(ENV_ID)).resolves.toBe(false);
     expect((await entry())?.gitSummary).toEqual(env.gitSummary);
+  });
+
+  // Cleanup after plan step 11 (PR C2, B1): the service reads the Git state with Stop's readGitSummary, so a failed read
+  // names its reason as Stop does: a script that did not end in time, or one that failed without output, by its exit
+  // code (before: its output, possibly none). The cancel stays a failed read here (see the test above).
+  it('PR C2 (B1): logs why the Git state could not be read as Stop does: the time limit, or the exit code without output', async () => {
+    await seedEnvironment(h, { container: 'running' });
+    const id = h.docker.containersOf(ENV_ID)[0].id;
+    h.docker.execHandler = () => ({ exitCode: null, stdout: 'partial', timedOut: true });
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    h.docker.execHandler = () => ({ exitCode: 128 });
+    expect(await h.service.recordGitState(ENV_ID)).toBe(false);
+    expect(h.logger.infos.filter((line) => line.startsWith('The Git state in'))).toEqual([
+      `The Git state in ${id} could not be read: the script did not end in time.`,
+      `The Git state in ${id} could not be read: exit code 128.`,
+    ]);
   });
 });
 

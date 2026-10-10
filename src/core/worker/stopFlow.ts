@@ -11,16 +11,14 @@
 // (runningDevContainers; the Git state is read from the first), then the running services. Pure over the port; no I/O
 // of its own, no `vscode`.
 import { errorMessage } from '../errors';
-import { parseGitSummaryOutput } from '../git/gitSummary';
 import { LABEL_COMPOSE_SERVICE } from '../names';
 import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH } from '../helperChannel/protocol';
+import { readGitSummary } from '../pipeline/refreshStates';
+import { withTimeLimit } from '../ports';
 import type { GitSummary } from '../types';
-import { runScript } from './containerScripts';
 import { isMissing, type DockerEngine, type EngineContainer } from './dockerEngine';
 import { environmentContainers, runningDevContainers, runningServices } from './environmentContainers';
 
-/** The time limit of the Git state (as before the move: GIT_EXEC_TIMEOUT_MS of the pipeline). */
-export const STOP_GIT_TIMEOUT_MS = 30_000;
 /**
  * The time limit of the stop of one container: its own stop time (which the policy caps at 20 s, else 10 s) and the end
  * of its processes (as DOCKER_QUERY_TIMEOUT_MS of `docker stop` before the move).
@@ -67,7 +65,8 @@ export async function stopFlow(p: StopFlow): Promise<StopResult> {
   if (devs.length === 0) {
     p.log(`The container ${p.containerName} does not run.`);
   } else {
-    gitSummary = await readGitSummary(p, devs[0]);
+    // Cleanup after plan step 11 (PR C2, B1): the one read of the Git state (readGitSummary); a cancel throws.
+    gitSummary = await readGitSummary(p.engine, devs[0], p.user, p.folder, { now: p.now, log: p.log, cancel: 'throw', signal: p.signal });
     await stopContainer(p, devs[0], `Stopping the container ${devs[0].name}.`, failures);
     for (const other of devs.slice(1)) await stopContainer(p, other, `Stopping the container ${other.name}, another dev container of the environment.`, failures);
   }
@@ -81,22 +80,6 @@ export async function stopFlow(p: StopFlow): Promise<StopResult> {
   return { outcome: devs.length === 0 ? 'notRunning' : 'stopped', ...(gitSummary !== undefined ? { gitSummary } : {}), services, failures };
 }
 
-/** The Git state of the running dev container, or undefined (logged) when it cannot be read. A cancel throws. */
-async function readGitSummary(p: StopFlow, dev: EngineContainer): Promise<GitSummary | undefined> {
-  try {
-    const result = await runScript(p.engine, dev.id, 'gitSummary', [p.folder], { user: p.user, timeoutMs: STOP_GIT_TIMEOUT_MS, signal: p.signal });
-    if (result.exitCode !== 0) {
-      p.log(`The Git state in ${dev.name} could not be read: ${result.timedOut ? 'the script did not end in time.' : (result.stderr || result.stdout).trim() || `exit code ${result.exitCode ?? 'none'}.`}`);
-      return undefined;
-    }
-    return parseGitSummaryOutput(result.stdout, p.now());
-  } catch (error) {
-    if (p.signal?.aborted) throw error;
-    p.log(`The Git state in ${dev.name} could not be read: ${errorMessage(error)}`);
-    return undefined;
-  }
-}
-
 /**
  * `docker stop` of one container, with its own stop time, within STOP_CONTAINER_TIMEOUT_MS. True when it is stopped (or
  * gone); a failure is added to `failures` (its reason, clipped). A cancel throws.
@@ -104,9 +87,13 @@ async function readGitSummary(p: StopFlow, dev: EngineContainer): Promise<GitSum
 async function stopContainer(p: StopFlow, container: EngineContainer, line: string, failures: string[]): Promise<boolean> {
   p.log(line);
   const limitMs = p.stopContainerTimeoutMs ?? STOP_CONTAINER_TIMEOUT_MS;
-  const limit = AbortSignal.timeout(limitMs);
+  // Cleanup after plan step 11 (PR C2, B4): the one time-limited call (withTimeLimit); past the limit, its own reason.
+  let timedOut = false;
   try {
-    await p.engine.stop(container.id, undefined, p.signal ? AbortSignal.any([p.signal, limit]) : limit);
+    await withTimeLimit(limitMs, p.signal, (limited) => p.engine.stop(container.id, undefined, limited), () => {
+      timedOut = true;
+      return new Error(`The container ${container.name} did not stop within ${limitMs / 1000} s.`);
+    });
     return true;
   } catch (error) {
     if (p.signal?.aborted) throw error;
@@ -115,9 +102,7 @@ async function stopContainer(p: StopFlow, container: EngineContainer, line: stri
       p.log(`The container ${container.name} does not exist any more.`);
       return true;
     }
-    const reason = limit.aborted
-      ? `The container ${container.name} did not stop within ${limitMs / 1000} s.`
-      : `The container ${container.name} could not be stopped: ${errorMessage(error)}`;
+    const reason = timedOut ? errorMessage(error) : `The container ${container.name} could not be stopped: ${errorMessage(error)}`;
     p.log(reason);
     // At most as many as the answer takes (StopValue: MAX_STOPPED_SERVICES + 1); the log has them all.
     if (failures.length <= MAX_STOPPED_SERVICES) failures.push(reason.length > MAX_STOP_FAILURE_LENGTH ? `${reason.slice(0, MAX_STOP_FAILURE_LENGTH - 1)}…` : reason);

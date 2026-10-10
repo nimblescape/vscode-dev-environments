@@ -8,27 +8,19 @@
 // stored script REMOTE_MONITOR_EXEC_TIMEOUT_MS); a call past it fails with "no answer in time", a cancel passes as an
 // AbortError. No I/O of its own, no `vscode`.
 import { errorMessage } from '../errors';
-import { isAbortError } from '../ports';
+import { isAbortError, withTimeLimit } from '../ports';
 import { NO_STORED_SCRIPT, REMOVAL_IN_PROGRESS, parseDockerTime, type MonitorEngine, type MonitorInspected } from '../remoteMonitor/monitorEngine';
 import { LABEL_SESSION_MONITOR } from '../remoteMonitor/protocol';
 import { REMOTE_MONITOR_DOCKER_TIMEOUT_MS, REMOTE_MONITOR_EXEC_TIMEOUT_MS } from '../remoteMonitor/remoteSessionMonitor';
 import { runScript } from './containerScripts';
-import { EngineError, type DockerEngine } from './dockerEngine';
+import { EngineError, isNotRunning, type DockerEngine } from './dockerEngine';
 
-/** `call` within `ms`: past it, an Error "no answer in time"; the cancel of `signal` passes as an AbortError. */
-export async function limited<T>(ms: number, signal: AbortSignal | undefined, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
-  const limit = AbortSignal.timeout(ms);
-  try {
-    return await call(signal ? AbortSignal.any([signal, limit]) : limit);
-  } catch (error) {
-    if (limit.aborted && !signal?.aborted) throw new Error('no answer in time');
-    throw error;
-  }
-}
-
-/** A container that does not exist (404), or that does not run or restarts (409), for an exec in it. */
-function notRunning(error: unknown): boolean {
-  return error instanceof EngineError && (error.status === 404 || (error.status === 409 && /is (?:not running|restarting)\b/i.test(error.message)));
+/**
+ * `call` within `ms`: past it, an Error "no answer in time"; the cancel of `signal` passes as an AbortError. Cleanup after
+ * plan step 11 (PR C2, B4): the one time-limited call (withTimeLimit), with the error of the ensure.
+ */
+export function limited<T>(ms: number, signal: AbortSignal | undefined, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  return withTimeLimit(ms, signal, call, () => new Error('no answer in time'));
 }
 
 /** The inspect of a container as the ensure reads it (MonitorInspected). */
@@ -105,8 +97,9 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
         return NO_STORED_SCRIPT.test(`${result.stderr}\n${result.stdout}`) ? 'none' : 'unknown';
       } catch (error) {
         if (isAbortError(error) && signal?.aborted) throw error;
-        // The engine refused the exec: the container does not exist, does not run, or restarts.
-        return notRunning(error) ? 'none' : 'unknown';
+        // The engine refused the exec: the container does not exist, does not run, or restarts. Cleanup after plan step 11
+        // (PR C2, B5): the one rule (isNotRunning, with `restarting`, as NO_STORED_SCRIPT); before, any 404 counted.
+        return isNotRunning(error, { restarting: true }) ? 'none' : 'unknown';
       }
     },
 

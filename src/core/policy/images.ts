@@ -8,7 +8,7 @@
 // references (imageReferencesToInspect, inspectedImageItems, otherAccountImageItems). Pure functions, no I/O.
 import { MAX_REFERENCE_LENGTH } from '../imageCheck/dockerfile';
 import { isDockerHub, parseImageReference } from '../imageCheck/reference';
-import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, isEnvironmentResourceName, resourceName } from '../names';
+import { LABEL_BUILD_RECORD, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, RESOURCE_NAME_PREFIX, isEnvironmentResourceName, resourceName } from '../names';
 import type { HostAccessFinding } from './report';
 import { isReservedLabel } from './rules';
 
@@ -344,7 +344,7 @@ export function imageNamedBy(reference: string, images: readonly InspectedImage[
  */
 export function environmentImageNames(reference: string): string[] {
   const repository = localImageRepository(reference).toLowerCase();
-  if (!repository.startsWith('devenv-') || repository.includes('/')) return [];
+  if (!repository.startsWith(RESOURCE_NAME_PREFIX) || repository.includes('/')) return [];
   const names: string[] = [];
   for (let end = repository.indexOf('-'); end !== -1; end = repository.indexOf('-', end + 1)) {
     const prefix = repository.slice(0, end);

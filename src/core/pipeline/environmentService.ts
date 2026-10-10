@@ -44,7 +44,6 @@ import {
   boundServiceFolders,
   parseExistingPaths,
   isNumericId,
-  parseGitSummaryOutput,
   serviceFolderPaths,
   servicePathArguments,
   type DevMountPaths,
@@ -139,7 +138,7 @@ import { namePair } from '../namePairs';
 import { imageBuildRecord, imageRecordLabels } from './imageRecord';
 import { ownerOf } from '../ownership';
 import { keepFlagsOf, keptWhenClosed } from '../session/sessionRules';
-import { BRANCH_EXEC_TIMEOUT_MS, readBranch } from './refreshStates';
+import { BRANCH_EXEC_TIMEOUT_MS, readBranch, readGitSummary } from './refreshStates';
 import {
   MAX_ITEM_LENGTH,
   addRefusedItems,
@@ -179,6 +178,7 @@ import {
   type NetworkState,
 } from '../policy';
 import {
+  abortError,
   isAbortError,
   isoTime,
   type GitHubAuth,
@@ -395,8 +395,7 @@ export interface EnvironmentDocker {
 /** The part of WorkspaceHelper that the service uses. */
 export type EnvironmentHelper = Pick<
   WorkspaceHelper,
-  | 'ensureImageUse'
-  | 'ensureImagePresent'
+  | 'ownImageUse'
   | 'clone'
   | 'readConfigFiles'
   | 'listConfigurations'
@@ -5648,17 +5647,12 @@ export class EnvironmentService extends OperationBase {
    */
   private async composeContainers(env: Environment): Promise<ContainerInfo[]> {
     const project = composeProjectName(env.repository, env.id);
-    const containers = [...(await this.deps.docker.environmentContainers(env.id)), ...(await this.deps.docker.listProjectContainers(project))];
-    const seen = new Set<string>();
-    const result: ContainerInfo[] = [];
-    for (const container of containers) {
-      if (seen.has(container.id)) continue;
-      seen.add(container.id);
+    // Cleanup after plan step 11 (PR C2, B9): the one listing of the containers by the label and the project, once each
+    // (upContainers; before, a copy of it here), of which only those of the project count.
+    return (await this.upContainers(env, true)).filter((container) => {
       const owner = container.labels[LABEL_ENVIRONMENT_ID];
-      if ((owner !== undefined && owner !== env.id) || !isComposeContainer(container.labels, project)) continue;
-      result.push(container);
-    }
-    return result;
+      return (owner === undefined || owner === env.id) && isComposeContainer(container.labels, project);
+    });
   }
 
   private async composeContainerIds(env: Environment): Promise<ReadonlySet<string>> {
@@ -6118,41 +6112,24 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * Resolves the helper image of the run. Plan step 11I (U7): in the worker that is its own image, so nothing is built
-   * or checked here any more. Until then it built the helper image if needed, shown as a detail of the current step
-   * (the steps of concept 6.5 keep their order: "Preparing environment" is the build of the environment image), and the
-   * check of the base image of the helper followed the setting updateImagesOnConnect, like the image check (concept
-   * 7.7). Review round 2 of PR #64 (A-N1): the first call of a run resolves the helper image of the run
-   * (ctx.helperImage); later calls do nothing.
+   * or checked here any more. Until then it built the helper image if needed, shown as a detail of the current step,
+   * and the check of the base image of the helper followed the setting updateImagesOnConnect. Cleanup after plan step 11
+   * (PR C2, A4): the own image is read (WorkspaceHelper.ownImageUse); the options of that build (onOutput, onBuild,
+   * checkBaseImage) and its progress detail, which the own image never used, are removed. Review round 2 of PR #64
+   * (A-N1): the first call of a run resolves the helper image of the run (ctx.helperImage); later calls do nothing.
    */
   private async prepareHelper(ctx: PipelineContext): Promise<void> {
     // Review round 2 of PR #64 (A-N1): the helper image is resolved once per run.
     if (ctx.helperImage !== undefined) return;
-    let announced = false;
-    const announce = (text: string): void => {
-      if (announced) return;
-      announced = true;
-      ctx.steps.detail(text);
-    };
     let image: HelperImageUse;
     try {
       // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
       // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
-      image = await this.deps.helper.ensureImageUse({
-        onOutput: (text) => {
-          announce(PipelineTexts.preparingHelper);
-          this.logger.output(text);
-        },
-        // Until plan step 11I (U7): a new helper after an extension update, or the rebuild of an existing one from a
-        // new base image. The worker's own image is never built, so this is not called there.
-        onBuild: (kind) => announce(kind === 'refresh' ? PipelineTexts.updatingHelper : PipelineTexts.preparingHelper),
-        checkBaseImage: this.deps.settings().updateImagesOnConnect,
-        signal: ctx.signal,
-      });
+      image = await this.deps.helper.ownImageUse(ctx.signal);
     } catch (error) {
+      // The own image fails only on a cancel; a helperFailed (of a test's helper) marks the run as for a failed helper run.
       if (isUserFacingError(error) && error.code === 'helperFailed') ctx.helperUnavailable = true;
       throw error;
-    } finally {
-      if (announced) ctx.steps.clearDetail();
     }
     // Plan step 8, PR A (Q3): the Session Monitor first; when it cannot be ensured, the open is refused, and the helper
     // image is not taken for resolved, so no later step of this run goes on without the monitor.
@@ -6654,25 +6631,16 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * The Git summary from the running container (the script `gitSummary` of the registry), or `undefined` when Git is
-   * missing, fails, or `signal` aborts.
+   * missing, fails, or `signal` aborts. Cleanup after plan step 11 (PR C2, B1): the one read of the Git state
+   * (readGitSummary, as Stop reads it); a cancel stays a failed read here (logged), as before.
    */
-  private async gitSummaryInContainer(
-    container: string,
-    user: string | undefined,
-    folder: string,
-    signal?: AbortSignal,
-  ): Promise<GitSummary | undefined> {
-    try {
-      const result = await runScript(this.deps.docker, container, 'gitSummary', [folder], { user, timeoutMs: GIT_EXEC_TIMEOUT_MS, signal });
-      if (result.exitCode !== 0) {
-        this.logger.info(`The Git state in ${container} could not be read: ${(result.stderr || result.stdout).trim()}`);
-        return undefined;
-      }
-      return parseGitSummaryOutput(result.stdout, isoTime(this.deps.clock));
-    } catch (error) {
-      this.logger.info(`The Git state in ${container} could not be read: ${errorMessage(error)}`);
-      return undefined;
-    }
+  private gitSummaryInContainer(container: string, user: string | undefined, folder: string, signal?: AbortSignal): Promise<GitSummary | undefined> {
+    return readGitSummary(this.deps.docker, { id: container, name: container }, user, folder, {
+      now: () => isoTime(this.deps.clock),
+      log: (line) => this.logger.info(line),
+      cancel: 'fail',
+      signal,
+    });
   }
 
   /**
@@ -6687,10 +6655,10 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
-   * (the state is made consistent before the operation, or the operation is refused): first the helper image (built when
-   * it is missing, without the maintenance: WorkspaceHelper.ensureImagePresent; plan step 11I, U7: in the worker the
-   * worker's own image, nothing is built), then the worker with the lock
-   * (the worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone). When either fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
+   * (the state is made consistent before the operation, or the operation is refused): the worker with the lock (the
+   * worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone; before, the
+   * helper image first, which in the worker is its own image since plan step 11I, U7, and which cleanup PR C2, A4,
+   * removed from here). When it fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
    * volume steps run in the batch helper of the lock (environmentLock.ts; plan step 11I1, PR B2: no Docker call goes
@@ -6708,15 +6676,10 @@ export class EnvironmentService extends OperationBase {
     options: { batchVolume?: string } = {},
   ): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();
-    try {
-      // PR #74 review round 1 (A-R1-1): only a missing tag is built (no rebuild, check, or cleanup before Stop or Delete).
-      await this.deps.helper.ensureImagePresent({ onOutput: (text) => this.logger.output(text), signal });
-    } catch (error) {
-      if (this.isCancellation(error, signal)) throw error;
-      const cause = isUserFacingError(error) && error.detail ? `${error.message} ${error.detail}` : errorMessage(error);
-      this.logger.warn(`${env.repository}: the helper image for the worker could not be prepared, so nothing is changed: ${cause}`);
-      throw new UserFacingError('helperFailed', PipelineTexts.environmentLockUnavailable(env.repository, cause), cause);
-    }
+    // Cleanup after plan step 11 (PR C2, A4): the worker's own image needs no preparation, so its refusal "the helper image
+    // for the worker could not be prepared", which only a cancel reached (the own image fails on nothing else), is gone; a
+    // cancel before the lock still throws its AbortError, as that read did.
+    if (signal?.aborted) throw abortError();
     let lock: HeldEnvironmentLock;
     try {
       lock = await this.deps.environmentLock(env.id, ENVIRONMENT_LOCK_WAIT_SECONDS, signal);

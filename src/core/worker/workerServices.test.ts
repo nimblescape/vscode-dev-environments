@@ -225,15 +225,16 @@ describe('the core services in the worker (plan step 11B3b)', () => {
         throw new Error('no lock in this test');
       },
     });
-    expect(await helper.ensureImagePresent()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
-    expect(await helper.ensureImageUse()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
+    // Cleanup after plan step 11 (PR C2, A4): the two image calls of the pipeline (ensureImagePresent, ensureImageUse)
+    // are one read of the own image (ownImageUse).
+    expect(await helper.ownImageUse()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
     // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the worker's helper has no image call besides
     // the two of the pipeline (before: presentImage gave the own image too; it is removed with the helper image code of
     // the extension, which the worker's bundle no longer holds).
     expect((helper as unknown as Record<string, unknown>).presentImage).toBeUndefined();
     const controller = new AbortController();
     controller.abort();
-    await expect(helper.ensureImagePresent({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(helper.ownImageUse(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
   });
 });
 
@@ -355,8 +356,9 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     await withExec.docker.exec('c', ['cat'], { secretInputName: SECRET_TOKEN });
     expect(execs).toEqual([{ secretInputName: SECRET_TOKEN }]);
     // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the image call of the pipeline (ensureImageUse;
-    // before: ensureImage, its tag only, which is removed with the helper image code of the extension).
-    await expect(all.helper.ensureImageUse()).resolves.toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
+    // before: ensureImage, its tag only, which is removed with the helper image code of the extension). Cleanup after
+    // plan step 11 (PR C2, A4): ownImageUse, the one read of the own image (ensureImageUse is removed).
+    await expect(all.helper.ownImageUse()).resolves.toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
   });
 });
 

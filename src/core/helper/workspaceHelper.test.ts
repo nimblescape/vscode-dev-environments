@@ -270,7 +270,7 @@ describe('WorkspaceHelper with the image of an open (user decision 2026-09-29)',
     // (before: the current tag of the window, pinned by the ID of its image), and the helper has no Docker port, so it
     // can build nothing (before: the count of the builds stayed).
     const helper = plainHelper();
-    const image = await helper.ensureImageUse();
+    const image = await helper.ownImageUse();
     expect(image).toEqual(OWN);
     // Changed expectation (review round 3 of PR #64, P2): before, the same tag was built again and the run went on with
     // it; a pinned run now uses the image ID, and when that image is gone the open ends with helperFailed: nothing is
@@ -333,7 +333,7 @@ describe('WorkspaceHelper with the image of an open (user decision 2026-09-29)',
       // window rebuilt the tag and another open of the window switched the cache of the helper to the new image).
       const helper = plainHelper();
       const pinned: HelperImageUse = { tag: OWN.tag, id: `sha256:${'7'.repeat(64)}` };
-      expect(await helper.ensureImageUse()).toEqual(OWN);
+      expect(await helper.ownImageUse()).toEqual(OWN);
       docker.handler = (args) => {
         if (args[0] !== 'run') return {};
         return { stdout: '{"outcome":"success","containerId":"cccc","configuration":{},"services":{}}\n' };
@@ -360,7 +360,7 @@ describe('R16-1: only a docker run that fails with exit code 125 and "No such im
   it.each(cases)('pinned run: %s is the result of the run', async (_name, failure) => {
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const helper = plainHelper();
-    const use = await helper.ensureImageUse();
+    const use = await helper.ownImageUse();
     docker.handler = (args) => (args[0] === 'run' ? failure : {});
     const result = await helperStep(helper, { image: use });
     expect(result).toMatchObject(failure);
@@ -368,14 +368,14 @@ describe('R16-1: only a docker run that fails with exit code 125 and "No such im
     // The cache of the window is kept: the next open reuses the image without a build. Plan step 11I (U7): changed
     // expectation, the next open gets the own image again, and nothing counts builds (before: one build, of the first
     // ensure).
-    expect(await helper.ensureImageUse()).toEqual(use);
+    expect(await helper.ownImageUse()).toEqual(use);
     expect(logger.lines.join('\n')).not.toContain('was removed');
   });
 
   it.each(cases)('unpinned run: %s is the result of the run, which is not run again', async (_name, failure) => {
     // Plan step 7 (user decision of 2026-10-01): the per-step path is removed; a batch step (helperStep).
     const helper = plainHelper();
-    await helper.ensureImageUse();
+    await helper.ownImageUse();
     docker.handler = (args) => (args[0] === 'run' ? failure : {});
     const result = await helperStep(helper);
     expect(result).toMatchObject(failure);
