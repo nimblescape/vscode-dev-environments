@@ -29,8 +29,8 @@ import { VSCODE_SERVER_LINK_SCRIPT } from './vscodeServerLink';
  */
 export type ScriptEntry =
   | {
-      /** The program that runs the script: `sh -c <script> sh <args…>`, or `node -e <script> <args…>`. */
-      program: 'sh' | 'node';
+      /** The program that runs the script: `sh -c <script> sh <args…>`. */
+      program: 'sh';
       script: string;
       /** The secret that is its standard input (plan step 11A: never an argument, never a log line). */
       secretInputName?: typeof SECRET_TOKEN;
@@ -144,7 +144,7 @@ export type ScriptOptions = Pick<EngineExecOptions, 'user' | 'timeoutMs' | 'sign
 export function scriptCommand(name: ContainerScript, args: readonly string[]): string[] {
   const entry: ScriptEntry = CONTAINER_SCRIPTS[name];
   if ('command' in entry) return [...entry.command, ...args];
-  return entry.program === 'sh' ? ['sh', '-c', entry.script, 'sh', ...args] : ['node', '-e', entry.script, ...args];
+  return ['sh', '-c', entry.script, 'sh', ...args];
 }
 
 /**

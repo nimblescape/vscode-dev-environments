@@ -229,8 +229,10 @@ interface Maintenance {
 
 /**
  * Builds the helper image if its tag is missing (first use, and after an extension update that changed the Dockerfile
- * or the CLI version). The build context is the folder of the Dockerfile. Returns the tag. Throws CommandError when
- * the image is missing and cannot be built.
+ * or the CLI version). The build context is the folder of the Dockerfile. Returns the image that it resolved
+ * (HelperImageUse): the tag and the ID of its image (review round 3 of PR #64, P1/P2). The ID of an image that this
+ * call built comes from the build (its build label: review round 3 of PR #64, P4; review round 4 of PR #64,
+ * R4-2/R4-3), not from the tag. Throws CommandError when the image is missing and cannot be built.
  *
  * With `statePath` (implementation notes 7):
  * - A missing tag is built with `--pull`, so a new helper starts from the current base image. Without `--pull` when the
@@ -248,19 +250,6 @@ interface Maintenance {
  * - User decision 2026-09-29: when the missing tag cannot be built, the error of the build is thrown; no other helper
  *   image is used in its place.
  * Problems of the check, the state file, and the cleanup are logged and never make this function fail.
- */
-export async function ensureHelperImage(
-  docker: HelperImageDocker,
-  dockerfilePath: string,
-  options: EnsureHelperImageOptions = {},
-): Promise<string> {
-  return (await ensureHelperImageUse(docker, dockerfilePath, options)).tag;
-}
-
-/**
- * ensureHelperImage, with the image that it resolved (HelperImageUse): the tag and the ID of its image (review round 3 of
- * PR #64, P1/P2). The ID of an image that this call built comes from the build
- * (its build label: review round 3 of PR #64, P4; review round 4 of PR #64, R4-2/R4-3), not from the tag.
  */
 export async function ensureHelperImageUse(
   docker: HelperImageDocker,

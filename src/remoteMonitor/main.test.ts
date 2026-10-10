@@ -9,7 +9,7 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID } from '../core/names';
 import { abortError } from '../core/ports';
-import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName, inUseByOtherComputer } from '../core/remoteMonitor/protocol';
+import { REMOTE_MONITOR_ENTRY, REMOTE_MONITOR_READY_TEXT, RECORDS_LOCK_BUSY_EXIT, forgetIfUnchangedCommand, heartbeatFileName } from '../core/remoteMonitor/protocol';
 import { EngineError, type EngineContainerSummary } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import {
@@ -210,11 +210,11 @@ describe('monitor.js heartbeat', () => {
     // The remote monitor keeps it.
     const records = await readRecords(heartbeatDir(stateDir));
     expect(decide({ now: T0, containers: [{ id: DEV_ID, state: 'running', name: 'x', environmentId: A, composeService: '' }], records, state: { lastTickAt: T0 - REMOTE_TICK_MS } }).kept).toEqual([A]);
-    // And B's own shared-engine check still blocks its stop. Plan step 11I (U10, decision of 2026-10-08): changed test, the
-    // records of the environment as the volume holds them (before: printed by the removed subcommand `records`).
+    // Plan step 11I (U10, decision of 2026-10-08): changed test, the records of the environment as the volume holds them
+    // (before: printed by the removed subcommand `records`). Cleanup after plan step 11 (PR C1): B's own shared-engine
+    // check (inUseByOtherComputer) is removed (Q6, U10), with its assertion here.
     const output = { now: T0, records: records.filter((record) => record.environmentId === A).map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) };
     expect(output.records).toEqual([{ source: OTHER, at: T0 - 5 * 24 * 60 * MINUTE, keepRunning: true }]);
-    expect(inUseByOtherComputer(output, SOURCE)).toBe(true);
   });
 
   it('a record of another source does not hold back an entry with a lower seq', async () => {

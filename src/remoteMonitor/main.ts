@@ -81,12 +81,10 @@ import {
   type RemoteRecord,
   type RemoteTiming,
 } from './rules';
+import { DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime } from '../core/remoteMonitor/cron';
 import {
-  DEFAULT_IMAGE_TIME_ZONE,
   ImageMaintenance,
   REMOTE_IMAGE_FIRST_PASS_MS,
-  isTimeZone,
-  nextCronTime,
   nodeHttpGet,
   parseReplacedImages,
   prefixesFromEnv,
@@ -717,8 +715,6 @@ export function permanentFromEnv(env: NodeJS.ProcessEnv): boolean {
 export const REPLACED_IMAGES_FILE = 'replaced-images.json';
 /** How often the monitor looks whether a time of the schedule has come (as cron: every minute). */
 export const IMAGE_CHECK_MS = 60_000;
-/** A clock that steps back by more than this starts the image schedule again from its time (review round 4, L1). */
-export const IMAGE_CLOCK_RESET_MS = CLOCK_RESET_MS;
 
 /**
  * The settings of the image maintenance with the parsed schedule. Plan step 11H2 (D2): the schedule of the whole

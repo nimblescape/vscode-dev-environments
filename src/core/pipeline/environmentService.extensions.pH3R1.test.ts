@@ -9,7 +9,8 @@
 // records the extensions of its merged configuration too.
 import { afterEach, describe, expect, it } from 'vitest';
 import { VSCODE_STORE_TARGET, VSCODE_STORE_VOLUME, composeProjectName } from '../names';
-import type { ComposeModel, ComposeModelOutput } from '../helper/compose';
+import type { ComposeModel } from '../helper/composeModel';
+import type { ComposeModelOutput } from '../helper/compose';
 import type { VscodePlatform } from '../helperChannel/protocol';
 import { VSCODE_EXTENSION_SEED_SCRIPT } from '../worker/vscodeExtensionSeed';
 import { VSCODE_SERVER_LINK_SCRIPT } from '../worker/vscodeServerLink';
@@ -17,7 +18,7 @@ import { UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import type { ExtensionRef } from '../vscodeExtensions';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, REPO, checked, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 import type { RepositoryTarget } from './operationBase';
 import type { VscodeExtensionCache } from './environmentService';
 

@@ -24,9 +24,6 @@ import { DevcontainerCommandError, isLifecycleCommandFailure, parseDevcontainerR
 import type { HelperImageUse } from './helperImage';
 // Plan step 11I (U7): only the types of the options that the pipeline passes to the two image calls (no code).
 import type { EnsureImageOptions, PresentImageOptions } from './helperImages';
-
-// Plan step 11I (PR D): only what the pipeline takes from here (the rest of helperImages.ts is imported from there).
-export type { HelperImageUse };
 import type { GitIdentity } from './containerGit';
 import { parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import { parseComposeHashes } from './scripts';
@@ -37,7 +34,8 @@ import { parseComposeHashes } from './scripts';
 import { checkConfigPath, checkRepository, isPassableEnvName, writeAndRunInput, type HelperFiles } from './stepInputs';
 // Plan step 6, PR C, plan step 7: the volume steps run only in the batch helper of an operation.
 import { currentBatchScope, type BatchScope } from './batchScope';
-import { batchStepCommand, type BatchStepKind } from './batchSteps';
+import type { BatchStepKind } from './batchStepKinds';
+import { batchStepCommand } from './batchSteps';
 
 /** Result of WorkspaceHelper.up. */
 export interface UpResult extends DevcontainerResult {
@@ -178,9 +176,6 @@ interface StreamOptions {
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
 }
-
-/** Files of the extension for a run of the Dev Container CLI (stepInputs.ts). */
-export type { HelperFiles };
 
 /** Plan step 6, PR C: the step kinds of the batch helper that take the variables of the request (`env`). */
 const BATCH_ENV_KINDS: ReadonlySet<BatchStepKind> = new Set<BatchStepKind>(['readConfiguration', 'build', 'up', 'runUserCommands']);

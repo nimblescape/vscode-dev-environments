@@ -26,8 +26,14 @@ import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../../src/core/helperChannel/batch';
-import { LABEL_CHANNEL_STEP } from '../../src/core/helperChannel/protocol';
-import { HELPER_CACHE_FOLDER, HELPER_CACHE_VOLUME, LABEL_HELPER_RUN, SECRETS_FOLDER, WORKSPACES_ROOT } from '../../src/core/names';
+import {
+  HELPER_CACHE_FOLDER,
+  HELPER_CACHE_VOLUME,
+  LABEL_CHANNEL_STEP,
+  LABEL_HELPER_RUN,
+  SECRETS_FOLDER,
+  WORKSPACES_ROOT,
+} from '../../src/core/names';
 import { bundleHash } from '../../src/core/loader/pipeLoader';
 import { NodeProcessRunner } from '../../src/core/process';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';

@@ -22,7 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { toContainerInfo } from '../../src/core/docker/dockerObjects';
 import { environmentDevcontainerId } from '../../src/core/helper/cliVariables';
-import { supportsVolumeSubpath } from '../../src/core/helper/compose';
+import { supportsVolumeSubpath } from '../../src/core/helper/composeModel';
 import { Messages } from '../../src/core/messages';
 import {
   CONTAINER_VERSION,

@@ -8,13 +8,17 @@ import { namePair, trailingPair } from './namePairs';
 import { LABEL_MONITOR_CREATE, LABEL_SESSION_MONITOR } from './remoteMonitor/protocol';
 
 /**
- * Labels of the helper channel (src/core/helperChannel/protocol.ts re-exports them). Here, not there, so that the script
- * of the remote Session Monitor, which imports names.ts, does not bundle the protocol of the channel (PR #57: its script
- * has to fit on the command line of `docker run`).
+ * Labels of the helper channel. Here, not in src/core/helperChannel/protocol.ts, so that the script of the remote
+ * Session Monitor, which imports names.ts, does not bundle the protocol of the channel (PR #57: its script has to fit on
+ * the command line of `docker run`).
  */
 /** Label of the container of a channel (its value: channelLabelValue). */
 export const LABEL_HELPER_CHANNEL = 'nimblescape.devenv.helper-channel';
-/** Label of a container that a `docker` operation of a channel starts (its value: the cleanup label). */
+/**
+ * Review round 1 (S1): the label of the containers that an operation starts and removes by it, never by a name. Plan
+ * step 11I1, PR B1: now the session label of a batch helper (`nimblescape.devenv.channel-step=<session>`,
+ * channelStepLabel), which the worker removes by that label (src/helperChannel/batch.ts).
+ */
 export const LABEL_CHANNEL_STEP = 'nimblescape.devenv.channel-step';
 
 /**
@@ -174,9 +178,13 @@ export const EXTENSION_LABEL_KEYS: ReadonlySet<string> = new Set([
   LABEL_CHANNEL_STEP,
 ]);
 export const HELPER_CACHE_VOLUME = 'devenv-helper-cache';
-/** Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI). */
+/**
+ * Mount point of the cache volume HELPER_CACHE_VOLUME in the workspace helper (`--user-data-folder` of the CLI).
+ * Assumption (V-10): the CLI keeps data there that is useful across helper runs. CLI 0.89.0 downloads Features into a
+ * new folder below os.tmpdir() for each build, so the Features themselves are not cached there.
+ */
 export const HELPER_CACHE_FOLDER = '/devenv-cache';
-/** Path of the Docker socket inside the workspace helper. */
+/** Path of the Docker socket inside the workspace helper, and the default source of its socket mount (helperDockerSocket). */
 export const HELPER_DOCKER_SOCKET = '/var/run/docker.sock';
 /** Mount point of the workspace volume, in the helper and in the dev container. */
 export const WORKSPACES_ROOT = '/workspaces';

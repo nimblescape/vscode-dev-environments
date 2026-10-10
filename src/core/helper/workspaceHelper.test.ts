@@ -15,7 +15,8 @@ import { configOwnershipFixCommand } from '../git/gitSummary';
 import { abortError, type Logger, type RunOptions, type RunResult } from '../ports';
 import { errorDetail } from '../pipeline/pipelineRules';
 import { runWithBatchScope } from './batchScope';
-import { batchStepCommand, type BatchStepKind } from './batchSteps';
+import type { BatchStepKind } from './batchStepKinds';
+import { batchStepCommand } from './batchSteps';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { DevcontainerCommandError } from './devcontainerCli';
 import {
@@ -31,7 +32,8 @@ import {
   WRITE_AND_RUN_SCRIPT,
 } from './scripts';
 import { COMPOSE_DEV_DOCKERFILE, COMPOSE_MODEL_PATH } from './compose';
-import { COMPOSE_MODEL_TIMEOUT_MS, MERGED_CONFIGURATION_TIMEOUT_MS, WorkspaceHelper, type HelperImageUse } from './workspaceHelper';
+import type { HelperImageUse } from './helperImage';
+import { COMPOSE_MODEL_TIMEOUT_MS, MERGED_CONFIGURATION_TIMEOUT_MS, WorkspaceHelper } from './workspaceHelper';
 import { isPassableEnvName } from './stepInputs';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).

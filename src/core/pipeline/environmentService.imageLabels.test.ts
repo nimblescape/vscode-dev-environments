@@ -42,7 +42,8 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { COMPOSE_CONTAINER_NUMBER_LABEL, DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { COMPOSE_CONTAINER_NUMBER_LABEL, configHash } from './pipelineRules';
 import { COMPOSE_PROJECT_LABEL } from '../names';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

@@ -5,7 +5,7 @@
 // Unit 11: the one entry point of the container policy (checkContainer). Each stage gives the report of the checks that
 // it stands for (the checks themselves are tested in their own files), with the per-repository switch applied.
 import { describe, expect, it } from 'vitest';
-import type { ComposeModel } from '../helper/compose';
+import type { ComposeModel } from '../helper/composeModel';
 import { runAnalysisJob } from '../helper/configurationAnalysis';
 import { COMPOSE_CLEARED_LABELS, composeProjectName, resourceName } from '../names';
 import {

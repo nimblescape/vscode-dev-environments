@@ -6,12 +6,12 @@ import * as crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 import { CommandError } from '../errors';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId, helperCliVariables } from '../helper/cliVariables';
+import { MAX_REFUSED_ITEMS_LENGTH, composeRecordOf, isRepositoryName, refusedUpdateOf } from './recordRules';
 import {
   baseImageKey,
   COMPOSE_VOLUME_KEY,
   composeMountVolumes,
   composeConfigurationChange,
-  composeRecordOf,
   hasComposeRecord,
   configHash,
   containerIsCurrent,
@@ -28,17 +28,14 @@ import {
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
-  isRepositoryName,
   isUnrestrictedContainer,
   isRootUser,
-  MAX_REFUSED_ITEMS_LENGTH,
   lifecycleHookFailure,
   lifecycleHookName,
   needsBuild,
   nextBuildNumber,
   nonEmptyString,
   recordDigests,
-  refusedUpdateOf,
   shouldCheckImages,
   stringList,
   containerMetadataUser,

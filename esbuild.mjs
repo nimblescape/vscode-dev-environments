@@ -55,11 +55,6 @@ const outfiles = [
   'dist/helperChannel.js',
 ];
 
-// Plan step 11F1: the extension no longer runs the host access analysis (the worker does, from its own bundle: plan step
-// 11E2), so dist/configurationAnalysisWorker.js is no longer built; one of an earlier build is removed.
-fs.rmSync('dist/configurationAnalysisWorker.js', { force: true });
-fs.rmSync('dist/configurationAnalysisWorker.js.map', { force: true });
-
 // A production build writes no source maps: remove maps of an earlier development build, so that no map that does not
 // match the minified bundles stays in dist/.
 if (production) {

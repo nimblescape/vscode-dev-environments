@@ -8,7 +8,7 @@
 // repository's compose files are read once, by the check, so nothing can change between the check and `up`. The rules
 // of the check are in the container policy (../policy/compose.ts); the mounts and ports of each service are decided by
 // the same functions of the policy for both (decideServiceMount, decideServicePort in ../policy/rewrites.ts). The model
-// types and names are in ./composeModel.ts (re-exported here). Pure functions, no I/O.
+// types and names are in ./composeModel.ts. Pure functions, no I/O.
 import * as crypto from 'crypto';
 import * as path from 'path';
 import type { ConfigReferences } from '../imageCheck/imageCheck';
@@ -51,24 +51,6 @@ import {
   type ComposeService,
 } from './composeModel';
 import { OVERRIDE_FOLDER } from './scripts';
-
-// The model types and names (./composeModel.ts), for the callers of this module.
-export {
-  MIN_COMPOSE_VERSION,
-  MIN_SUBPATH_API_VERSION,
-  MIN_SUBPATH_ENGINE,
-  VSCODE_STORE_KEY,
-  WORKSPACE_VOLUME_KEY,
-  composeNetworkNames,
-  composeVolumeNames,
-  durationSeconds,
-  isSupportedComposeVersion,
-  supportsVolumeSubpath,
-  type ComposeModel,
-  type ComposeNetworkName,
-  type ComposeService,
-  type ComposeVolumeName,
-} from './composeModel';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

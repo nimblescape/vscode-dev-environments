@@ -3,12 +3,11 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { composeProjectName, resourceName } from '../names';
+import { HELPER_CACHE_FOLDER, composeProjectName, resourceName } from '../names';
 import { devContainersSettings } from '../devContainers';
 import { CommandError } from '../errors';
 import {
   DevcontainerCommandError,
-  HELPER_CACHE_FOLDER,
   buildArgs,
   buildComposeOverrideConfig,
   buildOverrideConfig,

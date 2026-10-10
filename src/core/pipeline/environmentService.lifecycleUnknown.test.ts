@@ -10,7 +10,7 @@ import { environmentImageName } from '../names';
 import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, PID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { LIFECYCLE_UNKNOWN, rememberedFor, windowLifecycleMemory } from './lifecycleMemory';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);

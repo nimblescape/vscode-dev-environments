@@ -8,7 +8,8 @@ import { describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
 import { collectReferences } from '../imageCheck/imageCheck';
 import type { DevcontainerConfig } from '../types';
-import { composeReferences, type ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
+import { composeReferences } from './compose';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { runAnalysisJob } from './configurationAnalysis';
 import {

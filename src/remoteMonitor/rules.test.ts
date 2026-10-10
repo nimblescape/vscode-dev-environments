@@ -3,7 +3,6 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { inUseByOtherComputer } from '../core/remoteMonitor/protocol';
 import {
   FUTURE_RECORD_TOLERANCE_MS,
   RECORD_MAX_AGE_MS,
@@ -344,7 +343,8 @@ describe('decide of the remote Session Monitor', () => {
       });
 
       // Review round 1 of PR #63 (F1): the local check of the computer of a removed record (inUseByOtherComputer) would count
-      // an old keep of another computer that is not newer than the removed record.
+      // an old keep of another computer that is not newer than the removed record. Cleanup after plan step 11 (PR C1): that
+      // check is removed (Q6, U10), with its assertions here; the rule that keeps the record stays (rules.ts).
       it('keeps an old record while a keepRunning record of another computer is not newer than it', () => {
         const DAY = 24 * 60 * MINUTE;
         const keep = record(A, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
@@ -352,11 +352,6 @@ describe('decide of the remote Session Monitor', () => {
         const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
         const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() });
         expect(decision.superseded).not.toContain(own);
-        const remaining = [keep, own, newest].filter((one) => !decision.superseded.includes(one));
-        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
-        expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
-        // Without its own record, the old keep would count for that computer.
-        expect(inUseByOtherComputer(output([keep, newest]), SOURCE)).toBe(true);
         // A keep of another computer that is newer than the record does not hold it back.
         const newerKeep = record(A, T0 - 8 * DAY, { source: OTHER, keepRunning: true });
         expect(decide({ now: T0, containers: [container(A)], records: [newerKeep, own, newest], state: running() }).superseded).toEqual([own]);
@@ -396,9 +391,6 @@ describe('decide of the remote Session Monitor', () => {
         const state = running({ futureSeen: { [`${SOURCE}.${A}.${own.at}`]: T0 - 10 * DAY } });
         const decision = decide({ now: T0, containers: [container(A)], records: [own, keep, newest], state });
         expect(decision.superseded).not.toContain(own);
-        const remaining = [own, keep, newest].filter((one) => !decision.superseded.includes(one));
-        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
-        expect(inUseByOtherComputer(output(remaining), SOURCE)).toBe(false);
       });
 
       // Review round 8 of PR #63 (R8-5): the other way round. A keep of another computer whose written time is later
@@ -412,9 +404,6 @@ describe('decide of the remote Session Monitor', () => {
         const state = running({ futureSeen: { [`${OTHER}.${A}.${keep.at}`]: T0 - 10 * DAY } });
         const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state });
         expect(decision.superseded).toEqual([own]);
-        const output = (records: RemoteRecord[]) => ({ now: T0, records: records.map(({ source, at, keepRunning }) => ({ source, at, keepRunning })) });
-        expect(inUseByOtherComputer(output([keep, own, newest]), SOURCE)).toBe(true);
-        expect(inUseByOtherComputer(output([keep, newest]), SOURCE)).toBe(true);
       });
     });
   });

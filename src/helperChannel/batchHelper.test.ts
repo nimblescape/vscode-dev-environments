@@ -9,10 +9,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
+import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
-import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
+import { OVERRIDE_FOLDER } from '../core/helper/scripts';
+import {
+  BATCH_SOCKET_FOLDER,
+  CONFIG_FOLDER,
+  HELPER_DOCKER_SOCKET,
+  SECRETS_FOLDER,
+  WORKSPACES_ROOT,
+} from '../core/names';
 import {
   BATCH_GIT_HOME,
   batchHelperOperations,

@@ -17,7 +17,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // Plan step 11I2: the Docker CLI of the extension (BootstrapDocker) in place of the removed CLI adapter ContainerAdapter.
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { toNetworkInfo } from '../../src/core/docker/dockerObjects';
-import { composeUpModel, isSupportedComposeVersion, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
+import { isSupportedComposeVersion } from '../../src/core/helper/composeModel';
+import { composeUpModel, resolveComposeFiles, type ComposeModelOutput } from '../../src/core/helper/compose';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import type { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';

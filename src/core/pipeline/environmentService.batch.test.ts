@@ -18,12 +18,14 @@ import { Messages } from '../messages';
 import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/helperChannel';
 import { currentBatchScope } from '../helper/batchScope';
 import { abortError, isAbortError, silentLogger, type RunResult } from '../ports';
-import { batchStepCommand, type BatchStepKind } from '../helper/batchSteps';
+import type { BatchStepKind } from '../helper/batchStepKinds';
+import { batchStepCommand } from '../helper/batchSteps';
 import { composeProjectName } from '../names';
-import { WorkspaceHelper, type HelperImageUse } from '../helper/workspaceHelper';
+import type { HelperImageUse } from '../helper/helperImage';
+import { WorkspaceHelper } from '../helper/workspaceHelper';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './operationBase';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, REPO, TOKEN, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 import { resourceName } from '../names';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

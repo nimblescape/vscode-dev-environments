@@ -14,11 +14,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BATCH_GIT_UID, BATCH_HOLD_LIMIT_MS, BATCH_MISSING_VOLUME_CODE, MAX_BATCH_INPUT_CHARACTERS, batchRunSpec } from '../core/helperChannel/batch';
 import { batchStepCommand } from '../core/helper/batchSteps';
-import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
+import { OVERRIDE_FOLDER } from '../core/helper/scripts';
 import { HelperChannel, HelperChannelError, type HelperBatchSession, type HelperChannelOptions } from '../core/helperChannel/helperChannel';
 import { CHANNEL_PROTOCOL_VERSION, channelStepLabel, encodeMessage, parseClientMessage, type ClientMessage } from '../core/helperChannel/protocol';
 import { bundleHash } from '../core/loader/pipeLoader';
-import { CONFIG_FOLDER, WORKSPACES_ROOT } from '../core/names';
+import { CONFIG_FOLDER, SECRETS_FOLDER, WORKSPACES_ROOT } from '../core/names';
 import { isAbortError } from '../core/ports';
 import { workerBatchSession, type BatchDeps } from './batch';
 import { batchHelperOperations, gitPrivilegeArgs, privilegeArgs, type BatchHelperDeps, type StepProcess } from './batchHelper';

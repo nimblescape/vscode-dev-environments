@@ -7,7 +7,8 @@
 // user and the signal of an exec but not its time limit, so the probes record the options of each exec themselves.
 import { afterEach, describe, expect, it } from 'vitest';
 import { servicePathArguments } from '../git/gitSummary';
-import { composeConfigHash, composeInputsHash, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
+import type { ComposeModel } from '../helper/composeModel';
+import { composeConfigHash, composeInputsHash, type ComposeModelOutput } from '../helper/compose';
 import { Messages } from '../messages';
 import { CONTAINER_VERSION, LABEL_COMPOSE_SERVICE, LABEL_CONTAINER_VERSION, composeProjectName } from '../names';
 import { SECRET_TOKEN } from '../helperChannel/protocol';
@@ -15,7 +16,7 @@ import { CONTAINER_SCRIPTS, type ContainerScript } from '../worker/containerScri
 import { BRANCH_EXEC_TIMEOUT_MS } from './refreshStates';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, REPO, checked, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import type { RepositoryTarget } from './operationBase';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 /** GIT_EXEC_TIMEOUT_MS and OWNERSHIP_TIMEOUT_MS of environmentService.ts (module-private). */

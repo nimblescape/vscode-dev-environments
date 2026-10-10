@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { durationSeconds, type ComposeModel } from './compose';
+import { durationSeconds, type ComposeModel } from './composeModel';
 import { TOKEN_TMPFS, composeProjectName, resourceName } from '../names';
 import {
   composeAccessReport,

@@ -15,7 +15,7 @@ import { runWithDockerTarget } from '../docker/dockerTargets';
 import type { DockerTarget } from '../docker/dockerHost';
 import type { HelperMaintenance } from '../helper/helperImages';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
-import { HELPER_DOCKER_SOCKET, LABEL_HELPER_RUN, VSCODE_STORE_DIR } from '../names';
+import { HELPER_DOCKER_SOCKET, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, VSCODE_STORE_DIR } from '../names';
 import { errorMessage, isUserFacingError } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { HelperChannel, HelperChannelError } from './helperChannel';
@@ -24,7 +24,6 @@ import {
   CHANNEL_IDLE_CLOSE_MS,
   CHANNEL_SCRIPT_PATH,
   ENGINE_IDENTITY_ARGS,
-  LABEL_HELPER_CHANNEL,
   LOCK_STATE_DIR,
   OP_PROBE,
   OP_REFRESH,

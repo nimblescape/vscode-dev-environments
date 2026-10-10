@@ -8,8 +8,8 @@
 // or dropped default was caught by no test. Probe: the default limit holds, also when the request ignores the abort.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HttpTransport } from '../http';
-import { IMAGE_CHECK_TIMEOUT_MS, ImageChecker } from './imageCheck';
-import { RegistryClient } from './registryClient';
+import { ImageChecker } from './imageCheck';
+import { IMAGE_CHECK_TIMEOUT_MS, RegistryClient } from './registryClient';
 
 const hanging: HttpTransport = { request: () => new Promise(() => {}) };
 

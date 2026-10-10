@@ -27,7 +27,7 @@
 // src/helperChannel/batch.ts).
 import { createHash, randomBytes } from 'crypto';
 import { PIPE_LOADER } from '../loader/pipeLoader';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../names';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_RUN, WORKSPACES_ROOT } from '../names';
 import type { EnvironmentStates, StateEnvironment } from '../pipeline/refreshStates';
 import { isStorageId } from '../storage/paths';
 import { LABEL_SESSION_MONITOR, isSourceId, parseHeartbeatInput, parseImageListInput, parseMonitorSettings, type HeartbeatInput, type MonitorSettings } from '../remoteMonitor/protocol';
@@ -35,8 +35,6 @@ import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
 import { parseExtensionList } from '../vscodeExtensions';
-
-export { LABEL_HELPER_CHANNEL };
 
 /**
  * The version of the messages. The extension closes a channel whose script answers with another one. Plan step 6, PR B:
@@ -397,13 +395,6 @@ export function parseSecrets(value: unknown): Secrets | undefined {
   }
   return secrets;
 }
-
-/**
- * Review round 1 (S1): the label of the containers that an operation starts and removes by it, never by a name. Plan
- * step 11I1, PR B1: now the session label of a batch helper (`nimblescape.devenv.channel-step=<session>`,
- * channelStepLabel), which the worker removes by that label (src/helperChannel/batch.ts).
- */
-export { LABEL_CHANNEL_STEP };
 
 /**
  * A cleanup label value: 24 hex digits, as newCleanupLabel makes them (review round 2, B4: a value of its own per call,

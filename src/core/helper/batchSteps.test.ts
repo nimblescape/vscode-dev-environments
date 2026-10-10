@@ -8,8 +8,8 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_SERVICE_FOLDERS, MAX_SERVICE_PATH_DEPTH, MAX_SERVICE_PATH_LENGTH, configOwnershipFixCommand, repositoryOwnershipFixCommand } from '../git/gitSummary';
 import { CONFIG_FOLDER, environmentIdLabel } from '../names';
-import { BAKE_FS_ENTITLEMENTS_OFF, BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepKind } from './batchSteps';
-import { isBatchStepKind } from './batchStepKinds';
+import { BAKE_FS_ENTITLEMENTS_OFF, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand } from './batchSteps';
+import { BATCH_STEP_KINDS, isBatchStepKind, type BatchStepKind } from './batchStepKinds';
 import { COMPOSE_MODEL_PATH } from './compose';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';

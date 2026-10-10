@@ -11,7 +11,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContainerInfo } from '../docker/dockerObjects';
 import { UserFacingError } from '../errors';
-import { composeConfigHash, composeInputsHash, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
+import type { ComposeModel } from '../helper/composeModel';
+import { composeConfigHash, composeInputsHash, type ComposeModelOutput } from '../helper/compose';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
 import {
   CONTAINER_VERSION,
@@ -46,7 +47,7 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const PROJECT = composeProjectName(REPO, ENV_ID);

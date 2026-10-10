@@ -101,5 +101,3 @@ export function workerMonitor(deps: WorkerMonitorDeps) {
     },
   };
 }
-
-export type WorkerMonitor = ReturnType<typeof workerMonitor>;

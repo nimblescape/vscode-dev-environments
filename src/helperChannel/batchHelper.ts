@@ -36,11 +36,18 @@
 // again (gitUserFilesToRootCommands).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
-import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID, BATCH_SOCKET_FOLDER } from '../core/helperChannel/batch';
-import { BATCH_STEP_KINDS, BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepCommand } from '../core/helper/batchSteps';
-import { OVERRIDE_FOLDER, SECRETS_FOLDER } from '../core/helper/scripts';
+import { BATCH_DOCKER_SOCKET, BATCH_GIT_UID } from '../core/helperChannel/batch';
+import { BATCH_STEP_KINDS } from '../core/helper/batchStepKinds';
+import { BatchStepError, COMPOSE_REMOTE_OFF, batchStepCommand, type BatchStepCommand } from '../core/helper/batchSteps';
+import { OVERRIDE_FOLDER } from '../core/helper/scripts';
 import { CHANNEL_KILL_GRACE_MS, SECRET_TOKEN } from '../core/helperChannel/protocol';
-import { CONFIG_FOLDER, HELPER_DOCKER_SOCKET, WORKSPACES_ROOT } from '../core/names';
+import {
+  BATCH_SOCKET_FOLDER,
+  CONFIG_FOLDER,
+  HELPER_DOCKER_SOCKET,
+  SECRETS_FOLDER,
+  WORKSPACES_ROOT,
+} from '../core/names';
 import { OperationError, type OperationContext, type OperationHandler } from './server';
 
 /** The HOME of the Git user: a path that does not exist and that it cannot create (no `~/.gitconfig` of its own). */

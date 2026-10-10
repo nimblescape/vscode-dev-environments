@@ -26,8 +26,8 @@ import { abortError, isAbortError, type Logger, type RunOptions, type RunResult 
 import { HELPER_CHECK_INTERVAL_MS, HELPER_GENERATION, helperImageTag, type BaseDigestLookup, type HelperImageUse } from './helperImage';
 import { HELPER_PREBUILD_TIMEOUT_MS, HelperPrebuild, dockerEngineAnswers, type HelperPrebuildDeps } from './helperPrebuild';
 import type { HelperState } from './helperState';
+import { HELPER_DOCKER_SOCKET } from '../names';
 import {
-  DOCKER_SOCKET,
   HELPER_IMAGE_RECHECK_MS,
   HelperImages,
   helperDockerSocket,
@@ -60,7 +60,7 @@ class FakeDocker implements HelperImageDocker {
   readonly builds: BuildOptions[] = [];
   buildHandler: (options: BuildOptions) => Promise<void> = async () => undefined;
 
-  /** Calls of imageId: each one is a run of ensureHelperImage with a state file. */
+  /** Calls of imageId: each one is a run of ensureHelperImageUse with a state file. */
   imageIdCalls = 0;
   /** Calls of listImagesByLabel: the cleanup, or the removal of the previous image after a rebuild. */
   listCalls = 0;
@@ -149,11 +149,11 @@ afterEach(() => {
 
 describe('helperDockerSocket', () => {
   it('uses /var/run/docker.sock by default and with Docker Desktop', () => {
-    expect(helperDockerSocket({}, 'linux')).toBe(DOCKER_SOCKET);
-    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///Users/me/.docker/run/docker.sock' }, 'darwin')).toBe(DOCKER_SOCKET);
-    expect(helperDockerSocket({ DOCKER_HOST: 'npipe:////./pipe/docker_engine' }, 'win32')).toBe(DOCKER_SOCKET);
-    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///home/me/.docker/desktop/docker.sock' }, 'linux')).toBe(DOCKER_SOCKET);
-    expect(helperDockerSocket({ DOCKER_HOST: 'tcp://10.0.0.1:2376' }, 'linux')).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({}, 'linux')).toBe(HELPER_DOCKER_SOCKET);
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///Users/me/.docker/run/docker.sock' }, 'darwin')).toBe(HELPER_DOCKER_SOCKET);
+    expect(helperDockerSocket({ DOCKER_HOST: 'npipe:////./pipe/docker_engine' }, 'win32')).toBe(HELPER_DOCKER_SOCKET);
+    expect(helperDockerSocket({ DOCKER_HOST: 'unix:///home/me/.docker/desktop/docker.sock' }, 'linux')).toBe(HELPER_DOCKER_SOCKET);
+    expect(helperDockerSocket({ DOCKER_HOST: 'tcp://10.0.0.1:2376' }, 'linux')).toBe(HELPER_DOCKER_SOCKET);
   });
 
   it('uses the path of a unix:// DOCKER_HOST on Linux (for example rootless Docker)', () => {
@@ -163,8 +163,8 @@ describe('helperDockerSocket', () => {
   // Unit 7: the endpoint of the current Docker context, like DOCKER_HOST (a context of a local rootless engine).
   it('uses the endpoint of the current Docker context with the same rules', () => {
     expect(helperDockerSocket({}, 'linux', 'unix:///run/user/1000/docker.sock')).toBe('/run/user/1000/docker.sock');
-    expect(helperDockerSocket({}, 'linux', 'unix:///home/me/.docker/desktop/docker.sock')).toBe(DOCKER_SOCKET);
-    expect(helperDockerSocket({}, 'darwin', 'unix:///Users/me/.docker/run/docker.sock')).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({}, 'linux', 'unix:///home/me/.docker/desktop/docker.sock')).toBe(HELPER_DOCKER_SOCKET);
+    expect(helperDockerSocket({}, 'darwin', 'unix:///Users/me/.docker/run/docker.sock')).toBe(HELPER_DOCKER_SOCKET);
     expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1/docker.sock' }, 'linux', '')).toBe('/run/user/1/docker.sock');
   });
 });
@@ -178,10 +178,10 @@ describe('helperStatePathFor (unit 7)', () => {
   });
 });
 
-describe('HelperImages.ensureImage', () => {
+describe('HelperImages.ensureImageUse', () => {
   it('shares one build between concurrent callers', async () => {
     const helper = createImages();
-    const tags = await Promise.all([helper.ensureImage(), helper.ensureImage(), helper.ensureImage()]);
+    const tags = (await Promise.all([helper.ensureImageUse(), helper.ensureImageUse(), helper.ensureImageUse()])).map((use) => use.tag);
     expect(tags).toEqual([TAG, TAG, TAG]);
     expect(docker.builds).toHaveLength(1);
   });
@@ -191,13 +191,13 @@ describe('HelperImages.ensureImage', () => {
     docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'network error');
     };
-    const error = await helper.ensureImage().catch((e: unknown) => e);
+    const error = await helper.ensureImageUse().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(UserFacingError);
     expect(error).toMatchObject({ code: 'helperFailed', message: 'The workspace helper could not be prepared.' });
     expect((error as UserFacingError).detail).toContain('network error');
 
     docker.buildHandler = async () => undefined;
-    await expect(helper.ensureImage()).resolves.toBe(TAG);
+    expect((await helper.ensureImageUse()).tag).toBe(TAG);
     expect(docker.builds).toHaveLength(2);
   });
 
@@ -206,16 +206,16 @@ describe('HelperImages.ensureImage', () => {
     docker.imageExists = async () => {
       throw new UserFacingError('dockerNotInstalled', 'Docker Desktop is not installed.');
     };
-    await expect(helper.ensureImage()).rejects.toMatchObject({ code: 'dockerNotInstalled' });
+    await expect(helper.ensureImageUse()).rejects.toMatchObject({ code: 'dockerNotInstalled' });
   });
 
   it('fails with helperFailed when the Dockerfile cannot be read', async () => {
     fs.rmSync(path.join(dir, 'Dockerfile'));
-    await expect(createImages().ensureImage()).rejects.toMatchObject({ code: 'helperFailed' });
+    await expect(createImages().ensureImageUse()).rejects.toMatchObject({ code: 'helperFailed' });
   });
 });
 
-describe('HelperImages.ensureImage with a state file (implementation notes 7)', () => {
+describe('HelperImages.ensureImageUse with a state file (implementation notes 7)', () => {
   const START = Date.parse('2026-09-24T12:00:00Z');
   const DIGEST = `sha256:${'a'.repeat(64)}`;
 
@@ -245,14 +245,14 @@ describe('HelperImages.ensureImage with a state file (implementation notes 7)', 
       },
       iso: (offsetMs = 0) => new Date(now + offsetMs).toISOString(),
       state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
-      /** Waits for the checks of the base image that ensureImage started in the background. */
+      /** Waits for the checks of the base image that ensureImageUse started in the background. */
       settled: () => Promise.all(checks.splice(0)),
     };
   }
 
   it('builds a new helper with --pull and records the digest of its base image', async () => {
     const { helper, lookups, state, iso } = setup();
-    expect(await helper.ensureImage()).toBe(TAG);
+    expect((await helper.ensureImageUse()).tag).toBe(TAG);
     expect(lookups).toEqual(['node:22-bookworm-slim']);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ tag: TAG, pull: true });
@@ -275,7 +275,7 @@ describe('HelperImages.ensureImage with a state file (implementation notes 7)', 
   it('uses the existing image when the registry cannot be reached', async () => {
     docker.images.add(TAG);
     const { helper, lookups, state, settled } = setup(async () => 'unreachable');
-    expect(await helper.ensureImage()).toBe(TAG);
+    expect((await helper.ensureImageUse()).tag).toBe(TAG);
     await settled();
     expect(lookups).toHaveLength(1);
     expect(docker.builds).toHaveLength(0);
@@ -285,11 +285,11 @@ describe('HelperImages.ensureImage with a state file (implementation notes 7)', 
     expect(await helper.runImage({})).toEqual({ tag: TAG, id: fakeImageId(TAG) });
   });
 
-  it('reuses the image for an hour; after that, ensureImage checks again, and the helper runs only record the use', async () => {
+  it('reuses the image for an hour; after that, ensureImageUse checks again, and the helper runs only record the use', async () => {
     // Plan step 11I (U7, decision of 2026-10-08): changed setup, each helper run is runImage (before: a step of
     // WorkspaceHelper, which got its image from runImage).
     const { helper, lookups, advance, iso, state, settled } = setup();
-    await helper.ensureImage();
+    await helper.ensureImageUse();
     const calls = docker.imageIdCalls;
     expect(calls).toBeGreaterThan(0);
 
@@ -305,15 +305,15 @@ describe('HelperImages.ensureImage with a state file (implementation notes 7)', 
     await helper.runImage({});
     expect(state().images[TAG].lastUsedAt).toBe(used);
 
-    // The open pipeline (ensureImage) runs ensureHelperImage again: the weekly check is due.
-    await helper.ensureImage();
+    // The open pipeline (ensureImageUse) runs ensureHelperImageUse again: the weekly check is due.
+    await helper.ensureImageUse();
     await settled();
     expect(docker.imageIdCalls).toBe(calls + 1);
     expect(lookups).toHaveLength(2);
     expect(state().images[TAG].checkedAt).toBe(iso());
-    await helper.ensureImage();
+    await helper.ensureImageUse();
     // Changed expectation (review round 4 of PR #64, R4-1): an open that reuses the cache checks once that the tag still
-    // has the cached image (one imageId call), without running ensureHelperImage again.
+    // has the cached image (one imageId call), without running ensureHelperImageUse again.
     expect(docker.imageIdCalls).toBe(calls + 2);
     expect(lookups).toHaveLength(2);
     expect(docker.builds).toHaveLength(1);
@@ -612,7 +612,7 @@ describe('HelperImages without a previous helper image (user decision 2026-09-29
     throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
   };
 
-  it('fails with helperFailed when the current tag cannot be built, never runs an older helper image, and builds the tag again at the next ensureImage', async () => {
+  it('fails with helperFailed when the current tag cannot be built, never runs an older helper image, and builds the tag again at the next ensureImageUse', async () => {
     // user decision 2026-09-29: no previous helper image. Changed expectation: before, the older helper image of this
     // installation was returned and the helper runs used it by its image ID. Plan step 11I (U7, decision of
     // 2026-10-08): changed expectation, a helper run gets no image (runImage fails; before: a step of WorkspaceHelper
@@ -1498,15 +1498,15 @@ describe('HelperImages: the helper runs in a new window (implementation notes 7)
     expect(w.state().images[TAG].lastUsedAt).toBe(w.iso());
     expect(w.state().images[TAG].checkedAt).toBe(w.iso(-8 * 24 * 60 * 60 * 1000));
 
-    // The open pipeline (ensureImage) in the same window does the maintenance: the check (in the background) and the
-    // cleanup. The rebuild that the check asks for comes with the next ensureImage.
-    await w.helper.ensureImage();
+    // The open pipeline (ensureImageUse) in the same window does the maintenance: the check (in the background) and the
+    // cleanup. The rebuild that the check asks for comes with the next ensureImageUse.
+    await w.helper.ensureImageUse();
     await w.settled();
     expect(w.lookups).toHaveLength(1);
     expect(docker.listCalls).toBe(1);
     expect(w.state().images[TAG].latestBaseDigest).toBe(DIGEST_B);
     w.advance(HELPER_IMAGE_RECHECK_MS);
-    await w.helper.ensureImage();
+    await w.helper.ensureImageUse();
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ pull: true, noCache: true });
   });
@@ -1519,13 +1519,13 @@ describe('HelperImages: the helper runs in a new window (implementation notes 7)
     docker.buildHandler = () => new Promise<void>((resolve) => (release = resolve));
     const run = w.helper.runImage({});
     await vi.waitFor(() => expect(docker.builds).toHaveLength(1));
-    const ensured = w.helper.ensureImage();
+    const ensured = w.helper.ensureImageUse();
     release();
     expect(await run).toEqual({ tag: TAG, id: fakeImageId(TAG) });
-    expect(await ensured).toBe(TAG);
+    expect((await ensured).tag).toBe(TAG);
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({ pull: true });
-    // ensureImage ran ensureHelperImage again, with the maintenance: the cleanup is due in a new state file.
+    // ensureImageUse ran ensureHelperImageUse again, with the maintenance: the cleanup is due in a new state file.
     expect(docker.listCalls).toBe(1);
   });
 });
@@ -1541,16 +1541,16 @@ describe('Docker access of the helper runs', () => {
       statePath,
       engine: async () => engine,
     });
-    await helper.ensureImage();
+    await helper.ensureImageUse();
     expect(docker.builds).toHaveLength(1);
     // The remote engine does not have the image: it is built there, with its own state file.
     docker.images.clear();
     engine = { key: 'box' };
-    await helper.ensureImage();
+    await helper.ensureImageUse();
     expect(docker.builds).toHaveLength(2);
     expect(fs.existsSync(helperStatePathFor(statePath, 'box'))).toBe(true);
     // The same engine again: reused.
-    await helper.ensureImage();
+    await helper.ensureImageUse();
     expect(docker.builds).toHaveLength(2);
   });
 });
@@ -1684,7 +1684,7 @@ describe('HelperImages.ensureImagePresent (PR #74 review round 1, A-R1-1)', () =
     expect(logger.lines.join('\n')).toContain(`The workspace helper image ${TAG} was removed. It is prepared again.`);
   });
 
-  it('fails like ensureImage when the missing tag cannot be built', async () => {
+  it('fails like ensureImageUse when the missing tag cannot be built', async () => {
     docker.buildHandler = async () => {
       throw new CommandError('docker build', 1, '', 'failed to solve: node:22-bookworm-slim: not found');
     };

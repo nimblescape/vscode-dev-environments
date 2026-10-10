@@ -29,7 +29,7 @@ import type { BatchStepOptions, HelperBatchSession } from '../helperChannel/help
 import { Messages } from '../messages';
 import { abortError, isAbortError, type Logger, type RunResult } from '../ports';
 import { OutputTooLargeError } from '../process';
-import type { BatchStepKind } from './batchSteps';
+import type { BatchStepKind } from './batchStepKinds';
 
 /** What a session needs besides the volume: the pinned helper image (its ID, `sha256:…`) and the socket source. */
 export interface BatchSessionTarget {

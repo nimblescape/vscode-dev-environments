@@ -10,7 +10,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ImageInfo } from '../docker/dockerObjects';
 import type { Logger } from '../ports';
-import { ensureHelperImage, helperImageTag, type HelperImageDocker } from './helperImage';
+import { ensureHelperImageUse, helperImageTag, type HelperImageDocker } from './helperImage';
 import type { HelperImageRecord, HelperState } from './helperState';
 
 const BASE = 'node:24-trixie-slim';
@@ -81,7 +81,7 @@ function setup(images: Array<{ id: string; tags: string[] }>, records: Record<st
     error: (message) => lines.push(`error ${message}`),
     output: () => {},
   };
-  const ensure = () => ensureHelperImage(docker, file, { statePath, baseDigest: async () => DIGEST_B, clock: { now: () => NOW }, logger });
+  const ensure = async () => (await ensureHelperImageUse(docker, file, { statePath, baseDigest: async () => DIGEST_B, clock: { now: () => NOW }, logger })).tag;
   const readState = () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState;
   return { tag, removals, refused, lines, ensure, readState };
 }

@@ -19,7 +19,6 @@ import {
   isUnderRecordsLock,
   monitorExecFailure,
   heartbeatFileName,
-  inUseByOtherComputer,
   isRemoteEnvironmentId,
   isSourceId,
   parseHeartbeatFileName,
@@ -30,7 +29,6 @@ import {
 } from './protocol';
 
 const SOURCE = '0123456789abcdef0123456789abcdef';
-const OTHER = 'fedcba9876543210fedcba9876543210';
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
 const input = (value: unknown): string => JSON.stringify(value);
@@ -181,27 +179,6 @@ describe('the subcommands of the remote monitor', () => {
     expect(isUnderRecordsLock(underRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]))).toBe(true);
     expect(isUnderRecordsLock(forgetIfUnchangedCommand(SOURCE, ID, 1234))).toBe(true);
     expect(isUnderRecordsLock(['node', REMOTE_MONITOR_SCRIPT_PATH, 'settings', '-'])).toBe(false);
-  });
-
-  it('counts only a fresh record of another computer as "in use from another computer" (shared engine)', () => {
-    const now = 1_000_000;
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 89_000, keepRunning: false }] }, SOURCE)).toBe(true);
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 91_000, keepRunning: false }] }, SOURCE)).toBe(false);
-    // The own record never counts.
-    expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: now, keepRunning: false }] }, SOURCE)).toBe(false);
-    expect(inUseByOtherComputer({ now, records: [] }, SOURCE)).toBe(false);
-    // Another computer keeps it running, however old its record, as long as this computer made no newer choice.
-    const old = now - 30 * 24 * 3_600_000;
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }] }, SOURCE)).toBe(true);
-    expect(inUseByOtherComputer({ now, records: [{ source: SOURCE, at: 1, keepRunning: true }] }, SOURCE)).toBe(false);
-    // Review round 2 of PR #39 (M1): the newest record decides. A newer record of this computer overrules an older keep
-    // of another one (for example a computer that no longer sends); a keep that is at least as new still holds.
-    const own = (at: number) => ({ source: SOURCE, at, keepRunning: false });
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }, own(old + 1)] }, SOURCE)).toBe(false);
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old + 1, keepRunning: true }, own(old)] }, SOURCE)).toBe(true);
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: old, keepRunning: true }, own(old)] }, SOURCE)).toBe(true);
-    // A fresh heartbeat of another computer counts whatever this computer sent.
-    expect(inUseByOtherComputer({ now, records: [{ source: OTHER, at: now - 1000, keepRunning: false }, own(now)] }, SOURCE)).toBe(true);
   });
 });
 

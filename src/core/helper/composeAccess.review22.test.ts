@@ -7,7 +7,7 @@
 // other containers stays refused whatever the switch of the host access checks says.
 import { describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
-import type { ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
 import {
   composeAccessClassification,
   composeAccessReport,

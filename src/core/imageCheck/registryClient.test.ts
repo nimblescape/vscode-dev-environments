@@ -7,8 +7,14 @@ import { describe, expect, it, vi } from 'vitest';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
 import type { Credentials } from '../ports';
 import { parseImageReference, type ImageReference } from './reference';
-import { IMAGE_CHECK_TIMEOUT_MS } from './imageCheck';
-import { CREDENTIALS_TIMEOUT_MS, MANIFEST_ACCEPT, parseWwwAuthenticate, RegistryClient, type CredentialsProvider } from './registryClient';
+import {
+  CREDENTIALS_TIMEOUT_MS,
+  MANIFEST_ACCEPT,
+  parseWwwAuthenticate,
+  RegistryClient,
+  type CredentialsProvider,
+  IMAGE_CHECK_TIMEOUT_MS,
+} from './registryClient';
 
 const DIGEST = `sha256:${'1'.repeat(64)}`;
 

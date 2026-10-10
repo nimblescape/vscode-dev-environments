@@ -17,7 +17,8 @@ import { UserFacingError, isBatchHelperUnavailable } from '../errors';
 import { HelperChannelError, type BatchStepOptions, type HelperBatchSession } from '../helperChannel/helperChannel';
 import { Messages } from '../messages';
 import { abortError, silentLogger, type RunResult } from '../ports';
-import { BAKE_FS_ENTITLEMENTS_OFF, batchStepCommand, type BatchStepKind } from './batchSteps';
+import type { BatchStepKind } from './batchStepKinds';
+import { BAKE_FS_ENTITLEMENTS_OFF, batchStepCommand } from './batchSteps';
 import { COMPOSE_MODEL_PATH } from './compose';
 import { CONTAINER_CREDENTIAL_HELPER } from './containerGit';
 import { buildArgs, readConfigurationArgs, runUserCommandsArgs, upArgs } from './devcontainerCli';
@@ -34,7 +35,8 @@ import {
 } from './scripts';
 import { overrideCommand, overrideInput, writeAndRunInput } from './stepInputs';
 import { currentBatchScope, runWithBatchScope } from './batchScope';
-import { WorkspaceHelper, type HelperImageUse } from './workspaceHelper';
+import type { HelperImageUse } from './helperImage';
+import { WorkspaceHelper } from './workspaceHelper';
 
 // User decisions 2026-10-03: the names of an environment are resourceName (before: devenv-<8 hex>).
 const NAME_ID = '3f2a9c1e-0000-4000-8000-000000000000';

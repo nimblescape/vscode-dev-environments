@@ -15,7 +15,8 @@
 //   ...COMPOSE_REMOTE_OFF }`): a helper environment with BUILDX_BAKE_ENTITLEMENTS_FS=1 turns the check on again for build
 //   and up (the test "sets the variables on the step after those of the helper" has no variable in both).
 import { describe, expect, it } from 'vitest';
-import { BATCH_STEP_KINDS, batchStepCommand, type BatchStepKind } from '../core/helper/batchSteps';
+import { BATCH_STEP_KINDS, type BatchStepKind } from '../core/helper/batchStepKinds';
+import { batchStepCommand } from '../core/helper/batchSteps';
 import { COMPOSE_MODEL_PATH } from '../core/helper/compose';
 import { CONFIG_FOLDER } from '../core/names';
 import { batchHelperOperations, stepEnvironment } from './batchHelper';

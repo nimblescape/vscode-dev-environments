@@ -15,7 +15,8 @@ import { abortError } from '../ports';
 import type { DevcontainerResult } from '../types';
 import { PipelineTexts, type RepositoryTarget } from './operationBase';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH, isContainerFault } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { isContainerFault } from './pipelineRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const NAME = resourceName(REPO, ENV_ID);

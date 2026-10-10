@@ -16,7 +16,14 @@ import type { ImageInfo } from '../docker/dockerObjects';
 import { silentLogger } from '../ports';
 import { helperImageTag } from './helperImage';
 import type { HelperState } from './helperState';
-import { DOCKER_SOCKET, HELPER_IMAGE_RECHECK_MS, HelperImages, helperDockerSocket, type HelperImageDocker, type HelperImagesDeps } from './helperImages';
+import { HELPER_DOCKER_SOCKET } from '../names';
+import {
+  HELPER_IMAGE_RECHECK_MS,
+  HelperImages,
+  helperDockerSocket,
+  type HelperImageDocker,
+  type HelperImagesDeps,
+} from './helperImages';
 
 const DOCKERFILE = 'FROM node:22-bookworm-slim\n';
 const TAG = helperImageTag(DOCKERFILE);
@@ -64,7 +71,7 @@ describe('review round 1 of PR #129 (reviewer B): HelperImages', () => {
   it('helperDockerSocket takes the endpoint of the context before DOCKER_HOST, by the rules of the platform (HI16)', () => {
     expect(helperDockerSocket({ DOCKER_HOST: 'unix:///run/user/1/docker.sock' }, 'linux', 'unix:///run/user/2/docker.sock')).toBe('/run/user/2/docker.sock');
     // A unix endpoint of Docker Desktop on macOS: the engine runs in a VM, its socket there is the default.
-    expect(helperDockerSocket({}, 'darwin', 'unix:///Users/me/.docker/run/docker.sock')).toBe(DOCKER_SOCKET);
+    expect(helperDockerSocket({}, 'darwin', 'unix:///Users/me/.docker/run/docker.sock')).toBe(HELPER_DOCKER_SOCKET);
   });
 
   it('reports a built image (onImageBuilt) only after a build (HI24)', async () => {

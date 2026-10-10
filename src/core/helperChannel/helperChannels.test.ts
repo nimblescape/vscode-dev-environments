@@ -18,7 +18,15 @@ import {
   openHelperChannel,
 } from './helperChannels';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
-import { CHANNEL_IDLE_CLOSE_MS, CHANNEL_PROTOCOL_VERSION, LABEL_HELPER_CHANNEL, MAX_REFRESH_ENVIRONMENTS, encodeMessage, parseClientMessage, refreshValue } from './protocol';
+import { LABEL_HELPER_CHANNEL } from '../names';
+import {
+  CHANNEL_IDLE_CLOSE_MS,
+  CHANNEL_PROTOCOL_VERSION,
+  MAX_REFRESH_ENVIRONMENTS,
+  encodeMessage,
+  parseClientMessage,
+  refreshValue,
+} from './protocol';
 import { EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
 
 // User decisions 2026-10-03: the Docker context of a host is named after it (remoteContextNames; before: remoteContextName).

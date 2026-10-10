@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { VSCODE_STORE_TARGET, VSCODE_STORE_VOLUME } from '../names';
 import { VSCODE_SERVER_LINK_SCRIPT } from '../worker/vscodeServerLink';
 import { ENV_ID, REPO, createHarness, type Harness } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 import type { RepositoryTarget } from './operationBase';
 
 const SERVER = { commit: '0123456789abcdef0123456789abcdef01234567', quality: 'stable' as const };
