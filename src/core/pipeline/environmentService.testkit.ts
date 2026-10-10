@@ -683,7 +683,9 @@ export class FakeHelper implements EnvironmentHelper {
   /**
    * Plan step 6, PR A: the tag of the helper image exists, so ensureImagePresent (the D1 step before the lock, which
    * only builds a missing tag) succeeds while `ensureImageError` fails the maintaining ensureImageUse of the open (for
-   * example a failed rebuild of the tag). Default false: `ensureImageError` fails both.
+   * example a failed rebuild of the tag). Default false: `ensureImageError` fails both. Cleanup after plan step 11 (PR
+   * C2, A4): the pipeline calls ensureImagePresent no more (only fakeWorkerFlow does, for Stop), and the image of the
+   * open is ownImageUse.
    */
   tagPresent = false;
   /** Review round 3 of PR #64 (P2): the ID of the image of the current tag `devenv-helper:test`, which the open pins. */
@@ -813,8 +815,12 @@ export class FakeHelper implements EnvironmentHelper {
     }
   }
 
-  /** Recorded in `calls` as `ensureImage` (review round 3 of PR #64, P1: the variant that returns the HelperImageUse). */
-  async ensureImageUse(_options: { onOutput?: (text: string) => void } = {}): Promise<HelperImageUse> {
+  /**
+   * The helper image of an open (prepareHelper). Recorded in `calls` as `ensureImage` (review round 3 of PR #64, P1: the
+   * variant that returns the HelperImageUse). Cleanup after plan step 11 (PR #138, A4): WorkspaceHelper.ownImageUse, the
+   * one read of the own image (before, ensureImageUse; the record keeps its name); fails with `ensureImageError`.
+   */
+  async ownImageUse(_signal?: AbortSignal): Promise<HelperImageUse> {
     this.calls.push('ensureImage');
     if (this.ensureImageError) throw this.ensureImageError;
     return { tag: 'devenv-helper:test', id: this.currentHelperImageId };
@@ -822,7 +828,9 @@ export class FakeHelper implements EnvironmentHelper {
 
   /**
    * PR #74 review round 1 (A-R1-1): the non-maintaining ensure before the environment lock, recorded in `calls` as
-   * `ensureImagePresent`; fails with `ensureImageError` like ensureImageUse.
+   * `ensureImagePresent`; fails with `ensureImageError` like ownImageUse. Cleanup after plan step 11 (PR #138, A4): no
+   * method of EnvironmentHelper any more (the pipeline's withEnvironmentLock prepares no image); only the worker of the
+   * tests (fakeWorkerFlow) calls it, as the stand-in of the extension's preparation of the worker before an operation.
    */
   async ensureImagePresent(_options: { onOutput?: (text: string) => void; signal?: AbortSignal } = {}): Promise<HelperImageUse> {
     this.calls.push('ensureImagePresent');

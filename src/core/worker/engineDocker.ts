@@ -13,9 +13,9 @@ import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/docke
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
-import { COMPOSE_PROJECT_LABEL, LABEL_ENVIRONMENT_ID } from '../names';
+import { COMPOSE_PROJECT_LABEL, LABEL_ENVIRONMENT_ID, RESOURCE_NAME_PREFIX } from '../names';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
-import { abortError, isAbortError, silentLogger, type Credentials, type Logger, type RunResult } from '../ports';
+import { abortError, isAbortError, silentLogger, withTimeLimit, type Credentials, type Logger, type RunResult } from '../ports';
 import type { ContainerState } from '../types';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';
 import { IDENTITY_TOKEN_USER } from '../imageCheck/credentials';
@@ -31,12 +31,28 @@ interface PullCredentials extends Credentials {
   registry: string;
 }
 
+/**
+ * Cleanup after plan step 11 (PR #138, D2; review round 1, A-C2-1): the time limit of EngineDocker.labelImage (10 min),
+ * longer than that of a query (DOCKER_QUERY_TIMEOUT_MS), because the commit can walk the whole filesystem of the image on
+ * some storage drivers (the containerd image store, fuse-overlayfs, vfs); still far below the time limit of the open, so
+ * that a stalled engine cannot hold the lock of the environment for long.
+ */
+export const LABEL_IMAGE_TIMEOUT_MS = 10 * 60_000;
+
 /** An Engine API answer about the reference itself (400): an invalid reference, as `docker image inspect` reports it. */
 const INVALID_REFERENCE = 400;
 
 /** As listImageTags sorts them (as the Docker CLI adapter did): by tag, numbers numerically. */
 function sortedTags(repository: string, tags: Iterable<string>): string[] {
   return [...new Set(tags)].sort((a, b) => a.localeCompare(b, 'en', { numeric: true })).map((tag) => `${repository}:${tag}`);
+}
+
+/**
+ * The strings of a list of an inspect answer (`RepoTags`, `RepoDigests`); none for anything else. Cleanup after plan
+ * step 11 (PR #138, B12): one helper for imageNames and inspectImageNames (before, a copy in each).
+ */
+function texts(list: unknown): string[] {
+  return Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : [];
 }
 
 function inspected(container: EngineContainer): InspectedContainer {
@@ -79,14 +95,9 @@ export class EngineDocker implements EnvironmentDocker {
    * (DOCKER_QUERY_TIMEOUT_MS unless the caller gives one); a request that the engine does not answer in time fails with an
    * EngineError, and a cancel of `signal` stays its AbortError.
    */
-  private async call<T>(what: string, signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>, timeoutMs = DOCKER_QUERY_TIMEOUT_MS): Promise<T> {
-    const limit = AbortSignal.timeout(timeoutMs);
-    try {
-      return await run(signal ? AbortSignal.any([signal, limit]) : limit);
-    } catch (error) {
-      if (limit.aborted && !signal?.aborted) throw new EngineError(`The engine did not answer ${what} within ${timeoutMs / 1000} s.`, 0);
-      throw error;
-    }
+  private call<T>(what: string, signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>, timeoutMs = DOCKER_QUERY_TIMEOUT_MS): Promise<T> {
+    // Cleanup after plan step 11 (PR #138, B4): the one time-limited call (withTimeLimit), with the error of EngineDocker.
+    return withTimeLimit(timeoutMs, signal, run, () => new EngineError(`The engine did not answer ${what} within ${timeoutMs / 1000} s.`, 0));
   }
 
   /** As `docker info` (within DOCKER_INFO_TIMEOUT_MS): the engine answers. Rejects only with an AbortError. */
@@ -333,7 +344,10 @@ export class EngineDocker implements EnvironmentDocker {
   async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
     const previous = await this.imageId(image);
     if (previous === undefined) throw new EngineError(`The image ${image} does not exist.`, 404);
-    const now = await this.engine.labelImage(image, labels, signal);
+    // Cleanup after plan step 11 (PR #138, D2): within a time limit of its own (LABEL_IMAGE_TIMEOUT_MS, review round 1,
+    // A-C2-1), so that a stalled engine cannot hold the lock of the environment up to the time limit of the open; the
+    // inspect and the commit of DockerEngine.labelImage run on its signal (before: on the signal of the operation only).
+    const now = await this.call(`the labels of ${image}`, signal, (limited) => this.engine.labelImage(image, labels, limited), LABEL_IMAGE_TIMEOUT_MS);
     if (now === previous) return;
     try {
       const names = await this.imageNames(previous);
@@ -348,7 +362,6 @@ export class EngineDocker implements EnvironmentDocker {
   async imageNames(reference: string): Promise<{ repoTags: string[]; repoDigests: string[] } | undefined> {
     const value = (await this.inspect('image', reference)) as { RepoTags?: unknown; RepoDigests?: unknown } | undefined;
     if (value === undefined) return undefined;
-    const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
     return { repoTags: texts(value.RepoTags), repoDigests: texts(value.RepoDigests) };
   }
 
@@ -367,7 +380,6 @@ export class EngineDocker implements EnvironmentDocker {
         const value = (await this.inspect('image', reference, signal)) as { Id?: unknown; RepoTags?: unknown; RepoDigests?: unknown } | undefined;
         if (value === undefined) continue;
         if (typeof value.Id !== 'string') throw new Error('an answer without an ID');
-        const texts = (list: unknown): string[] => (Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : []);
         images.push({ id: value.Id, repoTags: texts(value.RepoTags), repoDigests: texts(value.RepoDigests) });
       } catch (error) {
         if (isAbortError(error) || signal?.aborted) throw error;
@@ -390,12 +402,15 @@ export class EngineDocker implements EnvironmentDocker {
     return outcome === 'removed';
   }
 
-  /** EnvironmentDocker.listEnvironmentImages: the named images `devenv-*`, each once with its references. */
+  /**
+   * EnvironmentDocker.listEnvironmentImages: the named images `devenv-*` (RESOURCE_NAME_PREFIX), each once with its
+   * references.
+   */
   async listEnvironmentImages(signal?: AbortSignal): Promise<ImageInfo[]> {
-    const images = await this.call('the list of the images', signal, (limited) => this.engine.images({ reference: ['devenv-*'] }, limited));
+    const images = await this.call('the list of the images', signal, (limited) => this.engine.images({ reference: [`${RESOURCE_NAME_PREFIX}*`] }, limited));
     if (signal?.aborted) throw abortError();
     return images
-      .map((image) => ({ id: image.id, tags: image.repoTags.filter((tag) => tag.startsWith('devenv-') && !tag.endsWith(':<none>')), createdAt: image.created }))
+      .map((image) => ({ id: image.id, tags: image.repoTags.filter((tag) => tag.startsWith(RESOURCE_NAME_PREFIX) && !tag.endsWith(':<none>')), createdAt: image.created }))
       .filter((image) => image.tags.length > 0);
   }
 

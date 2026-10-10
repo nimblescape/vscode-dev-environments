@@ -96,7 +96,7 @@ export const LIST_CONFIGURATIONS_FLOW_TIMEOUT_MS = 5 * 60_000;
 export const DELETE_FLOW_TIMEOUT_MS = 30 * 60_000;
 
 /**
- * Plan step 11C2b: the longest check of Delete in the worker: the Git state (GIT_EXEC_TIMEOUT_MS) and the questions,
+ * Plan step 11C2b: the longest check of Delete in the worker: the Git state (GIT_SUMMARY_TIMEOUT_MS) and the questions,
  * which wait for the user.
  */
 export const DELETE_CHECK_FLOW_TIMEOUT_MS = 60 * 60_000;

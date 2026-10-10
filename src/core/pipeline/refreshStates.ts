@@ -8,9 +8,11 @@
 // service, so that the script of the worker stays small.
 import { Semaphore } from '../concurrency';
 import type { ListedContainer } from '../docker/dockerObjects';
+import { errorMessage } from '../errors';
+import { parseGitSummaryOutput } from '../git/gitSummary';
 import { LABEL_ENVIRONMENT_ID } from '../names';
-import type { ContainerState } from '../types';
-import { runScript } from '../worker/containerScripts';
+import type { ContainerState, GitSummary } from '../types';
+import { runScript, type ScriptExec } from '../worker/containerScripts';
 import { devContainerOf } from '../worker/environmentContainers';
 // Plan step 11I2: a type only (no code of the service in the worker's script).
 import type { EnvironmentDocker } from './environmentService';
@@ -84,6 +86,45 @@ export async function readBranch(
     return branch === '' ? null : branch;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The time limit of the script `gitSummary` (readGitSummary). Cleanup after plan step 11 (PR #138, B1): one constant (before,
+ * STOP_GIT_TIMEOUT_MS of Stop and GIT_EXEC_TIMEOUT_MS of the service, both 30 s).
+ */
+export const GIT_SUMMARY_TIMEOUT_MS = 30_000;
+
+/**
+ * Cleanup after plan step 11 (PR #138, B1, one function per fact): the Git state of the repository at `folder` in a
+ * running container, for Stop (stopFlow) and the service (the open after a clone, Delete's check, recordGitState). Before,
+ * each had its own copy (stopFlow's readGitSummary, EnvironmentService.gitSummaryInContainer). The script `gitSummary`
+ * of the registry runs as `user` within GIT_SUMMARY_TIMEOUT_MS; its output is parsed with the time `now()` after it.
+ * Undefined when it cannot be read; the reason goes to `log` as "The Git state in <container.name> could not be read:
+ * <reason>" (the end of a script that failed: "the script did not end in time.", its output, or its exit code). A
+ * cancel of `signal`: with `cancel: 'throw'` (Stop) its error is thrown; with `cancel: 'fail'` (the service) it is a
+ * failed read like any other, as before.
+ */
+export async function readGitSummary(
+  docker: ScriptExec,
+  container: { id: string; name: string },
+  user: string | undefined,
+  folder: string,
+  options: { now: () => string; log: (line: string) => void; cancel: 'throw' | 'fail'; signal?: AbortSignal },
+): Promise<GitSummary | undefined> {
+  const failed = (reason: string): undefined => {
+    options.log(`The Git state in ${container.name} could not be read: ${reason}`);
+    return undefined;
+  };
+  try {
+    const result = await runScript(docker, container.id, 'gitSummary', [folder], { user, timeoutMs: GIT_SUMMARY_TIMEOUT_MS, signal: options.signal });
+    if (result.exitCode !== 0) {
+      return failed(result.timedOut ? 'the script did not end in time.' : (result.stderr || result.stdout).trim() || `exit code ${result.exitCode ?? 'none'}.`);
+    }
+    return parseGitSummaryOutput(result.stdout, options.now());
+  } catch (error) {
+    if (options.cancel === 'throw' && options.signal?.aborted) throw error;
+    return failed(errorMessage(error));
   }
 }
 

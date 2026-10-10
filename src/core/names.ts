@@ -268,6 +268,13 @@ export function splitRepository(repository: string): { owner: string; name: stri
 const MAX_NAME_LENGTH = 63;
 
 /**
+ * The start of the name of everything of an environment (resourceName), by which the extension finds its images
+ * (EngineDocker.listEnvironmentImages) and the host access policy tells an environment image (environmentImageNames).
+ * Cleanup after plan step 11 (PR #138, B6): one constant (before, the text in five places).
+ */
+export const RESOURCE_NAME_PREFIX = 'devenv-';
+
+/**
  * Name of everything of an environment (user decisions 2026-10-03): the workspace volume, the dev container, the
  * repository of the environment image, and the Docker Compose project (so also the names that Compose derives from it):
  * `devenv-<owner>-<repository>-<adjective>-<scientist>`, with the pair of the environment ID (namePair). Lower case,
@@ -277,7 +284,7 @@ const MAX_NAME_LENGTH = 63;
  */
 export function resourceName(repository: string, environmentId: string): string {
   const { owner, name } = splitRepository(repository);
-  const prefix = 'devenv-';
+  const prefix = RESOURCE_NAME_PREFIX;
   const suffix = `-${namePair(environmentId)}`;
   let middle = `${owner}-${name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '');
   const room = MAX_NAME_LENGTH - prefix.length - suffix.length;
@@ -293,7 +300,7 @@ export function resourceName(repository: string, environmentId: string): string 
  */
 export function isEnvironmentResourceName(name: string): boolean {
   const lower = name.toLowerCase();
-  return /^devenv-[a-z0-9-]+$/.test(lower) && trailingPair(lower) !== undefined;
+  return lower.startsWith(RESOURCE_NAME_PREFIX) && /^[a-z0-9-]+$/.test(lower.slice(RESOURCE_NAME_PREFIX.length)) && trailingPair(lower) !== undefined;
 }
 
 /** Repository part of the environment image name: resourceName. */

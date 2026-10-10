@@ -12,7 +12,8 @@
 // root owns the repository (implementation notes §17, Known limitation). Plan step 11I (U7, decision of
 // 2026-10-08): only the worker builds a WorkspaceHelper (workerServices.ts), and every step runs from the worker's own
 // helper image (section 3b of the plan); the helper image of the extension (its build, check, maintenance and record)
-// is HelperImages' (helperImages.ts), of which this module imports only types, so the worker's bundle holds none of it.
+// is HelperImages' (helperImages.ts), of which this module imports nothing (cleanup after plan step 11, PR #138, A4:
+// before, the types of its options), so the worker's bundle holds none of it.
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
 import { boundServiceFolders, checkNumericIds, type ServiceFolders } from '../git/gitSummary';
@@ -22,8 +23,6 @@ import { abortError, isAbortError, type Logger, type RunResult } from '../ports'
 import type { DevcontainerConfig, DevcontainerResult } from '../types';
 import { DevcontainerCommandError, isLifecycleCommandFailure, parseDevcontainerResult, tryParseDevcontainerResult } from './devcontainerCli';
 import type { HelperImageUse } from './helperImage';
-// Plan step 11I (U7): only the types of the options that the pipeline passes to the two image calls (no code).
-import type { EnsureImageOptions, PresentImageOptions } from './helperImages';
 import type { GitIdentity } from './containerGit';
 import { parseComposeModelOutput, type ComposeModelOutput } from './compose';
 import { parseComposeHashes } from './scripts';
@@ -196,19 +195,13 @@ export class WorkspaceHelper {
 
   /**
    * The helper image of an open (the pipeline's prepareHelper). Plan step 11I (U7, decision of 2026-10-08): the
-   * worker's own image (HelperDeps.ownImage); nothing is checked, built or recorded, so of the options of the pipeline
-   * (those of HelperImages.ensureImageUse) only `signal` is read: an abort passes through.
+   * worker's own image (HelperDeps.ownImage); nothing is checked, built or recorded; an abort of `signal` passes through.
+   * Cleanup after plan step 11 (PR #138, A4): the one read of the own image (before, ensureImageUse and ensureImagePresent,
+   * which took the options of the helper image of the extension and read only their `signal`).
    */
-  async ensureImageUse(options: EnsureImageOptions = {}): Promise<HelperImageUse> {
-    return this.ownImageUse(options.signal);
-  }
-
-  /**
-   * The helper image before the lock of an operation (the pipeline's withEnvironmentLock): the own image, as
-   * ensureImageUse.
-   */
-  async ensureImagePresent(options: PresentImageOptions = {}): Promise<HelperImageUse> {
-    return this.ownImageUse(options.signal);
+  async ownImageUse(signal?: AbortSignal): Promise<HelperImageUse> {
+    if (signal?.aborted) throw abortError();
+    return { ...this.deps.ownImage };
   }
 
   /**
@@ -778,12 +771,6 @@ export class WorkspaceHelper {
   }
 
   private readonly logOutput = (text: string): void => this.deps.logger.output(text);
-
-  /** Plan step 11B3b: HelperDeps.ownImage (an abort of `signal` passes through, as for the other image calls). */
-  private async ownImageUse(signal: AbortSignal | undefined): Promise<HelperImageUse> {
-    if (signal?.aborted) throw abortError();
-    return { ...this.deps.ownImage };
-  }
 
   /**
    * Whether the container has the state `running` (HelperDeps.containerRuns). A failed query counts as `false`; an

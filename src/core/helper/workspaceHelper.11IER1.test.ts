@@ -90,16 +90,15 @@ describe('review round 1 of PR #129 (reviewer B): the state query of a kept cont
     expect(lines).toContain(`warn The state of the container ${CONTAINER_ID.slice(0, 12)} could not be read: the engine is gone`);
   });
 
+  // Cleanup after plan step 11 (PR #138, A4): the two image calls of the pipeline are one (ownImageUse), so the copy is
+  // asserted once (before: also for ensureImagePresent, removed).
   it('gives a copy of the own image for the two image calls of the pipeline (W05)', async () => {
     const own = { ...OWN };
     const helper = new WorkspaceHelper({ logger: recordingLogger([]), ownImage: own, socket: '/var/run/docker.sock', containerRuns: async () => false });
-    const use = await helper.ensureImageUse();
-    const present = await helper.ensureImagePresent();
+    const use = await helper.ownImageUse();
     expect(use).toEqual(OWN);
-    expect(present).toEqual(OWN);
     expect(use).not.toBe(own);
-    expect(present).not.toBe(own);
     use.id = 'changed by a caller';
-    expect(await helper.ensureImageUse()).toEqual(OWN);
+    expect(await helper.ownImageUse()).toEqual(OWN);
   });
 });
