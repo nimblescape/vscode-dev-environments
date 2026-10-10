@@ -93,7 +93,7 @@ export function flowHost(context: OperationContext) {
 export type EngineOfOperation = (context: OperationContext) => DockerEngine;
 
 /**
- * Cleanup after plan step 11 (PR C6, B11): the start that every operation shares. Its parameters by the schema of both
+ * Cleanup after plan step 11 (PR #142, B11): the start that every operation shares. Its parameters by the schema of both
  * sides (`parse`; else `invalid`, "The parameters of the <name> operation are invalid.", or `texts.invalid`), and no
  * secret (else `invalid`, "The <name> operation takes no secret.", or `texts.secret`); then `run` with the parameters.
  */
@@ -111,13 +111,13 @@ export function checkedOperation<P>(
   };
 }
 
-/** Cleanup after plan step 11 (PR C6, B11): `cancelled`, "The <name> operation was cancelled.", when the operation was cancelled. */
+/** Cleanup after plan step 11 (PR #142, B11): `cancelled`, "The <name> operation was cancelled.", when the operation was cancelled. */
 export function cancelledIfAborted(name: string, context: OperationContext): void {
   if (context.signal.aborted) throw new OperationError('cancelled', `The ${name} operation was cancelled.`);
 }
 
 /**
- * Cleanup after plan step 11 (PR C6, B11): the end of an operation that failed with `error`: `cancelled` when it was
+ * Cleanup after plan step 11 (PR #142, B11): the end of an operation that failed with `error`: `cancelled` when it was
  * cancelled (cancelledIfAborted), else `failed` with the message of the error.
  */
 export function operationFailure(name: string, error: unknown, context: OperationContext): OperationError {
@@ -218,7 +218,7 @@ export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
 /**
  * Plan step 11B3b: the worker's own helper image of an operation (ownHelperOf). A cancel ends the operation as
  * `cancelled`; another failure changed nothing, so the extension says so as for a worker that cannot take the lock
- * (LOCK_UNAVAILABLE_CODE: environmentLockUnavailable). Cleanup after plan step 11 (PR C6, B11): one function for the six
+ * (LOCK_UNAVAILABLE_CODE: environmentLockUnavailable). Cleanup after plan step 11 (PR #142, B11): one function for the six
  * operations that read it before their pipeline.
  */
 async function ownHelperOfOperation(ownHelperOf: OwnHelperOf, context: OperationContext): Promise<OwnHelper> {

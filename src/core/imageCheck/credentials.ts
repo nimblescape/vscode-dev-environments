@@ -185,7 +185,7 @@ export class DockerCredentialStore {
 
 /**
  * The only registry for which the GitHub session gives credentials (scope `read:packages`; concept 7.7): the sign-in is
- * its login when Docker has none. Cleanup after plan step 11 (PR C6, B8): one definition (before: copies in
+ * its login when Docker has none. Cleanup after plan step 11 (PR #142, B8): one definition (before: copies in
  * src/vscode/hostSide.ts and pipelineUi.ts, and the literal here and in src/vscode/auth.ts).
  */
 export const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';

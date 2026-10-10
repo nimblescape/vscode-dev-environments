@@ -214,7 +214,7 @@ describe('the token removal as a flow of the worker (plan step 11B1)', () => {
     const exact = fakeEngine([container()], () => ok(1, 'y'.repeat(1000)));
     expect(((await flow(exact.engine).catch((e: unknown) => e)) as Error).message).toBe('y'.repeat(1000));
     // The extension allows 60 s for the whole removal (TOKEN_REMOVE_FLOW_TIMEOUT_MS). PR #127 review round 1 (A, L3): for
-    // the container of the request, which the flow tries first (plan step 11I, U4). Cleanup after plan step 11 (PR C6,
+    // the container of the request, which the flow tries first (plan step 11I, U4). Cleanup after plan step 11 (PR #142,
     // D5): tied to the constant of the extension (before: its value, 60_000, with its name in this comment).
     expect(TOKEN_REMOVE_FLOW_TIMEOUT_MS).toBe(60_000);
     expect(2 * TOKEN_REMOVE_TIMEOUT_MS).toBeLessThan(TOKEN_REMOVE_FLOW_TIMEOUT_MS);

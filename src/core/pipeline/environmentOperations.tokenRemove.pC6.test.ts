@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C6, C3): the token removal of concept 7.5 through the operations of the window
+// Cleanup after plan step 11 (PR #142, C3): the token removal of concept 7.5 through the operations of the window
 // (removeTokenInWorker), as every other flow; before, the controller sent it over a `flow` of its own. The same operation,
 // parameters, time limit and texts.
 import { describe, expect, it } from 'vitest';
@@ -20,7 +20,7 @@ function harness(answer: () => Promise<unknown>) {
   return { h, calls };
 }
 
-describe('removeTokenInWorker (cleanup PR C6, C3)', () => {
+describe('removeTokenInWorker (cleanup PR #142, C3)', () => {
   it('sends `tokenRemove` with the environment and the container, within TOKEN_REMOVE_FLOW_TIMEOUT_MS, and answers its value', async () => {
     const { h, calls } = harness(async () => ({ outcome: 'removed', container: 'c0ffeec0ffee' }));
     expect(await h.operations.removeTokenInWorker(ENV_ID, CONTAINER)).toEqual({ outcome: 'removed', container: 'c0ffeec0ffee' });

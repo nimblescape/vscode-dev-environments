@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C6, B7): the checks of the shape of a value that is not trusted (JSON of a file, of the
+// Cleanup after plan step 11 (PR #142, B7): the checks of the shape of a value that is not trusted (JSON of a file, of the
 // worker, of the engine, of a webview), one definition each; before, about 30 modules had a copy of their own. No import,
 // so that each bundle that takes it takes only this module.
 

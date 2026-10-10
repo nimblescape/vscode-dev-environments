@@ -114,7 +114,7 @@ export type OperationFlow = (
 /**
  * Plan step 11B1 (decision of 2026-10-03, the worker is the deputy): the token removal of concept 7.5 (`tokenRemove`) by
  * the worker of the current engine (`flow`), within TOKEN_REMOVE_FLOW_TIMEOUT_MS (review round 1, A-R1-5). Rejects when
- * the flow fails or answers with an invalid value; its caller logs that (best effort). Cleanup after plan step 11 (PR C6,
+ * the flow fails or answers with an invalid value; its caller logs that (best effort). Cleanup after plan step 11 (PR #142,
  * C3): here with the other flows of a window (EnvironmentOperations.removeTokenInWorker; before: in the controller); apart
  * from the class for the tests of the controller, which give it their fake flow.
  */
@@ -691,7 +691,7 @@ export class EnvironmentOperations extends OperationBase {
 
   /**
    * Concept 7.5 (plan step 11B1): the token removal from the dev container `containerName` of an environment by the worker
-   * of the current engine (removeTokenThroughWorker). Cleanup after plan step 11 (PR C6, C3): through the operations of
+   * of the current engine (removeTokenThroughWorker). Cleanup after plan step 11 (PR #142, C3): through the operations of
    * the window, as every other flow (before: `deps.flow` of the controller). Its caller checks the Docker host first.
    */
   async removeTokenInWorker(environmentId: string, containerName: string): Promise<TokenRemoveValue> {

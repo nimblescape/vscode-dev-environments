@@ -113,7 +113,7 @@ export const OPEN_FLOW_TIMEOUT_MS = 4 * 60 * 60_000;
 /**
  * Plan step 11B1 (review round 1, A-R1-5): the whole token removal in the worker: the two tries of the flow
  * (TOKEN_REMOVE_TIMEOUT_MS of src/core/worker/tokenRemoveFlow.ts each; its test ties them to this limit) and the requests
- * around them. Cleanup after plan step 11 (PR C6, C3/D5): here with the limits of the other flows (before:
+ * around them. Cleanup after plan step 11 (PR #142, C3/D5): here with the limits of the other flows (before:
  * TOKEN_REMOVAL_TIMEOUT_MS of src/vscode/controller.ts).
  */
 export const TOKEN_REMOVE_FLOW_TIMEOUT_MS = 60_000;
@@ -121,14 +121,14 @@ export const TOKEN_REMOVE_FLOW_TIMEOUT_MS = 60_000;
 /**
  * Plan step 11D2: the longest ensure of the Session Monitor in the worker: its looks and waits (a name conflict, a
  * container that another window creates: 25.5 s at most), the create and the wait for its ready line (60 s), each call of
- * the engine bounded by 60 s. Cleanup after plan step 11 (PR C6, C3/D5): here with the limits of the other flows (before:
+ * the engine bounded by 60 s. Cleanup after plan step 11 (PR #142, C3/D5): here with the limits of the other flows (before:
  * in src/vscode/workerMonitor.ts).
  */
 export const MONITOR_ENSURE_FLOW_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * The longest heartbeat or monitor command in the worker: its `docker exec` (20 s) and the way there. Cleanup after plan
- * step 11 (PR C6, C3/D5): here with the limits of the other flows (before: in src/vscode/workerMonitor.ts).
+ * step 11 (PR #142, C3/D5): here with the limits of the other flows (before: in src/vscode/workerMonitor.ts).
  */
 export const MONITOR_FLOW_TIMEOUT_MS = 30_000;
 

@@ -113,7 +113,7 @@ export interface ControllerDeps {
   disconnectRequests: DisconnectRequests;
   docker: BootstrapDocker;
   /**
-   * The operations of this window, each a flow in the worker of the Docker target. Cleanup after plan step 11 (PR C6, C3):
+   * The operations of this window, each a flow in the worker of the Docker target. Cleanup after plan step 11 (PR #142, C3):
    * also the token removal (removeTokenInWorker; before: a `flow` of its own here).
    */
   service: EnvironmentOperations;
@@ -1929,7 +1929,7 @@ export class Controller implements vscode.Disposable {
         return;
       }
       // Plan step 11B1: the flow runs in the worker of the engine (its log lines come from there). Review round 1 of plan
-      // step 11B1 (A-R1-5): bounded (TOKEN_REMOVE_FLOW_TIMEOUT_MS). Cleanup after plan step 11 (PR C6, C3): through the
+      // step 11B1 (A-R1-5): bounded (TOKEN_REMOVE_FLOW_TIMEOUT_MS). Cleanup after plan step 11 (PR #142, C3): through the
       // operations of the window, as every other flow.
       await this.deps.service.removeTokenInWorker(left.environmentId, containerName);
     } catch (error) {

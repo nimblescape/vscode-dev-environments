@@ -274,7 +274,7 @@ function parseEntries(value: unknown): EditorEntry[] | undefined {
   return entries;
 }
 
-/** A plain object (prototype Object or none). Cleanup after plan step 11 (PR C6, B7): not isRecord, which takes any object. */
+/** A plain object (prototype Object or none). Cleanup after plan step 11 (PR #142, B7): not isRecord, which takes any object. */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value) as unknown;

@@ -18,7 +18,7 @@ import type { HostOpenFinish, OpenRequestScope } from './openRequests';
 /**
  * Plan step 11E4d: the time limit of the question to GitHub for the profile of the account (HostSide.viewer), for the Git
  * identity of a new environment: the worker's pipeline waits this long for it (EnvironmentService.identityOf), and the
- * extension gives its question to GitHub as long (extensionHostSide). Cleanup after plan step 11 (PR C6, B8): one
+ * extension gives its question to GitHub as long (extensionHostSide). Cleanup after plan step 11 (PR #142, B8): one
  * definition for both ends (before: a copy in src/vscode/hostSide.ts and in environmentService.ts).
  */
 export const VIEWER_TIMEOUT_MS = 5_000;

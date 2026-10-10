@@ -194,7 +194,7 @@ interface Harness {
     windowStateInWorker: ReturnType<typeof vi.fn<(environment: Environment, containerName: string, options?: { branch?: boolean; signal?: AbortSignal }) => Promise<WindowStateValue | undefined>>>;
     // Plan step 11C3: changed, the restore runs in the worker (reconcileInWorker).
     reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean }) => Promise<number>>>;
-    /** Cleanup after plan step 11 (PR C6, C3): the token removal, sent by the operations of the window over `flow`. */
+    /** Cleanup after plan step 11 (PR #142, C3): the token removal, sent by the operations of the window over `flow`. */
     removeTokenInWorker: ReturnType<typeof vi.fn<(environmentId: string, containerName: string) => Promise<TokenRemoveValue>>>;
     // Plan step 11I (D3; PR #127 review round 1, A L6): the three reads of this fake service are its own fixtures (the
     // tests of the dialogs of Delete give each list), which its deleteCheckInWorker joins into the one read of the
@@ -293,7 +293,7 @@ function createHarness(
     deleteInWorker: vi.fn(async () => {}),
     listConfigurationsInWorker: vi.fn(async () => ['.devcontainer/devcontainer.json']),
     currentBranch: vi.fn(async () => undefined),
-    // Cleanup after plan step 11 (PR C6, C3): the token removal of the operations of the window (removeTokenThroughWorker,
+    // Cleanup after plan step 11 (PR #142, C3): the token removal of the operations of the window (removeTokenThroughWorker,
     // the production code) over the fake flow of this harness, so that the tests below still see the flow it sends.
     removeTokenInWorker: vi.fn((environmentId: string, containerName: string) => removeTokenThroughWorker(flow, environmentId, containerName)),
     // Plan step 11C1: the reads of the window as the worker answers them, over the Docker fakes of this harness; a read
@@ -415,7 +415,7 @@ function createHarness(
     disconnectRequests,
     docker,
     // Plan step 11B1: the flows that run in the worker (the token removal; the flow itself is tested in
-    // src/core/worker/tokenRemoveFlow.test.ts). Cleanup after plan step 11 (PR C6, C3): `flow` goes to the controller
+    // src/core/worker/tokenRemoveFlow.test.ts). Cleanup after plan step 11 (PR #142, C3): `flow` goes to the controller
     // through `service` (removeTokenInWorker) only.
     service,
     discovery,

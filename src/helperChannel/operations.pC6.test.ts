@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C6, B11): the answers that every operation of the worker shares (checkedOperation,
+// Cleanup after plan step 11 (PR #142, B11): the answers that every operation of the worker shares (checkedOperation,
 // operationFailure, the read of the worker's own helper image), pinned per operation: parameters that its schema refuses,
 // a secret that it does not take, and the end of a failure and of a cancel. The texts are those before the cleanup.
 import { describe, expect, it } from 'vitest';
@@ -89,7 +89,7 @@ function contextOf(secrets: Record<string, string> = {}, aborted = false): { con
   return { context, progress };
 }
 
-describe('the shared start of every operation (cleanup PR C6, B11)', () => {
+describe('the shared start of every operation (cleanup PR #142, B11)', () => {
   it('the table names every operation of the worker', () => {
     expect(Object.keys(TABLE).sort()).toEqual(Object.keys(OPERATIONS).sort());
   });
@@ -107,7 +107,7 @@ describe('the shared start of every operation (cleanup PR C6, B11)', () => {
   }
 });
 
-describe('the end of a failure and of a cancel (cleanup PR C6, B11)', () => {
+describe('the end of a failure and of a cancel (cleanup PR #142, B11)', () => {
   const failing: OwnHelperOf = async () => Promise.reject(new Error('no inspect'));
   const openBatch = async () => Promise.reject(new Error('no batch in this test'));
   const engineOf = () => unusedEngine();
