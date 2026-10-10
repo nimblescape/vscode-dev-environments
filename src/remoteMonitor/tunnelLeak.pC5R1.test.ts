@@ -43,12 +43,6 @@ vi.mock('tls', async (importOriginal) => {
   return { ...original, default: { ...original, connect }, connect };
 });
 
-vi.mock('tls', async (importOriginal) => {
-  const original = await importOriginal<typeof import('tls')>();
-  const connect = ((options: import('tls').ConnectionOptions) => original.connect({ ca: [...original.rootCertificates, CERT], ...options })) as typeof original.connect;
-  return { ...original, default: { ...original, connect }, connect };
-});
-
 /** A registry that wants the Bearer token `good` and hands out `token`, and a CONNECT proxy that counts its tunnels. */
 async function registryBehindProxy(token: string) {
   let registry = '';
