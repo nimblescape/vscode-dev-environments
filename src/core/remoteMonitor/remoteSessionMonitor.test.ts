@@ -530,7 +530,9 @@ describe('RemoteSessionMonitor.ensure with the pipe loader', () => {
   });
 
   // Cleanup C4 (plan step 11J): changed test (before: "fails without a Docker CLI to start", the CLI client that could
-  // not be started): a create that fails before its container exists.
+  // not be started): a create that fails before its container exists. The port allows that rejection when nothing was
+  // sent; the production client rejects only on a cancelled signal and reports a failed connection as `exited` (review
+  // round 1 of PR #140, L1), so this pins the port's contract, not a failure the client produces.
   it('fails when the create fails before its container exists', async () => {
     const docker = new FakeDocker(() => MISSING, () => Promise.reject(new EngineError('connect ENOENT /var/run/docker.sock', 0)));
     expect(await monitor(docker).ensure(TAG, SOCKET)).toBe('failed');
