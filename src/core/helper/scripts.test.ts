@@ -87,7 +87,6 @@ function runSh(command: string[], input = ''): { status: number | null; stdout: 
 
 const SHELL_SCRIPTS: Array<[string, string]> = [
   ['CLONE_SCRIPT', CLONE_SCRIPT],
-  // 2026-10-01: the Switch branch command was dropped (user decision). SWITCH_BRANCH_SCRIPT is gone.
   // Follow-up of plan step 11I (the links of the owner): GIT_FILES_SCRIPT is a Node.js script now; its suite below runs it.
   ['GIT_SUMMARY_SCRIPT', GIT_SUMMARY_SCRIPT],
   ['UP_SCRIPT', UP_SCRIPT],
@@ -110,7 +109,6 @@ describe('shell scripts', () => {
   it('never embeds a value: the commands pass all values as positional parameters', () => {
     expect(cloneCommand('acme/api', 'api', 'main')).toEqual(['sh', '-c', CLONE_SCRIPT, 'sh', 'acme/api', 'api', 'main']);
     expect(cloneCommand('acme/api', 'api')).toEqual(['sh', '-c', CLONE_SCRIPT, 'sh', 'acme/api', 'api', '']);
-    // 2026-10-01: the Switch branch command was dropped (user decision). switchBranchCommand is gone.
     // unit 15: no login argument (the sign-in of the GitHub CLI is written into the memory of the dev container).
     // Follow-up of plan step 11I (the links of the owner): changed expectation, a Node.js script (was `sh -c … sh`); the
     // values are still arguments only. Review round 1 of that follow-up (B-L1): changed expectation, `--` before them, so
@@ -148,7 +146,6 @@ describe('shell scripts', () => {
 
   it.each([
     ['CLONE_SCRIPT', cloneCommand('acme/api', `devenv-test-${process.pid}-missing`)],
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its row SWITCH_BRANCH_SCRIPT is gone.
   ])('%s refuses to write the token when the secrets folder is not a tmpfs mount', (_name, command) => {
     const result = runSh(command, 'secret-token-value');
     expect(result.status).toBe(3);
@@ -157,7 +154,6 @@ describe('shell scripts', () => {
   });
 
   it('keeps the credential helper intact through the shell quoting of the scripts', () => {
-    // 2026-10-01: the Switch branch command was dropped (user decision). SWITCH_BRANCH_SCRIPT is gone.
     for (const script of [CLONE_SCRIPT]) {
       const line = script.split('\n').find((candidate) => candidate.startsWith('helper='));
       expect(line).toBeDefined();

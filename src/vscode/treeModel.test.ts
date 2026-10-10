@@ -248,7 +248,6 @@ describe('row actions and contextValue', () => {
   });
 
   it('offers Delete while the environment is updating, except while it is being deleted (concept 7.15)', () => {
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     for (const operation of ['create', 'update', 'rebuild'] as const) {
       expect(contextValue(rowActions('updating', info, operation))).toBe('repository;canDelete;onGitHub');
     }
@@ -315,7 +314,6 @@ describe('row actions and contextValue', () => {
           }
         }
         // The ⋯ submenu appears on every repository row.
-        // 2026-10-01: the Switch branch command was dropped (user decision).
         const submenu = menus['view/item/context'].find((item) => item.submenu === 'devEnvironments.more');
         expect(matches(submenu?.when ?? '', value)).toBe(true);
       }

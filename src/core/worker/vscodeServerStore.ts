@@ -89,7 +89,7 @@ export interface VscodeStoreDeps {
   /** The architecture of the engine (`Architecture` of `GET /info`), for ensureEngineServer. */
   architecture: (signal: AbortSignal) => Promise<string>;
   /**
-   * Takes the lock of one server version (`name`, serverLockName) in the store `root`, waiting at most `waitSeconds`;
+   * Takes the lock of one server version (`name`, serverLockFile) in the store `root`, waiting at most `waitSeconds`;
    * resolves with its release (storeLock).
    */
   lock: (root: string, name: string, waitSeconds: number, signal: AbortSignal) => Promise<() => void>;

@@ -31,7 +31,7 @@ import {
   serviceFolderPaths,
   servicePathArguments,
 } from './gitSummary';
-import type { EnvironmentDocker } from '../pipeline/environmentService';
+import type { EnvironmentDocker } from '../pipeline/environmentPorts';
 import { devMountFolders, verifiedIdentityTargets, workspaceIdentityMounts } from '../pipeline/pipelineRules';
 import { BRANCH_EXEC_TIMEOUT_MS, readBranch } from '../pipeline/refreshStates';
 import { scriptCommand } from '../worker/containerScripts';
@@ -299,7 +299,6 @@ describe.skipIf(!hasGit)('GIT_SUMMARY_SCRIPT with a real repository', () => {
     });
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('counts unpushed commits on a local branch that is not checked out', () => {
     const root = tempDir();
     const remote = path.join(root, 'remote.git');

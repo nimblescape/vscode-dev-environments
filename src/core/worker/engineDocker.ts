@@ -14,7 +14,7 @@ import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
 import { SECRET_REGISTRY, SECRET_TOKEN, isValidToken, pullReference } from '../helperChannel/protocol';
 import { COMPOSE_PROJECT_LABEL, LABEL_ENVIRONMENT_ID, RESOURCE_NAME_PREFIX } from '../names';
-import type { EnvironmentDocker } from '../pipeline/environmentService';
+import type { EnvironmentDocker } from '../pipeline/environmentPorts';
 import { abortError, isAbortError, silentLogger, withTimeLimit, type Credentials, type Logger, type RunResult } from '../ports';
 import type { ContainerState } from '../types';
 import { credentialServerName, parseImageReference } from '../imageCheck/reference';

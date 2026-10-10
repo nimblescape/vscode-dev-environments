@@ -8,7 +8,7 @@ import type { EnvironmentOperationsDeps } from './environmentOperations';
 import type { OperationFlow } from './environmentOperations';
 import { describe, expect, it } from 'vitest';
 import { OP_RECONCILE } from '../helperChannel/protocol';
-import { type EnvironmentServiceDeps } from './environmentService';
+import { type EnvironmentServiceDeps } from './environmentPorts';
 import { RECONCILE_FLOW_TIMEOUT_MS } from './operationBase';
 import { createHarness } from './environmentService.testkit';
 

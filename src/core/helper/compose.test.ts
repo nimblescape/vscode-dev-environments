@@ -1025,7 +1025,6 @@ describe('review round 10 (D10-2, D10-3): the recorded paths of the repository t
       bind(`${REPO}/link`),
     ], { realPaths: { [`${REPO}/link`]: `${REPO}/.git/objects` } });
     // Before: every one of them, so the owner restores left the files that root rewrote to root.
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     expect(result.serviceFolders).toEqual([`${REPO}/frontend`, `${REPO}/link`]);
   });
 });

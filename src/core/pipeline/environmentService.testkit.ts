@@ -64,12 +64,8 @@ import type {
   ExtensionSettings,
   GitHubAccount,
 } from '../types';
-import {
-  EnvironmentService,
-  type EnvironmentDocker,
-  type EnvironmentHelper,
-  type EnvironmentServiceDeps,
-} from './environmentService';
+import { EnvironmentService } from './environmentService';
+import type { EnvironmentDocker, EnvironmentHelper, EnvironmentServiceDeps } from './environmentPorts';
 import type { DockerStarter } from './operationBase';
 import { DEFAULT_CONFIG_PATH } from './recordRules';
 import { configHash } from './pipelineRules';

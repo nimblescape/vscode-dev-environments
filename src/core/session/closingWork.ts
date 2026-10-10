@@ -4,8 +4,8 @@
 
 // Review round 1 of PR #87 (B-R1-7 (a)): the close-time wiring of the extension. VS Code calls deactivate() and then, at
 // once and synchronously, disposes context.subscriptions. The release of deactivate() (SessionCoordinator.deactivate:
-// the Git record and the short release, bounded by CLOSE_RELEASE_BOUNDS) still needs the worker channels with their
-// router, the preparation of the heartbeats (HeartbeatPreparation: a worker that must be opened again), and the logger.
+// the Git record and the short release, bounded by CLOSE_RELEASE_BOUNDS) still needs the worker channels, the
+// preparation of the heartbeats (HeartbeatPreparation: a worker that must be opened again), and the logger.
 // So these are registered through `deferred`: their disposal waits until the closing work settled (it never rejects; it
 // is bounded). Before deactivate() (or without closing work), they are disposed at once. No `vscode`.
 

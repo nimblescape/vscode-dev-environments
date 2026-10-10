@@ -157,7 +157,6 @@ describe('showError (concept 6.5)', () => {
     // refusal of a Compose setting that the policy does not support, which is shown the same way.
     ['hostAccess', Messages.unsupportedOptions('service db: restart always')],
     ['noConfiguration', Messages.noConfiguration('acme/api')],
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its row gitSwitchFailed is gone.
   ] as const)('shows %s as a warning with Show details', (code, message) => {
     const { logger } = recordingLogger();
     showError(new UserFacingError(code, message), { logger, showLog: vi.fn(), retry: vi.fn() });
@@ -224,7 +223,6 @@ describe('showError (concept 6.5)', () => {
       'buildFailed',
       'startFailed',
       'filesMissing',
-      // 2026-10-01: the Switch branch command was dropped (user decision). gitSwitchFailed is gone.
       'signInRequired',
       'hostAccess',
       // Plan step 11I (PR D): unencryptedDockerConnection no longer exists (nothing could raise it).

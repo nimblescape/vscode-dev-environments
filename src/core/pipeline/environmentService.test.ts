@@ -47,12 +47,8 @@ import { abortError } from '../ports';
 import { HelperChannelError, HelperOperationError } from '../helperChannel/helperChannel';
 import { LOCK_BUSY_CODE, LOCK_UNAVAILABLE_CODE, OP_OPEN, OP_STOP, parseStopParams } from '../helperChannel/protocol';
 import type { Environment, GitHubAccount, WindowStatus } from '../types';
-import {
-  afterUpClause,
-  kindSwitchFailure,
-  withdrawnOutcome,
-  type EnvironmentServiceDeps,
-} from './environmentService';
+import { afterUpClause, kindSwitchFailure, withdrawnOutcome } from './environmentService';
+import type { EnvironmentServiceDeps } from './environmentPorts';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, STOP_FLOW_TIMEOUT_MS, type RepositoryTarget } from './operationBase';
 import { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, lifecycleMarkClears } from './recordRules';
 import {
@@ -4439,7 +4435,6 @@ describe('accounts (concept 7.5, section 9 "Accounts")', () => {
     expect((await rejection(h.operations.stop(ENV_ID))).code).toBe('signInRequired');
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('refuses stop, delete, the safety check, and the configuration questions for another account', async () => {
     await seedEnvironment(h, { owner: OTHER_ACCOUNT, container: 'running' });
     const operations: Array<[string, () => Promise<unknown>]> = [
