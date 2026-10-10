@@ -6193,7 +6193,10 @@ export class EnvironmentService extends OperationBase {
    */
   private async ensureSessionMonitorAfterStart(ctx: PipelineContext): Promise<void> {
     const sessionMonitor = this.deps.sessionMonitor;
-    if (!sessionMonitor || !ctx.sessionMonitorEnsured || ctx.sessionMonitorEnsuredAfterStart || ctx.helperImage === undefined) return;
+    // Review round 1 of PR #141 (B, E06): no check of ctx.helperImage any more. ensureSessionMonitor (only called by
+    // prepareHelper) sets sessionMonitorEnsured, and prepareHelper sets helperImage right after it returns; a throw in
+    // between is a cancel of the run, which every caller of prepareHelper rethrows, so no `up` follows.
+    if (!sessionMonitor || !ctx.sessionMonitorEnsured || ctx.sessionMonitorEnsuredAfterStart) return;
     ctx.sessionMonitorEnsuredAfterStart = true;
     // Review round 2 of PR #86: the target is read inside the try, so that a failure to read it is a warning too, never
     // the refusal of an open whose container runs already. `undefined` while the engine is not known.

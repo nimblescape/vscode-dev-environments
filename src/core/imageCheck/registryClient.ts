@@ -35,6 +35,8 @@ export const CREDENTIALS_TIMEOUT_MS = 2500;
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const DIGEST = /^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]+$/;
+/** A token of a token service: visible ASCII only (review round 1 of PR #141, A-L1). */
+const VISIBLE_ASCII = /^[\x21-\x7e]+$/;
 
 export type DigestResult =
   | { kind: 'digest'; digest: string }
@@ -208,6 +210,9 @@ export class RegistryClient {
     const registry = reference.registry;
     const base = `https://${registry}`;
     const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': USER_AGENT };
+    // Review round 1 of PR #141 (B, defect 1): the origin as the URL parser writes it (host in lower case, without the
+    // default port 443), so that a registry written as `Host:443` or in upper case pages on.
+    const origin = new URL(base).origin;
     const tags: string[] = [];
     let url: string | undefined = `${base}/v2/${reference.repository}/tags/list`;
     for (let page = 0; url !== undefined && page < MAX_TAG_PAGES; page++) {
@@ -238,7 +243,13 @@ export class RegistryClient {
       if (Array.isArray(listed)) for (const tag of listed) if (typeof tag === 'string') tags.push(tag);
       // The next page (RFC 5988 Link), only on the same registry.
       const next = /<([^>]+)>;\s*rel="next"/.exec(response.headers.link ?? '')?.[1];
-      url = next === undefined ? undefined : new URL(next, base).origin === base ? new URL(next, base).toString() : undefined;
+      url = next === undefined ? undefined : new URL(next, base).origin === origin ? new URL(next, base).toString() : undefined;
+    }
+    if (url !== undefined) {
+      // Review round 1 of PR #141 (B, defect 1): the list stays the partial one, and the log says so.
+      this.logger.warn(
+        `The tag list of ${reference.repository} at ${registryDisplayName(registry)} has more than ${MAX_TAG_PAGES} pages; only the first ${MAX_TAG_PAGES} were read.`,
+      );
     }
     return { kind: 'tags', tags };
   }
@@ -373,7 +384,9 @@ export class RegistryClient {
   ): Promise<TokenResult> {
     const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': USER_AGENT };
     if (credentials) headers.Authorization = `Basic ${basic(credentials)}`;
-    const response = await this.send({ method: 'GET', url: url.toString(), headers }, signal);
+    // Review round 1 of PR #141 (A-L2): the token answer has the body limit of a tag list, as every answer of the
+    // monitor's former client had (not the transport's 16 MiB).
+    const response = await this.send({ method: 'GET', url: url.toString(), headers, maxBodyBytes: MAX_TAG_LIST_BYTES }, signal);
     if (response.status === 401 || response.status === 403) return { kind: 'denied', status: response.status };
     if (response.status !== 200) {
       const result = statusResult(registry, response.status);
@@ -388,6 +401,11 @@ export class RegistryClient {
     }
     if (typeof token !== 'string' || token === '') {
       return { kind: 'result', result: { kind: 'error', registry, error: 'The token service returned no token.' } };
+    }
+    // Review round 1 of PR #141 (A-L1): a token goes into the Authorization header, so one with a character that is not
+    // visible ASCII (CR, LF, a space, a control or non-ASCII character) is refused before any request carries it.
+    if (!VISIBLE_ASCII.test(token)) {
+      return { kind: 'result', result: { kind: 'error', registry, error: 'The token service returned an invalid token.' } };
     }
     return { kind: 'token', token };
   }

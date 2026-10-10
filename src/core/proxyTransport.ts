@@ -187,8 +187,9 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): 
  */
 export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): HttpTransport & HttpStreamTransport {
   let read: Promise<ProxySettings> | undefined;
-  // The options of the connection to `target`: none for a direct one, else the tunnel through the proxy.
-  const connection = async (target: string, signal: AbortSignal | undefined): Promise<https.RequestOptions> => {
+  // The options of the connection to `target`: none for a direct one, else the tunnel through the proxy. `discard`
+  // destroys a tunnel that the request did not use.
+  const connection = async (target: string, signal: AbortSignal | undefined): Promise<{ options: https.RequestOptions; discard(): void }> => {
     const url = new URL(target);
     if (url.protocol !== 'https:') throw new Error(`The worker sends no request without TLS (${url.protocol}//${url.host}).`);
     read ??= settings();
@@ -196,24 +197,45 @@ export function proxiedHttpsTransport(settings: () => Promise<ProxySettings>): H
     // so a daemon that does not answer never holds a request beyond its signal (the fetch of the shared VS Code server
     // and its time limit). The read itself stays shared by the later requests.
     const proxy = proxyFor(url, await untilAborted(read, signal));
-    if (proxy === undefined) return {};
+    if (proxy === undefined) return { options: {}, discard: () => {} };
     const host = url.hostname.replace(/^\[|\]$/g, '');
     const socket = await tunnel(proxy, host, url.port === '' ? 443 : Number(url.port), signal);
+    let used = false;
     // No agent: Node then uses createConnection (with `agent: false` it would make an agent of its own, which connects
     // directly).
     return {
-      // Review round 1 of PR #109 (A-M1): checked for the host of the URL, also an IP address (Node would take the name
-      // of the proxy from the socket).
-      createConnection: () => tls.connect({ socket, ...tlsNameOf(host) }),
+      options: {
+        // Review round 1 of PR #109 (A-M1): checked for the host of the URL, also an IP address (Node would take the
+        // name of the proxy from the socket).
+        createConnection: () => {
+          used = true;
+          return tls.connect({ socket, ...tlsNameOf(host) });
+        },
+      },
+      // Review round 1 of PR #141 (A-L1): a request that fails before it connects (https.request refuses a header value,
+      // for example) never hands the tunnel to TLS, so the tunnel is destroyed here instead of staying open.
+      discard: () => {
+        if (!used) socket.destroy();
+      },
     };
+  };
+  /** Runs `send` over the connection to `target`; a tunnel that the failed request did not use is destroyed. */
+  const over = async <T>(target: string, signal: AbortSignal | undefined, send: (options: https.RequestOptions) => Promise<T>): Promise<T> => {
+    const { options, discard } = await connection(target, signal);
+    try {
+      return await send(options);
+    } catch (error) {
+      discard();
+      throw error;
+    }
   };
   return {
     async request(request, signal) {
-      return httpsRequest(request, signal, await connection(request.url, signal));
+      return over(request.url, signal, (options) => httpsRequest(request, signal, options));
     },
     // Plan step 11H1: the download of the shared VS Code server, streamed to a file (the same connection rules).
     async stream(url, signal) {
-      return httpsStream(url, signal, await connection(url, signal));
+      return over(url, signal, (options) => httpsStream(url, signal, options));
     },
   };
 }
