@@ -32,7 +32,7 @@ import { pipeline } from 'stream/promises';
 import { errorMessage } from '../errors';
 import { acquireFlock, flockFailure, openPlainLockFile, startFlockProcess, type FlockAttempt, type FlockProcess } from '../helperChannel/lockFile';
 import { type VscodePlatform, type VscodeQuality, type VscodeServerRef } from '../helperChannel/protocol';
-import type { HttpStreamTransport, HttpTransport } from '../http';
+import type { HttpResponse, HttpStreamTransport, HttpTransport } from '../http';
 import type { Logger } from '../ports';
 
 /** Plan step 11H1: the update service of Microsoft; the only host whose server the worker fetches (never a parameter). */
@@ -40,8 +40,17 @@ export const VSCODE_UPDATE_SERVICE = 'https://update.code.visualstudio.com';
 
 /** Plan step 11H1: the longest fetch of a server, the wait for the lock of the store included (the brief: 10 minutes). */
 export const SERVER_FETCH_TIMEOUT_MS = 10 * 60_000;
-/** Plan step 11H1: the largest archive of a server that the worker downloads (a server is about 70 MB). */
-export const MAX_SERVER_ARCHIVE_BYTES = 256 * 1024 * 1024;
+/**
+ * Plan step 11H1: the largest archive of a server that the worker downloads. Fix after the live check of 2026-10-10: the
+ * server of VS Code 1.141 is 222 MiB (it was about 70 MB in 2025), so 512 MiB (before 256 MiB).
+ */
+export const MAX_SERVER_ARCHIVE_BYTES = 512 * 1024 * 1024;
+/**
+ * Fix after the live check of 2026-10-10 (an open waited the 10 minutes of the fetch for a download that hung): a request
+ * of a download (the answer of the update service, each redirect, and the body) that receives nothing for this long ends
+ * as stalled; the timer starts again with every chunk of the body.
+ */
+export const DOWNLOAD_STALL_MS = 30_000;
 /** Plan step 11H1: the most redirects of the download (each to an `https:` URL). */
 export const MAX_SERVER_REDIRECTS = 5;
 /** Review round 1 of 11H1 (reviewer B): the largest answer of the update service (its JSON is a few hundred bytes). */
@@ -100,6 +109,8 @@ export interface VscodeStoreDeps {
   timeoutMs?: number;
   /** The largest archive; default MAX_SERVER_ARCHIVE_BYTES. */
   maxBytes?: number;
+  /** The longest time without data of a download (the tests); default DOWNLOAD_STALL_MS. */
+  stallMs?: number;
   /**
    * Plan step 11H2: the fetch of the Session Monitor's background run (its log lines name the run, not an open and the
    * fallback of the Dev Containers extension).
@@ -365,8 +376,9 @@ async function fetchServer(deps: VscodeStoreDeps, server: VscodeServerRef, platf
   const archive = path.posix.join(own, 'server.tar.gz');
   const unpacked = path.posix.join(own, 'server');
   try {
-    const { url, sha256 } = await serverDownload(deps.transport, server, platform, signal);
-    const hash = await downloadToFile(deps.transport, url, archive, deps.maxBytes ?? MAX_SERVER_ARCHIVE_BYTES, signal);
+    const stallMs = deps.stallMs ?? DOWNLOAD_STALL_MS;
+    const { url, sha256 } = await serverDownload(deps.transport, server, platform, signal, stallMs);
+    const hash = await downloadToFile(deps.transport, url, archive, deps.maxBytes ?? MAX_SERVER_ARCHIVE_BYTES, signal, undefined, undefined, stallMs);
     if (hash !== sha256) throw new FetchError(`the SHA-256 of the download ${hash} is not the ${sha256} of the update service`);
     await fs.promises.mkdir(unpacked, { mode: 0o700 });
     await deps.unpack(archive, unpacked, signal);
@@ -396,11 +408,25 @@ async function fetchServer(deps: VscodeStoreDeps, server: VscodeServerRef, platf
 }
 
 /** The URL and the SHA-256 of the archive of the server, from the update service (VSCODE_UPDATE_SERVICE). */
-async function serverDownload(transport: HttpTransport, server: VscodeServerRef, platform: VscodePlatform, signal: AbortSignal): Promise<{ url: string; sha256: string }> {
-  const response = await transport.request(
-    { method: 'GET', url: serverVersionUrl(server, platform), headers: { Accept: 'application/json' }, maxBodyBytes: MAX_UPDATE_SERVICE_BYTES },
-    signal,
-  );
+async function serverDownload(
+  transport: HttpTransport,
+  server: VscodeServerRef,
+  platform: VscodePlatform,
+  signal: AbortSignal,
+  stallMs: number,
+): Promise<{ url: string; sha256: string }> {
+  // Fix after the live check of 2026-10-10: the answer of the update service within stallMs too.
+  const stall = AbortSignal.timeout(stallMs);
+  let response: HttpResponse;
+  try {
+    response = await transport.request(
+      { method: 'GET', url: serverVersionUrl(server, platform), headers: { Accept: 'application/json' }, maxBodyBytes: MAX_UPDATE_SERVICE_BYTES },
+      AbortSignal.any([signal, stall]),
+    );
+  } catch (error) {
+    if (stall.aborted && !signal.aborted) throw new FetchError(`the update service did not answer within ${Math.round(stallMs / 1000)} s`);
+    throw error;
+  }
   if (response.status !== 200) throw new FetchError(`the update service answered HTTP ${response.status}`);
   // Review round 1 of 11H1 (reviewer B): at most MAX_UPDATE_SERVICE_BYTES (httpsRequest stops reading there; checked
   // here too, whatever the transport).
@@ -450,51 +476,86 @@ export async function downloadToFile(
   signal: AbortSignal,
   allowedUrl?: (url: URL) => boolean,
   onBytes?: (bytes: number) => void,
+  stallMs: number = DOWNLOAD_STALL_MS,
 ): Promise<string> {
-  let current = url;
-  for (let redirects = 0; ; redirects++) {
-    if (allowedUrl !== undefined && !urlAllowed(current, allowedUrl)) throw new FetchError('the download URL is not on an allowed host');
-    const response = await transport.stream(current, signal);
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      response.body.destroy();
-      const location = response.headers.location;
-      if (redirects >= MAX_SERVER_REDIRECTS) throw new FetchError(`the download was redirected more than ${MAX_SERVER_REDIRECTS} times`);
-      let next: URL;
-      try {
-        next = new URL(location ?? '', current);
-      } catch {
-        throw new FetchError('the download was redirected to an invalid URL');
-      }
-      if (location === undefined || next.protocol !== 'https:') throw new FetchError('the download was redirected to a URL that is not https');
-      current = next.toString();
-      continue;
-    }
-    if (response.status !== 200) {
-      response.body.destroy();
-      throw new FetchError(`the download answered HTTP ${response.status}`);
-    }
-    const length = Number(response.headers['content-length']);
-    if (Number.isFinite(length) && length > maxBytes) {
-      response.body.destroy();
-      throw new FetchError(`the download is larger than ${maxBytes} bytes`);
-    }
-    const hash = createHash('sha256');
-    let size = 0;
-    const counter = new Transform({
-      transform(chunk: Buffer, _encoding, done) {
-        size += chunk.length;
-        onBytes?.(chunk.length);
-        if (size > maxBytes) {
-          done(new FetchError(`the download is larger than ${maxBytes} bytes`));
-          return;
+  // Fix after the live check of 2026-10-10: a download that receives nothing for stallMs (no answer, or no data of its
+  // body) ends as stalled, and a failure says how far it came (the received and the announced size, the time).
+  const started = Date.now();
+  let size = 0;
+  let total: number | undefined;
+  // The body of the download is being read (a failure before it is the error of the request, as before).
+  let receiving = false;
+  const stall = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => stall.abort(), stallMs);
+  };
+  const both = AbortSignal.any([signal, stall.signal]);
+  const progress = (): string =>
+    ` after ${mebibytes(size)}${total !== undefined ? ` of ${mebibytes(total)}` : ''} MiB in ${Math.round((Date.now() - started) / 1000)} s`;
+  try {
+    let current = url;
+    for (let redirects = 0; ; redirects++) {
+      if (allowedUrl !== undefined && !urlAllowed(current, allowedUrl)) throw new FetchError('the download URL is not on an allowed host');
+      arm();
+      const response = await transport.stream(current, both);
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        response.body.destroy();
+        const location = response.headers.location;
+        if (redirects >= MAX_SERVER_REDIRECTS) throw new FetchError(`the download was redirected more than ${MAX_SERVER_REDIRECTS} times`);
+        let next: URL;
+        try {
+          next = new URL(location ?? '', current);
+        } catch {
+          throw new FetchError('the download was redirected to an invalid URL');
         }
-        hash.update(chunk);
-        done(null, chunk);
-      },
-    });
-    await pipeline(response.body, counter, fs.createWriteStream(file, { flags: 'wx', mode: 0o600 }), { signal });
-    return hash.digest('hex');
+        if (location === undefined || next.protocol !== 'https:') throw new FetchError('the download was redirected to a URL that is not https');
+        current = next.toString();
+        continue;
+      }
+      if (response.status !== 200) {
+        response.body.destroy();
+        throw new FetchError(`the download answered HTTP ${response.status}`);
+      }
+      const length = Number(response.headers['content-length']);
+      if (Number.isFinite(length) && length > maxBytes) {
+        response.body.destroy();
+        throw new FetchError(`the download is larger than ${maxBytes} bytes`);
+      }
+      if (Number.isFinite(length)) total = length;
+      receiving = true;
+      const hash = createHash('sha256');
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, done) {
+          arm();
+          size += chunk.length;
+          onBytes?.(chunk.length);
+          if (size > maxBytes) {
+            done(new FetchError(`the download is larger than ${maxBytes} bytes`));
+            return;
+          }
+          hash.update(chunk);
+          done(null, chunk);
+        },
+      });
+      await pipeline(response.body, counter, fs.createWriteStream(file, { flags: 'wx', mode: 0o600 }), { signal: both });
+      return hash.digest('hex');
+    }
+  } catch (error) {
+    // A cancel or the time limit of the caller: its own error (the caller names it).
+    if (signal.aborted) throw error;
+    if (stall.signal.aborted) throw new FetchError(`the download stalled: no data for ${Math.round(stallMs / 1000)} s${progress()}`);
+    if (error instanceof FetchError || !receiving) throw error;
+    throw new FetchError(`${errorMessage(error)}${progress()}`);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+/** A size in MiB with one decimal (the log line of a failed download). */
+function mebibytes(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1);
 }
 
 /**

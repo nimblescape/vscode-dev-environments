@@ -59,7 +59,8 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
     // commands of the Session Monitor are entries too (monitorForget, monitorHeartbeat, monitorImages, monitorSettings).
     // Plan step 11H1 (decision of 2026-10-03, "Shared VS Code server store"): changed expectation, the link of the shared
     // VS Code server in the dev container (vscodeServerLink). Plan step 11H3 (decision of 2026-10-09): changed
-    // expectation, the seed of the shared extension cache in the dev container (vscodeExtensionSeed).
+    // expectation, the seed of the shared extension cache in the dev container (vscodeExtensionSeed). The live check of
+    // 2026-10-10: changed expectation, the check whether the container has the server of the window (vscodeServerPresent).
     expect(Object.keys(CONTAINER_SCRIPTS).sort()).toEqual([
       'branch',
       'check',
@@ -80,6 +81,7 @@ describe('the registry of the scripts that run in a container (plan step 11B1)',
       'userId',
       'vscodeExtensionSeed',
       'vscodeServerLink',
+      'vscodeServerPresent',
     ]);
     expect(CONTAINER_SCRIPTS.tokenWrite.script).toBe(TOKEN_WRITE_SCRIPT);
     // Plan step 11H1: the text of its module, without a secret.
