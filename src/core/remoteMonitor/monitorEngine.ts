@@ -92,14 +92,17 @@ export interface MonitorEngine {
 /**
  * A failed `sha256sum` that shows that no script is stored, or that the container does not run (in its output or the
  * engine's message). Review round 3 of PR #69 (B-R3-1): each alternative is tied to the start of a line of its source
- * (`sha256sum`, the daemon, the OCI runtime), so an unrelated line of a transport failure that also says "No such file or
+ * (`sha256sum`, the OCI runtime), so an unrelated line of a transport failure that also says "No such file or
  * directory" is no evidence. A-R3-4: a stored script that cannot be read (`Permission denied`) is no evidence either.
  * A-R3-5: the runtime's refusal of an exec in a container that stopped between two restarts is evidence that it does not
  * run (the wording of newer runc and the older one), which the daemon writes to the output of the exec. Plan step 11D2:
- * the same pattern as before; the engine's refusal of the exec itself comes as its status (engineMonitor).
+ * the engine's refusal of the exec itself comes as its status (engineMonitor). Cleanup C4 (plan step 11J): the forms of
+ * the Docker CLI are gone (`Error response from daemon: ` or `Error: ` before "No such container" or "container … is not
+ * running/restarting", and before the runtime's message): over the Engine API the exec's output carries only what the
+ * process and the daemon write to it, never the CLI's prefixes, so only the removed CLI testkit of the ensure produced them.
  */
 export const NO_STORED_SCRIPT =
-  /^sha256sum: .*No such file or directory|^(?:Error response from daemon|Error): (?:No such container: |container \S+ is (?:not running|restarting)\b)|^(?:Error response from daemon: )?OCI runtime exec failed: exec failed: cannot exec (?:in a stopped container|a container that has stopped)\b/im;
+  /^sha256sum: .*No such file or directory|^OCI runtime exec failed: exec failed: cannot exec (?:in a stopped container|a container that has stopped)\b/im;
 
 /** Review round 3 of PR #69 (A-R3-1): another window removes the same container right now; its removal goes on. */
 export const REMOVAL_IN_PROGRESS = /removal of container .* is already in progress/i;

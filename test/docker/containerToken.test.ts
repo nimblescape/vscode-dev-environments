@@ -16,15 +16,14 @@ import { GITHUB_TOKEN_FILE, LABEL_ENVIRONMENT_ID, TOKEN_FOLDER, TOKEN_TMPFS, new
 import type { Environment } from '../../src/core/types';
 import { runScript } from '../../src/core/worker/containerScripts';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
-import { cliEngine } from './cliEngine';
-import { DUMMY_TOKEN, dockerTestContext } from './harness';
+import { DUMMY_TOKEN, dockerTestContext, testEngine } from './harness';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL } from './dockerRun';
 
 /** The remote user of the containers: a numeric user without an entry in /etc/passwd (the scripts take it as it is). */
 const USER = '1000';
 
 describe('the token in the memory of a real container (review of unit 15)', () => {
-  const { run, cli } = dockerTestContext('containerToken');
+  const { run, env, cli } = dockerTestContext('containerToken');
   const created: { containers: string[]; volumes: string[] } = { containers: [], volumes: [] };
 
   afterAll(() => {
@@ -78,13 +77,15 @@ describe('the token in the memory of a real container (review of unit 15)', () =
     return found.out.split('\n').filter((line) => line !== '');
   }
 
-  // Plan step 11B1: the removal is a flow of the worker; here it runs against the real engine through the port of the tests.
-  // Plan step 11I (PR B): the port holds the token as the secret of the operation, as the worker does.
-  const engine = cliEngine(cli, { [SECRET_TOKEN]: DUMMY_TOKEN });
+  // Plan step 11B1: the removal is a flow of the worker; here it runs against the real engine through the worker's port.
+  // Plan step 11I (PR B): the port holds the token as the secret of the operation, as the worker does. Cleanup C4 (plan
+  // step 11J): the production client over the Engine API (testEngine; before: the port over the Docker CLI of the tests),
+  // so the scripts get the token through the production standard input and their output its masking.
+  const engine = testEngine(env, { [SECRET_TOKEN]: DUMMY_TOKEN });
   /**
    * Plan step 11I (PR B): the write as the pipeline runs it (EnvironmentService.writeGitToken, in place of the removed
    * writeContainerToken): the script `tokenWrite` of the registry as root, the token as the secret of the operation by its
-   * name (cliEngine writes it to the standard input of `docker exec -i`, as the worker does); a failure throws its reason
+   * name (the production client writes it to the standard input of the exec); a failure throws its reason
    * without the token.
    */
   const write = async (container: string): Promise<void> => {

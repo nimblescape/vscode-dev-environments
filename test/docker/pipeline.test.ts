@@ -52,7 +52,6 @@ import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import { scriptCommand } from '../../src/core/worker/containerScripts';
 import { removeTokenFlow } from '../../src/core/worker/tokenRemoveFlow';
-import { cliEngine } from './cliEngine';
 import { OLD_GIT_BASE_IMAGE, TEST_BASE_IMAGE, TEST_RUN_LABEL, familiarName, readBaseline, removeRunObjects } from './dockerRun';
 import {
   DUMMY_TOKEN,
@@ -69,6 +68,7 @@ import {
   registryDigest,
   registryTransport,
   runInVolume,
+  testEngine,
   testHelperImage,
 } from './harness';
 import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, workerWindow, type WorkerWindow } from './workerWindow';
@@ -180,8 +180,9 @@ describe.skipIf(engineHadMonitor)('open pipeline on a seeded environment', () =>
   }
 
   // Plan step 11B1: the removal of the token is a flow of the worker (Controller.removeGitToken sends the operation);
-  // here it runs against the real engine through the port of the tests.
-  const removeToken = (id: string, name: string) => removeTokenFlow({ environmentId: id, containerName: name, engine: cliEngine(cli), records: { get: (one) => registry.get(one) } });
+  // here it runs against the real engine through the worker's port. Cleanup C4 (plan step 11J): the production client over
+  // the Engine API (testEngine; before: the port over the Docker CLI of the tests).
+  const removeToken = (id: string, name: string) => removeTokenFlow({ environmentId: id, containerName: name, engine: testEngine(env), records: { get: (one) => registry.get(one) } });
 
   const environmentId = newEnvironmentId();
   const volumeName = resourceName(REPOSITORY, environmentId);
