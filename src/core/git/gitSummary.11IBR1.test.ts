@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { EnvironmentDocker } from '../pipeline/environmentService';
+import type { EnvironmentDocker } from '../pipeline/environmentPorts';
 import { readBranch } from '../pipeline/refreshStates';
 import { scriptCommand } from '../worker/containerScripts';
 import { parseGitSummaryOutput } from './gitSummary';

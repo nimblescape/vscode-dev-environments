@@ -294,7 +294,7 @@ export const Messages = {
     `The Dev Environments worker on the Docker host could not be prepared (${cause}), so nothing was run. Check that Docker runs and that the workspace helper image can be built (see the Dev Environments output), then try again.`,
   /**
    * Plan step 8, PR A, user decision Q3 of 2026-10-02 (D1): the Session Monitor container of the engine could not be
-   * started at an open, so the open was refused (SessionMonitorUnavailableError, src/core/errors.ts).
+   * started at an open, so the open was refused (the user error `sessionMonitorFailed`, isSessionMonitorFailed).
    */
   sessionMonitorUnavailable: (repository: string, cause: string) =>
     `${repository} was not opened: the Session Monitor on the Docker engine could not be started (${cause}). Without it, an environment that no window uses any more would not be stopped. Check that Docker runs (see the Dev Environments output), then try again.`,

@@ -382,7 +382,7 @@ export interface ImageSettings {
  * Plan step 11H2 (D1, decision of 2026-10-09): the settings of the Session Monitor that an open and `monitorEnsure`
  * carry: the image settings (ImageSettings, which the monitor gets with `settings -`), and whether it runs permanently
  * (monitorRunsPermanently: on a remote engine, or on a local one with stopLocalMonitorWhenIdle off). The mode is part of
- * its label (monitorModeLabelPart), never of `settings -`; missing means false. Review round 1 of 11H2 (A-L2): and why it
+ * its label (monitorModeOf, monitorLabel), never of `settings -`; missing means false. Review round 1 of 11H2 (A-L2): and why it
  * is permanent: `remote` when the computer reaches the engine as a remote one (only with `permanent`).
  */
 export interface MonitorSettings extends ImageSettings {

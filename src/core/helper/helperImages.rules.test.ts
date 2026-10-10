@@ -294,7 +294,6 @@ describe('HelperImages.ensureImageUse with a state file (implementation notes 7)
     expect(calls).toBeGreaterThan(0);
 
     // A long-lived window: the helper runs of a stop or a delete never check or rebuild.
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     advance(HELPER_CHECK_INTERVAL_MS + HELPER_IMAGE_RECHECK_MS);
     await helper.runImage({});
     expect(docker.imageIdCalls).toBe(calls);
@@ -1483,7 +1482,6 @@ describe('HelperImages: the helper runs in a new window (implementation notes 7)
     };
   }
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('never checks, rebuilds, or cleans up in the first helper run (a stop, a delete)', async () => {
     // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the helper run is runImage and gets the existing
     // image (before: a step of WorkspaceHelper that got its image from it, and ran once with exit code 0).

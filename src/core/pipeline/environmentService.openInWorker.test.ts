@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { HelperChannelError } from '../helperChannel/helperChannel';
 import { OP_OPEN, OPEN_PROGRESS_DETAIL } from '../helperChannel/protocol';
-import { type EnvironmentServiceDeps } from './environmentService';
+import { type EnvironmentServiceDeps } from './environmentPorts';
 import { OPEN_FLOW_TIMEOUT_MS } from './operationBase';
 import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, PID, REPO, WINDOW_ID, createHarness, seedEnvironment } from './environmentService.testkit';
 import { LIFECYCLE_UNKNOWN, windowLifecycleMemory } from './lifecycleMemory';

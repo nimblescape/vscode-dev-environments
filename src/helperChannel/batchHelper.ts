@@ -98,7 +98,7 @@ export interface BatchHelperDeps {
   killGraceMs?: number;
 }
 
-/** The command line of a step for the log: the script of `sh -c` and `node -e` is left out (as describeCommand). */
+/** The command line of a step for the log: the script of `sh -c` and `node -e` is left out. */
 export function describeStep(step: BatchStepCommand): string {
   const command = step.command;
   const shown =

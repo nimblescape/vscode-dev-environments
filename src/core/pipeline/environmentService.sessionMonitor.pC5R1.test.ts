@@ -6,7 +6,7 @@
 // open: the open gives `images` of the Session Monitor the signal of its run (the one its ensure gets), so a cancel of the
 // open also ends the sending of the image list.
 import { afterEach, describe, expect, it } from 'vitest';
-import type { EnvironmentSessionMonitor } from './environmentService';
+import type { EnvironmentSessionMonitor } from './environmentPorts';
 import { ENV_ID, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 
 let h: Harness | undefined;

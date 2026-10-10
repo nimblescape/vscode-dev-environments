@@ -16,7 +16,7 @@ import type { ExtensionRef } from '../vscodeExtensions';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 import { DEFAULT_CONFIG_PATH } from './recordRules';
 import type { RepositoryTarget } from './operationBase';
-import type { VscodeExtensionCache } from './environmentService';
+import type { VscodeExtensionCache } from './environmentPorts';
 
 const SERVER = { commit: '0123456789abcdef0123456789abcdef01234567', quality: 'stable' as const };
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

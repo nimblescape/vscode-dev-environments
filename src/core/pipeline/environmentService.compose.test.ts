@@ -46,7 +46,7 @@ import {
 } from '../names';
 import type { ContainerInfo } from '../docker/dockerObjects';
 import type { BuildRecord, ContainerState, Environment, WindowStatus } from '../types';
-import { type EnvironmentSessionMonitor } from './environmentService';
+import { type EnvironmentSessionMonitor } from './environmentPorts';
 import { PipelineTexts, type RepositoryTarget } from './operationBase';
 import {
   ACCOUNT,
@@ -848,7 +848,6 @@ describe('existing Docker Compose environment', () => {
     await seedCompose();
     useCompose(h, output((m) => (m.services.db.environment = { POSTGRES_PASSWORD: 'dev' })));
     h.ui.configurationChangedAnswer = 'rebuildNow';
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.prompts).toEqual([`configurationChanged ${REPO}`]);
     expect(h.helper.calls.filter((call) => call.startsWith('up'))).toEqual([`up ${IMAGE_2} --remove-existing-container`]);
@@ -860,7 +859,6 @@ describe('existing Docker Compose environment', () => {
     await seedCompose({ record: { compose: { service: 'app', images: [`${PROJECT}-app`], serviceImages: [DB_IMAGE], version: '2.39.0', inputsHash: composeInputsHash(CONFIG_TEXT, 'inputs-1', {}) } } });
     // The same files, printed by the newer plugin with a key more.
     useCompose(h, { ...output((m) => (m.services.db.stop_signal = 'SIGTERM')), version: '2.40.3' });
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     await h.service.openEnvironment(ENV_ID, options());
     expect(h.ui.prompts).toEqual([]);
     expect(h.helper.builds).toEqual([]);
@@ -2556,7 +2554,6 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     });
   }
 
-  // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
   it('reports a switch from Docker Compose to a single container with the question of the pipeline (D5-3)', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     await withoutRecord();
@@ -2574,7 +2571,6 @@ describe('review round 5 of unit 6 (D5-1, D5-2, D5-3, P5-4)', () => {
     await withoutRecord();
     useSingle();
     const question = Messages.configurationKindChangedDevContainerMissing(DEFAULT_CONFIG_PATH);
-    // 2026-10-01: the Switch branch command was dropped (user decision). Its configurationChanged query is gone.
     expect(question).toContain('Later starts nothing');
     expect(question).toContain('choose Rebuild');
     expect(question).toContain('Select configuration…');
@@ -2851,7 +2847,6 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     expect(h.helper.repositoryOwnershipFixes).toEqual([]);
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('leaves them out when a rebuild creates the containers again', async () => {
     withDataFolder();
     await seedCompose({ dev: 'stopped', db: 'stopped' });
@@ -2861,7 +2856,6 @@ describe('review round 9 of unit 6 (D9-1): the ownership fixes leave out the pat
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', ...servicePathArguments(FOLDER, [SOURCE])]]);
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('records the paths at an up without a build', async () => {
     await seedCompose({ dev: 'stopped', db: 'stopped' });
     // The next start with up records the paths of the model. Review round 10, D10-3: with a data folder of db that
@@ -2891,7 +2885,6 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     useCompose(h, out);
   }
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('keeps the folder of the old model at an up --no-recreate (Rebuild later), for Delete', async () => {
     // The entry names OLD; the db container was created with it and is not created again.
     await seedCompose({ dev: 'stopped', db: 'stopped', extra: { serviceFolders: [OLD] } });
@@ -2912,7 +2905,6 @@ describe('review round 10 of unit 6 (D10-1): the recorded paths of the services 
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([NEW, OLD]);
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   it('records the folders before a first up that fails', async () => {
     // An entry without a build record (restored after a lost registry, or a first open that was cut off).
     await seedEnvironment(h, { container: null, record: null });
@@ -3397,7 +3389,6 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA, PGDATA]);
     expect(h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT)).toEqual([]);
     // Delete too.
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     expect(await h.service.repositoryServiceData(ENV_ID)).toEqual(['./data/pg', './pgdata']);
   });
 
@@ -3448,7 +3439,6 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     });
     expect(await h.service.reconcileFromVolumes()).toBe(1);
     // Before: no list: the ownership fixes left nothing out until the next `up`.
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     expect((await h.registry.get(ENV_ID))?.serviceFolders).toEqual([DATA]);
   });
 
@@ -3466,7 +3456,6 @@ describe('review round 11 of unit 6 (G3, G4, G5): the paths of the services from
     expect(entry?.serviceFoldersOverflow).toBe(true);
     expect(fixArguments()).toEqual([[FOLDER, 'vscode', '-path', FOLDER, '-o', '-path', `${FOLDER}/*`]]);
     expect(h.logger.warnings.some((line) => line.includes(`More than ${MAX_SERVICE_FOLDERS} paths of ${REPO}`))).toBe(true);
-    // 2026-10-01: the Switch branch command was dropped (user decision).
     // The existence check of the recorded paths goes in calls of a bounded command line.
     const checks = h.docker.execs.filter((e) => e.command[2] === EXISTING_PATHS_SCRIPT);
     expect(checks.length).toBeGreaterThan(1);

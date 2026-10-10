@@ -15,7 +15,7 @@ import type { ContainerState, GitSummary } from '../types';
 import { runScript, type ScriptExec } from '../worker/containerScripts';
 import { devContainerOf } from '../worker/environmentContainers';
 // Plan step 11I2: a type only (no code of the service in the worker's script).
-import type { EnvironmentDocker } from './environmentService';
+import type { EnvironmentDocker } from './environmentPorts';
 
 /** State of the container and the volume of an environment. */
 export interface EnvironmentRuntimeState {

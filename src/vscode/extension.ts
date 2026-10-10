@@ -89,8 +89,8 @@ export const ImageListTexts = {
 let coordinator: SessionCoordinator | undefined;
 /**
  * Plan step 8, PR C: the work of deactivate() (the release of the window's environment, bounded). VS Code disposes the
- * subscriptions right after it calls deactivate(); review round 1 of PR #87 (B-R1-7 (a)): the worker channels with their
- * router, the preparation of the heartbeats, and the logger are disposed only after it settled (ClosingWork.deferred),
+ * subscriptions right after it calls deactivate(); review round 1 of PR #87 (B-R1-7 (a)): the worker channels, the
+ * preparation of the heartbeats, and the logger are disposed only after it settled (ClosingWork.deferred),
  * so the release still has its worker, can open it again, and logs to a live channel.
  */
 const closingWork = new ClosingWork();

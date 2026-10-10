@@ -630,7 +630,7 @@ describe('Controller commands', () => {
     // 32 with the link Show details of a progress notification (hidden), which also closes it (user decision 2026-09-28).
     // 33 with the choice of the Docker host, the command of the first row of the view (user requests 2026-09-28).
     // 34 with Ask Again Before Changing the Docker Host (user decision 2026-09-28: "Don't Ask Again" for all questions).
-    // 2026-10-01: the Switch branch command was dropped (user decision). 33 without it.
+    // 33 since the Switch branch command was dropped (user decision 2026-10-01).
     expect(declared).toHaveLength(33);
   });
 
@@ -2923,7 +2923,6 @@ describe('Connection of this window', () => {
 });
 
 describe('Accounts (concept 7.5)', () => {
-  // 2026-10-01: the Switch branch command was dropped (user decision). Its row is gone (6 warnings, before 7).
   it('refuses Start, Stop, Delete, Rebuild, and Select configuration of an environment of another account', async () => {
     const env = environment({ owner: OTHER_ACCOUNT });
     await h.registry.add(env);
@@ -3516,7 +3515,6 @@ describe('Accounts (concept 7.5)', () => {
     });
   });
 
-  // 2026-10-01: the Switch branch command was dropped (user decision).
   describe('Try again of a first open of Select configuration… after the account changed', () => {
     const OTHER_ENV = () =>
       environment({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, containerName: 'devenv-acme-api-7c1d2e3f', volumeName: 'devenv-acme-api-7c1d2e3f' });
@@ -4699,7 +4697,6 @@ describe('Double-click on a repository row (user request 2026-09-27)', () => {
     await click(viewRow('acme/api', environment(), 'stopped'), 0);
     expect(start).not.toHaveBeenCalled();
     expect(h.service.openEnvironmentInWorker).not.toHaveBeenCalled();
-    // 2026-10-01: the Switch branch command was dropped (user decision). No FakeQuickPick any more.
     expect(fakeVscode.window.createQuickPick).not.toHaveBeenCalled();
   });
 

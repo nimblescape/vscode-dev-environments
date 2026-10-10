@@ -234,7 +234,7 @@ export class RemoteSessionMonitor {
       throw new Error(`The script of the Session Monitor is too long (${scriptLine.length - 1} characters as JSON).`);
     }
     const images = this.options.imageMaintenance?.();
-    // Review round 1 of PR #57 (C): the prefixes, the schedule and the time zone come with `settings -` (imageSettings),
+    // Review round 1 of PR #57 (C): the prefixes, the schedule and the time zone come with `settings -` (monitorSettings),
     // so computers with other settings or another time zone on the same engine do not replace it at each open. Plan step
     // 11H2 (D1 of 2026-10-09): the label holds the mode (permanent or not: its restart policy and its exit when idle) in
     // place of whether it maintains images (its network, which it now always has).
@@ -243,7 +243,7 @@ export class RemoteSessionMonitor {
     const store = this.options.vscodeStoreVolume;
     const label = monitorLabel(script, helperTag, mode, store);
     // Plan step 11H2 (D1): one engine can be local for one computer and remote for another, so an ensure takes a running
-    // monitor of the same version that another computer runs permanently as current (acceptedLabels). Review round 1 of
+    // monitor of the same version that another computer runs permanently as current (`accepted`). Review round 1 of
     // 11H2 (A-L2): an ensure that sees the engine as local (permanent or not) takes a running `permanent-remote` one; one
     // that sees it as remote takes a running `permanent-local` one. So turning stopLocalMonitorWhenIdle on again replaces
     // this computer's own permanent monitor (`permanent-local`) at its next ensure.
