@@ -11,6 +11,7 @@
 // reads the file again right before it writes, so a lost update costs at most a second check or a second build.
 import { writeJsonAtomic } from '../storage/atomicJson';
 import { readJsonTolerant, retryTransient } from '../storage/paths';
+import { isRecord } from '../valueChecks';
 
 /** What the state knows about one helper tag. Times are ISO 8601. */
 export interface HelperImageRecord {
@@ -112,10 +113,6 @@ const TIME_FIELDS: ReadonlySet<string> = new Set([
 
 export function emptyHelperState(): HelperState {
   return { version: 1, images: {} };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isTime(value: unknown): value is string {

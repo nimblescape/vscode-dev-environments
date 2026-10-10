@@ -9,10 +9,7 @@
 // `docker inspect` with them, ContainerAdapter, is removed). Pure; no I/O.
 import * as path from 'path';
 import type { ContainerState } from '../types';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+import { isRecord } from '../valueChecks';
 
 export interface ContainerInfo {
   id: string;

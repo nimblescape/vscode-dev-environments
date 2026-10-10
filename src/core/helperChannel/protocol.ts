@@ -35,6 +35,7 @@ import type { ContainerState, GitSummary } from '../types';
 import { isGitSummary } from '../git/gitSummary';
 import { isUserErrorCode, type UserErrorCode } from '../errors';
 import { parseExtensionList } from '../vscodeExtensions';
+import { hasOnlyKeys, isRecord } from '../valueChecks';
 
 /**
  * The version of the messages. The extension closes a channel whose script answers with another one. Plan step 6, PR B:
@@ -362,16 +363,6 @@ export class StreamRedactor {
 /** One line of the channel (JSON and a line feed; JSON.stringify escapes every line feed in a string). */
 export function encodeMessage(message: ClientMessage | ServerMessage): string {
   return `${JSON.stringify(message)}\n`;
-}
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** True when `value` has all `required` keys and no key beyond them and `optional`. */
-export function hasOnlyKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
-  const keys = Object.keys(value);
-  return required.every((key) => key in value) && keys.every((key) => required.includes(key) || optional.includes(key));
 }
 
 function isId(value: unknown): value is number {

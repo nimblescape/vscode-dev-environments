@@ -27,10 +27,7 @@ import {
   sharedPropagationItem,
   tokenPropagationTarget,
 } from './rules';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+import { isRecord } from '../valueChecks';
 
 // ---------------------------------------------------------------------------------------------------------------------
 // runArgs and appPort of a single container

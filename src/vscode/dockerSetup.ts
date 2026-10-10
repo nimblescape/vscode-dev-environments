@@ -45,7 +45,7 @@ import {
   quarantineAttribute,
   zoneIdentifier,
 } from '../core/docker/dockerSetup';
-import { ensureDockerRunning, launchDetachedProcess } from '../core/docker/dockerStart';
+import { MAC_OPEN, ensureDockerRunning, launchDetachedProcess } from '../core/docker/dockerStart';
 import { errorMessage, isUserFacingError } from '../core/errors';
 import { Steps } from '../core/messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner } from '../core/ports';
@@ -59,7 +59,6 @@ export const DOCKER_SETUP_START_COMMAND = 'devEnvironments.dockerSetup.start';
 const SHOW_SIDEBAR_COMMAND = 'devEnvironments.repositories.focus';
 /** Name of the terminal of the installation commands. */
 export const INSTALL_TERMINAL_NAME = 'Install Docker';
-const MAC_OPEN = '/usr/bin/open';
 const XATTR = '/usr/bin/xattr';
 const WSL_STATUS_TIMEOUT_MS = 15_000;
 const OS_RELEASE_FILES = ['/etc/os-release', '/usr/lib/os-release'];

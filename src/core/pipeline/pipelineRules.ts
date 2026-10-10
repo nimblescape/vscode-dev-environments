@@ -28,6 +28,7 @@ import {
 } from '../names';
 import type { BuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
 import { composeRecordOf } from './recordRules';
+import { isRecord } from '../valueChecks';
 
 /**
  * True for a container of the current setup: its label nimblescape.devenv.container-version is CONTAINER_VERSION or
@@ -337,10 +338,6 @@ export function digestReference(reference: string, digest: string): string | und
 /** The user of a container is root (the ownership fix is not needed). */
 export function isRootUser(user: string): boolean {
   return user === 'root' || user === '0';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**

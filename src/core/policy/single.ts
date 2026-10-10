@@ -80,6 +80,7 @@ import {
   tokenPropagationTarget,
 } from './rules';
 import { volumeContext, volumeNameProblems, type VolumeContext, type VolumeInput } from './volumes';
+import { isRecord } from '../valueChecks';
 
 export interface HostAccessInput extends VolumeInput {
   /** The repository configuration, as `devcontainer read-configuration` resolved it (`configuration`). */
@@ -140,10 +141,6 @@ export interface HostAccessInput extends VolumeInput {
    * (HELPER_KNOWN_ENV, mayBeSetInHelper).
    */
   variables?: CliVariables;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**

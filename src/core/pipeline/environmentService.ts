@@ -18,6 +18,7 @@ import { vscodeExtensionSeedOutcome } from '../worker/vscodeExtensionSeed';
 import { configurationExtensions, type ExtensionRef } from '../vscodeExtensions';
 import type { VscodePlatform, VscodeServerLink, VscodeServerRef } from '../helperChannel/protocol';
 import { isDevContainer } from '../worker/dockerEngine';
+import { VIEWER_TIMEOUT_MS } from '../worker/hostSide';
 import {
   dockerHostField,
   dockerHostOf,
@@ -275,9 +276,7 @@ import {
   type OperationOptions,
   type RepositoryTarget,
 } from './operationBase';
-
-
-
+import { isRecord } from '../valueChecks';
 
 /**
  * The Docker of the pipeline: the calls that the service and the refresh make (concept 7.2). Plan step 11I2 (decision D8
@@ -410,8 +409,6 @@ export type EnvironmentHelper = Pick<
   | 'fixRepositoryOwnership'
 >;
 
-
-
 /**
  * Unit 7, PR 2: the Session Monitor container of the Docker engine of the operation (RemoteSessionMonitor, with the
  * socket of that engine and the id of this computer). Plan step 8, PR A: on every engine, local and remote (user decision
@@ -442,7 +439,6 @@ export interface EnvironmentSessionMonitor {
    */
   images(signal?: AbortSignal): Promise<void>;
 }
-
 
 /**
  * The deps of the worker's pipeline. Plan step 11I (PR D, audit D6): what it shares with the window's operations is
@@ -540,7 +536,6 @@ export interface VscodeExtensionCache {
   /** The cached files of the store to seed for `list` (`<folder>/<cache name>`), for the engine's platform when known. */
   seedFiles(list: ExtensionRef[], platform: VscodePlatform | undefined): Promise<string[]>;
 }
-
 
 /** Review round 4 of PR #68 (B-R4-2): the pause before the second write of Environment.lifecycleIncomplete. */
 const LIFECYCLE_MARK_RETRY_MS = 500;
@@ -956,7 +951,6 @@ interface UpdatePlan {
   current: boolean;
 }
 
-
 /**
  * Review round 4 of PR #68 (A-R4-5): a step without a busy mark (Step 9) would have to stop, remove, or rename a container,
  * and another window uses the environment (or that could not be checked): nothing was changed (requireNoOtherWindow).
@@ -981,7 +975,6 @@ function configurationError(error: unknown): unknown {
   if (isUserFacingError(error) || isAbortError(error)) return error;
   return new UserFacingError('buildFailed', Messages.buildFailed, errorDetail(error));
 }
-
 
 function volumeLabels(environment: Environment): Record<string, string> {
   const labels: Record<string, string> = { [LABEL_ENVIRONMENT_ID]: environment.id, [LABEL_REPOSITORY]: environment.repository };
@@ -1050,10 +1043,6 @@ export function additionalVolumeLabels(environment: Environment): Record<string,
   return { ...volumeLabels(environment), [LABEL_VOLUME]: VOLUME_KIND_ADDITIONAL };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 /**
  * The files of a helper run for the build model of a Docker Compose configuration: the model, and the Dockerfile of the
  * dev service.
@@ -1068,7 +1057,6 @@ function composeBuildFiles(build: ComposeBuildModelRewrite): HelperFiles {
 function isHostAccess(error: unknown): boolean {
   return isUserFacingError(error) && error.code === 'hostAccess';
 }
-
 
 /**
  * The message of a refusal (concept section 9 "Host access"): the settings that need access to the computer
@@ -1146,11 +1134,8 @@ function tooLargeError(reason: string): AnalysisFailedError {
 /** Review round 11 (G3): the most characters of the paths of one EXISTING_PATHS_SCRIPT call (existingServiceFolders). */
 const EXISTING_PATHS_CHARACTERS = 16 * 1024;
 
-/** Time limit of the question for the profile name of the account (the Git identity has a fallback). */
-const VIEWER_TIMEOUT_MS = 5_000;
 /** After a failed question for the profile, the fallback identity is used this long before GitHub is asked again. */
 const IDENTITY_RETRY_MS = 10 * 60_000;
-
 
 /**
  * The open pipeline and the environment operations (concept 7.5, 7.6, 7.7, 7.12, 7.14).
@@ -6750,7 +6735,6 @@ export class EnvironmentService extends OperationBase {
   }
 
 }
-
 
 /**
  * Review round 5 of PR #82 (A-R5-4): a helperFailed of Step 8 with `detail`; the refusal of the batch scope keeps its

@@ -8,7 +8,8 @@ import type { DockerTarget } from '../core/docker/dockerHost';
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
 import { MONITOR_EXEC_TIMEOUT_MS } from '../core/worker/monitorFlow';
-import { MONITOR_FLOW_TIMEOUT_MS, workerMonitor, type TargetFlow } from './workerMonitor';
+import { MONITOR_FLOW_TIMEOUT_MS } from '../core/pipeline/operationBase';
+import { workerMonitor, type TargetFlow } from './workerMonitor';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const TARGET = { kind: 'remote', host: 'ssh://box', endpoint: 'ssh://box', context: 'box' } as DockerTarget;

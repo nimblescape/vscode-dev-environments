@@ -10,6 +10,7 @@ import { configurationName } from '../core/names';
 import type { RepositoryTarget } from '../core/pipeline/operationBase';
 import type { DiscoveryData, Environment, ExtensionSettings, RepositoryInfo } from '../core/types';
 import { ControllerTexts } from './controllerTexts';
+import { isRecord } from '../core/valueChecks';
 
 /** Key of a repository in maps and in the operation gate: lower-case `owner/name` (GitHub names ignore case). */
 export function repositoryKey(repository: string): string {
@@ -166,10 +167,6 @@ export function configurationChoices(configPaths: readonly string[], current: st
       current: isCurrent,
     };
   });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isRepositoryInfo(value: unknown): value is RepositoryInfo {

@@ -11,7 +11,8 @@ import { OP_HEARTBEAT, OP_MONITOR_ENSURE, OP_RECORD_GIT_STATE, OP_WINDOW_STATE }
 import { silentLogger } from '../core/ports';
 import type { Environment } from '../core/types';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
-import { MONITOR_ENSURE_FLOW_TIMEOUT_MS, MONITOR_FLOW_TIMEOUT_MS, workerMonitor, type TargetFlow } from './workerMonitor';
+import { MONITOR_ENSURE_FLOW_TIMEOUT_MS, MONITOR_FLOW_TIMEOUT_MS } from '../core/pipeline/operationBase';
+import { workerMonitor, type TargetFlow } from './workerMonitor';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const TARGET = { kind: 'remote', host: 'ssh://box', endpoint: 'ssh://box', context: 'box' } as DockerTarget;

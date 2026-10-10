@@ -11,6 +11,7 @@ import { errorMessage } from '../errors';
 import { isAbortError, silentLogger, type Credentials, type GitHubAuth, type Logger, type ProcessRunner } from '../ports';
 import { credentialServerName, isDockerHub, registryDisplayName } from './reference';
 import type { CredentialsProvider } from './registryClient';
+import { isRecord } from '../valueChecks';
 
 interface AuthEntry {
   auth?: unknown;
@@ -183,6 +184,13 @@ export class DockerCredentialStore {
 }
 
 /**
+ * The only registry for which the GitHub session gives credentials (scope `read:packages`; concept 7.7): the sign-in is
+ * its login when Docker has none. Cleanup after plan step 11 (PR C6, B8): one definition (before: copies in
+ * src/vscode/hostSide.ts and pipelineUi.ts, and the literal here and in src/vscode/auth.ts).
+ */
+export const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
+
+/**
  * Adds the GitHub session (scope `read:packages`) as fallback for ghcr.io (concept 7.7, implementation notes 9).
  * The session is only requested without a dialog, and only when the registry asks for credentials.
  */
@@ -192,7 +200,7 @@ export function withGitHubPackagesFallback(
 ): CredentialsProvider {
   return async (registry, signal) => {
     const found = await primary(registry, signal);
-    if (found || registry.toLowerCase() !== 'ghcr.io' || signal?.aborted) return found;
+    if (found || registry.toLowerCase() !== GITHUB_PACKAGES_REGISTRY || signal?.aborted) return found;
     try {
       return await github.getPackagesCredentials({ interactive: false });
     } catch {
@@ -241,8 +249,4 @@ function envValue(env: NodeJS.ProcessEnv, name: string, platform: NodeJS.Platfor
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

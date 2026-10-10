@@ -15,6 +15,14 @@ import type { GitHubViewer } from '../helper/containerGit';
 import type { BuildChange, ConfigurationChange, LifecycleMarkChange, StepMarkResult } from '../pipeline/openRecords';
 import type { HostOpenFinish, OpenRequestScope } from './openRequests';
 
+/**
+ * Plan step 11E4d: the time limit of the question to GitHub for the profile of the account (HostSide.viewer), for the Git
+ * identity of a new environment: the worker's pipeline waits this long for it (EnvironmentService.identityOf), and the
+ * extension gives its question to GitHub as long (extensionHostSide). Cleanup after plan step 11 (PR C6, B8): one
+ * definition for both ends (before: a copy in src/vscode/hostSide.ts and in environmentService.ts).
+ */
+export const VIEWER_TIMEOUT_MS = 5_000;
+
 /** The questions of a flow to the user (PipelineUi without the messages, which go as log lines and progress). */
 export interface HostQuestions {
   confirmUntrustedRepository(repository: string): Promise<boolean>;

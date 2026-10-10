@@ -35,6 +35,7 @@ import { checkConfigPath, checkRepository, isPassableEnvName, writeAndRunInput, 
 import { currentBatchScope, type BatchScope } from './batchScope';
 import type { BatchStepKind } from './batchStepKinds';
 import { batchStepCommand } from './batchSteps';
+import { isRecord } from '../valueChecks';
 
 /** Result of WorkspaceHelper.up. */
 export interface UpResult extends DevcontainerResult {
@@ -86,10 +87,6 @@ function lastJsonLine(stdout: string): unknown {
   const lines = stdout.split(/\r?\n/).filter((line) => line.trim() !== '');
   if (lines.length === 0) throw new Error('The workspace helper printed no result.');
   return JSON.parse(lines[lines.length - 1]);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** Forwards stdout of `build`/`up` line by line, without the JSON result line. */

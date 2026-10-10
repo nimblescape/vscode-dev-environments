@@ -7,6 +7,7 @@
 // ports, and local build contexts. The container policy checks what these parsers read. Pure functions, no I/O.
 import * as path from 'path';
 import type { Problem } from './report';
+import { isRecord } from '../valueChecks';
 
 /** How a flag of `docker run` or `docker build` is treated. */
 export type FlagRule =
@@ -17,10 +18,6 @@ export type FlagRule =
   // `guarded`: refused whatever the switch of the host access checks says (HostAccessClass `protected`).
   | { kind: 'refuse'; value: boolean; item?: string; guarded?: boolean }
   | { kind: 'check'; check: (value: string) => Problem[] };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Flags

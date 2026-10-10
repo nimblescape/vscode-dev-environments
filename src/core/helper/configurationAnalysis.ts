@@ -22,6 +22,7 @@ import {
   type HostAccessReport,
   type NamedImageReference,
 } from '../policy';
+import { isRecord } from '../valueChecks';
 
 /**
  * The item of a configuration whose analysis failed (ConfigurationAnalyzer): refused as not supported, whatever the
@@ -201,15 +202,14 @@ export function exceedsJobSize(value: unknown, maxCharacters: number): boolean {
  * references as lists. Anything else counts as a failure.
  */
 export function isAnalysisResult(job: AnalysisJob, value: unknown): boolean {
-  const record = (item: unknown): item is Record<string, unknown> => typeof item === 'object' && item !== null && !Array.isArray(item);
   const texts = (item: unknown): boolean => Array.isArray(item) && item.every((entry) => typeof entry === 'string');
-  if (!record(value) || !record(value.report) || !texts(value.report.hostAccess) || !texts(value.report.unsupported)) return false;
+  if (!isRecord(value) || !isRecord(value.report) || !texts(value.report.hostAccess) || !texts(value.report.unsupported)) return false;
   if (job.kind === 'hostAccess') return true;
   const references = value.references;
   return (
     Array.isArray(value.imageReferences) &&
-    value.imageReferences.every((entry) => record(entry) && typeof entry.reference === 'string' && typeof entry.what === 'string') &&
-    record(references) &&
+    value.imageReferences.every((entry) => isRecord(entry) && typeof entry.reference === 'string' && typeof entry.what === 'string') &&
+    isRecord(references) &&
     texts(references.images) &&
     texts(references.features)
   );

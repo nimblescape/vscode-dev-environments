@@ -8,6 +8,7 @@
 // Docker host of an environment; the check of an SSH address; the plain reasons of a failed connection. No `vscode`.
 import { namePair } from '../namePairs';
 import type { Environment } from '../types';
+import { isRecord } from '../valueChecks';
 
 /**
  * The description of the Docker contexts that "Use a Remote Docker Host…" creates (`docker context create --description`):
@@ -362,8 +363,4 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
     return 'unreachable';
   }
   return 'unknown';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

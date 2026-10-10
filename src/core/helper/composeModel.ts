@@ -6,6 +6,7 @@
 // the versions of Compose and of the Docker Engine, and the Docker names of the top-level volumes and networks. Split off
 // ./compose.ts in unit 11, so that the container policy (../policy) can use them without an import cycle (./compose.ts
 // builds the models that run and calls the policy). Pure functions, no I/O.
+import { isRecord } from '../valueChecks';
 
 /** A service of the merged model (`services.<name>`), as `docker compose config --format json` prints it. */
 export type ComposeService = Record<string, unknown>;
@@ -41,10 +42,6 @@ export const MIN_COMPOSE_VERSION = '2.24.4';
 export const MIN_SUBPATH_API_VERSION = '1.45';
 /** The Docker Engine version of MIN_SUBPATH_API_VERSION, for the messages. */
 export const MIN_SUBPATH_ENGINE = 'Docker Engine 26';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** The numeric parts of a version text (`v2.29.1-desktop.1` → [2, 29, 1]); `undefined` when it starts otherwise. */
 function versionParts(version: string): number[] | undefined {

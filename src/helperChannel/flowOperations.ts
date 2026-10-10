@@ -92,12 +92,42 @@ export function flowHost(context: OperationContext) {
  */
 export type EngineOfOperation = (context: OperationContext) => DockerEngine;
 
+/**
+ * Cleanup after plan step 11 (PR C6, B11): the start that every operation shares. Its parameters by the schema of both
+ * sides (`parse`; else `invalid`, "The parameters of the <name> operation are invalid.", or `texts.invalid`), and no
+ * secret (else `invalid`, "The <name> operation takes no secret.", or `texts.secret`); then `run` with the parameters.
+ */
+export function checkedOperation<P>(
+  name: string,
+  parse: (params: unknown) => P | undefined,
+  run: (checked: P, context: OperationContext) => Promise<unknown>,
+  texts: { invalid?: string; secret?: string } = {},
+): OperationHandler {
+  return async (params, context) => {
+    const checked = parse(params);
+    if (checked === undefined) throw new OperationError('invalid', texts.invalid ?? `The parameters of the ${name} operation are invalid.`);
+    if (!context.hasNoSecret()) throw new OperationError('invalid', texts.secret ?? `The ${name} operation takes no secret.`);
+    return run(checked, context);
+  };
+}
+
+/** Cleanup after plan step 11 (PR C6, B11): `cancelled`, "The <name> operation was cancelled.", when the operation was cancelled. */
+export function cancelledIfAborted(name: string, context: OperationContext): void {
+  if (context.signal.aborted) throw new OperationError('cancelled', `The ${name} operation was cancelled.`);
+}
+
+/**
+ * Cleanup after plan step 11 (PR C6, B11): the end of an operation that failed with `error`: `cancelled` when it was
+ * cancelled (cancelledIfAborted), else `failed` with the message of the error.
+ */
+export function operationFailure(name: string, error: unknown, context: OperationContext): OperationError {
+  cancelledIfAborted(name, context);
+  return new OperationError('failed', errorMessage(error));
+}
+
 /** `tokenRemove`: empties the token folder of the dev container of an environment (concept section 9). */
 export function tokenRemoveOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    const checked = parseTokenRemoveParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the tokenRemove operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The tokenRemove operation takes no secret.');
+  return checkedOperation('tokenRemove', parseTokenRemoveParams, async (checked, context) => {
     const host = flowHost(context);
     context.progress('tokenRemove', checked.containerName);
     try {
@@ -117,9 +147,9 @@ export function tokenRemoveOperation(engineOf: EngineOfOperation): OperationHand
       return result satisfies TokenRemoveValue;
     } catch (error) {
       if (error instanceof OperationError) throw error;
-      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+      throw new OperationError('failed', errorMessage(error));
     }
-  };
+  });
 }
 
 /**
@@ -127,10 +157,7 @@ export function tokenRemoveOperation(engineOf: EngineOfOperation): OperationHand
  * one way: takeEnvironmentLock) and lets go at its end. A lock held elsewhere for the whole wait is `busy`.
  */
 export function stopOperation(engineOf: EngineOfOperation, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseStopParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the stop operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The stop operation takes no secret.');
+  return checkedOperation('stop', parseStopParams, async (checked, context) => {
     context.progress('lock', checked.environmentId);
     let release: () => void;
     try {
@@ -156,12 +183,11 @@ export function stopOperation(engineOf: EngineOfOperation, lockDeps: LockDeps = 
       return result satisfies StopValue;
     } catch (error) {
       if (error instanceof OperationError) throw error;
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The stop operation was cancelled.');
-      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+      throw operationFailure('stop', error, context);
     } finally {
       release();
     }
-  };
+  });
 }
 
 /**
@@ -174,7 +200,7 @@ export function flowRefusal(error: unknown, context: OperationContext): { refuse
     throw new OperationError('cancelled', 'The operation was cancelled.');
   }
   if (error instanceof OperationError) throw error;
-  if (!isUserFacingError(error) || error.code === 'cancelled') throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+  if (!isUserFacingError(error) || error.code === 'cancelled') throw new OperationError('failed', errorMessage(error));
   const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
   return {
     refused: {
@@ -188,6 +214,21 @@ export function flowRefusal(error: unknown, context: OperationContext): { refuse
 
 /** Plan step 11B3b: the worker's own helper image and socket, for the batch helpers of its flows (readOwnHelper). */
 export type OwnHelperOf = (context: OperationContext) => Promise<OwnHelper>;
+
+/**
+ * Plan step 11B3b: the worker's own helper image of an operation (ownHelperOf). A cancel ends the operation as
+ * `cancelled`; another failure changed nothing, so the extension says so as for a worker that cannot take the lock
+ * (LOCK_UNAVAILABLE_CODE: environmentLockUnavailable). Cleanup after plan step 11 (PR C6, B11): one function for the six
+ * operations that read it before their pipeline.
+ */
+async function ownHelperOfOperation(ownHelperOf: OwnHelperOf, context: OperationContext): Promise<OwnHelper> {
+  try {
+    return await ownHelperOf(context);
+  } catch (error) {
+    if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
+    throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${errorMessage(error)}`);
+  }
+}
 
 /**
  * Plan step 11E2: the host access analysis of an operation in the worker: each job in a thread of its own, started from
@@ -256,19 +297,9 @@ export type OpenWorkerBatch = (context: OperationContext, p: { volume: string; i
  * and the batch helper (on the worker's own image) taken here.
  */
 export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseListConfigurationsParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the listConfigurations operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The listConfigurations operation takes no secret.');
+  return checkedOperation('listConfigurations', parseListConfigurationsParams, async (checked, context) => {
     context.progress('listConfigurations', checked.environmentId);
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const { service } = workerServices({
       host: flowHost(context),
       engine: engineOf(context),
@@ -287,7 +318,7 @@ export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelp
     } catch (error) {
       return flowRefusal(error, context) satisfies ListConfigurationsValue;
     }
-  };
+  });
 }
 
 /**
@@ -295,18 +326,14 @@ export function listConfigurationsOperation(engineOf: EngineOfOperation, ownHelp
  * container (windowStateFlow). It only reads: no lock, no secret, no request to the extension.
  */
 export function windowStateOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    const checked = parseWindowStateParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the windowState operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The windowState operation takes no secret.');
+  return checkedOperation('windowState', parseWindowStateParams, async (checked, context) => {
     try {
       const value = await windowStateFlow({ ...checked, docker: new EngineDocker(engineOf(context), contextLogger(context)), signal: context.signal });
       return value satisfies WindowStateValue;
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The windowState operation was cancelled.');
-      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+      throw operationFailure('windowState', error, context);
     }
-  };
+  });
 }
 
 /**
@@ -316,19 +343,9 @@ export function windowStateOperation(engineOf: EngineOfOperation): OperationHand
  * engine, and the heartbeat record of the computer that sent it forgotten in the Session Monitor of the engine.
  */
 export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseDeleteParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the delete operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The delete operation takes no secret.');
+  return checkedOperation('delete', parseDeleteParams, async (checked, context) => {
     context.progress('delete', checked.environmentId);
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const { service } = workerServices({
       host: flowHost(context),
       engine: engineOf(context),
@@ -348,7 +365,7 @@ export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHel
     } catch (error) {
       return flowRefusal(error, context) satisfies DeleteValue;
     }
-  };
+  });
 }
 
 /**
@@ -358,18 +375,9 @@ export function deleteOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHel
  * questions as `question` requests. No lock: it only reads on the engine.
  */
 export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseDeleteCheckParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the deleteCheck operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The deleteCheck operation takes no secret.');
+  return checkedOperation('deleteCheck', parseDeleteCheckParams, async (checked, context) => {
     context.progress('deleteCheck', checked.environmentId);
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const { service } = workerServices({
       host: flowHost(context),
       engine: engineOf(context),
@@ -388,7 +396,7 @@ export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: O
     } catch (error) {
       return flowRefusal(error, context) satisfies DeleteCheckValue;
     }
-  };
+  });
 }
 
 /**
@@ -398,17 +406,8 @@ export function deleteCheckOperation(engineOf: EngineOfOperation, ownHelperOf: O
  * added by the extension (`record restore`). No lock: it only reads on the engine.
  */
 export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseReconcileParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the reconcile operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The reconcile operation takes no secret.');
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+  return checkedOperation('reconcile', parseReconcileParams, async (checked, context) => {
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const { service } = workerServices({
       host: flowHost(context),
       engine: engineOf(context),
@@ -424,10 +423,9 @@ export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: Own
     try {
       return { added: await service.reconcileFromVolumes() } satisfies ReconcileValue;
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The reconcile operation was cancelled.');
-      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+      throw operationFailure('reconcile', error, context);
     }
-  };
+  });
 }
 
 /**
@@ -435,16 +433,13 @@ export function reconcileOperation(engineOf: EngineOfOperation, ownHelperOf: Own
  * the worker's engine (monitorFlow.sendHeartbeat). `missing` tells the window to start the monitor again.
  */
 export function heartbeatOperation(engineOf: EngineOfOperation): OperationHandler {
-  return async (params, context) => {
-    const checked = parseHeartbeatParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the heartbeat operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The heartbeat operation takes no secret.');
+  return checkedOperation('heartbeat', parseHeartbeatParams, async (checked, context) => {
     const value = await sendHeartbeat(engineOf(context), checked.heartbeat, context.signal).catch((error: unknown) => {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The heartbeat operation was cancelled.');
+      cancelledIfAborted('heartbeat', context);
       throw error;
     });
     return value satisfies HeartbeatValue;
-  };
+  });
 }
 
 /**
@@ -453,17 +448,8 @@ export function heartbeatOperation(engineOf: EngineOfOperation): OperationHandle
  * through `record get`, the state recorded through `record recordGitSummary`. No lock: it only reads on the engine.
  */
 export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseRecordGitStateParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the recordGitState operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The recordGitState operation takes no secret.');
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+  return checkedOperation('recordGitState', parseRecordGitStateParams, async (checked, context) => {
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const { service } = workerServices({
       host: flowHost(context),
       engine: engineOf(context),
@@ -477,9 +463,9 @@ export function recordGitStateOperation(engineOf: EngineOfOperation, ownHelperOf
       analyzer: workerAnalyzer(context),
     });
     const recorded = await service.recordGitState(checked.environmentId, context.signal);
-    if (context.signal.aborted) throw new OperationError('cancelled', 'The recordGitState operation was cancelled.');
+    cancelledIfAborted('recordGitState', context);
     return { recorded } satisfies RecordGitStateValue;
-  };
+  });
 }
 
 /**
@@ -538,19 +524,15 @@ export async function ensureWorkerMonitor(
  * fails the operation with its cause.
  */
 export function monitorEnsureOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, script: () => string): OperationHandler {
-  return async (params, context) => {
-    const checked = parseMonitorEnsureParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the monitorEnsure operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The monitorEnsure operation takes no secret.');
+  return checkedOperation('monitorEnsure', parseMonitorEnsureParams, async (checked, context) => {
     try {
       const own = await ownHelperOf(context);
       const outcome = await ensureWorkerMonitor(engineOf(context), own, contextLogger(context), script, checked.images, context.signal);
       return { outcome } satisfies MonitorEnsureValue;
     } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The monitorEnsure operation was cancelled.');
-      throw new OperationError('failed', error instanceof Error ? error.message : String(error));
+      throw operationFailure('monitorEnsure', error, context);
     }
-  };
+  });
 }
 
 /**
@@ -636,19 +618,9 @@ export function openMonitor(
  * limit of the settings. It answers with what the window needs to connect (A1); a refusal of the pipeline is its value.
  */
 export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelperOf, openBatch: OpenWorkerBatch, script: () => string, lockDeps: LockDeps = LOCK_DEPS): OperationHandler {
-  return async (params, context) => {
-    const checked = parseOpenParams(params);
-    if (checked === undefined) throw new OperationError('invalid', 'The parameters of the open operation are invalid.');
-    if (!context.hasNoSecret()) throw new OperationError('invalid', 'The open operation takes no secret: it asks for the ones it needs.');
+  return checkedOperation('open', parseOpenParams, async (checked, context) => {
     context.progress('open', checked.environmentId ?? checked.repository);
-    let ownHelper: OwnHelper;
-    try {
-      ownHelper = await ownHelperOf(context);
-    } catch (error) {
-      if (context.signal.aborted) throw new OperationError('cancelled', 'The operation was cancelled.');
-      // Nothing has changed: the extension says so as for a worker that cannot take the lock (environmentLockUnavailable).
-      throw new OperationError(LOCK_UNAVAILABLE_CODE, `The helper image of the worker cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    const ownHelper = await ownHelperOfOperation(ownHelperOf, context);
     const engine = engineOf(context);
     const logger = contextLogger(context);
     const monitor = openMonitor(engine, ownHelper, logger, script, checked, context.signal);
@@ -693,5 +665,5 @@ export function openOperation(engineOf: EngineOfOperation, ownHelperOf: OwnHelpe
     } catch (error) {
       return { ...flowRefusal(error, context), ...sent() } satisfies OpenValue;
     }
-  };
+  }, { secret: 'The open operation takes no secret: it asks for the ones it needs.' });
 }
