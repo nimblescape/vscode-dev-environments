@@ -245,9 +245,9 @@ export async function collectBatchStep(
  * is held per operation and stream until its line ends, so that the log's pattern masking (redactSecrets of
  * OutputChannelLogger: a GitHub token that the operation does not hold) sees whole lines, not pieces that a cut in the
  * worker split (the pipe reads, the OUTPUT_CHUNK_CHARACTERS pieces). Bounded: a line longer than
- * MAX_HELD_OUTPUT_CHARACTERS is written up to the last HELD_OUTPUT_TAIL_CHARACTERS (more than any token the pattern
- * matches), cut after a character that cannot be part of a token (the pattern matches a whole run of the characters
- * [A-Za-z0-9_]). The rest is written when the operation ends (its result, failure, cancel, time limit, or the loss of
+ * MAX_HELD_OUTPUT_CHARACTERS is written up to about its last HELD_OUTPUT_TAIL_CHARACTERS, cut after a character that
+ * cannot be part of a token (the pattern matches a whole run of the characters [A-Za-z0-9_]), so a cut never splits a
+ * token (review round 2 of PR #139, L3). The rest is written when the operation ends (its result, failure, cancel, time limit, or the loss of
  * the channel).
  */
 export const MAX_HELD_OUTPUT_CHARACTERS = 64 * 1024;
@@ -278,7 +278,8 @@ export class OutputLines {
 
 /**
  * The end of the text to write before `limit`: after its last character that is not one of [A-Za-z0-9_] (nor the first
- * half of a surrogate pair), else at `limit` (a run of such characters longer than MAX_HELD_OUTPUT_CHARACTERS).
+ * half of a surrogate pair), else at `limit` (a run of such characters longer than the text before `limit`; a run that
+ * follows a line break is held whole until it grows beyond the limit itself).
  */
 function tokenSafeCut(text: string, limit: number): number {
   for (let index = limit - 1; index >= 0; index--) {
@@ -602,16 +603,25 @@ export class HelperChannel {
     const pending = this.pending.get(id);
     if (!pending) return undefined;
     this.pending.delete(id);
-    // Review round 1 of PR #139 (A-M1): the held output is written when the operation ends, however it ends.
-    pending.output?.stdout.flush();
-    pending.output?.stderr.flush();
+    // Review round 1 of PR #139 (A-M1): the held output is written when the operation ends, however it ends; review
+    // round 2 (L2): a logger that throws there cannot keep the operation's place.
+    try {
+      pending.output?.stdout.flush();
+      pending.output?.stderr.flush();
+    } finally {
+      this.finishPending(pending);
+    }
+    return pending;
+  }
+
+  /** The rest of finish: frees what the operation held and its place. */
+  private finishPending(pending: Pending): void {
     pending.asks?.abort();
     if (pending.timer) clearTimeout(pending.timer);
     if (pending.onAbort) pending.options.signal?.removeEventListener('abort', pending.onAbort);
     // Review round 1 (P10): the idle time counts from the end of the last operation, not from its start.
     this.lastUsedAt = Date.now();
     this.releaseSlot();
-    return pending;
   }
 
   /** Gives a place to the next waiting operation, or frees it. */
