@@ -6,7 +6,8 @@
 // worker's pipeline share. One operation per repository at a time also with three queued; a process whose state is not
 // known counts as running; processExists never counts an invalid PID as running, and counts a process of another user
 // (EPERM) as running. Cleanup after plan step 11 (PR C1): processExists is removed; the default of OperationBase is
-// isProcessAlive of sessionRules.ts, which these two tests now pin.
+// isProcessAlive of sessionRules.ts. These two tests pin isProcessAlive itself; operationBase.pC1R1.test.ts pins that
+// OperationBase and markViewOf use it as their default (review round 1 of C1, reviewers A and B, L1).
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isProcessAlive } from '../session/sessionRules';
 import { OperationBase, type OperationBaseDeps, type OperationRecords } from './operationBase';
