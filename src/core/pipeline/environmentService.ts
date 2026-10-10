@@ -11,7 +11,7 @@ import { type EnvironmentBusyMarks } from './busyMarks';
 import { deleteCheck, type DeleteDecision, type RemovableVolumes } from './deleteCheck';
 import { otherWindowMayUseEnvironment, otherWindowUsesEnvironment, sleepGraceOfWindow, waitingTimeMs } from '../busy';
 import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
-import type { SECRET_TOKEN } from '../helperChannel/protocol';
+import { isValidToken, type SECRET_TOKEN } from '../helperChannel/protocol';
 import { runScript, scriptCommand } from '../worker/containerScripts';
 import { mountsVscodeStore, vscodeServerLinkOutcome } from '../worker/vscodeServerLink';
 import { vscodeExtensionSeedOutcome } from '../worker/vscodeExtensionSeed';
@@ -5024,7 +5024,8 @@ export class EnvironmentService extends OperationBase {
       this.logger.warn(`The GitHub login ${JSON.stringify(account.login)} is no valid GitHub login; the GitHub CLI in the container is not signed in.`);
     }
     try {
-      if (!token || /\s/.test(token)) throw new Error('No valid GitHub token.');
+      // Cleanup after plan step 11 (PR C3, B2): the one token check (isValidToken).
+      if (!isValidToken(token)) throw new Error('No valid GitHub token.');
       const result = await runScript(this.deps.docker, container, 'tokenWrite', [user, tokenLogin(account.login)], {
         user: 'root',
         signal: ctx.signal,

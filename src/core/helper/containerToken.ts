@@ -15,6 +15,7 @@
 // which builds their commands and gives `tokenWrite` the token as the secret of the operation by its name; the pipeline
 // writes it (EnvironmentService.writeGitToken). No vscode import.
 import type { RunResult } from '../ports';
+import { redact } from '../helperChannel/protocol';
 import { GH_CONFIG_FOLDER, GH_HOSTS_FILE, GH_VOLUME_CONFIG_FILE, GITHUB_TOKEN_FILE, TOKEN_FOLDER } from '../names';
 import { isGitHubLogin } from './containerGit';
 
@@ -323,8 +324,10 @@ export function tokenLogin(login: string): string {
   return isGitHubLogin(login) ? login : '';
 }
 
-/** The text of a failed run of the scripts, without the token. */
+/**
+ * The text of a failed run of the scripts, without the token. Cleanup after plan step 11 (PR C3, B2): masked by the
+ * protocol's `redact` (before: an own copy of its rule).
+ */
 export function tokenRunMessage(result: RunResult, token?: string): string {
-  const text = (result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`;
-  return token !== undefined && token.length >= 4 ? text.split(token).join('***') : text;
+  return redact((result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`, token);
 }

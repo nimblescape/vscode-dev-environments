@@ -12,7 +12,7 @@ import { mapContainerState, publicInfo, toLabels, toNetworkInfo, toVolumeInfo, t
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from '../docker/dockerTimeouts';
 import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { errorMessage } from '../errors';
-import { SECRET_REGISTRY, SECRET_TOKEN, pullReference } from '../helperChannel/protocol';
+import { SECRET_REGISTRY, SECRET_TOKEN, isValidToken, pullReference } from '../helperChannel/protocol';
 import { COMPOSE_PROJECT_LABEL, LABEL_ENVIRONMENT_ID, RESOURCE_NAME_PREFIX } from '../names';
 import type { EnvironmentDocker } from '../pipeline/environmentService';
 import { abortError, isAbortError, silentLogger, withTimeLimit, type Credentials, type Logger, type RunResult } from '../ports';
@@ -245,9 +245,9 @@ export class EngineDocker implements EnvironmentDocker {
     // Plan step 11I (PR B): no other secret of the operation (a registry login) ever goes into a container, and a token
     // that the operation does not hold is refused before anything is sent. Review round 1 of PR #124 (A, L-1): the token
     // that is sent is checked here, where it is sent (not only the token of the pipeline's session): a value that is
-    // empty or holds white space is refused too.
+    // empty or holds white space is refused too (cleanup after plan step 11, PR C3, B2: the one check, isValidToken).
     const token = options.secretInputName !== undefined ? this.secretOf(SECRET_TOKEN) : undefined;
-    if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || !token || /\s/.test(token))) {
+    if (options.secretInputName !== undefined && (options.secretInputName !== SECRET_TOKEN || !isValidToken(token))) {
       throw new EngineError('A docker exec with a secret input needs it as the token secret of the operation.', 0);
     }
     try {

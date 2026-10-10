@@ -14,7 +14,7 @@
 // helper image (section 3b of the plan); the helper image of the extension (its build, check, maintenance and record)
 // is HelperImages' (helperImages.ts), of which this module imports nothing (cleanup after plan step 11, PR #138, A4:
 // before, the types of its options), so the worker's bundle holds none of it.
-import { SECRET_TOKEN } from '../helperChannel/protocol';
+import { SECRET_TOKEN, StreamRedactor, isValidToken, redact } from '../helperChannel/protocol';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
 import { boundServiceFolders, checkNumericIds, type ServiceFolders } from '../git/gitSummary';
 import { Messages } from '../messages';
@@ -74,50 +74,11 @@ export interface HelperDeps {
  */
 export const MERGED_CONFIGURATION_TIMEOUT_MS = 10_000;
 
+// Cleanup after plan step 11 (PR C3, B2): the token check (isValidToken) and the masking (redact, StreamRedactor) are the
+// protocol's, the one implementation. Before: a copy of the check, an own `redact`, and an own line-buffered stream
+// (RedactingStream) whose flush passed the start of a token that a cut stream ended with on unmasked.
 function checkToken(token: string): void {
-  if (!token || /\s/.test(token)) throw new UserFacingError('signInRequired', Messages.signInRequired, 'No valid GitHub token.');
-}
-
-function redact(text: string, secret: string): string {
-  return secret.length >= 4 ? text.split(secret).join('***') : text;
-}
-
-/** Review PL-1: a stream that is not redacted line by line holds at most this many characters before it passes them on. */
-const REDACTION_BUFFER_LIMIT = 64 * 1024;
-
-/**
- * Review PL-1: passes a stream on with `secret` replaced (redact), also when the secret is split across chunks: whole
- * lines go on at once; a line longer than REDACTION_BUFFER_LIMIT goes on except for its last characters (shorter than
- * the secret), which wait for the next chunk. flush passes on the rest.
- */
-class RedactingStream {
-  private buffer = '';
-
-  constructor(
-    private readonly forward: (text: string) => void,
-    private readonly secret: string,
-  ) {}
-
-  write(text: string): void {
-    this.buffer += text;
-    const end = this.buffer.lastIndexOf('\n') + 1;
-    if (end > 0) {
-      this.forward(redact(this.buffer.slice(0, end), this.secret));
-      this.buffer = this.buffer.slice(end);
-    }
-    if (this.buffer.length > REDACTION_BUFFER_LIMIT) {
-      // A secret split at the end starts within its last `length - 1` characters, which stay.
-      const text = redact(this.buffer, this.secret);
-      const keep = Math.min(text.length, Math.max(this.secret.length - 1, 0));
-      this.forward(text.slice(0, text.length - keep));
-      this.buffer = text.slice(text.length - keep);
-    }
-  }
-
-  flush(): void {
-    if (this.buffer) this.forward(redact(this.buffer, this.secret));
-    this.buffer = '';
-  }
+  if (!isValidToken(token)) throw new UserFacingError('signInRequired', Messages.signInRequired, 'No valid GitHub token.');
 }
 
 /** The last non-empty line of stdout, parsed as JSON. Throws if it is missing or invalid. */
@@ -220,16 +181,25 @@ export class WorkspaceHelper {
   }): Promise<void> {
     checkToken(p.token);
     checkRepository(p.repository);
-    const output = this.redactingOutput(p.onOutput ?? this.logOutput, p.token);
+    const output = p.onOutput ?? this.logOutput;
+    // Cleanup after plan step 11 (PR C3, B2): each stream through a StreamRedactor, so a token split across two chunks is
+    // masked too (before: each chunk on its own).
+    const streams = { stdout: new StreamRedactor(p.token, output), stderr: new StreamRedactor(p.token, output) };
     this.deps.logger.info(`Cloning ${p.repository}${p.branch ? ` (branch ${p.branch})` : ''} into the volume ${p.volumeName}.`);
-    const result = await this.runStreams(p.volumeName, {
-      // Plan step 6, PR C: in the batch helper the token travels only in the `secret` field.
-      batch: { kind: 'clone', params: { repository: p.repository, ...(p.branch ? { branch: p.branch } : {}) }, secret: p.token },
-      image: p.image,
-      signal: p.signal,
-      onStdout: output,
-      onStderr: output,
-    });
+    let result: RunResult;
+    try {
+      result = await this.runStreams(p.volumeName, {
+        // Plan step 6, PR C: in the batch helper the token travels only in the `secret` field.
+        batch: { kind: 'clone', params: { repository: p.repository, ...(p.branch ? { branch: p.branch } : {}) }, secret: p.token },
+        image: p.image,
+        signal: p.signal,
+        onStdout: (text) => streams.stdout.push(text),
+        onStderr: (text) => streams.stderr.push(text),
+      });
+    } finally {
+      streams.stdout.flush();
+      streams.stderr.flush();
+    }
     if (result.exitCode !== 0) {
       throw new CommandError('git clone', result.exitCode, redact(result.stdout, p.token), redact(result.stderr, p.token));
     }
@@ -786,10 +756,6 @@ export class WorkspaceHelper {
     }
   }
 
-  private redactingOutput(output: (text: string) => void, secret: string): (text: string) => void {
-    return (text) => output(redact(text, secret));
-  }
-
   private repositoryFolder(repository: string): string {
     return `${WORKSPACES_ROOT}/${checkRepository(repository).name}`;
   }
@@ -809,9 +775,13 @@ export class WorkspaceHelper {
   ): Promise<DevcontainerResult> {
     const output = options.onOutput ?? this.logOutput;
     const secret = options.secret;
-    // Review PL-1: stdout goes on in whole lines (ResultLineFilter), stderr through a RedactingStream.
-    const stdoutFilter = new ResultLineFilter(secret === undefined ? output : this.redactingOutput(output, secret));
-    const stderr = secret === undefined ? undefined : new RedactingStream(output, secret);
+    // Review PL-1: stdout goes on in whole lines without the result line (ResultLineFilter). Cleanup after plan step 11
+    // (PR C3, B2): both streams through a StreamRedactor (without a secret it passes the text on as it is); its flush
+    // masks the start of a token that a cut stream ended with (before: stderr through RedactingStream, which passed it
+    // on unmasked, and stdout masked line by line).
+    const stdout = new StreamRedactor(secret, output);
+    const stdoutFilter = new ResultLineFilter((text) => stdout.push(text));
+    const stderr = new StreamRedactor(secret, output);
     let result: RunResult;
     try {
       result = await this.runStreams(volumeName, {
@@ -821,11 +791,12 @@ export class WorkspaceHelper {
         image: options.image,
         signal: options.signal,
         onStdout: (text) => stdoutFilter.write(text),
-        onStderr: stderr === undefined ? output : (text) => stderr.write(text),
+        onStderr: (text) => stderr.push(text),
       });
     } finally {
       stdoutFilter.flush();
-      stderr?.flush();
+      stdout.flush();
+      stderr.flush();
     }
     if (secret !== undefined) result = { ...result, stdout: redact(result.stdout, secret), stderr: redact(result.stderr, secret) };
     let parsed: DevcontainerResult | undefined;
