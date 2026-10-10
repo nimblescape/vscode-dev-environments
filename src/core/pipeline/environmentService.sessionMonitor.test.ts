@@ -49,29 +49,31 @@ function setup(
   seqs = [];
   ensureSignals = [];
   ensureAt = [];
+  // Cleanup C5 (plan step 11J, A11): the port takes no target; the calls name the engine of the open's target.
+  const current = (): Target => (typeof target === 'function' ? target(created.helper) : target);
   const sessionMonitor: EnvironmentSessionMonitor = {
-    ensure: async (target, helperTag, signal, helperImage) => {
+    ensure: async (signal) => {
       ensureSignals.push(signal);
       ensureAt.push({ ups: created.helper.ups.length, userCommands: created.helper.userCommandRuns.length });
-      const host = engineOf(target);
-      // Review round 1 of PR #64 (S1), review round 3 of PR #64 (P2): the image ID of the helper image of the open.
-      calls.push(`ensure ${host} ${helperTag}` + (helperImage !== undefined ? ` image ${helperImage}` : ''));
+      const host = engineOf(current());
+      calls.push(`ensure ${host}`);
       // In the order of the helper calls.
       created.helper.calls.push('remote monitor');
       return behavior.ensure?.(ensureSignals.length - 1);
     },
-    heartbeat: async (target, environmentId, keepRunning, seq) => {
-      const host = engineOf(target);
+    heartbeat: async (environmentId, keepRunning, seq) => {
+      const host = engineOf(current());
       calls.push(`heartbeat ${host} ${environmentId} ${keepRunning}`);
       seqs.push(seq);
       created.helper.calls.push('first heartbeat');
       return (await behavior.heartbeat?.()) ?? { ok: true };
     },
-    forget: async (target, environmentId) => {
-      const host = engineOf(target);
+    forget: async (environmentId) => {
+      const host = engineOf(current());
       calls.push(`forget ${host} ${environmentId}`);
       return behavior.forget?.();
     },
+    images: async () => {},
   };
   const created = createHarness({ dockerTarget: async () => (typeof target === 'function' ? target(created.helper) : target), sessionMonitor });
   h = created;
@@ -87,14 +89,17 @@ const REMOTE = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' 
 const LOCAL = { kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock' } as const;
 
 describe('the Session Monitor in the open pipeline', () => {
-  it('a first open on a remote host ensures it once, with the helper tag, after the helper image and before up', async () => {
+  it('a first open on a remote host ensures it once, after the helper image and before up', async () => {
     const { h, calls } = setup(REMOTE);
     const result = await h.service.open(TARGET, { progress: h.progress });
     // Then the first heartbeat of this computer for the new environment, not kept. Changed expectation (review round 3 of
     // PR #64, P2): the monitor runs the image ID that the open pinned for the current tag too; the label keeps the tag.
     // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container (was:
     // the ensure and the first heartbeat only).
-    const ensure = `ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    // Cleanup C5 (plan step 11J, A11): changed expectation, the port takes no target, helper tag or image (the
+    // worker's monitor runs its own helper image and ignored them); the engine is the target of the open (was: `ensure
+    // <engine> devenv-helper:test image <ID>`).
+    const ensure = 'ensure build-box';
     expect(calls).toEqual([ensure, `heartbeat build-box ${result.environment.id} false`, ensure]);
     const order = h.helper.calls;
     expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
@@ -110,7 +115,10 @@ describe('the Session Monitor in the open pipeline', () => {
     await h.service.openEnvironment(ENV_ID, { progress: h.progress });
     // Changed expectation (review round 3 of PR #64, P2): the monitor runs the image ID that the open pinned.
     // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container.
-    const ensure = `ensure build-box devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    // Cleanup C5 (plan step 11J, A11): changed expectation, the port takes no target, helper tag or image (the
+    // worker's monitor runs its own helper image and ignored them); the engine is the target of the open (was: `ensure
+    // <engine> devenv-helper:test image <ID>`).
+    const ensure = 'ensure build-box';
     expect(calls).toEqual([ensure, `heartbeat build-box ${ENV_ID} false`, ensure]);
     // The stopped container is started with `up` of the Dev Container CLI.
     const up = h.helper.calls.findIndex((call) => call.startsWith('up '));
@@ -168,7 +176,10 @@ describe('the Session Monitor in the open pipeline', () => {
     const { h, calls } = setup(LOCAL);
     const result = await h.service.open(TARGET, { progress: h.progress });
     // Changed expectation, review round 1 of PR #86, A-R1-1: ensured again right after `up` started the container.
-    const ensure = `ensure local devenv-helper:test image ${h.helper.currentHelperImageId}`;
+    // Cleanup C5 (plan step 11J, A11): changed expectation, the port takes no target, helper tag or image (the
+    // worker's monitor runs its own helper image and ignored them); the engine is the target of the open (was: `ensure
+    // <engine> devenv-helper:test image <ID>`).
+    const ensure = 'ensure local';
     expect(calls).toEqual([ensure, `heartbeat local ${result.environment.id} false`, ensure]);
     const order = h.helper.calls;
     expect(order.indexOf('ensureImage')).toBeLessThan(order.indexOf('remote monitor'));
@@ -469,15 +480,16 @@ describe('the image list for the Session Monitor in the open pipeline', () => {
   function withImages(target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>, images: (host: string) => Promise<void>) {
     const calls: string[] = [];
     const sessionMonitor: EnvironmentSessionMonitor = {
-      ensure: async (target) => {
+      // Cleanup C5 (plan step 11J, A11): the port takes no target; the calls name the engine of the open's target.
+      ensure: async () => {
         calls.push(`ensure ${engineOf(target)}`);
       },
-      heartbeat: async (target) => {
+      heartbeat: async () => {
         calls.push(`heartbeat ${engineOf(target)}`);
         return { ok: true };
       },
       forget: async () => {},
-      images: async (target) => {
+      images: async () => {
         calls.push(`images ${engineOf(target)}`);
         return images(engineOf(target));
       },

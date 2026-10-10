@@ -12,7 +12,6 @@ import { unusedEngine } from './dockerEngine.testkit';
 import { workerHostSide } from './workerHostSide';
 import { workerSessionMonitor } from './workerServices';
 
-const TARGET = { kind: 'local' as const, host: '', endpoint: '' };
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
 describe("the worker's services of an open (plan step 11E6)", () => {
@@ -20,9 +19,12 @@ describe("the worker's services of an open (plan step 11E6)", () => {
     const images = vi.fn(async (_signal: AbortSignal | undefined) => {});
     const monitor = workerSessionMonitor(unusedEngine(), undefined, silentLogger, { images });
     const signal = new AbortController().signal;
-    await monitor.images!(TARGET, signal);
+    await monitor.images(signal);
     expect(images).toHaveBeenCalledWith(signal);
-    expect(workerSessionMonitor(unusedEngine(), undefined, silentLogger).images).toBeUndefined();
+    // Cleanup C5 (plan step 11J, A11): changed expectation, `images` is required by the port; without the operation's
+    // images it sends nothing and resolves (was: no `images` at all, so the pipeline skipped it). unusedEngine throws on
+    // any call.
+    await expect(workerSessionMonitor(unusedEngine(), undefined, silentLogger).images(signal)).resolves.toBeUndefined();
   });
 
   it('the memory of the window: a container ID, or LIFECYCLE_UNKNOWN; anything else is refused', async () => {

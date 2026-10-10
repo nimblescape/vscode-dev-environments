@@ -154,13 +154,17 @@ export function workerSessionMonitor(
 ): EnvironmentSessionMonitor {
   return {
     // Plan step 11E6 (decision D1 of 2026-10-05): the image settings and the image list of the open, given by its operation.
-    ...(open.images !== undefined ? { images: (_target: unknown, signal?: AbortSignal) => open.images!(signal) } : {}),
-    // The worker's own helper image runs the monitor (the operation knows it), never the tag or ID of the pipeline's run.
-    ensure: async (_target, _helperTag, signal) => {
+    // Cleanup C5 (plan step 11J, A11): required by the port; without them, nothing is sent (as before, when it was left out).
+    images: async (signal) => {
+      if (open.images !== undefined) await open.images(signal);
+    },
+    // The worker's own helper image runs the monitor (the operation knows it); the port names no tag or image of the
+    // pipeline's run (cleanup C5, plan step 11J, A11).
+    ensure: async (signal) => {
       if (open.ensure === undefined) throw notGiven('ensure of the Session Monitor (with its image maintenance)');
       await open.ensure(signal);
     },
-    heartbeat: async (_target, environmentId, keepRunning, seq) => {
+    heartbeat: async (environmentId, keepRunning, seq) => {
       if (source === undefined) return { ok: false, detail: 'The operation names no computer for the Session Monitor.' };
       // Review round 1 of PR #108 (A-L1): a computer ID that the monitor script would refuse is named as such.
       if (!isSourceId(source)) return { ok: false, detail: 'The computer of the operation has no valid ID for the Session Monitor.' };
@@ -168,7 +172,7 @@ export function workerSessionMonitor(
       const result = await sendHeartbeat(engine, { source, limitSeconds: open.limitSeconds(), environments: [{ id: environmentId, keepRunning, seq }] });
       return result.ok ? { ok: true } : { ok: false, detail: result.detail };
     },
-    forget: async (_target, environmentId) => {
+    forget: async (environmentId) => {
       if (source === undefined) throw new Error('The operation names no computer for the Session Monitor.');
       const result = await forgetRecord(engine, source, environmentId);
       if (!result.ok && !result.missing) log.warn(`The heartbeat record of ${environmentId} could not be removed from the Session Monitor: ${result.detail}`);

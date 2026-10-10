@@ -10,7 +10,6 @@ import { unusedEngine } from './dockerEngine.testkit';
 import type { HostSide } from './hostSide';
 import { workerServiceDeps, type WorkerServicesDeps } from './workerServices';
 
-const TARGET = { kind: 'local', host: undefined, endpoint: undefined } as never;
 
 const deps = (overrides: Partial<WorkerServicesDeps>) =>
   workerServiceDeps({
@@ -30,8 +29,10 @@ describe("the images of an open in the worker's services (review B, round 1 of P
   it('B1-57: the monitorImages of the operation are the Session Monitor\'s images, with the signal of the pipeline', async () => {
     const monitorImages = vi.fn(async (_signal: AbortSignal | undefined) => {});
     const signal = new AbortController().signal;
-    await deps({ monitorImages }).sessionMonitor!.images!(TARGET, signal);
+    await deps({ monitorImages }).sessionMonitor!.images(signal);
     expect(monitorImages).toHaveBeenCalledWith(signal);
-    expect(deps({}).sessionMonitor!.images).toBeUndefined();
+    // Cleanup C5 (plan step 11J, A11): changed expectation, `images` is required by the port; without monitorImages it
+    // sends nothing and resolves (was: no `images`). The engine of these deps (unusedEngine) throws on any call.
+    await expect(deps({}).sessionMonitor!.images(signal)).resolves.toBeUndefined();
   });
 });

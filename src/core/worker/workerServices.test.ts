@@ -367,7 +367,6 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
 describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
   const SOURCE = '0123456789abcdef0123456789abcdef';
   const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
-  const TARGET = { kind: 'local', host: '', endpoint: '' } as const;
 
   function engineWith(answer: () => Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }>) {
     const execs: { container: string; command: readonly string[]; timeoutMs?: number }[] = [];
@@ -386,7 +385,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
   it('forgets the record of the computer by the command of the monitor script, under the lock of its records, within its limit', async () => {
     const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
     const { lines, logger } = log();
-    await workerSessionMonitor(engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engine, SOURCE, logger).forget(ID);
     // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorForget (forgetCommand before), the same line.
     expect(execs).toEqual([{ container: REMOTE_MONITOR_CONTAINER, command: scriptCommand('monitorForget', [SOURCE, ID]), timeoutMs: MONITOR_EXEC_TIMEOUT_MS }]);
     expect(execs[0].command.slice(-5)).toEqual(['node', REMOTE_MONITOR_SCRIPT_PATH, 'forget', SOURCE, ID]);
@@ -396,14 +395,14 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
 
   it('a missing monitor container is not logged; a failure, a kill and no end in time are', async () => {
     const { lines, logger } = log();
-    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('No such container', 404))).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('No such container', 404))).engine, SOURCE, logger).forget(ID);
     expect(lines).toEqual([]);
-    await workerSessionMonitor(engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'boom', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
-    await workerSessionMonitor(engineWith(async () => ({ exitCode: RECORDS_RUN_LIMIT_EXIT, stdout: '', stderr: '', timedOut: false })).engine, SOURCE, logger).forget!(TARGET, ID);
-    await workerSessionMonitor(engineWith(async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true })).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'boom', timedOut: false })).engine, SOURCE, logger).forget(ID);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: RECORDS_RUN_LIMIT_EXIT, stdout: '', stderr: '', timedOut: false })).engine, SOURCE, logger).forget(ID);
+    await workerSessionMonitor(engineWith(async () => ({ exitCode: null, stdout: '', stderr: '', timedOut: true })).engine, SOURCE, logger).forget(ID);
     // Review round 1 of 11C2a (A-R1-L3): changed expectation, a monitor that does not run (idle) is not logged either.
-    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('Container abc is not running', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
-    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('conflict', 409))).engine, SOURCE, logger).forget!(TARGET, ID);
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('Container abc is not running', 409))).engine, SOURCE, logger).forget(ID);
+    await workerSessionMonitor(engineWith(async () => Promise.reject(new EngineError('conflict', 409))).engine, SOURCE, logger).forget(ID);
     expect(lines).toEqual([
       `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: boom`,
       `warn The heartbeat record of ${ID} could not be removed from the Session Monitor: the command was killed (its limit of 10 s, or a kill from outside)`,
@@ -415,14 +414,14 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
   it('without the computer of the operation, it refuses; the rest of the monitor fails closed', async () => {
     const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
     const monitor = workerSessionMonitor(engine, undefined, silentLogger);
-    await expect(monitor.forget!(TARGET, ID)).rejects.toThrow('names no computer');
+    await expect(monitor.forget(ID)).rejects.toThrow('names no computer');
     // Plan step 11D1: changed, the ensure comes with 11D2, the first heartbeat of the open with the open (11E); the
     // heartbeats of a window are the operation `heartbeat` (before: both named 11D). Plan step 11E4e: changed again, the
     // ensure fails closed without the ensure of its operation (until 11E6 gives it), and the first heartbeat is not sent
     // without the computer (before: both threw "before plan step 11D2" and "before plan step 11E").
     // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E6").
-    await expect(monitor.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
-    expect(await monitor.heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'The operation names no computer for the Session Monitor.' });
+    await expect(monitor.ensure(undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
+    expect(await monitor.heartbeat(ID, false, 1)).toEqual({ ok: false, detail: 'The operation names no computer for the Session Monitor.' });
     expect(execs).toEqual([]);
   });
 
@@ -432,7 +431,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     it("the first heartbeat of the open: this computer's record with the time limit, by the command of the monitor script", async () => {
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
       const monitor = workerSessionMonitor(engine, COMPUTER, silentLogger, { limitSeconds: () => 900 });
-      expect(await monitor.heartbeat(TARGET, ID, true, 7)).toEqual({ ok: true });
+      expect(await monitor.heartbeat(ID, true, 7)).toEqual({ ok: true });
       // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
       expect(execs).toEqual([
         {
@@ -446,7 +445,7 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
     it('a computer ID that the monitor would refuse is not sent (review round 1 of PR #108, A-L1); the limit is clamped', async () => {
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
       for (const source of ['', 'a b', '../x', 'x'.repeat(200)]) {
-        expect(await workerSessionMonitor(engine, source, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1), source).toEqual({
+        expect(await workerSessionMonitor(engine, source, silentLogger, { limitSeconds: () => 900 }).heartbeat(ID, false, 1), source).toEqual({
           ok: false,
           detail: 'The computer of the operation has no valid ID for the Session Monitor.',
         });
@@ -461,9 +460,9 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
 
     it('a failed heartbeat is answered as not sent, with its cause; without the time limit it is not sent', async () => {
       const failing = engineWith(async () => ({ exitCode: 1, stdout: '', stderr: 'records locked', timedOut: false }));
-      expect(await workerSessionMonitor(failing.engine, COMPUTER, silentLogger, { limitSeconds: () => 900 }).heartbeat(TARGET, ID, false, 1)).toEqual({ ok: false, detail: 'records locked' });
+      expect(await workerSessionMonitor(failing.engine, COMPUTER, silentLogger, { limitSeconds: () => 900 }).heartbeat(ID, false, 1)).toEqual({ ok: false, detail: 'records locked' });
       const { engine, execs } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
-      expect(await workerSessionMonitor(engine, COMPUTER, silentLogger).heartbeat(TARGET, ID, false, 1)).toEqual({
+      expect(await workerSessionMonitor(engine, COMPUTER, silentLogger).heartbeat(ID, false, 1)).toEqual({
         ok: false,
         detail: 'The operation has no settings for the time limit of the heartbeat.',
       });
@@ -474,10 +473,10 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       const { engine } = engineWith(async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
       const signals: (AbortSignal | undefined)[] = [];
       const signal = new AbortController().signal;
-      await workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async (s) => void signals.push(s) }).ensure(TARGET, 'ignored-tag', signal, 'sha256:ignored');
+      await workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async (s) => void signals.push(s) }).ensure(signal);
       expect(signals).toEqual([signal]);
       const failing = workerSessionMonitor(engine, COMPUTER, silentLogger, { ensure: async () => Promise.reject(new Error('no space left')) });
-      await expect(failing.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('no space left');
+      await expect(failing.ensure(undefined)).rejects.toThrow('no space left');
     });
 
     it('the deps of the pipeline: the ensure of the operation, and the time limit of its settings', async () => {
@@ -497,12 +496,12 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
           ...overrides,
         });
       const all = deps({ monitorSource: COMPUTER, settings: { stopAfterMinutes: 30 } as never, monitorEnsure: async (s) => void ensured.push(s) });
-      await all.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined);
+      await all.sessionMonitor!.ensure(undefined);
       // Review round 1 of PR #108: the signal of the run goes to the ensure of the operation.
       const run = new AbortController().signal;
-      await all.sessionMonitor!.ensure(TARGET, 'tag', run, undefined);
+      await all.sessionMonitor!.ensure(run);
       expect(ensured).toEqual([undefined, run]);
-      expect(await all.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toEqual({ ok: true });
+      expect(await all.sessionMonitor!.heartbeat(ID, false, 3)).toEqual({ ok: true });
       // Plan step 11I (U2, decision of 2026-10-08): the command of the entry monitorHeartbeat (heartbeatCommand before).
       expect(execs.map((exec) => exec.command)).toEqual([
         scriptCommand('monitorHeartbeat', [JSON.stringify({ source: COMPUTER, limitSeconds: stopAfterSeconds(30), environments: [{ id: ID, keepRunning: false, seq: 3 }] })]),
@@ -510,8 +509,8 @@ describe("the worker's Session Monitor for Delete (plan step 11C2a)", () => {
       // Without them, the ensure fails closed and no heartbeat is sent.
       const bare = deps({});
       // Plan step 11I (PR D): changed, the message names what the operation did not give (before: "before plan step 11E6").
-      await expect(bare.sessionMonitor!.ensure(TARGET, 'tag', undefined, undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
-      expect(await bare.sessionMonitor!.heartbeat(TARGET, ID, false, 3)).toMatchObject({ ok: false });
+      await expect(bare.sessionMonitor!.ensure(undefined)).rejects.toThrow('The operation gives the worker no ensure of the Session Monitor');
+      expect(await bare.sessionMonitor!.heartbeat(ID, false, 3)).toMatchObject({ ok: false });
       expect(execs).toHaveLength(1);
     });
   });

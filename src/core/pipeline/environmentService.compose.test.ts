@@ -645,9 +645,8 @@ describe('first open of a Docker Compose configuration', () => {
 // Review round 2 of PR #86 (B-R2-1, B-R2-2): the Session Monitor again after `up` of Docker Compose started the dev
 // container (review round 1 of PR #86, A-R1-1), as in runUp: once per run, after `up` and before the lifecycle commands.
 describe('the Session Monitor again after `up` of Docker Compose (review round 2 of PR #86)', () => {
+  // Cleanup C5 (plan step 11J, A11): the port takes no helper tag or image any more (the worker's monitor runs its own).
   interface Ensure {
-    tag: string;
-    image: string | undefined;
     signal: AbortSignal | undefined;
     ups: number;
     userCommands: number;
@@ -658,12 +657,13 @@ describe('the Session Monitor again after `up` of Docker Compose (review round 2
     h.cleanup();
     const ensures: Ensure[] = [];
     const sessionMonitor: EnvironmentSessionMonitor = {
-      ensure: async (_target, tag, signal, image) => {
-        ensures.push({ tag, image, signal, ups: h.helper.ups.length, userCommands: h.helper.userCommandRuns.length });
+      ensure: async (signal) => {
+        ensures.push({ signal, ups: h.helper.ups.length, userCommands: h.helper.userCommandRuns.length });
         return fail(ensures.length - 1);
       },
       heartbeat: async () => ({ ok: true }),
       forget: async () => undefined,
+      images: async () => undefined,
     };
     h = createHarness({
       newEnvironmentId: () => ENV_ID,
@@ -674,7 +674,7 @@ describe('the Session Monitor again after `up` of Docker Compose (review round 2
     return ensures;
   }
 
-  it('ensures it again after `up` and before the lifecycle commands, with the same image and signal, once (B-R2-1 a)', async () => {
+  it('ensures it again after `up` and before the lifecycle commands, with the same signal, once (B-R2-1 a)', async () => {
     const ensures = withSessionMonitor();
     await seedCompose();
     const controller = new AbortController();
@@ -685,9 +685,8 @@ describe('the Session Monitor again after `up` of Docker Compose (review round 2
       { ups: 1, userCommands: 0 },
     ]);
     expect(h.helper.userCommandRuns).toHaveLength(1);
-    expect(ensures[1].tag).toBe(ensures[0].tag);
-    expect(ensures[1].image).toBe(ensures[0].image);
-    expect(ensures[1].image).toBeDefined();
+    // Cleanup C5 (plan step 11J, A11): the checks of the same tag and image of both ensures are removed with those
+    // parameters of the port (the worker's monitor ignored them).
     expect(ensures[1].signal).toBe(ensures[0].signal);
     expect(ensures[1].signal).toBeDefined();
   });

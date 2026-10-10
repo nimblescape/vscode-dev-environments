@@ -26,7 +26,7 @@ describe('the rule of `missing` per command of the Session Monitor (PR #138, B5,
     expect(await forgetRecord(failingExec(error), SOURCE, 'env')).toEqual({ ok: false, missing: false, detail: error.message });
     const lines: string[] = [];
     const logger = { ...silentLogger, warn: (text: string) => lines.push(text) } as Logger;
-    await workerSessionMonitor(failingExec(error), SOURCE, logger).forget!({ kind: 'local', host: '', endpoint: '' }, 'env');
+    await workerSessionMonitor(failingExec(error), SOURCE, logger).forget('env');
     expect(lines).toEqual([`The heartbeat record of env could not be removed from the Session Monitor: ${error.message}`]);
   });
 

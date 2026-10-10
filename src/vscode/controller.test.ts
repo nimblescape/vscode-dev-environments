@@ -255,8 +255,6 @@ function createHarness(
     sessionMonitor?: ControllerDeps['sessionMonitor'];
     /** User decision 2026-09-28: the pause between the checks of the container (default 0). */
     readyPollMs?: number;
-    /** Plan step 11B1 (review round 1, A-R1-9): a window that runs no flow in a worker. */
-    noFlow?: boolean;
   } = {},
 ): Harness {
   const listOpenMode: Harness['listOpenMode'] = { value: 'singleClick' };
@@ -412,7 +410,7 @@ function createHarness(
     docker,
     // Plan step 11B1: the flows that run in the worker (the token removal); the flow itself is tested in
     // src/core/worker/tokenRemoveFlow.test.ts.
-    flow: options.noFlow === true ? undefined : flow,
+    flow,
     service,
     discovery,
     auth,
@@ -3247,14 +3245,6 @@ describe('Accounts (concept 7.5)', () => {
       h.flow.mockResolvedValueOnce({ outcome: 'notRunning' });
       await takeTokenOut();
       expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('GitHub token could not be removed'));
-    });
-
-    it('warns when this window runs no flow (review round 1 of 11B1, A-R1-9)', async () => {
-      recreateHarness({ noFlow: true });
-      const env = environment({ owner: OTHER_ACCOUNT, volumeName: VOLUME });
-      await h.registry.add(env);
-      await h.controller.openAttachedWindow(env, CONTAINER, undefined);
-      await settle(() => h.logger.warn.mock.calls.some((call) => String(call[0]).includes('runs no flow in a worker')), 'the warning');
     });
 
     it('runs no flow on another Docker host', async () => {

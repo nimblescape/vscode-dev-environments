@@ -15,7 +15,11 @@
 //      and those of the list that the extension sent ("all images": the registry lists no repositories without a token,
 //      so the extension reads the packages with its GitHub session and sends only the names; `monitor.js images -`).
 //   2. For each: the tags of the registry (anonymous, the token of its challenge); the highest major tag (a plain number,
-//      for example `2`) is pulled (`<repository>:<major>`: the engine downloads only what changed).
+//      for example `2`) is pulled (`<repository>:<major>`: the engine downloads only what changed). Cleanup C5 (plan step
+//      11J, C1; the user's decision of 2026-10-10): the tags are read with the worker's registry client
+//      (imageCheck/registryClient.ts, listTags) over the HTTPS of the proxy of the daemon (proxyTransport.ts), as the
+//      worker's image checks and the monitor's VS Code downloads; before, the monitor had its own `https.get` client
+//      that went around that proxy.
 //   3. For each: the two newest versions stay (an image ID is one version: its highest version tag, a shorter tag such as
 //      `2` or `latest` above the longer ones of its line, else its creation time); every older one is removed when no
 //      container uses it and no other image is built on it (an environment image: its layers start with those of the
@@ -23,8 +27,9 @@
 // Plan step 11I (U1, decision of 2026-10-08): every request to the engine goes over the Engine API (the port of
 // engine.ts; before, the Docker CLI of the container), each within its time limit; the pull without a login, as the CLI
 // of the monitor had none. Never throws; each problem is one line of the log.
-import type { IncomingMessage } from 'http';
-import * as https from 'https';
+import { RegistryClient, type RegistryFailure } from '../core/imageCheck/registryClient';
+import type { HttpTransport } from '../core/http';
+import { abortError } from '../core/ports';
 import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import type { EngineImage } from '../core/worker/dockerEngine';
 import { engineFailure, type ImageEngine } from './engine';
@@ -40,72 +45,37 @@ export const KEPT_IMAGE_VERSIONS = 2;
 export const IMAGE_LIST_TIMEOUT_MS = 60_000;
 export const IMAGE_PULL_TIMEOUT_MS = 60 * 60_000;
 export const IMAGE_REMOVE_TIMEOUT_MS = 120_000;
+/**
+ * The time limit of each request to a registry (review round 2 of PR #57, R5: every request settles within it, also when
+ * the answer trickles or is cut). Cleanup C5 (plan step 11J, C1): applied to each request of the registry client
+ * (requestsWithin), the tunnel through the proxy included.
+ */
 export const REGISTRY_TIMEOUT_MS = 30_000;
-/** The longest answer of a registry that is read. */
-const MAX_REGISTRY_BODY = 4 * 1024 * 1024;
-/** At most this many pages of a tag list. */
-const MAX_TAG_PAGES = 20;
-
-/** An HTTP GET: status, lower-case headers, body. Rejects on a network error or the time limit. */
-export type HttpGet = (url: string, headers: Record<string, string>) => Promise<{ status: number; headers: Record<string, string>; body: string }>;
 
 /**
- * HttpGet with https. Review round 2 of PR #57 (R5): settles in every case within REGISTRY_TIMEOUT_MS: the idle time
- * limit of the socket alone let a registry that sends a byte now and then, or a connection cut in the middle of the
- * answer (no `end`, no error of the request), keep a pass open for ever, and with it every later pass.
+ * Cleanup C5 (plan step 11J, C1): `transport` with the time limit `timeoutMs` on each request: its signal aborts at the
+ * limit, and the request rejects with an AbortError then, also when the transport does not end on its signal; one that
+ * cannot start rejects.
  */
-export const nodeHttpGet: HttpGet = (url, headers) => httpGetWith(https.get, url, headers, REGISTRY_TIMEOUT_MS);
-
-/** nodeHttpGet with another `get` (the tests: `http.get` of a local server) and time limit. */
-export function httpGetWith(
-  get: typeof https.get,
-  url: string,
-  headers: Record<string, string>,
-  timeoutMs: number,
-): ReturnType<HttpGet> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    // Review round 3 of PR #57 (N1): `get` throws at once for an invalid URL (the realm of a registry's challenge) or
-    // header (its token); then there is no request, and the time limit found none to end (an uncaught error ended the
-    // monitor).
-    let request: ReturnType<typeof https.get> | undefined;
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      request?.destroy();
-      reject(error);
-    };
-    const onResponse = (response: IncomingMessage) => {
-      let body = '';
-      response.setEncoding('utf8');
-      response.on('data', (chunk: string) => {
-        body += chunk;
-        if (body.length > MAX_REGISTRY_BODY) fail(new Error('The answer of the registry is too large.'));
+export function requestsWithin(transport: HttpTransport, timeoutMs: number): HttpTransport {
+  return {
+    request: (request, signal) => {
+      const limit = AbortSignal.timeout(timeoutMs);
+      const both = signal === undefined ? limit : AbortSignal.any([signal, limit]);
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(abortError());
+        if (both.aborted) {
+          onAbort();
+          return;
+        }
+        both.addEventListener('abort', onAbort, { once: true });
+        transport
+          .request(request, both)
+          .then(resolve, reject)
+          .finally(() => both.removeEventListener('abort', onAbort));
       });
-      response.on('error', (error) => fail(error));
-      response.on('close', () => {
-        if (!response.complete) fail(new Error('The connection to the registry was cut.'));
-      });
-      response.on('end', () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(deadline);
-        const flat: Record<string, string> = {};
-        for (const [key, value] of Object.entries(response.headers)) if (value !== undefined) flat[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
-        resolve({ status: response.statusCode ?? 0, headers: flat, body });
-      });
-    };
-    const deadline = setTimeout(() => fail(new Error('The registry did not answer in time.')), timeoutMs);
-    try {
-      request = get(url, { headers, timeout: timeoutMs }, onResponse);
-    } catch (error) {
-      fail(error instanceof Error ? error : new Error(String(error)));
-      return;
-    }
-    request.on('timeout', () => fail(new Error('The registry did not answer in time.')));
-    request.on('error', (error) => fail(error));
-  });
+    },
+  };
 }
 
 /** One image of a repository, as one row of `docker image ls` showed it. */
@@ -230,19 +200,15 @@ export function splitRepository(repository: string): { registry: string; path: s
   return { registry, path: repository.slice(slash + 1) };
 }
 
-/** The Bearer challenge of `WWW-Authenticate`: realm, service, scope. */
-export function parseBearerChallenge(header: string | undefined): { realm: string; service?: string; scope?: string } | undefined {
-  if (!header || !/^Bearer\s/i.test(header)) return undefined;
-  const fields: Record<string, string> = {};
-  for (const match of header.matchAll(/(\w+)="([^"]*)"/g)) fields[match[1].toLowerCase()] = match[2];
-  if (!fields.realm || !/^https:\/\//.test(fields.realm)) return undefined;
-  return { realm: fields.realm, service: fields.service, scope: fields.scope };
-}
-
 export interface ImageMaintenanceDeps {
   /** Plan step 11I (U1, decision of 2026-10-08): the engine over the Engine API (engine.ts), not the Docker CLI. */
   engine: ImageEngine;
-  httpGet: HttpGet;
+  /**
+   * Cleanup C5 (plan step 11J, C1; decision of 2026-10-10): the HTTPS of the registry requests, made afresh for each pass
+   * (the monitor's: the proxy of the daemon, read once per transport, so a failed read or a changed proxy counts only for
+   * that pass). Before: `httpGet`, the monitor's own `https.get` client.
+   */
+  registryTransport: () => HttpTransport;
   log: (message: string) => void;
   /**
    * The prefixes of the pass: those of the container (DEVENV_IMAGE_PREFIXES), or the newer ones that an extension sent
@@ -329,6 +295,8 @@ function createdTime(text: string): number {
 /** The passes of the image maintenance. */
 export class ImageMaintenance {
   private replaced: ReplacedImages = {};
+  /** Cleanup C5 (plan step 11J, C1): the registry client of the current pass (anonymous; see `pass`). */
+  private registry: RegistryClient | undefined;
 
   constructor(private readonly deps: ImageMaintenanceDeps) {}
 
@@ -337,6 +305,15 @@ export class ImageMaintenance {
     const prefixes = this.deps.prefixes();
     if (prefixes.length === 0) return;
     try {
+      // Cleanup C5 (plan step 11J, C1): the worker's registry client, anonymous (no credentials, as before), each request
+      // within REGISTRY_TIMEOUT_MS; its warnings go to the log.
+      const log = (message: string) => this.deps.log(message);
+      this.registry = new RegistryClient(requestsWithin(this.deps.registryTransport(), REGISTRY_TIMEOUT_MS), async () => undefined, {
+        info: log,
+        warn: log,
+        error: log,
+        output: () => {},
+      });
       if (this.deps.replaced) this.replaced = await this.deps.replaced.read();
       const local = await this.repositories(prefixes);
       await this.remember(local);
@@ -586,38 +563,30 @@ export class ImageMaintenance {
     return failure;
   }
 
-  /** The tags of a repository at its registry, anonymous with the token of its challenge; all pages. */
+  /**
+   * The tags of a repository at its registry, anonymous with the token of its challenge; all pages. Cleanup C5 (plan step
+   * 11J, C1): with the worker's registry client (RegistryClient.listTags); rejects with the reason it gives.
+   */
   private async tags(repository: string): Promise<string[]> {
     const parts = splitRepository(repository);
     if (!parts) throw new Error('no registry');
-    const base = `https://${parts.registry}`;
-    let url: string | undefined = `${base}/v2/${parts.path}/tags/list`;
-    let token: string | undefined;
-    const tags: string[] = [];
-    for (let page = 0; url !== undefined && page < MAX_TAG_PAGES; page++) {
-      let answer = await this.deps.httpGet(url, token ? { authorization: `Bearer ${token}` } : {});
-      if (answer.status === 401 && token === undefined) {
-        const challenge = parseBearerChallenge(answer.headers['www-authenticate']);
-        if (!challenge) throw new Error(`HTTP 401 without a Bearer challenge`);
-        const query = new URLSearchParams();
-        if (challenge.service) query.set('service', challenge.service);
-        query.set('scope', challenge.scope ?? `repository:${parts.path}:pull`);
-        const tokenAnswer = await this.deps.httpGet(`${challenge.realm}?${query.toString()}`, {});
-        if (tokenAnswer.status !== 200) throw new Error(`the token of the registry: HTTP ${tokenAnswer.status}`);
-        const parsed = JSON.parse(tokenAnswer.body) as { token?: unknown; access_token?: unknown };
-        const value = typeof parsed.token === 'string' ? parsed.token : typeof parsed.access_token === 'string' ? parsed.access_token : undefined;
-        if (!value) throw new Error('the registry gave no token');
-        token = value;
-        answer = await this.deps.httpGet(url, { authorization: `Bearer ${token}` });
-      }
-      if (answer.status !== 200) throw new Error(`HTTP ${answer.status}`);
-      const body = JSON.parse(answer.body) as { tags?: unknown };
-      if (Array.isArray(body.tags)) for (const tag of body.tags) if (typeof tag === 'string') tags.push(tag);
-      // The next page (RFC 5988 Link), only on the same registry.
-      const next = /<([^>]+)>;\s*rel="next"/.exec(answer.headers.link ?? '')?.[1];
-      url = next === undefined ? undefined : new URL(next, base).origin === base ? new URL(next, base).toString() : undefined;
-    }
-    return tags;
+    if (this.registry === undefined) throw new Error('no registry client');
+    const listed = await this.registry.listTags(parts.registry, parts.path);
+    if (listed.kind === 'tags') return listed.tags;
+    throw new Error(registryFailureText(listed));
+  }
+}
+
+/** Cleanup C5 (plan step 11J, C1): the reason of a failed tag list, for the log. */
+function registryFailureText(failure: RegistryFailure): string {
+  switch (failure.kind) {
+    case 'authRequired':
+      return 'the registry asks for a sign-in';
+    case 'notFound':
+      return 'HTTP 404';
+    case 'unreachable':
+    case 'error':
+      return failure.error;
   }
 }
 

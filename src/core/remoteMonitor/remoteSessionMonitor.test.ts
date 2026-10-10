@@ -17,7 +17,7 @@ import * as esbuild from 'esbuild';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_BUNDLE_LINE_LENGTH, PIPE_LOADER, bundleHash, encodeBundle } from '../loader/pipeLoader';
 import { abortError, type Logger } from '../ports';
-import { EngineError, type DockerEngine, type EngineExecResult } from '../worker/dockerEngine';
+import { EngineError, type DockerEngine, type EngineExecResult, type MonitorCreated, type MonitorRunSpec } from '../worker/dockerEngine';
 import { unusedEngine } from '../worker/dockerEngine.testkit';
 import { engineMonitor } from '../worker/engineMonitor';
 import {
@@ -36,7 +36,7 @@ import {
   REMOTE_MONITOR_STALE_CREATED_MS,
   RemoteSessionMonitor,
 } from './remoteSessionMonitor';
-import { parseDockerTime, type MonitorCreated, type MonitorEngine, type MonitorRunSpec } from './monitorEngine';
+import { parseDockerTime, type MonitorEngine } from './monitorEngine';
 
 const SCRIPT = 'console.log("monitor")';
 const TAG = 'devenv-helper:0123456789ab';

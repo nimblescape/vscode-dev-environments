@@ -9,8 +9,8 @@
 // open file of the monitor; `release` closes it. When the monitor process ends (an exit, `docker stop`, a kill), the
 // kernel frees it.
 import * as fs from 'fs';
-import { LOCK_BUSY_EXIT, flockNoWaitArgs } from '../core/helperChannel/protocol';
-import { FLOCK_FD, openLockFile, startFlockProcess, type FlockProcess } from '../core/helperChannel/lockFile';
+import { errorMessage } from '../core/errors';
+import { acquireFlock, flockFailure, openLockFile, startFlockProcess, type FlockAttempt, type FlockProcess } from '../core/helperChannel/lockFile';
 
 /** What an attempt to take the lock of an environment gave. `failed`: never stop without the lock (D2). */
 export type StopLockAttempt = { kind: 'locked'; release(): void } | { kind: 'busy' } | { kind: 'failed'; detail: string };
@@ -37,54 +37,38 @@ export function stopLockDeps(stateDir: string): StopLockDeps {
 
 /** The StopLocker of `run` (see the module comment). */
 export function stopLocker(deps: StopLockDeps): StopLocker {
-  const close = (fd: number) => {
-    try {
-      deps.closeFile(fd);
-    } catch {
-      // Closed already.
-    }
-  };
   return async (environmentId) => {
-    let fd: number;
+    const timeoutMs = deps.timeoutMs ?? STOP_FLOCK_TIMEOUT_MS;
+    // Cleanup C5 (plan step 11J, B3): the acquisition of lockFile.ts (no wait, bounded); the outcomes keep their texts.
+    let attempt: FlockAttempt;
     try {
-      fd = deps.openLockFile(deps.stateDir, environmentId);
+      attempt = await acquireFlock({
+        open: () => deps.openLockFile(deps.stateDir, environmentId),
+        close: (fd) => deps.closeFile(fd),
+        start: (args, fd) => deps.startFlock(args, fd),
+        timeoutMs,
+      });
     } catch (error) {
-      return { kind: 'failed', detail: `the lock file could not be opened: ${error instanceof Error ? error.message : String(error)}` };
+      return { kind: 'failed', detail: `flock could not be started: ${errorMessage(error)}` };
     }
-    let outcome: { exitCode: number | null; error?: string; stderr?: string } | 'timeout';
-    try {
-      const flock = deps.startFlock(flockNoWaitArgs(FLOCK_FD), fd);
-      let timer: NodeJS.Timeout | undefined;
-      const timeout = new Promise<'timeout'>((resolve) => (timer = setTimeout(() => resolve('timeout'), deps.timeoutMs ?? STOP_FLOCK_TIMEOUT_MS)));
-      outcome = await Promise.race([flock.exited, timeout]);
-      clearTimeout(timer);
-      if (outcome === 'timeout') {
-        flock.kill('SIGKILL');
-        await flock.exited;
-      }
-    } catch (error) {
-      close(fd);
-      return { kind: 'failed', detail: `flock could not be started: ${error instanceof Error ? error.message : String(error)}` };
+    switch (attempt.kind) {
+      case 'locked':
+        return { kind: 'locked', release: attempt.release };
+      case 'busy':
+        return { kind: 'busy' };
+      case 'openFailed':
+        return { kind: 'failed', detail: `the lock file could not be opened: ${errorMessage(attempt.error)}` };
+      case 'startThrew':
+        return { kind: 'failed', detail: `flock could not be started: ${errorMessage(attempt.error)}` };
+      case 'startFailed':
+        return { kind: 'failed', detail: `flock could not be started: ${attempt.detail}` };
+      case 'timeout':
+        return { kind: 'failed', detail: `flock did not end within ${timeoutMs / 1000} s` };
+      case 'failed':
+        return { kind: 'failed', detail: flockFailure(attempt, true) };
+      case 'cancelled':
+        // Never: no signal is given.
+        return { kind: 'failed', detail: 'the lock was cancelled' };
     }
-    if (outcome !== 'timeout' && outcome.error === undefined && outcome.exitCode === 0) {
-      let released = false;
-      return {
-        kind: 'locked',
-        release: () => {
-          if (released) return;
-          released = true;
-          close(fd);
-        },
-      };
-    }
-    // Not held by this monitor (a killed flock that took it lets it go with the close).
-    close(fd);
-    if (outcome === 'timeout') return { kind: 'failed', detail: `flock did not end within ${(deps.timeoutMs ?? STOP_FLOCK_TIMEOUT_MS) / 1000} s` };
-    if (outcome.error !== undefined) return { kind: 'failed', detail: `flock could not be started: ${outcome.error}` };
-    if (outcome.exitCode === LOCK_BUSY_EXIT) return { kind: 'busy' };
-    return {
-      kind: 'failed',
-      detail: `flock failed (${outcome.exitCode === null ? 'ended by a signal' : `exit code ${outcome.exitCode}`})${outcome.stderr ? `: ${outcome.stderr}` : ''}`,
-    };
   };
 }

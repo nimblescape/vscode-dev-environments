@@ -45,7 +45,7 @@ import {
 } from '../../src/core/remoteMonitor/protocol';
 import { forgetRecord, sendHeartbeat, sendMonitorSettings } from '../../src/core/worker/monitorFlow';
 import { engineMonitor } from '../../src/core/worker/engineMonitor';
-import type { MonitorRunSpec } from '../../src/core/remoteMonitor/monitorEngine';
+import type { MonitorRunSpec } from '../../src/core/worker/dockerEngine';
 import { engineApi, engineHijack } from '../../src/helperChannel/engineApi';
 import { dockerEngine } from '../../src/helperChannel/engineClient';
 import { RemoteSessionMonitor } from '../../src/core/remoteMonitor/remoteSessionMonitor';
