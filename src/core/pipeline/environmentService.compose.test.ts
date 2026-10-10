@@ -8,13 +8,12 @@
 // services, update, rebuild, refused update, and start and stop of all containers.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CommandError, UserFacingError } from '../errors';
+import { WORKSPACE_VOLUME_KEY, type ComposeModel } from '../helper/composeModel';
 import {
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
-  WORKSPACE_VOLUME_KEY,
   composeConfigHash,
   composeInputsHash,
-  type ComposeModel,
   type ComposeModelOutput,
 } from '../helper/compose';
 import { DEVCONTAINER_ID_PLACEHOLDER, environmentDevcontainerId } from '../helper/cliVariables';
@@ -70,7 +69,8 @@ import {
   seedEnvironment,
   type Harness,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH, repositoryServiceDataFolders } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { repositoryServiceDataFolders } from './pipelineRules';
 import { parseJsonc } from '../jsonc';
 import { MAX_ITEM_LENGTH, MAX_LISTED_ITEMS } from '../policy';
 

@@ -16,8 +16,30 @@ import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
-import { LABEL_HELPER_CHANNEL, OP_DELETE, OP_DELETE_CHECK, OP_LIST_CONFIGURATIONS, OP_STOP, OP_TOKEN_REMOVE, OP_WINDOW_STATE, parseDeleteCheckValue, parseDeleteValue, parseListConfigurationsValue, parseStopValue, parseTokenRemoveValue, parseWindowStateValue } from '../../src/core/helperChannel/protocol';
-import { GITHUB_TOKEN_FILE, LABEL_COMPOSE_SERVICE, LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, TOKEN_FOLDER, TOKEN_TMPFS, newEnvironmentId } from '../../src/core/names';
+import {
+  OP_DELETE,
+  OP_DELETE_CHECK,
+  OP_LIST_CONFIGURATIONS,
+  OP_STOP,
+  OP_TOKEN_REMOVE,
+  OP_WINDOW_STATE,
+  parseDeleteCheckValue,
+  parseDeleteValue,
+  parseListConfigurationsValue,
+  parseStopValue,
+  parseTokenRemoveValue,
+  parseWindowStateValue,
+} from '../../src/core/helperChannel/protocol';
+import {
+  GITHUB_TOKEN_FILE,
+  LABEL_COMPOSE_SERVICE,
+  LABEL_ENVIRONMENT_ID,
+  LABEL_HELPER_CHANNEL,
+  LABEL_OWNER_ID,
+  TOKEN_FOLDER,
+  TOKEN_TMPFS,
+  newEnvironmentId,
+} from '../../src/core/names';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { Environment } from '../../src/core/types';
 import { FLOW_REQUESTS, type HostSide } from '../../src/core/worker/hostSide';

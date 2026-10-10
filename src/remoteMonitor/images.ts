@@ -25,12 +25,9 @@
 // of the monitor had none. Never throws; each problem is one line of the log.
 import type { IncomingMessage } from 'http';
 import * as https from 'https';
-import { DEFAULT_IMAGE_TIME_ZONE, isTimeZone, nextCronTime, parseCronSchedule } from '../core/remoteMonitor/cron';
 import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import type { EngineImage } from '../core/worker/dockerEngine';
 import { engineFailure, type ImageEngine } from './engine';
-
-export { DEFAULT_IMAGE_TIME_ZONE, imagePrefixesOf, isTimeZone, nextCronTime, parseCronSchedule };
 
 /** Time from the start of the monitor to the first pass. */
 export const REMOTE_IMAGE_FIRST_PASS_MS = 60_000;

@@ -13,14 +13,11 @@
 // (`git -c credential.helper=…`) reads it from there. The file is removed right after use, and by a trap on every exit.
 // Unit 15: no copy is in the volume. The token file of the dev container and the sign-in of the GitHub CLI are only in the
 // memory of the dev container (TOKEN_FOLDER, ./containerToken.ts).
-import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GH_VOLUME_FOLDER, GIT_CONFIG_FILE, WORKSPACES_ROOT } from '../names';
+import { CONFIG_FOLDER, DOCKER_CONFIG_FOLDER, GH_VOLUME_FOLDER, GIT_CONFIG_FILE, SECRETS_FOLDER, WORKSPACES_ROOT } from '../names';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { GIT_CREDENTIALS_CONFIG_CONTENT, GIT_CREDENTIALS_CONFIG_FILE } from './containerGit';
 
-// Plan step 11F2: SECRETS_FOLDER moved to ../names (the window's helper channel uses it without the scripts).
-import { SECRETS_FOLDER } from '../names';
-export { SECRETS_FOLDER };
 /** File of the token in SECRETS_FOLDER. */
 export const TOKEN_FILE = `${SECRETS_FOLDER}/github-token`;
 /**

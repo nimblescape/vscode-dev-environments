@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { PIPE_LOADER, encodeBundle } from '../loader/pipeLoader';
 import type { StateEnvironment } from '../pipeline/refreshStates';
 import { ENV_API, ENV_WEB, EXPECTED_STATES, REFRESH_ENVIRONMENTS } from '../pipeline/refreshStates.testkit';
-import { LABEL_CHANNEL_STEP, LABEL_HELPER_RUN } from '../names';
+import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../names';
 import { LABEL_SESSION_MONITOR } from '../remoteMonitor/protocol';
 import { batchRunSpec } from './batch';
 import { channelRunArgs } from './helperChannels';
@@ -42,7 +42,6 @@ import {
   parseSweepParams,
   parseSweepValue,
   sameEngine,
-  LABEL_HELPER_CHANNEL,
   SWEEP_FILTERS,
   parseServerMessage,
   refusedOperationId,

@@ -13,7 +13,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ImageInfo } from '../docker/dockerObjects';
 import type { Logger } from '../ports';
-import { ensureHelperImage, helperImageTag, type HelperImageDocker } from './helperImage';
+import { ensureHelperImageUse, helperImageTag, type HelperImageDocker } from './helperImage';
 
 const BASE = 'node:24-trixie-slim';
 const DOCKERFILE = `FROM ${BASE}\n`;
@@ -70,13 +70,15 @@ describe('the log of a check of the base image (review round 1 of PR H, reviewer
     const checks: Promise<void>[] = [];
     const docker = new FakeDocker();
     expect(
-      await ensureHelperImage(docker, file, {
-        statePath,
-        baseDigest: async () => DIGEST,
-        clock: { now: () => NOW },
-        logger,
-        onBaseImageCheck: (check) => checks.push(check),
-      }),
+      (
+        await ensureHelperImageUse(docker, file, {
+          statePath,
+          baseDigest: async () => DIGEST,
+          clock: { now: () => NOW },
+          logger,
+          onBaseImageCheck: (check) => checks.push(check),
+        })
+      ).tag,
     ).toBe(TAG);
     expect(checks).toHaveLength(1);
     await Promise.all(checks);

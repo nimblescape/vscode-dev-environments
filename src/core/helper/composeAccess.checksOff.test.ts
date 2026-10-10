@@ -9,7 +9,7 @@
 // clear) and `unsupported` stay refused whatever the switch says.
 import { describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
-import type { ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
 import {
   composeAccessClassification,
   composeAccessReport,

@@ -12,7 +12,7 @@ import { LABEL_ENVIRONMENT_ID, LABEL_OWNER_ID, LABEL_REPOSITORY, LABEL_VOLUME, V
 import type { VscodePlatform } from '../helperChannel/protocol';
 import { VSCODE_SERVER_LINK_SCRIPT } from '../worker/vscodeServerLink';
 import { ACCOUNT, ENV_ID, REPO, createHarness, type Harness, type HarnessOverrides } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 import { PipelineTexts, type RepositoryTarget } from './operationBase';
 
 const SERVER = { commit: '0123456789abcdef0123456789abcdef01234567', quality: 'stable' as const };

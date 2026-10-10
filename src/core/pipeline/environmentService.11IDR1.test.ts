@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { abortError } from '../ports';
 import { BASE_IMAGE, REPO, createHarness, type Harness } from './environmentService.testkit';
 import type { RepositoryTarget } from './operationBase';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 

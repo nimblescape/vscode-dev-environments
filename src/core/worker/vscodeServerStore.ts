@@ -34,8 +34,6 @@ import { LOCK_BUSY_EXIT, flockArgs, flockNoWaitArgs, type VscodePlatform, type V
 import type { HttpStreamTransport, HttpTransport } from '../http';
 import type { Logger } from '../ports';
 
-export type { VscodePlatform };
-
 /** Plan step 11H1: the update service of Microsoft; the only host whose server the worker fetches (never a parameter). */
 export const VSCODE_UPDATE_SERVICE = 'https://update.code.visualstudio.com';
 

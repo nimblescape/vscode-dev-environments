@@ -24,7 +24,6 @@ import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/
 import {
   CHANNEL_PROTOCOL_VERSION,
   ENGINE_IDENTITY_ARGS,
-  LABEL_HELPER_CHANNEL,
   OP_PROBE,
   OP_SWEEP,
   channelLabelValue,
@@ -36,7 +35,7 @@ import {
   parseSweepValue,
 } from '../../src/core/helperChannel/protocol';
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
-import { LABEL_HELPER_RUN } from '../../src/core/names';
+import { LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../../src/core/names';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';

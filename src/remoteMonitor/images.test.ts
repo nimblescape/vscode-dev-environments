@@ -9,6 +9,7 @@ import { EngineError, type EngineFilters, type EngineImage } from '../core/worke
 import { MAX_ENGINE_LIST_ANSWER_CHARACTERS, type EngineApi, type EngineAnswer, type EngineRequest } from '../helperChannel/engineApi';
 import { dockerEngine } from '../helperChannel/engineClient';
 import type { ImageEngine } from './engine';
+import { imagePrefixesOf } from '../core/remoteMonitor/protocol';
 import {
   IMAGE_LIST_TIMEOUT_MS,
   IMAGE_PULL_TIMEOUT_MS,
@@ -16,7 +17,6 @@ import {
   ImageMaintenance,
   highestMajorTag,
   httpGetWith,
-  imagePrefixesOf,
   localImagesOf,
   parseBearerChallenge,
   parseReplacedImages,

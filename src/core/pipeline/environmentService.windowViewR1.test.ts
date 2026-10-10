@@ -9,12 +9,13 @@ import { CommandError, UserFacingError } from '../errors';
 import { Messages } from '../messages';
 import { LABEL_CONTAINER_VERSION, environmentImageName } from '../names';
 import type { Environment, WindowStatus } from '../types';
-import type { ComposeModel, ComposeModelOutput } from '../helper/compose';
+import type { ComposeModel } from '../helper/composeModel';
+import type { ComposeModelOutput } from '../helper/compose';
 import type { RepositoryTarget } from './operationBase';
 import { BASE_IMAGE, DIGEST_NEW, ENV_ID, FEATURE, FEATURE_DIGEST, PID, REPO, T0, checked, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 import { composeProjectName } from '../names';
 import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);

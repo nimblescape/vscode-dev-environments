@@ -10,7 +10,7 @@ import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import { describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
-import type { ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
 import { composeAccessReport, type ComposeAccessInput, type HostAccessReport } from '../policy';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';

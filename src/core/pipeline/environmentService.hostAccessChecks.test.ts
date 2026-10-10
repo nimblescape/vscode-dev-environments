@@ -40,7 +40,8 @@ import {
   TOKEN_TMPFS_ARGS,
   CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { configHash } from './pipelineRules';
 import { GITHUB_CLI_ACCOUNT_REASON, hostAccessProblems, runArgsProblems } from '../policy';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

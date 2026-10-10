@@ -10,7 +10,7 @@ import { resourceName } from '../names';
 import { namePair } from '../namePairs';
 import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, OTHER_ACCOUNT, OTHER_ID, REPO, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const RECORDED = '4d4d4d4d-0000-4000-8000-000000000004';

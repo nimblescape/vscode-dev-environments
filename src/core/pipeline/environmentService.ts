@@ -52,6 +52,7 @@ import {
 } from '../git/gitSummary';
 import { MAX_CONFIG_TEXT_LENGTH, MAX_IMAGE_ID_REFERENCES } from '../helper/analysisLimits';
 import type { UserIds } from '../docker/passwdUsers';
+import { composeVolumeNames, type ComposeModel } from '../helper/composeModel';
 import {
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
@@ -65,10 +66,8 @@ import {
   composeServiceVolumeNames,
   composeUpModel,
   composeUserArgs,
-  composeVolumeNames,
   resolveComposeFiles,
   type ComposeBuildModelRewrite,
-  type ComposeModel,
   type ComposeModelOutput,
   type ComposeRewriteParams,
 } from '../helper/compose';
@@ -98,7 +97,9 @@ import {
   composeConfigOverride,
 } from '../helper/devcontainerCli';
 import { findLocalEnvNames, helperEnvNames } from '../helper/localEnv';
-import type { HelperFiles, HelperImageUse, WorkspaceHelper } from '../helper/workspaceHelper';
+import type { HelperImageUse } from '../helper/helperImage';
+import type { HelperFiles } from '../helper/stepInputs';
+import type { WorkspaceHelper } from '../helper/workspaceHelper';
 import {
   compareWithBuildRecord,
   type CheckedOutcome,
@@ -202,10 +203,16 @@ import type {
 } from '../types';
 import {
   DEFAULT_CONFIG_PATH,
+  MAX_REFUSED_ITEMS_LENGTH,
+  composeRecordOf,
+  isRepositoryName,
+  refusedUpdateOf,
+} from './recordRules';
+import { sameContainer, sameContainerId } from './containerIds';
+import {
   baseImageKey,
   composeConfigurationChange,
   composeMountVolumes,
-  composeRecordOf,
   hasComposeRecord,
   recordedComposeService,
   serviceFoldersOf,
@@ -236,7 +243,6 @@ import {
   isGitHubTokenRejected,
   isNetworkFailure,
   isRefusedUpdate,
-  isRepositoryName,
   isRootUser,
   isUnrestrictedContainer,
   lifecycleHookFailure,
@@ -245,11 +251,6 @@ import {
   nextBuildNumber,
   nonEmptyString,
   recordDigests,
-  refusedUpdateOf,
-  lifecycleMarkClears,
-  sameContainer,
-  sameContainerId,
-  MAX_REFUSED_ITEMS_LENGTH,
   shouldCheckImages,
   stringList,
   type ImageCheckState,
@@ -969,12 +970,6 @@ class OtherWindowUsesError extends UserFacingError {
     super('startFailed', PipelineTexts.startFailed, detail);
   }
 }
-
-
-
-
-/** Plan step 11E4a: moved to ./pipelineRules (the open's registry writes, ./openRecords, use it too). */
-export { lifecycleMarkClears };
 
 /** The workspace helper could not be prepared, or the helper image of the open is gone (UserFacingError helperFailed). */
 function isHelperFailed(error: unknown): boolean {

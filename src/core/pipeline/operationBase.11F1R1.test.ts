@@ -5,9 +5,11 @@
 // Plan step 11F1, review B round 1 (mutation probes): the rules of OperationBase that the window's operations and the
 // worker's pipeline share. One operation per repository at a time also with three queued; a process whose state is not
 // known counts as running; processExists never counts an invalid PID as running, and counts a process of another user
-// (EPERM) as running.
+// (EPERM) as running. Cleanup after plan step 11 (PR C1): processExists is removed; the default of OperationBase is
+// isProcessAlive of sessionRules.ts, which these two tests now pin.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OperationBase, processExists, type OperationBaseDeps, type OperationRecords } from './operationBase';
+import { isProcessAlive } from '../session/sessionRules';
+import { OperationBase, type OperationBaseDeps, type OperationRecords } from './operationBase';
 
 class Probe extends OperationBase {
   constructor(deps: Partial<OperationBaseDeps> = {}) {
@@ -77,20 +79,20 @@ describe('OperationBase, review B round 1 of plan step 11F1', () => {
     expect(alive(11)).toBe(true);
   });
 
-  it('processExists: no invalid PID counts as running', () => {
+  it('isProcessAlive (the default of OperationBase): no invalid PID counts as running', () => {
     const kill = vi.spyOn(process, 'kill');
-    for (const pid of [0, -1, 1.5, Number.NaN]) expect(processExists(pid), String(pid)).toBe(false);
+    for (const pid of [0, -1, 1.5, Number.NaN]) expect(isProcessAlive(pid), String(pid)).toBe(false);
     expect(kill).not.toHaveBeenCalled();
   });
 
-  it('processExists: a process of another user (EPERM) counts as running; an ended one (ESRCH) does not', () => {
+  it('isProcessAlive (the default of OperationBase): a process of another user (EPERM) counts as running; an ended one (ESRCH) does not', () => {
     vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' });
     });
-    expect(processExists(4242)).toBe(true);
+    expect(isProcessAlive(4242)).toBe(true);
     vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
     });
-    expect(processExists(4242)).toBe(false);
+    expect(isProcessAlive(4242)).toBe(false);
   });
 });

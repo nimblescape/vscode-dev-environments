@@ -14,7 +14,7 @@ import type { Environment, WindowStatus } from '../types';
 import type { RepositoryTarget } from './operationBase';
 import { ENV_ID, PID, REPO, T0, WINDOW_ID, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
 import { windowLifecycleMemory, type LifecycleMemory } from './lifecycleMemory';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
 const IMAGE_1 = environmentImageName(REPO, ENV_ID, 1);

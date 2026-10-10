@@ -60,8 +60,6 @@ export const MAX_LIMIT_SECONDS = 86_400;
 export const MAX_HEARTBEAT_ENVIRONMENTS = 200;
 /** The longest heartbeat argument that the script accepts. */
 export const MAX_HEARTBEAT_LENGTH = 32_000;
-/** A record of another computer younger than this makes an environment "in use from another computer" (shared engine). */
-export const OTHER_COMPUTER_FRESH_MS = 90_000;
 const SOURCE_PATTERN = /^[0-9a-f]{32}$/;
 /** The form of `newEnvironmentId` (crypto.randomUUID, lower case). */
 const ENVIRONMENT_ID_PATTERN = /^[0-9a-f-]{36}$/;
@@ -428,23 +426,6 @@ export function parseImageSettingsInput(text: string): ImageSettings | undefined
   if (!Array.isArray(prefixes) || prefixes.length > MAX_IMAGE_PREFIXES || !prefixes.every(isImagePrefix)) return undefined;
   if (typeof schedule !== 'string' || !parseCacheSchedule(schedule) || typeof timeZone !== 'string' || !isTimeZone(timeZone)) return undefined;
   return { prefixes: [...new Set(prefixes as string[])], schedule, timeZone };
-}
-
-/**
- * Shared engine (reviewer note of PR 2), consistent with "the newest record decides" of the remote monitor (review round
- * 2 of PR #39, M1): true when a computer other than `ownSource` sent a heartbeat for the environment less than
- * OTHER_COMPUTER_FRESH_MS ago (it uses it), or has a record that keeps it running and that is at least as new as the
- * newest record of this computer (by the clock of the remote host). A later choice of this computer (a heartbeat without
- * the flag) overrules an older keep of another one, for example of a computer that no longer sends. Then this computer
- * does not stop it. `output`: the clock of the remote host and the records of the environment (plan step 11I, U10: the
- * output of the removed subcommand `records` is no longer a type of its own).
- */
-export function inUseByOtherComputer(output: { now: number; records: ReadonlyArray<{ source: string; at: number; keepRunning: boolean }> }, ownSource: string): boolean {
-  const own = output.records.filter((record) => record.source === ownSource).reduce((newest, record) => Math.max(newest, record.at), Number.NEGATIVE_INFINITY);
-  return output.records.some(
-    (record) =>
-      record.source !== ownSource && (Math.abs(output.now - record.at) < OTHER_COMPUTER_FRESH_MS || (record.keepRunning && record.at >= own)),
-  );
 }
 
 /**

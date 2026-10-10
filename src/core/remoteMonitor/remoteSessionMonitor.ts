@@ -17,7 +17,7 @@ import { errorMessage } from '../errors';
 import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
 import { abortError, isAbortError, type Logger } from '../ports';
 import { VSCODE_STORE_DIR } from '../names';
-import { IDLE_MONITOR_RESTART_POLICY, monitorRestartPolicy } from './cacheSettings';
+import { monitorRestartPolicy } from './cacheSettings';
 import type { MonitorEngine, MonitorInspected, MonitorRunSpec } from './monitorEngine';
 import {
   LABEL_MONITOR_CREATE,
@@ -48,14 +48,6 @@ export const REMOTE_MONITOR_EXEC_TIMEOUT_MS = 20_000;
  * running monitor keeps its log settings until it is replaced for another reason.
  */
 export const REMOTE_MONITOR_LOG: MonitorRunSpec['log'] = { driver: 'json-file', maxSize: '1m', maxFile: '2' };
-
-/**
- * Plan step 8, PR B (Q5): the restart policy of the monitor container (see runArgs). Every monitor of an older version
- * is replaced at the next open, as its script, and so its label, changed with this policy. Plan step 11H2 (the user's
- * decision "unless-stopped" of 2026-10-09): the policy of a monitor that ends when idle; a permanent one has
- * `unless-stopped` (monitorRestartPolicy).
- */
-export const MONITOR_RESTART_POLICY = IDLE_MONITOR_RESTART_POLICY;
 
 export interface RemoteSessionMonitorOptions {
   /** Plan step 11D2: the engine of the monitor (the worker's, over the Engine API). */

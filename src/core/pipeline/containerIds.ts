@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Plan step 11F1: the comparison of container IDs, shared by the pipeline (pipelineRules re-exports it) and the window's
+// Plan step 11F1: the comparison of container IDs, shared by the pipeline and the window's
 // memory of its containers (lifecycleMemory), without the rules of the pipeline. Pure; no `vscode`.
 
 /** Plan step 11E4a: moved from ./environmentService. Docker and the Dev Container CLI name a container by its full ID or by a prefix of it. */

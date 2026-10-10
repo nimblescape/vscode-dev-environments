@@ -13,7 +13,7 @@ import * as path from 'path';
 import { Worker } from 'worker_threads';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
-import type { ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
 import { helperCliVariables, mayBeSetInHelper } from './cliVariables';
 import {
   ANALYSIS_FAILED_ITEM,

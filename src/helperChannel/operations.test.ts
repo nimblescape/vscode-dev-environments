@@ -5,15 +5,22 @@
 // Plan step 5, PR A: the probe names the engine behind the socket of the worker. Plan step 11I (PR A): the probe and the
 // sweep over the port of the engine (DockerEngine), no Docker CLI of the worker.
 import { describe, expect, it } from 'vitest';
-import { LABEL_HELPER_CHANNEL, parseProbeValue, parseRefreshValue, parseSweepValue, parseWindowStateValue, type EngineIdentity } from '../core/helperChannel/protocol';
-import { LABEL_HELPER_RUN } from '../core/names';
+import {
+  parseProbeValue,
+  parseRefreshValue,
+  parseSweepValue,
+  parseWindowStateValue,
+  type EngineIdentity,
+  MAX_PROBE_DETAIL_LENGTH,
+} from '../core/helperChannel/protocol';
+import { LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../core/names';
 import { LABEL_SESSION_MONITOR } from '../core/remoteMonitor/protocol';
 import { ENV_API, EXPECTED_STATES, REFRESH_ENVIRONMENTS, fixtureContainerId, fixtureEngine } from '../core/pipeline/refreshStates.testkit';
 import { EngineError, type DockerEngine, type EngineFilters } from '../core/worker/dockerEngine';
 import { unusedEngine } from '../core/worker/dockerEngine.testkit';
 import { abortError } from '../core/ports';
 import { windowStateOperation } from './flowOperations';
-import { MAX_PROBE_DETAIL_LENGTH, probeOperation, refreshOperation, sweepOperation } from './operations';
+import { probeOperation, refreshOperation, sweepOperation } from './operations';
 import { OperationError, type OperationContext } from './server';
 import { contextSecrets } from './operationContext.testkit';
 

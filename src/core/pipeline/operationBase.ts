@@ -27,6 +27,7 @@ import {
   type PipelineUi,
   type ProgressReporter,
 } from '../ports';
+import { isProcessAlive } from '../session/sessionRules';
 import { type EnvironmentRegistry } from '../storage/registry';
 import type { SessionFiles } from '../storage/sessionFiles';
 import type { BusyMark, BusyOperation, Environment, ExtensionSettings, GitHubAccount, WindowStatus } from '../types';
@@ -226,17 +227,6 @@ export function repositoryKey(repository: string): string {
   return repository.toLowerCase();
 }
 
-/** `process.kill(pid, 0)`: EPERM (a process of another user) counts as alive. */
-export function processExists(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
 /** Waits for `promise`; rejects with an AbortError when `signal` aborts first. */
 export function waitUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return promise;
@@ -290,7 +280,7 @@ export interface OperationBaseDeps {
    * (dockerEndpointUnsupported) and never read or recorded.
    */
   dockerTarget?: () => Promise<Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>>;
-  /** Default: `process.kill(pid, 0)` does not fail with ESRCH. */
+  /** Default: `isProcessAlive` of sessionRules.ts (`process.kill(pid, 0)` does not fail with ESRCH). */
   isProcessAlive?: (pid: number) => boolean;
   /**
    * Plan step 11E4d: whether the process `pid` of this computer runs, asked before a decision about the other windows
@@ -326,7 +316,7 @@ export interface OperationRecords {
 
 /** Plan step 11E4a: the owner, clock, and view of the windows with which the window of `deps` decides busy marks. */
 export function markViewOf(deps: Pick<OperationBaseDeps, 'owner' | 'clock' | 'isProcessAlive' | 'windowStatuses' | 'logger'>): BusyMarkView {
-  return { owner: deps.owner, clock: deps.clock, isAlive: deps.isProcessAlive ?? processExists, windowStatuses: deps.windowStatuses, logger: deps.logger };
+  return { owner: deps.owner, clock: deps.clock, isAlive: deps.isProcessAlive ?? isProcessAlive, windowStatuses: deps.windowStatuses, logger: deps.logger };
 }
 
 /** Plan step 11F1: the rules of an operation of a window (see the module comment). */
@@ -355,7 +345,7 @@ export abstract class OperationBase {
     /** Plan step 11I (PR D): the busy marks and the registry writes of the open, over the view of the marks of this window. */
     records: (view: BusyMarkView) => OperationRecords,
   ) {
-    this.isAlive = deps.isProcessAlive ?? processExists;
+    this.isAlive = deps.isProcessAlive ?? isProcessAlive;
     this.processAlive = deps.processAlive ?? (async (pid) => this.isAlive(pid));
     this.lifecycleMemory = deps.lifecycleMemory ?? windowLifecycleMemory();
     this.markView = markViewOf(deps);

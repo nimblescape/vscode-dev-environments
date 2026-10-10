@@ -53,12 +53,11 @@ import type { Environment, GitHubAccount, WindowStatus } from '../types';
 import {
   afterUpClause,
   kindSwitchFailure,
-  lifecycleMarkClears,
   withdrawnOutcome,
   type EnvironmentServiceDeps,
 } from './environmentService';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, STOP_FLOW_TIMEOUT_MS, type RepositoryTarget } from './operationBase';
-import { MAX_REFUSED_ITEMS_LENGTH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, lifecycleMarkClears } from './recordRules';
 import {
   fakeWorkerFlow,
   ACCOUNT,
@@ -87,7 +86,7 @@ import {
   TOKEN_TMPFS_ARGS,
   CONFIG_PATH_LABEL,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { configHash } from './pipelineRules';
 import { hostAccessProblems } from '../policy';
 
 const TARGET: RepositoryTarget = {

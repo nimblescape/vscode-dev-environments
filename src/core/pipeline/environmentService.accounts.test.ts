@@ -28,7 +28,7 @@ import {
   type Harness,
   type HarnessOverrides,
 } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 const OTHER_TOKEN = 'gho_othertoken';
 const TARGET: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };

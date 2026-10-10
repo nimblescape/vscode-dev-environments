@@ -8,7 +8,8 @@
 // every container nimblescape.devenv.host-access=unrestricted, as buildOverrideConfig does for a single container.
 import { describe, expect, it } from 'vitest';
 import { HOST_ACCESS_UNRESTRICTED, LABEL_HOST_ACCESS, composeProjectName, resourceName } from '../names';
-import { composeBuildModel, composeUpModel, serviceDecidesHostname, type ComposeModel, type ComposeRewriteParams, type ComposeService } from './compose';
+import type { ComposeModel, ComposeService } from './composeModel';
+import { composeBuildModel, composeUpModel, serviceDecidesHostname, type ComposeRewriteParams } from './compose';
 
 const ID = '3f2a9c1e-0000-4000-8000-000000000000';
 // User decisions 2026-10-03: one name per environment (resourceName); the project, the volume, and the container share it.

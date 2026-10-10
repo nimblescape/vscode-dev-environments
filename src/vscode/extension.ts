@@ -22,7 +22,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage, UserFacingError } from '../core/errors';
 import { helperImageTag, registryBaseDigest } from '../core/helper/helperImage';
 import { HelperPrebuild, dockerEngineAnswers } from '../core/helper/helperPrebuild';
-import { DOCKER_SOCKET, HelperImages, helperDockerSocket } from '../core/helper/helperImages';
+import { HelperImages, helperDockerSocket } from '../core/helper/helperImages';
 import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperChannels';
 import { HelperChannelError } from '../core/helperChannel/helperChannel';
 import { Messages } from '../core/messages';
@@ -49,7 +49,7 @@ import { EnvironmentRegistry } from '../core/storage/registry';
 import { findWindowEnvironment, restoreAfterPrebuild } from './windowEnvironment';
 import { workerMonitor } from './workerMonitor';
 import { defaultExtensionEntries, windowVscodeServer } from './vscodeServer';
-import { VSCODE_STORE_VOLUME } from '../core/names';
+import { HELPER_DOCKER_SOCKET, VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings } from '../core/types';
@@ -239,7 +239,7 @@ async function activateExtension(
   // recorded socket of a rootless remote engine, else /var/run/docker.sock there; on the local Docker the socket of its
   // endpoint.
   const engineSocket = async (target: Pick<DockerTarget, 'kind' | 'host' | 'endpoint'>): Promise<string> =>
-    target.kind === 'remote' ? ((await remoteState.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, platform, target.endpoint);
+    target.kind === 'remote' ? ((await remoteState.rootlessSocket(target.host)) ?? HELPER_DOCKER_SOCKET) : helperDockerSocket(env, platform, target.endpoint);
   let channelScript: Promise<string> | undefined;
   const channels = new HelperChannels({
     logger,

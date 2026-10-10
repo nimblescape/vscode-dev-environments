@@ -27,13 +27,7 @@ import {
   repositoryFolder,
 } from '../names';
 import type { BuildRecord, DevcontainerResult, Environment, RefusedUpdate } from '../types';
-
-export type { RefusedUpdate };
-
-// Plan step 11F2: the rules of the records that the window's side of the worker's requests also checks (openRecords.ts,
-// the host side) moved to ./recordRules, without the rules of the pipeline.
-import { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, composeRecordOf, isRepositoryName, lifecycleMarkClears, refusedUpdateOf } from './recordRules';
-export { DEFAULT_CONFIG_PATH, MAX_REFUSED_ITEMS_LENGTH, composeRecordOf, isRepositoryName, lifecycleMarkClears, refusedUpdateOf };
+import { composeRecordOf } from './recordRules';
 
 /**
  * True for a container of the current setup: its label nimblescape.devenv.container-version is CONTAINER_VERSION or
@@ -756,8 +750,4 @@ export function composeMountVolumes(
   }
   return { names: [...names], sources: [...sources], skipped: [...skipped] };
 }
-
-/** Plan step 11F1: moved to ./containerIds (the window's operations use them without the rules of the pipeline). */
-import { sameContainer, sameContainerId } from './containerIds';
-export { sameContainer, sameContainerId };
 

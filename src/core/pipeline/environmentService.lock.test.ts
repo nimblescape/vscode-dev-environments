@@ -21,7 +21,7 @@ import { LABEL_ENVIRONMENT_ID } from '../names';
 import { ENVIRONMENT_LOCK_WAIT_SECONDS, PipelineTexts, type RepositoryTarget } from './operationBase';
 import { ACCOUNT, ENV_ID, PID, REPO, T0, WINDOW_ID, createHarness, seedEnvironment, type Harness } from './environmentService.testkit';
 import { isBusyMarkLive } from '../busy';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 
 let h: Harness;
 /** What happened, in order: `ensureImage`, `build`, `lock <id> <wait>`, `busy=<operation>` at the lock, `docker …`, `release`. */

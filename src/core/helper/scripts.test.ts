@@ -23,7 +23,6 @@ import {
   GIT_FILES_SCRIPT,
   OVERRIDE_CONFIG_PATH,
   OVERRIDE_FOLDER,
-  SECRETS_FOLDER,
   TOKEN_FILE,
   UP_SCRIPT,
   WRITE_AND_RUN_SCRIPT,
@@ -41,7 +40,7 @@ import { composeReferences, parseComposeModelOutput, type ComposeModelOutput } f
 import { MAX_CONFIG_TEXT_LENGTH } from './analysisLimits';
 import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
 import { BATCH_HELPER_FOLDERS, composeAccessReport, isHelperPath, type ComposeAccessInput } from '../policy';
-import { WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
+import { SECRETS_FOLDER, WORKSPACES_ROOT, composeProjectName, resourceName } from '../names';
 
 /** User decisions 2026-10-03: the name of an environment of another repository and ID (before: devenv-<8 hex>). */
 const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');

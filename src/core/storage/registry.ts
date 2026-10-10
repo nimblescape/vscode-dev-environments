@@ -50,8 +50,7 @@ export interface RegistryOptions {
 
 const DEFAULT_LOCK_STALE_MS = 10_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000;
-// Shorter than the default of withDirectoryLock (50 ms): a mkdir every 20 ms costs little, and a waiting window or the
-// Session Monitor gets the lock sooner.
+// A mkdir every 20 ms costs little, and a waiting window or the Session Monitor gets the lock soon.
 const LOCK_RETRY_MS = 20;
 // On Windows, a lock folder that its last holder is still removing cannot be created again for a moment (EPERM). On
 // macOS and Linux these errors are permanent, so they are thrown after about one second instead of a lock timeout.
@@ -344,8 +343,8 @@ interface LockTimings {
 }
 
 /**
- * Runs `fn` while holding the lock folder `lockDir`. Same protocol as `withDirectoryLock` of atomicJson.ts (implementation
- * notes 4: created with mkdir, removed after `fn`, stale when older than `staleMs`), which it replaces here because:
+ * Runs `fn` while holding the lock folder `lockDir` (implementation notes 4: created with mkdir, removed after `fn`,
+ * stale when older than `staleMs`). Beyond a plain mkdir lock:
  * - two waiters that both see a stale folder must not both get the lock. With a plain "remove, then mkdir", the slower
  *   one removes the fresh lock of the faster one, and one of the two changes is lost;
  * - the holder refreshes the folder time while `fn` runs, so a slow `fn` is not taken for stale;

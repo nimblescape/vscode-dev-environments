@@ -11,9 +11,6 @@ import { buildArgumentTexts, extractBaseImages } from './dockerfile';
 import { hasDigest, isOciFeatureReference, parseFeatureReference, parseImageReference, registryDisplayName } from './reference';
 import { IMAGE_CHECK_TIMEOUT_MS, type DigestResult, type RegistryClient } from './registryClient';
 
-/** Common time limit of all requests of one check (NFR-08). Plan step 11F1: defined in ./registryClient (the helper image uses it too). */
-export { IMAGE_CHECK_TIMEOUT_MS };
-
 /** References of a configuration, as written in the configuration (Dockerfile references with ARG values applied). */
 export interface ConfigReferences {
   images: string[];

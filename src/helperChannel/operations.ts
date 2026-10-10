@@ -44,9 +44,6 @@ import * as os from 'os';
 import { OperationError, type OperationHandler } from './server';
 import monitorScript from 'devenv:monitor-script';
 
-// Review round 1 of PR #122 (B, L2): MAX_PROBE_DETAIL_LENGTH moved to the protocol, whose parseProbeValue checks it.
-export { MAX_PROBE_DETAIL_LENGTH };
-
 /**
  * `probe` (plan step 5, PR A): the version of the engine behind the socket of the worker, and the identity of that
  * engine, which the extension compares with the identity that its own Docker CLI reads without the worker. Plan step

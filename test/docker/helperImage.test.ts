@@ -153,7 +153,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
 
   it('a missing tag is built with --pull, and the digest of its base image is recorded', async () => {
     const started = Date.now();
-    expect(await timings.measure('first build (--pull)', () => newWindowHelper().ensureImage())).toBe(tag);
+    expect((await timings.measure('first build (--pull)', () => newWindowHelper().ensureImageUse())).tag).toBe(tag);
 
     expect(docker.builds).toEqual([{ tag, pull: true, noCache: false }]);
     expect(lookups).toEqual([TEST_BASE_IMAGE]);
@@ -172,7 +172,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
   it('another window uses the image without a check and without a build', async () => {
     const imageId = cli.image(tag)?.Id;
     const state = await readHelperState(statePath);
-    await timings.measure('ensure in a new window (nothing due)', () => newWindowHelper().ensureImage());
+    await timings.measure('ensure in a new window (nothing due)', () => newWindowHelper().ensureImageUse());
 
     expect(docker.builds).toHaveLength(1);
     expect(lookups).toHaveLength(1);
@@ -188,7 +188,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     });
     // The weekly check runs in the background: the open does not wait for it, and it asks the next open for a rebuild.
     await timings.measure('weekly check, base image changed (in the background)', async () => {
-      await newWindowHelper().ensureImage();
+      await newWindowHelper().ensureImageUse();
       await settled();
     });
     expect(docker.builds).toHaveLength(1);
@@ -196,7 +196,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     expect((await readHelperState(statePath)).images[tag]?.latestBaseDigest).toBe(await registryDigest(digestChecker, TEST_BASE_IMAGE));
 
     const started = Date.now();
-    await timings.measure('next open: rebuild (--pull --no-cache)', () => newWindowHelper().ensureImage());
+    await timings.measure('next open: rebuild (--pull --no-cache)', () => newWindowHelper().ensureImageUse());
     await settled();
 
     expect(docker.builds).toEqual([
@@ -236,7 +236,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
       state.lastCleanupAt = ago(HELPER_CLEANUP_INTERVAL_MS + DAY_MS);
     });
     const started = Date.now();
-    await timings.measure('daily cleanup', () => newWindowHelper().ensureImage());
+    await timings.measure('daily cleanup', () => newWindowHelper().ensureImageUse());
 
     expect(cli.image(unusedId)).toBeUndefined();
     expect(cli.image(danglingId)).toBeUndefined();
@@ -269,7 +269,7 @@ describe('workspace helper image: weekly refresh and daily cleanup', () => {
     // Plan step 11I (U7, decision of 2026-10-08): HelperImages (before: a WorkspaceHelper).
     const helper = new HelperImages({ docker, logger: log, dockerfilePath: updatedPath, statePath, baseDigest, onBaseImageCheck: (check) => checks.push(check) });
 
-    const failure = await timings.measure('failed build', () => helper.ensureImage().catch((error: unknown) => error));
+    const failure = await timings.measure('failed build', () => helper.ensureImageUse().catch((error: unknown) => error));
     await settled();
     expect(failure).toMatchObject({ code: 'helperFailed' });
     expect(cli.image(updatedTag)).toBeUndefined();

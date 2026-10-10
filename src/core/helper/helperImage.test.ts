@@ -10,8 +10,7 @@ import { devcontainerCliVersion } from '../../../scripts/cliVersion.mjs';
 import type { ImageInfo } from '../docker/dockerObjects';
 import { CommandError } from '../errors';
 import type { HttpTransport } from '../http';
-import { IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/imageCheck';
-import { RegistryClient, type DigestResult } from '../imageCheck/registryClient';
+import { RegistryClient, type DigestResult, IMAGE_CHECK_TIMEOUT_MS } from '../imageCheck/registryClient';
 import type { ImageReference } from '../imageCheck/reference';
 import { abortError, type Logger } from '../ports';
 import {
@@ -23,7 +22,6 @@ import {
   HELPER_RETRY_INTERVAL_MS,
   HELPER_TOMBSTONE_MS,
   HELPER_UNUSED_LIMIT_MS,
-  ensureHelperImage,
   ensureHelperImageUse,
   helperImageTag,
   recordHelperImageUse,
@@ -213,12 +211,12 @@ describe('helperImageTag', () => {
   });
 });
 
-describe('ensureHelperImage', () => {
+describe('ensureHelperImageUse', () => {
   it('builds the image when the tag is missing', async () => {
     const file = dockerfile('FROM node:22-bookworm-slim\n');
     const docker = new FakeDocker();
     const output: string[] = [];
-    const tag = await ensureHelperImage(docker, file, { onOutput: (text) => output.push(text) });
+    const { tag } = await ensureHelperImageUse(docker, file, { onOutput: (text) => output.push(text) });
     expect(tag).toBe(helperImageTag('FROM node:22-bookworm-slim\n'));
     expect(docker.builds).toHaveLength(1);
     expect(docker.builds[0]).toMatchObject({
@@ -238,7 +236,7 @@ describe('ensureHelperImage', () => {
     const file = dockerfile('FROM x\n');
     const docker = new FakeDocker();
     docker.addImage([helperImageTag('FROM x\n')]);
-    await ensureHelperImage(docker, file);
+    await ensureHelperImageUse(docker, file);
     expect(docker.builds).toHaveLength(0);
   });
 
@@ -257,7 +255,7 @@ describe('ensureHelperImage', () => {
     expect(content).not.toMatch(/^[^#]*<</m);
     expect(content).not.toMatch(/^\s*RUN\s+--mount/m);
     const docker = new FakeDocker();
-    expect(await ensureHelperImage(docker, file)).toBe(helperImageTag(content));
+    expect((await ensureHelperImageUse(docker, file)).tag).toBe(helperImageTag(content));
   });
 });
 
@@ -275,7 +273,7 @@ const h0iso = (offsetMs: number): string => new Date(START + offsetMs).toISOStri
 
 type LookupAnswer = string | 'unreachable' | undefined;
 
-/** ensureHelperImage with a state file, a fake Docker, a fake clock, and a fake digest lookup. */
+/** ensureHelperImageUse with a state file, a fake Docker, a fake clock, and a fake digest lookup. */
 class Harness {
   readonly docker = new FakeDocker();
   readonly logger = new RecordingLogger();
@@ -293,8 +291,9 @@ class Harness {
     return this.answer(signal);
   };
 
-  ensure(options: Partial<EnsureHelperImageOptions> = {}): Promise<string> {
-    return ensureHelperImage(this.docker, this.file, {
+  /** The tag that ensureHelperImageUse resolved. */
+  async ensure(options: Partial<EnsureHelperImageOptions> = {}): Promise<string> {
+    const use = await ensureHelperImageUse(this.docker, this.file, {
       statePath: this.statePath,
       baseDigest: this.baseDigest,
       clock: this.clock,
@@ -302,6 +301,7 @@ class Harness {
       onBaseImageCheck: (check) => this.checks.push(check),
       ...options,
     });
+    return use.tag;
   }
 
   /** Waits for the checks of the base image that ensure started in the background. */
@@ -332,7 +332,7 @@ class Harness {
   }
 }
 
-describe('ensureHelperImage with a state file: new helper image', () => {
+describe('ensureHelperImageUse with a state file: new helper image', () => {
   it('builds a missing tag with --pull and records the digest of the base image read before the build', async () => {
     const h = new Harness();
     expect(await h.ensure()).toBe(h.tag);
@@ -612,12 +612,12 @@ describe('ensureHelperImage with a state file: new helper image', () => {
     const h = new Harness();
     const file = path.resolve(__dirname, '../../../resources/helper/Dockerfile');
     const docker = new FakeDocker();
-    await ensureHelperImage(docker, file, { statePath: h.statePath, baseDigest: h.baseDigest, clock: h.clock });
+    await ensureHelperImageUse(docker, file, { statePath: h.statePath, baseDigest: h.baseDigest, clock: h.clock });
     expect(h.lookups.map((lookup) => lookup.reference)).toEqual(['node:24-trixie-slim']);
   });
 });
 
-describe('ensureHelperImage with a state file: weekly check of the base image', () => {
+describe('ensureHelperImageUse with a state file: weekly check of the base image', () => {
   /** An existing helper image whose base image digest was recorded `checkedAgoMs` ago. */
   function existing(checkedAgoMs: number): { h: Harness; oldId: string } {
     const h = new Harness();
@@ -1071,7 +1071,7 @@ describe('ensureHelperImage with a state file: weekly check of the base image', 
   });
 });
 
-describe('ensureHelperImage with a state file: lastUsedAt and the state file', () => {
+describe('ensureHelperImageUse with a state file: lastUsedAt and the state file', () => {
   it('writes lastUsedAt at most once per hour', async () => {
     const h = new Harness();
     h.docker.addImage([h.tag]);
@@ -1135,7 +1135,7 @@ describe('ensureHelperImage with a state file: lastUsedAt and the state file', (
   });
 });
 
-describe('ensureHelperImage with a state file: cleanup of other helper images', () => {
+describe('ensureHelperImageUse with a state file: cleanup of other helper images', () => {
   /** The current helper image exists and was checked today; only the cleanup has work. */
   function current(records: Record<string, HelperState['images'][string]> = {}, lastCleanupAt?: string) {
     const h = new Harness();
@@ -1388,7 +1388,7 @@ describe('ensureHelperImage with a state file: cleanup of other helper images', 
   });
 });
 
-describe('ensureHelperImage with a state file: two installations on one Docker engine', () => {
+describe('ensureHelperImageUse with a state file: two installations on one Docker engine', () => {
   // VS Code and VS Code Insiders have their own global storage folder (so their own helper.json) and share one Docker
   // engine. With different extension versions, each one's helper tag is foreign to the other.
   const DOCKERFILE_A = `${HELPER_DOCKERFILE}RUN echo a\n`;
@@ -1407,7 +1407,7 @@ describe('ensureHelperImage with a state file: two installations on one Docker e
         ensure: async () => {
           const checks: Array<Promise<void>> = [];
           const options = { statePath, baseDigest: h.baseDigest, clock: h.clock, logger: h.logger };
-          await ensureHelperImage(h.docker, file, { ...options, onBaseImageCheck: (check) => checks.push(check) });
+          await ensureHelperImageUse(h.docker, file, { ...options, onBaseImageCheck: (check) => checks.push(check) });
           await Promise.all(checks);
         },
         state: () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as HelperState,
@@ -1438,7 +1438,7 @@ describe('ensureHelperImage with a state file: two installations on one Docker e
   });
 });
 
-describe('ensureHelperImage with a state file: tombstones of removed helper tags', () => {
+describe('ensureHelperImageUse with a state file: tombstones of removed helper tags', () => {
   function current(records: Record<string, HelperState['images'][string]> = {}) {
     const h = new Harness();
     h.docker.addImage([h.tag]);
@@ -1500,7 +1500,7 @@ function h0(offsetMs: number): string {
   return new Date(START + offsetMs).toISOString();
 }
 
-describe('ensureHelperImage with a state file: no previous helper image (user decision 2026-09-29)', () => {
+describe('ensureHelperImageUse with a state file: no previous helper image (user decision 2026-09-29)', () => {
   const offline = async (): Promise<void> => {
     throw new CommandError('docker build', 1, '', 'Temporary failure resolving deb.debian.org');
   };
@@ -1554,7 +1554,7 @@ describe('ensureHelperImage with a state file: no previous helper image (user de
     await expect(h.ensure()).rejects.toBeInstanceOf(CommandError);
     expect(h.warnings().join('\n')).not.toContain('there is no previous helper image');
     expect(h.docker.labelQueries).toEqual([]);
-    await expect(ensureHelperImage(h.docker, h.file, { logger: h.logger })).rejects.toBeInstanceOf(CommandError);
+    await expect(ensureHelperImageUse(h.docker, h.file, { logger: h.logger })).rejects.toBeInstanceOf(CommandError);
 
     h.docker.buildHandler = async () => {
       throw abortError();

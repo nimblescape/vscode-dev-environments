@@ -20,10 +20,11 @@ import { passwdUserIds, type UserIds } from '../docker/passwdUsers';
 import { TOKEN_WRITE_SCRIPT } from '../helper/containerToken';
 import type { ContainerInfo, ImageInfo, ImageInspection, ListedContainer, MountTarget, NetworkInfo, VolumeInfo } from '../docker/dockerObjects';
 import { CommandError, UserFacingError } from '../errors';
-import { COMPOSE_MODEL_PATH, WORKSPACE_VOLUME_KEY, type ComposeModel, type ComposeModelOutput } from '../helper/compose';
+import { WORKSPACE_VOLUME_KEY, type ComposeModel } from '../helper/composeModel';
+import { COMPOSE_MODEL_PATH, type ComposeModelOutput } from '../helper/compose';
 import { checkConfiguration } from '../helper/configChecks';
 import { DevcontainerCommandError } from '../helper/devcontainerCli';
-import type { HelperImageUse } from '../helper/workspaceHelper';
+import type { HelperImageUse } from '../helper/helperImage';
 import type { CheckOutcome, ConfigReferences } from '../imageCheck/imageCheck';
 import { parseJsonc } from '../jsonc';
 import type { ProgressStep } from '../messages';
@@ -69,7 +70,8 @@ import {
   type EnvironmentServiceDeps,
 } from './environmentService';
 import type { DockerStarter } from './operationBase';
-import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { configHash } from './pipelineRules';
 import { inProcessAnalyzer } from '../helper/configurationAnalysis.testkit';
 
 export const REPO = 'acme/api';

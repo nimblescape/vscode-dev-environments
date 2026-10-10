@@ -8,12 +8,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { loaderCommand } from '../loader/pipeLoader';
+import { BATCH_SOCKET_FOLDER } from '../names';
 import {
   BATCH_DOCKER_SOCKET,
   BATCH_ENTRY,
   BATCH_GIT_UID,
   BATCH_SCRIPT_PATH,
-  BATCH_SOCKET_FOLDER,
   batchContainerName,
   batchRunSpec,
   parseBatchParams,

@@ -12,7 +12,7 @@ import {
   configPathLabel,
   isConfigPathLabelValue,
   containerHostname,
-  HELPER_CACHE_FOLDER as NAMES_HELPER_CACHE_FOLDER,
+  HELPER_CACHE_FOLDER,
   HOST_ACCESS_UNRESTRICTED_LABEL,
   TOKEN_TMPFS,
   WORKSPACES_ROOT,
@@ -25,13 +25,6 @@ import {
   runArgsDecideHostname,
   type HostAccessChecks,
 } from '../policy';
-
-/**
- * Mount point of the cache volume devenv-helper-cache in the helper, passed as `--user-data-folder`.
- * Assumption (V-10): the CLI keeps data there that is useful across helper runs. CLI 0.89.0 downloads Features into a
- * new folder below os.tmpdir() for each build, so the Features themselves are not cached there.
- */
-export const HELPER_CACHE_FOLDER = NAMES_HELPER_CACHE_FOLDER;
 
 /**
  * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:

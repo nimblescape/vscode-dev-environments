@@ -35,7 +35,8 @@ describe('ScriptEntry keeps a plain input and a secret apart also for a value th
   // alone stays an entry.
   it('refuses such entries in a registry checked as CONTAINER_SCRIPTS is (T2, T3)', () => {
     const commandWithSecret = { command: ['cat'], plainInput: true, secretInputName: SECRET_TOKEN } as const;
-    const scriptWithInput = { program: 'node', script: 'x', plainInput: true } as const;
+    // Cleanup after plan step 11 (PR C1): `program: 'sh'` (the unused kind 'node' is removed), so the only error is the input.
+    const scriptWithInput = { program: 'sh', script: 'x', plainInput: true } as const;
     const plain = { command: ['cat'], plainInput: true } as const;
     const secret = { program: 'sh', script: 'cat', secretInputName: SECRET_TOKEN } as const;
     // @ts-expect-error: the command entry with a secret

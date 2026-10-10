@@ -14,7 +14,7 @@ import { VSCODE_EXTENSION_SEED_SCRIPT } from '../worker/vscodeExtensionSeed';
 import { VSCODE_SERVER_LINK_SCRIPT } from '../worker/vscodeServerLink';
 import type { ExtensionRef } from '../vscodeExtensions';
 import { ENV_ID, REPO, createHarness, seedEnvironment, type Harness, type HarnessOverrides } from './environmentService.testkit';
-import { DEFAULT_CONFIG_PATH } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
 import type { RepositoryTarget } from './operationBase';
 import type { VscodeExtensionCache } from './environmentService';
 

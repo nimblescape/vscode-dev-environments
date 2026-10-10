@@ -7,7 +7,7 @@
 // The real protection is the check of the write in the container (containerToken.test.ts); these give a clear message.
 import { describe, expect, it } from 'vitest';
 import { composeProjectName, resourceName } from '../names';
-import type { ComposeModel } from './compose';
+import type { ComposeModel } from './composeModel';
 import {
   decideServiceMount,
   composeAccessClassification,

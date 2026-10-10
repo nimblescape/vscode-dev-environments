@@ -28,7 +28,8 @@ import {
   type Harness,
 } from './environmentService.testkit';
 import { otherWindowMarkIsLive, registryOpenRecords, sameBusyMark, type OpenFinish, type OpenRecords } from './openRecords';
-import { DEFAULT_CONFIG_PATH, configHash } from './pipelineRules';
+import { DEFAULT_CONFIG_PATH } from './recordRules';
+import { configHash } from './pipelineRules';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 const NOW = Date.parse('2026-10-04T12:00:00.000Z');

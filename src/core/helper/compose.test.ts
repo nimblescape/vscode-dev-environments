@@ -5,17 +5,24 @@
 import { describe, expect, it } from 'vitest';
 import { CONTAINER_VERSION, TOKEN_TMPFS, composeProjectName, environmentImageRepository, resourceName } from '../names';
 import {
+  VSCODE_STORE_KEY,
+  WORKSPACE_VOLUME_KEY,
+  composeNetworkNames,
+  composeVolumeNames,
+  isSupportedComposeVersion,
+  supportsVolumeSubpath,
+  type ComposeModel,
+} from './composeModel';
+import {
   COMPOSE_BUILD_CONTEXT,
   COMPOSE_DEV_DOCKERFILE,
   COMPOSE_MODEL_PATH,
-  WORKSPACE_VOLUME_KEY,
   builtServiceImages,
   composeBuildModel,
   composeConfigHash,
   composeInputsHash,
   composeModelLimit,
   composeMountVolumeName,
-  composeNetworkNames,
   composeNetworkReferences,
   composeReferences,
   composeServiceImage,
@@ -24,15 +31,10 @@ import {
   composeUpModel,
   composeUserArgs,
   type ComposeModelOutput,
-  composeVolumeNames,
   escapeComposeDollars,
-  isSupportedComposeVersion,
   parseComposeModelOutput,
   resolveComposeFiles,
-  supportsVolumeSubpath,
-  type ComposeModel,
   type ComposeRewriteParams,
-  VSCODE_STORE_KEY,
 } from './compose';
 import { OVERRIDE_FOLDER } from './scripts';
 import {

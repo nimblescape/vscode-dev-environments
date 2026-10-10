@@ -252,10 +252,11 @@ export function decide(input: RemoteDecideInput): RemoteDecision {
     if (now - at <= RECORD_MAX_AGE_MS) return false;
     const same = recordsOf.get(record.environmentId) ?? [];
     // Review round 1 of PR #63 (F1): never while a keepRunning record of another computer is not newer than it. This record
-    // is the only one of its computer for the environment, and the local check of that computer (inUseByOtherComputer)
-    // counts such a keep only while it is at least as new as its own newest record; without it, an old keep would count.
-    // Review round 2 (R2-6): with the written times, as that check sees them (as the records hold them; the subcommand
-    // `records` that printed them is removed, plan step 11I, U10), not the clamped ones.
+    // is the only one of its computer for the environment; the local check of that computer (inUseByOtherComputer)
+    // counted such a keep only while it was at least as new as its own newest record. That check is removed (Q6; its
+    // input, the subcommand `records`, plan step 11I, U10; the function, the cleanup after plan step 11, PR C1), so this
+    // exception decides no stop any more; it stays so that a record is removed no sooner than before. Review round 2
+    // (R2-6): with the written times (as the records hold them), not the clamped ones.
     if (input.records.some((other) => other.environmentId === record.environmentId && other.keepRunning && other.source !== record.source && other.at <= record.at)) return false;
     return same.some((other) => other.at > at);
   });

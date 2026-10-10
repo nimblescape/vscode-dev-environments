@@ -37,8 +37,9 @@ import {
   useRemoteContext,
   type SshCheckDeps,
 } from '../../src/core/docker/remoteDocker';
-import { DOCKER_SOCKET, helperDockerSocket } from '../../src/core/helper/helperImages';
+import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import {
+  HELPER_DOCKER_SOCKET,
   GITHUB_TOKEN_FILE,
   LABEL_ENVIRONMENT_ID,
   LABEL_REPOSITORY,
@@ -255,7 +256,7 @@ describe('Docker on another computer through the Docker context (unit 7)', () =>
       computer: testComputer({ run, log }, 'remote-host'),
       windowId: 'docker-test-remote-window',
       settings: { updateImagesOnConnect: true },
-      socketPath: async (target) => (target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint)),
+      socketPath: async (target) => (target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? HELPER_DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint)),
       startDocker: async ({ onStarting, signal }) =>
         startDockerFor(
           await targets.current(),
