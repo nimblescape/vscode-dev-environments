@@ -32,7 +32,7 @@ interface PullCredentials extends Credentials {
 }
 
 /**
- * Cleanup after plan step 11 (PR C2, D2; review round 1, A-C2-1): the time limit of EngineDocker.labelImage (10 min),
+ * Cleanup after plan step 11 (PR #138, D2; review round 1, A-C2-1): the time limit of EngineDocker.labelImage (10 min),
  * longer than that of a query (DOCKER_QUERY_TIMEOUT_MS), because the commit can walk the whole filesystem of the image on
  * some storage drivers (the containerd image store, fuse-overlayfs, vfs); still far below the time limit of the open, so
  * that a stalled engine cannot hold the lock of the environment for long.
@@ -49,7 +49,7 @@ function sortedTags(repository: string, tags: Iterable<string>): string[] {
 
 /**
  * The strings of a list of an inspect answer (`RepoTags`, `RepoDigests`); none for anything else. Cleanup after plan
- * step 11 (PR C2, B12): one helper for imageNames and inspectImageNames (before, a copy in each).
+ * step 11 (PR #138, B12): one helper for imageNames and inspectImageNames (before, a copy in each).
  */
 function texts(list: unknown): string[] {
   return Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === 'string') : [];
@@ -96,7 +96,7 @@ export class EngineDocker implements EnvironmentDocker {
    * EngineError, and a cancel of `signal` stays its AbortError.
    */
   private call<T>(what: string, signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>, timeoutMs = DOCKER_QUERY_TIMEOUT_MS): Promise<T> {
-    // Cleanup after plan step 11 (PR C2, B4): the one time-limited call (withTimeLimit), with the error of EngineDocker.
+    // Cleanup after plan step 11 (PR #138, B4): the one time-limited call (withTimeLimit), with the error of EngineDocker.
     return withTimeLimit(timeoutMs, signal, run, () => new EngineError(`The engine did not answer ${what} within ${timeoutMs / 1000} s.`, 0));
   }
 
@@ -344,7 +344,7 @@ export class EngineDocker implements EnvironmentDocker {
   async labelImage(image: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
     const previous = await this.imageId(image);
     if (previous === undefined) throw new EngineError(`The image ${image} does not exist.`, 404);
-    // Cleanup after plan step 11 (PR C2, D2): within a time limit of its own (LABEL_IMAGE_TIMEOUT_MS, review round 1,
+    // Cleanup after plan step 11 (PR #138, D2): within a time limit of its own (LABEL_IMAGE_TIMEOUT_MS, review round 1,
     // A-C2-1), so that a stalled engine cannot hold the lock of the environment up to the time limit of the open; the
     // inspect and the commit of DockerEngine.labelImage run on its signal (before: on the signal of the operation only).
     const now = await this.call(`the labels of ${image}`, signal, (limited) => this.engine.labelImage(image, labels, limited), LABEL_IMAGE_TIMEOUT_MS);

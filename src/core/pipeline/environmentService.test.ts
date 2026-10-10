@@ -712,7 +712,7 @@ describe('open: first open', () => {
     expect(error.code).toBe('dockerStartFailed');
     expect(await h.registry.list()).toEqual([]);
   });
-  // Cleanup after plan step 11 (PR C2, A4): the test "shows the build of the helper image as a detail of the current
+  // Cleanup after plan step 11 (PR #138, A4): the test "shows the build of the helper image as a detail of the current
   // step, so the steps keep their order" is removed with the progress detail of prepareHelper that it tested (the own
   // image of the worker is never built); the steps of a first open stay pinned by the tests above.
 });
@@ -1038,7 +1038,7 @@ describe('open: existing environment', () => {
       expect(h.ui.prompts).toEqual([`filesMissing ${REPO}`]);
       expect(h.docker.volumes.size).toBe(0);
       // Plan step 6, PR A: changed expectation, the question is asked under the lock, so the helper image of the worker
-      // was ensured before it (D1); no helper run. Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper
+      // was ensured before it (D1); no helper run. Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper
       // image before the lock (the worker's own image; before: ensureImagePresent).
       expect(h.helper.calls).toEqual([]);
       expect(await pendingIds()).toEqual([]);
@@ -1227,7 +1227,7 @@ describe('open: existing environment', () => {
     expect(h.progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
   });
 
-  // Cleanup after plan step 11 (PR C2, A4): four tests are removed with the code of prepareHelper that they tested (the
+  // Cleanup after plan step 11 (PR #138, A4): four tests are removed with the code of prepareHelper that they tested (the
   // own image of the worker is never built or checked): "shows a build of the helper image during a reconnect as a detail
   // of …", "shows the rebuild of an existing helper image from a new base image as an update …", "checks the base image
   // of the helper only when the setting updateImagesOnConnect is on", and "does not wait for the check of the base image
@@ -3924,7 +3924,7 @@ describe('safetyCheck', () => {
   });
 
   // Review round 6 of PR #84 (B-R6-2): the refresh's exec gets the operation's signal and the time limit of the Git
-  // execs (GIT_EXEC_TIMEOUT_MS, 30 s; since PR C2 GIT_SUMMARY_TIMEOUT_MS of readGitSummary), so a hanging Git in the
+  // execs (GIT_EXEC_TIMEOUT_MS, 30 s; since PR #138 GIT_SUMMARY_TIMEOUT_MS of readGitSummary), so a hanging Git in the
   // container never holds Delete up.
   it('review round 6 of PR #84 (B-R6-2): the refresh runs with the signal of the Delete and a time limit of 30 s', async () => {
     await seedEnvironment(h, { container: 'running' });
@@ -4097,10 +4097,10 @@ describe('recordGitState (plan step 8, PR C, Q2)', () => {
     expect((await entry())?.gitSummary).toEqual(env.gitSummary);
   });
 
-  // Cleanup after plan step 11 (PR C2, B1): the service reads the Git state with Stop's readGitSummary, so a failed read
+  // Cleanup after plan step 11 (PR #138, B1): the service reads the Git state with Stop's readGitSummary, so a failed read
   // names its reason as Stop does: a script that did not end in time, or one that failed without output, by its exit
   // code (before: its output, possibly none). The cancel stays a failed read here (see the test above).
-  it('PR C2 (B1): logs why the Git state could not be read as Stop does: the time limit, or the exit code without output', async () => {
+  it('PR #138 (B1): logs why the Git state could not be read as Stop does: the time limit, or the exit code without output', async () => {
     await seedEnvironment(h, { container: 'running' });
     const id = h.docker.containersOf(ENV_ID)[0].id;
     h.docker.execHandler = () => ({ exitCode: null, stdout: 'partial', timedOut: true });

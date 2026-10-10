@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C2, B6): one `devenv-` prefix of the names of an environment, for the names, the list
+// Cleanup after plan step 11 (PR #138, B6): one `devenv-` prefix of the names of an environment, for the names, the list
 // of the environment images (EngineDocker) and the image-ownership check of the host access policy (policy/images.ts).
 import { describe, expect, it } from 'vitest';
 import { RESOURCE_NAME_PREFIX, isEnvironmentResourceName, resourceName } from './names';
@@ -12,7 +12,7 @@ import { EngineDocker } from './worker/engineDocker';
 
 const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
 
-describe('the resource prefix (PR C2, B6)', () => {
+describe('the resource prefix (PR #138, B6)', () => {
   it('is devenv-, the start of every name of an environment', () => {
     expect(RESOURCE_NAME_PREFIX).toBe('devenv-');
     const name = resourceName('acme/api', ID);

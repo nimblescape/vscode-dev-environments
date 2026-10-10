@@ -65,7 +65,7 @@ export async function stopFlow(p: StopFlow): Promise<StopResult> {
   if (devs.length === 0) {
     p.log(`The container ${p.containerName} does not run.`);
   } else {
-    // Cleanup after plan step 11 (PR C2, B1): the one read of the Git state (readGitSummary); a cancel throws.
+    // Cleanup after plan step 11 (PR #138, B1): the one read of the Git state (readGitSummary); a cancel throws.
     gitSummary = await readGitSummary(p.engine, devs[0], p.user, p.folder, { now: p.now, log: p.log, cancel: 'throw', signal: p.signal });
     await stopContainer(p, devs[0], `Stopping the container ${devs[0].name}.`, failures);
     for (const other of devs.slice(1)) await stopContainer(p, other, `Stopping the container ${other.name}, another dev container of the environment.`, failures);
@@ -87,7 +87,7 @@ export async function stopFlow(p: StopFlow): Promise<StopResult> {
 async function stopContainer(p: StopFlow, container: EngineContainer, line: string, failures: string[]): Promise<boolean> {
   p.log(line);
   const limitMs = p.stopContainerTimeoutMs ?? STOP_CONTAINER_TIMEOUT_MS;
-  // Cleanup after plan step 11 (PR C2, B4): the one time-limited call (withTimeLimit); past the limit, its own reason.
+  // Cleanup after plan step 11 (PR #138, B4): the one time-limited call (withTimeLimit); past the limit, its own reason.
   let timedOut = false;
   try {
     await withTimeLimit(limitMs, p.signal, (limited) => p.engine.stop(container.id, undefined, limited), () => {

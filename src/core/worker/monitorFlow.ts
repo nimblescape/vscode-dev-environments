@@ -48,7 +48,7 @@ export async function monitorCommand(
     return { ok: false, missing: false, detail: clip(detail) };
   } catch (error) {
     if (options.signal?.aborted) throw error;
-    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning) unless the caller gives its own (Delete's
+    // Cleanup after plan step 11 (PR #138, B5): the one rule (isNotRunning) unless the caller gives its own (Delete's
     // forget); before, any 404 counted.
     const missing = (options.missing ?? isNotRunning)(error);
     return { ok: false, missing, detail: clip(errorMessage(error)) };
@@ -74,7 +74,7 @@ export function sendMonitorSettings(engine: DockerEngine, params: { settings: Im
 
 /**
  * Delete's `forget`: the heartbeat record of `source` for the environment (the entry monitorForget, under the lock of the
- * records). Cleanup after plan step 11 (PR C2, B5; review round 1, A-C2-5): `missing` keeps its rule from before, any 404
+ * records). Cleanup after plan step 11 (PR #138, B5; review round 1, A-C2-5): `missing` keeps its rule from before, any 404
  * (also "No such exec instance": the monitor container went away between the create and the start of the exec) or a 409
  * "is not running", because Delete logs no record of a monitor that does not run (workerSessionMonitor); the one rule
  * would make that race a warning.

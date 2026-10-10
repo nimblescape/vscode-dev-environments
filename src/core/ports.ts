@@ -63,7 +63,7 @@ export function isAbortError(error: unknown): boolean {
 }
 
 /**
- * Cleanup after plan step 11 (PR C2, B4): `run` within `ms`, the one time-limited call of the worker (EngineDocker's
+ * Cleanup after plan step 11 (PR #138, B4): `run` within `ms`, the one time-limited call of the worker (EngineDocker's
  * calls, the engine of the Session Monitor's ensure, the stops of Stop). `run` gets a signal that aborts at `signal` or
  * after `ms`. When the time limit ended it and `signal` did not abort, it rejects with the error of `timedOut`, whatever
  * `run` rejected with; any other failure, and a cancel of `signal`, passes unchanged.

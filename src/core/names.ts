@@ -270,7 +270,7 @@ const MAX_NAME_LENGTH = 63;
 /**
  * The start of the name of everything of an environment (resourceName), by which the extension finds its images
  * (EngineDocker.listEnvironmentImages) and the host access policy tells an environment image (environmentImageNames).
- * Cleanup after plan step 11 (PR C2, B6): one constant (before, the text in five places).
+ * Cleanup after plan step 11 (PR #138, B6): one constant (before, the text in five places).
  */
 export const RESOURCE_NAME_PREFIX = 'devenv-';
 

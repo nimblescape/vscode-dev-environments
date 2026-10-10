@@ -4,7 +4,7 @@
 
 // Plan step 5, PR B: Stop and Delete under the lock of the environment on the Docker host (EnvironmentService
 // withEnvironmentLock). User decision D1: the worker is opened before (its lock); when that fails, the operation is
-// refused and nothing is stopped or removed. Cleanup after plan step 11 (PR C2, A4): no helper image is prepared before
+// refused and nothing is stopped or removed. Cleanup after plan step 11 (PR #138, A4): no helper image is prepared before
 // the lock any more (before: the helper image was ensured, built when missing, and a failure refused the operation).
 // User decision D2: Stop and Delete in step 5. User decision D3: a lock held elsewhere is refused after the wait, with
 // its message. The busy mark comes first, then the lock; both are released in `finally`.
@@ -69,7 +69,7 @@ beforeEach(() => {
   });
   // PR #74 review round 1, A-R1-1: the image before the lock is the non-maintaining ensureImagePresent (event
   // `ensureImage`); the maintaining ensureImageUse would add its own event, which no expectation of Stop or Delete has.
-  // Cleanup after plan step 11 (PR C2, A4): ensureImagePresent is called only by the worker of the tests (fakeWorkerFlow:
+  // Cleanup after plan step 11 (PR #138, A4): ensureImagePresent is called only by the worker of the tests (fakeWorkerFlow:
   // Stop), as the extension's preparation of the worker; the pipeline's withEnvironmentLock (Delete, the opens) prepares
   // no image. The image of an open is the own image (ownImageUse, before ensureImageUse; event `ownImageUse`).
   const ensure = h.helper.ensureImagePresent.bind(h.helper);
@@ -116,7 +116,7 @@ describe('Delete under the environment lock (plan step 5, PR B)', () => {
   it('takes the busy mark first, then the lock (10 s wait), removes under the lock, and releases both', async () => {
     await seedEnvironment(h, { container: 'running' });
     await h.service.delete(ENV_ID, deleteOptions());
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (the worker's own
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (the worker's own
     // image; before: `ensureImage` first).
     expect(events.slice(0, 4)).toEqual([`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=delete', 'docker stop (locked)', 'docker rm (locked)']);
     expect(events.at(-1)).toBe('release');
@@ -147,7 +147,7 @@ describe('Delete under the environment lock (plan step 5, PR B)', () => {
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
-  // Cleanup after plan step 11 (PR C2, A4): the tests "user decision D1: the helper image cannot be built: refused with
+  // Cleanup after plan step 11 (PR #138, A4): the tests "user decision D1: the helper image cannot be built: refused with
   // the cause before the lock, nothing removed" and "user decision D1: a missing helper image is built first, then the
   // lock is taken and the delete goes on" are removed with the code that they tested: withEnvironmentLock prepares no
   // helper image (the worker's own image), so that refusal is gone. A refused lock stays covered above.
@@ -208,7 +208,7 @@ describe('Stop under the environment lock (plan step 5, PR B)', () => {
   // a `--pull --no-cache` rebuild (here: forever). Stop does not run it: it only ensures that the tag exists.
   it('A-R1-1: a pending rebuild of the maintaining ensure does not delay Stop: only the tag is ensured, then the lock', async () => {
     await seedEnvironment(h, { container: 'running' });
-    // Cleanup after plan step 11 (PR C2, A4): the image of an open is ownImageUse (before, the maintaining
+    // Cleanup after plan step 11 (PR #138, A4): the image of an open is ownImageUse (before, the maintaining
     // ensureImageUse).
     h.helper.ownImageUse = () => {
       events.push('ownImageUse');
@@ -279,7 +279,7 @@ function lockedSuffix(volumeName: string): string {
 
 /**
  * The events without the container steps of Delete (`docker stop`, `docker rm`) and the image of the open (ownImageUse;
- * before PR C2, the maintaining ensureImageUse).
+ * before PR #138, the maintaining ensureImageUse).
  */
 function openEvents(): string[] {
   return events.filter((event) => !event.startsWith('docker stop') && !event.startsWith('docker rm') && event !== 'ownImageUse');
@@ -341,7 +341,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     await h.service.open(TARGET, openOptions());
     expect(h.dockerStarts).toBe(1);
     // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` after the wait).
     expect(openEvents().slice(0, 4)).toEqual(['busy wait', `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none', 'docker volume inspect (locked)']);
     expect(openEvents()).toContain('up (locked)');
@@ -352,9 +352,9 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     expect((await h.registry.get(ENV_ID))?.busy).toBeUndefined();
   });
 
-  // Cleanup after plan step 11 (PR C2, A4): withEnvironmentLock prepares no helper image any more; a cancel before the
+  // Cleanup after plan step 11 (PR #138, A4): withEnvironmentLock prepares no helper image any more; a cancel before the
   // lock still ends the operation with its AbortError before the lock is asked for, as the read of the own image did.
-  it('PR C2 (A4): a cancel before the lock asks for no lock and starts nothing', async () => {
+  it('PR #138 (A4): a cancel before the lock asks for no lock and starts nothing', async () => {
     await seedEnvironment(h, { extra: { busy: { operation: 'rebuild', since: new Date(h.clock.now()).toISOString(), pid: 7777, windowId: 'window-2' } } });
     h.alivePids.add(7777);
     const controller = new AbortController();
@@ -397,7 +397,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     h.ui.filesMissingAnswer = 'cloneAgain';
     await h.service.open(TARGET, openOptions());
     expect(lockedIds).toEqual([ENV_ID]);
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` first).
     expect(openEvents().slice(0, 6)).toEqual([
       `lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`,
@@ -420,7 +420,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     const error = await rejection(h.service.open(TARGET, openOptions()));
     expect(error.code).toBe('cancelled');
     expect(lockedIds).toEqual([ENV_ID]);
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before: one
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before: one
     // `ensureImage`, of the open; the Delete within its lock added none).
     expect(events.filter((event) => event === 'ensureImage')).toEqual([]);
     expect(events).toContain('docker rm (locked)');
@@ -435,7 +435,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     await seedEnvironment(h, { record: null, container: null, extra: { busy: staleCreate } });
     await h.service.open(TARGET, openOptions());
     // Review round 3 of PR #88 (A-R3-1): changed expectation, the open reads whose the volume is (before: whether it exists).
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` first).
     expect(openEvents().slice(0, 4)).toEqual([`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create', 'docker volume inspect (locked)', 'clone (locked)']);
     expect(openEvents()).toContain('up (locked)');
@@ -450,7 +450,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     lockOutcome = refusal();
     const error = await rejection(h.service.open(TARGET, openOptions()));
     expect(error.message).toBe(message);
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
     // `ensureImage` first, and the call ensureImagePresent).
     expect(events).toEqual([`lock ${ENV_ID} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=none']);
     expect(h.docker.log).toEqual([]);
@@ -465,7 +465,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     lockOutcome = new EnvironmentLockError('busy', 'held');
     expect((await rejection(h.service.openEnvironment(ENV_ID, openOptions({ forceRebuild: true })))).message).toBe(PipelineTexts.environmentLockBusy(REPO));
     expect((await rejection(h.service.openEnvironment(ENV_ID, openOptions({ configPath: DEFAULT_CONFIG_PATH })))).message).toBe(PipelineTexts.environmentLockBusy(REPO));
-    // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before: the call
+    // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before: the call
     // ensureImagePresent of each).
     expect(h.helper.calls).toEqual([]);
     expect(h.docker.log).toEqual([]);
@@ -484,7 +484,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
     expect((await h.registry.get(ENV_ID))?.busy).toEqual(staleCreate);
   });
 
-  // Cleanup after plan step 11 (PR C2, A4): the test "D1: a missing helper image that cannot be built refuses Start
+  // Cleanup after plan step 11 (PR #138, A4): the test "D1: a missing helper image that cannot be built refuses Start
   // before the lock; nothing is started" is removed with the refusal of withEnvironmentLock that it tested.
 
   describe('first open', () => {
@@ -493,7 +493,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       const [id] = lockedIds;
       expect(lockedIds).toEqual([id]);
       expect((await h.registry.list()).map((entry) => entry.id)).toEqual([id]);
-      // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+      // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
       // `ensureImage` after the check of the name).
       expect(openEvents().slice(0, 6)).toEqual([
         FREE_NAME_CHECK,
@@ -516,7 +516,7 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       lockOutcome = refusal();
       const error = await rejection(h.service.open(TARGET, openOptions()));
       expect(error.message).toBe(message);
-      // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+      // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
       // `ensureImage` after the check of the name, and the call ensureImagePresent).
       expect(events).toEqual([FREE_NAME_CHECK, `lock ${lockedIds[0]} ${ENVIRONMENT_LOCK_WAIT_SECONDS}`, 'busy=create']);
       expect(await h.registry.list()).toEqual([]);
@@ -538,13 +538,13 @@ describe('Start, Rebuild, Select configuration and Clone again under the environ
       expect(h.docker.log).toEqual([]);
     });
 
-    // Cleanup after plan step 11 (PR C2, A4): the test "D1: a helper image that cannot be built refuses the first open;
+    // Cleanup after plan step 11 (PR #138, A4): the test "D1: a helper image that cannot be built refuses the first open;
     // the new registry entry is removed again" is removed with the refusal of withEnvironmentLock that it tested.
     it('a failed clone is removed again under the lock, before the release', async () => {
       h.helper.cloneError = new CommandError('git clone', 128, '', 'Repository not found');
       await rejection(h.service.open(TARGET, openOptions()));
       const [id] = lockedIds;
-      // Cleanup after plan step 11 (PR C2, A4): changed expectation, no helper image before the lock (before:
+      // Cleanup after plan step 11 (PR #138, A4): changed expectation, no helper image before the lock (before:
       // `ensureImage` after the check of the name).
       expect(openEvents()).toEqual([
         FREE_NAME_CHECK,

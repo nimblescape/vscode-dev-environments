@@ -225,7 +225,7 @@ describe('the core services in the worker (plan step 11B3b)', () => {
         throw new Error('no lock in this test');
       },
     });
-    // Cleanup after plan step 11 (PR C2, A4): the two image calls of the pipeline (ensureImagePresent, ensureImageUse)
+    // Cleanup after plan step 11 (PR #138, A4): the two image calls of the pipeline (ensureImagePresent, ensureImageUse)
     // are one read of the own image (ownImageUse).
     expect(await helper.ownImageUse()).toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
     // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the worker's helper has no image call besides
@@ -357,7 +357,7 @@ describe('the deps of the pipeline in the worker (review round 1 of 11B3b)', () 
     expect(execs).toEqual([{ secretInputName: SECRET_TOKEN }]);
     // Plan step 11I (U7, decision of 2026-10-08): changed expectation, the image call of the pipeline (ensureImageUse;
     // before: ensureImage, its tag only, which is removed with the helper image code of the extension). Cleanup after
-    // plan step 11 (PR C2, A4): ownImageUse, the one read of the own image (ensureImageUse is removed).
+    // plan step 11 (PR #138, A4): ownImageUse, the one read of the own image (ensureImageUse is removed).
     await expect(all.helper.ownImageUse()).resolves.toEqual({ tag: 'devenv-helper:abc', id: IMAGE_ID });
   });
 });

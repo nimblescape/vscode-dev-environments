@@ -17,7 +17,7 @@ import { EngineError, isNotRunning, type DockerEngine } from './dockerEngine';
 
 /**
  * `call` within `ms`: past it, an Error "no answer in time"; the cancel of `signal` passes as an AbortError. Cleanup after
- * plan step 11 (PR C2, B4): the one time-limited call (withTimeLimit), with the error of the ensure.
+ * plan step 11 (PR #138, B4): the one time-limited call (withTimeLimit), with the error of the ensure.
  */
 export function limited<T>(ms: number, signal: AbortSignal | undefined, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
   return withTimeLimit(ms, signal, call, () => new Error('no answer in time'));
@@ -98,7 +98,7 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
       } catch (error) {
         if (isAbortError(error) && signal?.aborted) throw error;
         // The engine refused the exec: the container does not exist, does not run, or restarts. Cleanup after plan step 11
-        // (PR C2, B5): the one rule (isNotRunning, with `restarting`, as NO_STORED_SCRIPT); before, any 404 counted.
+        // (PR #138, B5): the one rule (isNotRunning, with `restarting`, as NO_STORED_SCRIPT); before, any 404 counted.
         return isNotRunning(error, { restarting: true }) ? 'none' : 'unknown';
       }
     },

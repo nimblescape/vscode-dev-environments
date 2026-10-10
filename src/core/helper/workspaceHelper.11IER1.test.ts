@@ -90,7 +90,7 @@ describe('review round 1 of PR #129 (reviewer B): the state query of a kept cont
     expect(lines).toContain(`warn The state of the container ${CONTAINER_ID.slice(0, 12)} could not be read: the engine is gone`);
   });
 
-  // Cleanup after plan step 11 (PR C2, A4): the two image calls of the pipeline are one (ownImageUse), so the copy is
+  // Cleanup after plan step 11 (PR #138, A4): the two image calls of the pipeline are one (ownImageUse), so the copy is
   // asserted once (before: also for ensureImagePresent, removed).
   it('gives a copy of the own image for the two image calls of the pipeline (W05)', async () => {
     const own = { ...OWN };

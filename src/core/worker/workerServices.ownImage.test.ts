@@ -63,7 +63,7 @@ describe("the worker's WorkspaceHelper (plan step 11I, U7)", () => {
     const helper = workerHelper();
     const deps = (helper as unknown as { deps: Record<string, unknown> }).deps;
     expect(Object.keys(deps).sort()).toEqual(['containerRuns', 'logger', 'ownImage', 'socket']);
-    // Cleanup after plan step 11 (PR C2, A4): the two image calls of the pipeline are one read of the own image
+    // Cleanup after plan step 11 (PR #138, A4): the two image calls of the pipeline are one read of the own image
     // (ownImageUse); ensureImageUse and ensureImagePresent are removed.
     for (const removed of ['ensureImage', 'checkImagePresent', 'presentImage', 'engineKey', 'prebuildImage', 'runImage', 'ensureImageUse', 'ensureImagePresent']) {
       expect((helper as unknown as Record<string, unknown>)[removed], removed).toBeUndefined();

@@ -5647,7 +5647,7 @@ export class EnvironmentService extends OperationBase {
    */
   private async composeContainers(env: Environment): Promise<ContainerInfo[]> {
     const project = composeProjectName(env.repository, env.id);
-    // Cleanup after plan step 11 (PR C2, B9): the one listing of the containers by the label and the project, once each
+    // Cleanup after plan step 11 (PR #138, B9): the one listing of the containers by the label and the project, once each
     // (upContainers; before, a copy of it here), of which only those of the project count.
     return (await this.upContainers(env, true)).filter((container) => {
       const owner = container.labels[LABEL_ENVIRONMENT_ID];
@@ -6114,7 +6114,7 @@ export class EnvironmentService extends OperationBase {
    * Resolves the helper image of the run. Plan step 11I (U7): in the worker that is its own image, so nothing is built
    * or checked here any more. Until then it built the helper image if needed, shown as a detail of the current step,
    * and the check of the base image of the helper followed the setting updateImagesOnConnect. Cleanup after plan step 11
-   * (PR C2, A4): the own image is read (WorkspaceHelper.ownImageUse); the options of that build (onOutput, onBuild,
+   * (PR #138, A4): the own image is read (WorkspaceHelper.ownImageUse); the options of that build (onOutput, onBuild,
    * checkBaseImage) and its progress detail, which the own image never used, are removed. Review round 2 of PR #64
    * (A-N1): the first call of a run resolves the helper image of the run (ctx.helperImage); later calls do nothing.
    */
@@ -6123,8 +6123,8 @@ export class EnvironmentService extends OperationBase {
     if (ctx.helperImage !== undefined) return;
     // Review round 3 of PR #64 (P1): the helper image of the open is the one that this call awaited (its return value),
     // never learned from a callback, so a reset of the cache of the window meanwhile cannot lose the ID of the image.
-    // Review round 1 of PR C2 (B-H2): no catch of its own; the own image fails only on a cancel, and a helperFailed (only
-    // a test's helper throws one here) marks the run in the catch of the open's step that called it (loadConfiguration).
+    // Review round 1 of PR #138 (B-H2): no catch of its own; the own image fails only on a cancel. A helperFailed (only a
+    // test's helper throws one here) marks the run where the calling step catches it (loadConfiguration), else ends it.
     const image = await this.deps.helper.ownImageUse(ctx.signal);
     // Plan step 8, PR A (Q3): the Session Monitor first; when it cannot be ensured, the open is refused, and the helper
     // image is not taken for resolved, so no later step of this run goes on without the monitor.
@@ -6626,7 +6626,7 @@ export class EnvironmentService extends OperationBase {
 
   /**
    * The Git summary from the running container (the script `gitSummary` of the registry), or `undefined` when Git is
-   * missing, fails, or `signal` aborts. Cleanup after plan step 11 (PR C2, B1): the one read of the Git state
+   * missing, fails, or `signal` aborts. Cleanup after plan step 11 (PR #138, B1): the one read of the Git state
    * (readGitSummary, as Stop reads it); a cancel stays a failed read here (logged), as before.
    */
   private gitSummaryInContainer(container: string, user: string | undefined, folder: string, signal?: AbortSignal): Promise<GitSummary | undefined> {
@@ -6652,7 +6652,7 @@ export class EnvironmentService extends OperationBase {
    * Plan step 5, PR B: runs `fn` under the lock of the environment on the Docker host of the operation. User decision D1
    * (the state is made consistent before the operation, or the operation is refused): the worker with the lock (the
    * worker's own lock, workerEnvironmentLock; plan step 11I1, PR B1: the lock through the relay is gone; before, the
-   * helper image first, which in the worker is its own image since plan step 11I, U7, and which cleanup PR C2, A4,
+   * helper image first, which in the worker is its own image since plan step 11I, U7, and which cleanup PR #138, A4,
    * removed from here). When it fails, the operation is refused (environmentLockUnavailable, with the cause) and `fn` never runs:
    * never without the lock, never the direct way. User decision D3: a lock held by another window or computer is waited
    * for ENVIRONMENT_LOCK_WAIT_SECONDS, then the operation is refused (environmentLockBusy); no retry loop. Within `fn` the
@@ -6671,7 +6671,7 @@ export class EnvironmentService extends OperationBase {
     options: { batchVolume?: string } = {},
   ): Promise<T> {
     if (holdsEnvironmentLock(env.id)) return fn();
-    // Cleanup after plan step 11 (PR C2, A4): the worker's own image needs no preparation, so its refusal "the helper image
+    // Cleanup after plan step 11 (PR #138, A4): the worker's own image needs no preparation, so its refusal "the helper image
     // for the worker could not be prepared", which only a cancel reached (the own image fails on nothing else), is gone; a
     // cancel before the lock still throws its AbortError, as that read did.
     if (signal?.aborted) throw abortError();

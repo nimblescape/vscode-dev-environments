@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Review round 1 of cleanup PR C2 (reviewer B, probes):
+// Review round 1 of cleanup PR #138 (reviewer B, probes):
 // - B1: the service reads the Git state with readGitSummary in its cancel mode `fail` (a cancel is a failed read, logged
 //   as such, as before the PR), not Stop's `throw`.
 // - B9: composeContainers (now upContainers plus a filter) keeps its rule: the containers of Docker Compose of the
@@ -26,7 +26,7 @@ afterEach(() => {
   h.cleanup();
 });
 
-describe('the Git state of the service on a cancel (PR C2, B1, review round 1)', () => {
+describe('the Git state of the service on a cancel (PR #138, B1, review round 1)', () => {
   it('a cancel during the read is a failed read of the Git state (logged by the container), not an error of recordGitState', async () => {
     await seedEnvironment(h, { container: 'running' });
     const id = h.docker.containersOf(ENV_ID)[0].id;
@@ -41,7 +41,7 @@ describe('the Git state of the service on a cancel (PR C2, B1, review round 1)',
   });
 });
 
-describe('composeContainers after its merge into upContainers (PR C2, B9, review round 1)', () => {
+describe('composeContainers after its merge into upContainers (PR #138, B9, review round 1)', () => {
   it('the Compose containers of the project with this ID label or none; not another environment\'s, not the single container', async () => {
     const env = await seedEnvironment(h, { container: 'running' });
     const single = h.docker.containersOf(ENV_ID)[0];
@@ -60,7 +60,7 @@ describe('composeContainers after its merge into upContainers (PR C2, B9, review
   });
 });
 
-describe('the helper image of the open (PR C2, A4, review round 1)', () => {
+describe('the helper image of the open (PR #138, A4, review round 1)', () => {
   it('prepareHelper reads the own image with the signal of the open', async () => {
     const target: RepositoryTarget = { repository: REPO, defaultBranch: 'main', configPaths: [DEFAULT_CONFIG_PATH], trusted: true };
     const seen: (AbortSignal | undefined)[] = [];

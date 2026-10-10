@@ -12,7 +12,7 @@
 // root owns the repository (implementation notes §17, Known limitation). Plan step 11I (U7, decision of
 // 2026-10-08): only the worker builds a WorkspaceHelper (workerServices.ts), and every step runs from the worker's own
 // helper image (section 3b of the plan); the helper image of the extension (its build, check, maintenance and record)
-// is HelperImages' (helperImages.ts), of which this module imports nothing (cleanup after plan step 11, PR C2, A4:
+// is HelperImages' (helperImages.ts), of which this module imports nothing (cleanup after plan step 11, PR #138, A4:
 // before, the types of its options), so the worker's bundle holds none of it.
 import { SECRET_TOKEN } from '../helperChannel/protocol';
 import { CommandError, UserFacingError, errorMessage } from '../errors';
@@ -196,7 +196,7 @@ export class WorkspaceHelper {
   /**
    * The helper image of an open (the pipeline's prepareHelper). Plan step 11I (U7, decision of 2026-10-08): the
    * worker's own image (HelperDeps.ownImage); nothing is checked, built or recorded; an abort of `signal` passes through.
-   * Cleanup after plan step 11 (PR C2, A4): the one read of the own image (before, ensureImageUse and ensureImagePresent,
+   * Cleanup after plan step 11 (PR #138, A4): the one read of the own image (before, ensureImageUse and ensureImagePresent,
    * which took the options of the helper image of the extension and read only their `signal`).
    */
   async ownImageUse(signal?: AbortSignal): Promise<HelperImageUse> {

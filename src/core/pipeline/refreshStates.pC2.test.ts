@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C2, B1, one function per fact): readGitSummary, the one read of the Git state of a
+// Cleanup after plan step 11 (PR #138, B1, one function per fact): readGitSummary, the one read of the Git state of a
 // running dev container, for Stop (cancel `throw`) and the service (cancel `fail`).
 import { describe, expect, it } from 'vitest';
 import { abortError } from '../ports';
@@ -32,7 +32,7 @@ function read(docker: ScriptExec, cancel: 'throw' | 'fail', signal?: AbortSignal
   return { result: readGitSummary(docker, CONTAINER, 'vscode', '/workspaces/api', { now: () => NOW, log: (line) => lines.push(line), cancel, signal }), lines };
 }
 
-describe('readGitSummary (PR C2, B1)', () => {
+describe('readGitSummary (PR #138, B1)', () => {
   it('runs the script gitSummary in the container by its ID, as the user, within 30 s and with the signal, and parses it at now()', async () => {
     const { docker, calls } = exec(() => ({ stdout: 'feature-z\n5\n6\n2\n' }));
     const signal = new AbortController().signal;

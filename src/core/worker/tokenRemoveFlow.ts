@@ -127,7 +127,7 @@ async function tryRemoval(p: TokenRemoveFlow, container: string, user: string): 
     // Review round 3 of plan step 11B1 (A-R3-2): any failure but a cancel is a failed try, as with `docker exec`.
     if (error instanceof Error && error.name === 'AbortError') throw error;
     // A container that stopped (409) or was removed (404, A-R3-3) since the lookup holds no token any more.
-    // Cleanup after plan step 11 (PR C2, B5): the one rule (isNotRunning); a paused or restarting container still holds
+    // Cleanup after plan step 11 (PR #138, B5): the one rule (isNotRunning); a paused or restarting container still holds
     // the token (review round 3, B-R3-1 to B-R3-3).
     if (isNotRunning(error)) return 'notRunning';
     return { exitCode: null, stdout: '', stderr: error instanceof Error ? error.message : String(error), timedOut: false };

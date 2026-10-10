@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C2, D2, behaviour change): EngineDocker.labelImage runs within a time limit of its own
+// Cleanup after plan step 11 (PR #138, D2, behaviour change): EngineDocker.labelImage runs within a time limit of its own
 // (LABEL_IMAGE_TIMEOUT_MS, 10 min; review round 1, A-C2-1: longer than DOCKER_QUERY_TIMEOUT_MS, because the commit can
 // walk the whole filesystem on some storage drivers), so that a stalled engine cannot hold the lock of the environment up
 // to the time limit of the open; before, DockerEngine.labelImage got the signal of the operation only.
@@ -30,7 +30,7 @@ function stalled(): { engine: DockerEngine; signals: (AbortSignal | undefined)[]
   return { engine, signals };
 }
 
-describe('EngineDocker.labelImage within a time limit of its own (PR C2, D2)', () => {
+describe('EngineDocker.labelImage within a time limit of its own (PR #138, D2)', () => {
   it('a labelImage that the engine does not end fails with its own time limit (10 min), and the port gets that limit as its signal', async () => {
     // Review round 1 (A-C2-1): the limit of labelImage is its own, not the one of a query (60 s).
     expect(LABEL_IMAGE_TIMEOUT_MS).toBe(10 * 60_000);

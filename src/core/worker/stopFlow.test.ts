@@ -9,7 +9,7 @@ import { scriptCommand } from './containerScripts';
 import { EngineError, type DockerEngine, type EngineContainer, type EngineExecOptions, type EngineExecResult } from './dockerEngine';
 import { unusedEngine } from './dockerEngine.testkit';
 import { runningDevContainers, runningServices } from './environmentContainers';
-// Cleanup after plan step 11 (PR C2, B1): the time limit of the Git state is the one of readGitSummary (refreshStates.ts).
+// Cleanup after plan step 11 (PR #138, B1): the time limit of the Git state is the one of readGitSummary (refreshStates.ts).
 import { GIT_SUMMARY_TIMEOUT_MS as STOP_GIT_TIMEOUT_MS } from '../pipeline/refreshStates';
 import { STOP_CONTAINER_TIMEOUT_MS, stopFlow } from './stopFlow';
 import { MAX_STOPPED_SERVICES, MAX_STOP_FAILURE_LENGTH, parseStopValue } from '../helperChannel/protocol';

@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Cleanup after plan step 11 (PR C2, B4): withTimeLimit, the one time-limited call (EngineDocker's calls, the engine of
+// Cleanup after plan step 11 (PR #138, B4): withTimeLimit, the one time-limited call (EngineDocker's calls, the engine of
 // the Session Monitor's ensure, the stops of Stop).
 import { describe, expect, it } from 'vitest';
 import { abortError, withTimeLimit } from './ports';
@@ -11,7 +11,7 @@ import { abortError, withTimeLimit } from './ports';
 const hanging = (signal: AbortSignal): Promise<never> => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(abortError())));
 const late = () => new Error('late');
 
-describe('withTimeLimit (PR C2, B4)', () => {
+describe('withTimeLimit (PR #138, B4)', () => {
   it('gives the answer of the call, which gets a signal that has not aborted', async () => {
     let seen: AbortSignal | undefined;
     expect(await withTimeLimit(1000, undefined, async (signal) => ((seen = signal), 'answer'), late)).toBe('answer');

@@ -90,13 +90,13 @@ export async function readBranch(
 }
 
 /**
- * The time limit of the script `gitSummary` (readGitSummary). Cleanup after plan step 11 (PR C2, B1): one constant (before,
+ * The time limit of the script `gitSummary` (readGitSummary). Cleanup after plan step 11 (PR #138, B1): one constant (before,
  * STOP_GIT_TIMEOUT_MS of Stop and GIT_EXEC_TIMEOUT_MS of the service, both 30 s).
  */
 export const GIT_SUMMARY_TIMEOUT_MS = 30_000;
 
 /**
- * Cleanup after plan step 11 (PR C2, B1, one function per fact): the Git state of the repository at `folder` in a
+ * Cleanup after plan step 11 (PR #138, B1, one function per fact): the Git state of the repository at `folder` in a
  * running container, for Stop (stopFlow) and the service (the open after a clone, Delete's check, recordGitState). Before,
  * each had its own copy (stopFlow's readGitSummary, EnvironmentService.gitSummaryInContainer). The script `gitSummary`
  * of the registry runs as `user` within GIT_SUMMARY_TIMEOUT_MS; its output is parsed with the time `now()` after it.
